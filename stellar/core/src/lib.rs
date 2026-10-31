@@ -488,6 +488,11 @@ pub struct SignedOperation {
     pub prepared: PreparedOperation,
     pub transaction_xdr: String,
     pub transaction_hash: [u8; 32],
+    /// Classic custody only: one verified proof over `transaction_hash` per automated role key,
+    /// in role order (agent, then service). The envelope keeps only the signatures that current
+    /// chain thresholds select, so these proofs keep service approval checkable at submission.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub role_signatures: Vec<DetachedSignature>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1701,6 +1706,7 @@ pub fn authorize(
     }
     let mut seen = std::collections::BTreeSet::new();
     let mut verified = std::collections::BTreeMap::new();
+    let mut proofs = std::collections::BTreeMap::new();
     for s in signatures {
         if !required.contains(&s.signer.as_str())
             || (!seen.insert(s.signer.clone()) && !aliased_roles)
@@ -1717,6 +1723,7 @@ pub fn authorize(
             .map_err(err)?
             .verify_strict(&p.transaction_hash, &EdSignature::from_bytes(&sig))
             .map_err(err)?;
+        proofs.entry(s.signer.clone()).or_insert_with(|| s.clone());
         verified.insert(
             s.signer.clone(),
             DecoratedSignature {
@@ -1725,6 +1732,19 @@ pub fn authorize(
             },
         );
     }
+    let role_signatures = if p.config.route == WalletRoute::Native {
+        required
+            .iter()
+            .map(|role| {
+                proofs
+                    .get(*role)
+                    .cloned()
+                    .ok_or("Missing automated role signature".to_string())
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
     let candidates = required;
     let selected = transaction_signers(p, &candidates)?;
     let out: Vec<_> = selected
@@ -1744,7 +1764,41 @@ pub fn authorize(
         prepared: p.clone(),
         transaction_xdr: xdr(&TransactionEnvelope::Tx(env))?,
         transaction_hash: p.transaction_hash,
+        role_signatures,
     })
+}
+/// Check the classic automated role proofs. `required` demands one proof per role key; a
+/// retained record from before role proofs existed may carry none.
+fn validate_role_signatures(s: &SignedOperation, required: bool) -> Result<()> {
+    if s.prepared.config.route != WalletRoute::Native {
+        if !s.role_signatures.is_empty() {
+            return Err("Role proofs are only valid for classic custody".into());
+        }
+        return Ok(());
+    }
+    if s.role_signatures.is_empty() && !required {
+        return Ok(());
+    }
+    let roles = automated_roles(&s.prepared.config);
+    if s.role_signatures.len() != roles.len() {
+        return Err("Every automated role must approve the exact transaction".into());
+    }
+    for (role, proof) in roles.iter().zip(&s.role_signatures) {
+        if proof.signer != *role {
+            return Err("Automated role proof order or signer differs".into());
+        }
+        let key = account_key(&proof.signer)?;
+        let sig: [u8; 64] = proof
+            .signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| "Invalid role proof length")?;
+        VerifyingKey::from_bytes(&key)
+            .map_err(err)?
+            .verify_strict(&s.transaction_hash, &EdSignature::from_bytes(&sig))
+            .map_err(|_| "Invalid automated role proof")?;
+    }
+    Ok(())
 }
 pub fn validate_signed(s: &SignedOperation, now: u64) -> Result<()> {
     operation_from_request(&s.prepared.config, &s.prepared.request)?;
@@ -1754,11 +1808,12 @@ pub fn validate_signed(s: &SignedOperation, now: u64) -> Result<()> {
         if s.prepared.created_at > now || now >= s.prepared.expires_at {
             return Err("Signed operation is stale".into());
         }
-        validate_retained_signed(s)
     } else {
         validate_prepared(&s.prepared, now)?;
-        validate_retained_signed(s)
     }
+    validate_retained_signed(s)?;
+    // Broadcast needs both role approvals even when the agent alone meets the thresholds.
+    validate_role_signatures(s, true)
 }
 /// Verify an original signed packet without reauthorizing retired policy source.
 /// Callers must compare their durable original identity and use it only for status/recovery.
@@ -1770,6 +1825,7 @@ pub fn validate_retained_signed(s: &SignedOperation) -> Result<()> {
     if s.transaction_hash != s.prepared.transaction_hash {
         return Err("Signed transaction identity differs".into());
     }
+    validate_role_signatures(s, false)?;
     let TransactionEnvelope::Tx(env) = read(&s.transaction_xdr)? else {
         return Err("Unsupported signed envelope".into());
     };

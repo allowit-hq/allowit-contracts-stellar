@@ -961,10 +961,21 @@ fn retained_native_signed(prepared: PreparedOperation) -> SignedOperation {
         .collect::<Vec<_>>()
         .try_into()
         .unwrap();
+    let role_signatures = [2u8, 3]
+        .into_iter()
+        .map(|value| {
+            let key = SigningKey::from_bytes(&[value; 32]);
+            DetachedSignature {
+                signer: account_for_seed(&[value; 32]),
+                signature: key.sign(&prepared.transaction_hash).to_bytes().to_vec(),
+            }
+        })
+        .collect();
     SignedOperation {
         transaction_xdr: envelope_to_xdr(envelope),
         transaction_hash: prepared.transaction_hash,
         prepared,
+        role_signatures,
     }
 }
 #[test]
@@ -1117,6 +1128,88 @@ fn exact_chain_quorum_omits_unused_role_signatures_but_verifies_both_proofs() {
         changed.transaction_xdr = env.to_xdr_base64(Limits::none()).unwrap();
         assert!(validate_signed(&changed, 86401).is_err());
     }
+}
+#[test]
+fn native_submission_requires_service_approval_when_agent_alone_meets_thresholds() {
+    use ed25519_dalek::{Signer, SigningKey};
+    let (c, r, mut s) = fixture(WalletRoute::Native, false);
+    s.source.signers[0].weight = 3;
+    s.source.low_threshold = 1;
+    s.source.medium_threshold = 2;
+    let p = prepare(&c, &r, &s, 86401, 86700).unwrap();
+    let agent = sign(&p, &[2; 32], 86401).unwrap();
+    let service = sign(&p, &[3; 32], 86401).unwrap();
+    assert!(authorize(&p, std::slice::from_ref(&agent), 86401).is_err());
+    let out = authorize(&p, &[agent.clone(), service.clone()], 86401).unwrap();
+    assert_eq!(out.role_signatures, vec![agent.clone(), service]);
+    validate_signed(&out, 86401).unwrap();
+
+    // Build the agent-only packet that the chain thresholds alone would accept.
+    let key = SigningKey::from_bytes(&[2; 32]);
+    let TransactionEnvelope::Tx(mut envelope) =
+        TransactionEnvelope::from_xdr_base64(&p.transaction_xdr, Limits::none()).unwrap()
+    else {
+        panic!()
+    };
+    envelope.signatures = vec![stellar_xdr::DecoratedSignature {
+        hint: stellar_xdr::SignatureHint(key.verifying_key().to_bytes()[28..].try_into().unwrap()),
+        signature: stellar_xdr::Signature(
+            key.sign(&p.transaction_hash)
+                .to_bytes()
+                .to_vec()
+                .try_into()
+                .unwrap(),
+        ),
+    }]
+    .try_into()
+    .unwrap();
+    let mut bypass = out.clone();
+    bypass.transaction_xdr = envelope_to_xdr(envelope);
+    assert_eq!(bypass.transaction_xdr, out.transaction_xdr);
+    for role_signatures in [
+        vec![],
+        vec![agent.clone()],
+        vec![agent.clone(), agent.clone()],
+        {
+            let mut forged = out.role_signatures.clone();
+            forged[1].signature[0] ^= 1;
+            forged
+        },
+        out.role_signatures.iter().rev().cloned().collect(),
+    ] {
+        let mut changed = bypass.clone();
+        changed.role_signatures = role_signatures;
+        assert!(validate_signed(&changed, 86401).is_err());
+        let rpc = FakeRpc {
+            calls: Mutex::new(vec![]),
+            signed: changed.clone(),
+            fail_send: false,
+        };
+        let mut store = Store { value: None };
+        assert!(rpc::submit(&rpc, &mut store, &changed, 86401).is_err());
+        assert!(rpc.calls.lock().unwrap().is_empty());
+        assert!(store.value.is_none());
+    }
+    // A record from before role proofs stays readable for recovery but cannot be broadcast.
+    let mut legacy = out.clone();
+    legacy.role_signatures.clear();
+    validate_retained_signed(&legacy).unwrap();
+    let mut serialized: Value = serde_json::to_value(&legacy).unwrap();
+    assert!(serialized.get("roleSignatures").is_none());
+    serialized["roleSignatures"] = serde_json::to_value(&out.role_signatures).unwrap();
+    let restored: SignedOperation = serde_json::from_value(serialized).unwrap();
+    assert_eq!(restored, out);
+}
+#[test]
+fn role_proofs_are_rejected_outside_classic_custody() {
+    let (c, r, s) = fixture(WalletRoute::PolicyWallet, false);
+    let p = server_ready(&prepare(&c, &r, &s, 86401, 86700).unwrap());
+    let proof = sign(&p, &[2; 32], 86401).unwrap();
+    let signed = authorize(&p, std::slice::from_ref(&proof), 86401).unwrap();
+    assert!(signed.role_signatures.is_empty());
+    let mut changed = signed;
+    changed.role_signatures = vec![proof];
+    assert!(validate_retained_signed(&changed).is_err());
 }
 #[test]
 fn additional_hash_preauthorized_and_payload_keys_do_not_lock_the_wallet() {
