@@ -286,7 +286,7 @@ def deployment(value):
     if type(value["x402_enabled"]) is not bool:
         raise ValueError("x402_enabled must be boolean")
     if value["x402_enabled"] and any(not StrKey.is_valid_ed25519_public_key(value[role]) for role in ("agent", "server")):
-        raise ValueError("x402 requires native G-agent and G-server signers")
+        raise ValueError("x402_enabled (custom-account authorization) requires native G-agent and G-server signers")
     for name in ("wasm_hash",):
         if value[name] is not None:
             code_hash(value[name])

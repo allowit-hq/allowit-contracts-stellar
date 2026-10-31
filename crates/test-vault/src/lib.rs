@@ -76,8 +76,8 @@ impl AllowitSep56TestVault {
     /// Burn `shares` of `owner` and pay as many underlying units to `receiver`, as an
     /// OpenZeppelin SEP-56 vault does with `operator.require_auth()` only. Hostile behaviors: 20
     /// also authorizes the owner in the same frame, 21 pays one unit less than it returns, 22
-    /// returns one unit more than it pays, 23 burns one share more, 24 changes its asset, and 13
-    /// makes the configured callback.
+    /// returns one unit more than it pays, 23 burns one share more, 24 changes its asset, 25 keeps a
+    /// three-unit fee that `preview_redeem` does not show, and 13 makes the configured callback.
     pub fn redeem(
         env: Env,
         shares: i128,
@@ -94,7 +94,11 @@ impl AllowitSep56TestVault {
         let burned = if behavior == 23 { shares + 1 } else { shares };
         let before = Self::balance(env.clone(), owner.clone());
         env.storage().persistent().set(&owner, &(before - burned));
-        let paid = if behavior == 21 { shares - 1 } else { shares };
+        let paid = match behavior {
+            21 => shares - 1,
+            25 => shares - 3,
+            _ => shares,
+        };
         token::Client::new(&env, &asset).transfer(
             &env.current_contract_address(),
             &receiver,
@@ -109,7 +113,11 @@ impl AllowitSep56TestVault {
             let vault = env.current_contract_address();
             env.storage().instance().set(&0u32, &vault);
         }
-        if behavior == 22 { shares + 1 } else { shares }
+        match behavior {
+            22 => shares + 1,
+            25 => shares - 3,
+            _ => shares,
+        }
     }
     /// Pull `assets` and mint shares, with the configured hostile behavior.
     pub fn deposit(

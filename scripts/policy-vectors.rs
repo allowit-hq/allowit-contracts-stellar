@@ -193,7 +193,8 @@ fn edit(name: &'static str, change: fn(&mut Vector)) -> Vector {
 }
 
 /// The shared vector set. Some vectors are host-only because the wallet kernel cannot produce
-/// them, such as a deposit into the transfer-only custom contract.
+/// them, such as an expired request or a negative amount. The wallet portability test also
+/// realizes only transfers; deposit, swap and redeem vectors run on the host backend there.
 pub fn vectors() -> Vec<Vector> {
     vec![
         base(),

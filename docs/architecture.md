@@ -711,7 +711,9 @@ persistent `operation_id` marker, and `expires_at` with `deployment_version`.
 for a swap, its other endpoint. `transaction_cap` and `day_total_cap` read the gross amount, so
 their limits on reverse swaps and redeems are floors. Swaps and redeems follow the deposit expense
 model: `conversion_units` is the loss ceiling, and `spent_units` equals it plus `gas_units`. A
-forward swap's loss cannot exceed `amount_in`. Custom policy can add its own params, such as a
+forward swap's loss cannot exceed `amount_in`. An `execute` redeem checks its loss against the
+vault's `preview_redeem`. The wallet cannot price a swap's other token, so agent and server attest
+a swap's `conversion_units`, and on the intercepted door also a redeem's. Custom policy can add its own params, such as a
 `swap_cap`, in a `match` arm of `operations`.
 
 ### Observed effects in `execute`
@@ -724,7 +726,8 @@ untrusted code runs after the router returns.
 
 An `execute` redeem requires the vault to report the asset before and after the call, the share
 balance to fall by exactly `shares`, and the asset credit to equal the returned assets and be at
-least `min_assets`. The final read is the asset balance.
+least `min_assets`. With expense bounds it reads `preview_redeem(shares)` before the call and
+requires `preview - min(preview, assets) <= conversion_units`. The final read is the asset balance.
 
 ### Limits
 

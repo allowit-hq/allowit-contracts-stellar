@@ -934,18 +934,36 @@ fn swap_tokens(env: &Env, args: &AllowitSwapArgs) -> Result<i128, AllowitWalletE
     }
     Ok(out)
 }
-/// Redeem vault shares for the asset, then check the share debit and the asset credit. The vault
-/// authorizes against this invoking contract; the wallet delegates no token authorization.
+/// Redeem vault shares for the asset, then check the share debit, the asset credit and the
+/// conversion loss against the vault's own preview. The vault authorizes against this invoking
+/// contract; the wallet delegates no token authorization.
 fn redeem_shares(
     env: &Env,
     asset: &Address,
     args: &AllowitSep56RedeemArgs,
+    expense: Option<&AllowitExpenseBounds>,
 ) -> Result<i128, AllowitWalletError> {
     let underlying: Address =
         env.invoke_contract(&args.vault, &Symbol::new(env, "query_asset"), Vec::new(env));
     if underlying != *asset {
         return Err(AllowitWalletError::UnsupportedAsset);
     }
+    // The selected vault values the shares before it acts. As for a deposit, this bounds the loss
+    // against the vault's own valuation; it is not a proof of economic honesty.
+    let previewed = match expense {
+        Some(_) => {
+            let value: i128 = env.invoke_contract(
+                &args.vault,
+                &Symbol::new(env, "preview_redeem"),
+                (args.shares,).into_val(env),
+            );
+            if value < 0 {
+                return Err(AllowitWalletError::InvalidEffects);
+            }
+            Some(value)
+        }
+        None => None,
+    };
     let wallet = env.current_contract_address();
     let asset_client = token::Client::new(env, asset);
     let shares_client = token::Client::new(env, &args.vault);
@@ -976,8 +994,13 @@ fn redeem_shares(
     let after_shares = shares_client.balance(&wallet);
     // The immutable SAC read is last: no untrusted vault code runs after these final observations.
     let after_assets = asset_client.balance(&wallet);
+    let loss_exceeded = match (previewed, expense) {
+        (Some(value), Some(expense)) => value - value.min(assets) > expense.conversion_units,
+        _ => false,
+    };
     if assets < args.min_assets
         || assets <= 0
+        || loss_exceeded
         || after_shares != expected_shares
         || after_assets != expected_assets
     {
@@ -1215,7 +1238,7 @@ pub fn execute<P: AllowitPolicy>(
             .publish(env);
         }
         NativeOperation::Redeem(args) => {
-            let assets = redeem_shares(env, &asset, &args)?;
+            let assets = redeem_shares(env, &asset, &args, expense.as_ref())?;
             let redeemed = AllowitSep56RedeemReceipt {
                 operation_id: receipt.operation_id.clone(),
                 vault: args.vault,

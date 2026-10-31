@@ -946,6 +946,31 @@ fn execute_redeem_checks_observed_effects_and_keeps_a_receipt() {
         assert_eq!(f.client().redeem_receipt(&e.operation_id), None);
         assert!(!marked(&f, &e));
     }
+    // A vault fee that its own preview hides must stay within the attested conversion bound.
+    for (conversion, result) in [
+        (2, Err(Ok(AllowitWalletError::InvalidEffects))),
+        (3, Ok(())),
+    ] {
+        let f = Fixture::new(COMMON, false);
+        let v = vault(&f, 25);
+        allow(&f, &[&v], &[], &OPS);
+        let before = f.client().state();
+        let mut e = redeem_request(&f, &v, 40, 37);
+        e.expense = Some(bounds(&f, 0, conversion));
+        assert_eq!(execute(&f, &e), result, "{conversion}");
+        if result.is_ok() {
+            assert_eq!((f.balance(), shares(&f, &v)), (1037, 60));
+            assert_eq!(
+                f.client().redeem_receipt(&e.operation_id).unwrap().assets,
+                37
+            );
+            assert_eq!(f.history().spent, 3);
+        } else {
+            assert_eq!(f.client().state(), before);
+            assert_eq!((f.balance(), shares(&f, &v)), (1000, 100));
+            assert!(!marked(&f, &e));
+        }
+    }
     // Through `execute` the vault authorizes against the invoking wallet, also twice.
     let f = Fixture::new(COMMON, false);
     let v = vault(&f, 20);
