@@ -27,13 +27,20 @@ fn wf(value: &str) -> AccountId {
     }
 }
 fn fixture(route: WalletRoute, usdc: bool) -> (WalletConfig, ExecutionRequest, TrustedState) {
+    fixture_with_wallet(route, usdc, [4; 32])
+}
+fn fixture_with_wallet(
+    route: WalletRoute,
+    usdc: bool,
+    contract: [u8; 32],
+) -> (WalletConfig, ExecutionRequest, TrustedState) {
     let owner = account_for_seed(&[1; 32]);
     let agent = account_for_seed(&[2; 32]);
     let engine = account_for_seed(&[3; 32]);
     let wallet = if route == WalletRoute::Native {
         owner.clone()
     } else {
-        Contract([4; 32]).to_string()
+        Contract(contract).to_string()
     };
     let source =
         "use allowit::v1::prelude::*; async fn _execute(ctx: &Context) -> PolicyResult { Ok(()) }"
@@ -3179,4 +3186,30 @@ fn historical_signed_issuer_payment_remains_read_only() {
     );
     assert!(sign(&signed.prepared, &[2; 32], 86401).is_err());
     assert!(prepare(&c, &signed.prepared.request, &state, 86401, 86700).is_err());
+}
+
+#[test]
+fn service_auth_nonce_is_scoped_to_the_policy_wallet() {
+    use stellar_xdr::*;
+    let service_nonce = |contract: [u8; 32]| {
+        let (c, r, s) = fixture_with_wallet(WalletRoute::PolicyWallet, false, contract);
+        let p = prepare(&c, &r, &s, 86401, 86700).unwrap();
+        let TransactionEnvelope::Tx(envelope) =
+            TransactionEnvelope::from_xdr_base64(&p.transaction_xdr, Limits::none()).unwrap()
+        else {
+            panic!()
+        };
+        let OperationBody::InvokeHostFunction(op) = &envelope.tx.operations[0].body else {
+            panic!()
+        };
+        let SorobanCredentials::Address(credentials) = &op.auth[1].credentials else {
+            panic!()
+        };
+        assert_eq!(credentials.address, address(&c.server).unwrap());
+        credentials.nonce
+    };
+    // Same service signer, operation nonce and deployment version; only the wallet differs.
+    // Soroban tracks nonces per signer address, so equal nonces would block the second wallet.
+    assert_ne!(service_nonce([4; 32]), service_nonce([14; 32]));
+    assert_eq!(service_nonce([4; 32]), service_nonce([4; 32]));
 }

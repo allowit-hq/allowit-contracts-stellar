@@ -7,8 +7,11 @@ pub(crate) fn server_entry(
     state: &TrustedState,
     root: SorobanAuthorizedInvocation,
 ) -> Result<SorobanAuthorizationEntry> {
-    let mut identity = b"allowit-server-auth-v1".to_vec();
+    // Soroban tracks authorization nonces per signer address. One service signer can serve
+    // several policy wallets, so the wallet address scopes the nonce.
+    let mut identity = b"allowit-server-auth-v2".to_vec();
     identity.extend(network_id(&c.network)?);
+    identity.extend(address(&c.wallet)?.to_xdr(limits()).map_err(err)?);
     identity.extend(r.operation.nonce);
     identity.extend(state.deployment_version.to_be_bytes());
     identity.extend(account_key(&c.server)?);
