@@ -279,7 +279,7 @@ fn no_operation_leaves_the_wallet_a_token_allowance() {
         assert_no_allowance(&f, &vaults, "before");
         f.transfer(10);
         assert_no_allowance(&f, &vaults, "transfer");
-        // Custom admits transfers only.
+        // Custom admits no deposit.
         if wasm != CUSTOM {
             allow_recipients(&f, &[&honest, &approving, &f.recipient]);
             assert!(execute(&f, &request(&f, &honest, 50, 50)).is_ok());
@@ -298,7 +298,7 @@ fn no_operation_leaves_the_wallet_a_token_allowance() {
 }
 
 #[test]
-fn deposit_cannot_inherit_transfer_only_custom_source_schema() {
+fn custom_policy_admits_no_deposit_schema() {
     let f = Fixture::new(CUSTOM, false);
     let vault = vault(&f, 0, None);
     allow_recipient(&f, &vault);
@@ -595,8 +595,8 @@ fn standard_prefix_digest_matches_independent_xdr_vector_and_binds_context() {
     let expected = BytesN::from_array(
         &env,
         &[
-            66, 101, 232, 202, 129, 105, 213, 21, 159, 38, 227, 129, 92, 65, 30, 68, 142, 108, 9,
-            16, 21, 190, 226, 11, 50, 204, 7, 142, 89, 244, 155, 255,
+            189, 68, 199, 46, 9, 31, 98, 232, 188, 107, 50, 209, 161, 33, 85, 130, 99, 159, 235,
+            54, 236, 14, 58, 68, 204, 139, 83, 138, 197, 114, 143, 196,
         ],
     );
     assert_eq!(

@@ -8,8 +8,15 @@ pub use allowit::AllowitValue;
 pub const ARGUMENT_SCHEMA_DESCRIPTOR: &[u8] = b"allowit.stellar.sep41_transfer.v1:ScValMap(amount:i128,from:Address,to:Address,token:Address)";
 /// Exact SEP-56 deposit encoding. The vault is also its SEP-41 share-token contract.
 pub const SEP56_DEPOSIT_SCHEMA_DESCRIPTOR: &[u8] = b"allowit.stellar.sep56_deposit.v1:ScValMap(assets:i128,from:Address,min_shares:i128,operator:Address,receiver:Address,vault:Address)";
+/// Exact exact-input router swap encoding: the arguments of a Soroswap-style
+/// `swap_exact_tokens_for_tokens(amount_in, amount_out_min, path, to, deadline)` and its router.
+pub const ROUTER_SWAP_SCHEMA_DESCRIPTOR: &[u8] = b"allowit.stellar.router_swap_exact_in.v1:ScValMap(amount_in:i128,amount_out_min:i128,deadline:u64,path:Vec<Address>,router:Address,to:Address)";
+/// Exact SEP-56 redeem encoding, with the wallet's minimum underlying output.
+pub const SEP56_REDEEM_SCHEMA_DESCRIPTOR: &[u8] = b"allowit.stellar.sep56_redeem.v1:ScValMap(min_assets:i128,operator:Address,owner:Address,receiver:Address,shares:i128,vault:Address)";
 pub const MAX_ARGUMENT_BYTES: u32 = 1024;
 pub const MAX_EXPENSE_BYTES: u32 = 1024;
+/// Most tokens in one swap path: the paid token, up to two intermediate tokens and the received token.
+pub const MAX_SWAP_PATH: u32 = 4;
 
 /// Exact arguments of the admitted stellar::sep41_transfer operation.
 #[contracttype]
@@ -81,6 +88,118 @@ pub struct AllowitSep56DepositEvent {
     pub shares: i128,
 }
 
+/// Exact arguments of the admitted stellar::router_swap_exact_in operation. The router pays
+/// `amount_in` of `path[0]` from the wallet to its first pair and returns at least
+/// `amount_out_min` of the last path token to `to`. One path endpoint is the wallet asset.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AllowitSwapArgs {
+    /// Router contract selected by the request and constrained by authored policy as the recipient.
+    pub router: Address,
+    /// Positive exact units of `path[0]` that leave the wallet.
+    pub amount_in: i128,
+    /// Positive minimum units of the last path token that the router must return.
+    pub amount_out_min: i128,
+    /// Two to `MAX_SWAP_PATH` token contracts. Exactly one endpoint is the wallet asset, and both
+    /// endpoints are Stellar Asset Contracts.
+    pub path: soroban_sdk::Vec<Address>,
+    /// Output receiver and debit source. Delegated swaps require the current wallet address.
+    pub to: Address,
+    /// Router deadline in Unix seconds, no later than the request expiry.
+    pub deadline: u64,
+}
+
+/// Exact arguments of the admitted stellar::sep56_redeem operation.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AllowitSep56RedeemArgs {
+    /// Vault and share-token contract selected by the request and constrained by authored policy.
+    pub vault: Address,
+    /// Positive share units burned, in the vault share token's native scale.
+    pub shares: i128,
+    /// Underlying receiver. Delegated redeems require the current wallet address.
+    pub receiver: Address,
+    /// Share owner. Delegated redeems require the current wallet address.
+    pub owner: Address,
+    /// Redeem operator. Delegated redeems require the current wallet address.
+    pub operator: Address,
+    /// Positive minimum underlying units. `execute` checks the observed credit against it.
+    pub min_assets: i128,
+}
+
+/// Settled swap effects of an `execute` swap, stored atomically with the custody nonce.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AllowitSwapReceipt {
+    /// Single-use logical operation identifier retained across re-preparation.
+    pub operation_id: BytesN<32>,
+    /// Admitted router.
+    pub router: Address,
+    /// Paid token, `path[0]`.
+    pub token_in: Address,
+    /// Received token, the last path token.
+    pub token_out: Address,
+    /// Exact observed debit of `token_in`.
+    pub amount_in: i128,
+    /// Observed credit of `token_out`, equal to the router's last returned amount.
+    pub amount_out: i128,
+    /// Consumed execution sequence, distinct from native authorization nonces.
+    pub nonce: u64,
+    /// Owner configuration sequence used for this swap.
+    pub deployment_version: u64,
+}
+
+/// Settled redeem effects of an `execute` redeem, stored atomically with the custody nonce.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AllowitSep56RedeemReceipt {
+    /// Single-use logical operation identifier retained across re-preparation.
+    pub operation_id: BytesN<32>,
+    /// Admitted vault, also the share-token contract.
+    pub vault: Address,
+    /// Immutable underlying SAC address.
+    pub asset: Address,
+    /// Share owner, equal to this wallet.
+    pub owner: Address,
+    /// Underlying receiver, equal to this wallet.
+    pub receiver: Address,
+    /// Authorized operator, equal to this wallet.
+    pub operator: Address,
+    /// Exact observed share debit.
+    pub shares: i128,
+    /// Observed underlying credit, equal to the returned assets.
+    pub assets: i128,
+    /// Consumed execution sequence, distinct from native authorization nonces.
+    pub nonce: u64,
+    /// Owner configuration sequence used for this redeem.
+    pub deployment_version: u64,
+}
+
+/// Confirmed `execute` swap. The complete receipt remains available by operation identity.
+#[contractevent(topics = ["swap"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AllowitSwapEvent {
+    #[topic]
+    pub operation_id: BytesN<32>,
+    #[topic]
+    pub router: Address,
+    pub amount_in: i128,
+    pub amount_out: i128,
+}
+
+/// Confirmed `execute` share-to-underlying exchange. The complete receipt remains available by
+/// operation identity.
+#[contractevent(topics = ["sep56_redeem"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AllowitSep56RedeemEvent {
+    #[topic]
+    pub operation_id: BytesN<32>,
+    #[topic]
+    pub vault: Address,
+    pub shares: i128,
+    pub assets: i128,
+}
+
 /// The native profile of the canonical signed module-selection record.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -106,9 +225,9 @@ pub struct AllowitExpenseBounds {
     pub decimals: u32,
     /// Conservative attributable gas ceiling in underlying units. Native XLM identity conversion is supported.
     pub gas_units: i128,
-    /// Deposit fee/slippage ceiling in underlying units. Transfers require zero.
+    /// Deposit, swap or redeem fee/slippage ceiling in underlying units. Transfers require zero.
     pub conversion_units: i128,
-    /// Full payment principal plus gas, or deposit conversion loss plus gas. The kernel checks the operation class.
+    /// Full payment principal plus gas, or conversion loss plus gas. The kernel checks the operation class.
     pub spent_units: i128,
     /// Signed outer transaction fee bound in stroops, checked by the SDK/server; the contract cannot observe final fees.
     pub max_fee_stroops: u32,

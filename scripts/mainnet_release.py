@@ -26,6 +26,8 @@ DEFAULT_REVISION = None
 DEFAULT_HASHES = {}
 SCHEMA = b"allowit.stellar.sep41_transfer.v1:ScValMap(amount:i128,from:Address,to:Address,token:Address)"
 DEPOSIT_SCHEMA = b"allowit.stellar.sep56_deposit.v1:ScValMap(assets:i128,from:Address,min_shares:i128,operator:Address,receiver:Address,vault:Address)"
+SWAP_SCHEMA = b"allowit.stellar.router_swap_exact_in.v1:ScValMap(amount_in:i128,amount_out_min:i128,deadline:u64,path:Vec<Address>,router:Address,to:Address)"
+REDEEM_SCHEMA = b"allowit.stellar.sep56_redeem.v1:ScValMap(min_assets:i128,operator:Address,owner:Address,receiver:Address,shares:i128,vault:Address)"
 WALLET_KIND = "common_policy_engine"
 POLICY_DENIED = 18
 BUILD_SCRIPTS = ("build-contracts.sh", "check-policy-bindings.py", "policy_source.py")
@@ -140,8 +142,9 @@ def prefix_digest(kind, module, asset, rules):
 
     The ordered rules are a Vec<AllowitRule>; each unit enum variant encodes as a one-symbol vector."""
     checks = scval.to_vec([scval.to_vec([scval.to_symbol(rule)]) for rule in rules])
+    schemas = [scval.to_bytes(hashlib.sha256(schema).digest()) for schema in (SCHEMA, DEPOSIT_SCHEMA, SWAP_SCHEMA, REDEEM_SCHEMA)]
     value = scval.to_vec([scval.to_symbol("allowit_std_prefix"), scval.to_symbol(kind), scval.to_bytes(bytes.fromhex(module)), scval.to_address(asset),
-                          scval.to_bytes(hashlib.sha256(SCHEMA).digest()), scval.to_bytes(hashlib.sha256(DEPOSIT_SCHEMA).digest()), checks])
+                          *schemas, checks])
     return digest(value.to_xdr_bytes())
 
 

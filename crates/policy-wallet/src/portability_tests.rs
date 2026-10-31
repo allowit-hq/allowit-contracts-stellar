@@ -47,7 +47,7 @@ mod vectors {
     use super::std::{self, format, string::String, vec, vec::Vec};
     include!("../../../scripts/policy-vectors.rs");
 }
-use vectors::{Ops, Outcome, Vector};
+use vectors::{Op, Ops, Outcome, Vector};
 
 /// Every rule error, indexed by its code minus one.
 const ERRORS: [AllowitError; 16] = [
@@ -254,14 +254,19 @@ fn context(env: &Env, universe: &[Address], v: &Vector) -> AllowitContext {
         params: AllowitParams(params(env, universe, v)),
         state: state_map(env, v),
         request: AllowitRequest {
-            operation: if v.deposit {
-                AllowitOperation::sep56_deposit
-            } else {
-                AllowitOperation::sep41_transfer
+            operation: match v.op {
+                Op::Transfer => AllowitOperation::sep41_transfer,
+                Op::Deposit => AllowitOperation::sep56_deposit,
+                Op::Swap => AllowitOperation::router_swap_exact_in,
+                Op::Redeem => AllowitOperation::sep56_redeem,
             },
             asset: universe[v.asset].clone(),
             recipient: universe[v.recipient].clone(),
             amount: v.amount,
+            token_in: universe[v.token_in].clone(),
+            amount_in: v.amount_in,
+            token_out: v.token_out.map(|i| universe[i].clone()),
+            min_out: v.min_out,
             now: v.now,
             expires_at: v.expires_at,
             spent_units: v.spent_units,
@@ -363,8 +368,8 @@ fn operations_valid(ops: &Ops) -> bool {
     }
 }
 
-/// Whether the kernel and owner configuration can produce the vector: a transfer of the installed
-/// asset whose expense bounds, when priced, attest principal plus gas, with args that the kernel
+/// Whether the kernel and owner configuration can produce the vector through `execute` of a
+/// transfer: a transfer of the installed asset whose expense bounds, when priced, attest principal plus gas, with args that the kernel
 /// admits and params that every tier admits. The kernel rejects more args with
 /// `InvalidInvocation` before any policy runs.
 fn realizable(v: &Vector) -> bool {
@@ -373,7 +378,7 @@ fn realizable(v: &Vector) -> bool {
     } else {
         v.spent_units == 0 && v.gas_units == 0
     };
-    !v.deposit
+    v.op == Op::Transfer
         && v.extra_args + usize::from(v.invoice) <= vectors::MAX_ARGS
         && v.asset == vectors::ASSET
         && v.amount > 0
@@ -622,7 +627,7 @@ fn one_vector_set_has_matching_outcomes_on_host_custom_standard_and_simple() {
             }
         }
     }
-    assert_eq!(realized, 48);
+    assert_eq!(realized, 49);
     // The deployed catching Wasm let these continue after a caught rule error and wrote its key.
     for name in ["over_day_spent_cap", "over_day_spent_cap_counted_once"] {
         assert!(caught.contains(&name), "{name} {caught:?}");

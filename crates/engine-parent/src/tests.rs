@@ -55,6 +55,7 @@ impl Fixture {
     }
 }
 fn context(env: &Env) -> AllowitContext {
+    let asset = Address::generate(env);
     AllowitContext {
         env: env.clone(),
         params: AllowitParams(soroban_sdk::Map::from_array(
@@ -67,9 +68,13 @@ fn context(env: &Env) -> AllowitContext {
         state: soroban_sdk::Map::new(env),
         request: AllowitRequest {
             operation: AllowitOperation::sep41_transfer,
-            asset: Address::generate(env),
+            asset: asset.clone(),
             recipient: Address::generate(env),
             amount: 1,
+            token_in: asset,
+            amount_in: 1,
+            token_out: None,
+            min_out: 0,
             now: 100,
             expires_at: 200,
             spent_units: 1,

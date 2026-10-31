@@ -41,6 +41,10 @@ fn custom_runner_maps_the_policy_result() {
             asset: asset.clone(),
             recipient: recipient.clone(),
             amount: 10,
+            token_in: asset.clone(),
+            amount_in: 10,
+            token_out: None,
+            min_out: 0,
             now: 10,
             expires_at: 20,
             spent_units: 10,
@@ -101,12 +105,35 @@ fn source_and_schema_bindings_match_their_exact_inputs() {
     let env = Env::default();
     let source = Bytes::from_slice(&env, include_bytes!("../policy/policy.rs"));
     assert_eq!(env.crypto().sha256(&source).to_array(), SOURCE_HASH);
-    let schema = Bytes::from_slice(&env, allowit_wallet_protocol::ARGUMENT_SCHEMA_DESCRIPTOR);
-    assert_eq!(
-        env.crypto().sha256(&schema).to_array(),
-        ARGUMENT_SCHEMA_HASH
+    let schemas = [
+        (
+            allowit_wallet_protocol::ARGUMENT_SCHEMA_DESCRIPTOR,
+            ARGUMENT_SCHEMA_HASH,
+        ),
+        (
+            allowit_wallet_protocol::ROUTER_SWAP_SCHEMA_DESCRIPTOR,
+            SWAP_SCHEMA_HASH,
+        ),
+        (
+            allowit_wallet_protocol::SEP56_REDEEM_SCHEMA_DESCRIPTOR,
+            REDEEM_SCHEMA_HASH,
+        ),
+    ];
+    for ((descriptor, hash), operation) in schemas.into_iter().zip(ADMITTED_OPERATIONS) {
+        let schema = Bytes::from_slice(&env, descriptor);
+        assert_eq!(env.crypto().sha256(&schema).to_array(), hash);
+        let descriptor = core::str::from_utf8(descriptor).unwrap();
+        assert!(descriptor.contains(&operation.replace("::", ".")));
+        assert!(AllowitCustom::admits_schema(
+            &env,
+            &BytesN::from_array(&env, &hash)
+        ));
+    }
+    // Custom admits no deposit.
+    let deposit = Bytes::from_slice(
+        &env,
+        allowit_wallet_protocol::SEP56_DEPOSIT_SCHEMA_DESCRIPTOR,
     );
-    let descriptor = core::str::from_utf8(allowit_wallet_protocol::ARGUMENT_SCHEMA_DESCRIPTOR);
-    let operation = ADMITTED_OPERATION.replace("::", ".");
-    assert!(descriptor.unwrap().contains(&operation));
+    let deposit = env.crypto().sha256(&deposit).to_bytes();
+    assert!(!AllowitCustom::admits_schema(&env, &deposit));
 }

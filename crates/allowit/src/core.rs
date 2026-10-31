@@ -49,6 +49,11 @@ mod types {
             sep41_transfer,
             /// SEP-56 deposit into a vault, which is the recipient.
             sep56_deposit,
+            /// Exact-input swap through a router, which is the recipient. One path endpoint is the
+            /// asset: a forward swap pays it, a reverse swap receives it.
+            router_swap_exact_in,
+            /// SEP-56 redeem of vault shares for the asset. The vault is the recipient.
+            sep56_redeem,
         }
     }
 
@@ -60,10 +65,22 @@ mod types {
             pub operation: AllowitOperation,
             /// Immutable underlying asset contract.
             pub asset: Address,
-            /// Exact destination: the payment recipient or the deposit vault.
+            /// Exact destination: the payment recipient, the deposit or redeem vault, or the swap
+            /// router.
             pub recipient: Address,
-            /// Positive gross underlying debit.
+            /// Positive gross amount in asset units: the transfer or deposit debit, the forward
+            /// swap input, or the minimum asset output of a reverse swap or redeem.
             pub amount: i128,
+            /// Token that leaves the wallet: the asset, the reverse swap's first path token or the
+            /// redeemed vault shares.
+            pub token_in: Address,
+            /// Exact units of `token_in` that leave the wallet.
+            pub amount_in: i128,
+            /// Token that the wallet receives back: the deposit vault's shares, the swap's last
+            /// path token or, for a redeem, the asset. `None` for a transfer.
+            pub token_out: Option<Address>,
+            /// Minimum units of `token_out` that the operation signs for; zero for a transfer.
+            pub min_out: i128,
             /// Authenticated ledger close time in Unix seconds.
             pub now: u64,
             /// Exclusive request expiry in Unix seconds.
@@ -538,6 +555,8 @@ fn operation_name(request: &AllowitRequest) -> &'static str {
     match request.operation {
         AllowitOperation::sep41_transfer => "transfer",
         AllowitOperation::sep56_deposit => "deposit",
+        AllowitOperation::router_swap_exact_in => "swap",
+        AllowitOperation::sep56_redeem => "redeem",
     }
 }
 
@@ -725,7 +744,8 @@ pub fn call_cap(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<u64
     Ok(cap - next)
 }
 
-/// Require an exact permitted destination. Deposits name their vault as the recipient.
+/// Require an exact permitted destination. Deposits and redeems name their vault, and swaps their
+/// router, as the recipient.
 ///
 /// Returns the matched `request.recipient`. An empty list denies.
 pub fn recipients(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<Address> {
@@ -733,11 +753,21 @@ pub fn recipients(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<A
     allowed(value, &ctx.request.recipient, e)
 }
 
-/// Require an exact permitted underlying asset contract.
+/// Require an exact permitted underlying asset contract and, for a swap, its other path endpoint:
+/// the token that a forward swap buys or a reverse swap sells.
 ///
 /// Returns the matched `request.asset`. An empty list denies.
 pub fn tokens(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<Address> {
-    allowed(value, &ctx.request.asset, AllowitError::TokenNotAllowed)
+    let r = &ctx.request;
+    let e = AllowitError::TokenNotAllowed;
+    if r.operation == AllowitOperation::router_swap_exact_in {
+        let other = match &r.token_out {
+            Some(out) if r.token_in == r.asset => out.clone(),
+            _ => r.token_in.clone(),
+        };
+        allowed(value.clone(), &other, e)?;
+    }
+    allowed(value, &r.asset, e)
 }
 
 /// Require unexpired params and request, with the request expiring no later than the params.
@@ -758,8 +788,8 @@ pub fn expiry(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<u64> 
 /// `custom` any custom call, `custom.<function>` that function on any contract and
 /// `custom:<contract>.<function>` that function on that contract. An empty list denies.
 ///
-/// Returns the request's op name for a `match`: `"transfer"` for a SEP-41 transfer and
-/// `"deposit"` for a SEP-56 deposit.
+/// Returns the request's op name for a `match`: `"transfer"` for a SEP-41 transfer, `"deposit"`
+/// for a SEP-56 deposit, `"swap"` for a router swap and `"redeem"` for a SEP-56 redeem.
 pub fn operations(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<&str> {
     let op = operation_name(&ctx.request);
     let mut found = false;

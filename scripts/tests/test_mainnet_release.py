@@ -326,7 +326,7 @@ class ReleaseTests(unittest.TestCase):
     def test_prefix_digest_matches_the_contract_vector(self):
         # crates/policy-wallet/src/sep56_tests.rs standard_prefix_digest_matches_independent_xdr_vector_and_binds_context
         asset='CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ'
-        expected=bytes([66,101,232,202,129,105,213,21,159,38,227,129,92,65,30,68,142,108,9,16,21,190,226,11,50,204,7,142,89,244,155,255]).hex()
+        expected=bytes([189,68,199,46,9,31,98,232,188,107,50,209,161,33,85,130,99,159,235,54,236,14,58,68,204,139,83,138,197,114,143,196]).hex()
         self.assertEqual(release.prefix_digest('common_policy_engine','01'*32,asset,['spent_cap','recipients']),expected)
         self.assertNotEqual(release.prefix_digest('common_policy_engine','01'*32,asset,['recipients','spent_cap']),expected)
 

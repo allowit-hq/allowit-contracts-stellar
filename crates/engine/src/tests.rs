@@ -33,6 +33,10 @@ fn fixture(env: &Env) -> AllowitContext {
             asset: asset.clone(),
             recipient: recipient.clone(),
             amount: 40,
+            token_in: asset.clone(),
+            amount_in: 40,
+            token_out: None,
+            min_out: 0,
             now: 100,
             expires_at: 500,
             spent_units: 40,
@@ -83,7 +87,7 @@ fn native_contract_wrapper_matches_the_bundled_rule() {
 #[test]
 fn engine_metadata_is_pure_release_data() {
     let env = Env::default();
-    assert_eq!(AllowitEngine::engine_version(env.clone()), 3);
+    assert_eq!(AllowitEngine::engine_version(env.clone()), 4);
     assert!(env.auths().is_empty());
 }
 

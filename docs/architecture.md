@@ -222,8 +222,9 @@ custom param with `InvalidParam`.
 Separate tests check that every tier stores exactly the state that the server's `evaluate`
 returned, and that execution params reach the Custom policy, fail authorization when changed after
 signing, reject beyond their bounds and leave the standard tiers unaffected. Vectors that the
-kernel cannot produce, such as a deposit into the transfer-only custom contract, a negative cap, an
-invalid `operations` value or more than 16 args, run only on the two backends. Kernel violations
+kernel cannot produce through a transfer `execute`, such as a deposit, swap or redeem, a negative
+cap, an invalid `operations` value or more than 16 args, run only on the two backends. The swap and
+redeem tests in `src/swap_redeem_tests.rs` run those operations through every contract. Kernel violations
 (another asset, payment to the wallet, request expiry, stale nonce, replay and pause) reject with the
 same kernel error in every contract.
 
@@ -248,7 +249,7 @@ computes it:
 | `env` | Backend environment: the contract's Soroban `Env` onchain, an `AllowitEnv` on the host |
 | `params` | The owner's constructor params, key => `AllowitValue`. An absent key is unset |
 | `state` | Current policy state before this operation: one free-form map of standard and policy-defined keys |
-| `request` | Typed `AllowitOperation`, immutable asset, recipient (deposit vault), amount, `now`, `expires_at`, `spent_units` and `gas_units` from the validated expense bounds, or `unpriced`, and the agent's `args` |
+| `request` | Typed `AllowitOperation`, immutable asset, recipient (payee, vault or router), amount, `token_in` and `amount_in` that leave the wallet, `token_out` and `min_out` that it receives back, `now`, `expires_at`, `spent_units` and `gas_units` from the validated expense bounds, or `unpriced`, and the agent's `args` |
 
 Params, state and args share one value type, `AllowitValue`: `Int(i128)`, `Bool(bool)`,
 `Str(String)`, `Addr(Address)` and `List(Vec<AllowitValue>)`. Onchain a map is
@@ -363,8 +364,8 @@ compile, because the Soroban backend has none of them.
 | `day_spent_cap` | Nonnegative `Int` UTC-day irreversible-expense ceiling | `cap - (today_spent + spent_units)` |
 | `day_total_cap` | Nonnegative `Int` UTC-day gross amount plus separate gas | `cap - (today_total + amount + gas_units)` |
 | `call_cap` | `Int` in the `u64` range: successful operation count ceiling; zero denies | `cap - (calls + 1)` |
-| `recipients` | `List` of `Addr`: permitted destinations, including vaults; empty denies | Matched recipient |
-| `tokens` | `List` of `Addr`: exact permitted SAC identities; empty denies | Matched asset |
+| `recipients` | `List` of `Addr`: permitted destinations, including vaults and swap routers; empty denies | Matched recipient |
+| `tokens` | `List` of `Addr`: exact permitted token identities, the asset and any token a swap trades against it; empty denies | Matched asset |
 | `expiry` | `Int` in the `u64` range: exclusive Unix timestamp; request expiry cannot exceed it | `expiry - now` |
 | `operations` | `Str` `*` for every op, or `List` of `Str` op names; empty denies | The request's op name |
 
@@ -379,7 +380,8 @@ The op names are `transfer`, `swap`, `deposit` and `redeem`, plus three custom-c
 `custom` admits any custom call, `custom.<function>` that function on any contract, and
 `custom:<contract>.<function>` that function on that contract instance. A function is 1 to 32
 ASCII letters, digits or underscores, and a contract a `C` StrKey. The native operations map to
-`transfer` (SEP-41 transfer) and `deposit` (SEP-56 deposit). `operations` returns the request's op
+`transfer` (SEP-41 transfer), `deposit` (SEP-56 deposit), `swap` (router swap) and `redeem`
+(SEP-56 redeem). `operations` returns the request's op
 name, so a policy can `match` it; an op outside the list is `OperationNotAllowed`. Any other value,
 such as `Str` `transfer` or an unknown name, is `InvalidParam`. Even transfers need the param: a
 policy that should only swap or run custom code leaves `transfer` out.
@@ -418,32 +420,47 @@ and expense day checks reject replays and changed facts before rules run; a back
 fails the daily rules and `post_flight` with `InvalidState`.
 
 After the policy approves, the wallet writes the post-flight state, the next nonce and the replay
-marker before it calls the token or the vault. Soroban transactions are atomic, so a later failed
-effect check rolls all of it back. Soroban also refuses a call into a contract that is already on
-the call stack, so a hostile vault cannot call `execute` or reach the x402 hook while the wallet's
-operation runs; the transaction fails and no state changes.
+marker before it calls the token, the router or the vault. Soroban transactions are atomic, so a
+later failed effect check rolls all of it back. Soroban also refuses a call into a contract that is
+already on the call stack, so a hostile vault or router cannot call `execute` or reach the wallet's
+`__check_auth` while the wallet's operation runs; the transaction fails and no state changes.
+
+In an intercepted operation, `__check_auth` writes the post-flight state, nonce and replay marker
+when the host verifies the whole signed tree at the wallet's first `require_auth`. For the
+Soroswap router and SEP-56 reference vaults, that is before any debit. Atomicity rolls them back on
+any later failure, such as a router's minimum-output check.
 
 ## Custom calls, re-entry and panics
 
 Two rules hold on every rail:
 
-- A custom call never moves wallet funds. Only native operations debit the wallet, and the transfer
-  rules check each debit.
+- A custom call never moves wallet funds. Only the native operations transfer, deposit, swap and
+  redeem debit the wallet. Each authorizes exactly one debit, and the canonical rules check it:
+  transfer and deposit one `transfer` of the asset; swap one `transfer` of the first path token from
+  the wallet to the first pair for exactly `amount_in`; redeem one burn of exactly `shares` through
+  the vault's `redeem`, with the wallet as owner, operator and receiver.
 - A policy never re-enters the wallet, also on a rail that does not block re-entry natively.
 
 On Stellar both rules follow from the wallet's authorization:
 
 - An agent custom call gets no nested authorization from the wallet, so a contract that it reaches
   cannot spend for the wallet. An agent deposit grants exactly one: the asset `transfer` of the
-  checked amount from the wallet to the vault.
+  checked amount from the wallet to the vault. An agent swap grants exactly the signed `transfer`
+  sub-invocation. An agent redeem grants only the `redeem` call, and the burn needs no token
+  authorization.
+- An intercepted transfer, swap or redeem runs the policy in the wallet's `__check_auth`, which the
+  host calls while the token, router or vault, not the wallet, is on the call stack. This is not
+  re-entry. That `__check_auth` makes no contract call into the router or vault (the host refuses
+  re-entry into a contract on the stack); it reads only signed arguments, host functions and its own
+  storage. A `__check_auth` that a callee triggers during the wallet's own `execute` is refused.
 - A nested `__check_auth` of the wallet during its own operation calls a contract that is already
   on the call stack. The Soroban host refuses that re-entry from a callee, and the transaction
   fails. The host does allow an immediate re-entry: the wallet's own frame calls `require_auth` on
   the wallet's address, and the host runs its `__check_auth`. The rule holds because the wallet
   never does that; it calls `require_auth` only on the owner, agent and server.
 - No agent operation approves a spender, so the policy leaves no standing allowance. Each debit is
-  one exact `transfer` authorization. A test checks that no transfer, x402 transfer or deposit
-  leaves an allowance, also for a vault that tries to approve itself.
+  one exact `transfer` authorization. Tests check that no transfer, x402 transfer, deposit, swap or
+  redeem leaves an allowance, also for a vault that tries to approve itself.
 - The owner-signed `invoke(contract, function, args, auth)` passthrough is outside the policy. It
   authorizes the scopes that the owner signs and can call any contract, `token.approve` included.
   An allowance that it leaves is the owner's choice.
@@ -495,15 +512,17 @@ process keeps running.
 ## Source and configuration binding
 
 Fixed standard `source_digest` is SHA-256 of canonical XDR containing the domain
-`allowit_std_prefix`, implementation kind, actual module hash, immutable SAC, transfer/deposit schema
-hashes and the ordered `Vec<AllowitRule>`. Each unit variant encodes as a one-symbol vector of its rule
+`allowit_std_prefix`, implementation kind, actual module hash, immutable SAC, the transfer, deposit,
+router swap and redeem schema hashes and the ordered `Vec<AllowitRule>`. Each unit variant encodes as a one-symbol vector of its rule
 name; the param it reads is always its canonical key. It excludes param values and full source.
 The constructor and binding getter check it against the actual runtime module.
 
 Custom `source_digest` is the plain SHA-256 of the exact bytes of `crates/custom-policy/policy/policy.rs`.
 `build.rs` computes `SOURCE_HASH` from the file that the contract compiles verbatim, so they
-cannot drift. `ARGUMENT_SCHEMA_HASH` admits only `stellar::sep41_transfer`. The contract does not
-depend on SDK-generated code. `scripts/check-policy-bindings.py` checks the schema binding.
+cannot drift. `ARGUMENT_SCHEMA_HASH`, `SWAP_SCHEMA_HASH` and `REDEEM_SCHEMA_HASH` admit
+`stellar::sep41_transfer`, `stellar::router_swap_exact_in` and `stellar::sep56_redeem`; Custom admits
+no deposit. The compiled policy's `operations` rule selects among them. The contract does not depend
+on SDK-generated code. `scripts/check-policy-bindings.py` checks the schema bindings.
 
 The complete source has separate offline owner authorization, scoped to wallet, network, policy,
 prefix and monotonic source revision. Changing only that offchain suffix needs no chain call.
@@ -553,10 +572,11 @@ It holds no custody, params or policy state. No policy wallet, release tool or s
 calls it; offchain evaluation uses `allowit` directly. It remains the engine parent's administered
 checker for onchain callers that cannot bundle `allowit`. Its tests match `AllowitRule` exhaustively, so a
 new rule fails to compile until the engine exposes it. The `test-deny` fixture aborts every rule
-with contract error `TEST_DENY` (1000), outside `allowit::AllowitError`. `engine_version` 3 marks this ABI.
-It replaces the shipped release 1 ABI, whose methods take `(request: EngineRequest, state:
-EngineState)`. Release 2 was never released. An `upgrade_engine` from a deployed release 1 engine
-to release 3 breaks every onchain caller of the release 1 methods, so migrate or retire those
+with contract error `TEST_DENY` (1000), outside `allowit::AllowitError`. `engine_version` 4 marks this ABI:
+its `AllowitRequest` carries `token_in`, `amount_in`, `token_out` and `min_out`, which release 3
+lacked. It replaces the shipped release 1 ABI, whose methods take `(request: EngineRequest, state:
+EngineState)`. Release 2 was never released. An `upgrade_engine` from a deployed release 1 or 3
+engine to release 4 breaks every onchain caller of the earlier methods, so migrate or retire those
 callers first.
 
 ## Expenses and native effects
@@ -575,11 +595,12 @@ transaction gas. XLM/stroop identity conversion is intrinsic; other gas conversi
 admitted trusted source. Onchain counters retain ceilings. The server separately settles actual
 expenses and temporary loss. No automatic onchain refund authority follows from that accounting.
 
-`execute` and the owner-enabled x402 transfer hook require agent and server authority. The kernel
+`execute` and the owner-enabled intercepted door require agent and server authority. The kernel
 checks source/module/schema, immutable asset, exact parties/amount, positive debit, pause, expiry,
 configuration version, execution nonce, single-use operation ID and the execution params' bounds
 independently of business checks.
-The x402 hook decodes its execution like `execute` and admits only the canonical transfer profile.
+The intercepted door decodes its execution like `execute` and admits the canonical transfer, swap
+and redeem profiles, each only with its exact signed tree.
 State, effects and receipts commit atomically. Denials and native failures roll them back.
 
 SEP-56 deposits bind vault, assets, minimum shares and wallet source/operator/share receiver.
@@ -593,7 +614,131 @@ The immutable SAC balance read is last. A vault getter cannot mutate already-che
 `AllowitTransferReceipt` retains the underlying leg. `deposit_receipt(operation_id)` and `sep56_deposit`
 record the observed share output. Vault code can misreport ownership, valuation or redeemability.
 The wrapper bounds SAC spending and interface observations; it cannot prove investment value.
-Owner `invoke` can redeem shares independently. The server reconciles actual settled redemptions.
+Owner `invoke` can redeem shares independently, and the agent can redeem them under the policy.
+
+## Swaps and redeems
+
+A swap trades the asset for another token, or back, through an exact-input router such as
+Soroswap. A redeem burns SEP-56 vault shares for the asset. Both have two doors, and both doors run
+the same `decode_operation` and `admit`: the same invariants, rules, `post_flight` and state writes.
+
+- **Intercepted.** The agent sends the plain call that a simple wallet would sign, and the wallet
+  intercepts it in `__check_auth`:
+  `router.swap_exact_tokens_for_tokens(amount_in, amount_out_min, path, wallet, deadline)` or
+  `vault.redeem(shares, wallet, wallet, wallet)`. The custom-account signature is an
+  `AllowitPolicyAuthorization`, as for an x402 transfer. `x402_enabled` enables this door.
+- **`execute`.** The agent and server authorize `execute` with the same request. The wallet calls
+  the router or vault itself, observes the effects and stores a receipt, which
+  `swap_receipt(operation_id)` and `redeem_receipt(operation_id)` return with the `swap` and
+  `sep56_redeem` events. Only this door can check a redeem's output.
+
+| | Intercepted | `execute` |
+| --- | --- | --- |
+| Agent transaction | The plain router or vault call | `wallet.execute(request)` |
+| Swap minimum output | The router enforces the signed `amount_out_min` | The router check, and the wallet checks the credit |
+| Redeem minimum output | None: SEP-56 `redeem` has no argument for it, and `__check_auth` cannot call the vault | The wallet checks the credit against `min_assets` |
+| Output receipt | None; the router, token and vault events | Stored receipt and event |
+| Debit authority | Exactly the signed tree | One exact `transfer`, by `authorize_as_current_contract` |
+
+### Arguments and invariants
+
+`AllowitSwapArgs` (`allowit.stellar.router_swap_exact_in.v1`) holds `router`, `amount_in`,
+`amount_out_min`, `path`, `to` and `deadline`. `AllowitSep56RedeemArgs`
+(`allowit.stellar.sep56_redeem.v1`) holds `vault`, `shares`, `receiver`, `owner`, `operator` and
+`min_assets`. Both are canonical XDR in `invocation.arguments`, like transfers and deposits. The
+kernel checks, before any policy runs:
+
+- Swap: `to` is the wallet; the router is neither the wallet nor the asset; the path holds 2 to
+  `MAX_SWAP_PATH` (4) tokens and not the wallet; exactly one endpoint is the asset; the other
+  endpoint is a Stellar Asset Contract (`UnsupportedAsset` otherwise); `amount_in` and
+  `amount_out_min` are positive; `deadline` is no later than `expires_at`.
+- Redeem: owner, operator and receiver are the wallet; the vault is neither the wallet nor the
+  asset; `shares` and `min_assets` are positive.
+
+A forward swap pays the asset; a reverse swap pays the other token and receives the asset. Only the
+installed asset is paid out, so a swap's other endpoint must be a Stellar Asset Contract: an owner
+lists the ones it accepts in `tokens`.
+
+### The intercepted authorization tree
+
+`__check_auth` receives every node of the signed tree in host preorder and accepts only these exact
+shapes, compared with the decoded request:
+
+- Transfer: `[asset.transfer(wallet, to, amount)]`.
+- Swap: `[router.swap_exact_tokens_for_tokens(amount_in, amount_out_min, path, wallet, deadline),
+  path[0].transfer(wallet, pair, amount_in)]`. The pair is a contract other than the wallet and the
+  router. The kernel does not recompute it: the router pays its own pair, so another pair fails the
+  host's authorization matching.
+- Redeem: `[vault.redeem(shares, wallet, wallet, wallet)]`.
+
+Any other node count is `InvalidInvocation`, another call `UnsupportedOperation`, and other
+arguments `InvalidInvocation`. A deposit has no intercepted form.
+
+The host calls `__check_auth` once per authorization entry, at the first `require_auth` that matches
+it: the router's `to.require_auth()` or the vault's `operator.require_auth()`. The later debit in
+the same tree matches its node without another call. A vault that calls `require_auth` twice for the
+wallet in one frame therefore needs a second entry, and the intercepted door rejects it; `execute`
+works with such a vault, because the wallet is then the vault's direct invoker.
+
+```
+agent tx: router.swap_exact_tokens_for_tokens(in, min, [asset, X], wallet, deadline)
+  router: wallet.require_auth()  ->  wallet.__check_auth(payload, signature, [swap, transfer])
+            decode_operation -> match_contexts -> agent and server signatures -> admit
+            (binding, replay, pause, nonce, version, expiry, expense, policy, post_flight)
+            store state, nonce + 1 and the replay marker
+  router: amounts.last() >= min, else the whole transaction rolls back
+  router: asset.transfer(wallet, pair, in)  (matches the signed sub-node)
+  pair:   X.transfer(pair, wallet, out)
+```
+
+The client simulates the call in recording mode to get the wallet's entry, signs the host payload
+and the request, and simulates again with the signed entry in enforcing mode. Recording mode does
+not run `__check_auth`, so only the second simulation finds the wallet's own storage footprint.
+Replay protection has four layers: the host authorization nonce, the strict execution nonce, the
+persistent `operation_id` marker, and `expires_at` with `deployment_version`.
+
+### Request facts and accounting
+
+| Op | `recipient` | `amount` (asset units) | `token_in` / `amount_in` | `token_out` / `min_out` |
+| --- | --- | --- | --- | --- |
+| transfer | `to` | amount | asset / amount | `None` / 0 |
+| deposit | vault | assets | asset / assets | vault shares / `min_shares` |
+| swap, asset to X | router | `amount_in` | asset / `amount_in` | X / `amount_out_min` |
+| swap, X to asset | router | `amount_out_min`, a floor | X / `amount_in` | asset / `amount_out_min` |
+| redeem | vault | `min_assets`, a floor | vault shares / `shares` | asset / `min_assets` |
+
+`recipients` allows routers and vaults; no separate list applies. `tokens` checks the asset and,
+for a swap, its other endpoint. `transaction_cap` and `day_total_cap` read the gross amount, so
+their limits on reverse swaps and redeems are floors. Swaps and redeems follow the deposit expense
+model: `conversion_units` is the loss ceiling, and `spent_units` equals it plus `gas_units`. A
+forward swap's loss cannot exceed `amount_in`. Custom policy can add its own params, such as a
+`swap_cap`, in a `match` arm of `operations`.
+
+### Observed effects in `execute`
+
+An `execute` swap reads `router_pair_for(path[0], path[1])`, authorizes exactly
+`path[0].transfer(wallet, pair, amount_in)`, calls the router and requires: one returned amount per
+path token, the first equal to `amount_in`, the last at least `amount_out_min`; an exact debit; and
+a credit equal to the last returned amount. Both endpoints are Stellar Asset Contracts, so no
+untrusted code runs after the router returns.
+
+An `execute` redeem requires the vault to report the asset before and after the call, the share
+balance to fall by exactly `shares`, and the asset credit to equal the returned assets and be at
+least `min_assets`. The final read is the asset balance.
+
+### Limits
+
+- An intercepted redeem has no onchain output floor. The vault allowlist, the server's
+  `preview_redeem` check before it signs and short expiries bound it; use `execute` when a redeem
+  needs a floor.
+- The intercepted door stores no output receipt. The server reconciles from the router `swap`,
+  token `transfer` and vault `withdraw` events.
+- An allowlisted router that misbehaves can lose up to `amount_in`, never more.
+- Another contract can wrap the agent's entry and move the pool or vault price earlier in the same
+  transaction. `amount_out_min` bounds a swap's loss; a redeem's loss has no onchain bound.
+- The strict execution nonce orders every operation across both doors.
+- Testnet resets change router and token addresses: update `recipients` and `tokens` with
+  `deploy_policy`.
 
 ## Owner authority and public metadata
 
