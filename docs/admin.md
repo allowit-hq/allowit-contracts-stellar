@@ -96,8 +96,9 @@ Negative caps reject at standard configuration. Code changes defer the new tier 
 delegated admission.
 Duplicate JSON keys reject. Fund the wallet only with its
 installed asset. `recover` transfers only that asset. A forward swap can leave the wallet holding
-another Stellar Asset Contract token listed in `tokens`. Only a reverse swap or an owner `invoke`
-of that token's `transfer` moves it; `recover` cannot.
+another Stellar Asset Contract token. Common and Custom can restrict that token with `tokens`;
+Simple relies on the server. Only a reverse swap or an owner `invoke` of that token's `transfer`
+moves it; `recover` cannot.
 
 `admin --family wallet --contract ADDRESS --source "$OWNER" --method METHOD --arguments JSON` admits
 `deploy_policy`, `set_pause` and `recover`. Parent administration uses `--family parent`, its native

@@ -437,8 +437,9 @@ Two rules hold on every rail:
 - A custom call never moves wallet funds. Only the native operations transfer, deposit, swap and
   redeem debit the wallet. Each authorizes exactly one debit, and the canonical rules check it:
   transfer and deposit one `transfer` of the asset; swap one `transfer` of the first path token from
-  the wallet to the first pair for exactly `amount_in`; redeem one burn of exactly `shares` through
-  the vault's `redeem`, with the wallet as owner, operator and receiver.
+  the wallet to the first pair for exactly `amount_in`. An intercepted redeem authorizes only the
+  call `redeem(shares, wallet, wallet, wallet)`; the vault's own code decides the burn and the
+  payout, and only `execute` checks the share debit, the underlying asset and `min_assets`.
 - A policy never re-enters the wallet, also on a rail that does not block re-entry natively.
 
 On Stellar both rules follow from the wallet's authorization:
@@ -656,8 +657,9 @@ kernel checks, before any policy runs:
   asset; `shares` and `min_assets` are positive.
 
 A forward swap pays the asset; a reverse swap pays the other token and receives the asset. Only the
-installed asset is paid out, so a swap's other endpoint must be a Stellar Asset Contract: an owner
-lists the ones it accepts in `tokens`.
+asset leaves through transfers, deposits and forward swaps. A swap's other endpoint must be a
+Stellar Asset Contract, which keeps the `execute` balance reads trusted. Common and Custom can
+restrict it with `tokens`; Simple relies on the server.
 
 ### The intercepted authorization tree
 
@@ -734,6 +736,7 @@ requires `preview - min(preview, assets) <= conversion_units`. The final read is
 - An intercepted redeem has no onchain output floor. The vault allowlist, the server's
   `preview_redeem` check before it signs and short expiries bound it; use `execute` when a redeem
   needs a floor.
+- An intercepted redeem does not check the vault's underlying asset or the burned share amount.
 - The intercepted door stores no output receipt. The server reconciles from the router `swap`,
   token `transfer` and vault `withdraw` events.
 - An allowlisted router that misbehaves can lose up to `amount_in`, never more.

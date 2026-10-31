@@ -22,7 +22,7 @@ A policy wallet is a Soroban contract that holds one native Stellar asset. The o
 Three wallet implementations share one custody core (`crates/policy-wallet`) and one owner interface. They differ only in where the policy runs.
 
 > [!NOTE]
-> Amounts, limits and usage are tracked in the asset's native base units. Only the installed asset can be paid out. A swap may leave the wallet holding a token listed in `tokens`; only a reverse swap or an owner `invoke` moves it. The wallet refuses to pay itself and refuses to pay the asset's issuer, because an issuer payment burns tokens.
+> Amounts, limits and usage are tracked in the asset's native base units. Only the asset leaves through transfers, deposits and forward swaps. A reverse swap pays out the other swap token. A swap's other endpoint must be a Stellar Asset Contract, which keeps the `execute` balance reads trusted. Common and Custom can restrict it with `tokens`; Simple relies on the server. Only a reverse swap or an owner `invoke` moves a held swap token. The wallet refuses to pay itself and refuses to pay the asset's issuer, because an issuer payment burns tokens.
 
 ## Three policy wallets
 

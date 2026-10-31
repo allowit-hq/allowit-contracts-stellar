@@ -9,6 +9,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 unset CARGO_TARGET_DIR
+# A cargo config build.target-dir would also redirect the deployable build away from ./target.
+export CARGO_BUILD_TARGET_DIR="$PWD/target"
 mkdir -p target/test-fixtures
 lock=target/.build-contracts.lock
 if ! mkdir "$lock" 2>/dev/null; then
