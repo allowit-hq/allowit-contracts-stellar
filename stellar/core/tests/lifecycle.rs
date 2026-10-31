@@ -897,7 +897,9 @@ fn odc_resource_fees_require_explicit_config_and_request_budget() {
     }
     resource.resource_fee = 1_999_900;
     assert!(attach_simulation(&approved, &encode(&resource)).is_ok());
-    config.max_fee_stroops = 2_000_001;
+    config.max_fee_stroops = POLICY_WALLET_MAX_FEE_STROOPS;
+    validate_config(&config).unwrap();
+    config.max_fee_stroops = POLICY_WALLET_MAX_FEE_STROOPS + 1;
     assert!(validate_config(&config).is_err());
     let (mut native, _, _) = fixture(WalletRoute::Native, false);
     native.max_fee_stroops = 1_000_000;
@@ -3489,6 +3491,8 @@ fn owner_recovery_reads_only_kept_fields_and_pause_only_the_current_layout() {
         now: 86401,
     };
     assert!(admin.custody().is_err());
+    // The pause version reads only what `set_pause` reads.
+    assert_eq!(admin.deployment_version().unwrap(), DeploymentVersion(2));
     let artifact = PolicyDeployment {
         owner: c.owner.clone(),
         agent: c.agent.clone(),
@@ -3528,6 +3532,7 @@ fn owner_recovery_reads_only_kept_fields_and_pause_only_the_current_layout() {
         };
         assert_eq!(admin.recover_to(&recipient, 5).unwrap().function, "recover");
         assert!(admin.set_pause(true, DeploymentVersion(3)).is_err());
+        assert!(admin.deployment_version().is_err());
         assert!(
             admin
                 .deploy_policy(DeploymentVersion(3), artifact.clone())

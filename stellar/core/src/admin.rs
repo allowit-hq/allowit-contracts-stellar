@@ -739,6 +739,12 @@ impl OwnerAdmin<'_> {
             vec![owner],
         )
     }
+    /// The current deployment version, read as `set_pause` reads the wallet: the exact layout 4
+    /// State and the owner-only account. A changed executable, policy binding or service signer
+    /// never blocks it, so the owner can always prepare a pause or resume.
+    pub fn deployment_version(&self) -> Result<DeploymentVersion> {
+        Ok(self.snapshot(Reach::Layout)?.deployment_version)
+    }
     /// The current decoded custody State and owner account, read as owner preparation does.
     pub fn custody(&self) -> Result<CustodyState> {
         self.snapshot(Reach::Bound)?

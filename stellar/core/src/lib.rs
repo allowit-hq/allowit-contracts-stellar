@@ -553,16 +553,26 @@ impl StellarOperation {
     }
 }
 
+/// The highest fee ceiling of one native custody operation, in stroops (0.1 XLM).
+pub const NATIVE_MAX_FEE_STROOPS: u32 = 1_000_000;
+/// The highest fee ceiling of one policy wallet operation, in stroops (1 XLM). Each wallet
+/// operation writes a persistent replay entry and extends it to the network's longest lifetime;
+/// on testnet on 2026-10-31 that rent made a Common wallet transfer cost 2645894 stroops.
+pub const POLICY_WALLET_MAX_FEE_STROOPS: u32 = 10_000_000;
+/// The highest installed fee ceiling of a custody route.
+pub fn max_fee_ceiling(route: &WalletRoute) -> u32 {
+    match route {
+        WalletRoute::Native => NATIVE_MAX_FEE_STROOPS,
+        WalletRoute::PolicyWallet | WalletRoute::Odc => POLICY_WALLET_MAX_FEE_STROOPS,
+    }
+}
+
 pub fn validate_config(c: &WalletConfig) -> Result<()> {
     passphrase(&c.network)?;
     if c.policy_instance == [0; 32]
         || c.source_hash != hash(c.policy_source.as_bytes())
         || c.max_fee_stroops < 100
-        || c.max_fee_stroops
-            > match c.route {
-                WalletRoute::Native => 1_000_000,
-                WalletRoute::PolicyWallet | WalletRoute::Odc => 2_000_000,
-            }
+        || c.max_fee_stroops > max_fee_ceiling(&c.route)
     {
         return Err("Invalid installed policy or fee binding".into());
     }
