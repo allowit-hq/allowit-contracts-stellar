@@ -251,23 +251,11 @@ impl OwnerAdmin<'_> {
         function: &str,
         args: Vec<ScVal>,
         expiry: u64,
-        auth: bool,
     ) -> Result<Transaction> {
         let call = InvokeContractArgs {
             contract_address: address(contract)?,
             function_name: ScSymbol(function.as_bytes().to_vec().try_into().map_err(err)?),
             args: args.try_into().map_err(err)?,
-        };
-        let entries = if auth {
-            vec![SorobanAuthorizationEntry {
-                credentials: SorobanCredentials::SourceAccount,
-                root_invocation: SorobanAuthorizedInvocation {
-                    function: SorobanAuthorizedFunction::ContractFn(call.clone()),
-                    sub_invocations: VecM::default(),
-                },
-            }]
-        } else {
-            vec![]
         };
         Ok(Transaction {
             source_account: muxed(&source.address)?,
@@ -282,7 +270,7 @@ impl OwnerAdmin<'_> {
                 source_account: None,
                 body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
                     host_function: HostFunction::InvokeContract(call),
-                    auth: entries.try_into().map_err(err)?,
+                    auth: VecM::default(),
                 }),
             }]
             .try_into()
@@ -305,9 +293,12 @@ impl OwnerAdmin<'_> {
             function,
             args,
             expires,
-            true,
         )?;
-        let response=self.rpc.call("simulateTransaction",json!({"transaction":xdr(&TransactionEnvelope::Tx(TransactionV1Envelope{tx:tx.clone(),signatures:VecM::default()}))?}))?;
+        // Record every authorization the contract requires, including a new owner's for an
+        // owner handoff. Enforce mode would fail on an entry the transaction does not yet have.
+        // The recorded entries are checked against `authorizers` and then become the unsigned
+        // transaction's entries for the owners to sign.
+        let response=self.rpc.call("simulateTransaction",json!({"transaction":xdr(&TransactionEnvelope::Tx(TransactionV1Envelope{tx:tx.clone(),signatures:VecM::default()}))?,"authMode":"record"}))?;
         if response.get("error").is_some() {
             return Err("Owner operation simulation rejected".into());
         }
@@ -452,7 +443,6 @@ impl RecoverFunds for OwnerAdmin<'_> {
             "balance",
             vec![ScVal::Address(address(&self.config.wallet)?)],
             self.now.checked_add(300).ok_or("Expiry overflow")?,
-            false,
         )?;
         let response=self.rpc.call("simulateTransaction",json!({"transaction":xdr(&TransactionEnvelope::Tx(TransactionV1Envelope{tx,signatures:VecM::default()}))?}))?;
         if response.get("error").is_some() {

@@ -170,6 +170,72 @@ fn sign_native(p: &PreparedOperation) -> SignedOperation {
     authorize(p, &[a, e], 86401).unwrap()
 }
 
+/// Model the authorization rules of Stellar RPC `simulateTransaction`.
+/// An omitted `authMode` means enforce when auth entries are present and record otherwise.
+/// Record mode rejects a transaction that already has auth entries, as Stellar RPC does, and
+/// records one root entry per required address with a fresh nonce. Enforce mode returns only the
+/// supplied entries and fails when a required address has no entry.
+fn rpc_auth(
+    params: &Value,
+    tx: &stellar_xdr::Transaction,
+    required: &[stellar_xdr::ScAddress],
+) -> std::result::Result<Vec<stellar_xdr::SorobanAuthorizationEntry>, String> {
+    use stellar_xdr::*;
+    let OperationBody::InvokeHostFunction(op) = &tx.operations[0].body else {
+        panic!()
+    };
+    let HostFunction::InvokeContract(call) = &op.host_function else {
+        panic!()
+    };
+    let MuxedAccount::Ed25519(source) = &tx.source_account else {
+        panic!()
+    };
+    let source = ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(source.clone())));
+    let mode = match params.get("authMode").and_then(serde_json::Value::as_str) {
+        Some(mode) => mode,
+        None if op.auth.is_empty() => "record",
+        None => "enforce",
+    };
+    match mode {
+        "record" if !op.auth.is_empty() => Err(format!(
+            "cannot set authMode to '{mode}' with an auth footprint"
+        )),
+        "record" => Ok(required
+            .iter()
+            .enumerate()
+            .map(|(index, who)| SorobanAuthorizationEntry {
+                credentials: if *who == source {
+                    SorobanCredentials::SourceAccount
+                } else {
+                    SorobanCredentials::Address(SorobanAddressCredentials {
+                        address: who.clone(),
+                        nonce: 9_000 + index as i64,
+                        signature_expiration_ledger: 0,
+                        signature: ScVal::Void,
+                    })
+                },
+                root_invocation: SorobanAuthorizedInvocation {
+                    function: SorobanAuthorizedFunction::ContractFn(call.clone()),
+                    sub_invocations: VecM::default(),
+                },
+            })
+            .collect()),
+        "enforce" => {
+            for who in required {
+                if !op.auth.iter().any(|entry| match &entry.credentials {
+                    SorobanCredentials::SourceAccount => *who == source,
+                    SorobanCredentials::Address(c) => c.address == *who,
+                    _ => false,
+                }) {
+                    return Err("require_auth has no matching authorization entry".into());
+                }
+            }
+            Ok(op.auth.to_vec())
+        }
+        _ => Err("invalid authMode".into()),
+    }
+}
+
 fn server_ready(p: &PreparedOperation) -> PreparedOperation {
     if p.config.route == WalletRoute::Native {
         return p.clone();
@@ -183,14 +249,38 @@ fn server_ready(p: &PreparedOperation) -> PreparedOperation {
                 return Ok(json!({"passphrase":passphrase(&p.config.network)?}));
             }
             assert_eq!(method, "simulateTransaction");
-            assert_eq!(params["transaction"], p.transaction_xdr);
-            let TransactionEnvelope::Tx(envelope) =
+            let TransactionEnvelope::Tx(envelope) = TransactionEnvelope::from_xdr_base64(
+                params["transaction"].as_str().unwrap(),
+                Limits::none(),
+            )
+            .unwrap() else {
+                panic!()
+            };
+            // Recording simulation receives the exact intent without its auth entries.
+            let TransactionEnvelope::Tx(mut intent) =
                 TransactionEnvelope::from_xdr_base64(&p.transaction_xdr, Limits::none()).unwrap()
             else {
                 panic!()
             };
-            let OperationBody::InvokeHostFunction(op) = &envelope.tx.operations[0].body else {
-                panic!()
+            if params["authMode"] == "record" {
+                let mut operations = intent.tx.operations.to_vec();
+                let OperationBody::InvokeHostFunction(op) = &mut operations[0].body else {
+                    panic!()
+                };
+                op.auth = VecM::default();
+                intent.tx.operations = operations.try_into().unwrap();
+            }
+            assert_eq!(envelope, intent);
+            let auth = match rpc_auth(
+                &params,
+                &envelope.tx,
+                &[
+                    address(&p.state.source.address)?,
+                    address(&p.config.server)?,
+                ],
+            ) {
+                Ok(auth) => auth,
+                Err(error) => return Ok(json!({ "error": error })),
             };
             let t = transfer_from_request(&p.config, &p.request)?;
             let bytes = |b: [u8; 32]| ScVal::Bytes(ScBytes(b.to_vec().try_into().unwrap()));
@@ -216,7 +306,7 @@ fn server_ready(p: &PreparedOperation) -> PreparedOperation {
             );
             let data = SorobanTransactionData::from_xdr_base64(&resources, Limits::none()).unwrap();
             Ok(
-                json!({"minResourceFee":data.resource_fee.to_string(),"transactionData":resources,"results":[{"xdr":receipt.to_xdr_base64(Limits::none()).unwrap(),"auth":op.auth.iter().map(|a|a.to_xdr_base64(Limits::none()).unwrap()).collect::<Vec<_>>()}]}),
+                json!({"minResourceFee":data.resource_fee.to_string(),"transactionData":resources,"results":[{"xdr":receipt.to_xdr_base64(Limits::none()).unwrap(),"auth":auth.iter().map(|a|a.to_xdr_base64(Limits::none()).unwrap()).collect::<Vec<_>>()}]}),
             )
         }
     }
@@ -1625,7 +1715,9 @@ impl rpc::Rpc for AdminRpc {
                     json!({"results":[{"xdr":ScVal::I128(Int128Parts{hi:(self.balance>>64) as i64,lo:self.balance as u64}).to_xdr_base64(Limits::none()).unwrap()}]}),
                 );
             }
-            let mut auth = op.auth.to_vec();
+            // The contract calls require_auth on the current owner and, for an owner
+            // handoff through deploy_policy, also on the new owner.
+            let mut required = vec![address(&self.base.config.owner)?];
             if function == "deploy_policy" {
                 let ScVal::Map(Some(fields)) = &call.args[0] else {
                     panic!()
@@ -1640,16 +1732,13 @@ impl rpc::Rpc for AdminRpc {
                     panic!()
                 };
                 if address_text(next_owner)? != self.base.config.owner {
-                    let mut extra = auth[0].clone();
-                    extra.credentials = SorobanCredentials::Address(SorobanAddressCredentials {
-                        address: next_owner.clone(),
-                        nonce: 7,
-                        signature_expiration_ledger: 200,
-                        signature: ScVal::Void,
-                    });
-                    auth.push(extra);
+                    required.push(next_owner.clone());
                 }
             }
+            let mut auth = match rpc_auth(&params, &envelope.tx, &required) {
+                Ok(auth) => auth,
+                Err(error) => return Ok(json!({ "error": error })),
+            };
             if self.bad_auth {
                 auth[0].root_invocation.sub_invocations =
                     vec![auth[0].root_invocation.clone()].try_into().unwrap();
@@ -1839,8 +1928,30 @@ fn full_policy_deployment_uses_one_versioned_owner_flow_and_owner_handoff_author
         let prepared = admin.deploy_policy(DeploymentVersion(3), artifact).unwrap();
         assert_eq!(
             prepared.required_authorizers,
-            vec![c.owner.clone(), next_owner]
+            vec![c.owner.clone(), next_owner.clone()]
         );
+        // The unsigned transaction carries the recorded entries of both owners.
+        let stellar_xdr::TransactionEnvelope::Tx(envelope) =
+            stellar_xdr::TransactionEnvelope::from_xdr_base64(
+                &prepared.transaction_xdr,
+                Limits::none(),
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        let OperationBody::InvokeHostFunction(op) = &envelope.tx.operations[0].body else {
+            panic!()
+        };
+        assert_eq!(op.auth.len(), 2);
+        assert_eq!(
+            op.auth[0].credentials,
+            stellar_xdr::SorobanCredentials::SourceAccount
+        );
+        assert!(matches!(
+            &op.auth[1].credentials,
+            stellar_xdr::SorobanCredentials::Address(c) if c.address == address(&next_owner).unwrap()
+        ));
         let calls = rpc.calls.lock().unwrap();
         let (name, args) = calls.last().unwrap();
         assert_eq!(name, "deploy_policy");
@@ -2084,7 +2195,14 @@ impl rpc::Rpc for PreflightRpc {
             ("nonce", ScVal::U64(4)),
             ("deployment_version", ScVal::U64(2)),
         ]);
-        let mut auth = op.auth.to_vec();
+        let mut auth = match rpc_auth(
+            &params,
+            &env.tx,
+            &[address(&self.base.source.address)?, address(&c.server)?],
+        ) {
+            Ok(auth) => auth,
+            Err(error) => return Ok(json!({ "error": error })),
+        };
         if self.failure == "auth" {
             auth[0].root_invocation.sub_invocations =
                 vec![auth[0].root_invocation.clone()].try_into().unwrap();
@@ -2228,6 +2346,53 @@ fn native_failure_or_wrong_auth_receipt_fee_and_restore_never_approve() {
             "{failure}"
         );
     }
+}
+#[test]
+fn first_simulation_records_without_auth_entries_and_signed_simulation_enforces() {
+    struct Modes {
+        rpc: PreflightRpc,
+        seen: Mutex<Vec<(Value, usize)>>,
+    }
+    impl rpc::Rpc for Modes {
+        fn call(&self, method: &str, params: Value) -> Result<Value> {
+            use stellar_xdr::*;
+            if method == "simulateTransaction" {
+                let TransactionEnvelope::Tx(env) = TransactionEnvelope::from_xdr_base64(
+                    params["transaction"].as_str().unwrap(),
+                    Limits::none(),
+                )
+                .unwrap() else {
+                    panic!()
+                };
+                let OperationBody::InvokeHostFunction(op) = &env.tx.operations[0].body else {
+                    panic!()
+                };
+                let HostFunction::InvokeContract(call) = &op.host_function else {
+                    panic!()
+                };
+                if call.function_name.0.as_slice() == b"execute" {
+                    self.seen
+                        .lock()
+                        .unwrap()
+                        .push((params["authMode"].clone(), op.auth.len()));
+                }
+            }
+            self.rpc.call(method, params)
+        }
+    }
+    let modes = Modes {
+        rpc: preflight_fixture(),
+        seen: Mutex::new(vec![]),
+    };
+    let c = &modes.rpc.base.config;
+    let prepared = rpc::prepare(&modes, c, &modes.rpc.request, None, 86401, 86700).unwrap();
+    let signed = authorize_server(&prepared, &[3; 32], 86401, None).unwrap();
+    let ready = rpc::simulate(&modes, &signed).unwrap();
+    assert!(ready.native_preflight.is_some());
+    assert_eq!(
+        *modes.seen.lock().unwrap(),
+        vec![(json!("record"), 0), (json!("enforce"), 2)]
+    );
 }
 #[test]
 fn odc_cannot_authorize_from_forged_classic_zero_usage() {

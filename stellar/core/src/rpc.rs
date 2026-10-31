@@ -165,9 +165,28 @@ pub fn simulate(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<PreparedOperatio
     if rpc.call("getNetwork", json!({}))?["passphrase"] != passphrase(&p.config.network)? {
         return Err("Simulation network differs from installation".into());
     }
+    // Stellar RPC rejects recording mode when the transaction already has auth entries.
+    // An unsigned intent is therefore recorded from a copy without them; the recorded scope is
+    // compared with the intent's entries below. The signed intent is simulated as is in enforce
+    // mode, which supplies the final resources, including the service entry's fixed nonce key.
+    let recording = authorization::server_signature(p, false)? == ScVal::Void;
+    let (transaction, mode) = if recording {
+        let TransactionEnvelope::Tx(mut env) = read(&p.transaction_xdr)? else {
+            return Err("Unsupported preflight envelope".into());
+        };
+        let mut operations = env.tx.operations.to_vec();
+        let OperationBody::InvokeHostFunction(op) = &mut operations[0].body else {
+            return Err("Expected one native policy invocation".into());
+        };
+        op.auth = VecM::default();
+        env.tx.operations = operations.try_into().map_err(err)?;
+        (xdr(&TransactionEnvelope::Tx(env))?, "record")
+    } else {
+        (p.transaction_xdr.clone(), "enforce")
+    };
     let v = rpc.call(
         "simulateTransaction",
-        json!({"transaction":p.transaction_xdr,"authMode":if authorization::server_signature(p,false)?==ScVal::Void {"record"} else {"enforce"}}),
+        json!({"transaction":transaction,"authMode":mode}),
     )?;
     if v.get("error").is_some_and(|value| !value.is_null()) {
         return Err("policy wallet simulation rejected the exact policy operation".into());
@@ -206,7 +225,7 @@ pub fn simulate(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<PreparedOperatio
             )
         })
         .collect::<Result<Vec<SorobanAuthorizationEntry>>>()?;
-    let same = if authorization::server_signature(p, false)? == ScVal::Void {
+    let same = if recording {
         auth.len() == op.auth.len()
             && auth.iter().zip(op.auth.iter()).all(|(actual, expected)| {
                 actual.root_invocation == expected.root_invocation
