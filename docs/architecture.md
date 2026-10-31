@@ -678,9 +678,15 @@ arguments `InvalidInvocation`. A deposit has no intercepted form.
 
 The host calls `__check_auth` once per authorization entry, at the first `require_auth` that matches
 it: the router's `to.require_auth()` or the vault's `operator.require_auth()`. The later debit in
-the same tree matches its node without another call. A vault that calls `require_auth` twice for the
-wallet in one frame therefore needs a second entry, and the intercepted door rejects it; `execute`
-works with such a vault, because the wallet is then the vault's direct invoker.
+the same tree matches its node without another call. The intercepted door does not support a vault
+that calls `require_auth` twice for the wallet in one frame. With one entry, the second call finds
+no unmatched entry and the transaction fails. The host then tries the next entry for the wallet, so
+a client can supply a second entry with the same `redeem` root and its own signed execution (the
+next nonce and a new `operation_id`). `__check_auth` admits it as a second operation: the one real
+redeem uses two nonces and counts twice in the policy state. Recording-mode simulation of such a
+vault returns both entries; the server co-signs at most one wallet entry per intercepted
+transaction. `execute` works with such a vault, because the wallet is then the vault's direct
+invoker.
 
 ```
 agent tx: router.swap_exact_tokens_for_tokens(in, min, [asset, X], wallet, deadline)

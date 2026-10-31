@@ -791,7 +791,7 @@ fn router_minimum_output_failure_rolls_back_the_state_written_in_check_auth() {
 }
 
 #[test]
-fn intercepted_redeem_runs_the_policy_and_a_double_authorizing_vault_fails() {
+fn intercepted_redeem_runs_the_policy_and_a_double_authorizing_vault_counts_twice() {
     for wasm in TIERS {
         let f = Fixture::new(wasm, true);
         let v = vault(&f, 0);
@@ -815,6 +815,25 @@ fn intercepted_redeem_runs_the_policy_and_a_double_authorizing_vault_fails() {
         assert!(!vault_redeem(&f, &twice, 40));
         assert_eq!((f.balance(), shares(&f, &twice)), (1040, 100));
         assert_eq!(f.client().state().nonce, 1);
+        // A second signed entry with its own execution is a second operation: the wallet admits
+        // both, so the one real redeem uses two nonces and counts twice in the policy state.
+        let mut second = e.clone();
+        second.nonce += 1;
+        let mut id = [0u8; 32];
+        id[24..].copy_from_slice(&(second.nonce + 1).to_be_bytes());
+        second.operation_id = BytesN::from_array(&f.env, &id);
+        f.env.set_auths(&[
+            redeem_entry(&f, &twice, &e, 40, 2),
+            redeem_entry(&f, &twice, &second, 40, 3),
+        ]);
+        assert!(vault_redeem(&f, &twice, 40));
+        assert_eq!((f.balance(), shares(&f, &twice)), (1080, 60));
+        assert_eq!(f.client().state().nonce, 3);
+        let history = f.history();
+        assert_eq!(
+            (history.calls, history.day_total, history.spent),
+            (3, 120, 0)
+        );
     }
 }
 
