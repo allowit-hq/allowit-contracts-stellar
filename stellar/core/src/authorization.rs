@@ -43,6 +43,42 @@ pub(crate) fn payload(network: &str, entry: &SorobanAuthorizationEntry) -> Resul
     ))
 }
 
+/// Verify that `entry` carries exactly one Ed25519 signature by the G-address `account`.
+pub(crate) fn verify_account_signature(
+    network: &str,
+    entry: &SorobanAuthorizationEntry,
+    account: &str,
+) -> Result<()> {
+    let SorobanCredentials::Address(credentials) = &entry.credentials else {
+        return Err("Address authorization is required".into());
+    };
+    let ScVal::Vec(Some(signatures)) = &credentials.signature else {
+        return Err("Invalid account signature".into());
+    };
+    if signatures.len() != 1 {
+        return Err("One exact account signature is required".into());
+    }
+    let key = account_key(account)?;
+    let ScVal::Bytes(bytes) = rpc::map_field(&signatures[0], "signature")? else {
+        return Err("Invalid account signature bytes".into());
+    };
+    let bytes: [u8; 64] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "Invalid account signature length")?;
+    let expected = value_map(vec![
+        ("public_key", value_bytes(&key)?),
+        ("signature", value_bytes(&bytes)?),
+    ])?;
+    if signatures[0] != expected {
+        return Err("Account signer or signature fields differ".into());
+    }
+    VerifyingKey::from_bytes(&key)
+        .map_err(err)?
+        .verify_strict(&payload(network, entry)?, &EdSignature::from_bytes(&bytes))
+        .map_err(err)
+}
+
 pub(crate) fn server_signature(p: &PreparedOperation, require_signed: bool) -> Result<ScVal> {
     let TransactionEnvelope::Tx(envelope) = read(&p.transaction_xdr)? else {
         return Err("Expected a policy transaction".into());

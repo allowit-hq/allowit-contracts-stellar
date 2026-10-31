@@ -40,7 +40,7 @@ Policy wallet preparation needs resource simulation before signing. Native confi
 
 `validate_retained_prepared` and `validate_retained_signed` verify the original transport, effects, hashes and signatures without compiling policy source. Use them only for read-only history and original-hash recovery. Native transaction signatures do not prove the accompanying policy source metadata. Before calling these helpers, compare that metadata with the original owner-approved binding in the durable record or client token. New preparation, signing and first broadcast still require current policy admission and fresh transaction bounds.
 
-`rpc::submit` retains signed bytes before broadcast. `recover` queries the original transaction hash. An uncertain broadcast never authorizes a replacement payment or releases its reservation. Terminal settlement remains distinct from external delivery.
+`rpc::submit` retains signed bytes before broadcast. `recover` queries the original transaction hash. A later `submit` of the same operation queries that hash first; while the transaction is not on the ledger and the signed operation is still valid, it resends the same bytes, for example after `TRY_AGAIN_LATER`. The same sequence number and hash mean the network includes them at most once. An uncertain broadcast never authorizes a replacement payment or releases its reservation. Terminal settlement remains distinct from external delivery.
 
 The signing seed stays with its actor. Wallet configuration contains public installation data. Historical signed packets remain read-only and cannot start new preparation. `rpc::checker_version` requires an explicit shared checker contract address; the service signer is never used as a checker address. Client-held signing material must remain private and is not part of public wallet configuration. Production promotion is a separate operation.
 
@@ -49,3 +49,7 @@ The signing seed stays with its actor. Wallet configuration contains public inst
 The owner must enable x402. Its raw Ed25519 keys need no funded G-accounts. Native account signer or threshold changes do not revoke those raw keys; rotate the wallet's configured keys or disable x402 through an owner-authorized deployment. Direct execution continues to use native account authorization.
 
 `admin::OwnerAdmin` prepares unsigned owner transactions for `deploy_policy`, `set_pause` and `recover`. It simulates each one in recording mode without auth entries, checks that the recorded entries name exactly the required owners (the current owner, plus the new owner for an owner handoff through `deploy_policy`), and puts those entries in the unsigned transaction for the owners to sign.
+
+An owner handoff returns the new owner in `pending_authorizers`. Its transaction cannot be submitted yet, and its hash is provisional. The new owner signs its recorded entry with a `signature_expiration_ledger` after the latest ledger. `OwnerAdmin::complete_owner_handoff` checks that entry and its signature, simulates again in enforce mode for the final fee and resources, and returns the final transaction and hash. The current owner signs only that transaction.
+
+`recover` moves the full balance observed at preparation. An agent payment that settles first makes it fail with `InsufficientFunds`. Pause automation with `set_pause` before a recovery.

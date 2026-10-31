@@ -344,6 +344,10 @@ pub trait OperationStore {
     fn load(&self, operation_id: [u8; 32]) -> Result<Option<(SignedOperation, OperationStatus)>>;
 }
 /// Persist exact signed bytes before broadcast. An uncertain response retains them for lookup.
+/// A later call for the same operation looks up the original hash first. While that
+/// transaction is not on the ledger and the signed operation is still valid, the call resends
+/// the retained bytes. They keep their sequence number and hash, so the network includes them
+/// at most once. It never re-signs or replaces the transaction.
 pub fn submit(
     rpc: &dyn Rpc,
     store: &mut dyn OperationStore,
@@ -365,8 +369,14 @@ pub fn submit(
                 &signed.prepared.config.network,
                 &signed.transaction_hash,
             )?;
-            store.record(id, signed, observed.clone())?;
-            return Ok(observed);
+            // NOT_FOUND after TRY_AGAIN_LATER, a lost response or a dropped pending transaction:
+            // resend the same bytes only while they are still valid.
+            if observed != OperationStatus::SubmissionUnknown
+                || validate_signed(signed, now).is_err()
+            {
+                store.record(id, signed, observed.clone())?;
+                return Ok(observed);
+            }
         }
     }
     validate_signed(signed, now)?;
@@ -387,6 +397,8 @@ pub fn submit(
                     &signed.transaction_hash,
                 )
                 .unwrap_or(OperationStatus::SubmissionUnknown),
+                // The network did not accept the transaction. A later submit resends it.
+                Some("TRY_AGAIN_LATER") => OperationStatus::SubmissionUnknown,
                 _ => OperationStatus::SubmissionUnknown,
             };
             store.record(id, signed, status.clone())?;

@@ -650,6 +650,78 @@ fn hash_mismatch_and_unresolved_error_retain_uncertainty() {
         );
     }
 }
+/// sendTransaction answers TRY_AGAIN_LATER first, then PENDING. getTransaction answers
+/// NOT_FOUND, as for a transaction the network never accepted.
+struct BusyRpc {
+    inner: FakeRpc,
+    busy: Mutex<bool>,
+}
+impl rpc::Rpc for BusyRpc {
+    fn call(&self, method: &str, params: Value) -> Result<Value> {
+        let hash = hex(&self.inner.signed.transaction_hash);
+        match method {
+            "sendTransaction" => {
+                self.inner.calls.lock().unwrap().push(method.into());
+                let mut busy = self.busy.lock().unwrap();
+                let status = if *busy { "TRY_AGAIN_LATER" } else { "PENDING" };
+                *busy = false;
+                Ok(json!({"hash":hash,"status":status}))
+            }
+            "getTransaction" => {
+                self.inner.calls.lock().unwrap().push(method.into());
+                Ok(json!({"status":"NOT_FOUND"}))
+            }
+            _ => self.inner.call(method, params),
+        }
+    }
+}
+#[test]
+fn try_again_later_resends_the_same_bytes_until_expiry() {
+    let (c, r, s) = fixture(WalletRoute::Native, false);
+    let signed = sign_native(&prepare(&c, &r, &s, 86401, 86700).unwrap());
+    let rpc = BusyRpc {
+        inner: FakeRpc {
+            calls: Mutex::new(vec![]),
+            signed: signed.clone(),
+            fail_send: false,
+        },
+        busy: Mutex::new(true),
+    };
+    let mut store = Store::default();
+    assert_eq!(
+        rpc::submit(&rpc, &mut store, &signed, 86401).unwrap(),
+        OperationStatus::SubmissionUnknown
+    );
+    // The original hash is not on the ledger and the operation is still valid: resend it.
+    assert_eq!(
+        rpc::submit(&rpc, &mut store, &signed, 86500).unwrap(),
+        OperationStatus::Submitted
+    );
+    assert_eq!(
+        *rpc.inner.calls.lock().unwrap(),
+        vec!["sendTransaction", "getTransaction", "sendTransaction"]
+    );
+    assert_eq!(store.value.as_ref().unwrap().0, signed);
+    // After expiry the bytes stay retained for lookup and are not sent again.
+    assert_eq!(
+        rpc::submit(&rpc, &mut store, &signed, 86700).unwrap(),
+        OperationStatus::SubmissionUnknown
+    );
+    assert_eq!(
+        rpc.inner
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m.as_str() == "sendTransaction")
+            .count(),
+        2
+    );
+    assert_eq!(
+        store.value.as_ref().unwrap().1,
+        OperationStatus::SubmissionUnknown
+    );
+}
 struct AccountRpc {
     config: WalletConfig,
     account: AccountState,
@@ -1743,8 +1815,14 @@ impl rpc::Rpc for AdminRpc {
                 auth[0].root_invocation.sub_invocations =
                     vec![auth[0].root_invocation.clone()].try_into().unwrap();
             }
+            // Enforce mode also verifies signatures, so it reports a higher resource fee.
+            let fee: i64 = if params["authMode"] == "enforce" {
+                1500
+            } else {
+                1000
+            };
             return Ok(
-                json!({"minResourceFee":"1000","transactionData":SorobanTransactionData{resource_fee:1000,..Default::default()}.to_xdr_base64(Limits::none()).unwrap(),"results":[{"xdr":ScVal::Void.to_xdr_base64(Limits::none()).unwrap(),"auth":auth.iter().map(|a|a.to_xdr_base64(Limits::none()).unwrap()).collect::<Vec<_>>()}]}),
+                json!({"minResourceFee":fee.to_string(),"transactionData":SorobanTransactionData{resource_fee:fee,..Default::default()}.to_xdr_base64(Limits::none()).unwrap(),"results":[{"xdr":ScVal::Void.to_xdr_base64(Limits::none()).unwrap(),"auth":auth.iter().map(|a|a.to_xdr_base64(Limits::none()).unwrap()).collect::<Vec<_>>()}]}),
             );
         }
         self.base.call(method, params)
@@ -1952,6 +2030,7 @@ fn full_policy_deployment_uses_one_versioned_owner_flow_and_owner_handoff_author
             &op.auth[1].credentials,
             stellar_xdr::SorobanCredentials::Address(c) if c.address == address(&next_owner).unwrap()
         ));
+        assert_eq!(prepared.pending_authorizers, vec![next_owner.clone()]);
         let calls = rpc.calls.lock().unwrap();
         let (name, args) = calls.last().unwrap();
         assert_eq!(name, "deploy_policy");
@@ -1966,7 +2045,164 @@ fn full_policy_deployment_uses_one_versioned_owner_flow_and_owner_handoff_author
                 && e.val == stellar_xdr::ScVal::Bool(enabled)
         ));
         assert!(!fields.iter().any(|e| matches!(&e.key,stellar_xdr::ScVal::Symbol(k) if [b"x402_signer".as_slice(),b"policy_version".as_slice()].contains(&k.0.as_slice()))));
+        drop(calls);
+        owner_handoff_completes_with_the_new_owner_signature(&rpc, &prepared, &op.auth[1]);
     }
+}
+
+/// Sign the new owner's recorded entry as a native wallet does.
+fn sign_owner_entry(
+    network: &str,
+    recorded: &stellar_xdr::SorobanAuthorizationEntry,
+    seed: &[u8; 32],
+    expiration: u32,
+) -> stellar_xdr::SorobanAuthorizationEntry {
+    use ed25519_dalek::{Signer, SigningKey};
+    use stellar_xdr::*;
+    let mut entry = recorded.clone();
+    let SorobanCredentials::Address(c) = &mut entry.credentials else {
+        panic!()
+    };
+    c.signature_expiration_ledger = expiration;
+    let payload = hash(
+        HashIdPreimage::SorobanAuthorization(HashIdPreimageSorobanAuthorization {
+            network_id: Hash(network_id(network).unwrap()),
+            nonce: c.nonce,
+            signature_expiration_ledger: expiration,
+            invocation: entry.root_invocation.clone(),
+        })
+        .to_xdr(Limits::none())
+        .unwrap(),
+    );
+    let key = SigningKey::from_bytes(seed);
+    let bytes = |v: &[u8]| ScVal::Bytes(ScBytes(v.to_vec().try_into().unwrap()));
+    c.signature = ScVal::Vec(Some(
+        vec![sc_map(vec![
+            ("public_key", bytes(key.verifying_key().as_bytes())),
+            ("signature", bytes(&key.sign(&payload).to_bytes())),
+        ])]
+        .try_into()
+        .unwrap(),
+    ));
+    entry
+}
+
+fn owner_handoff_completes_with_the_new_owner_signature(
+    rpc: &AdminRpc,
+    prepared: &allowit_stellar_wallet::admin::PreparedOwnerOperation,
+    recorded: &stellar_xdr::SorobanAuthorizationEntry,
+) {
+    use allowit_policy_sdk::admin::{Admin, DeploymentVersion};
+    use allowit_stellar_wallet::admin::{OwnerAdmin, PreparedOwnerOperation};
+    use stellar_xdr::*;
+    let c = &rpc.base.config;
+    let owner_admin = OwnerAdmin {
+        rpc,
+        config: c,
+        now: 86401,
+    };
+    // The latest ledger in the mock is 120.
+    let signed = sign_owner_entry(&c.network, recorded, &[51; 32], 130);
+    let signed_xdr = signed.to_xdr_base64(Limits::none()).unwrap();
+    let rejects = |entry: SorobanAuthorizationEntry| {
+        owner_admin
+            .complete_owner_handoff(prepared, &entry.to_xdr_base64(Limits::none()).unwrap())
+            .is_err()
+    };
+    assert!(rejects(sign_owner_entry(
+        &c.network, recorded, &[52; 32], 130
+    )));
+    assert!(rejects(sign_owner_entry(
+        &c.network, recorded, &[51; 32], 120
+    )));
+    // A validly signed entry with another nonce or scope is not the recorded entry.
+    let mut other = recorded.clone();
+    if let SorobanCredentials::Address(credentials) = &mut other.credentials {
+        credentials.nonce += 1;
+    }
+    assert!(rejects(sign_owner_entry(
+        &c.network, &other, &[51; 32], 130
+    )));
+    let mut forged = signed.clone();
+    if let SorobanCredentials::Address(credentials) = &mut forged.credentials {
+        credentials.signature_expiration_ledger = 131;
+    }
+    assert!(rejects(forged));
+    let stale = OwnerAdmin {
+        rpc,
+        config: c,
+        now: prepared.expires_at,
+    };
+    assert!(stale.complete_owner_handoff(prepared, &signed_xdr).is_err());
+    let mut tampered = prepared.clone();
+    tampered.transaction_hash[0] ^= 1;
+    assert!(
+        owner_admin
+            .complete_owner_handoff(&tampered, &signed_xdr)
+            .is_err()
+    );
+    let json = serde_json::to_value(prepared).unwrap();
+    assert_eq!(
+        serde_json::from_value::<PreparedOwnerOperation>(json).unwrap(),
+        *prepared
+    );
+
+    let done = owner_admin
+        .complete_owner_handoff(prepared, &signed_xdr)
+        .unwrap();
+    assert!(done.pending_authorizers.is_empty());
+    assert_eq!(done.required_authorizers, prepared.required_authorizers);
+    assert_ne!(done.transaction_hash, prepared.transaction_hash);
+    let TransactionEnvelope::Tx(envelope) =
+        TransactionEnvelope::from_xdr_base64(&done.transaction_xdr, Limits::none()).unwrap()
+    else {
+        panic!()
+    };
+    assert!(envelope.signatures.is_empty());
+    // Fee and resources come from the enforce-mode simulation of the signed entry.
+    assert_eq!(envelope.tx.fee, 1600);
+    let TransactionExt::V1(data) = &envelope.tx.ext else {
+        panic!()
+    };
+    assert_eq!(data.resource_fee, 1500);
+    let OperationBody::InvokeHostFunction(op) = &envelope.tx.operations[0].body else {
+        panic!()
+    };
+    assert_eq!(op.auth[0].credentials, SorobanCredentials::SourceAccount);
+    assert_eq!(op.auth[1], signed);
+    // The returned hash is the hash of the final transaction the current owner signs.
+    let payload = TransactionSignaturePayload {
+        network_id: Hash(network_id(&c.network).unwrap()),
+        tagged_transaction: TransactionSignaturePayloadTaggedTransaction::Tx(envelope.tx.clone()),
+    };
+    assert_eq!(
+        done.transaction_hash,
+        hash(payload.to_xdr(Limits::none()).unwrap())
+    );
+    assert!(
+        owner_admin
+            .complete_owner_handoff(&done, &signed_xdr)
+            .is_err()
+    );
+    // An operation without a new owner has nothing to complete.
+    let paused = Admin::new(OwnerAdmin {
+        rpc,
+        config: c,
+        now: 86401,
+    })
+    .set_pause(true, DeploymentVersion(3))
+    .unwrap();
+    assert!(paused.pending_authorizers.is_empty());
+    assert!(
+        !serde_json::to_string(&paused)
+            .unwrap()
+            .contains("pendingAuthorizers")
+    );
+    assert!(
+        owner_admin
+            .complete_owner_handoff(&paused, &signed_xdr)
+            .is_err()
+    );
 }
 #[test]
 fn canonical_main_revision_packet_is_status_only_and_preserves_signed_bytes() {

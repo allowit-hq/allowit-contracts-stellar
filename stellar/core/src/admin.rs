@@ -154,6 +154,12 @@ pub struct PreparedOwnerOperation {
     pub transaction_hash: [u8; 32],
     pub expires_at: u64,
     pub required_authorizers: Vec<String>,
+    /// Owners whose address authorization entry is still unsigned (the new owner of an owner
+    /// handoff). While this is not empty, the transaction cannot be submitted and
+    /// `transaction_hash` is provisional. Call [`OwnerAdmin::complete_owner_handoff`] with the
+    /// new owner's signed entry first. The current owner signs only the returned transaction.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_authorizers: Vec<String>,
 }
 
 /// Bound vendor implementation. Native account ownership is required for this
@@ -302,16 +308,6 @@ impl OwnerAdmin<'_> {
         if response.get("error").is_some() {
             return Err("Owner operation simulation rejected".into());
         }
-        let fee = response["minResourceFee"]
-            .as_str()
-            .ok_or("Missing resource fee")?
-            .parse::<u32>()
-            .map_err(err)?
-            .checked_add(100)
-            .ok_or("Fee overflow")?;
-        if fee > self.config.max_fee_stroops {
-            return Err("Owner operation exceeds configured fee ceiling".into());
-        }
         let results = response["results"]
             .as_array()
             .ok_or("Missing simulation result")?;
@@ -335,6 +331,7 @@ impl OwnerAdmin<'_> {
             unreachable!()
         };
         let mut seen = Vec::new();
+        let mut pending = Vec::new();
         for entry in &parsed {
             if entry.root_invocation.function != SorobanAuthorizedFunction::ContractFn(call.clone())
                 || !entry.root_invocation.sub_invocations.is_empty()
@@ -344,7 +341,9 @@ impl OwnerAdmin<'_> {
             let who = match &entry.credentials {
                 SorobanCredentials::SourceAccount => snapshot.owner.address.clone(),
                 SorobanCredentials::Address(c) | SorobanCredentials::AddressV2(c) => {
-                    address_text(&c.address)?
+                    let who = address_text(&c.address)?;
+                    pending.push(who.clone());
+                    who
                 }
                 _ => return Err("Unsupported owner credentials".into()),
             };
@@ -358,18 +357,7 @@ impl OwnerAdmin<'_> {
         }
         op.auth = parsed.try_into().map_err(err)?;
         tx.operations = operations.try_into().map_err(err)?;
-        tx.fee = fee;
-        tx.ext = TransactionExt::V1(read(
-            response["transactionData"]
-                .as_str()
-                .ok_or("Missing owner resource data")?,
-        )?);
-        if let TransactionExt::V1(ref data) = tx.ext
-            && (data.resource_fee < 0
-                || u64::try_from(data.resource_fee).map_err(err)? + 100 != u64::from(fee))
-        {
-            return Err("Owner resource fee differs from simulation".into());
-        }
+        self.apply_resources(&mut tx, &response)?;
         Ok(PreparedOwnerOperation {
             network: self.config.network.clone(),
             wallet: self.config.wallet.clone(),
@@ -383,7 +371,142 @@ impl OwnerAdmin<'_> {
             }))?,
             expires_at: expires,
             required_authorizers: authorizers,
+            pending_authorizers: pending,
         })
+    }
+    /// Set the fee and resource data from a simulation, within the configured fee ceiling.
+    fn apply_resources(&self, tx: &mut Transaction, response: &serde_json::Value) -> Result<()> {
+        let fee = response["minResourceFee"]
+            .as_str()
+            .ok_or("Missing resource fee")?
+            .parse::<u32>()
+            .map_err(err)?
+            .checked_add(100)
+            .ok_or("Fee overflow")?;
+        if fee > self.config.max_fee_stroops {
+            return Err("Owner operation exceeds configured fee ceiling".into());
+        }
+        let data: SorobanTransactionData = read(
+            response["transactionData"]
+                .as_str()
+                .ok_or("Missing owner resource data")?,
+        )?;
+        if data.resource_fee < 0
+            || u64::try_from(data.resource_fee).map_err(err)? + 100 != u64::from(fee)
+        {
+            return Err("Owner resource fee differs from simulation".into());
+        }
+        tx.fee = fee;
+        tx.ext = TransactionExt::V1(data);
+        Ok(())
+    }
+    /// Complete an owner handoff prepared by `deploy_policy`.
+    ///
+    /// `signed_entry_xdr` is the new owner's recorded authorization entry from
+    /// `prepared.transaction_xdr`, signed by the new owner's G-address key with a
+    /// `signature_expiration_ledger` after the latest ledger. This checks that only the
+    /// expiration ledger and the signature changed, verifies the signature, simulates the
+    /// transaction again in enforce mode for the final fee and resources, and returns the final
+    /// unsigned transaction and its hash. The current owner signs only that transaction.
+    pub fn complete_owner_handoff(
+        &self,
+        prepared: &PreparedOwnerOperation,
+        signed_entry_xdr: &str,
+    ) -> Result<PreparedOwnerOperation> {
+        validate_config(self.config)?;
+        if prepared.network != self.config.network
+            || prepared.wallet != self.config.wallet
+            || prepared.owner != self.config.owner
+            || prepared.function != "deploy_policy"
+        {
+            return Err("Owner handoff differs from the bound wallet".into());
+        }
+        let [new_owner] = prepared.pending_authorizers.as_slice() else {
+            return Err("Owner handoff requires exactly one pending new owner".into());
+        };
+        if prepared.required_authorizers != [prepared.owner.clone(), new_owner.clone()] {
+            return Err("Owner handoff authorizers differ".into());
+        }
+        if self.now >= prepared.expires_at {
+            return Err("Owner handoff is stale".into());
+        }
+        let TransactionEnvelope::Tx(envelope) = read(&prepared.transaction_xdr)? else {
+            return Err("Expected an owner transaction".into());
+        };
+        if !envelope.signatures.is_empty() {
+            return Err("Owner handoff transaction is already signed".into());
+        }
+        let mut tx = envelope.tx;
+        let Preconditions::Time(bounds) = &tx.cond else {
+            return Err("Owner handoff time bounds differ".into());
+        };
+        if transaction_hash(&self.config.network, &tx)? != prepared.transaction_hash
+            || bounds.max_time.0 != prepared.expires_at
+        {
+            return Err("Owner handoff transaction identity differs".into());
+        }
+        if tx.operations.len() != 1 {
+            return Err("One owner invocation is required".into());
+        }
+        let mut operations = tx.operations.to_vec();
+        let OperationBody::InvokeHostFunction(ref mut op) = operations[0].body else {
+            return Err("Expected owner invocation".into());
+        };
+        let mut auth = op.auth.to_vec();
+        let new_owner_address = address(new_owner)?;
+        let mut slots = auth.iter().enumerate().filter(|(_, entry)| {
+            matches!(&entry.credentials, SorobanCredentials::Address(c) if c.address == new_owner_address)
+        });
+        let (Some((index, _)), None) = (slots.next(), slots.next()) else {
+            return Err("Owner handoff needs one new owner address entry".into());
+        };
+        let SorobanCredentials::Address(recorded) = &auth[index].credentials else {
+            unreachable!()
+        };
+        if recorded.signature != ScVal::Void {
+            return Err("New owner entry is already signed".into());
+        }
+        let signed: SorobanAuthorizationEntry = read(signed_entry_xdr)?;
+        let SorobanCredentials::Address(credentials) = &signed.credentials else {
+            return Err("New owner address authorization is required".into());
+        };
+        let mut unsigned = signed.clone();
+        if let SorobanCredentials::Address(c) = &mut unsigned.credentials {
+            c.signature = ScVal::Void;
+            c.signature_expiration_ledger = recorded.signature_expiration_ledger;
+        }
+        if unsigned != auth[index] {
+            return Err("New owner authorization scope differs".into());
+        }
+        let latest = self.rpc.call("getLatestLedger", json!({}))?["sequence"]
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or("Missing latest ledger")?;
+        if credentials.signature_expiration_ledger <= latest {
+            return Err("New owner authorization has expired".into());
+        }
+        authorization::verify_account_signature(&self.config.network, &signed, new_owner)?;
+        auth[index] = signed;
+        op.auth = auth.try_into().map_err(err)?;
+        tx.operations = operations.try_into().map_err(err)?;
+        // The signed entry changes the transaction, and verifying the new owner's signature
+        // changes the resources. Enforce mode checks every entry and returns the final resources.
+        let response=self.rpc.call("simulateTransaction",json!({"transaction":xdr(&TransactionEnvelope::Tx(TransactionV1Envelope{tx:tx.clone(),signatures:VecM::default()}))?,"authMode":"enforce"}))?;
+        if response.get("error").is_some() {
+            return Err("Owner handoff simulation rejected".into());
+        }
+        if response["results"].as_array().map(Vec::len) != Some(1) {
+            return Err("Unexpected owner simulation result count".into());
+        }
+        self.apply_resources(&mut tx, &response)?;
+        let mut out = prepared.clone();
+        out.transaction_hash = transaction_hash(&self.config.network, &tx)?;
+        out.transaction_xdr = xdr(&TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: VecM::default(),
+        }))?;
+        out.pending_authorizers = Vec::new();
+        Ok(out)
     }
 }
 impl DeployPolicy for OwnerAdmin<'_> {
@@ -432,6 +555,10 @@ impl SetPause for OwnerAdmin<'_> {
 impl RecoverFunds for OwnerAdmin<'_> {
     type Output = PreparedOwnerOperation;
     type Error = String;
+    /// Recover the full balance observed at preparation. The amount is fixed in the
+    /// transaction, so an agent payment or x402 transfer that settles before the recovery makes
+    /// it fail with `InsufficientFunds`, and the owner still pays the fee. Pause automation
+    /// with `set_pause` and let that transaction settle before preparing a recovery.
     fn recover_funds(&mut self, token: &str) -> Result<PreparedOwnerOperation> {
         let s = self.snapshot()?;
         if token != self.config.asset {
