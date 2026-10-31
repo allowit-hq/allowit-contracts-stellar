@@ -82,6 +82,42 @@ pub(crate) fn verify_account_signature(
         .map_err(err)
 }
 
+/// Sign an unsigned address authorization entry with a G-account seed, as a classic account
+/// signature, valid through `expiration_ledger`. Use it for a new owner's handoff entry.
+pub fn sign_account_entry(
+    network: &str,
+    entry: &SorobanAuthorizationEntry,
+    seed: &[u8; 32],
+    expiration_ledger: u32,
+) -> Result<SorobanAuthorizationEntry> {
+    let mut signed = entry.clone();
+    let SorobanCredentials::Address(credentials) = &mut signed.credentials else {
+        return Err("Address authorization is required".into());
+    };
+    let signer = account_for_seed(seed);
+    if credentials.address != address(&signer)? || credentials.signature != ScVal::Void {
+        return Err("The seed does not own this unsigned authorization entry".into());
+    }
+    credentials.signature_expiration_ledger = expiration_ledger;
+    let signature = SigningKey::from_bytes(seed)
+        .sign(&payload(network, &signed)?)
+        .to_bytes();
+    let value = ScVal::Vec(Some(
+        vec![value_map(vec![
+            ("public_key", value_bytes(&account_key(&signer)?)?),
+            ("signature", value_bytes(&signature)?),
+        ])?]
+        .try_into()
+        .map_err(err)?,
+    ));
+    let SorobanCredentials::Address(credentials) = &mut signed.credentials else {
+        unreachable!()
+    };
+    credentials.signature = value;
+    verify_account_signature(network, &signed, &signer)?;
+    Ok(signed)
+}
+
 pub(crate) fn server_signature(p: &PreparedOperation, require_signed: bool) -> Result<ScVal> {
     let TransactionEnvelope::Tx(envelope) = read(&p.transaction_xdr)? else {
         return Err("Expected a policy transaction".into());
@@ -178,48 +214,55 @@ pub(crate) fn attach(p: &PreparedOperation, signature: ScVal) -> Result<Prepared
 
 /// Sign the service's exact native authorization after trusted simulation, before agent signing.
 /// This changes the transaction hash. Persist and deliver the returned packet to the agent.
+///
+/// The service evaluates the installed policy on the host first. A Custom wallet runs its whole
+/// policy onchain, so native preflight completes it. A Simple or Common wallet runs at most its
+/// prefix onchain: a policy that is not canonical-only needs `authorize_server_with` and the
+/// compiled evaluator of its source. Layout 4 wallets keep standard accounting onchain, so
+/// `accounting` must be `None`.
 pub fn authorize_server(
     p: &PreparedOperation,
     seed: &[u8; 32],
     now: u64,
     accounting: Option<rpc::NativeAccounting>,
 ) -> Result<PreparedOperation> {
+    if accounting.is_some() {
+        return Err("Contract policy accounting cannot be replaced by service counters".into());
+    }
+    authorize_service(p, seed, now, None)
+}
+/// `authorize_server` with the compiled evaluator of the installed source, built by the
+/// server's policy build gate from the same bytes as `config.policy_source`.
+pub fn authorize_server_with(
+    p: &PreparedOperation,
+    seed: &[u8; 32],
+    now: u64,
+    evaluator: policy::PortableEvaluator,
+) -> Result<PreparedOperation> {
+    authorize_service(p, seed, now, Some(evaluator))
+}
+fn authorize_service(
+    p: &PreparedOperation,
+    seed: &[u8; 32],
+    now: u64,
+    evaluator: Option<policy::PortableEvaluator>,
+) -> Result<PreparedOperation> {
     if p.config.route != WalletRoute::PolicyWallet || account_for_seed(seed) != p.config.server {
         return Err("Configured policy service signer required".into());
     }
     validate_prepared(p, now)?;
-    if p.config.policy_engine == Some(PolicyEngine::SimplePolicyEngine) {
-        let usage =
-            accounting.ok_or("SimplePolicyEngine requires authoritative service accounting")?;
-        if usage.nonce != p.state.nonce || usage.deployment_version != p.state.deployment_version {
-            return Err("Service accounting differs from active policy ordering".into());
-        }
-        let policy =
-            allowit_policy_sdk::compile_stellar_policy(&p.config.policy_source).map_err(err)?;
-        let transfer = transfer_from_request(&p.config, &p.request)?;
-        let pass_through = policy.engine_recommendations().iter().any(|choice| {
-            choice.engine == PolicyEngine::SimplePolicyEngine && choice.onchain_policy
-        });
-        if !pass_through
-            && (policy.uses_named_state()
-                || !policy.explicit_engine_checks.is_empty()
-                || !policy.evaluate_classic(&allowit_policy_sdk::StellarPolicyContext {
-                    asset: p.config.asset.clone(),
-                    recipient: transfer.recipient,
-                    token: p.config.asset_symbol.clone(),
-                    decimals: 7,
-                    amount: transfer.amount,
-                    spent_daily: usage.spent_daily,
-                    spent_total: usage.spent_total,
-                    spent_day: usage.spent_day,
-                    calls: usage.calls,
-                    now,
-                }))
-        {
-            return Err("SimplePolicyEngine service policy denied the exact transfer".into());
-        }
-    } else if accounting.is_some() {
-        return Err("Contract policy accounting cannot be replaced by service counters".into());
+    let tier = p.config.tier.ok_or("Selected policy tier is required")?;
+    let evaluation = verify_operation(
+        &p.config,
+        &p.request,
+        &p.terms,
+        &p.state,
+        now,
+        p.expires_at,
+        evaluator,
+    )?;
+    if tier.standard() && evaluation == policy::Evaluation::Prefix {
+        return Err("The service must evaluate the full Simple or Common policy; supply its compiled evaluator".into());
     }
     if server_signature(p, false)? != ScVal::Void {
         return Err("Service authorization is already signed".into());

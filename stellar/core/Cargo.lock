@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "allowit"
+version = "0.1.0"
+
+[[package]]
 name = "allowit-sdk"
 version = "0.1.0"
 source = "git+https://github.com/allowit-hq/allowit-sdk.git?rev=67f5d696847992e18131f815ce905713ec3646e1#67f5d696847992e18131f815ce905713ec3646e1"
@@ -22,6 +26,7 @@ dependencies = [
 name = "allowit-stellar-wallet"
 version = "0.1.0"
 dependencies = [
+ "allowit",
  "allowit-sdk",
  "base64 0.22.1",
  "ed25519-dalek",

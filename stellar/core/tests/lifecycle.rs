@@ -42,9 +42,13 @@ fn fixture_with_wallet(
     } else {
         Contract(contract).to_string()
     };
-    let source =
+    let portable = route == WalletRoute::PolicyWallet;
+    let source = if portable {
+        PORTABLE.to_string()
+    } else {
         "use allowit::v1::prelude::*; async fn _execute(ctx: &Context) -> PolicyResult { Ok(()) }"
-            .to_string();
+            .to_string()
+    };
     let mut c = WalletConfig {
         network: "stellar:testnet".into(),
         policy_instance: [7; 32],
@@ -53,8 +57,15 @@ fn fixture_with_wallet(
         agent: agent.clone(),
         server: engine.clone(),
         route: route.clone(),
-        policy_engine: (route == WalletRoute::PolicyWallet)
-            .then_some(PolicyEngine::SimplePolicyEngine),
+        tier: portable.then_some(PolicyTier::Simple),
+        language: if portable {
+            PolicyLanguage::Portable
+        } else {
+            PolicyLanguage::Legacy
+        },
+        rules: vec![],
+        params: PolicyParams::default(),
+        source_digest: [0; 32],
         asset: String::new(),
         asset_symbol: if usdc { "USDC" } else { "XLM" }.into(),
         asset_issuer: usdc.then(|| account_for_seed(&[9; 32])),
@@ -65,6 +76,16 @@ fn fixture_with_wallet(
     };
     c.asset = sac_address(&c.network, &asset_xdr(&c).unwrap()).unwrap();
     let recipient = account_for_seed(&[6; 32]);
+    if portable {
+        c.params = policy::params_from_json(
+            &json!({"recipients": [recipient]}),
+            Some(PolicyTier::Simple),
+        )
+        .unwrap();
+        c.source_digest =
+            policy::standard_prefix_digest(PolicyTier::Simple, &c.module_digest, &c.asset, &[])
+                .unwrap();
+    }
     let token = WorkflowAsset::Token(AssetId {
         network: network_id(&c.network).unwrap(),
         token: wf(&c.asset),
@@ -149,10 +170,13 @@ fn fixture_with_wallet(
         }
     };
     let state = TrustedState {
-        contract_version: (route == WalletRoute::PolicyWallet).then_some(1),
-        policy_state: (route == WalletRoute::PolicyWallet).then_some(PolicyStateSnapshot {
-            grant: NativeValues::default(),
-            spent: NativeValues::default(),
+        contract_version: portable.then_some(CONTRACT_VERSION),
+        policy_state: portable.then(|| PolicyStateSnapshot {
+            params: c.params.clone(),
+            state: PolicyParams::default(),
+            rules: vec![],
+            source_digest: c.source_digest,
+            x402_enabled: false,
         }),
         source: account,
         nonce: 9,
@@ -289,23 +313,7 @@ fn server_ready(p: &PreparedOperation) -> PreparedOperation {
                 Ok(auth) => auth,
                 Err(error) => return Ok(json!({ "error": error })),
             };
-            let t = transfer_from_request(&p.config, &p.request)?;
-            let bytes = |b: [u8; 32]| ScVal::Bytes(ScBytes(b.to_vec().try_into().unwrap()));
-            let receipt = sc_map(vec![
-                ("operation_id", bytes(p.request.operation.nonce)),
-                ("token", ScVal::Address(address(&t.token)?)),
-                ("from", ScVal::Address(address(&t.source)?)),
-                ("to", ScVal::Address(address(&t.recipient)?)),
-                (
-                    "amount",
-                    ScVal::I128(Int128Parts {
-                        hi: (t.amount >> 64) as i64,
-                        lo: t.amount as u64,
-                    }),
-                ),
-                ("nonce", ScVal::U64(p.state.nonce)),
-                ("deployment_version", ScVal::U64(p.state.deployment_version)),
-            ]);
+            let receipt = rpc::expected_receipt(p)?.scval()?;
             let resources = p.simulation_data.clone().unwrap_or(
                 SorobanTransactionData::default()
                     .to_xdr_base64(Limits::none())
@@ -318,17 +326,7 @@ fn server_ready(p: &PreparedOperation) -> PreparedOperation {
         }
     }
     let simulated = rpc::simulate(&Simulation(p), p).unwrap();
-    let accounting = (p.config.policy_engine == Some(PolicyEngine::SimplePolicyEngine)).then_some(
-        rpc::NativeAccounting {
-            nonce: p.state.nonce,
-            deployment_version: p.state.deployment_version,
-            spent_daily: p.state.spent_daily,
-            spent_total: p.state.spent_total,
-            spent_day: p.state.spent_day,
-            calls: p.state.calls,
-        },
-    );
-    let signed = authorize_server(&simulated, &[3; 32], 86401, accounting).unwrap();
+    let signed = authorize_server(&simulated, &[3; 32], 86401, None).unwrap();
     assert!(signed.native_preflight.is_none());
     rpc::simulate(&Simulation(&signed), &signed).unwrap()
 }
@@ -404,15 +402,31 @@ fn stale_or_changed_payload_cannot_be_signed() {
 #[test]
 fn classic_caps_keep_exact_local_math_while_odc_requires_native_preflight() {
     for route in [WalletRoute::Native, WalletRoute::PolicyWallet] {
-        let (mut c, mut r, mut s) = fixture(route, true);
-        c.policy_source="use allowit::v1::prelude::*; async fn _execute(ctx: &Context) -> PolicyResult { allowit::cap_per_transaction(ctx, \"2\", \"USDC\")?; Ok(()) }".into();
-        c.source_hash = hash(&c.policy_source);
-        s.source_hash = c.source_hash;
-        if c.route == WalletRoute::Native {
-            assert!(prepare(&c, &r, &s, 86401, 86700).is_ok());
+        let (mut c, mut r, mut s) = fixture(route.clone(), true);
+        if route == WalletRoute::Native {
+            c.policy_source="use allowit::v1::prelude::*; async fn _execute(ctx: &Context) -> PolicyResult { allowit::cap_per_transaction(ctx, \"2\", \"USDC\")?; Ok(()) }".into();
+            c.source_hash = hash(&c.policy_source);
         } else {
+            install(
+                &mut c,
+                PolicyTier::Common,
+                CAPPED,
+                json!({"recipients": [account_for_seed(&[6; 32])], "transaction_cap": 20_000_000}),
+            );
+            s.policy_state = Some(PolicyStateSnapshot {
+                params: c.params.clone(),
+                state: PolicyParams::default(),
+                rules: c.rules.clone(),
+                source_digest: c.source_digest,
+                x402_enabled: false,
+            });
+        }
+        s.source_hash = c.source_hash;
+        let prepared = prepare(&c, &r, &s, 86401, 86700).unwrap();
+        if c.route == WalletRoute::PolicyWallet {
+            // Host evaluation admits it, but signing still needs native preflight.
             assert!(
-                prepare(&c, &r, &s, 86401, 86700)
+                sign(&prepared, &[2; 32], 86401)
                     .unwrap_err()
                     .contains("preflight")
             );
@@ -1264,6 +1278,51 @@ fn sc_map(fields: Vec<(&str, stellar_xdr::ScVal)>) -> stellar_xdr::ScVal {
     entries.sort_by(|a, b| a.key.cmp(&b.key));
     stellar_xdr::ScVal::Map(Some(entries.try_into().unwrap()))
 }
+/// Portable canonical-only source of the policy wallet fixtures.
+const PORTABLE: &str = "use allowit::prelude::*;\n/// Pay only recipients I approve.\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::recipients(ctx, ctx.params.get(allowit::RECIPIENTS))?;\n    Ok(())\n}\n";
+/// Layout 4 State of the fixture wallet.
+fn custody_scval(
+    c: &WalletConfig,
+    agent: &str,
+    owner: &str,
+    paused: bool,
+    nonce: u64,
+    deployment_version: u64,
+) -> stellar_xdr::ScVal {
+    allowit_stellar_wallet::contract::CustodyState {
+        policy_state: PolicyParams::default(),
+        contract_version: CONTRACT_VERSION,
+        owner: owner.into(),
+        agent: agent.into(),
+        server: c.server.clone(),
+        asset: c.asset.clone(),
+        policy_instance: c.policy_instance,
+        source_digest: c.source_digest,
+        rules: c.rules.clone(),
+        params: c.params.clone(),
+        x402_enabled: false,
+        token: c.asset_symbol.clone(),
+        deployment_version,
+        nonce,
+        paused,
+    }
+    .scval()
+    .unwrap()
+}
+/// The installed binding of the fixture wallet for one schema.
+fn binding_scval(c: &WalletConfig, schema: [u8; 32]) -> stellar_xdr::ScVal {
+    allowit_stellar_wallet::contract::PolicyBinding {
+        engine_kind: c.tier.unwrap().kind().into(),
+        contract_version: CONTRACT_VERSION,
+        policy_instance: c.policy_instance,
+        module_digest: c.module_digest,
+        source_digest: c.source_digest,
+        argument_schema_digest: schema,
+        entrypoint: "execute".into(),
+    }
+    .scval()
+    .unwrap()
+}
 struct PolicyWalletAccountRpc {
     config: WalletConfig,
     source: AccountState,
@@ -1308,72 +1367,14 @@ impl rpc::Rpc for PolicyWalletAccountRpc {
                 {
                     return Ok(json!({"latestLedger":120,"entries":[]}));
                 }
-                let state = sc_map(vec![
-                    ("contract_version", ScVal::U32(1)),
-                    ("paused", ScVal::Bool(self.paused)),
-                    (
-                        "owner",
-                        ScVal::Address(address(&Contract([33; 32]).to_string())?),
-                    ),
-                    ("agent", ScVal::Address(address(&self.source.address)?)),
-                    ("server", ScVal::Address(address(&c.server)?)),
-                    ("asset", ScVal::Address(address(&c.asset)?)),
-                    (
-                        "source_digest",
-                        ScVal::Bytes(ScBytes(c.source_hash.to_vec().try_into().unwrap())),
-                    ),
-                    (
-                        "rules",
-                        ScVal::Vec(Some(
-                            allowit_policy_sdk::select_stellar_engine(
-                                &c.policy_source,
-                                allowit_policy_sdk::StellarRail::PolicyWallet,
-                                c.policy_engine.unwrap(),
-                                false,
-                            )
-                            .unwrap()
-                            .rules
-                            .iter()
-                            .map(|name| {
-                                ScVal::Symbol(ScSymbol(
-                                    name.as_bytes().to_vec().try_into().unwrap(),
-                                ))
-                            })
-                            .collect::<Vec<_>>()
-                            .try_into()
-                            .unwrap(),
-                        )),
-                    ),
-                    (
-                        "grant",
-                        ScVal::Map(Some(
-                            vec![
-                                ScMapEntry {
-                                    key: ScVal::String(ScString(
-                                        b"daily_limit".to_vec().try_into().unwrap(),
-                                    )),
-                                    val: ScVal::U64(1_000_000_000),
-                                },
-                                ScMapEntry {
-                                    key: ScVal::String(ScString(
-                                        b"max_calls".to_vec().try_into().unwrap(),
-                                    )),
-                                    val: ScVal::U64(10),
-                                },
-                                ScMapEntry {
-                                    key: ScVal::String(ScString(
-                                        b"total_limit".to_vec().try_into().unwrap(),
-                                    )),
-                                    val: ScVal::U64(1_000_000_000),
-                                },
-                            ]
-                            .try_into()
-                            .unwrap(),
-                        )),
-                    ),
-                    ("nonce", ScVal::U64(4)),
-                    ("deployment_version", ScVal::U64(2)),
-                ]);
+                let state = custody_scval(
+                    c,
+                    &self.source.address,
+                    &Contract([33; 32]).to_string(),
+                    self.paused,
+                    4,
+                    2,
+                );
                 let entry = LedgerEntryData::ContractData(ContractDataEntry {
                     ext: ExtensionPoint::V0,
                     contract: address(&c.wallet)?,
@@ -1411,35 +1412,8 @@ impl rpc::Rpc for PolicyWalletAccountRpc {
                 let HostFunction::InvokeContract(call) = &op.host_function else {
                     panic!()
                 };
-                if call.function_name.0.as_slice() == b"policy_spent" {
-                    return Ok(
-                        json!({"results":[{"xdr":ScVal::Void.to_xdr_base64(Limits::none()).unwrap()}]}),
-                    );
-                }
-                let bytes = |b: [u8; 32]| ScVal::Bytes(ScBytes(b.to_vec().try_into().unwrap()));
-                let binding = sc_map(vec![
-                    (
-                        "engine_kind",
-                        ScVal::Symbol(ScSymbol(
-                            c.policy_engine
-                                .unwrap()
-                                .symbol()
-                                .as_bytes()
-                                .to_vec()
-                                .try_into()
-                                .unwrap(),
-                        )),
-                    ),
-                    ("contract_version", ScVal::U32(1)),
-                    ("policy_instance", bytes(c.policy_instance)),
-                    ("module_digest", bytes(c.module_digest)),
-                    ("source_digest", bytes(c.source_hash)),
-                    ("argument_schema_digest", bytes(hash(ARGUMENT_SCHEMA))),
-                    (
-                        "entrypoint",
-                        ScVal::Symbol(ScSymbol(b"_execute".to_vec().try_into().unwrap())),
-                    ),
-                ]);
+                assert_eq!(call.function_name.0.as_slice(), b"policy_binding");
+                let binding = binding_scval(c, hash(TRANSFER_SCHEMA));
                 Ok(json!({"results":[{"xdr":binding.to_xdr_base64(Limits::none()).unwrap()}]}))
             }
             _ => Err("unexpected RPC".into()),
@@ -1676,8 +1650,24 @@ impl rpc::Rpc for AdminRpc {
                 return self.base.call(method, params);
             }
             if matches!(key, LedgerKey::Account(_)) {
+                // Trusted delegated discovery reads the agent; owner administration reads the
+                // current owner and a new owner of a handoff.
+                let LedgerKey::Account(a) = &key else {
+                    unreachable!()
+                };
+                let Some(owner) = [self.base.config.owner.clone(), account_for_seed(&[51; 32])]
+                    .into_iter()
+                    .find(|owner| {
+                        a.account_id
+                            == AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+                                account_key(owner).unwrap(),
+                            )))
+                    })
+                else {
+                    return self.base.call(method, params);
+                };
                 let account = AccountState {
-                    address: self.base.config.owner.clone(),
+                    address: owner,
                     sequence: 40,
                     master_weight: 1,
                     low_threshold: 1,
@@ -1685,17 +1675,6 @@ impl rpc::Rpc for AdminRpc {
                     high_threshold: 1,
                     signers: vec![],
                 };
-                // Trusted delegated discovery reads the agent; owner administration reads owner.
-                let LedgerKey::Account(a) = &key else {
-                    unreachable!()
-                };
-                if a.account_id
-                    != AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(account_key(
-                        &account.address,
-                    )?)))
-                {
-                    return self.base.call(method, params);
-                }
                 return AccountRpc {
                     config: self.base.config.clone(),
                     account,
@@ -1750,39 +1729,22 @@ impl rpc::Rpc for AdminRpc {
                 panic!()
             };
             let function = String::from_utf8(call.function_name.0.to_vec()).unwrap();
-            if function == "policy_spent" {
-                return self.base.call(method, params);
-            }
             if function == "policy_binding" {
-                let bytes = |v: [u8; 32]| ScVal::Bytes(ScBytes(v.to_vec().try_into().unwrap()));
-                let c = &self.base.config;
-                let mut fields = vec![
-                    (
-                        "engine_kind",
-                        ScVal::Symbol(ScSymbol(
-                            c.policy_engine
-                                .unwrap()
-                                .symbol()
-                                .as_bytes()
-                                .to_vec()
-                                .try_into()
-                                .unwrap(),
-                        )),
-                    ),
-                    ("policy_instance", bytes(c.policy_instance)),
-                    ("module_digest", bytes(c.module_digest)),
-                    ("source_digest", bytes(c.source_hash)),
-                    ("argument_schema_digest", bytes(hash(ARGUMENT_SCHEMA))),
-                    (
-                        "entrypoint",
-                        ScVal::Symbol(ScSymbol(b"_execute".to_vec().try_into().unwrap())),
-                    ),
-                ];
+                let mut binding = binding_scval(&self.base.config, hash(TRANSFER_SCHEMA));
+                let ScVal::Map(Some(map)) = &mut binding else {
+                    panic!()
+                };
+                let mut fields = map.to_vec();
+                fields.retain(|e| {
+                    e.key
+                        != ScVal::Symbol(ScSymbol(b"contract_version".to_vec().try_into().unwrap()))
+                });
+                *map = fields.try_into().unwrap();
                 if let Some(version) = &self.binding_contract_version {
-                    fields.push(("contract_version", version.clone()));
+                    replace_field(&mut binding, "contract_version", version.clone());
                 }
                 return Ok(
-                    json!({"results":[{"xdr":sc_map(fields).to_xdr_base64(Limits::none()).unwrap()}]}),
+                    json!({"results":[{"xdr":binding.to_xdr_base64(Limits::none()).unwrap()}]}),
                 );
             }
             self.calls
@@ -1858,7 +1820,7 @@ fn admin_fixture(
 fn owner_admin_delegates_full_balance_and_versions_without_agent_or_engine_calls() {
     use allowit_policy_sdk::admin::{Admin, DeploymentVersion};
     use allowit_stellar_wallet::admin::OwnerAdmin;
-    let rpc = admin_fixture(1, Some(stellar_xdr::ScVal::U32(1)));
+    let rpc = admin_fixture(4, Some(stellar_xdr::ScVal::U32(4)));
     let c = &rpc.base.config;
     let mut facade = Admin::new(OwnerAdmin {
         rpc: &rpc,
@@ -1900,7 +1862,7 @@ fn owner_admin_fails_closed_on_release_owner_mismatch_auth_and_empty_balance() {
     use allowit_policy_sdk::admin::{Admin, DeploymentVersion};
     use allowit_stellar_wallet::admin::OwnerAdmin;
     for case in ["release", "owner", "auth", "balance"] {
-        let mut rpc = admin_fixture(1, Some(stellar_xdr::ScVal::U32(1)));
+        let mut rpc = admin_fixture(4, Some(stellar_xdr::ScVal::U32(4)));
         match case {
             "release" => {
                 rpc.state_contract_version = 0;
@@ -1932,19 +1894,20 @@ fn owner_admin_fails_closed_on_release_owner_mismatch_auth_and_empty_balance() {
 fn contract_release_and_persisted_counter_names_are_exact() {
     use stellar_xdr::ScVal;
     for (state, binding, works) in [
-        (1, Some(ScVal::U32(1)), true),
-        (0, Some(ScVal::U32(1)), false),
-        (2, Some(ScVal::U32(1)), false),
-        (1, None, false),
-        (1, Some(ScVal::U32(2)), false),
-        (1, Some(ScVal::Bool(true)), false),
+        (4, Some(ScVal::U32(4)), true),
+        (0, Some(ScVal::U32(4)), false),
+        (1, Some(ScVal::U32(4)), false),
+        (5, Some(ScVal::U32(4)), false),
+        (4, None, false),
+        (4, Some(ScVal::U32(1)), false),
+        (4, Some(ScVal::Bool(true)), false),
     ] {
         let rpc = admin_fixture(state, binding);
         let observed = rpc::trusted_state_for_discovery(&rpc, &rpc.base.config, None);
         assert_eq!(observed.is_ok(), works);
         if let Ok(observed) = observed {
             assert_eq!(observed.state.deployment_version, 2);
-            assert_eq!(observed.state.contract_version, Some(1));
+            assert_eq!(observed.state.contract_version, Some(CONTRACT_VERSION));
         }
     }
     let (_, _, mut old) = fixture(WalletRoute::PolicyWallet, false);
@@ -1977,23 +1940,24 @@ fn contract_release_and_persisted_counter_names_are_exact() {
 #[test]
 fn full_policy_deployment_uses_one_versioned_owner_flow_and_owner_handoff_authorization() {
     use allowit_policy_sdk::admin::{Admin, DeploymentVersion};
-    use allowit_stellar_wallet::admin::{Grant, OwnerAdmin, PolicyDeployment};
+    use allowit_stellar_wallet::admin::{OwnerAdmin, PolicyDeployment};
     for enabled in [false, true] {
-        let rpc = admin_fixture(1, Some(stellar_xdr::ScVal::U32(1)));
+        let rpc = admin_fixture(4, Some(stellar_xdr::ScVal::U32(4)));
         let c = &rpc.base.config;
         let next_owner = account_for_seed(&[51; 32]);
         let artifact = PolicyDeployment {
             owner: next_owner.clone(),
             agent: c.agent.clone(),
             server: c.server.clone(),
-            source_digest: c.source_hash,
+            source_digest: c.source_digest,
             rules: Vec::new(),
-            grant: Grant(std::collections::BTreeMap::from([(
-                "daily_cap".into(),
-                stellar_xdr::ScVal::U64(20),
-            )])),
+            params: policy::params_from_json(
+                &json!({"recipients": [account_for_seed(&[6; 32])], "call_cap": 20}),
+                Some(PolicyTier::Simple),
+            )
+            .unwrap(),
             x402_enabled: enabled,
-            wasm_hash: Some([8; 32]),
+            wasm_hash: None,
         };
         let mut admin = Admin::new(OwnerAdmin {
             rpc: &rpc,
@@ -2235,8 +2199,8 @@ fn canonical_main_revision_packet_is_status_only_and_preserves_signed_bytes() {
 #[test]
 fn enabled_x402_rejects_contract_agents() {
     use allowit_policy_sdk::admin::{Admin, DeploymentVersion};
-    use allowit_stellar_wallet::admin::{Grant, OwnerAdmin, PolicyDeployment};
-    let rpc = admin_fixture(1, Some(stellar_xdr::ScVal::U32(1)));
+    use allowit_stellar_wallet::admin::{OwnerAdmin, PolicyDeployment};
+    let rpc = admin_fixture(4, Some(stellar_xdr::ScVal::U32(4)));
     let c = &rpc.base.config;
     let mut admin = Admin::new(OwnerAdmin {
         rpc: &rpc,
@@ -2247,12 +2211,9 @@ fn enabled_x402_rejects_contract_agents() {
         owner: c.owner.clone(),
         agent: c.wallet.clone(),
         server: c.server.clone(),
-        source_digest: c.source_hash,
+        source_digest: c.source_digest,
         rules: Vec::new(),
-        grant: Grant(std::collections::BTreeMap::from([(
-            "daily_cap".into(),
-            stellar_xdr::ScVal::U64(2),
-        )])),
+        params: c.params.clone(),
         x402_enabled: true,
         wasm_hash: None,
     };
@@ -2476,11 +2437,8 @@ impl rpc::Rpc for PreflightRpc {
 }
 fn preflight_fixture() -> PreflightRpc {
     let (mut c, r, s) = fixture(WalletRoute::PolicyWallet, true);
-    c.policy_source = include_str!("fixtures/stellar-local-state-policy.rs").into();
-    if c.route == WalletRoute::PolicyWallet {
-        c.policy_engine = Some(PolicyEngine::CustomPolicy);
-    }
-    c.source_hash = hash(&c.policy_source);
+    c.tier = Some(PolicyTier::Custom);
+    c.source_digest = c.source_hash;
     PreflightRpc {
         base: PolicyWalletAccountRpc {
             config: c,
@@ -2523,9 +2481,9 @@ fn native_preflight_binds_new_signing_and_json_cannot_restore_it() {
                     .policy_state
                     .as_mut()
                     .unwrap()
-                    .spent
+                    .state
                     .0
-                    .insert("counter".into(), stellar_xdr::ScVal::U64(1));
+                    .insert("counter".into(), PolicyValue::Int(1));
             }
             _ => unreachable!(),
         };
@@ -2646,8 +2604,11 @@ fn odc_cannot_authorize_from_forged_classic_zero_usage() {
     state.spent_total = 0;
     state.spent_day = 1;
     state.calls = 0;
+    // Classic usage fields are informational for a policy wallet: the packet still needs native
+    // preflight, which reads the contract's own policy state.
+    let offline = prepare(c, &rpc.request, &state, 86401, 86700).unwrap();
     assert!(
-        prepare(c, &rpc.request, &state, 86401, 86700)
+        sign(&offline, &[2; 32], 86401)
             .unwrap_err()
             .contains("preflight")
     );
@@ -2726,9 +2687,6 @@ fn exact_pre_task_records_preserve_request_bytes_hashes_signatures_and_status_re
 fn classic_route_clearly_rejects_stateful_engine_calls_without_fake_validation() {
     let (mut c, r, mut state) = fixture(WalletRoute::Native, true);
     c.policy_source = include_str!("fixtures/stellar-local-state-policy.rs").into();
-    if c.route == WalletRoute::PolicyWallet {
-        c.policy_engine = Some(PolicyEngine::CustomPolicy);
-    }
     c.source_hash = hash(&c.policy_source);
     state.source_hash = c.source_hash;
     assert!(
@@ -2738,20 +2696,56 @@ fn classic_route_clearly_rejects_stateful_engine_calls_without_fake_validation()
     );
 }
 
-#[test]
-fn simple_service_authorization_checks_exact_source_and_durable_usage() {
-    let (mut c, r, s) = fixture(WalletRoute::PolicyWallet, true);
-    c.policy_source="use allowit::v1::prelude::*;async fn _execute(ctx:&Context)->PolicyResult{allowit::cap_per_transaction(ctx,\"1\",\"USDC\")?;Ok(())}".into();
-    c.source_hash = hash(&c.policy_source);
-    let rpc = PreflightRpc {
+/// Install `source` on the fixture wallet as `tier` with `params`.
+fn install(c: &mut WalletConfig, tier: PolicyTier, source: &str, params: Value) {
+    c.tier = Some(tier);
+    c.policy_source = source.into();
+    c.source_hash = hash(source);
+    c.rules = policy::tier_rules(tier, source).unwrap();
+    c.params = policy::params_from_json(&params, Some(tier)).unwrap();
+    c.source_digest =
+        policy::installed_source_digest(tier, &c.module_digest, &c.asset, &c.rules, source)
+            .unwrap();
+}
+fn preflight_rpc(c: &WalletConfig, r: &ExecutionRequest, s: &TrustedState) -> PreflightRpc {
+    PreflightRpc {
         base: PolicyWalletAccountRpc {
             config: c.clone(),
-            source: s.source,
+            source: s.source.clone(),
             paused: false,
         },
         request: r.clone(),
         failure: "",
-    };
+    }
+}
+const CAPPED: &str = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::recipients(ctx, ctx.params.get(allowit::RECIPIENTS))?;\n    allowit::transaction_cap(ctx, ctx.params.get(allowit::TRANSACTION_CAP))?;\n    Ok(())\n}\n";
+const SUFFIXED: &str = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::recipients(ctx, ctx.params.get(allowit::RECIPIENTS))?;\n    let cap: i128 = allowit::param(ctx, \"transaction_cap\");\n    if ctx.request.amount > cap {\n        return Err(AllowitError::TransactionCapExceeded);\n    }\n    Ok(())\n}\n";
+
+#[test]
+fn simple_service_authorization_evaluates_the_full_policy() {
+    let (mut c, r, s) = fixture(WalletRoute::PolicyWallet, true);
+    let recipient = account_for_seed(&[6; 32]);
+    // A canonical-only source runs in full on the host: a cap below the amount denies early.
+    install(
+        &mut c,
+        PolicyTier::Simple,
+        CAPPED,
+        json!({"recipients": [recipient], "transaction_cap": 1}),
+    );
+    let rpc = preflight_rpc(&c, &r, &s);
+    assert!(
+        rpc::prepare(&rpc, &c, &r, None, 86401, 86700)
+            .unwrap_err()
+            .contains("denied")
+    );
+    // Another source runs only its onchain part here; the service needs its compiled evaluator.
+    install(
+        &mut c,
+        PolicyTier::Simple,
+        SUFFIXED,
+        json!({"recipients": [recipient], "transaction_cap": 1}),
+    );
+    let rpc = preflight_rpc(&c, &r, &s);
     let prepared = rpc::prepare(&rpc, &c, &r, None, 86401, 86700).unwrap();
     let usage = rpc::NativeAccounting {
         nonce: prepared.state.nonce,
@@ -2761,53 +2755,67 @@ fn simple_service_authorization_checks_exact_source_and_durable_usage() {
         spent_day: 1,
         calls: 0,
     };
-    assert!(authorize_server(&prepared, &[3; 32], 86401, None).is_err());
     assert!(
-        authorize_server(&prepared, &[3; 32], 86401, Some(usage))
+        authorize_server(&prepared, &[3; 32], 86401, None)
             .unwrap_err()
-            .contains("denied")
+            .contains("compiled evaluator")
+    );
+    assert!(authorize_server(&prepared, &[3; 32], 86401, Some(usage)).is_err());
+    let compiled = |ctx: &allowit::AllowitContext| -> allowit::Result {
+        allowit::recipients(ctx, ctx.params.get(allowit::RECIPIENTS))?;
+        let cap: i128 = allowit::param(ctx, "transaction_cap");
+        if ctx.request.amount > cap {
+            return Err(allowit::AllowitError::TransactionCapExceeded);
+        }
+        Ok(())
+    };
+    assert!(
+        authorize_server_with(&prepared, &[3; 32], 86401, &compiled)
+            .unwrap_err()
+            .contains("TransactionCapExceeded")
     );
     assert!(sign(&prepared, &[2; 32], 86401).is_err());
+    install(
+        &mut c,
+        PolicyTier::Simple,
+        SUFFIXED,
+        json!({"recipients": [recipient], "transaction_cap": 100_000_000}),
+    );
+    let rpc = preflight_rpc(&c, &r, &s);
+    let prepared = rpc::prepare(&rpc, &c, &r, None, 86401, 86700).unwrap();
+    authorize_server_with(&prepared, &[3; 32], 86401, &compiled).unwrap();
 }
 
 #[test]
 fn selected_implementations_bind_constructor_and_both_authorities() {
-    use allowit_stellar_wallet::admin::{Grant, PolicyConfig};
-    for engine in [
-        PolicyEngine::SimplePolicyEngine,
-        PolicyEngine::CommonPolicyEngine,
-        PolicyEngine::CustomPolicy,
-    ] {
+    use allowit_stellar_wallet::admin::PolicyConfig;
+    for tier in [PolicyTier::Simple, PolicyTier::Common, PolicyTier::Custom] {
         let (mut c, r, s) = fixture(WalletRoute::PolicyWallet, true);
-        c.policy_engine = Some(engine);
-        if engine == PolicyEngine::CommonPolicyEngine {
-            c.policy_source="use allowit::v1::prelude::*;async fn _execute(request:&Context,grant:&Grant,state:&State)->Result<Spent,PolicyError>{allowit::daily_cap(request,state)}".into();
-        }
-        if engine == PolicyEngine::CustomPolicy {
-            c.policy_source = include_str!("fixtures/stellar-local-state-policy.rs").into();
-        }
-        c.source_hash = hash(&c.policy_source);
-        let config = PolicyConfig::for_policy(&c, Grant::default(), false, true).unwrap();
-        assert_eq!(config.source_digest, c.source_hash);
+        install(
+            &mut c,
+            tier,
+            CAPPED,
+            json!({"recipients": [account_for_seed(&[6; 32])], "transaction_cap": 100_000_000}),
+        );
+        let config = PolicyConfig::for_policy(&c, false).unwrap();
+        assert_eq!(config.source_digest, c.source_digest);
         assert_eq!(config.server, c.server);
+        assert_eq!(config.params, c.params);
         assert_eq!(
             config.rules,
-            if engine == PolicyEngine::CommonPolicyEngine {
-                vec!["daily_cap".to_string()]
+            if tier == PolicyTier::Common {
+                vec!["recipients".to_string(), "transaction_cap".to_string()]
             } else {
                 vec![]
             }
         );
+        if tier == PolicyTier::Custom {
+            assert_eq!(config.source_digest, c.source_hash);
+        } else {
+            assert_ne!(config.source_digest, c.source_hash);
+        }
         assert_eq!(config.constructor_args().unwrap().len(), 1);
-        let rpc = PreflightRpc {
-            base: PolicyWalletAccountRpc {
-                config: c.clone(),
-                source: s.source,
-                paused: false,
-            },
-            request: r.clone(),
-            failure: "",
-        };
+        let rpc = preflight_rpc(&c, &r, &s);
         let unsigned = rpc::prepare(&rpc, &c, &r, None, 86401, 86700).unwrap();
         assert!(sign(&unsigned, &[2; 32], 86401).is_err());
         let signed = server_ready(&unsigned);
@@ -2850,8 +2858,12 @@ fn common_installed_rules_cannot_omit_or_reorder_authored_checks() {
                         self.rules
                             .iter()
                             .map(|name| {
-                                ScVal::Symbol(ScSymbol(
-                                    name.as_bytes().to_vec().try_into().unwrap(),
+                                ScVal::Vec(Some(
+                                    vec![ScVal::Symbol(ScSymbol(
+                                        name.as_bytes().to_vec().try_into().unwrap(),
+                                    ))]
+                                    .try_into()
+                                    .unwrap(),
                                 ))
                             })
                             .collect::<Vec<_>>()
@@ -2868,14 +2880,17 @@ fn common_installed_rules_cannot_omit_or_reorder_authored_checks() {
         }
     }
     let (mut c, r, s) = fixture(WalletRoute::PolicyWallet, true);
-    c.policy_engine = Some(PolicyEngine::CommonPolicyEngine);
-    c.policy_source="use allowit::v1::prelude::*;async fn _execute(request:&Context,grant:&Grant,state:&State)->Result<Spent,PolicyError>{let daily=allowit::daily_cap(request,state)?;let next=allowit::with_spent(state,daily)?;allowit::total_cap(request,&next)}".into();
-    c.source_hash = hash(&c.policy_source);
+    install(
+        &mut c,
+        PolicyTier::Common,
+        CAPPED,
+        json!({"recipients": [account_for_seed(&[6; 32])], "transaction_cap": 100_000_000}),
+    );
     for rules in [
         vec![],
-        vec!["daily_cap"],
-        vec!["total_cap", "daily_cap"],
-        vec!["daily_cap", "daily_cap"],
+        vec!["recipients"],
+        vec!["transaction_cap", "recipients"],
+        vec!["recipients", "recipients"],
     ] {
         let rpc = ChangedRules {
             base: PreflightRpc {
@@ -2892,7 +2907,7 @@ fn common_installed_rules_cannot_omit_or_reorder_authored_checks() {
         assert!(
             rpc::prepare(&rpc, &c, &r, None, 86401, 86700)
                 .unwrap_err()
-                .contains("Installed rules differ")
+                .contains("rules")
         );
     }
 }
@@ -3034,11 +3049,12 @@ fn x402_packet_binds_both_raw_keys_and_the_complete_native_scope() {
         request: r,
         state: x402::WalletState {
             custody: state,
-            policy_engine: PolicyEngine::SimplePolicyEngine,
+            tier: PolicyTier::Simple,
             x402_enabled: true,
             paused: false,
         },
         expires_at: 86700,
+        terms: ExecutionTerms::default(),
         authorization_xdr: entry.to_xdr_base64(Limits::none()).unwrap(),
     };
     let digest = x402::signing_digest(&request, 86401).unwrap();
@@ -3072,7 +3088,7 @@ fn x402_packet_binds_both_raw_keys_and_the_complete_native_scope() {
     ] {
         let mut changed = request.clone();
         match case {
-            "tier" => changed.state.policy_engine = PolicyEngine::CommonPolicyEngine,
+            "tier" => changed.state.tier = PolicyTier::Common,
             "disabled" => changed.state.x402_enabled = false,
             "paused" => changed.state.paused = true,
             "zero_operation" => changed.request.operation.nonce = [0; 32],

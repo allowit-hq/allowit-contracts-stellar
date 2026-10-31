@@ -13,7 +13,9 @@ use crate::*;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WalletState {
     pub custody: TrustedState,
-    pub policy_engine: PolicyEngine,
+    /// Installed tier from the verified policy binding.
+    #[serde(alias = "policyEngine")]
+    pub tier: PolicyTier,
     pub x402_enabled: bool,
     pub paused: bool,
 }
@@ -27,6 +29,9 @@ pub struct SigningRequest {
     pub request: ExecutionRequest,
     pub state: WalletState,
     pub expires_at: u64,
+    /// Execution args and expense bounds signed inside the execution packet.
+    #[serde(default, skip_serializing_if = "ExecutionTerms::is_empty")]
+    pub terms: ExecutionTerms,
     /// Unsigned wallet-address authorization for exactly one SAC transfer.
     pub authorization_xdr: String,
 }
@@ -39,10 +44,10 @@ fn checked(
     let state = &request.state.custody;
     validate_config(c)?;
     if c.route != WalletRoute::PolicyWallet
-        || Some(request.state.policy_engine) != c.policy_engine
+        || Some(request.state.tier) != c.tier
         || !request.state.x402_enabled
         || request.state.paused
-        || state.contract_version != Some(1)
+        || state.contract_version != Some(CONTRACT_VERSION)
         || state.agent != c.agent
         || state.server != c.server
         || state.policy_instance != c.policy_instance
@@ -89,13 +94,18 @@ fn checked(
     if entry.root_invocation != expected {
         return Err("x402 authorization must match the one exact approved SAC transfer".into());
     }
+    if let Some(expense) = &request.terms.expense
+        && expense.day != now / 86_400
+    {
+        return Err("x402 expense bounds belong to another UTC day".into());
+    }
     let execution = policy_wallet_request(
         c,
         &request.request,
+        &request.terms,
         state,
-        &transfer,
+        &StellarOperation::Transfer(transfer.clone()),
         request.expires_at,
-        false,
     )?;
     let host_payload = authorization::payload(&c.network, &entry)?;
     let domain = ScVal::Vec(Some(
