@@ -1292,3 +1292,6 @@ mod sep56_tests;
 
 #[cfg(test)]
 mod portability_tests;
+
+#[cfg(test)]
+mod core_vectors_tests;

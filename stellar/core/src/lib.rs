@@ -593,7 +593,21 @@ pub fn validate_config(c: &WalletConfig) -> Result<()> {
     if c.route == WalletRoute::PolicyWallet {
         validate_portable_install(c)?;
     }
+    if c.route == WalletRoute::Native && c.language == PolicyLanguage::Portable {
+        validate_classic_portable_install(c)?;
+    }
     Ok(())
+}
+/// Classic custody enforces nothing onchain and its prepare and sign paths take no compiled
+/// evaluator, so the host must run the whole portable policy itself. Only a canonical-only
+/// source allows that: one `execute` of canonical rule calls over canonical params.
+fn validate_classic_portable_install(c: &WalletConfig) -> Result<()> {
+    if !policy::source_shape(&c.policy_source)?.canonical_only {
+        return Err("Portable classic custody supports only canonical-only sources: `use allowit::...;` items and one execute of canonical rule calls followed by Ok(()). Use a policy wallet for other sources".into());
+    }
+    c.params
+        .check(PolicyTier::Simple)
+        .map_err(|e| format!("Portable classic custody reads only canonical params: {e}"))
 }
 /// Bind a layout 4 policy wallet installation to its portable source: tier rules, binding
 /// digest, owner params and standard-state writes.

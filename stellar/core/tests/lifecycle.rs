@@ -1620,6 +1620,7 @@ struct AdminRpc {
     balance: i128,
     wrong_owner: bool,
     bad_auth: bool,
+    address_v2: bool,
 }
 fn replace_field(value: &mut stellar_xdr::ScVal, name: &str, new: stellar_xdr::ScVal) {
     let stellar_xdr::ScVal::Map(Some(map)) = value else {
@@ -1784,6 +1785,13 @@ impl rpc::Rpc for AdminRpc {
                 auth[0].root_invocation.sub_invocations =
                     vec![auth[0].root_invocation.clone()].try_into().unwrap();
             }
+            if self.address_v2 {
+                for entry in &mut auth {
+                    if let SorobanCredentials::Address(c) = &entry.credentials {
+                        entry.credentials = SorobanCredentials::AddressV2(c.clone());
+                    }
+                }
+            }
             // Enforce mode also verifies signatures, so it reports a higher resource fee.
             let fee: i64 = if params["authMode"] == "enforce" {
                 1500
@@ -1814,6 +1822,7 @@ fn admin_fixture(
         balance: 1234567,
         wrong_owner: false,
         bad_auth: false,
+        address_v2: false,
     }
 }
 #[test]
@@ -3118,6 +3127,27 @@ fn x402_packet_binds_both_raw_keys_and_the_complete_native_scope() {
         );
     }
     assert!(x402::assemble(&request, &agent, &server, 86700).is_err());
+    // A priced request signed before UTC midnight must not settle after it: the kernel checks
+    // the expense day against the settlement ledger time.
+    let late_now = 2 * 86_400 - 100;
+    let mut late = request.clone();
+    late.terms.expense = Some(ExpenseBounds {
+        gas_units: 100,
+        conversion_units: 0,
+        spent_units: 100,
+        max_fee_stroops: 100,
+        observed_ledger: late.state.custody.ledger,
+        day: 1,
+    });
+    for expires_at in [late_now + 200, 2 * 86_400] {
+        late.expires_at = expires_at;
+        let error = x402::signing_digest(&late, late_now).unwrap_err();
+        assert!(error.contains("cross its UTC expense day"), "{error}");
+    }
+    late.expires_at = 2 * 86_400 - 1;
+    if let Err(error) = x402::signing_digest(&late, late_now) {
+        assert!(!error.contains("cross its UTC expense day"), "{error}");
+    }
 }
 
 #[test]
@@ -3228,4 +3258,164 @@ fn service_auth_nonce_is_scoped_to_the_policy_wallet() {
     // Soroban tracks nonces per signer address, so equal nonces would block the second wallet.
     assert_ne!(service_nonce([4; 32]), service_nonce([14; 32]));
     assert_eq!(service_nonce([4; 32]), service_nonce([4; 32]));
+}
+
+#[test]
+fn owner_recovery_reads_only_kept_fields_and_pause_only_the_current_layout() {
+    use allowit_policy_sdk::admin::{DeployPolicy, DeploymentVersion, RecoverFunds, SetPause};
+    use allowit_stellar_wallet::admin::{OwnerAdmin, PolicyDeployment};
+    let recipient = account_for_seed(&[6; 32]);
+    // A policy binding that does not verify, as after an upgrade whose source digest differs:
+    // the contract still accepts recover and set_pause, so preparation must too.
+    let broken = admin_fixture(4, None);
+    let c = &broken.base.config;
+    let mut admin = OwnerAdmin {
+        rpc: &broken,
+        config: c,
+        now: 86401,
+    };
+    assert!(admin.custody().is_err());
+    let artifact = PolicyDeployment {
+        owner: c.owner.clone(),
+        agent: c.agent.clone(),
+        server: c.server.clone(),
+        source_digest: c.source_digest,
+        rules: Vec::new(),
+        params: c.params.clone(),
+        x402_enabled: false,
+        wasm_hash: None,
+    };
+    assert!(
+        admin
+            .deploy_policy(DeploymentVersion(3), artifact.clone())
+            .is_err()
+    );
+    let recovered = admin.recover_to(&recipient, 5).unwrap();
+    assert_eq!(
+        (recovered.function.as_str(), recovered.deployment_version),
+        ("recover", 2)
+    );
+    assert_eq!(admin.recover_funds(&c.asset).unwrap().function, "recover");
+    assert_eq!(
+        admin
+            .set_pause(true, DeploymentVersion(3))
+            .unwrap()
+            .function,
+        "set_pause"
+    );
+    // An earlier readable layout keeps the owner's recovery; set_pause and deploy_policy read
+    // the current layout onchain, so they reject.
+    for layout in [1, 3] {
+        let old = admin_fixture(layout, None);
+        let mut admin = OwnerAdmin {
+            rpc: &old,
+            config: &old.base.config,
+            now: 86401,
+        };
+        assert_eq!(admin.recover_to(&recipient, 5).unwrap().function, "recover");
+        assert!(admin.set_pause(true, DeploymentVersion(3)).is_err());
+        assert!(
+            admin
+                .deploy_policy(DeploymentVersion(3), artifact.clone())
+                .is_err()
+        );
+    }
+    // A layout this crate does not know, or no layout, still rejects.
+    for layout in [0, 5] {
+        let unknown = admin_fixture(layout, None);
+        let mut admin = OwnerAdmin {
+            rpc: &unknown,
+            config: &unknown.base.config,
+            now: 86401,
+        };
+        assert!(admin.recover_to(&recipient, 5).is_err(), "{layout}");
+    }
+}
+
+#[test]
+fn owner_deployment_binds_common_rules_to_the_installed_source_prefix() {
+    use allowit_policy_sdk::admin::{DeployPolicy, DeploymentVersion};
+    use allowit_stellar_wallet::admin::{OwnerAdmin, PolicyDeployment};
+    let rpc = admin_fixture(4, Some(stellar_xdr::ScVal::U32(4)));
+    let mut c = rpc.base.config.clone();
+    // The installed Common source has the prefix `recipients`.
+    c.tier = Some(PolicyTier::Common);
+    let mut admin = OwnerAdmin {
+        rpc: &rpc,
+        config: &c,
+        now: 86401,
+    };
+    // A packet whose digest is derived from other rules matches its own digest but not the
+    // source, so it would commit rules that differ from the installation.
+    let rules = vec!["spent_cap".to_string()];
+    let artifact = PolicyDeployment {
+        owner: c.owner.clone(),
+        agent: c.agent.clone(),
+        server: c.server.clone(),
+        source_digest: policy::standard_prefix_digest(
+            PolicyTier::Common,
+            &c.module_digest,
+            &c.asset,
+            &rules,
+        )
+        .unwrap(),
+        rules,
+        params: c.params.clone(),
+        x402_enabled: false,
+        wasm_hash: None,
+    };
+    let error = admin
+        .deploy_policy(DeploymentVersion(3), artifact)
+        .unwrap_err();
+    assert!(error.contains("standard prefix derived"), "{error}");
+}
+
+#[test]
+fn portable_classic_custody_accepts_only_canonical_only_sources() {
+    let (mut c, _, _) = fixture(WalletRoute::Native, false);
+    c.language = PolicyLanguage::Portable;
+    c.policy_source = PORTABLE.into();
+    c.source_hash = hash(PORTABLE);
+    validate_config(&c).unwrap();
+    // A helper item makes the file more than its prefix: the host cannot run it without a
+    // compiled evaluator, which no classic prepare or sign path takes.
+    let helper = format!("{PORTABLE}fn helper() -> bool {{ true }}\n");
+    let mut other = c.clone();
+    other.policy_source = helper.clone();
+    other.source_hash = hash(&helper);
+    let error = validate_config(&other).unwrap_err();
+    assert!(error.contains("canonical-only"), "{error}");
+    let mut custom = c.clone();
+    custom.params =
+        policy::params_from_json(&json!({"supplier_cap": 5}), Some(PolicyTier::Custom)).unwrap();
+    let error = validate_config(&custom).unwrap_err();
+    assert!(error.contains("canonical params"), "{error}");
+}
+
+#[test]
+fn owner_preparation_refuses_address_v2_entries_that_the_handoff_cannot_sign() {
+    use allowit_policy_sdk::admin::{DeployPolicy, DeploymentVersion};
+    use allowit_stellar_wallet::admin::{OwnerAdmin, PolicyDeployment};
+    let mut rpc = admin_fixture(4, Some(stellar_xdr::ScVal::U32(4)));
+    rpc.address_v2 = true;
+    let c = &rpc.base.config;
+    let artifact = PolicyDeployment {
+        owner: account_for_seed(&[51; 32]),
+        agent: c.agent.clone(),
+        server: c.server.clone(),
+        source_digest: c.source_digest,
+        rules: Vec::new(),
+        params: c.params.clone(),
+        x402_enabled: false,
+        wasm_hash: None,
+    };
+    let mut admin = OwnerAdmin {
+        rpc: &rpc,
+        config: c,
+        now: 86401,
+    };
+    let error = admin
+        .deploy_policy(DeploymentVersion(3), artifact)
+        .unwrap_err();
+    assert_eq!(error, "Unsupported owner credentials");
 }

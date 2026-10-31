@@ -1,7 +1,7 @@
 //! Owner preparation for the layout 4 policy wallet interface: Wasm upload, wallet creation and
 //! owner calls. Preparation simulates and checks every authorization; it never signs. The owner
 //! signs with `sign_owner_transaction`, then `rpc::send_and_poll` submits and waits.
-use crate::contract::{CustodyState, PolicyBinding};
+use crate::contract::{CustodyState, KeptState, PolicyBinding};
 use crate::*;
 use allowit_policy_sdk::admin::{DeployPolicy, DeploymentVersion, RecoverFunds, SetPause};
 use serde_json::json;
@@ -210,6 +210,10 @@ pub struct PreparedOwnerOperation {
     /// new owner's signed entry first. The current owner signs only the returned transaction.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_authorizers: Vec<String>,
+    /// Owner-visible warnings of `contract_admin.py` `policy_rules`, such as prefix rules whose
+    /// param is absent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// Bound vendor implementation. Native account ownership is required for this
@@ -219,10 +223,25 @@ pub struct OwnerAdmin<'a> {
     pub config: &'a WalletConfig,
     pub now: u64,
 }
+/// How much of the installed wallet an owner call checks before preparation. Each level
+/// matches what the contract entrypoint itself reads, so an owner can always prepare a call that
+/// the contract would accept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reach {
+    /// `recover`: the kept fields of any readable layout and the owner-only account. A wallet
+    /// whose code, layout or policy binding is broken stays recoverable.
+    Kept,
+    /// `set_pause` and `deploy_policy` with new code: also the exact layout 4 State, which the
+    /// contract's `load` and `kept_policy_state` require.
+    Layout,
+    /// Packets bound to the installed code: also the owner-approved executable, the policy
+    /// binding and the custody fields.
+    Bound,
+}
 struct Snapshot {
     owner: AccountState,
     deployment_version: DeploymentVersion,
-    state: CustodyState,
+    state: Option<CustodyState>,
 }
 impl AccountState {
     /// `wallet_admin.py` `owner_only`: only the master key is active and it meets every
@@ -245,7 +264,7 @@ impl AccountState {
     }
 }
 impl OwnerAdmin<'_> {
-    fn snapshot(&self) -> Result<Snapshot> {
+    fn snapshot(&self, reach: Reach) -> Result<Snapshot> {
         let c = self.config;
         validate_config(c)?;
         if c.route != WalletRoute::PolicyWallet {
@@ -282,7 +301,9 @@ impl OwnerAdmin<'_> {
         let ScVal::ContractInstance(instance) = data.val else {
             return Err("Missing policy wallet instance".into());
         };
-        if instance.executable != ContractExecutable::Wasm(Hash(c.module_digest)) {
+        if reach == Reach::Bound
+            && instance.executable != ContractExecutable::Wasm(Hash(c.module_digest))
+        {
             return Err("policy wallet executable differs from owner-approved code".into());
         }
         let storage = instance.storage.ok_or("Missing policy wallet storage")?;
@@ -291,21 +312,34 @@ impl OwnerAdmin<'_> {
             .find(|e| e.key == ScVal::U32(0))
             .map(|e| &e.val)
             .ok_or("Missing policy wallet custody state")?;
-        // Owner packets require the current layout; recovery depends on no layout.
-        let state = CustodyState::from_scval(raw)?;
-        if state.owner != c.owner {
+        // Recovery reads only the kept fields; the other owner calls need the current layout.
+        let kept = KeptState::from_scval(raw)?;
+        if kept.owner != c.owner {
             return Err("Current owner differs from the bound owner".into());
         }
-        account_key(&state.owner)
+        if kept.asset != c.asset || kept.policy_instance != c.policy_instance {
+            return Err("Stored asset or policy instance differs from the installation".into());
+        }
+        account_key(&kept.owner)
             .map_err(|_| "Contract owners require a separate native authorization adapter")?;
-        let owner = rpc::get_account(self.rpc, &state.owner)?;
+        let owner = rpc::get_account(self.rpc, &kept.owner)?;
         owner.validate_owner_only()?;
-        PolicyBinding::from_scval(&rpc::readonly_call(self.rpc, c, &owner, "policy_binding")?)?
-            .verify(c, &hash(TRANSFER_SCHEMA))?;
-        rpc::verify_custody(c, &state)?;
+        let state = if reach == Reach::Kept {
+            None
+        } else {
+            Some(CustodyState::from_scval(raw)?)
+        };
+        if reach == Reach::Bound {
+            let state = state
+                .as_ref()
+                .ok_or("Missing policy wallet custody state")?;
+            PolicyBinding::from_scval(&rpc::readonly_call(self.rpc, c, &owner, "policy_binding")?)?
+                .verify(c, &hash(TRANSFER_SCHEMA))?;
+            rpc::verify_custody(c, state)?;
+        }
         Ok(Snapshot {
             owner,
-            deployment_version: DeploymentVersion(state.deployment_version),
+            deployment_version: DeploymentVersion(kept.deployment_version),
             state,
         })
     }
@@ -399,7 +433,9 @@ impl OwnerAdmin<'_> {
             }
             let who = match &entry.credentials {
                 SorobanCredentials::SourceAccount => snapshot.owner.address.clone(),
-                SorobanCredentials::Address(c) | SorobanCredentials::AddressV2(c) => {
+                // `complete_owner_handoff` and the account signature check sign and verify the
+                // classic address payload only, so a recorded `AddressV2` entry is refused here.
+                SorobanCredentials::Address(c) => {
                     let who = address_text(&c.address)?;
                     pending.push(who.clone());
                     who
@@ -431,6 +467,7 @@ impl OwnerAdmin<'_> {
             expires_at: expires,
             required_authorizers: authorizers,
             pending_authorizers: pending,
+            warnings: Vec::new(),
         })
     }
     /// Set the fee and resource data from a simulation, within the configured fee ceiling.
@@ -598,14 +635,31 @@ impl DeployPolicy for OwnerAdmin<'_> {
                 "Deployment rules and source digest differ from the installed tier binding".into(),
             );
         }
-        artifact.params.check(tier)?;
-        self.prepare_deployment(version, artifact)
+        // `contract_admin.py` binds every owner packet to its authored source: the Common rules
+        // are the standard prefix of the installed source, and standard tiers write no state.
+        let check = policy::policy_rules(
+            tier,
+            &self.config.policy_source,
+            &artifact.rules,
+            &artifact.source_digest,
+            &artifact.params,
+        )?;
+        let mut prepared = self.prepare_deployment(version, artifact, Reach::Bound)?;
+        prepared.warnings = check.warnings;
+        Ok(prepared)
     }
 }
 impl OwnerAdmin<'_> {
     /// Prepare an owner update that installs uploaded code `wasm` atomically. The new code must
     /// declare custody layout 4, so it can read the stored State; the new code validates its own
     /// rules and params on its next call.
+    ///
+    /// The packet is bound to `config.tier` and `config.policy_source` as `contract_admin.py`
+    /// binds it to `--tier` and `--policy-source`: pass the configuration of the target tier and
+    /// source when they change. A Simple or Common packet must carry the standard prefix digest
+    /// of the new code, so its binding verifies after the upgrade. A Custom digest is the
+    /// source's SHA-256, which the new code checks against its own compiled source. The installed
+    /// executable and binding are not required, so this also repairs a broken binding.
     pub fn deploy_code(
         &mut self,
         version: DeploymentVersion,
@@ -616,15 +670,39 @@ impl OwnerAdmin<'_> {
         if artifact.wasm_hash.is_some_and(|h| h != hash) {
             return Err("Deployment Wasm hash differs from the supplied code".into());
         }
+        let tier = self.config.tier.ok_or("Selected policy tier is required")?;
+        let digest = policy::installed_source_digest(
+            tier,
+            &hash,
+            &self.config.asset,
+            &artifact.rules,
+            &self.config.policy_source,
+        )?;
+        if artifact.source_digest != digest {
+            return Err(
+                "Deployment source digest differs from the binding of the new code and source"
+                    .into(),
+            );
+        }
+        let check = policy::policy_rules(
+            tier,
+            &self.config.policy_source,
+            &artifact.rules,
+            &artifact.source_digest,
+            &artifact.params,
+        )?;
         artifact.wasm_hash = Some(hash);
-        self.prepare_deployment(version, artifact)
+        let mut prepared = self.prepare_deployment(version, artifact, Reach::Layout)?;
+        prepared.warnings = check.warnings;
+        Ok(prepared)
     }
     fn prepare_deployment(
         &mut self,
         version: DeploymentVersion,
         artifact: PolicyDeployment,
+        reach: Reach,
     ) -> Result<PreparedOwnerOperation> {
-        let s = self.snapshot()?;
+        let s = self.snapshot(reach)?;
         if !version.follows(s.deployment_version) {
             return Err("Policy deployment must target the next version".into());
         }
@@ -640,9 +718,10 @@ impl OwnerAdmin<'_> {
         let arguments = artifact.scval(version)?;
         self.prepare(s, "deploy_policy", vec![arguments], version, authorizers)
     }
-    /// Recover `amount` of the wallet asset to `recipient`. Recovery reads no policy layout.
+    /// Recover `amount` of the wallet asset to `recipient`. Like the contract's `recover`, this
+    /// reads only the kept fields: no layout 4 State, executable or policy binding.
     pub fn recover_to(&mut self, recipient: &str, amount: i128) -> Result<PreparedOwnerOperation> {
-        let s = self.snapshot()?;
+        let s = self.snapshot(Reach::Kept)?;
         if amount <= 0 {
             return Err("Recovery amount must be positive".into());
         }
@@ -662,7 +741,9 @@ impl OwnerAdmin<'_> {
     }
     /// The current decoded custody State and owner account, read as owner preparation does.
     pub fn custody(&self) -> Result<CustodyState> {
-        Ok(self.snapshot()?.state)
+        self.snapshot(Reach::Bound)?
+            .state
+            .ok_or_else(|| "Missing policy wallet custody state".into())
     }
 }
 impl SetPause for OwnerAdmin<'_> {
@@ -673,7 +754,8 @@ impl SetPause for OwnerAdmin<'_> {
         paused: bool,
         version: DeploymentVersion,
     ) -> Result<PreparedOwnerOperation> {
-        let s = self.snapshot()?;
+        // The contract's `set_pause` needs only the exact current State, not the binding.
+        let s = self.snapshot(Reach::Layout)?;
         if !version.follows(s.deployment_version) {
             return Err("Pause must target the next deployment version".into());
         }
@@ -695,7 +777,7 @@ impl RecoverFunds for OwnerAdmin<'_> {
     /// it fail with `InsufficientFunds`, and the owner still pays the fee. Pause automation
     /// with `set_pause` and let that transaction settle before preparing a recovery.
     fn recover_funds(&mut self, token: &str) -> Result<PreparedOwnerOperation> {
-        let s = self.snapshot()?;
+        let s = self.snapshot(Reach::Kept)?;
         if token != self.config.asset {
             return Err("This policy wallet profile can recover only its installed asset".into());
         }

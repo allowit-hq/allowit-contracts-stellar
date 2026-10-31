@@ -604,17 +604,20 @@ pub fn installed_source_digest(
 pub struct SourceShape {
     /// Leading canonical prefix statements of `execute`.
     pub prefix: Vec<String>,
-    /// `execute` is exactly the prefix followed by `Ok(())`.
+    /// The file is only `use allowit::...;` items and an `execute` that is exactly the prefix
+    /// followed by `Ok(())`, so the host runs it in full without compiling it.
     pub canonical_only: bool,
     /// The source calls `allowit::set_state`.
     pub writes_state: bool,
 }
 /// Check portable source and derive its shape: `scripts/policy_source.py` `standard_prefix` and
 /// `writes_state`. This applies the structural gate: one self-contained file, `allowit` only as
-/// the path root, no file or environment macros, no `#[path]`, `cfg_attr` or raw pointers and one
+/// the path root, no file or environment macros, no `#[path]`, `cfg_attr` or raw pointers, only
+/// the `MACROS` and `ATTRIBUTES` allowlists and one
 /// `pub fn execute(ctx: &AllowitContext) -> allowit::Result`. The identifier allowlist and the
 /// std-only compile remain the server build gate (`policy_source.py` `checked_code` and
-/// `host_compile`), which needs `rustc`.
+/// `host_compile`), which needs `rustc`; a source that is not canonical-only needs that compiled
+/// evaluator for full host evaluation.
 pub fn source_shape(source: &str) -> Result<SourceShape> {
     let code = gate::checked_code(source)?;
     let (prefix, canonical_only) = gate::standard_prefix(&code)?;
@@ -799,8 +802,85 @@ pub fn evaluate(
 pub(crate) mod gate {
     use super::*;
 
+    /// `policy_source.py` `MACROS`: the macros authored code may invoke.
+    const MACROS: [&str; 6] = [
+        "assert",
+        "assert_eq",
+        "assert_ne",
+        "panic",
+        "matches",
+        "unreachable",
+    ];
+    /// `policy_source.py` `ATTRIBUTES`: the attributes authored code may use.
+    const ATTRIBUTES: [&str; 8] = [
+        "allow", "expect", "warn", "deny", "forbid", "inline", "cold", "must_use",
+    ];
+    /// `policy_source.py` `RUST_KEYWORDS`, which may precede a `!` operator.
+    const RUST_KEYWORDS: [&str; 53] = [
+        "abstract", "as", "async", "await", "become", "box", "break", "const", "continue", "crate",
+        "do", "dyn", "else", "enum", "extern", "false", "final", "fn", "for", "gen", "if", "impl",
+        "in", "let", "loop", "macro", "match", "mod", "move", "mut", "override", "priv", "pub",
+        "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "try",
+        "type", "typeof", "union", "unsafe", "unsized", "use", "virtual", "where", "while",
+        "yield",
+    ];
     fn reject(what: &str) -> String {
         format!("Policy source must be one self-contained, portable file; it uses {what}")
+    }
+    /// The identifier that starts at `k` (`[A-Za-z_]\w*` at a word start) and its end.
+    fn ident_at(chars: &[char], k: usize) -> Option<(String, usize)> {
+        let first = *chars.get(k)?;
+        if !(first.is_ascii_alphabetic() || first == '_') || (k > 0 && word(chars[k - 1])) {
+            return None;
+        }
+        let mut end = k;
+        while end < chars.len() && word(chars[end]) {
+            end += 1;
+        }
+        Some((chars[k..end].iter().collect(), end))
+    }
+    /// The macro and attribute allowlists of `policy_source.py` `portable`: `name!` (not `!=`)
+    /// must name an allowed macro or a keyword, and `#[name` an allowed attribute. Every other
+    /// macro, such as `macro_rules!` or `asm!`, and every other attribute, such as `cfg` or
+    /// `doc`, rejects.
+    fn macros_and_attributes(chars: &[char]) -> Result<()> {
+        for k in 0..chars.len() {
+            if let Some((name, end)) = ident_at(chars, k) {
+                let bang = skip_ws(chars, end);
+                if chars.get(bang) == Some(&'!')
+                    && chars.get(bang + 1) != Some(&'=')
+                    && !RUST_KEYWORDS.contains(&name.as_str())
+                    && !MACROS.contains(&name.as_str())
+                {
+                    return Err(reject(&format!(
+                        "macro `{name}!`; only assert!, assert_eq!, assert_ne!, matches!, panic!, unreachable! are allowed"
+                    )));
+                }
+            }
+            if chars[k] == '#' {
+                let open = skip_ws(chars, k + 1);
+                if chars.get(open) != Some(&'[') {
+                    continue;
+                }
+                let mut p = skip_ws(chars, open + 1);
+                if starts(chars, p, "r#") {
+                    p += 2;
+                }
+                let first = chars.get(p).copied().unwrap_or(' ');
+                if !(first.is_ascii_alphabetic() || first == '_') {
+                    continue;
+                }
+                let mut end = p;
+                while end < chars.len() && word(chars[end]) {
+                    end += 1;
+                }
+                let name: String = chars[p..end].iter().collect();
+                if !ATTRIBUTES.contains(&name.as_str()) {
+                    return Err(reject(&format!("attribute `{name}`")));
+                }
+            }
+        }
+        Ok(())
     }
     fn word(c: char) -> bool {
         c.is_alphanumeric() || c == '_'
@@ -1112,6 +1192,7 @@ pub(crate) mod gate {
                 "Policy source must be one self-contained file; it uses a raw pointer".into(),
             );
         }
+        macros_and_attributes(&chars)?;
         Ok(code)
     }
     /// Match `\bpub\s+fn\s+execute\s*\(\s*ctx\s*:\s*&\s*AllowitContext\s*\)\s*->\s*allowit\s*::\s*Result(?:\s*<\s*\(\s*\)\s*>)?\s*\{`
@@ -1184,7 +1265,12 @@ pub(crate) mod gate {
         }
         Some(name.into())
     }
-    /// The standard prefix of lexed code and whether `execute` is exactly the prefix and `Ok(())`.
+    /// The standard prefix of lexed code and whether the whole file is canonical-only.
+    ///
+    /// A file is canonical-only when it is nothing but optional `use allowit::...;` items and
+    /// one `execute` whose body is exactly the prefix statements followed by `Ok(())`. Only then
+    /// does running the prefix rules on the host equal running the compiled file: any other
+    /// item, such as a local `fn Ok` that shadows the prelude, could change what `execute` does.
     pub(crate) fn standard_prefix(code: &str) -> Result<(Vec<String>, bool)> {
         let chars: Vec<char> = code.chars().collect();
         let found: Vec<usize> = (0..chars.len())
@@ -1195,19 +1281,66 @@ pub(crate) mod gate {
         }
         let body: String = chars[found[0]..].iter().collect();
         let mut rules = vec![];
-        let mut rest = None;
+        let mut consumed = 0;
         for statement in body.split(';') {
             let compact: String = statement.chars().filter(|c| !c.is_whitespace()).collect();
             match prefix_call(&compact) {
-                Some(rule) => rules.push(rule),
-                None => {
-                    rest = Some(compact);
-                    break;
+                Some(rule) => {
+                    rules.push(rule);
+                    consumed += statement.len() + 1;
                 }
+                None => break,
             }
         }
-        let canonical_only = rest.is_some_and(|r| r.starts_with("Ok(())}"));
+        let rest: String = body[consumed.min(body.len())..]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let canonical_only = rest == "Ok(())}" && only_allowit_uses_before(&chars, found[0]);
         Ok((rules, canonical_only))
+    }
+    /// True when the code before `execute` (which ends at `body_start`, after its `{`) is only
+    /// `use allowit::...;` items: a use tree of path segments, `::`, `*`, `,` and braces,
+    /// without renaming.
+    fn only_allowit_uses_before(chars: &[char], body_start: usize) -> bool {
+        let Some(signature) = (0..body_start)
+            .rev()
+            .find(|k| starts(chars, *k, "pub") && execute_at(chars, *k) == Some(body_start))
+        else {
+            return false;
+        };
+        let mut k = skip_ws(chars, 0);
+        while k < signature {
+            if !(starts(chars, k, "use") && !chars.get(k + 3).is_some_and(|c| word(*c))) {
+                return false;
+            }
+            let mut p = skip_ws(chars, k + 3);
+            if !(starts(chars, p, "allowit") && !chars.get(p + 7).is_some_and(|c| word(*c))) {
+                return false;
+            }
+            p = skip_ws(chars, p + 7);
+            if !starts(chars, p, "::") {
+                return false;
+            }
+            p += 2;
+            let tree = p;
+            while p < signature && chars[p] != ';' {
+                let c = chars[p];
+                if !(word(c) || c.is_whitespace() || matches!(c, ':' | '*' | ',' | '{' | '}')) {
+                    return false;
+                }
+                p += 1;
+            }
+            // A renaming import (`use allowit::x as Ok;`) could shadow a prelude name.
+            if words(&chars[tree..p], &["as"]).next().is_some() {
+                return false;
+            }
+            if p >= signature {
+                return false;
+            }
+            k = skip_ws(chars, p + 1);
+        }
+        k == signature
     }
     /// `\ballowit\s*::\s*(?:r#)?set_state\b` on lexed code.
     pub(crate) fn writes_state(code: &str) -> bool {
@@ -1237,6 +1370,56 @@ mod tests {
         assert_eq!(shape.prefix, PARAM_KEYS.map(String::from).to_vec());
         assert!(shape.canonical_only);
         assert!(!shape.writes_state);
+    }
+    #[test]
+    fn only_a_file_of_allowit_uses_and_the_prefix_is_canonical_only() {
+        // A local `fn Ok` shadows the prelude constructor, so the compiled policy would deny
+        // every operation while the prefix alone allows it.
+        let shadowed = format!(
+            "{SOURCE}\nfn Ok(_: ()) -> allowit::Result {{ Err(allowit::AllowitError::MissingParam) }}\n"
+        );
+        let shape = source_shape(&shadowed).unwrap();
+        assert_eq!(shape.prefix.len(), PARAM_KEYS.len());
+        assert!(!shape.canonical_only);
+        let helper = SOURCE.replace(
+            "use allowit::prelude::*;",
+            "use allowit::prelude::*;\nconst LIMIT: i128 = 5;",
+        );
+        assert!(!source_shape(&helper).unwrap().canonical_only);
+        let renamed = SOURCE.replace(
+            "use allowit::prelude::*;",
+            "use allowit::prelude::*;\nuse allowit::{transaction_cap as Ok};",
+        );
+        assert!(!source_shape(&renamed).unwrap().canonical_only);
+        let braced = SOURCE.replace(
+            "use allowit::prelude::*;",
+            "use allowit::{prelude::*, AllowitError};",
+        );
+        assert!(source_shape(&braced).unwrap().canonical_only);
+        let attributed = SOURCE.replace("pub fn execute", "#[inline]\npub fn execute");
+        assert!(!source_shape(&attributed).unwrap().canonical_only);
+    }
+    #[test]
+    fn macros_and_attributes_follow_the_policy_source_allowlists() {
+        for (bad, what) in [
+            ("macro_rules! m { () => {} }", "macro `macro_rules!`"),
+            ("#[cfg(test)]\nconst A: i128 = 1;", "attribute `cfg`"),
+            ("#[doc = \"x\"]\nconst A: i128 = 1;", "attribute `doc`"),
+            (
+                "const A: () = core::arch::global_asm!(\"\");",
+                "macro `global_asm!`",
+            ),
+            ("const A: &str = concat!(\"a\");", "macro `concat!`"),
+        ] {
+            let error = source_shape(&format!("{SOURCE}\n{bad}\n")).unwrap_err();
+            assert!(error.contains(what), "{bad}: {error}");
+        }
+        for ok in [
+            "#[allow(dead_code)]\nfn helper(a: bool) -> bool { assert!(a != false); !a }",
+            "#[inline]\nfn other(a: i128) -> bool { matches!(a, 1) && a != 2 }",
+        ] {
+            source_shape(&format!("{SOURCE}\n{ok}\n")).unwrap();
+        }
     }
     #[test]
     fn standard_prefix_digest_matches_the_contract_vector() {

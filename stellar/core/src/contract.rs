@@ -357,6 +357,43 @@ impl CustodyState {
         ])
     }
 }
+/// The stored fields that every readable custody layout keeps: the contract's `KeptState`.
+/// Owner `recover` reads only these, so recovery needs no exact layout 4 State or policy binding.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct KeptState {
+    pub contract_version: u32,
+    pub owner: String,
+    pub asset: String,
+    pub policy_instance: [u8; 32],
+    pub token: String,
+    pub deployment_version: u64,
+    pub nonce: u64,
+    pub paused: bool,
+}
+impl KeptState {
+    /// Decode the kept fields of any layout from 1 to [`CONTRACT_VERSION`], ignoring the other
+    /// State keys as the contract's struct decoding does.
+    pub fn from_scval(value: &ScVal) -> Result<Self> {
+        use rpc::{addr, digest_field, map_field};
+        let version = u32_field(map_field(value, "contract_version")?)?;
+        if version == 0 || version > CONTRACT_VERSION {
+            return Err(format!(
+                "Unsupported policy contract version {version}; this crate reads layouts 1 to {CONTRACT_VERSION}"
+            ));
+        }
+        Ok(Self {
+            contract_version: version,
+            owner: addr(map_field(value, "owner")?)?,
+            asset: addr(map_field(value, "asset")?)?,
+            policy_instance: digest_field(map_field(value, "policy_instance")?)?,
+            token: string(map_field(value, "token")?)?,
+            deployment_version: u64_field(map_field(value, "deployment_version")?)?,
+            nonce: u64_field(map_field(value, "nonce")?)?,
+            paused: boolean(map_field(value, "paused")?)?,
+        })
+    }
+}
 /// Decoded `AllowitPolicyBinding`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
