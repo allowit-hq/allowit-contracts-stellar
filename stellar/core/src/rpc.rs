@@ -165,9 +165,28 @@ pub fn simulate(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<PreparedOperatio
     if rpc.call("getNetwork", json!({}))?["passphrase"] != passphrase(&p.config.network)? {
         return Err("Simulation network differs from installation".into());
     }
+    // Stellar RPC rejects recording mode when the transaction already has auth entries.
+    // An unsigned intent is therefore recorded from a copy without them; the recorded scope is
+    // compared with the intent's entries below. The signed intent is simulated as is in enforce
+    // mode, which supplies the final resources, including the service entry's fixed nonce key.
+    let recording = authorization::server_signature(p, false)? == ScVal::Void;
+    let (transaction, mode) = if recording {
+        let TransactionEnvelope::Tx(mut env) = read(&p.transaction_xdr)? else {
+            return Err("Unsupported preflight envelope".into());
+        };
+        let mut operations = env.tx.operations.to_vec();
+        let OperationBody::InvokeHostFunction(op) = &mut operations[0].body else {
+            return Err("Expected one native policy invocation".into());
+        };
+        op.auth = VecM::default();
+        env.tx.operations = operations.try_into().map_err(err)?;
+        (xdr(&TransactionEnvelope::Tx(env))?, "record")
+    } else {
+        (p.transaction_xdr.clone(), "enforce")
+    };
     let v = rpc.call(
         "simulateTransaction",
-        json!({"transaction":p.transaction_xdr,"authMode":if authorization::server_signature(p,false)?==ScVal::Void {"record"} else {"enforce"}}),
+        json!({"transaction":transaction,"authMode":mode}),
     )?;
     if v.get("error").is_some_and(|value| !value.is_null()) {
         return Err("policy wallet simulation rejected the exact policy operation".into());
@@ -206,7 +225,7 @@ pub fn simulate(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<PreparedOperatio
             )
         })
         .collect::<Result<Vec<SorobanAuthorizationEntry>>>()?;
-    let same = if authorization::server_signature(p, false)? == ScVal::Void {
+    let same = if recording {
         auth.len() == op.auth.len()
             && auth.iter().zip(op.auth.iter()).all(|(actual, expected)| {
                 actual.root_invocation == expected.root_invocation
@@ -325,6 +344,10 @@ pub trait OperationStore {
     fn load(&self, operation_id: [u8; 32]) -> Result<Option<(SignedOperation, OperationStatus)>>;
 }
 /// Persist exact signed bytes before broadcast. An uncertain response retains them for lookup.
+/// A later call for the same operation looks up the original hash first. While that
+/// transaction is not on the ledger and the signed operation is still valid, the call resends
+/// the retained bytes. They keep their sequence number and hash, so the network includes them
+/// at most once. It never re-signs or replaces the transaction.
 pub fn submit(
     rpc: &dyn Rpc,
     store: &mut dyn OperationStore,
@@ -346,8 +369,14 @@ pub fn submit(
                 &signed.prepared.config.network,
                 &signed.transaction_hash,
             )?;
-            store.record(id, signed, observed.clone())?;
-            return Ok(observed);
+            // NOT_FOUND after TRY_AGAIN_LATER, a lost response or a dropped pending transaction:
+            // resend the same bytes only while they are still valid.
+            if observed != OperationStatus::SubmissionUnknown
+                || validate_signed(signed, now).is_err()
+            {
+                store.record(id, signed, observed.clone())?;
+                return Ok(observed);
+            }
         }
     }
     validate_signed(signed, now)?;
@@ -368,6 +397,8 @@ pub fn submit(
                     &signed.transaction_hash,
                 )
                 .unwrap_or(OperationStatus::SubmissionUnknown),
+                // The network did not accept the transaction. A later submit resends it.
+                Some("TRY_AGAIN_LATER") => OperationStatus::SubmissionUnknown,
                 _ => OperationStatus::SubmissionUnknown,
             };
             store.record(id, signed, status.clone())?;
