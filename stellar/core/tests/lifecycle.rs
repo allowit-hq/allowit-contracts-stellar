@@ -2547,6 +2547,41 @@ fn local_revalidation_preserves_existing_unsigned_identity_and_checks_current_au
     }
 }
 #[test]
+fn revalidation_keeps_an_exact_hash_preauthorization_when_fresh_resources_are_smaller() {
+    // The original packet carries a 1001 stroop resource fee; fresh simulation needs only 1000.
+    // The source meets its threshold only with a preauthorization of the original hash.
+    let mut rpc = preflight_fixture();
+    let p = rpc::prepare(&rpc, &rpc.base.config, &rpc.request, None, 86401, 86700).unwrap();
+    let data = SorobanTransactionData {
+        resource_fee: 1001,
+        ..Default::default()
+    }
+    .to_xdr_base64(Limits::none())
+    .unwrap();
+    let mut p = attach_simulation(&p, &data).unwrap();
+    let final_hash = server_ready(&p).transaction_hash;
+    rpc.base.source.low_threshold = 2;
+    rpc.base.source.medium_threshold = 2;
+    rpc.base.source.signers.push(AccountSigner {
+        key: stellar_strkey::PreAuthTx(final_hash).to_string(),
+        weight: 1,
+    });
+    p.state.source = rpc.base.source.clone();
+    let p = server_ready(&p);
+    assert_eq!(p.transaction_hash, final_hash);
+    sign(&p, &[2; 32], 86401).unwrap();
+    let validated = rpc::revalidate_prepared(&rpc, &p, 86402).unwrap();
+    assert_eq!(validated.transaction_hash, final_hash);
+    assert_eq!(validated.transaction_xdr, p.transaction_xdr);
+    sign(&validated, &[2; 32], 86402).unwrap();
+    // Without the preauthorization the same original packet cannot meet the threshold.
+    let mut locked = rpc;
+    locked.base.source.signers.pop();
+    let mut stale = p.clone();
+    stale.state.source = locked.base.source.clone();
+    assert!(rpc::revalidate_prepared(&locked, &stale, 86402).is_err());
+}
+#[test]
 fn native_failure_or_wrong_auth_receipt_fee_and_restore_never_approve() {
     for failure in ["deny", "auth", "receipt", "fee", "restore"] {
         let mut rpc = preflight_fixture();
@@ -3067,6 +3102,8 @@ fn x402_packet_binds_both_raw_keys_and_the_complete_native_scope() {
         authorization_xdr: entry.to_xdr_base64(Limits::none()).unwrap(),
     };
     let digest = x402::signing_digest(&request, 86401).unwrap();
+    // The fixture source is canonical-only, so the host runs the full Simple policy.
+    assert_eq!(x402::verify_server(&request, 86401, None).unwrap(), digest);
     let agent = SigningKey::from_bytes(&[2; 32]).sign(&digest).to_bytes();
     let server = SigningKey::from_bytes(&[3; 32]).sign(&digest).to_bytes();
     let encoded = x402::assemble(&request, &agent, &server, 86401).unwrap();
@@ -3147,6 +3184,90 @@ fn x402_packet_binds_both_raw_keys_and_the_complete_native_scope() {
     late.expires_at = 2 * 86_400 - 1;
     if let Err(error) = x402::signing_digest(&late, late_now) {
         assert!(!error.contains("cross its UTC expense day"), "{error}");
+    }
+}
+
+#[test]
+fn x402_server_approval_runs_the_full_simple_policy() {
+    use stellar_xdr::*;
+    let (mut c, r, state) = fixture(WalletRoute::PolicyWallet, true);
+    let recipient = account_for_seed(&[6; 32]);
+    let transfer = transfer_from_request(&c, &r).unwrap();
+    let entry = SorobanAuthorizationEntry {
+        credentials: SorobanCredentials::Address(SorobanAddressCredentials {
+            address: address(&c.wallet).unwrap(),
+            nonce: 17,
+            signature_expiration_ledger: state.ledger + 20,
+            signature: ScVal::Void,
+        }),
+        root_invocation: SorobanAuthorizedInvocation {
+            function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                contract_address: address(&c.asset).unwrap(),
+                function_name: ScSymbol(b"transfer".to_vec().try_into().unwrap()),
+                args: vec![
+                    ScVal::Address(address(&c.wallet).unwrap()),
+                    ScVal::Address(address(&transfer.recipient).unwrap()),
+                    ScVal::I128(Int128Parts {
+                        hi: 0,
+                        lo: transfer.amount as u64,
+                    }),
+                ]
+                .try_into()
+                .unwrap(),
+            }),
+            sub_invocations: VecM::default(),
+        },
+    };
+    let compiled = |ctx: &allowit::AllowitContext| -> allowit::Result {
+        allowit::recipients(ctx, ctx.params.get(allowit::RECIPIENTS))?;
+        let cap: i128 = allowit::param(ctx, "transaction_cap");
+        if ctx.request.amount > cap {
+            return Err(allowit::AllowitError::TransactionCapExceeded);
+        }
+        Ok(())
+    };
+    for (cap, approved) in [(1, false), (100_000_000, true)] {
+        install(
+            &mut c,
+            PolicyTier::Simple,
+            SUFFIXED,
+            json!({"recipients": [recipient], "transaction_cap": cap}),
+        );
+        let mut custody = state.clone();
+        custody.source_hash = c.source_hash;
+        custody.policy_state = Some(PolicyStateSnapshot {
+            params: c.params.clone(),
+            state: PolicyParams::default(),
+            rules: c.rules.clone(),
+            source_digest: c.source_digest,
+            x402_enabled: true,
+        });
+        let request = x402::SigningRequest {
+            config: c.clone(),
+            request: r.clone(),
+            state: x402::WalletState {
+                custody,
+                tier: PolicyTier::Simple,
+                x402_enabled: true,
+                paused: false,
+            },
+            expires_at: 86700,
+            terms: ExecutionTerms::default(),
+            authorization_xdr: entry.to_xdr_base64(Limits::none()).unwrap(),
+        };
+        // Encoding the digest is no approval. Only the onchain prefix runs without an evaluator.
+        let digest = x402::signing_digest(&request, 86401).unwrap();
+        assert!(
+            x402::verify_server(&request, 86401, None)
+                .unwrap_err()
+                .contains("compiled evaluator")
+        );
+        let verdict = x402::verify_server(&request, 86401, Some(&compiled));
+        if approved {
+            assert_eq!(verdict.unwrap(), digest);
+        } else {
+            assert!(verdict.unwrap_err().contains("TransactionCapExceeded"));
+        }
     }
 }
 

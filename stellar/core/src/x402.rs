@@ -1,10 +1,17 @@
 //! Exact custom-account authorization packets for external raw-key signers.
 //!
-//! These functions encode and verify signatures. They do not approve policy execution.
-//! Each signer must obtain current trusted wallet state and enforce its own approval
-//! boundary before signing. The server must evaluate Simple with durable accounting;
-//! Common and Custom require native policy preflight. The facilitator must simulate
-//! the final transaction in enforce mode before submission.
+//! `signing_digest` and `assemble` encode and verify signatures. They do not approve policy
+//! execution. Each signer must obtain current trusted wallet state and enforce its own approval
+//! boundary before signing.
+//!
+//! The server signs `signing_digest` only after `verify_server` accepts the exact request and
+//! terms. A Simple or Common wallet runs at most its standard prefix onchain, so native preflight
+//! does not enforce the rest of the authored policy: unless the source is canonical-only, the
+//! server supplies the compiled evaluator of its source, and `verify_server` refuses a
+//! prefix-only evaluation. Only a Custom wallet runs its whole policy onchain and can rely on
+//! native preflight for the rest. Layout 4 keeps standard accounting onchain; the server supplies
+//! no accounting. The facilitator simulates the final transaction in enforce mode before
+//! submission.
 use crate::*;
 
 /// Native wallet observations required by raw-key authorization.
@@ -129,7 +136,39 @@ fn checked(
     ))
 }
 
-/// Hash reviewed by each raw Ed25519 signer. This is not a signing approval.
+/// The server's approval rule for one raw-key request, then the digest it signs.
+///
+/// This checks the exact bindings as `signing_digest` does and runs `verify_operation` on the
+/// exact request and terms. For a Simple or Common wallet the full policy must run on the host:
+/// a source that is not canonical-only needs `evaluator`, compiled by the server's policy build
+/// gate from `config.policy_source`, and a prefix-only evaluation is refused, as
+/// `authorize_server_with` refuses it for direct execution.
+pub fn verify_server(
+    request: &SigningRequest,
+    now: u64,
+    evaluator: Option<policy::PortableEvaluator>,
+) -> Result<[u8; 32]> {
+    let digest = checked(request, now)?.2;
+    let evaluation = verify_operation(
+        &request.config,
+        &request.request,
+        &request.terms,
+        &request.state.custody,
+        now,
+        request.expires_at,
+        evaluator,
+    )?;
+    if request.state.tier.standard() && evaluation == policy::Evaluation::Prefix {
+        return Err(
+            "The server must evaluate the full Simple or Common policy; supply its compiled evaluator"
+                .into(),
+        );
+    }
+    Ok(digest)
+}
+
+/// Hash reviewed by each raw Ed25519 signer. This is not a signing approval; the server calls
+/// `verify_server` instead.
 /// It binds the network, complete authorization tree and native execution packet.
 pub fn signing_digest(request: &SigningRequest, now: u64) -> Result<[u8; 32]> {
     Ok(checked(request, now)?.2)

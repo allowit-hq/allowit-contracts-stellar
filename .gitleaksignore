@@ -1,3 +1,14 @@
 # Stellar public account IDs (G-addresses) of the classic multisig signers in a test fixture, not secrets.
 stellar/core/tests/fixtures/canonical-main-9682-native-signed.json:generic-api-key:741
 stellar/core/tests/fixtures/canonical-main-9682-native-signed.json:generic-api-key:745
+# A Stellar public account ID (G-address) and its checksum-corrupted variant in the params parity vectors, not secrets.
+stellar/core/tests/fixtures/params-vectors.json:generic-api-key:708
+stellar/core/tests/fixtures/params-vectors.json:generic-api-key:709
+stellar/core/tests/fixtures/params-vectors.json:generic-api-key:712
+stellar/core/tests/fixtures/params-vectors.json:generic-api-key:713
+stellar/core/tests/fixtures/params-vectors.json:generic-api-key:1251
+stellar/core/tests/fixtures/params-vectors.json:generic-api-key:1274
+stellar/core/tests/fixtures/params-vectors.json:generic-api-key:1280
+stellar/core/tests/fixtures/params-vectors.json:generic-api-key:1304
+stellar/core/tests/fixtures/params-vectors.json:generic-api-key:1440
+stellar/core/tests/fixtures/params-vectors.json:generic-api-key:1463

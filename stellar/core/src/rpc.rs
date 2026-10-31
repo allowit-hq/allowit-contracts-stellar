@@ -192,6 +192,15 @@ pub(crate) fn reject_restoration(value: &Value) -> Result<()> {
 /// Simulate an original unsigned policy wallet intent and bind successful native validation to it.
 /// Supplied resource XDR or JSON booleans alone never create a signing approval.
 pub fn simulate(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<PreparedOperation> {
+    let encoded = simulated_resources(rpc, p)?;
+    let mut prepared = attach_simulation(p, &encoded)?;
+    record_native_preflight(&mut prepared)?;
+    Ok(prepared)
+}
+/// Simulate the unchanged intent and return the checked resource requirements as XDR.
+/// This does not build a replacement transaction, so it does not check source quorum against a
+/// rebuilt hash. `simulate` attaches the result; revalidation compares it with the original.
+fn simulated_resources(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<String> {
     validate_retained_prepared(p)?;
     if p.config.route != WalletRoute::PolicyWallet {
         return Err("Native contract simulation requires policy wallet custody".into());
@@ -281,9 +290,7 @@ pub fn simulate(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<PreparedOperatio
     if resources.resource_fee < 0 || minimum > resources.resource_fee as u64 {
         return Err("Native preflight fee is below its minimum".into());
     }
-    let mut prepared = attach_simulation(p, encoded)?;
-    record_native_preflight(&mut prepared)?;
-    Ok(prepared)
+    Ok(encoded.into())
 }
 /// Revalidate an existing unsigned gateway intent through a locally trusted native RPC.
 /// The original transaction, hash and operation identity remain unchanged. Current authority,
@@ -328,13 +335,10 @@ pub fn revalidate_prepared(
     {
         return Err("Existing resource footprint has duplicate or overlapping keys".into());
     }
-    let simulated = simulate(rpc, p)?;
-    let required: SorobanTransactionData = read(
-        simulated
-            .simulation_data
-            .as_deref()
-            .ok_or("Native simulation omitted resource requirements")?,
-    )?;
+    // Fresh requirements can be smaller than the existing resources. Attaching them would change
+    // the hash, and an exact-hash preauthorization of the source would no longer match. Compare
+    // the requirements only; `validate_prepared` below checks quorum on the unchanged original.
+    let required: SorobanTransactionData = read(&simulated_resources(rpc, p)?)?;
     let have = &original.resources;
     let need = &required.resources;
     let footprint_covers =
