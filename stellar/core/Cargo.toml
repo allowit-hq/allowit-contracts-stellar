@@ -9,9 +9,12 @@ description = "Canonical Stellar wallet preparation, native authorization and se
 
 [workspace]
 
+[workspace.metadata.allowit.track]
+allowit-core = "head"
+
 [dependencies]
 allowit = { path = "../../crates/allowit", default-features = false, features = ["std"] }
-allowit-policy-sdk = { package = "allowit-sdk", git = "https://github.com/allowit-hq/allowit-core.git", rev = "e68ad4be5e4d1c28b8435982a2a208d2f872ba4e", default-features = false, features = ["std", "typed-workflow", "compiler"] }
+allowit-policy-sdk = { package = "allowit-sdk", git = "https://github.com/allowit-hq/allowit-core.git", rev = "6aa00597a0796acf6f6fa911a86c0fe57c055b67", default-features = false, features = ["std", "typed-workflow", "compiler"] }
 base64 = "0.22"
 ed25519-dalek = "2.2"
 serde = { version = "1", features = ["derive"] }
