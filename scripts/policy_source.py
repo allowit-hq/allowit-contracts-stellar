@@ -132,7 +132,7 @@ FIELDS = frozenset(("env", "params", "request", "operation", "asset", "recipient
 # Methods allowed only on one receiver field: `contains` tells whether params or args set a key, as
 # in `ctx.params.contains` or `ctx.request.args.contains`. The receiver must be that field access,
 # and the file must not declare these names: on a list bound to `params` or `args`, `contains` would
-# differ between the backend lists.
+# be a Soroban list method that the host list lacks.
 FIELD_METHODS = {"contains": ("params", "args")}
 # The only indexed receiver: `ctx.params[key]`. `AllowitParams` indexes only by key text, so the
 # std-only compile rejects any other index; every other indexing takes a pointer-width `usize`.

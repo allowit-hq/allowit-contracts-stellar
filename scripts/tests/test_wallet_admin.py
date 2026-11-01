@@ -1030,8 +1030,8 @@ class ContractAdmin(unittest.TestCase):
 
     def test_policy_source_reads_params_and_args_only_through_their_context_fields(self):
         head = HEAD + CALL("destinations")
-        # Review probes: a list bound to `args` or `params` takes a pointer-width index, so the
-        # host stores width=Int(4294967296) where the chain stores Int(0).
+        # Review probes: a list bound to `args` or `params` took a pointer-width index, so the
+        # host stored width=Int(4294967296) where the chain stored Int(0).
         probes = (
             "    if let AllowitValue::List(args) = &ctx.params[\"vendors\"] {\n"
             "        let i = 65_536;\n        let _ = args.get(i);\n        let wide = i.checked_mul(65_536).unwrap_or(0);\n"
@@ -1046,8 +1046,10 @@ class ContractAdmin(unittest.TestCase):
             for body in probes:
                 with self.subTest(body=body):
                     policy.write_text(source(body, head))
-                    # Each passes the std-only compile, so only the gate rejects it.
-                    ca.host_compile(policy)
+                    # The host list has no `get`, as it has no other list method, so the std-only
+                    # compile rejects each; the gate rejects the binding name too.
+                    with self.assertRaisesRegex(ValueError, "std-only compile"):
+                        ca.host_compile(policy)
                     with self.assertRaisesRegex(ValueError, "self-contained"):
                         ca.standard_prefix(source(body, head))
         # Any other binding named for the fields, or `contains` on a value that is no field access.

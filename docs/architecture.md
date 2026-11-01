@@ -137,11 +137,12 @@ Beside the allowlist, the tooling rejects:
   whose type indexes only by key text; every other index, such as `list[0]` or
   `ctx.request.args["k"]`, rejects. `contains` passes only on the field access `.params` or
   `.args`, and the file may not declare `params` or `args` as a binding or function name: on a
-  list, `contains` differs between the backends. A struct expression or pattern of
-  `AllowitContext`, which would reach `state`, and struct update syntax `..` reject. Soroban and
-  heap vectors have different methods with the same names, for example `append` drains its argument
-  only on the host, so a list from `AllowitValue::List`, and a `Vec` or `String` that `param` or
-  `arg` returns, admits only comparison, `clone`, matching and `for`.
+  list, `contains` is a Soroban method that the host list lacks. A struct expression or pattern
+  of `AllowitContext`, which would reach `state`, and struct update syntax `..` reject. The host
+  list has no methods, and Soroban and heap strings have different methods with the same names,
+  for example `len` returns `u32` onchain and `usize` on the host, so a list from
+  `AllowitValue::List`, and a `Vec` or `String` that `param` or `arg` returns, admits only
+  comparison, `clone`, matching and `for`.
 - Indexing (`x[i]`), whose index Rust infers as `usize`.
 
 `scripts/policy_source.py` implements these checks; `check-policy-bindings.py` and the owner packet
@@ -245,8 +246,8 @@ fixture.
 
 Portable authored code beyond canonical calls uses typed scalar fields, enum comparisons such as
 `ctx.request.operation == AllowitOperation::deposit`, matches on `AllowitValue`, and its own
-state keys. Backend list methods differ (`len` returns `u32` onchain and `usize` on the host), so
-the tooling admits no list method.
+state keys. The host list has no methods and `String::len` returns `u32` onchain and `usize` on
+the host, so the tooling admits no list or text method.
 
 `AllowitContext` is the complete rule input. It is plain data without methods. The wallet or server
 computes it:
