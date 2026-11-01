@@ -795,7 +795,8 @@ requires `preview - min(preview, assets) <= conversion_units`. The final read is
   token `transfer` and vault `withdraw` events.
 - An allowlisted router that misbehaves can lose up to `amount_in`, never more.
 - Another contract can wrap the agent's entry and move the pool or vault price earlier in the same
-  transaction. `amount_out_min` bounds a swap's loss; a redeem's loss has no onchain bound.
+  transaction. `amount_out_min` bounds a swap's loss and `min_assets` an `execute` redeem's; an
+  intercepted redeem's loss has no onchain bound.
 - The strict execution nonce orders every operation across both doors.
 - Testnet resets change router and token addresses: update `recipients` and `tokens` with
   `deploy_policy`.
