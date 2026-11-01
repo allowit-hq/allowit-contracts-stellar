@@ -1,7 +1,8 @@
 //! Canonical execution requests of the operations this crate maps. Each builder returns the
 //! `ExecutionRequest` that [`operation_from_request`] decodes, so a client sends exactly what the
-//! service checks. The policy wallet pays fees from the agent account and classic custody from
-//! the wallet account.
+//! service checks. Classic custody pays fees from the wallet account. A policy wallet pays them
+//! from its current agent account, the transaction source in the trusted state, which can differ
+//! from the configured customer signer.
 use crate::*;
 use allowit_policy_sdk::typed_workflow::{
     AssetId, OperationRef, WorkflowEffectBound, WorkflowFeeBound,
@@ -29,6 +30,7 @@ pub fn account(value: &str) -> Result<WorkflowAccount> {
 /// `transfer` of an issued asset.
 pub fn transfer(
     c: &WalletConfig,
+    state: &TrustedState,
     operation_id: [u8; 32],
     to: &str,
     amount: i128,
@@ -49,13 +51,14 @@ pub fn transfer(
         ];
         (call(&c.asset, "transfer", arguments)?, token(c, &c.asset)?)
     };
-    request(c, operation_id, instruction, asset, to, amount)
+    request(c, state, operation_id, instruction, asset, to, amount)
 }
 
 /// A SEP-56 deposit of `assets` of the wallet asset into `vault` for at least `min_shares`.
 /// Policy wallets only.
 pub fn deposit(
     c: &WalletConfig,
+    state: &TrustedState,
     operation_id: [u8; 32],
     vault: &str,
     assets: i128,
@@ -64,6 +67,7 @@ pub fn deposit(
     let instruction = call(vault, "deposit", sep56(c, assets, min_shares)?)?;
     request(
         c,
+        state,
         operation_id,
         instruction,
         token(c, &c.asset)?,
@@ -76,6 +80,7 @@ pub fn deposit(
 /// effect bound is on the vault's share token. Policy wallets only.
 pub fn redeem(
     c: &WalletConfig,
+    state: &TrustedState,
     operation_id: [u8; 32],
     vault: &str,
     shares: i128,
@@ -84,6 +89,7 @@ pub fn redeem(
     let instruction = call(vault, "redeem", sep56(c, shares, min_assets)?)?;
     request(
         c,
+        state,
         operation_id,
         instruction,
         token(c, vault)?,
@@ -138,9 +144,10 @@ fn units(value: i128) -> Result<Amount256> {
 }
 
 /// One request whose `instruction` debits exactly `amount` of `asset` from the wallet to
-/// `beneficiary`, within the installed fee bound. It returns only a request that decodes.
+/// `beneficiary`, within the installed fee bound paid by the trusted fee payer. It returns only a request that decodes.
 fn request(
     c: &WalletConfig,
+    state: &TrustedState,
     operation_id: [u8; 32],
     instruction: NativeInstruction,
     asset: WorkflowAsset,
@@ -151,7 +158,7 @@ fn request(
     let payer = if c.route == WalletRoute::Native {
         wallet.clone()
     } else {
-        account(&c.agent)?
+        account(&state.source.address)?
     };
     let request = ExecutionRequest {
         operation: OperationRef {

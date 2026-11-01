@@ -868,7 +868,7 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
     // 4. A transfer, priced with server-attested gas in XLM.
     let recipient = account_for_seed(&RECIPIENT);
     let ledger = chain.0.lock().unwrap().ledger;
-    let transfer = request::transfer(&c, [1; 32], &recipient, 10_000_000).unwrap();
+    let transfer = request::transfer(&c, &found.state, [1; 32], &recipient, 10_000_000).unwrap();
     let receipt = run(
         &chain,
         &c,
@@ -887,7 +887,7 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
     );
     // A transfer over the cap is denied on the host before any signature.
     let ledger = chain.0.lock().unwrap().ledger;
-    let over = request::transfer(&c, [9; 32], &recipient, 60_000_000).unwrap();
+    let over = request::transfer(&c, &found.state, [9; 32], &recipient, 60_000_000).unwrap();
     assert!(
         rpc::prepare_with(
             &chain,
@@ -904,7 +904,8 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
     // 5. A SEP-56 deposit, then a redeem of part of its shares: Simple and Common run both,
     // Custom's code runs no deposit.
     let ledger = chain.0.lock().unwrap().ledger;
-    let deposit = request::deposit(&c, [2; 32], &vault(), 5_000_000, 5_000_000).unwrap();
+    let deposit =
+        request::deposit(&c, &found.state, [2; 32], &vault(), 5_000_000, 5_000_000).unwrap();
     let priced = ExecutionTerms {
         args: PolicyParams::default(),
         expense: Some(ExpenseBounds::xlm(0, 0, MAX_FEE, ledger - 1, NOW).unwrap()),
@@ -923,7 +924,8 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
             (vault().as_str(), 5_000_000, 5_000_000)
         );
         let ledger = chain.0.lock().unwrap().ledger;
-        let redeem = request::redeem(&c, [5; 32], &vault(), 2_000_000, 2_000_000).unwrap();
+        let redeem =
+            request::redeem(&c, &found.state, [5; 32], &vault(), 2_000_000, 2_000_000).unwrap();
         let priced = ExecutionTerms {
             args: PolicyParams::default(),
             expense: Some(ExpenseBounds::xlm(0, 0, MAX_FEE, ledger - 1, NOW).unwrap()),
@@ -971,7 +973,7 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
     owner_submit(&chain, "params", &updated.transaction_xdr);
     assert_eq!(chain.state().params, lower);
     let ledger = chain.0.lock().unwrap().ledger;
-    let again = request::transfer(&c, [3; 32], &recipient, 15_000_000).unwrap();
+    let again = request::transfer(&c, &found.state, [3; 32], &recipient, 15_000_000).unwrap();
     let receipt = run(
         &chain,
         &c,
@@ -982,7 +984,7 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
     .unwrap();
     assert_eq!(receipt.transfer.deployment_version, 3);
     let ledger = chain.0.lock().unwrap().ledger;
-    let blocked = request::transfer(&c, [4; 32], &recipient, 25_000_000).unwrap();
+    let blocked = request::transfer(&c, &found.state, [4; 32], &recipient, 25_000_000).unwrap();
     assert!(
         rpc::prepare_with(
             &chain,
