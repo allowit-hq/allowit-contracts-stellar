@@ -87,6 +87,14 @@ pub fn operation(asset: &str, operation: &StellarOperation) -> Result<ScVal> {
                 ("vault", ScVal::Address(address(&d.vault)?)),
             ])?,
         ),
+        StellarOperation::Redeem(r) => variant(
+            "Redeem",
+            struct_value(vec![
+                ("min_assets", i128_value(r.min_assets)),
+                ("shares", i128_value(r.shares)),
+                ("vault", ScVal::Address(address(&r.vault)?)),
+            ])?,
+        ),
     }
 }
 /// `AllowitExpense`: `Unpriced`, or `Priced` with the server-approved `AllowitExpenseBounds`.
@@ -137,8 +145,8 @@ pub fn execution_request(p: ExecutionPacket) -> Result<ScVal> {
     ])
 }
 
-/// `AllowitTransferReceipt`, returned by `execute` for both operations. A deposit reports its
-/// underlying debit to the vault.
+/// `AllowitTransferReceipt`, returned by `execute` for every operation. A deposit reports its
+/// underlying debit to the vault, and a redeem its share debit at the vault.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TransferReceipt {
@@ -243,6 +251,67 @@ impl DepositReceipt {
             operator: addr(map_field(value, "operator")?)?,
             assets: wide(map_field(value, "assets")?)?,
             shares: wide(map_field(value, "shares")?)?,
+            nonce: u64_field(map_field(value, "nonce")?)?,
+            deployment_version: u64_field(map_field(value, "deployment_version")?)?,
+        })
+    }
+}
+/// `AllowitSep56RedeemReceipt`: the settled asset credit of one redeem.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RedeemReceipt {
+    pub operation_id: [u8; 32],
+    pub vault: String,
+    pub asset: String,
+    pub owner: String,
+    pub receiver: String,
+    pub operator: String,
+    pub shares: i128,
+    pub assets: i128,
+    pub nonce: u64,
+    pub deployment_version: u64,
+}
+impl RedeemReceipt {
+    pub fn scval(&self) -> Result<ScVal> {
+        struct_value(vec![
+            ("asset", ScVal::Address(address(&self.asset)?)),
+            ("assets", i128_value(self.assets)),
+            ("deployment_version", ScVal::U64(self.deployment_version)),
+            ("nonce", ScVal::U64(self.nonce)),
+            ("operation_id", value_bytes(&self.operation_id)?),
+            ("operator", ScVal::Address(address(&self.operator)?)),
+            ("owner", ScVal::Address(address(&self.owner)?)),
+            ("receiver", ScVal::Address(address(&self.receiver)?)),
+            ("shares", i128_value(self.shares)),
+            ("vault", ScVal::Address(address(&self.vault)?)),
+        ])
+    }
+    pub fn from_scval(value: &ScVal) -> Result<Self> {
+        use rpc::{addr, digest_field, map_field, wide};
+        exact_keys(
+            value,
+            &[
+                "asset",
+                "assets",
+                "deployment_version",
+                "nonce",
+                "operation_id",
+                "operator",
+                "owner",
+                "receiver",
+                "shares",
+                "vault",
+            ],
+        )?;
+        Ok(Self {
+            operation_id: digest_field(map_field(value, "operation_id")?)?,
+            vault: addr(map_field(value, "vault")?)?,
+            asset: addr(map_field(value, "asset")?)?,
+            owner: addr(map_field(value, "owner")?)?,
+            receiver: addr(map_field(value, "receiver")?)?,
+            operator: addr(map_field(value, "operator")?)?,
+            shares: wide(map_field(value, "shares")?)?,
+            assets: wide(map_field(value, "assets")?)?,
             nonce: u64_field(map_field(value, "nonce")?)?,
             deployment_version: u64_field(map_field(value, "deployment_version")?)?,
         })
@@ -471,6 +540,10 @@ pub fn operation_key(wallet: &str, operation_id: &[u8; 32]) -> Result<LedgerKey>
 /// Persistent ledger key of a deposit receipt.
 pub fn deposit_key(wallet: &str, operation_id: &[u8; 32]) -> Result<LedgerKey> {
     persistent_key(wallet, "Deposit", operation_id)
+}
+/// Persistent ledger key of a redeem receipt.
+pub fn redeem_key(wallet: &str, operation_id: &[u8; 32]) -> Result<LedgerKey> {
+    persistent_key(wallet, "Redeem", operation_id)
 }
 fn persistent_key(wallet: &str, variant: &str, operation_id: &[u8; 32]) -> Result<LedgerKey> {
     Ok(LedgerKey::ContractData(LedgerKeyContractData {

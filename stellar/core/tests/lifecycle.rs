@@ -592,6 +592,45 @@ fn requests_reject_other_rails_unbounded_fees_extra_effects_and_wrong_asset() {
     };
     assert!(prepare(&c, &r, &s, 86401, 86700).is_err());
 }
+#[test]
+fn redeems_admit_only_positive_amounts_for_the_wallet_on_a_policy_wallet() {
+    let vault = Contract([0x56; 32]).to_string();
+    let (native, _, native_state) = fixture(WalletRoute::Native, false);
+    assert!(
+        request::redeem(&native, &native_state, [8; 32], &vault, 3, 2)
+            .unwrap_err()
+            .contains("require a policy wallet")
+    );
+    let (c, _, s) = fixture(WalletRoute::PolicyWallet, false);
+    let r = request::redeem(&c, &s, [8; 32], &vault, 3, 2).unwrap();
+    assert_eq!(
+        operation_from_request(&c, &r).unwrap(),
+        StellarOperation::Redeem(Redeem {
+            vault,
+            shares: 3,
+            min_assets: 2,
+        })
+    );
+    // `redeem(shares, receiver, owner, operator, min_assets)` with one argument replaced.
+    let with_argument = |i: usize, value: AbiValue| {
+        let mut r = r.clone();
+        let ExecutionInput::Instructions(v) = &mut r.input else {
+            panic!()
+        };
+        let NativeInstruction::StellarCall { arguments, .. } = &mut v[0] else {
+            panic!()
+        };
+        arguments[i] = value;
+        operation_from_request(&c, &r).unwrap_err()
+    };
+    let other = AbiValue::Account(wf(&account_for_seed(&[6; 32])));
+    for party in 1..=3 {
+        assert!(with_argument(party, other.clone()).contains("must be the wallet"));
+    }
+    for (i, units) in [(0, 0), (0, -3), (4, 0), (4, -1)] {
+        assert!(with_argument(i, AbiValue::Signed128(units)).contains("must be positive"));
+    }
+}
 
 struct ErrorAfterBroadcast {
     inner: FakeRpc,
@@ -1297,6 +1336,9 @@ fn odc_current_agent_account_may_have_a_different_customer_signer() {
         },
     ];
     assert_eq!(s.source.address, actual_agent);
+    // A built request names the agent account, not the customer signer, as its fee payer.
+    let built = request::transfer(&c, &s, [8; 32], &account_for_seed(&[6; 32]), 1).unwrap();
+    prepare(&c, &built, &s, 86401, 86700).unwrap();
     let mut p = prepare(&c, &r, &s, 86401, 86700).unwrap();
     let resource = SorobanTransactionData {
         ext: stellar_xdr::SorobanTransactionDataExt::V0,

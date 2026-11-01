@@ -16,8 +16,9 @@ mod authorization;
 pub mod contract;
 pub mod owner;
 pub mod policy;
+pub mod request;
 pub use authorization::{authorize_server, authorize_server_with, sign_account_entry};
-pub use contract::{CONTRACT_VERSION, DepositReceipt, TransferReceipt};
+pub use contract::{CONTRACT_VERSION, DepositReceipt, RedeemReceipt, TransferReceipt};
 pub use policy::{PolicyLanguage, PolicyParams, PolicyTier, PolicyValue};
 pub mod rpc;
 pub mod x402;
@@ -215,7 +216,7 @@ impl WalletConfig {
     }
 }
 /// The general operations of the policy core, which policy wallet bindings list and rules read.
-/// This crate prepares transfers and deposits.
+/// This crate prepares transfers, deposits and redeems.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum OperationKind {
@@ -548,24 +549,44 @@ pub struct Deposit {
     pub assets: i128,
     pub min_shares: i128,
 }
+/// One SEP-56 redeem of `shares` of `vault` for at least `min_assets` of the wallet asset. The
+/// wallet is its owner, receiver and operator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Redeem {
+    pub vault: String,
+    pub shares: i128,
+    pub min_assets: i128,
+}
 /// The admitted native operation of one request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StellarOperation {
     Transfer(Transfer),
     Deposit(Deposit),
+    Redeem(Redeem),
 }
 impl StellarOperation {
     pub fn kind(&self) -> OperationKind {
         match self {
             Self::Transfer(_) => OperationKind::Transfer,
             Self::Deposit(_) => OperationKind::Deposit,
+            Self::Redeem(_) => OperationKind::Redeem,
         }
     }
-    /// The underlying debit: deposits move `assets` to the vault.
+    /// The one debit's beneficiary and units: deposits move `assets` to the vault, and redeems
+    /// burn `shares` at the vault.
     pub fn debit(&self) -> (&str, i128) {
         match self {
             Self::Transfer(t) => (&t.recipient, t.amount),
             Self::Deposit(d) => (&d.vault, d.assets),
+            Self::Redeem(r) => (&r.vault, r.shares),
+        }
+    }
+    /// The token of the debit on a wallet of `asset`: the asset, or the vault's shares for a
+    /// redeem.
+    pub fn debit_token<'a>(&'a self, asset: &'a str) -> &'a str {
+        match self {
+            Self::Redeem(r) => &r.vault,
+            Self::Transfer(_) | Self::Deposit(_) => asset,
         }
     }
 }
@@ -676,11 +697,11 @@ fn validate_portable_install(c: &WalletConfig) -> Result<()> {
 pub fn transfer_from_request(c: &WalletConfig, r: &ExecutionRequest) -> Result<Transfer> {
     match decode_operation(c, r, false)? {
         StellarOperation::Transfer(t) => Ok(t),
-        StellarOperation::Deposit(_) => Err("This profile admits only a transfer".into()),
+        _ => Err("This profile admits only a transfer".into()),
     }
 }
-/// Decode one admitted native operation: a SEP-41 transfer, or a SEP-56 deposit for policy
-/// wallets, with exact effect and fee bounds.
+/// Decode one admitted native operation: a SEP-41 transfer, or a SEP-56 deposit or redeem for
+/// policy wallets, with exact effect and fee bounds.
 pub fn operation_from_request(c: &WalletConfig, r: &ExecutionRequest) -> Result<StellarOperation> {
     decode_operation(c, r, false)
 }
@@ -733,39 +754,50 @@ fn decode_operation(
                 amount: *units,
                 native: false,
             }),
+            // SEP-56 `deposit(assets, receiver, from, operator)` and `redeem(shares, receiver,
+            // owner, operator)`, then the wallet's minimum output.
             (
-                "deposit",
+                function @ ("deposit" | "redeem"),
                 [
-                    AbiValue::Signed128(assets),
+                    AbiValue::Signed128(amount),
                     AbiValue::Account(receiver),
-                    AbiValue::Account(from),
+                    AbiValue::Account(holder),
                     AbiValue::Account(operator),
-                    AbiValue::Signed128(min_shares),
+                    AbiValue::Signed128(minimum),
                 ],
             ) => {
                 if c.route != WalletRoute::PolicyWallet || contract.kind != AccountKind::Contract {
                     return Err(
-                        "SEP-56 deposits require a policy wallet and a vault contract".into(),
+                        "SEP-56 operations require a policy wallet and a vault contract".into(),
                     );
                 }
-                for party in [receiver, from, operator] {
+                for party in [receiver, holder, operator] {
                     if workflow_address(party)? != c.wallet {
                         return Err(
-                            "Deposit receiver, source and operator must be the wallet".into()
+                            "SEP-56 receiver, holder and operator must be the wallet".into()
                         );
                     }
                 }
-                StellarOperation::Deposit(Deposit {
-                    vault: workflow_address(contract)?,
-                    assets: *assets,
-                    min_shares: *min_shares,
-                })
+                let vault = workflow_address(contract)?;
+                if function == "deposit" {
+                    StellarOperation::Deposit(Deposit {
+                        vault,
+                        assets: *amount,
+                        min_shares: *minimum,
+                    })
+                } else {
+                    StellarOperation::Redeem(Redeem {
+                        vault,
+                        shares: *amount,
+                        min_assets: *minimum,
+                    })
+                }
             }
             _ => return Err("Unknown Stellar contract, method or arguments".into()),
         },
         _ => return Err("Unsupported Stellar instruction".into()),
     };
-    let (beneficiary, units, native) = match &operation {
+    let native = match &operation {
         StellarOperation::Transfer(transfer) => {
             if transfer.native && asset_xdr(c)? != Asset::Native {
                 return Err("Native XLM request differs from installed asset".into());
@@ -777,18 +809,29 @@ fn decode_operation(
             if !retained && c.asset_issuer.as_deref() == Some(transfer.recipient.as_str()) {
                 return Err("Issued-asset payments to the issuer burn units instead of crediting the required recipient balance".into());
             }
-            (&transfer.recipient, transfer.amount, transfer.native)
+            transfer.native
         }
-        StellarOperation::Deposit(deposit) => {
-            if deposit.vault == c.wallet || deposit.vault == c.asset {
-                return Err("The deposit vault must be another contract".into());
+        StellarOperation::Deposit(Deposit {
+            vault,
+            assets: amount,
+            min_shares: minimum,
+        })
+        | StellarOperation::Redeem(Redeem {
+            vault,
+            shares: amount,
+            min_assets: minimum,
+        }) => {
+            if *vault == c.wallet || *vault == c.asset {
+                return Err("The vault must be another contract".into());
             }
-            if deposit.assets <= 0 || deposit.min_shares <= 0 {
-                return Err("Deposit assets and minimum shares must be positive".into());
+            if *amount <= 0 || *minimum <= 0 {
+                return Err("SEP-56 amounts and minimum outputs must be positive".into());
             }
-            (&deposit.vault, deposit.assets, false)
+            false
         }
     };
+    // The effect bound is the one debit: the asset, or the vault's shares for a redeem.
+    let (beneficiary, units) = operation.debit();
     let effect = &r.effect_bounds[0];
     let asset = match &effect.asset {
         WorkflowAsset::Native { chain, network } => {
@@ -796,13 +839,13 @@ fn decode_operation(
         }
         WorkflowAsset::Token(a) => {
             a.network == network_id(&c.network)?
-                && workflow_address(&a.token)? == c.asset
+                && workflow_address(&a.token)? == operation.debit_token(&c.asset)
                 && !native
         }
     };
     if !asset
         || workflow_address(&effect.source)? != c.wallet
-        || workflow_address(&effect.beneficiary)? != *beneficiary
+        || workflow_address(&effect.beneficiary)? != beneficiary
         || amount(&effect.max_debit)? != units
         || amount(&effect.min_credit)? != units
         || amount(&effect.max_burn)? != 0
@@ -1043,6 +1086,7 @@ fn validate_expense(
             }
             expense.conversion_units
         }
+        StellarOperation::Redeem(_) => expense.conversion_units,
     };
     if Some(expense.spent_units) != principal.checked_add(expense.gas_units) {
         return Err("Expense spent units must be principal plus gas".into());
