@@ -154,7 +154,7 @@ def wallet_layout(state):
 
 CAPS = {"transaction_cap", "spent_cap", "day_spent_cap", "day_total_cap"}
 LISTS = {"recipients", "tokens"}
-# One `operations` entry, as `allowit` checks it: a plain op name, `custom.<function>` or
+# One `operations` entry, as the Soroban backend of `allowit` checks it: a plain op name, `custom.<function>` or
 # `custom:<contract>.<function>`.
 OPERATION = re.compile(r"transfer|swap|deposit|redeem|custom|custom\.[A-Za-z0-9_]{1,32}|custom:C[A-Z2-7]{55}\.[A-Za-z0-9_]{1,32}")
 # Bounds that the wallet contract enforces: `allowit::MAX_PARAMS`, `MAX_ITEMS`, `MAX_TEXT` and

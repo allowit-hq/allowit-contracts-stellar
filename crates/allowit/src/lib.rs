@@ -53,7 +53,7 @@
 //! Types and rule logic are written once in `core.rs` and compiled per backend. Each backend binds
 //! `Address`, `AllowitEnv`, `Map`, `String`, `Symbol` and `Vec`. Feature `soroban` (default) uses
 //! host values, contract types and the Soroban `Env`, and buffers policy writes in contract
-//! temporary storage until `post_flight`. Feature `std` uses StrKey addresses, heap maps and
+//! temporary storage until `post_flight`. Feature `std` uses text addresses, heap maps and
 //! vectors, and a host `AllowitEnv` that buffers policy writes. The selected backend backs the
 //! crate root, which authored policy names.
 //!
@@ -112,16 +112,6 @@ compile_error!("Enable feature `soroban` or `std`");
 compile_error!(
     "Features `soroban` and `std` select different crate-root types; use `default-features = false`"
 );
-
-/// Whether `text` is the text of a contract address: a 56-character base32 StrKey that starts
-/// with `C`. Both backends hold addresses as StrKeys.
-fn contract_strkey_ok(text: &[u8]) -> bool {
-    text.len() == 56
-        && text[0] == b'C'
-        && text
-            .iter()
-            .all(|b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(b))
-}
 
 /// Onchain backend. Params, state, request facts and errors are Soroban contract types.
 #[cfg(feature = "soroban")]
@@ -194,7 +184,15 @@ pub mod soroban {
         Some(bytes)
     }
 
-    use super::contract_strkey_ok as contract_text_ok;
+    /// Whether `text` is the text of a contract address: a 56-character base32 StrKey that starts
+    /// with `C`.
+    fn contract_text_ok(text: &[u8]) -> bool {
+        text.len() == 56
+            && text[0] == b'C'
+            && text
+                .iter()
+                .all(|b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(b))
+    }
 
     /// The text of an address: its StrKey.
     fn address_text(address: &Address) -> String {
@@ -282,33 +280,34 @@ pub mod soroban {
     }
 }
 
-/// Host backend for the offchain server and SDK evaluator. Addresses are StrKey strings.
+/// Host backend for the offchain server and SDK evaluator. Addresses are text that the rail
+/// supplies.
 #[cfg(feature = "std")]
 pub mod host {
     use alloc::collections::BTreeMap;
     pub use alloc::{string::String, vec::Vec};
     use std::sync::{Arc, Mutex, MutexGuard};
 
-    /// Exact account or contract identity, held as its StrKey text. It compares only for
-    /// equality. Soroban orders addresses by `ScAddress`, so accounts sort before contracts, while
-    /// text would sort by StrKey; `Address` therefore has no order on the host, and authored code
-    /// that orders addresses fails the std-only compile.
+    /// Exact account or contract identity, held as the text that its rail supplies. It compares
+    /// only for equality. The onchain backend orders addresses by type, so accounts sort before
+    /// contracts, while text would sort by its characters; `Address` therefore has no order on the
+    /// host, and authored code that orders addresses fails the std-only compile.
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub struct Address(String);
 
     impl Address {
-        /// The address with this StrKey text. The server supplies a validated StrKey.
-        pub fn new(strkey: impl Into<String>) -> Self {
-            Self(strkey.into())
+        /// The address with this text. The rail supplies text that it has validated.
+        pub fn new(text: impl Into<String>) -> Self {
+            Self(text.into())
         }
 
-        /// The StrKey text of this address.
+        /// The text of this address.
         pub fn as_str(&self) -> &str {
             &self.0
         }
     }
 
-    /// Host map: keys are text checked like Soroban `Symbol`s.
+    /// Host map: keys are text checked like onchain map keys.
     type Map<K, V> = BTreeMap<K, V>;
     /// Host map key.
     type Symbol = String;
@@ -417,9 +416,13 @@ pub mod host {
         (text.len() <= MAX_TEXT as usize).then_some(text.as_bytes())
     }
 
-    use super::contract_strkey_ok as contract_text_ok;
+    /// Whether `text` can be the text of a contract address: 1 or more ASCII letters or digits.
+    /// The rail that builds each `Address` checks its own address format.
+    fn contract_text_ok(text: &[u8]) -> bool {
+        !text.is_empty() && text.iter().all(u8::is_ascii_alphanumeric)
+    }
 
-    /// The text of an address: its StrKey.
+    /// The text of an address, as its rail supplied it.
     fn address_text(address: &Address) -> String {
         String::from(address.as_str())
     }
@@ -452,7 +455,7 @@ pub mod host {
         }
     }
 
-    /// Run `check` on each value of `map`. A key that no Soroban map could hold is `InvalidParam`.
+    /// Run `check` on each value of `map`. A key that no backend map holds is `InvalidParam`.
     fn each_value(map: &AllowitMap, mut check: impl FnMut(AllowitValue) -> Result) -> Result {
         for (key, value) in map {
             if !key_ok(key) {
@@ -488,7 +491,7 @@ pub mod host {
 
     /// Server-only enrichment. Each function takes its owner-written request, returns its passing
     /// constraint or an `AllowitError`, and is an API stub that the offchain server fills; here it
-    /// is `Unsupported`. The Soroban backend has none of them, so onchain policy cannot call one.
+    /// is `Unsupported`. The onchain backend has none of them, so onchain policy cannot call one.
     pub mod server {
         use super::{Address, AllowitContext, AllowitError, AllowitValue, Result};
 

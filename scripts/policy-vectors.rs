@@ -7,7 +7,7 @@ pub const ASSET: usize = 0;
 pub const RECIPIENT: usize = 1;
 pub const VAULT: usize = 2;
 pub const OTHER: usize = 3;
-pub const ROUTER: usize = 4;
+pub const EXCHANGE: usize = 4;
 /// A second token, which a swap buys or sells against the asset.
 pub const TOKEN: usize = 5;
 /// Universe size.
@@ -159,13 +159,13 @@ fn deposit(v: &mut Vector) {
     v.min_out = v.amount;
 }
 
-/// Make `v` a swap through the router that every rule admits: forward, 40 asset units for at
+/// Make `v` a swap through the exchange that every rule admits: forward, 40 asset units for at
 /// least 37 of `TOKEN`, or reverse, 100 `TOKEN` units for at least 40 asset units, which count as
 /// its gross amount. A swap spends its 3-unit conversion bound.
 fn swap(v: &mut Vector, reverse: bool) {
     v.op = Op::Swap;
-    v.recipient = ROUTER;
-    v.recipients = Some(vec![RECIPIENT, VAULT, ROUTER]);
+    v.recipient = EXCHANGE;
+    v.recipients = Some(vec![RECIPIENT, VAULT, EXCHANGE]);
     v.tokens = Some(vec![ASSET, TOKEN]);
     v.operations = Some(Ops::List(vec!["transfer", "swap", "redeem"]));
     v.spent_units = 3;
@@ -300,12 +300,12 @@ pub fn vectors() -> Vec<Vector> {
             deposit(v);
             v.operations = Some(Ops::List(vec!["deposit"]));
         }),
-        // Swaps and redeems: the router and the vault are recipients, `tokens` also checks the
+        // Swaps and redeems: the exchange and the vault are recipients, `tokens` also checks the
         // token a swap trades against the asset, and a reverse swap or redeem counts its minimum
         // asset output as its gross amount.
         edit("swap", |v| swap(v, false)),
         edit("reverse_swap", |v| swap(v, true)),
-        edit("swap_unlisted_router", |v| {
+        edit("swap_unlisted_exchange", |v| {
             swap(v, false);
             v.recipients = Some(vec![RECIPIENT, VAULT]);
         }),

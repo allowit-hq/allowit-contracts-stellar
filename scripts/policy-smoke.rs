@@ -375,7 +375,7 @@ fn approval_server_only_functions_compile_on_the_host_and_are_unsupported_until_
     );
 }
 
-/// Host address with StrKey-shaped text for each universe index.
+/// Host address text for each universe index.
 fn address(index: usize) -> Address {
     Address::new(format!("CADDRESS{index}"))
 }
@@ -587,7 +587,7 @@ fn vectors_print_host_outcomes() {
     let recipient = denied(AllowitError::RecipientNotAllowed);
     let token = denied(AllowitError::TokenNotAllowed);
     let cap = denied(AllowitError::TransactionCapExceeded);
-    assert_eq!(named("swap_unlisted_router").policy, recipient);
+    assert_eq!(named("swap_unlisted_exchange").policy, recipient);
     assert_eq!(named("swap_other_token_not_allowed").policy, token);
     assert_eq!(
         named("reverse_swap_other_token_not_allowed").rules[6],

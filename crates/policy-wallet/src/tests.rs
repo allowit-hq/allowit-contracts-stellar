@@ -1935,7 +1935,7 @@ fn issuer_identity_decodes_real_sac_symbols_and_rejects_malformed_cache() {
         );
         asset.append(&Bytes::from_slice(&f.env, code));
         asset.append(&Bytes::from_array(&f.env, &[0; 4]));
-        asset.append(&public_key(&f.env, &issuer).unwrap().into());
+        asset.append(&public_key(&issuer).unwrap().into());
         let deployed = f.env.deployer().with_stellar_asset(asset).deploy();
         let mut state = f.client().state();
         state.asset = deployed.clone();
@@ -2203,4 +2203,27 @@ fn clock_regression_and_cross_day_expense_reject_before_rules_run() {
         Err(AllowitWalletError::InvalidInvocation)
     );
     assert_eq!(f.client().state(), before);
+}
+
+#[test]
+fn address_kind_checks_tell_accounts_from_contracts() {
+    use soroban_sdk::xdr as x;
+    let env = Env::default();
+    let key = [7; 32];
+    let account = Address::from_xdr(
+        &env,
+        &x::ScVal::Address(x::ScAddress::Account(x::AccountId(
+            x::PublicKey::PublicKeyTypeEd25519(x::Uint256(key)),
+        )))
+        .to_xdr(&env),
+    )
+    .unwrap();
+    let contract = Address::from_xdr(
+        &env,
+        &x::ScVal::Address(x::ScAddress::Contract(x::ContractId(x::Hash(key)))).to_xdr(&env),
+    )
+    .unwrap();
+    assert_eq!(public_key(&account), Ok(BytesN::from_array(&env, &key)));
+    assert_eq!(public_key(&contract), Err(AllowitWalletError::InvalidActor));
+    assert!(is_contract(&contract) && !is_contract(&account));
 }

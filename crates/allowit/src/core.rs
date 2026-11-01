@@ -139,7 +139,7 @@ mod types {
     /// Complete rule input, supplied by the wallet or server. Plain data without methods.
     #[derive(Clone)]
     pub struct AllowitContext {
-        /// Backend environment: a Soroban `Env` onchain and an `AllowitEnv` on the host.
+        /// The backend's environment.
         pub env: AllowitEnv,
         /// The owner's constructor params, set at install and changed by owner-signed update.
         pub params: AllowitParams,
@@ -309,7 +309,7 @@ impl AllowitRule {
 /// Lookup of params and args by key: the only read that authored policy has.
 impl AllowitParams {
     /// The value of `key`, or `None` when it is unset. A key that no map can hold, such as one
-    /// with a space, is unset. Values are owned because Soroban maps decode them on read.
+    /// with a space, is unset. Values are owned because onchain maps decode them on read.
     pub fn get(&self, key: &str) -> Option<AllowitValue> {
         lookup(&self.0, key)
     }
@@ -396,7 +396,7 @@ impl AllowitStandardState {
     }
 }
 
-/// A key is 1 to 32 ASCII letters, digits or underscores, as a Soroban `Symbol` requires.
+/// A key is 1 to 32 ASCII letters, digits or underscores, so that every backend map holds it.
 fn key_ok(key: &str) -> bool {
     symbol_ok(key.as_bytes())
 }

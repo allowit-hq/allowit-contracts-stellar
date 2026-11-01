@@ -379,8 +379,11 @@ rejects negative caps.
 The op names are the general operations of `AllowitOperation`: `transfer`, `swap`, `deposit`
 and `redeem`, plus three custom-call forms. `custom` admits any custom call, `custom.<function>`
 that function on any contract, and `custom:<contract>.<function>` that function on that contract
-instance. A function is 1 to 32 ASCII letters, digits or underscores. The backend supplies the
-contract text check: both Stellar backends accept a `C` StrKey.
+instance. A function is 1 to 32 ASCII letters, digits or underscores. Each backend supplies the
+contract text check. The Soroban backend accepts only a `C` StrKey. The rail-neutral host backend
+accepts 1 or more ASCII letters or digits, because the rail checks each address it supplies; so an
+`operations` entry with a malformed Stellar contract is `InvalidParam` onchain but matches nothing on
+the host. `contract_admin.py` rejects such an entry before the owner sets it.
 A custom call whose contract and function form no such name is admitted by no entry, not even
 `*`. The policy core names no rail operation. The Stellar wallet maps its native calls onto the
 general operations: a SEP-41 transfer is `transfer`, a SEP-56 deposit `deposit`, a router swap

@@ -12,6 +12,7 @@ use allowit_wallet_protocol::{
 };
 use soroban_sdk::{
     Address, Bytes, BytesN, Env, Executable, IntoVal, Map, String, Symbol, TryFromVal, Val, Vec,
+    address_payload::AddressPayload,
     auth::{Context, ContractContext, InvokerContractAuthEntry, SubContractInvocation},
     contracterror, contracttype,
     crypto::Hash,
@@ -256,21 +257,13 @@ fn stored(env: &Env) -> Result<Val, AllowitWalletError> {
         .get(&STATE_KEY)
         .ok_or(AllowitWalletError::InvalidState)
 }
-/// The ed25519 key of a G-account address; any other address is `InvalidActor`.
-fn public_key(env: &Env, address: &Address) -> Result<BytesN<32>, AllowitWalletError> {
-    let encoded = address.to_xdr(env);
-    let prefix = [0, 0, 0, 18, 0, 0, 0, 0, 0, 0, 0, 0];
-    if encoded.len() != 44
-        || prefix
-            .iter()
-            .enumerate()
-            .any(|(i, b)| encoded.get(i as u32) != Some(*b))
-    {
-        return Err(AllowitWalletError::InvalidActor);
+/// The ed25519 master key of a G-account address; any other address is `InvalidActor`. The
+/// wallet's agent and server sign with their master keys.
+fn public_key(address: &Address) -> Result<BytesN<32>, AllowitWalletError> {
+    match address.to_payload() {
+        Some(AddressPayload::AccountIdPublicKeyEd25519(key)) => Ok(key),
+        _ => Err(AllowitWalletError::InvalidActor),
     }
-    let mut key = [0; 32];
-    encoded.slice(12..44).copy_into_slice(&mut key);
-    Ok(BytesN::from_array(env, &key))
 }
 /// Pure standard-prefix binding: SHA-256 of the canonical XDR of the domain `allowit_std_prefix`,
 /// the implementation kind, the module hash, the asset and the ordered rules. The module hash fixes
@@ -341,8 +334,8 @@ fn validate<P: AllowitPolicy>(
         return Err(AllowitWalletError::InvalidState);
     }
     if config.x402_enabled {
-        public_key(env, &config.agent)?;
-        public_key(env, &config.server)?;
+        public_key(&config.agent)?;
+        public_key(&config.server)?;
     }
     Ok(())
 }
@@ -469,9 +462,11 @@ fn facts(operation: &AllowitStellarOperation, asset: &Address) -> Facts {
     }
 }
 /// Whether `address` is a contract, not an account. A contract address never burns a classic asset.
-fn is_contract(env: &Env, address: &Address) -> bool {
-    let encoded = address.to_xdr(env);
-    encoded.len() == 40 && encoded.slice(0..8) == Bytes::from_array(env, &[0, 0, 0, 18, 0, 0, 0, 1])
+fn is_contract(address: &Address) -> bool {
+    matches!(
+        address.to_payload(),
+        Some(AddressPayload::ContractIdHash(_))
+    )
 }
 /// Check the native operation of a request: a transfer moves the installed asset, a vault or
 /// router is neither the wallet nor the asset, and amounts are positive. The wallet supplies itself
@@ -604,7 +599,7 @@ fn issuer_destination(
     }
     // SEP-11 keeps at least five bytes for AlphaNum12, including escaped zeros.
     let (kind, width) = if size <= 4 { (1u32, 4) } else { (2u32, 12) };
-    let Ok(issuer) = public_key(env, to) else {
+    let Ok(issuer) = public_key(to) else {
         return Ok(false);
     };
     let mut preimage = Bytes::from_array(env, &kind.to_be_bytes());
@@ -786,7 +781,7 @@ fn swap_tokens(env: &Env, args: &AllowitSwapArgs) -> Result<i128, AllowitWalletE
         &Symbol::new(env, "router_pair_for"),
         (token_in.clone(), args.path.get_unchecked(1)).into_val(env),
     );
-    if pair == wallet || pair == args.router || !is_contract(env, &pair) {
+    if pair == wallet || pair == args.router || !is_contract(&pair) {
         return Err(AllowitWalletError::InvalidEffects);
     }
     let in_client = token::Client::new(env, &token_in);
@@ -1371,8 +1366,7 @@ fn match_contexts(
                 .and_then(|raw| Address::try_from_val(env, &raw).ok())
                 .ok_or(AllowitWalletError::InvalidInvocation)?;
             let paid: Vec<Val> = (wallet.clone(), pair.clone(), a.amount_in).into_val(env);
-            if pair == wallet || pair == a.router || !is_contract(env, &pair) || debit.args != paid
-            {
+            if pair == wallet || pair == a.router || !is_contract(&pair) || debit.args != paid {
                 return Err(AllowitWalletError::InvalidInvocation);
             }
             let path = a.path.clone();
@@ -1411,12 +1405,12 @@ fn verify_cosigners(
         )
         .to_bytes();
     env.crypto().ed25519_verify(
-        &public_key(env, &state.agent)?,
+        &public_key(&state.agent)?,
         &digest.clone().into(),
         &authorization.agent_signature,
     );
     env.crypto().ed25519_verify(
-        &public_key(env, &state.server)?,
+        &public_key(&state.server)?,
         &digest.into(),
         &authorization.server_signature,
     );
