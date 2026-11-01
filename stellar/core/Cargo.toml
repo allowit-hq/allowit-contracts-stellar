@@ -11,8 +11,7 @@ description = "Canonical Stellar wallet preparation, native authorization and se
 
 [dependencies]
 allowit = { path = "../../crates/allowit", version = "0.1.0", default-features = false, features = ["std"] }
-# TODO: replace rev with tag = "v0.1.0" once allowit-core releases it.
-allowit-policy-sdk = { package = "allowit-sdk", git = "https://github.com/allowit-hq/allowit-core.git", rev = "6aa00597a0796acf6f6fa911a86c0fe57c055b67", version = "0.1", default-features = false, features = ["std", "typed-workflow", "compiler"] }
+allowit-policy-sdk = { package = "allowit-sdk", git = "https://github.com/allowit-hq/allowit-core.git", tag = "v0.1.0", version = "0.1", default-features = false, features = ["std", "typed-workflow", "compiler"] }
 base64 = "0.22"
 ed25519-dalek = "2.2"
 serde = { version = "1", features = ["derive"] }
