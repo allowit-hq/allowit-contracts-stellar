@@ -1,8 +1,10 @@
 [package]
 name = "allowit"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
 license = "UNLICENSED"
+description = "Allowit portable policy library for Soroban contracts and host evaluators"
 
 [lib]
 crate-type = ["rlib"]

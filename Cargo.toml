@@ -2,16 +2,30 @@
 members = ["crates/protocol", "crates/allowit", "crates/engine", "crates/engine-parent", "crates/policy-wallet", "crates/simple-policy-engine", "crates/common-policy-engine", "crates/custom-policy", "crates/test-vault"]
 resolver = "2"
 
+# Every package in this repository, including stellar/core, releases at this version.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/allowit-hq/allowit-contracts-stellar"
+
 [workspace.dependencies]
 soroban-sdk = "=28.0.0"
 
+# Every Allowit workspace uses this profile block, so a shared target directory
+# builds each shared crate once. Release builds keep overflow checks, which the
+# portable policy library requires, and the Soroban contract settings; the Wasm
+# targets abort on panic by default.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+[profile.test]
+debug = "line-tables-only"
+incremental = false
+
 [profile.release]
+codegen-units = 1
+lto = true
 opt-level = "z"
 overflow-checks = true
 strip = "symbols"
-panic = "abort"
-lto = true
-codegen-units = 1
-
-[profile.dev]
-debug = 0
