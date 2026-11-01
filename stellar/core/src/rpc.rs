@@ -1099,33 +1099,44 @@ pub fn send_and_poll(
         return Err("Transaction is unsigned".into());
     }
     let expected = transaction_hash_for(network, &envelope.tx)?;
+    let id = hex(&expected);
+    // Once bytes may have reached the network, a failed call leaves the result unknown: name the
+    // hash, so the caller reconciles it before preparing any replacement.
+    let unknown = |e: String| {
+        format!("Transaction {id} result is unknown ({e}); look it up again before any replacement")
+    };
     let mut sent = false;
     for attempt in 0..poll.attempts.max(1) {
         if attempt > 0 {
             std::thread::sleep(poll.interval);
         }
         if !sent {
-            let v = rpc.call("sendTransaction", json!({"transaction":envelope_xdr}))?;
-            if v["hash"].as_str() != Some(hex(&expected).as_str()) {
-                return Err("Stellar RPC returned another transaction hash".into());
+            let v = rpc
+                .call("sendTransaction", json!({"transaction":envelope_xdr}))
+                .map_err(unknown)?;
+            if v["hash"].as_str() != Some(id.as_str()) {
+                return Err(unknown(
+                    "Stellar RPC returned another transaction hash".into(),
+                ));
             }
             match v["status"].as_str() {
                 Some("PENDING" | "DUPLICATE") => sent = true,
                 Some("TRY_AGAIN_LATER") => continue,
                 Some("ERROR") => {
-                    if let Some(receipt) = receipt_by_hash(rpc, network, &expected)? {
+                    if let Some(receipt) =
+                        receipt_by_hash(rpc, network, &expected).map_err(unknown)?
+                    {
                         return Ok(receipt);
                     }
                     return Err(format!(
-                        "Stellar rejected transaction {}: {}",
-                        hex(&expected),
+                        "Stellar rejected transaction {id}: {}",
                         v["errorResultXdr"].as_str().unwrap_or("no result")
                     ));
                 }
-                _ => return Err("Unknown sendTransaction status".into()),
+                _ => return Err(unknown("Unknown sendTransaction status".into())),
             }
         }
-        if let Some(receipt) = receipt_by_hash(rpc, network, &expected)? {
+        if let Some(receipt) = receipt_by_hash(rpc, network, &expected).map_err(unknown)? {
             return Ok(receipt);
         }
     }

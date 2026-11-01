@@ -3749,3 +3749,81 @@ fn owner_preparation_refuses_address_v2_entries_that_the_handoff_cannot_sign() {
         .unwrap_err();
     assert_eq!(error, "Unsupported owner credentials");
 }
+
+#[test]
+fn uncertain_submission_errors_name_the_transaction_hash() {
+    use stellar_xdr::*;
+    struct Failing(&'static str);
+    impl rpc::Rpc for Failing {
+        fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+            match (method, self.0) {
+                ("sendTransaction", "send") => Err("transport timeout".into()),
+                ("sendTransaction", _) => {
+                    let TransactionEnvelope::Tx(env) =
+                        read::<TransactionEnvelope>(params["transaction"].as_str().unwrap())?
+                    else {
+                        panic!()
+                    };
+                    let hash = hash(
+                        TransactionSignaturePayload {
+                            network_id: Hash(network_id("stellar:testnet")?),
+                            tagged_transaction: TransactionSignaturePayloadTaggedTransaction::Tx(
+                                env.tx,
+                            ),
+                        }
+                        .to_xdr(Limits::none())
+                        .unwrap(),
+                    );
+                    Ok(json!({"hash": hex(&hash), "status": "PENDING"}))
+                }
+                _ => Err("transport timeout".into()),
+            }
+        }
+    }
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(
+            account_key(&account_for_seed(&[1; 32])).unwrap(),
+        )),
+        fee: 100,
+        seq_num: SequenceNumber(1),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: VecM::default(),
+        ext: TransactionExt::V0,
+    };
+    let id = hex(&hash(
+        TransactionSignaturePayload {
+            network_id: Hash(network_id("stellar:testnet").unwrap()),
+            tagged_transaction: TransactionSignaturePayloadTaggedTransaction::Tx(tx.clone()),
+        }
+        .to_xdr(Limits::none())
+        .unwrap(),
+    ));
+    let envelope = xdr(&TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: vec![DecoratedSignature {
+            hint: SignatureHint([0; 4]),
+            signature: Signature(vec![0; 64].try_into().unwrap()),
+        }]
+        .try_into()
+        .unwrap(),
+    }))
+    .unwrap();
+    // A send whose response is lost and a poll that fails both leave the result unknown.
+    for stage in ["send", "poll"] {
+        let error = rpc::send_and_poll(
+            &Failing(stage),
+            "stellar:testnet",
+            &envelope,
+            rpc::Poll {
+                attempts: 1,
+                interval: std::time::Duration::ZERO,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.contains(&id) && error.contains("before any replacement"),
+            "{stage}: {error}"
+        );
+    }
+}
