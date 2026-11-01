@@ -58,9 +58,9 @@
 //! `Address`, `AllowitEnv`, `Map`, `String`, `Symbol` and `Vec`, and defines `AllowitParams`.
 //! Feature `soroban` (default) uses host values, contract types and the Soroban `Env`, decodes the
 //! params once per run so that indexing returns a reference, and buffers policy writes in contract
-//! temporary storage until `post_flight`. Feature `std` uses text addresses, heap maps and
-//! vectors, and a host `AllowitEnv` that buffers policy writes. The selected backend backs the
-//! crate root, which authored policy names.
+//! temporary storage until `post_flight`. Feature `std` uses text addresses, heap maps, heap
+//! lists that iterate by clone like the onchain `Vec`, and a host `AllowitEnv` that buffers policy
+//! writes. The selected backend backs the crate root, which authored policy names.
 //!
 //! The server-only enrichment functions (`price`, `fetch`, `internet_search`,
 //! `marketplace_search`, `request_screening`, `systemone`, `clear_systemone_context`) exist only
@@ -103,6 +103,48 @@
 //! pub fn execute(ctx: &AllowitContext) -> allowit::Result {
 //!     allowit::reentry_transfer(ctx, 1)?;
 //!     Ok(())
+//! }
+//! ```
+//!
+//! A `for` loop over a list binds owned values on both backends, also when the list borrows from
+//! `ctx.params[key]`: the host list iterates by clone, as the onchain `Vec` does. The
+//! `scripts/tests` std-only compile checks the same loops.
+//!
+//! ```
+//! use allowit::prelude::*;
+//! /// Pay only listed vendors or suppliers.
+//! pub fn execute(ctx: &AllowitContext) -> allowit::Result {
+//!     let wanted = AllowitValue::Addr(ctx.request.recipient.clone());
+//!     if let AllowitValue::List(items) = &ctx.params["vendors"] {
+//!         for item in items {
+//!             if item == wanted {
+//!                 return Ok(());
+//!             }
+//!         }
+//!     }
+//!     let suppliers: Vec<Address> = allowit::param(ctx, "suppliers");
+//!     for supplier in &suppliers {
+//!         if supplier == ctx.request.recipient {
+//!             return Ok(());
+//!         }
+//!     }
+//!     Err(AllowitError::DestinationNotAllowed)
+//! }
+//! ```
+//!
+//! ```compile_fail,E0614
+//! use allowit::prelude::*;
+//! /// A loop item is no reference, so a dereference does not build on either backend.
+//! pub fn execute(ctx: &AllowitContext) -> allowit::Result {
+//!     let wanted = AllowitValue::Addr(ctx.request.recipient.clone());
+//!     if let AllowitValue::List(items) = &ctx.params["vendors"] {
+//!         for item in items {
+//!             if *item == wanted {
+//!                 return Ok(());
+//!             }
+//!         }
+//!     }
+//!     Err(AllowitError::DestinationNotAllowed)
 //! }
 //! ```
 #[cfg(feature = "std")]
@@ -330,7 +372,7 @@ pub mod soroban {
 #[cfg(feature = "std")]
 pub mod host {
     use alloc::collections::BTreeMap;
-    pub use alloc::{string::String, vec::Vec};
+    pub use alloc::string::String;
     use core::cell::Cell;
     use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -350,6 +392,56 @@ pub mod host {
         /// The text of this address.
         pub fn as_str(&self) -> &str {
             &self.0
+        }
+    }
+
+    /// Host list. Like the onchain `Vec`, iterating a borrowed list yields owned clones, so
+    /// `for item in items` binds an owned `AllowitValue` on both backends, also when `items`
+    /// borrows from `ctx.params[key]`. It has no `Deref` to a slice, so authored code that needs a
+    /// slice fails the std-only compile as it fails onchain. The server reads it with `as_slice`.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct Vec<T>(alloc::vec::Vec<T>);
+
+    impl<T> Vec<T> {
+        /// The items, for the server.
+        pub fn as_slice(&self) -> &[T] {
+            &self.0
+        }
+    }
+
+    impl<T> From<alloc::vec::Vec<T>> for Vec<T> {
+        /// The list of these items.
+        fn from(items: alloc::vec::Vec<T>) -> Self {
+            Self(items)
+        }
+    }
+
+    impl<T> FromIterator<T> for Vec<T> {
+        /// The list of the iterated items.
+        fn from_iter<I: IntoIterator<Item = T>>(items: I) -> Self {
+            Self(items.into_iter().collect())
+        }
+    }
+
+    impl<T> IntoIterator for Vec<T> {
+        /// An owned item.
+        type Item = T;
+        /// The items in order.
+        type IntoIter = alloc::vec::IntoIter<T>;
+        /// The items in order.
+        fn into_iter(self) -> Self::IntoIter {
+            self.0.into_iter()
+        }
+    }
+
+    impl<'a, T: Clone> IntoIterator for &'a Vec<T> {
+        /// A clone of an item, as the onchain `Vec` decodes one.
+        type Item = T;
+        /// Clones of the items in order.
+        type IntoIter = core::iter::Cloned<core::slice::Iter<'a, T>>;
+        /// Clones of the items in order.
+        fn into_iter(self) -> Self::IntoIter {
+            self.0.iter().cloned()
         }
     }
 
@@ -540,11 +632,8 @@ pub mod host {
     }
 
     /// Run `check` on each item of a list.
-    fn each_item(
-        items: &Vec<AllowitValue>,
-        mut check: impl FnMut(AllowitValue) -> Result,
-    ) -> Result {
-        items.iter().try_for_each(|item| check(item.clone()))
+    fn each_item(items: &Vec<AllowitValue>, check: impl FnMut(AllowitValue) -> Result) -> Result {
+        items.into_iter().try_for_each(check)
     }
 
     /// Buffer one policy write for `post_flight`.

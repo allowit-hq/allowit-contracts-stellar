@@ -772,6 +772,25 @@ class ContractAdmin(unittest.TestCase):
                     ca.checked_code(text)
                     with self.assertRaisesRegex(ValueError, "std-only compile"):
                         compiled(text)
+            # A loop over a list binds owned items, as the onchain `Vec` does, also when the list
+            # borrows from `ctx.params[key]`, so a dereference fails. The crate doc tests of
+            # `allowit` build the same loops onchain.
+            loops = (
+                ("item", "    let wanted = AllowitValue::Addr(ctx.request.recipient.clone());\n"
+                         '    if let AllowitValue::List(items) = &ctx.params["vendors"] {{\n'
+                         "        for item in items {{\n            if {} == wanted {{\n"
+                         "                return Ok(());\n            }}\n        }}\n    }}\n"),
+                ("vendor", '    let vendors: Vec<Address> = allowit::param(ctx, "vendors");\n'
+                           "    for vendor in &vendors {{\n        if {} == ctx.request.recipient {{\n"
+                           "            return Ok(());\n        }}\n    }}\n"),
+            )
+            for name, body in loops:
+                with self.subTest(body=body):
+                    compiled(source(body.format(name)))
+                    text = source(body.format("*" + name))
+                    ca.checked_code(text)
+                    with self.assertRaisesRegex(ValueError, "std-only compile"):
+                        compiled(text)
             # The owner packet path of every tier runs the same compile.
             policy.write_text(source("    let _ = ctx.request.asset < ctx.request.recipient;\n"))
             digest = hashlib.sha256(policy.read_bytes()).hexdigest()

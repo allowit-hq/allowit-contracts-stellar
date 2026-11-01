@@ -315,7 +315,9 @@ impl PolicyValue {
             AllowitValue::Bool(v) => Self::Bool(*v),
             AllowitValue::Str(v) => Self::Str(v.clone()),
             AllowitValue::Addr(v) => Self::Addr(v.as_str().into()),
-            AllowitValue::List(v) => Self::List(v.iter().map(PolicyValue::from_allowit).collect()),
+            AllowitValue::List(v) => {
+                Self::List(v.as_slice().iter().map(PolicyValue::from_allowit).collect())
+            }
         }
     }
 }

@@ -11,9 +11,10 @@ mod catching;
 mod policy;
 #[path = "policy-vectors.rs"]
 mod vectors;
-use allowit::prelude::*;
+// The prelude without its list type `Vec`, so test plumbing keeps the standard `Vec`.
 use allowit::{
-    AllowitArgs, AllowitEnv, AllowitMap, AllowitRule, AllowitStandardState, AllowitTier, DAY, RULES,
+    Address, AllowitArgs, AllowitContext, AllowitEnv, AllowitError, AllowitMap, AllowitOperation,
+    AllowitRequest, AllowitRule, AllowitStandardState, AllowitTier, AllowitValue, DAY, RULES,
 };
 use vectors::{Op, Ops, Outcome, Vector};
 
@@ -272,10 +273,10 @@ fn approval_typed_reads_return_the_binding_type_and_a_policy_panic_denies_withou
     let mut c = context();
     put(&mut c.params, "payment_cap", int(10));
     put(&mut c.request.args, "amount", int(10));
-    let destinations: Vec<Address> = allowit::param(&c, allowit::DESTINATIONS);
+    let destinations: allowit::Vec<Address> = allowit::param(&c, allowit::DESTINATIONS);
     let amount: u32 = allowit::arg(&c, "amount");
     let cap: u64 = allowit::param(&c, "payment_cap");
-    assert_eq!(destinations, vec![c.request.recipient.clone()]);
+    assert_eq!(destinations, vec![c.request.recipient.clone()].into());
     assert_eq!((amount, cap), (10, 10));
     let custom = AllowitTier::Custom;
     let next = allowit::evaluate(&c, writing_per_op, custom).unwrap();

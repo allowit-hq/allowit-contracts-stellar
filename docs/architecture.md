@@ -87,8 +87,8 @@ code through an allowlist, not a list of known hazards. Every identifier must be
 - a listed field after `.`: `env`, `params`, `request` and the request fields, including `args`;
 - a listed method after `.`: comparisons, `clone`, and the `Option`, `Result`, fixed-width integer,
   `bool` and `Ordering` methods that take and return no pointer-width value, such as `is_some`,
-  `unwrap_or`, `checked_add`, `saturating_sub`, `min` and `max`, and `get` on `params` and `args`
-  only;
+  `unwrap_or`, `checked_add`, `saturating_sub`, `min` and `max`, and `contains` on `params` and
+  `args` only;
 - a listed path: the `allowit` rules, `param`, `arg`, `get_state`, `set_state`, the canonical key
   constants, the server-only functions and their request types, the `AllowitOperation`,
   `AllowitError`, `AllowitRule` and `AllowitValue` variants, `Option` and `Result` variants,
@@ -159,7 +159,10 @@ compiles:
   address comparison with `<`, `min`, `max`, `sort` or `binary_search`, and a `std` prelude item
   such as `vec!`. On the host, `Address` holds the text that its rail supplies, a StrKey on Stellar,
   and compares only for equality: Soroban orders addresses by `ScAddress`, so accounts sort before contracts, while text would
-  sort by StrKey. `scripts/policy_source.py` runs this compile in `check-policy-bindings.py`, and
+  sort by StrKey. The host `Vec` iterates a borrowed list by clone, as the Soroban `Vec` does, so
+  `for item in items` binds an owned item on both backends, also when `items` borrows from
+  `ctx.params[key]`, and a dereference `*item` fails both compiles. It has no slice `Deref`.
+  `scripts/policy_source.py` runs this compile in `check-policy-bindings.py`, and
   so in `scripts/build-contracts.sh`, and in `scripts/contract_admin.py` for the owner packets of
   every tier. These tools need `rustc` (from `RUSTC` or `PATH`). The portability test below and the
   `policy` job of `.github/workflows/contracts.yml` also compile `scripts/policy-smoke.rs`, which
@@ -193,7 +196,7 @@ wallets.
 
 `allowit` has two backends that share one rule implementation. Feature `soroban` (default) uses
 Soroban `Address`, `Vec`, `Map`, `Env` and contract types. Feature `std` uses heap strings, maps
-and vectors for the host evaluator; addresses are unordered rail-supplied texts and the environment is
+and lists for the host evaluator; addresses are unordered rail-supplied texts and the environment is
 a host `AllowitEnv`, which buffers the policy's state writes. The selected backend backs the crate root that authored policy names. The offchain
 server depends on `allowit = { default-features = false, features = ["std"] }` and builds with
 `overflow-checks = true`. Enabling both backends is a compile error, so a server cannot silently
