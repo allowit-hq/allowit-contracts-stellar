@@ -112,7 +112,7 @@ You need:
 - [Rust](https://rustup.rs) with `rustup`. `rust-toolchain.toml` pins Rust 1.98.0 and the `wasm32v1-none` target.
 - [Stellar CLI](https://developers.stellar.org/docs/tools/cli/stellar-cli) 28.1.0.
 - Python 3.10 or later.
-- Git.
+- Git, Bash and `jq`.
 
 ```sh
 git clone https://github.com/allowit-hq/allowit-contracts-stellar.git
@@ -226,6 +226,8 @@ cargo fmt --manifest-path stellar/core/Cargo.toml --check
 cargo test --locked --manifest-path stellar/core/Cargo.toml
 cargo clippy --locked --manifest-path stellar/core/Cargo.toml --all-targets -- -D warnings
 ```
+
+`stellar/core` pins `allowit-core` by commit. Its `[workspace.metadata.allowit.track]` entry says that the pin follows the head of `allowit-core` main. `scripts/build.sh --check` fails on a stale pin or lock, and the `stellar/core` checks run it. `scripts/build.sh --update allowit-core` moves the pin and the lock to the current head. `scripts/build.sh` with no flag checks the pins, then builds the Wasm and both workspaces.
 
 Keep contract code, the `stellar/core` rail crate, build and API documentation and release inputs here. [AGENTS.md](AGENTS.md) describes the repository scope.
 

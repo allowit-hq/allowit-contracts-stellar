@@ -11,6 +11,7 @@ on:
       - "scripts/policy_source.py"
       - "scripts/contract_admin.py"
       - "scripts/build-contracts.sh"
+      - "scripts/build.sh"
       - ".github/workflows/stellar-core.yml"
   pull_request:
     paths:
@@ -22,6 +23,7 @@ on:
       - "scripts/policy_source.py"
       - "scripts/contract_admin.py"
       - "scripts/build-contracts.sh"
+      - "scripts/build.sh"
       - ".github/workflows/stellar-core.yml"
   schedule:
     - cron: "17 4 * * *"
@@ -45,6 +47,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: stellar/core -> target
+      - name: Check the allowit-core pin and the locks
+        run: scripts/build.sh --check
       - run: cargo fmt --manifest-path stellar/core/Cargo.toml --check
       - run: cargo test --locked --manifest-path stellar/core/Cargo.toml
       - run: cargo clippy --locked --manifest-path stellar/core/Cargo.toml --all-targets -- -D warnings
