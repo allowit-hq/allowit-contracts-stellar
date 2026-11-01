@@ -16,7 +16,7 @@ use allowit::{
     AllowitEnv, AllowitMap, AllowitParams, AllowitRule, AllowitStandardState, AllowitTier, DAY,
     RULES,
 };
-use vectors::{Ops, Outcome, Vector};
+use vectors::{Op, Ops, Outcome, Vector};
 
 const NOW: u64 = 3 * DAY + 10;
 /// The state map of standard values `s`.
@@ -86,10 +86,14 @@ fn context() -> AllowitContext {
             ..Default::default()
         }),
         request: AllowitRequest {
-            operation: AllowitOperation::sep41_transfer,
+            operation: AllowitOperation::transfer,
             asset,
             recipient,
             amount: 10,
+            token_in: Address::new("CASSET"),
+            amount_in: 10,
+            token_out: None,
+            min_out: 0,
             now: NOW,
             expires_at: NOW + 50,
             spent_units: 10,
@@ -128,7 +132,7 @@ fn approval_branch_policy_caps_deposits() {
     let mut c = context();
     edit(&mut c, |s| s.spent = 21);
     assert_eq!(branch::execute(&c), Ok(()));
-    c.request.operation = AllowitOperation::sep56_deposit;
+    c.request.operation = AllowitOperation::deposit;
     assert_eq!(branch::execute(&c), Err(AllowitError::SpentCapExceeded));
 }
 #[test]
@@ -371,7 +375,7 @@ fn approval_server_only_functions_compile_on_the_host_and_are_unsupported_until_
     );
 }
 
-/// Host address with StrKey-shaped text for each universe index.
+/// Host address text for each universe index.
 fn address(index: usize) -> Address {
     Address::new(format!("CADDRESS{index}"))
 }
@@ -430,14 +434,19 @@ fn host_context(v: &Vector) -> AllowitContext {
         ]),
         state,
         request: AllowitRequest {
-            operation: if v.deposit {
-                AllowitOperation::sep56_deposit
-            } else {
-                AllowitOperation::sep41_transfer
+            operation: match v.op {
+                Op::Transfer => AllowitOperation::transfer,
+                Op::Deposit => AllowitOperation::deposit,
+                Op::Swap => AllowitOperation::swap,
+                Op::Redeem => AllowitOperation::redeem,
             },
             asset: address(v.asset),
             recipient: address(v.recipient),
             amount: v.amount,
+            token_in: address(v.token_in),
+            amount_in: v.amount_in,
+            token_out: v.token_out.map(address),
+            min_out: v.min_out,
             now: v.now,
             expires_at: v.expires_at,
             spent_units: v.spent_units,
@@ -558,4 +567,35 @@ fn vectors_print_host_outcomes() {
     for name in ["operations_not_a_list", "unknown_operation"] {
         assert_eq!(named(name).rules[8], Err(invalid_param as u32), "{name}");
     }
+    // Swaps and redeems pass every rule that admits them, and each rule denies its own way.
+    for name in ["swap", "reverse_swap", "redeem"] {
+        let outcome = named(name);
+        assert_eq!(outcome.policy, Ok(()), "{name}");
+        assert_eq!(outcome.preflight, vec![Ok(()); 9], "{name}");
+    }
+    assert_eq!(named("swap").rules[8], Ok("swap".to_string()));
+    assert_eq!(named("redeem").rules[8], Ok("redeem".to_string()));
+    assert_eq!(named("swap").rules[5], Ok("@4".to_string()));
+    assert_eq!(named("redeem").rules[5], Ok("@2".to_string()));
+    // A reverse swap counts its 40-unit asset floor; a forward swap its 40-unit input.
+    assert_eq!(named("reverse_swap").rules[0], Ok("60".to_string()));
+    assert_eq!(
+        named("swap").next,
+        Ok("1/8/false/2/8/43/false/-".to_string())
+    );
+    let denied = |e: AllowitError| Err(e as u32);
+    let recipient = denied(AllowitError::RecipientNotAllowed);
+    let token = denied(AllowitError::TokenNotAllowed);
+    let cap = denied(AllowitError::TransactionCapExceeded);
+    assert_eq!(named("swap_unlisted_exchange").policy, recipient);
+    assert_eq!(named("swap_other_token_not_allowed").policy, token);
+    assert_eq!(
+        named("reverse_swap_other_token_not_allowed").rules[6],
+        Err(AllowitError::TokenNotAllowed as u32)
+    );
+    assert_eq!(named("swap_not_in_operations").policy, not_allowed);
+    assert_eq!(named("redeem_not_in_operations").policy, not_allowed);
+    assert_eq!(named("only_swaps").policy, not_allowed);
+    assert_eq!(named("swap_over_transaction_cap").policy, cap);
+    assert_eq!(named("reverse_swap_floor_over_transaction_cap").policy, cap);
 }

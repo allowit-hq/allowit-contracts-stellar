@@ -7,12 +7,14 @@ use allowit::{AllowitContext, AllowitError, AllowitParams, AllowitRequest, Allow
 use soroban_sdk::{Address, Env, Map, String, Symbol, contract, contractimpl, panic_with_error};
 #[contract]
 pub struct AllowitEngine;
-/// Engine executable release, independent of parent administration. Version 3 takes the context
+/// Engine executable release, independent of parent administration. Version 4 takes the context
 /// fields `params` (the owner's key => value params), `state` (the free-form current policy state)
-/// and `request` as separate arguments, because the context carries the contract `Env`. It
-/// replaces the release 1 ABI, `(request: EngineRequest, state: EngineState)`; release 2 was never
-/// released.
-const ENGINE_VERSION: u32 = 3;
+/// and `request` as separate arguments, because the context carries the contract `Env`; its
+/// `AllowitRequest` names general operations and carries the swap and redeem facts `token_in`,
+/// `amount_in`, `token_out` and `min_out`. Version 3 took the same arguments with a request that
+/// named Stellar operations and lacked those facts. It replaces the
+/// release 1 ABI, `(request: EngineRequest, state: EngineState)`; release 2 was never released.
+const ENGINE_VERSION: u32 = 4;
 /// Contract error code of the test fixture veto. It is outside `allowit::AllowitError`.
 pub const TEST_DENY: u32 = 1000;
 /// Test fixture veto: every rule aborts with `TEST_DENY`. Used only to prove reference upgrades

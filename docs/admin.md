@@ -63,7 +63,8 @@ Prepare `deploy-wallet --source "$OWNER" --config JSON --wasm PATH --wasm-hash H
 Select `allowit_simple_policy_engine.wasm`, `allowit_common_policy_engine.wasm`, or a reviewed
 `allowit_custom_policy.wasm`. Config contains exactly `owner`, `agent`, `server`, `asset`,
 `policy_instance`, `source_digest`, `rules`, `params`, and `x402_enabled`.
-The asset is an immutable native SAC. Identity and source digests are nonzero 32-byte hex strings.
+The asset is an immutable native SAC. `policy_instance` and `source_digest` are 32-byte hex
+strings, and `policy_instance` is nonzero.
 `rules` contains the ordered standard prefix of canonical rule names. The tool derives it from the
 authored `--policy-source` file and rejects any other list: Common binds the source's prefix,
 Simple and Custom bind an empty list. `--tier custom` also requires `source_digest` to be the
@@ -95,7 +96,10 @@ Legacy names such as `per_transfer`, `daily_limit` or `max_calls` reject on the 
 Negative caps reject at standard configuration. Code changes defer the new tier validation to
 delegated admission.
 Duplicate JSON keys reject. Fund the wallet only with its
-installed asset. `recover` transfers only that asset.
+installed asset. `recover` transfers only that asset. A forward swap can leave the wallet holding
+another Stellar Asset Contract token. Common and Custom can restrict that token with `tokens`;
+Simple relies on the server. Only a reverse swap or an owner `invoke` of that token's `transfer`
+moves it; `recover` cannot.
 
 `admin --family wallet --contract ADDRESS --source "$OWNER" --method METHOD --arguments JSON` admits
 `deploy_policy`, `set_pause` and `recover`. Parent administration uses `--family parent`, its native
@@ -107,8 +111,8 @@ one. Use null for unchanged code. A non-null `wasm_hash` also requires `--wasm P
 the tool refuses Wasm without `allowit_custody_layout` metadata equal to 4. Code for another custody
 layout cannot read the stored State, so such a change, including a rollback to an earlier release,
 locks custody permanently. Recover funds before any change across layouts. Deployment preserves
-pause and policy state. A changed owner must also authorize. Enabled x402 requires distinct G-agent and G-server keys and both signatures.
-False disables x402 without changing direct two-role execution authorization. Classic signer rotation and `shutdown-wallet` do not revoke raw-key x402 delegation. The contract wallet owner must disable x402, pause, or replace the agent/server address through `deploy_policy`.
+pause and policy state. A changed owner must also authorize. `x402_enabled` enables custom-account authorization: the agent can then send a plain x402 `asset.transfer`, a plain `router.swap_exact_tokens_for_tokens` or a plain `vault.redeem`, and the wallet's `__check_auth` applies the policy to it. Enable it for payments only when swaps and redeems are also acceptable. On Common and Custom the `operations` and `recipients` rules can still deny them; on Simple only the server's offchain policy does. Enabled custom-account authorization requires distinct G-agent and G-server keys and both signatures.
+False disables all three plain calls without changing direct two-role execution authorization. Classic signer rotation and `shutdown-wallet` do not revoke raw-key delegation. The contract wallet owner must disable `x402_enabled`, pause, or replace the agent/server address through `deploy_policy`.
 
 Owner passthrough uses `invoke(contract, function, args, auth)`. Prepare this exact call with the
 native CLI and inspect every nested authorization entry. This general owner operation is outside
@@ -127,7 +131,7 @@ envelopes expire after five minutes. Save signed bytes before broadcast and reco
 hash after an uncertain response. The tool never signs, submits, restores or retries automatically.
 
 Use `read --contract POLICY_WALLET_ADDRESS --source "$OWNER" --method policy_binding` to inspect the contract
-release, policy instance, module/source digests and argument schema. `state` returns the custody
+release, policy instance, module/source digests and the operations that the wallet runs. `state` returns the custody
 State, including `params` and `policy_state`; `policy_state` returns the current policy state map
 alone. Archived data requires native restoration and is never reinitialized.
 The SDK rejects unavailable or ambiguous state observations before new signing. Owner pause,

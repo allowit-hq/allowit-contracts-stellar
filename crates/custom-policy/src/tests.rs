@@ -1,4 +1,4 @@
-//! Source and schema bindings. The shared portability vectors run in `allowit-policy-wallet`:
+//! Rule checks. The shared portability vectors run in `allowit-policy-wallet`:
 //! `src/portability_tests.rs` compares the std-only host smoke with the Soroban backend and the
 //! custom, standard and simple contracts.
 extern crate std;
@@ -8,7 +8,7 @@ use allowit::{
     DAY_SPENT_CAP, DAY_TOTAL_CAP, EXPIRY, OPERATIONS, RECIPIENTS, SPENT_CAP, TOKENS,
     TRANSACTION_CAP,
 };
-use soroban_sdk::{Address, Bytes, Map, String, Symbol, testutils::Address as _, vec};
+use soroban_sdk::{Address, Map, String, Symbol, testutils::Address as _, vec};
 
 /// Set one param of `ctx`, or unset it with `None`.
 fn set(ctx: &mut AllowitContext, key: &str, value: Option<AllowitValue>) {
@@ -37,10 +37,14 @@ fn custom_runner_maps_the_policy_result() {
         params: AllowitParams(Map::new(&env)),
         state,
         request: AllowitRequest {
-            operation: AllowitOperation::sep41_transfer,
+            operation: AllowitOperation::transfer,
             asset: asset.clone(),
             recipient: recipient.clone(),
             amount: 10,
+            token_in: asset.clone(),
+            amount_in: 10,
+            token_out: None,
+            min_out: 0,
             now: 10,
             expires_at: 20,
             spent_units: 10,
@@ -94,19 +98,4 @@ fn custom_runner_maps_the_policy_result() {
         AllowitCustom::check(&deposits, &rules),
         Err(AllowitWalletError::PolicyDenied)
     );
-}
-
-#[test]
-fn source_and_schema_bindings_match_their_exact_inputs() {
-    let env = Env::default();
-    let source = Bytes::from_slice(&env, include_bytes!("../policy/policy.rs"));
-    assert_eq!(env.crypto().sha256(&source).to_array(), SOURCE_HASH);
-    let schema = Bytes::from_slice(&env, allowit_wallet_protocol::ARGUMENT_SCHEMA_DESCRIPTOR);
-    assert_eq!(
-        env.crypto().sha256(&schema).to_array(),
-        ARGUMENT_SCHEMA_HASH
-    );
-    let descriptor = core::str::from_utf8(allowit_wallet_protocol::ARGUMENT_SCHEMA_DESCRIPTOR);
-    let operation = ADMITTED_OPERATION.replace("::", ".");
-    assert!(descriptor.unwrap().contains(&operation));
 }

@@ -154,8 +154,9 @@ def wallet_layout(state):
 
 CAPS = {"transaction_cap", "spent_cap", "day_spent_cap", "day_total_cap"}
 LISTS = {"recipients", "tokens"}
-# One `operations` entry, as `allowit` checks it: a plain op name, `custom.<function>` or
-# `custom:<contract>.<function>`.
+# One `operations` entry: a plain op name, `custom.<function>` or `custom:<contract>.<function>`. `allowit`
+# accepts any ASCII letters or digits as the contract; this Stellar tool also requires a `C` StrKey,
+# so that the entry can match a Stellar contract.
 OPERATION = re.compile(r"transfer|swap|deposit|redeem|custom|custom\.[A-Za-z0-9_]{1,32}|custom:C[A-Z2-7]{55}\.[A-Za-z0-9_]{1,32}")
 # Bounds that the wallet contract enforces: `allowit::MAX_PARAMS`, `MAX_ITEMS`, `MAX_TEXT` and
 # `MAX_PARAM_BYTES`. A value's encoded size counts `VALUE_BYTES` per value plus each text padded to
@@ -286,7 +287,7 @@ def deployment(value):
     if type(value["x402_enabled"]) is not bool:
         raise ValueError("x402_enabled must be boolean")
     if value["x402_enabled"] and any(not StrKey.is_valid_ed25519_public_key(value[role]) for role in ("agent", "server")):
-        raise ValueError("x402 requires native G-agent and G-server signers")
+        raise ValueError("x402_enabled (custom-account authorization) requires native G-agent and G-server signers")
     for name in ("wasm_hash",):
         if value[name] is not None:
             code_hash(value[name])
@@ -452,8 +453,8 @@ def command(args):
             policy_rules(config, getattr(args, "tier", None), getattr(args, "policy_source", None))
             contract(config["asset"])
             code_hash(config["policy_instance"])
-            if int(config["policy_instance"], 16) == 0 or int(config["source_digest"], 16) == 0:
-                raise ValueError("Policy and source identities must be nonzero")
+            if int(config["policy_instance"], 16) == 0:
+                raise ValueError("Policy identity must be nonzero")
             if args.source != config["owner"]:
                 raise ValueError("Policy wallet deployment source must be its owner")
             if len({config[key] for key in ("owner", "agent", "server")}) != 3:

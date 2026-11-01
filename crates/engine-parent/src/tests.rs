@@ -55,6 +55,7 @@ impl Fixture {
     }
 }
 fn context(env: &Env) -> AllowitContext {
+    let asset = Address::generate(env);
     AllowitContext {
         env: env.clone(),
         params: AllowitParams(soroban_sdk::Map::from_array(
@@ -66,10 +67,14 @@ fn context(env: &Env) -> AllowitContext {
         )),
         state: soroban_sdk::Map::new(env),
         request: AllowitRequest {
-            operation: AllowitOperation::sep41_transfer,
-            asset: Address::generate(env),
+            operation: AllowitOperation::transfer,
+            asset: asset.clone(),
             recipient: Address::generate(env),
             amount: 1,
+            token_in: asset,
+            amount_in: 1,
+            token_out: None,
+            min_out: 0,
             now: 100,
             expires_at: 200,
             spent_units: 1,
@@ -94,16 +99,6 @@ fn transaction_cap(
 }
 fn approved(env: &Env, engine: &Address) -> bool {
     transaction_cap(env, engine).is_ok_and(|left| left == Ok(9))
-}
-
-#[test]
-fn compiled_parent_deploys_compiled_external_reference_engine() {
-    let f = Fixture::new(true);
-    let state = f.client().state();
-    assert_eq!(state.owner, f.admin);
-    assert_eq!(state.version, 0);
-    assert_eq!(f.client().engine(), state.engine);
-    assert!(approved(&f.env, &state.engine));
 }
 
 #[test]
@@ -327,14 +322,20 @@ fn constructor_requires_admin_authorization() {
 fn engine_lookup_extends_cold_reference_instance_and_code_ttl() {
     use soroban_sdk::testutils::Deployer as _;
     let f = Fixture::new(true);
-    let state = f.client().state();
+    let max = f.env.storage().max_ttl();
+    // The constructor alone sets the admin and version and gives the parent its full lifetime.
+    assert_eq!(f.env.deployer().get_contract_instance_ttl(&f.parent), max);
+    assert_eq!(f.env.deployer().get_contract_code_ttl(&f.parent), max);
+    let state: AllowitParentState = f
+        .env
+        .as_contract(&f.parent, || f.env.storage().instance().get(&STATE_KEY))
+        .unwrap();
+    assert_eq!((state.owner.clone(), state.version), (f.admin.clone(), 0));
     let before_code = f.env.deployer().get_contract_code_ttl(&state.engine);
     let before_instance = f.env.deployer().get_contract_instance_ttl(&state.engine);
     let before_ref = f
         .env
         .as_contract(&f.parent, || f.env.executable_refs().get_ttl(&tag(&f.env)));
-    let max = f.env.storage().max_ttl();
-    assert_eq!(f.env.deployer().get_contract_code_ttl(&f.parent), max);
     assert!(before_code < max / 2);
     assert!(before_instance < max / 2);
     assert!(before_ref < max / 2);
@@ -349,15 +350,6 @@ fn engine_lookup_extends_cold_reference_instance_and_code_ttl() {
             .as_contract(&f.parent, || f.env.executable_refs().get_ttl(&tag(&f.env))),
         max
     );
-}
-
-#[test]
-fn constructor_initializes_parent_lifetime_without_an_extra_state_read() {
-    use soroban_sdk::testutils::Deployer as _;
-    let f = Fixture::new(true);
-    let max = f.env.storage().max_ttl();
-    assert_eq!(f.env.deployer().get_contract_instance_ttl(&f.parent), max);
-    assert_eq!(f.env.deployer().get_contract_code_ttl(&f.parent), max);
 }
 
 #[test]

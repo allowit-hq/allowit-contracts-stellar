@@ -1,8 +1,9 @@
 // Shared types and rules, included once per backend. The including module supplies `Address`,
 // `AllowitEnv`, `Map`, `String`, `Symbol` and `Vec`, the type macros `value!`, `error!` and
 // `params!`, the map primitives `lookup`, `insert`, `count`, `text_len`, `text_bytes`,
-// `each_value`, `each_item`, `record`, `take_writes` and `merge`, and the panic primitives `fail`
-// and `guarded`. Field types keep those names so Soroban contract specs name native types.
+// `each_value`, `each_item`, `address_text`, `record`, `take_writes` and `merge`, and the panic
+// primitives `fail` and `guarded`. Field types keep those names so contract
+// specs name the backend's native types.
 
 /// UTC day length in seconds.
 pub const DAY: u64 = 86_400;
@@ -27,7 +28,7 @@ mod types {
             Bool(bool),
             /// Text of at most `MAX_TEXT` bytes.
             Str(String),
-            /// Exact Stellar account or contract.
+            /// Exact account or contract.
             Addr(Address),
             /// Ordered values, such as the addresses of an allowlist.
             List(Vec<AllowitValue>),
@@ -42,13 +43,21 @@ mod types {
     }
 
     value! {
-        /// Kernel-selected native operation. Variants keep the canonical `stellar::<name>` names.
-        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        /// Kernel-selected operation. Each rail maps its native operations onto these variants,
+        /// whose names are the op names of `operations`.
+        #[derive(Clone, Debug, Eq, PartialEq)]
         pub enum AllowitOperation {
-            /// SEP-41 token transfer to a recipient.
-            sep41_transfer,
-            /// SEP-56 deposit into a vault, which is the recipient.
-            sep56_deposit,
+            /// Token transfer to a recipient.
+            transfer,
+            /// Exact-input swap through an exchange, which is the recipient. One end of the swap is
+            /// the asset: a forward swap pays it, a reverse swap receives it.
+            swap,
+            /// Deposit of the asset into a vault, which is the recipient.
+            deposit,
+            /// Redeem of vault shares for the asset. The vault is the recipient.
+            redeem,
+            /// Call of a function, the text, on a contract, which is the recipient.
+            custom(Address, String),
         }
     }
 
@@ -56,14 +65,26 @@ mod types {
         /// Authenticated request facts read by rules, and the agent's execution params.
         #[derive(Clone, Debug, Eq, PartialEq)]
         pub struct AllowitRequest {
-            /// Kernel-selected native operation.
+            /// Kernel-selected operation.
             pub operation: AllowitOperation,
             /// Immutable underlying asset contract.
             pub asset: Address,
-            /// Exact destination: the payment recipient or the deposit vault.
+            /// Exact destination: the payment recipient, the deposit or redeem vault, the swap
+            /// exchange or the custom call's contract.
             pub recipient: Address,
-            /// Positive gross underlying debit.
+            /// Positive gross amount in asset units: the transfer or deposit debit, the forward
+            /// swap input, or the minimum asset output of a reverse swap or redeem.
             pub amount: i128,
+            /// Token that leaves the wallet: the asset, the token that a reverse swap pays or the
+            /// redeemed vault shares.
+            pub token_in: Address,
+            /// Exact units of `token_in` that leave the wallet.
+            pub amount_in: i128,
+            /// Token that the wallet receives back: the deposit vault's shares, the token that a
+            /// swap buys or, for a redeem, the asset. `None` for a transfer.
+            pub token_out: Option<Address>,
+            /// Minimum units of `token_out` that the operation signs for; zero for a transfer.
+            pub min_out: i128,
             /// Authenticated ledger close time in Unix seconds.
             pub now: u64,
             /// Exclusive request expiry in Unix seconds.
@@ -118,7 +139,7 @@ mod types {
     /// Complete rule input, supplied by the wallet or server. Plain data without methods.
     #[derive(Clone)]
     pub struct AllowitContext {
-        /// Backend environment: a Soroban `Env` onchain and an `AllowitEnv` on the host.
+        /// The backend's environment.
         pub env: AllowitEnv,
         /// The owner's constructor params, set at install and changed by owner-signed update.
         pub params: AllowitParams,
@@ -210,10 +231,8 @@ pub const EXPIRY: &str = "expiry";
 pub const OPERATIONS: &str = "operations";
 
 // Bounds of params, args and state values. The byte budgets bound a map's encoded size by
-// `KEY_BYTES` per key plus `VALUE_BYTES` per value plus each text padded to four bytes, which is
-// at least its XDR size. The wallet stores params and policy state in its one instance entry; the
-// two budgets with its other fields stay far below the network's contract data entry limit,
-// 64 KiB in current settings.
+// `KEY_BYTES` per key plus `VALUE_BYTES` per value plus each text padded to four bytes. A rail
+// checks that these budgets fit its storage limits.
 /// Most params that a Custom wallet stores.
 pub const MAX_PARAMS: u32 = 32;
 /// Most execution params that one request carries.
@@ -288,7 +307,7 @@ impl AllowitRule {
 /// Lookup of params and args by key: the only read that authored policy has.
 impl AllowitParams {
     /// The value of `key`, or `None` when it is unset. A key that no map can hold, such as one
-    /// with a space, is unset. Values are owned because Soroban maps decode them on read.
+    /// with a space, is unset. Values are owned because onchain maps decode them on read.
     pub fn get(&self, key: &str) -> Option<AllowitValue> {
         lookup(&self.0, key)
     }
@@ -375,7 +394,7 @@ impl AllowitStandardState {
     }
 }
 
-/// A key is 1 to 32 ASCII letters, digits or underscores, as a Soroban `Symbol` requires.
+/// A key is 1 to 32 ASCII letters, digits or underscores, so that every backend map holds it.
 fn key_ok(key: &str) -> bool {
     symbol_ok(key.as_bytes())
 }
@@ -384,6 +403,13 @@ fn key_ok(key: &str) -> bool {
 /// contract function name.
 fn symbol_ok(name: &[u8]) -> bool {
     (1..=32).contains(&name.len()) && name.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+}
+
+/// Whether `text` can name a contract in an op name: 1 or more ASCII letters or digits. The rail
+/// that builds each `Address` checks its own address format, so a text that is no address of the
+/// rail matches no request.
+fn contract_text_ok(text: &[u8]) -> bool {
+    !text.is_empty() && text.iter().all(u8::is_ascii_alphanumeric)
 }
 
 /// The typed value of state `key`, or `None`. An invalid key is `InvalidParam`; a value of
@@ -533,31 +559,57 @@ fn allowed(value: Option<AllowitValue>, wanted: &Address, denied: AllowitError) 
 /// `custom:<contract>.<function>`.
 const OPERATION_NAMES: [&[u8]; 5] = [b"transfer", b"swap", b"deposit", b"redeem", b"custom"];
 
-/// The op name of the request's native operation.
+/// The op name of the request's operation.
 fn operation_name(request: &AllowitRequest) -> &'static str {
-    match request.operation {
-        AllowitOperation::sep41_transfer => "transfer",
-        AllowitOperation::sep56_deposit => "deposit",
+    match &request.operation {
+        AllowitOperation::transfer => "transfer",
+        AllowitOperation::swap => "swap",
+        AllowitOperation::deposit => "deposit",
+        AllowitOperation::redeem => "redeem",
+        AllowitOperation::custom(..) => "custom",
     }
 }
 
+/// Run `seen` on the name that `operations` entries match: the op name, or
+/// `custom:<contract>.<function>` for a custom call. `None` is a custom call that this grammar
+/// cannot name, which no entry admits.
+fn operation_match<T>(request: &AllowitRequest, seen: impl FnOnce(Option<&[u8]>) -> T) -> T {
+    let AllowitOperation::custom(contract, function) = &request.operation else {
+        return seen(Some(operation_name(request).as_bytes()));
+    };
+    let contract = address_text(contract);
+    let (mut contract_buf, mut function_buf) = ([0; MAX_TEXT as usize], [0; MAX_TEXT as usize]);
+    let mut name = [0; MAX_TEXT as usize];
+    let mut len = 0;
+    let parts = text_bytes(&contract, &mut contract_buf)
+        .zip(text_bytes(function, &mut function_buf))
+        .map(|(contract, function)| [b"custom:".as_slice(), contract, b".", function]);
+    let fits = parts.is_some_and(|parts| {
+        parts.iter().all(|part| {
+            let end = len + part.len();
+            let fits = end <= name.len();
+            if fits {
+                name[len..end].copy_from_slice(part);
+                len = end;
+            }
+            fits
+        })
+    });
+    seen(Some(&name[..len]).filter(|name| fits && op_name_ok(name)))
+}
+
 /// Whether `name` is an op name: one of `OPERATION_NAMES`, `custom.<function>` or
-/// `custom:<contract>.<function>`, where a function is a `Symbol` and a contract a `C` StrKey.
+/// `custom:<contract>.<function>`, where a function is a key-like name and `contract_text_ok`
+/// accepts the contract text.
 pub(crate) fn op_name_ok(name: &[u8]) -> bool {
     if let Some(function) = name.strip_prefix(b"custom.") {
         return symbol_ok(function);
     }
-    match name
-        .strip_prefix(b"custom:")
-        .and_then(|call| call.split_at_checked(56))
-    {
-        Some((contract, function)) => {
-            contract[0] == b'C'
-                && contract
-                    .iter()
-                    .all(|b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(b))
-                && function.strip_prefix(b".").is_some_and(symbol_ok)
-        }
+    match name.strip_prefix(b"custom:") {
+        Some(call) => call
+            .iter()
+            .rposition(|b| *b == b'.')
+            .is_some_and(|dot| contract_text_ok(&call[..dot]) && symbol_ok(&call[dot + 1..])),
         None => OPERATION_NAMES.contains(&name),
     }
 }
@@ -725,7 +777,8 @@ pub fn call_cap(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<u64
     Ok(cap - next)
 }
 
-/// Require an exact permitted destination. Deposits name their vault as the recipient.
+/// Require an exact permitted destination. Deposits and redeems name their vault, swaps their
+/// exchange and custom calls their contract as the recipient.
 ///
 /// Returns the matched `request.recipient`. An empty list denies.
 pub fn recipients(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<Address> {
@@ -733,11 +786,21 @@ pub fn recipients(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<A
     allowed(value, &ctx.request.recipient, e)
 }
 
-/// Require an exact permitted underlying asset contract.
+/// Require an exact permitted underlying asset contract and, for a swap, its other token: the
+/// token that a forward swap buys or a reverse swap sells.
 ///
 /// Returns the matched `request.asset`. An empty list denies.
 pub fn tokens(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<Address> {
-    allowed(value, &ctx.request.asset, AllowitError::TokenNotAllowed)
+    let r = &ctx.request;
+    let e = AllowitError::TokenNotAllowed;
+    if r.operation == AllowitOperation::swap {
+        let other = match &r.token_out {
+            Some(out) if r.token_in == r.asset => out.clone(),
+            _ => r.token_in.clone(),
+        };
+        allowed(value.clone(), &other, e)?;
+    }
+    allowed(value, &r.asset, e)
 }
 
 /// Require unexpired params and request, with the request expiring no later than the params.
@@ -756,14 +819,19 @@ pub fn expiry(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<u64> 
 /// Require the request's operation in the `operations` value in `value`. `Str` `*` admits every
 /// op. A `List` of `Str` op names admits `transfer`, `swap`, `deposit` or `redeem` by name,
 /// `custom` any custom call, `custom.<function>` that function on any contract and
-/// `custom:<contract>.<function>` that function on that contract. An empty list denies.
+/// `custom:<contract>.<function>` that function on that contract. An empty list denies. No entry
+/// admits a custom call whose contract and function do not form such a name.
 ///
-/// Returns the request's op name for a `match`: `"transfer"` for a SEP-41 transfer and
-/// `"deposit"` for a SEP-56 deposit.
+/// Returns the request's op name for a `match`: `"transfer"`, `"swap"`, `"deposit"`, `"redeem"`
+/// or `"custom"`.
 pub fn operations(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<&str> {
-    let op = operation_name(&ctx.request);
     let mut found = false;
-    each_op(value, |entry| found |= admits(entry, op.as_bytes()))?;
+    operation_match(&ctx.request, |op| {
+        each_op(value, |entry| {
+            found |= op.is_some_and(|op| admits(entry, op));
+        })
+    })?;
+    let op = operation_name(&ctx.request);
     if found {
         Ok(op)
     } else {
