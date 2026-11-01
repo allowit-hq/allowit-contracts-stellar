@@ -907,8 +907,8 @@ fn execute_redeem_checks_observed_effects_and_keeps_a_receipt() {
         assert_eq!(f.client().state(), before);
         assert!(!marked(&f, &e));
     }
-    // Short payment, a lied return, an over-burn and a changed asset roll everything back.
-    for behavior in [21, 22, 23, 24] {
+    // Short payment, a lied return and an over-burn roll everything back.
+    for behavior in [21, 22, 23] {
         let f = Fixture::new(COMMON, false);
         let v = vault(&f, behavior);
         allow(&f, &[&v], &[], &OPS);

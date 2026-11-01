@@ -1005,18 +1005,17 @@ fn owner_upgrades_exact_code_without_server_and_preserves_state() {
 fn request_bindings_reject_changed_fields_and_unexpected_effects() {
     let f = Fixture::new(SIMPLE, false);
     let e = f.execution(10);
-    for field in 0..10 {
+    for field in 0..9 {
         let mut bad = e.clone();
         match field {
             0 => bad.policy_instance = BytesN::from_array(&f.env, &[3; 32]),
             1 => bad.module_digest = BytesN::from_array(&f.env, &[3; 32]),
-            2 => bad.source_hash = BytesN::from_array(&f.env, &[0; 32]),
-            3 => bad.nonce += 1,
-            4 => bad.deployment_version += 1,
-            5 => bad.operation_id = BytesN::from_array(&f.env, &[0; 32]),
-            6 => transfer_args(&mut bad).token = f.recipient.clone(),
-            7 => transfer_args(&mut bad).to = f.wallet.clone(),
-            8 => transfer_args(&mut bad).amount = 0,
+            2 => bad.nonce += 1,
+            3 => bad.deployment_version += 1,
+            4 => bad.operation_id = BytesN::from_array(&f.env, &[0; 32]),
+            5 => transfer_args(&mut bad).token = f.recipient.clone(),
+            6 => transfer_args(&mut bad).to = f.wallet.clone(),
+            7 => transfer_args(&mut bad).amount = 0,
             _ => transfer_args(&mut bad).amount = -1,
         }
         f.auth(

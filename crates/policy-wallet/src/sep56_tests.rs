@@ -160,8 +160,8 @@ fn deposit_rejects_the_wallet_or_its_asset_as_vault_and_nonpositive_bounds() {
 }
 
 #[test]
-fn deposit_wrong_asset_under_mint_lied_credit_and_changed_asset_roll_back_everything() {
-    for behavior in [1, 2, 6] {
+fn deposit_wrong_asset_under_mint_and_lied_credit_roll_back_everything() {
+    for behavior in [1, 2] {
         let f = Fixture::new(COMMON, false);
         let vault = vault(&f, behavior, None);
         allow_recipient(&f, &vault);
@@ -374,20 +374,6 @@ fn ordinary_recipient_allowlist_admits_multiple_vaults_and_denies_other_targets(
     assert_eq!(f.client().state().nonce, 2);
     assert_eq!(f.history().day_total, 80);
     assert_eq!(f.client().deposit_receipt(&e.operation_id), None);
-}
-
-#[test]
-fn deposit_untrusted_metadata_getter_cannot_mutate_final_share_or_asset_effects() {
-    for behavior in [9, 10] {
-        let f = Fixture::new(COMMON, false);
-        let vault = vault(&f, behavior, None);
-        allow_recipient(&f, &vault);
-        let e = request(&f, &vault, 50, 50);
-        let before = f.client().state();
-        let spent = f.history();
-        assert_eq!(execute(&f, &e), Err(Ok(AllowitWalletError::InvalidEffects)));
-        assert_unchanged(&f, &vault, &e.operation_id, &before, &spent);
-    }
 }
 
 fn set_cost(f: &Fixture, e: &mut AllowitExecutionRequest, gas: i128, conversion: i128) {

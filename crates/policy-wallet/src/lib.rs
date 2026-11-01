@@ -205,7 +205,8 @@ fn extend(env: &Env) {
     env.deployer()
         .extend_ttl(env.current_contract_address(), ttl / 2, ttl);
 }
-/// Write the custody State.
+/// Write the custody State. Params and policy state share this one instance entry; the core
+/// byte budgets keep it far below the 64 KiB contract data entry limit of current settings.
 fn store(env: &Env, state: &AllowitState) {
     env.storage().instance().set(&STATE_KEY, state);
 }
@@ -317,9 +318,7 @@ fn validate<P: AllowitPolicy>(
             return Err(AllowitWalletError::InvalidActor);
         }
     }
-    if config.policy_instance == BytesN::from_array(env, &[0; 32])
-        || config.source_digest == BytesN::from_array(env, &[0; 32])
-    {
+    if config.policy_instance == BytesN::from_array(env, &[0; 32]) {
         return Err(AllowitWalletError::InvalidState);
     }
     if P::source_digest(env).is_some_and(|digest| digest != config.source_digest) {
@@ -541,13 +540,15 @@ fn validate_swap(
     Ok(())
 }
 
+/// The native XLM Stellar Asset Contract address.
+fn native_asset(env: &Env) -> Address {
+    env.deployer()
+        .with_stellar_asset(Bytes::from_array(env, &[0; 4]))
+        .deployed_address()
+}
 /// The SAC symbol of the asset, cached at construction for issuer checks.
 fn token_label(env: &Env, asset: &Address) -> String {
-    let native = env
-        .deployer()
-        .with_stellar_asset(Bytes::from_array(env, &[0; 4]))
-        .deployed_address();
-    if asset == &native {
+    if *asset == native_asset(env) {
         String::from_str(env, "XLM")
     } else {
         token::Client::new(env, asset).symbol()
@@ -650,19 +651,16 @@ fn validate_expense(
         || expense.spent_units < 0
         || expense.observed_ledger == 0
         || expense.observed_ledger > env.ledger().sequence()
-        || expense.day != env.ledger().timestamp() / 86_400
+        || expense.day != env.ledger().timestamp() / allowit::DAY
     {
         return Err(AllowitWalletError::InvalidInvocation);
     }
-    let native_asset = env
-        .deployer()
-        .with_stellar_asset(Bytes::from_array(env, &[0; 4]))
-        .deployed_address();
     // Both authenticated actors attest normalized gas for non-XLM accounting assets.
     // The kernel cannot verify a cross-asset price. XLM remains exact stroop identity.
     if (expense.max_fee_stroops == 0 && expense.gas_units != 0)
         || (expense.max_fee_stroops > 0 && expense.gas_units <= 0)
-        || (state.asset == native_asset && expense.gas_units != i128::from(expense.max_fee_stroops))
+        || (state.asset == native_asset(env)
+            && expense.gas_units != i128::from(expense.max_fee_stroops))
     {
         return Err(AllowitWalletError::InvalidInvocation);
     }
@@ -745,23 +743,18 @@ fn deposit_tokens(
             &Symbol::new(env, "preview_redeem"),
             (shares,).into_val(env),
         );
-        if redeemable < 0 || args.assets - args.assets.min(redeemable) > expense.conversion_units {
+        // A negative preview exceeds the loss bound, which never exceeds the assets.
+        if args.assets - args.assets.min(redeemable) > expense.conversion_units {
             return Err(AllowitWalletError::InvalidEffects);
         }
-    }
-    // Finish foreign metadata reads before measuring final effects. A vault getter is not trusted to be pure.
-    let after_asset: Address =
-        env.invoke_contract(&args.vault, &Symbol::new(env, "query_asset"), Vec::new(env));
-    if after_asset != *asset {
-        return Err(AllowitWalletError::InvalidEffects);
     }
     let expected_assets = checked(before_assets.checked_sub(args.assets))?;
     let expected_shares = checked(before_shares.checked_add(shares))?;
     let after_shares = shares_client.balance(&wallet);
     // The immutable SAC read is last: no untrusted vault code runs after these final observations.
     let after_assets = asset_client.balance(&wallet);
+    // `min_shares` is positive, so this also rejects a nonpositive mint.
     if shares < args.min_shares
-        || shares <= 0
         || after_assets != expected_assets
         || after_shares != expected_shares
     {
@@ -851,20 +844,14 @@ fn redeem_shares(
     }
     // The selected vault values the shares before it acts. As for a deposit, this bounds the loss
     // against the vault's own valuation; it is not a proof of economic honesty.
-    let previewed = match expense {
-        Some(_) => {
-            let value: i128 = env.invoke_contract(
-                &args.vault,
-                &Symbol::new(env, "preview_redeem"),
-                (args.shares,).into_val(env),
-            );
-            if value < 0 {
-                return Err(AllowitWalletError::InvalidEffects);
-            }
-            Some(value)
-        }
-        None => None,
-    };
+    // A nonpositive preview bounds no loss, as the vault can always report zero.
+    let previewed: Option<i128> = expense.map(|_| {
+        env.invoke_contract(
+            &args.vault,
+            &Symbol::new(env, "preview_redeem"),
+            (args.shares,).into_val(env),
+        )
+    });
     let wallet = env.current_contract_address();
     let asset_client = token::Client::new(env, asset);
     let shares_client = token::Client::new(env, &args.vault);
@@ -879,12 +866,6 @@ fn redeem_shares(
         &Symbol::new(env, "redeem"),
         (args.shares, wallet.clone(), wallet.clone(), wallet.clone()).into_val(env),
     );
-    // Finish foreign reads before the final asset balance. A vault getter is not trusted to be pure.
-    let after_asset: Address =
-        env.invoke_contract(&args.vault, &Symbol::new(env, "query_asset"), Vec::new(env));
-    if after_asset != *asset {
-        return Err(AllowitWalletError::InvalidEffects);
-    }
     let expected_shares = checked(before_shares.checked_sub(args.shares))?;
     let expected_assets = checked(before_assets.checked_add(assets))?;
     let after_shares = shares_client.balance(&wallet);
@@ -894,8 +875,8 @@ fn redeem_shares(
         (Some(value), Some(expense)) => value - value.min(assets) > expense.conversion_units,
         _ => false,
     };
+    // `min_assets` is positive, so this also rejects a nonpositive payout.
     if assets < args.min_assets
-        || assets <= 0
         || loss_exceeded
         || after_shares != expected_shares
         || after_assets != expected_assets
@@ -948,7 +929,6 @@ fn admit<P: AllowitPolicy>(
     }
     let installed = binding::<P>(env, &state)?;
     if execution.policy_instance != installed.policy_instance
-        || execution.source_hash == BytesN::from_array(env, &[0; 32])
         || (!P::STANDARD_PREFIX && execution.source_hash != installed.source_digest)
         || execution.operation_id == BytesN::from_array(env, &[0; 32])
         || execution.module_digest != installed.module_digest
@@ -1430,7 +1410,9 @@ pub fn check_auth<P: AllowitPolicy>(
     if !state.x402_enabled {
         return Err(AllowitWalletError::UnsupportedOperation);
     }
-    // The same typed operation and kernel invariants as execute.
+    // The same typed operation checks and admission as execute. With no contract call, it cannot
+    // check a vault's underlying asset or the router's or vault's output: these rest on the agent
+    // and server signatures and on the called contract.
     let execution = &authorization.execution;
     validate_operation(env, execution, &state)?;
     match_contexts(env, &state, &execution.operation, &contexts)?;

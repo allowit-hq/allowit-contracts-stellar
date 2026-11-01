@@ -231,10 +231,8 @@ pub const EXPIRY: &str = "expiry";
 pub const OPERATIONS: &str = "operations";
 
 // Bounds of params, args and state values. The byte budgets bound a map's encoded size by
-// `KEY_BYTES` per key plus `VALUE_BYTES` per value plus each text padded to four bytes, which is
-// at least its XDR size. The wallet stores params and policy state in its one instance entry; the
-// two budgets with its other fields stay far below the network's contract data entry limit,
-// 64 KiB in current settings.
+// `KEY_BYTES` per key plus `VALUE_BYTES` per value plus each text padded to four bytes. A rail
+// checks that these budgets fit its storage limits.
 /// Most params that a Custom wallet stores.
 pub const MAX_PARAMS: u32 = 32;
 /// Most execution params that one request carries.

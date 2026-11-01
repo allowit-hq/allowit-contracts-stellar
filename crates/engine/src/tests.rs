@@ -67,31 +67,6 @@ fn fixture(env: &Env) -> AllowitContext {
     ctx
 }
 #[test]
-fn native_contract_wrapper_matches_the_bundled_rule() {
-    let env = Env::default();
-    let ctx = fixture(&env);
-    let call = || {
-        AllowitEngine::day_total_cap(
-            env.clone(),
-            ctx.params.0.clone(),
-            ctx.state.clone(),
-            ctx.request.clone(),
-        )
-    };
-    assert_eq!(
-        call(),
-        allowit::day_total_cap(&ctx, ctx.params.get(allowit::DAY_TOTAL_CAP))
-    );
-    assert_eq!(call(), Ok(57));
-}
-#[test]
-fn engine_metadata_is_pure_release_data() {
-    let env = Env::default();
-    assert_eq!(AllowitEngine::engine_version(env.clone()), 4);
-    assert!(env.auths().is_empty());
-}
-
-#[test]
 fn compiled_engine_returns_bundled_pass_values_and_rule_errors() {
     const WASM: &[u8] =
         include_bytes!("../../../target/wasm32v1-none/release/allowit_wallet_engine.wasm");

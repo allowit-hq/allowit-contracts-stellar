@@ -102,16 +102,6 @@ fn approved(env: &Env, engine: &Address) -> bool {
 }
 
 #[test]
-fn compiled_parent_deploys_compiled_external_reference_engine() {
-    let f = Fixture::new(true);
-    let state = f.client().state();
-    assert_eq!(state.owner, f.admin);
-    assert_eq!(state.version, 0);
-    assert_eq!(f.client().engine(), state.engine);
-    assert!(approved(&f.env, &state.engine));
-}
-
-#[test]
 fn wrong_or_absent_admin_cannot_upgrade_and_stale_version_does_not_commit() {
     let f = Fixture::new(false);
     let c = f.client();
@@ -332,14 +322,20 @@ fn constructor_requires_admin_authorization() {
 fn engine_lookup_extends_cold_reference_instance_and_code_ttl() {
     use soroban_sdk::testutils::Deployer as _;
     let f = Fixture::new(true);
-    let state = f.client().state();
+    let max = f.env.storage().max_ttl();
+    // The constructor alone sets the admin and version and gives the parent its full lifetime.
+    assert_eq!(f.env.deployer().get_contract_instance_ttl(&f.parent), max);
+    assert_eq!(f.env.deployer().get_contract_code_ttl(&f.parent), max);
+    let state: AllowitParentState = f
+        .env
+        .as_contract(&f.parent, || f.env.storage().instance().get(&STATE_KEY))
+        .unwrap();
+    assert_eq!((state.owner.clone(), state.version), (f.admin.clone(), 0));
     let before_code = f.env.deployer().get_contract_code_ttl(&state.engine);
     let before_instance = f.env.deployer().get_contract_instance_ttl(&state.engine);
     let before_ref = f
         .env
         .as_contract(&f.parent, || f.env.executable_refs().get_ttl(&tag(&f.env)));
-    let max = f.env.storage().max_ttl();
-    assert_eq!(f.env.deployer().get_contract_code_ttl(&f.parent), max);
     assert!(before_code < max / 2);
     assert!(before_instance < max / 2);
     assert!(before_ref < max / 2);
@@ -354,15 +350,6 @@ fn engine_lookup_extends_cold_reference_instance_and_code_ttl() {
             .as_contract(&f.parent, || f.env.executable_refs().get_ttl(&tag(&f.env))),
         max
     );
-}
-
-#[test]
-fn constructor_initializes_parent_lifetime_without_an_extra_state_read() {
-    use soroban_sdk::testutils::Deployer as _;
-    let f = Fixture::new(true);
-    let max = f.env.storage().max_ttl();
-    assert_eq!(f.env.deployer().get_contract_instance_ttl(&f.parent), max);
-    assert_eq!(f.env.deployer().get_contract_code_ttl(&f.parent), max);
 }
 
 #[test]

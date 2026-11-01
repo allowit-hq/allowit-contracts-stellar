@@ -19,26 +19,9 @@ impl AllowitSep56TestVault {
         env.storage().instance().set(&0u32, &asset);
         env.storage().instance().set(&1u32, &behavior);
     }
-    /// The underlying asset; behaviors 9 and 10 also change effects after a deposit.
+    /// The underlying asset.
     pub fn query_asset(env: Env) -> Address {
-        let asset: Address = env.storage().instance().get(&0u32).unwrap();
-        let behavior: u32 = env.storage().instance().get(&1u32).unwrap();
-        if let Some(receiver) = env.storage().instance().get::<_, Address>(&3u32) {
-            if behavior == 9 {
-                // A metadata getter can destroy credited shares after deposit returns.
-                env.storage().persistent().set(&receiver, &0i128);
-            }
-            if behavior == 10 {
-                // A metadata getter can also refund underlying after an earlier balance observation.
-                let assets: i128 = env.storage().instance().get(&4u32).unwrap();
-                token::Client::new(&env, &asset).transfer(
-                    &env.current_contract_address(),
-                    &receiver,
-                    &assets,
-                );
-            }
-        }
-        asset
+        env.storage().instance().get(&0u32).unwrap()
     }
     /// Underlying value of `shares`; behavior 11 undervalues by two, 12 destroys shares.
     pub fn preview_redeem(env: Env, shares: i128) -> i128 {
@@ -76,7 +59,7 @@ impl AllowitSep56TestVault {
     /// Burn `shares` of `owner` and pay as many underlying units to `receiver`, as an
     /// OpenZeppelin SEP-56 vault does with `operator.require_auth()` only. Hostile behaviors: 20
     /// also authorizes the owner in the same frame, 21 pays one unit less than it returns, 22
-    /// returns one unit more than it pays, 23 burns one share more, 24 changes its asset, 25 keeps a
+    /// returns one unit more than it pays, 23 burns one share more, 25 keeps a
     /// three-unit fee that `preview_redeem` does not show, and 13 makes the configured callback.
     pub fn redeem(
         env: Env,
@@ -108,10 +91,6 @@ impl AllowitSep56TestVault {
             let (contract, function, args): (Address, Symbol, Vec<Val>) =
                 env.storage().instance().get(&5u32).unwrap();
             env.invoke_contract::<Val>(&contract, &function, args);
-        }
-        if behavior == 24 {
-            let vault = env.current_contract_address();
-            env.storage().instance().set(&0u32, &vault);
         }
         match behavior {
             22 => shares + 1,
@@ -174,10 +153,6 @@ impl AllowitSep56TestVault {
         }
         .publish(&env);
         env.storage().instance().set(&3u32, &receiver);
-        env.storage().instance().set(&4u32, &assets);
-        if behavior == 6 {
-            env.storage().instance().set(&0u32, &vault);
-        }
         shares
     }
 }
