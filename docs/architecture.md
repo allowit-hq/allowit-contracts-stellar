@@ -20,12 +20,12 @@ expose identical entrypoints and differ only in their `AllowitPolicy` logic.
 ## Public names
 
 Every public type that authored policy, SDK integrations or contract specs name carries the
-`Allowit` prefix: `AllowitContext`, `AllowitEnv`, `AllowitParams`, `AllowitValue`, `AllowitRule`,
+`Allowit` prefix: `AllowitContext`, `AllowitEnv`, `AllowitParams`, `AllowitArgs`, `AllowitValue`, `AllowitRule`,
 `AllowitError`, `AllowitExecutionRequest`, `AllowitPolicyDeployment`, `AllowitState` and the others. The contract
 structs and their generated clients carry it too: `AllowitSimplePolicyEngine`,
 `AllowitCommonPolicyEngine`, `AllowitCustomPolicy`, `AllowitEngine`, `AllowitEngineParent`, and
 `AllowitEngineClient` and the other `*Client` types. Namespaced items keep their short names, such
-as `allowit::Result`, `allowit::spent_cap` and `allowit::TRANSACTION_CAP`.
+as `allowit::Result`, `allowit::lifetime_spending_limit` and `allowit::PAYMENT_LIMIT`.
 
 Encodings carry struct field names and enum variant symbols, not type names. The prefix therefore
 leaves signed encodings, the standard prefix digest and the stored layout unchanged.
@@ -43,18 +43,18 @@ use allowit::prelude::*;
 /// I approve.
 pub fn execute(ctx: &AllowitContext) -> allowit::Result {
     // "Cap every payment"
-    allowit::transaction_cap(ctx, ctx.params.get(allowit::TRANSACTION_CAP))?;
+    allowit::payment_limit(ctx, &ctx.params[allowit::PAYMENT_LIMIT])?;
     // "cap its total spending"
-    allowit::spent_cap(ctx, ctx.params.get(allowit::SPENT_CAP))?;
+    allowit::lifetime_spending_limit(ctx, &ctx.params[allowit::LIFETIME_SPENDING_LIMIT])?;
     // "pay only vendors I approve"
-    allowit::recipients(ctx, ctx.params.get(allowit::RECIPIENTS))?;
+    allowit::destinations(ctx, &ctx.params[allowit::DESTINATIONS])?;
     Ok(())
 }
 ```
 
 `execute` takes only the context. Each rule call keeps the form
-`allowit::<rule>(ctx, ctx.params.get(<key>))?`: the policy looks up the param and the rule decodes
-the value. A rule may read any key, such as a custom `vendor_cap`.
+`allowit::<rule>(ctx, &ctx.params[<key>])?`: the policy reads the param by key and the rule
+decodes the value. A rule may read any key, such as a custom `vendor_cap`.
 
 The function doc comment keeps the owner's original policy prompt. Each inline comment quotes the
 prompt clause that the next call implements.
@@ -87,8 +87,8 @@ code through an allowlist, not a list of known hazards. Every identifier must be
 - a listed field after `.`: `env`, `params`, `request` and the request fields, including `args`;
 - a listed method after `.`: comparisons, `clone`, and the `Option`, `Result`, fixed-width integer,
   `bool` and `Ordering` methods that take and return no pointer-width value, such as `is_some`,
-  `unwrap_or`, `checked_add`, `saturating_sub`, `min` and `max`, and `get` on `params` and `args`
-  only;
+  `unwrap_or`, `checked_add`, `saturating_sub`, `min` and `max`, and `contains` on `params` and
+  `args` only;
 - a listed path: the `allowit` rules, `param`, `arg`, `get_state`, `set_state`, the canonical key
   constants, the server-only functions and their request types, the `AllowitOperation`,
   `AllowitError`, `AllowitRule` and `AllowitValue` variants, `Option` and `Result` variants,
@@ -129,17 +129,20 @@ Beside the allowlist, the tooling rejects:
   any brace.
 - Every attribute other than `allow`, `expect`, `warn`, `deny`, `forbid`, `inline`, `cold` and
   `must_use`, for example `track_caller`, `doc` or `cfg`.
-- The map inside `params` and `args`, such as `ctx.params.0`, and the name `AllowitParams`. Soroban
-  maps key by `Symbol` and decode values on read, and heap maps have other methods, so params and
-  args are read only with `.get(key)`. The host backend keeps that map private, so the std-only
-  compile also rejects `.0` on a clone or a binding, such as `ctx.params.clone().0`. `get` passes
-  only on the field access `.params` or `.args`, such as `ctx.params.get` or
-  `ctx.request.args.get`, and the file may not declare `params` or `args` as a binding or function
-  name: on a list or a string, `get` would take a pointer-width index on the host. A struct expression or pattern of
-  `AllowitContext`, which would reach `state`, and struct update syntax `..` reject. Soroban and
-  heap vectors have different methods with the same names, for example `append` drains its argument
-  only on the host, so a list from `AllowitValue::List`, and a `Vec` or `String` that `param` or
-  `arg` returns, admits only comparison, `clone`, matching and `for`.
+- The map inside `params` and `args`, such as `ctx.params.0`, and the names `AllowitParams` and
+  `AllowitArgs`. Soroban maps key by `Symbol` and decode values on read, and heap maps have other
+  methods, so params are read only by key, `ctx.params[key]`, and args only with `allowit::arg`.
+  The host backend keeps both maps private, so the std-only compile also rejects `.0` on a clone or
+  a binding, such as `ctx.params.clone().0`. Indexing passes only on the field access `.params`,
+  whose type indexes only by key text; every other index, such as `list[0]` or
+  `ctx.request.args["k"]`, rejects. `contains` passes only on the field access `.params` or
+  `.args`, and the file may not declare `params` or `args` as a binding or function name: on a
+  list, `contains` is a Soroban method that the host list lacks. A struct expression or pattern
+  of `AllowitContext`, which would reach `state`, and struct update syntax `..` reject. The host
+  list offers authored code no methods (the server reads it with `as_slice`), and Soroban and heap strings have different methods with the same names,
+  for example `len` returns `u32` onchain and `usize` on the host, so a list from
+  `AllowitValue::List`, and a `Vec` or `String` that `param` or `arg` returns, admits only
+  comparison, `clone`, matching and `for`.
 - Indexing (`x[i]`), whose index Rust infers as `usize`.
 
 `scripts/policy_source.py` implements these checks; `check-policy-bindings.py` and the owner packet
@@ -157,7 +160,10 @@ compiles:
   address comparison with `<`, `min`, `max`, `sort` or `binary_search`, and a `std` prelude item
   such as `vec!`. On the host, `Address` holds the text that its rail supplies, a StrKey on Stellar,
   and compares only for equality: Soroban orders addresses by `ScAddress`, so accounts sort before contracts, while text would
-  sort by StrKey. `scripts/policy_source.py` runs this compile in `check-policy-bindings.py`, and
+  sort by StrKey. The host `Vec` iterates a borrowed list by clone, as the Soroban `Vec` does, so
+  `for item in items` binds an owned item on both backends, also when `items` borrows from
+  `ctx.params[key]`, and a dereference `*item` fails both compiles. It has no slice `Deref`.
+  `scripts/policy_source.py` runs this compile in `check-policy-bindings.py`, and
   so in `scripts/build-contracts.sh`, and in `scripts/contract_admin.py` for the owner packets of
   every tier. These tools need `rustc` (from `RUSTC` or `PATH`). The portability test below and the
   `policy` job of `.github/workflows/contracts.yml` also compile `scripts/policy-smoke.rs`, which
@@ -191,7 +197,7 @@ wallets.
 
 `allowit` has two backends that share one rule implementation. Feature `soroban` (default) uses
 Soroban `Address`, `Vec`, `Map`, `Env` and contract types. Feature `std` uses heap strings, maps
-and vectors for the host evaluator; addresses are unordered rail-supplied texts and the environment is
+and lists for the host evaluator; addresses are unordered rail-supplied texts and the environment is
 a host `AllowitEnv`, which buffers the policy's state writes. The selected backend backs the crate root that authored policy names. The offchain
 server depends on `allowit = { default-features = false, features = ["std"] }` and builds with
 `overflow-checks = true`. Enabling both backends is a compile error, so a server cannot silently
@@ -202,9 +208,11 @@ The portability test, `crates/policy-wallet/src/portability_tests.rs`, runs one 
 
 1. The host backend: the std-only compile of `scripts/policy-smoke.rs` prints its outcomes.
 2. `AllowitCustomPolicy`: the Soroban backend of the same sources must give identical pass values,
-   errors and post-flight state. The real custom Wasm must then return the mapped policy result.
+   errors and post-flight state. Each Soroban step runs in its own contract frame, so an unset
+   `ctx.params[key]` reports its `MissingParam` abort as the host reports its caught panic. The
+   real custom Wasm must then return the mapped policy result, or the abort's own error code.
    A fixture Wasm built with the `test-catching` feature compiles `src/catching_policy.rs`
-   instead, and must return the mapped catching result. That policy catches a daily cap error,
+   instead, and must return the mapped catching result. That policy catches a daily spending limit error,
    counts it in its own state key and continues, at most twice. When the agent's args name an
    `invoice`, it also caps the payment with the custom `invoice_cap` param.
 3. `AllowitCommonPolicyEngine`: the real standard Wasm, bound to the sample policy's prefix, must
@@ -223,7 +231,7 @@ Separate tests check that every tier stores exactly the state that the server's 
 returned, and that execution params reach the Custom policy, fail authorization when changed after
 signing, reject beyond their bounds and leave the standard tiers unaffected. Vectors that the
 kernel cannot produce through a transfer `execute`, such as a deposit, swap or redeem, a negative
-cap, an invalid `operations` value or more than 16 args, run only on the two backends. The swap and
+limit, an invalid `operations` value or more than 16 args, run only on the two backends. The swap and
 redeem tests in `src/swap_redeem_tests.rs` run those operations through every contract. Kernel violations
 (another asset, payment to the wallet, request expiry, stale nonce, replay and pause) reject with the
 same kernel error in every contract.
@@ -238,8 +246,8 @@ fixture.
 
 Portable authored code beyond canonical calls uses typed scalar fields, enum comparisons such as
 `ctx.request.operation == AllowitOperation::deposit`, matches on `AllowitValue`, and its own
-state keys. Backend list methods differ (`len` returns `u32` onchain and `usize` on the host), so
-the tooling admits no list method.
+state keys. The host list offers authored code no methods and `String::len` returns `u32` onchain and `usize` on
+the host, so the tooling admits no list or text method.
 
 `AllowitContext` is the complete rule input. It is plain data without methods. The wallet or server
 computes it:
@@ -253,17 +261,22 @@ computes it:
 
 Params, state and args share one value type, `AllowitValue`: `Int(i128)`, `Bool(bool)`,
 `Str(String)`, `Addr(Address)` and `List(Vec<AllowitValue>)`. Onchain a map is
-`Map<Symbol, AllowitValue>`, on the host `BTreeMap<String, AllowitValue>`. `params` and
-`request.args` are `AllowitParams`, which wraps that map and offers authored policy only
-`get(key) -> Option<AllowitValue>`. The host map is private; the server converts with `From`. Values are owned on both backends, because Soroban maps decode
-them on read; a borrowed host value would bind differently in a `match`. A key that no map can
-hold, such as one with a space, is unset on both backends.
+`Map<Symbol, AllowitValue>`, on the host `BTreeMap<String, AllowitValue>`. `params` is
+`AllowitParams`. Policy reads a param by key, `ctx.params[allowit::DESTINATIONS]` or
+`ctx.params["destinations"]`, which returns `&AllowitValue` on both backends. A Soroban map decodes
+a value on every read, so the Soroban `AllowitParams::new` decodes the at most 32 entries once per
+run, and indexing returns a reference to the decoded value. Indexing an unset key panics with
+`MissingParam`; see [Panics](#panics). `ctx.params.contains(key)` tells whether the owner set a
+key. `request.args` is `AllowitArgs`, the contract type of the agent's map, read with
+`allowit::arg` and `ctx.request.args.contains(key)`. Both host maps are private; the server
+converts with `From`. A key that no map can hold, such as one with a space, is unset on both
+backends.
 
-Rules are checks: `allowit::<rule>(ctx, Option<AllowitValue>) -> allowit::Result<T>`. Each decodes
-the value, then returns only its passing constraint, or an `allowit::AllowitError`. An unset param is
-`MissingParam`; a value of the wrong type or range is `InvalidParam`. Policy code calls rules
-unguarded, so an unset param denies. A rule error that the policy catches denies nothing: the
-policy decides. Custom keys reach policy as `ctx.params.get("vendor_cap")` or as a typed read
+Rules are checks: `allowit::<rule>(ctx, &AllowitValue) -> allowit::Result<T>`. Each decodes the
+value, then returns only its passing constraint, or an `allowit::AllowitError`. A value of the
+wrong type or range is `InvalidParam`. Policy code reads the param unguarded, so an unset param
+stops the run. A rule error that the policy catches denies nothing: the policy decides. Custom
+keys reach policy as `&ctx.params["vendor_cap"]` or as a typed read
 `let cap: i128 = allowit::param(ctx, "vendor_cap");`, and agent args as
 `let amount: i128 = allowit::arg(ctx, "amount");`. A typed read returns the type of its binding:
 `i128`, `u64`, `u32`, `bool`, `Address`, `String`, `Vec<AllowitValue>`, `Vec<Address>` or
@@ -271,11 +284,11 @@ policy decides. Custom keys reach policy as `ctx.params.get("vendor_cap")` or as
 [Panics](#panics).
 
 The owner sets params at install and changes them with `deploy_policy`, without code redeployment.
-The canonical keys are `allowit::TRANSACTION_CAP`, `SPENT_CAP`, `DAY_SPENT_CAP`, `DAY_TOTAL_CAP`,
-`CALL_CAP`, `RECIPIENTS`, `TOKENS`, `EXPIRY` and `OPERATIONS`, each the name of its rule.
+The canonical keys are `allowit::PAYMENT_LIMIT`, `LIFETIME_SPENDING_LIMIT`, `DAILY_SPENDING_LIMIT`, `DAILY_VOLUME_LIMIT`,
+`CALL_LIMIT`, `DESTINATIONS`, `TOKENS`, `EXPIRES_AT` and `OPERATIONS`, each the name of its rule.
 `allowit::check_params` checks every owner write. Simple and Common admit only the canonical keys,
-each with the type its rule decodes: a nonnegative `Int` cap, an `Int` in the `u64` range for
-`call_cap` and `expiry`, a `List` of `Addr` for `recipients` and `tokens`, and `Str` `*` or a
+each with the type its rule decodes: a nonnegative `Int` limit, an `Int` in the `u64` range for
+`call_limit` and `expires_at`, a `List` of `Addr` for `destinations` and `tokens`, and `Str` `*` or a
 `List` of `Str` op names for `operations`. Custom admits up to 32 keys, whose meaning its policy
 defines. Every value holds at most 64 nested values, and every text at most 256 bytes. Nothing
 checks that a rule reads its own key.
@@ -293,7 +306,7 @@ with the same key and value bounds. An empty key, which a Soroban `Symbol` can h
 `InvalidParam` in params and args on both backends. The agent and server authorize the whole request, so a changed arg
 fails authorization. The wallet passes them to policy as `ctx.request.args` and never stores them.
 Canonical rules and the standard contract ignore them; Custom and offchain policy read them with
-`ctx.request.args.get("key")`.
+`allowit::arg(ctx, "key")` and test one with `ctx.request.args.contains("key")`.
 
 The state map holds the standard keys `spent`, `day_spent`, `day_total`, `calls`, `day`,
 `unpriced` and `day_unpriced`, and any keys the policy defines, at most `allowit::MAX_STATE_KEYS`
@@ -359,22 +372,23 @@ compile, because the Soroban backend has none of them.
 
 | Rule and canonical param key | Param value | Pass value |
 | --- | --- | --- |
-| `transaction_cap` | Nonnegative `Int` gross units for one operation | `cap - amount` |
-| `spent_cap` | Nonnegative `Int` cumulative irreversible-expense ceiling | `cap - (spent + spent_units)` |
-| `day_spent_cap` | Nonnegative `Int` UTC-day irreversible-expense ceiling | `cap - (today_spent + spent_units)` |
-| `day_total_cap` | Nonnegative `Int` UTC-day gross amount plus separate gas | `cap - (today_total + amount + gas_units)` |
-| `call_cap` | `Int` in the `u64` range: successful operation count ceiling; zero denies | `cap - (calls + 1)` |
-| `recipients` | `List` of `Addr`: permitted destinations, including vaults and swap routers; empty denies | Matched recipient |
+| `payment_limit` | Nonnegative `Int` gross units for one operation | `limit - amount` |
+| `lifetime_spending_limit` | Nonnegative `Int` cumulative irreversible-expense ceiling | `limit - (spent + spent_units)` |
+| `daily_spending_limit` | Nonnegative `Int` UTC-day irreversible-expense ceiling | `limit - (today_spent + spent_units)` |
+| `daily_volume_limit` | Nonnegative `Int` UTC-day gross amount plus separate gas | `limit - (today_total + amount + gas_units)` |
+| `call_limit` | `Int` in the `u64` range: successful operation count ceiling; zero denies | `limit - (calls + 1)` |
+| `destinations` | `List` of `Addr`: permitted destinations, including vaults and swap routers; empty denies | Matched recipient |
 | `tokens` | `List` of `Addr`: exact permitted token identities, the asset and any token a swap trades against it; empty denies | Matched asset |
-| `expiry` | `Int` in the `u64` range: exclusive Unix timestamp; request expiry cannot exceed it | `expiry - now` |
+| `expires_at` | `Int` in the `u64` range: exclusive Unix timestamp; request expiry cannot exceed it | `expires_at - now` |
 | `operations` | `Str` `*` for every op, or `List` of `Str` op names; empty denies | The request's op name |
 
 `today_spent` and `today_total` are the daily values when `state.day == now / 86400`, and zero for
 an earlier day. A later day is `InvalidState`. Each rule checks only the facts it reads. A negative
-cap is `InvalidParam`, as are a nonpositive `transaction_cap` amount and negative request units. A negative state value that a cap reads is `InvalidState`. Lifetime unpriced state or an
-unpriced request denies `spent_cap`; unpriced state of the day or an unpriced request denies both
-daily caps (`Unpriced`). A sum outside its integer range is `Overflow`. Standard configuration
-rejects negative caps.
+limit is `InvalidParam`, as are a nonpositive `payment_limit` amount and negative request units. A
+negative state value that a limit reads is `InvalidState`. Lifetime unpriced state or an unpriced
+request denies `lifetime_spending_limit`; unpriced state of the day or an unpriced request denies
+both daily limits (`Unpriced`). A sum outside its integer range is `Overflow`. Standard
+configuration rejects negative limits.
 
 The op names are the general operations of `AllowitOperation`: `transfer`, `swap`, `deposit`
 and `redeem`, plus three custom-call forms. `custom` admits any custom call, `custom.<function>`
@@ -394,7 +408,7 @@ policy that should only swap or run custom code leaves `transfer` out.
 ## Standard prefix
 
 The standard prefix is the consecutive leading top-level statements of exactly the form
-`allowit::<rule>(ctx, ctx.params.get(allowit::<RULE>))?;`: one canonical rule and its own canonical
+`allowit::<rule>(ctx, &ctx.params[allowit::<RULE>])?;`: one canonical rule and its own canonical
 key constant. Any other statement ends it, including a rule that reads another key. Later
 statements run offchain or in `AllowitCustomPolicy`.
 The standard contract receives the exact owner-approved ordered prefix as `rules: Vec<AllowitRule>`, never
@@ -402,16 +416,17 @@ caller selectors. `AllowitRule` is a typed enum whose variants are the canonical
 vector and map elements when read, so owner configuration decodes every rule and param value before
 storing it: an unknown rule name aborts and a malformed element is `InvalidParam`. It runs each call
 through `allowit::preflight` as
-`if let Some(value) = ctx.params.get(rule.key()) { allowit::<rule>(ctx, Some(value))?; }` and
+`if ctx.params.contains(rule.key()) { allowit::<rule>(ctx, &ctx.params[rule.key()])?; }` and
 discards pass values. This preflight runner is the only place an absent param skips its rule. The
-offchain full policy and `AllowitCustomPolicy` still run the unguarded call, so they deny it with
+offchain full policy and `AllowitCustomPolicy` still index it unguarded, so they stop with
 `MissingParam`. An absent prefix param is valid configuration: the owner can set or remove params
 with `deploy_policy` without code redeployment. `scripts/contract_admin.py` warns about it without
 rejecting the packet. The preflight runner propagates the first rule error. Repeated rules
 read the same current state and only `post_flight` charges, so a rule cannot charge twice.
 
-Rule denials, including `OperationNotAllowed`, map to `PolicyDenied`. `MissingParam` and
-`InvalidParam` map to `InvalidParam`. `InvalidState` maps to `InvalidState`, `Overflow` to
+Rule denials, including `OperationNotAllowed`, map to `PolicyDenied`. A returned `MissingParam` or
+`InvalidParam` maps to `InvalidParam`; a failed read aborts with its own code instead, see
+[Panics](#panics). `InvalidState` maps to `InvalidState`, `Overflow` to
 `Overflow` and `Unsupported` to `UnsupportedOperation`. The host evaluator returns `Panicked` for a
 caught panic. A policy may also return it; onchain it then maps to `PolicyDenied`. A
 failed call rolls back its events, so only the host evaluator and the shared engine return the
@@ -485,7 +500,7 @@ A policy can check each op with its own params and args:
 
 ```rust
 pub fn execute(ctx: &AllowitContext) -> allowit::Result {
-    match allowit::operations(ctx, ctx.params.get(allowit::OPERATIONS))? {
+    match allowit::operations(ctx, &ctx.params[allowit::OPERATIONS])? {
         "custom:CPOOL….swap" => {
             // "at most 50 XLM per swap"
             let amount: i128 = allowit::arg(ctx, "amount");
@@ -504,12 +519,13 @@ An op that the `operations` param admits but that has no arm runs with no per-op
 ### Panics
 
 A rule returns `Err`. The policy may catch it and continue, and only a returned error denies. A
-panic is a hard stop: the run denies and its writes are discarded. `allowit::param` and
-`allowit::arg` panic with `MissingParam` for an unset key and with `InvalidParam` for a value of
-another type or range. `panic!`, `assert!`, `unreachable!` and integer overflow panic too.
+panic is a hard stop: the run denies and its writes are discarded. Indexing an unset param,
+`ctx.params[key]`, panics with `MissingParam`. `allowit::param` and `allowit::arg` panic with
+`MissingParam` for an unset key and with `InvalidParam` for a value of another type or range.
+`panic!`, `assert!`, `unreachable!` and integer overflow panic too.
 
-Onchain a panic aborts the wallet call, which rolls back every write. A failed typed read aborts
-with `panic_with_error` and its `AllowitError` code: 101 for `MissingParam` and 111 for
+Onchain a panic aborts the wallet call, which rolls back every write. A failed read aborts with
+`panic_with_error` and its `AllowitError` code: 101 for `MissingParam` and 111 for
 `InvalidParam`. `AllowitError` codes start at 101 and wallet error codes stay below 100, so a
 client never reads one as the other. On the host, `allowit::evaluate` catches the panic, discards
 the writes and returns the failed read's error, or `Panicked` for any other panic. The evaluator
@@ -578,18 +594,19 @@ exposes each canonical rule as
 `<rule>(params: Map<Symbol, AllowitValue>, state: Map<Symbol, AllowitValue>, request: AllowitRequest) -> Result<T, AllowitError>`,
 where `state` is the current policy state.
 Callers use its generated `AllowitEngineClient`.
-It builds the context with its own `Env`, runs `allowit::<rule>(&ctx, ctx.params.get(allowit::<RULE>))`
-and returns the same pass value or rule error.
+It builds the context with its own `Env`, runs `allowit::<rule>(&ctx, &ctx.params[allowit::<RULE>])`
+and returns the same pass value or rule error. An unset param aborts the call with `MissingParam`.
 It holds no custody, params or policy state. No policy wallet, release tool or server in this repository
 calls it; offchain evaluation uses `allowit` directly. It remains the engine parent's administered
 checker for onchain callers that cannot bundle `allowit`. Its tests match `AllowitRule` exhaustively, so a
 new rule fails to compile until the engine exposes it. The `test-deny` fixture aborts every rule
-with contract error `TEST_DENY` (1000), outside `allowit::AllowitError`. `engine_version` 4 marks this ABI:
-its `AllowitRequest` names the general operations `transfer`, `swap`, `deposit`, `redeem` and
-`custom(contract, function)`, and carries `token_in`, `amount_in`, `token_out` and `min_out`.
-Release 3 named Stellar operations and lacked those facts. It replaces the shipped release 1 ABI, whose methods take `(request: EngineRequest, state:
-EngineState)`. Release 2 was never released. An `upgrade_engine` from a deployed release 1 or 3
-engine to release 4 breaks every onchain caller of the earlier methods, so migrate or retire those
+with contract error `TEST_DENY` (1000), outside `allowit::AllowitError`. `engine_version` 5 marks this ABI:
+its methods carry the canonical rule names, and its `AllowitRequest` names the general operations
+`transfer`, `swap`, `deposit`, `redeem` and `custom(contract, function)`, and carries `token_in`,
+`amount_in`, `token_out` and `min_out`. Release 4 used the earlier rule names. Release 3 named Stellar operations and lacked those facts. It
+replaces the shipped release 1 ABI, whose methods take `(request: EngineRequest, state:
+EngineState)`. Release 2 was never released. An `upgrade_engine` from a deployed release 1, 3 or 4
+engine to release 5 breaks every onchain caller of the earlier methods, so migrate or retire those
 callers first.
 
 ## Typed operations
@@ -655,7 +672,7 @@ State, effects and receipts commit atomically. Denials and native failures roll 
 
 SEP-56 deposits name vault, assets and minimum shares; the wallet is source, operator and share
 receiver.
-Ordinary `recipients` controls destination vaults; no separate vault list or code-hash pin applies.
+Ordinary `destinations` controls destination vaults; no separate vault list or code-hash pin applies.
 The vault must report the immutable underlying SAC. Custody authorizes one exact deeper
 `transfer(wallet, vault, assets)`. Extra debits, including a second debit later refunded, lack authority.
 Returned shares must match the observed balance credit and meet the minimum. Any conversion-loss
@@ -763,8 +780,8 @@ persistent `operation_id` marker, and `expires_at` with `deployment_version`.
 | swap, X to asset | router | `amount_out_min`, a floor | X / `amount_in` | asset / `amount_out_min` |
 | redeem | vault | `min_assets`, a floor | vault shares / `shares` | asset / `min_assets` |
 
-`recipients` allows routers and vaults; no separate list applies. `tokens` checks the asset and,
-for a swap, its other endpoint. `transaction_cap` and `day_total_cap` read the gross amount, so
+`destinations` allows routers and vaults; no separate list applies. `tokens` checks the asset and,
+for a swap, its other endpoint. `payment_limit` and `daily_volume_limit` read the gross amount, so
 their limits on reverse swaps and redeems are floors. Swaps and redeems follow the deposit expense
 model: `conversion_units` is the loss ceiling, and `spent_units` equals it plus `gas_units`. A
 forward swap's loss cannot exceed `amount_in`. An `execute` redeem checks its loss against the
@@ -798,7 +815,7 @@ requires `preview - min(preview, assets) <= conversion_units`. The final read is
   transaction. `amount_out_min` bounds a swap's loss and `min_assets` an `execute` redeem's; an
   intercepted redeem's loss has no onchain bound.
 - The strict execution nonce orders every operation across both doors.
-- Testnet resets change router and token addresses: update `recipients` and `tokens` with
+- Testnet resets change router and token addresses: update `destinations` and `tokens` with
   `deploy_policy`.
 
 ## Owner authority and public metadata

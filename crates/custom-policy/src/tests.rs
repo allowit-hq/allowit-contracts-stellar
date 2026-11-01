@@ -4,21 +4,31 @@
 extern crate std;
 use super::*;
 use allowit::{
-    AllowitOperation, AllowitParams, AllowitRequest, AllowitStandardState, AllowitValue, CALL_CAP,
-    DAY_SPENT_CAP, DAY_TOTAL_CAP, EXPIRY, OPERATIONS, RECIPIENTS, SPENT_CAP, TOKENS,
-    TRANSACTION_CAP,
+    AllowitArgs, AllowitOperation, AllowitParams, AllowitRequest, AllowitStandardState,
+    AllowitValue, CALL_LIMIT, DAILY_SPENDING_LIMIT, DAILY_VOLUME_LIMIT, DESTINATIONS, EXPIRES_AT,
+    LIFETIME_SPENDING_LIMIT, OPERATIONS, PAYMENT_LIMIT, TOKENS,
 };
-use soroban_sdk::{Address, Map, String, Symbol, testutils::Address as _, vec};
+use soroban_sdk::{
+    Address, Map, String, Symbol, contract, contractimpl, testutils::Address as _, vec,
+};
+
+/// Contract scope in which a policy abort reports its contract error.
+#[contract]
+struct Scope;
+#[contractimpl]
+impl Scope {}
 
 /// Set one param of `ctx`, or unset it with `None`.
 fn set(ctx: &mut AllowitContext, key: &str, value: Option<AllowitValue>) {
     let key = Symbol::new(&ctx.env, key);
+    let mut map = ctx.params.map().clone();
     match value {
-        Some(value) => ctx.params.0.set(key, value),
+        Some(value) => map.set(key, value),
         None => {
-            ctx.params.0.remove(key);
+            map.remove(key);
         }
     }
+    ctx.params = AllowitParams::new(&ctx.env, map).unwrap();
 }
 
 #[test]
@@ -34,7 +44,7 @@ fn custom_runner_maps_the_policy_result() {
     current.write(&mut state).unwrap();
     let mut ctx = AllowitContext {
         env: env.clone(),
-        params: AllowitParams(Map::new(&env)),
+        params: AllowitParams::new(&env, Map::new(&env)).unwrap(),
         state,
         request: AllowitRequest {
             operation: AllowitOperation::transfer,
@@ -50,7 +60,7 @@ fn custom_runner_maps_the_policy_result() {
             spent_units: 10,
             gas_units: 0,
             unpriced: false,
-            args: AllowitParams(Map::new(&env)),
+            args: AllowitArgs(Map::new(&env)),
         },
     };
     let int = |n: i128| Some(AllowitValue::Int(n));
@@ -65,14 +75,14 @@ fn custom_runner_maps_the_policy_result() {
         Some(AllowitValue::List(vec![&env, name]))
     };
     for (key, value) in [
-        (TRANSACTION_CAP, int(10)),
-        (SPENT_CAP, int(15)),
-        (DAY_SPENT_CAP, int(10)),
-        (DAY_TOTAL_CAP, int(10)),
-        (CALL_CAP, int(1)),
-        (RECIPIENTS, list(&recipient)),
+        (PAYMENT_LIMIT, int(10)),
+        (LIFETIME_SPENDING_LIMIT, int(15)),
+        (DAILY_SPENDING_LIMIT, int(10)),
+        (DAILY_VOLUME_LIMIT, int(10)),
+        (CALL_LIMIT, int(1)),
+        (DESTINATIONS, list(&recipient)),
         (TOKENS, list(&asset)),
-        (EXPIRY, int(100)),
+        (EXPIRES_AT, int(100)),
         (OPERATIONS, ops("transfer")),
     ] {
         set(&mut ctx, key, value);
@@ -80,17 +90,19 @@ fn custom_runner_maps_the_policy_result() {
     let rules = Vec::new(&env);
     assert_eq!(AllowitCustom::check(&ctx, &rules), Ok(()));
     let mut denied = ctx.clone();
-    set(&mut denied, SPENT_CAP, int(14));
+    set(&mut denied, LIFETIME_SPENDING_LIMIT, int(14));
     assert_eq!(
         AllowitCustom::check(&denied, &rules),
         Err(AllowitWalletError::PolicyDenied)
     );
+    // An unset param that the policy indexes aborts the whole contract call with `MissingParam`.
     let mut unset = ctx.clone();
-    set(&mut unset, EXPIRY, None);
-    assert_eq!(
-        AllowitCustom::check(&unset, &rules),
-        Err(AllowitWalletError::InvalidParam)
-    );
+    set(&mut unset, EXPIRES_AT, None);
+    let scope = env.register(Scope, ());
+    let run = env.try_as_contract::<_, allowit::AllowitError>(&scope, || {
+        AllowitCustom::check(&unset, &rules)
+    });
+    assert_eq!(run, Err(Ok(allowit::AllowitError::MissingParam)));
     // Only payments: a policy that allows only deposits denies this transfer.
     let mut deposits = ctx.clone();
     set(&mut deposits, OPERATIONS, ops("deposit"));

@@ -1,8 +1,8 @@
 extern crate std;
 use super::*;
 use allowit::{
-    AllowitError, AllowitStandardState, CALL_CAP, DAY_SPENT_CAP, DAY_TOTAL_CAP, EXPIRY, OPERATIONS,
-    RECIPIENTS, SPENT_CAP, TOKENS, TRANSACTION_CAP,
+    AllowitError, AllowitStandardState, CALL_LIMIT, DAILY_SPENDING_LIMIT, DAILY_VOLUME_LIMIT,
+    DESTINATIONS, EXPIRES_AT, LIFETIME_SPENDING_LIMIT, OPERATIONS, PAYMENT_LIMIT, TOKENS,
 };
 use allowit_wallet_protocol::{AllowitExpense, AllowitTransferArgs};
 use ed25519_dalek::{Signer, SigningKey};
@@ -164,14 +164,14 @@ impl Fixture {
         };
         let mut params = Map::new(&env);
         for (key, value) in [
-            (TRANSACTION_CAP, AllowitValue::Int(100)),
-            (SPENT_CAP, AllowitValue::Int(250)),
-            (DAY_SPENT_CAP, AllowitValue::Int(150)),
-            (DAY_TOTAL_CAP, AllowitValue::Int(150)),
-            (CALL_CAP, AllowitValue::Int(3)),
-            (RECIPIENTS, addresses(&env, &[&recipient])),
+            (PAYMENT_LIMIT, AllowitValue::Int(100)),
+            (LIFETIME_SPENDING_LIMIT, AllowitValue::Int(250)),
+            (DAILY_SPENDING_LIMIT, AllowitValue::Int(150)),
+            (DAILY_VOLUME_LIMIT, AllowitValue::Int(150)),
+            (CALL_LIMIT, AllowitValue::Int(3)),
+            (DESTINATIONS, addresses(&env, &[&recipient])),
             (TOKENS, addresses(&env, &[&asset])),
-            (EXPIRY, AllowitValue::Int(1_000_000)),
+            (EXPIRES_AT, AllowitValue::Int(1_000_000)),
             (OPERATIONS, op_names(&env, &["transfer", "deposit"])),
         ] {
             params.set(Symbol::new(&env, key), value);
@@ -179,14 +179,14 @@ impl Fixture {
         let mut rules = Vec::new(&env);
         if wasm == COMMON {
             for rule in [
-                AllowitRule::recipients,
+                AllowitRule::destinations,
                 AllowitRule::tokens,
-                AllowitRule::transaction_cap,
-                AllowitRule::day_spent_cap,
-                AllowitRule::day_total_cap,
-                AllowitRule::spent_cap,
-                AllowitRule::call_cap,
-                AllowitRule::expiry,
+                AllowitRule::payment_limit,
+                AllowitRule::daily_spending_limit,
+                AllowitRule::daily_volume_limit,
+                AllowitRule::lifetime_spending_limit,
+                AllowitRule::call_limit,
+                AllowitRule::expires_at,
             ] {
                 rules.push_back(rule);
             }
@@ -531,13 +531,13 @@ fn common_skips_absent_params_and_rejects_unknown_names_keys_and_values() {
     };
     // A malformed rule element, param value or list item is InvalidParam.
     let junk: Val = 5u32.into_val(&f.env);
-    let recipient: Val = vec![&f.env, Symbol::new(&f.env, "recipients")].into_val(&f.env);
+    let recipient: Val = vec![&f.env, Symbol::new(&f.env, "destinations")].into_val(&f.env);
     let list: Val = Symbol::new(&f.env, "List").into_val(&f.env);
     let junk_list: Val = vec![&f.env, list, vec![&f.env, junk].into_val(&f.env)].into_val(&f.env);
     for raw in [
         packet(junk, None),
-        packet(recipient, Some(("recipients", junk))),
-        packet(recipient, Some(("recipients", junk_list))),
+        packet(recipient, Some(("destinations", junk))),
+        packet(recipient, Some(("destinations", junk_list))),
         packet(recipient, Some(("tokens", junk_list))),
     ] {
         assert_eq!(deploy(raw), Err(Ok(AllowitWalletError::InvalidParam)));
@@ -563,13 +563,13 @@ fn common_skips_absent_params_and_rejects_unknown_names_keys_and_values() {
     // The standard contract admits only the canonical keys, each with its rule's type.
     let text = AllowitValue::Str(String::from_str(&f.env, "100"));
     let invalid = [
-        (TRANSACTION_CAP, AllowitValue::Int(-1)),
-        (SPENT_CAP, AllowitValue::Int(-1)),
-        (DAY_SPENT_CAP, AllowitValue::Int(-1)),
-        (DAY_TOTAL_CAP, text.clone()),
-        (CALL_CAP, AllowitValue::Int(-1)),
-        (EXPIRY, AllowitValue::Bool(true)),
-        (RECIPIENTS, AllowitValue::Addr(f.recipient.clone())),
+        (PAYMENT_LIMIT, AllowitValue::Int(-1)),
+        (LIFETIME_SPENDING_LIMIT, AllowitValue::Int(-1)),
+        (DAILY_SPENDING_LIMIT, AllowitValue::Int(-1)),
+        (DAILY_VOLUME_LIMIT, text.clone()),
+        (CALL_LIMIT, AllowitValue::Int(-1)),
+        (EXPIRES_AT, AllowitValue::Bool(true)),
+        (DESTINATIONS, AllowitValue::Addr(f.recipient.clone())),
         (TOKENS, AllowitValue::List(vec![&f.env, text])),
         ("vendor_cap", AllowitValue::Int(5)),
         ("per_transfer", AllowitValue::Int(5)),
@@ -595,7 +595,7 @@ fn common_skips_absent_params_and_rejects_unknown_names_keys_and_values() {
     assert!(f.deploy_raw(packet(recipient, None)));
     assert_eq!(
         f.client().state().rules,
-        vec![&f.env, AllowitRule::recipients]
+        vec![&f.env, AllowitRule::destinations]
     );
 }
 #[test]
@@ -604,7 +604,7 @@ fn standard_tiers_reject_a_custom_key_beside_few_canonical_keys() {
         let f = Fixture::new(wasm, false);
         let mut p = f.deployment();
         p.params = Map::new(&f.env);
-        set_param(&mut p.params, TRANSACTION_CAP, Some(AllowitValue::Int(1)));
+        set_param(&mut p.params, PAYMENT_LIMIT, Some(AllowitValue::Int(1)));
         set_param(&mut p.params, "vendor_cap", Some(AllowitValue::Int(5)));
         f.auth(&[&f.owner], "deploy_policy", (p.clone(),).into_val(&f.env));
         let result = f.client().try_deploy_policy(&p);
@@ -675,7 +675,7 @@ fn custom_policy_denies_an_absent_param_that_common_preflight_skips() {
     for wasm in [COMMON, CUSTOM] {
         let f = Fixture::new(wasm, false);
         let mut p = f.deployment();
-        set_param(&mut p.params, EXPIRY, None);
+        set_param(&mut p.params, EXPIRES_AT, None);
         f.auth(&[&f.owner], "deploy_policy", (p.clone(),).into_val(&f.env));
         f.client().deploy_policy(&p);
         let e = f.execution(10);
@@ -685,9 +685,11 @@ fn custom_policy_denies_an_absent_param_that_common_preflight_skips() {
             (e.clone(),).into_val(&f.env),
         );
         if wasm == CUSTOM {
+            // Indexing the unset param aborts the call with its `AllowitError` code.
+            let missing = allowit::AllowitError::MissingParam as u32;
             assert_eq!(
                 f.client().try_execute(&e),
-                Err(Ok(AllowitWalletError::InvalidParam))
+                Err(Err(soroban_sdk::InvokeError::Contract(missing)))
             );
             assert_eq!(f.history(), AllowitStandardState::default());
         } else {
@@ -703,11 +705,11 @@ fn params_that_are_not_key_value_maps_do_not_decode() {
     // A text-keyed map and a struct of raw values, the earlier layouts' encodings.
     let mut text_keys = Map::<String, Val>::new(&f.env);
     text_keys.set(
-        String::from_str(&f.env, "transaction_cap"),
+        String::from_str(&f.env, "payment_limit"),
         AllowitValue::Int(10).into_val(&f.env),
     );
     let mut raw_values = Map::<Symbol, Val>::new(&f.env);
-    raw_values.set(Symbol::new(&f.env, "call_cap"), 3u64.into_val(&f.env));
+    raw_values.set(Symbol::new(&f.env, "call_limit"), 3u64.into_val(&f.env));
     let packet: Val = p.clone().into_val(&f.env);
     for params in [text_keys.into_val(&f.env), raw_values.into_val(&f.env)] {
         let mut raw = Map::<Symbol, Val>::try_from_val(&f.env, &packet).unwrap();
@@ -737,7 +739,7 @@ fn owner_signs_the_canonical_packet_so_absent_or_extra_keys_reject() {
     }
     // The canonical raw packet passes through the same path; an absent key is unset.
     let mut unset = p.clone();
-    set_param(&mut unset.params, EXPIRY, None);
+    set_param(&mut unset.params, EXPIRES_AT, None);
     assert!(f.deploy_raw(f.packet(&unset)));
     assert_eq!(f.client().state().deployment_version, 1);
     assert_eq!(f.client().state().params, unset.params);
@@ -1121,7 +1123,7 @@ fn earlier_layouts_keep_owner_recovery_and_do_not_migrate_implicitly() {
     let current = f.client().state();
     let mut params = Map::<String, Val>::new(&f.env);
     params.set(
-        String::from_str(&f.env, "transaction_cap"),
+        String::from_str(&f.env, "payment_limit"),
         5i128.into_val(&f.env),
     );
     let mut legacy = LegacyState {
@@ -1141,7 +1143,7 @@ fn earlier_layouts_keep_owner_recovery_and_do_not_migrate_implicitly() {
         asset: current.asset.clone(),
         policy_instance: current.policy_instance.clone(),
         source_digest: current.source_digest.clone(),
-        rules: vec![&f.env, Symbol::new(&f.env, "transaction_cap")],
+        rules: vec![&f.env, Symbol::new(&f.env, "payment_limit")],
         grant: params,
         x402_enabled: false,
         token: current.token.clone(),
@@ -1523,23 +1525,22 @@ fn x402_enforces_compiled_business_rules_without_committing() {
     for wasm in [COMMON, CUSTOM] {
         for case in 0..3 {
             let f = Fixture::new(wasm, true);
+            let denied = Ok(AllowitWalletError::PolicyDenied);
             let (to, amount, expected) = match case {
-                0 => (f.recipient.clone(), 101, AllowitWalletError::PolicyDenied),
-                1 => (
-                    Address::generate(&f.env),
-                    10,
-                    AllowitWalletError::PolicyDenied,
-                ),
+                0 => (f.recipient.clone(), 101, denied),
+                1 => (Address::generate(&f.env), 10, denied),
                 _ => {
                     let mut p = f.deployment();
-                    set_param(&mut p.params, EXPIRY, None);
+                    set_param(&mut p.params, EXPIRES_AT, None);
                     f.auth(&[&f.owner], "deploy_policy", (p.clone(),).into_val(&f.env));
                     f.client().deploy_policy(&p);
-                    // Common preflight skips the unset field; Custom denies it.
+                    // Common preflight skips the unset field; Custom indexes it and aborts with
+                    // `MissingParam`.
+                    let missing = allowit::AllowitError::MissingParam as u32;
                     let expected = if wasm == CUSTOM {
-                        AllowitWalletError::InvalidParam
+                        Err(soroban_sdk::InvokeError::Contract(missing))
                     } else {
-                        AllowitWalletError::PolicyDenied
+                        denied
                     };
                     (
                         f.recipient.clone(),
@@ -1558,7 +1559,7 @@ fn x402_enforces_compiled_business_rules_without_committing() {
                     f.authorization(e, &payload).into_val(&f.env),
                     &vec![&f.env, context],
                 ),
-                Err(Ok(expected))
+                Err(expected)
             );
             assert_eq!(f.client().state(), before);
             assert_eq!(f.balance(), 1_000);
@@ -1793,7 +1794,11 @@ fn upgraded_tiers_validate_retained_rules_and_owner_can_correct_configuration() 
                 .to_bytes();
         }
         if target == COMMON {
-            set_param(&mut p.params, DAY_SPENT_CAP, Some(AllowitValue::Int(-1)));
+            set_param(
+                &mut p.params,
+                DAILY_SPENDING_LIMIT,
+                Some(AllowitValue::Int(-1)),
+            );
         }
         if target == SIMPLE {
             p.source_digest = standard_prefix_digest(
@@ -1828,7 +1833,7 @@ fn upgraded_tiers_validate_retained_rules_and_owner_can_correct_configuration() 
         if target == COMMON {
             set_param(
                 &mut fixed.params,
-                DAY_SPENT_CAP,
+                DAILY_SPENDING_LIMIT,
                 Some(AllowitValue::Int(150)),
             );
         } else {
@@ -2140,11 +2145,11 @@ fn repeated_prefix_rules_read_one_current_state_and_charge_once() {
     let mut p = f.deployment();
     p.rules = Vec::new(&f.env);
     for rule in [
-        AllowitRule::spent_cap,
-        AllowitRule::spent_cap,
-        AllowitRule::day_total_cap,
-        AllowitRule::call_cap,
-        AllowitRule::call_cap,
+        AllowitRule::lifetime_spending_limit,
+        AllowitRule::lifetime_spending_limit,
+        AllowitRule::daily_volume_limit,
+        AllowitRule::call_limit,
+        AllowitRule::call_limit,
     ] {
         p.rules.push_back(rule);
     }
@@ -2158,11 +2163,15 @@ fn repeated_prefix_rules_read_one_current_state_and_charge_once() {
         &f.asset,
         &p.rules,
     );
-    set_param(&mut p.params, SPENT_CAP, Some(AllowitValue::Int(30)));
+    set_param(
+        &mut p.params,
+        LIFETIME_SPENDING_LIMIT,
+        Some(AllowitValue::Int(30)),
+    );
     f.auth(&[&f.owner], "deploy_policy", (p.clone(),).into_val(&f.env));
     f.client().deploy_policy(&p);
     f.transfer(20);
-    // The boundary passes although spent_cap runs twice.
+    // The boundary passes although lifetime_spending_limit runs twice.
     f.transfer(10);
     assert_eq!(f.history().spent, 30);
     assert_eq!(f.history().day_total, 30);

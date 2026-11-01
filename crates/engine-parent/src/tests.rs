@@ -1,5 +1,7 @@
 use super::*;
-use allowit::{AllowitContext, AllowitOperation, AllowitParams, AllowitRequest, AllowitValue};
+use allowit::{
+    AllowitArgs, AllowitContext, AllowitOperation, AllowitParams, AllowitRequest, AllowitValue,
+};
 use allowit_wallet_engine::AllowitEngineClient;
 use soroban_sdk::{
     Bytes, IntoVal, Val, Vec,
@@ -58,13 +60,17 @@ fn context(env: &Env) -> AllowitContext {
     let asset = Address::generate(env);
     AllowitContext {
         env: env.clone(),
-        params: AllowitParams(soroban_sdk::Map::from_array(
+        params: AllowitParams::new(
             env,
-            [(
-                soroban_sdk::Symbol::new(env, allowit::TRANSACTION_CAP),
-                AllowitValue::Int(10),
-            )],
-        )),
+            soroban_sdk::Map::from_array(
+                env,
+                [(
+                    soroban_sdk::Symbol::new(env, allowit::PAYMENT_LIMIT),
+                    AllowitValue::Int(10),
+                )],
+            ),
+        )
+        .unwrap(),
         state: soroban_sdk::Map::new(env),
         request: AllowitRequest {
             operation: AllowitOperation::transfer,
@@ -80,25 +86,25 @@ fn context(env: &Env) -> AllowitContext {
             spent_units: 1,
             gas_units: 0,
             unpriced: false,
-            args: AllowitParams(soroban_sdk::Map::new(env)),
+            args: AllowitArgs(soroban_sdk::Map::new(env)),
         },
     }
 }
-/// Call the engine's `transaction_cap` with the fixture context.
-fn transaction_cap(
+/// Call the engine's `payment_limit` with the fixture context.
+fn payment_limit(
     env: &Env,
     engine: &Address,
 ) -> Result<Result<i128, soroban_sdk::Error>, Result<allowit::AllowitError, soroban_sdk::InvokeError>>
 {
     let ctx = context(env);
-    AllowitEngineClient::new(env, engine).try_transaction_cap(
-        &ctx.params.0,
+    AllowitEngineClient::new(env, engine).try_payment_limit(
+        ctx.params.map(),
         &ctx.state,
         &ctx.request,
     )
 }
 fn approved(env: &Env, engine: &Address) -> bool {
-    transaction_cap(env, engine).is_ok_and(|left| left == Ok(9))
+    payment_limit(env, engine).is_ok_and(|left| left == Ok(9))
 }
 
 #[test]
@@ -229,7 +235,7 @@ fn compiled_engine_reference_upgrade_changes_veto_without_changing_address() {
     f.client().upgrade_engine(&deny, &0);
     assert_eq!(f.client().engine(), engine);
     assert_eq!(
-        transaction_cap(&f.env, &engine),
+        payment_limit(&f.env, &engine),
         Err(Err(soroban_sdk::InvokeError::Contract(
             allowit_wallet_engine::TEST_DENY
         )))

@@ -17,12 +17,12 @@ ROOT = Path(__file__).resolve().parents[1]
 ALLOWIT = ROOT / "crates/allowit/src"
 
 # Canonical param keys, which are also the canonical rule names. `allowit::<KEY>` names each key.
-PARAM_KEYS = ("transaction_cap", "spent_cap", "day_spent_cap", "day_total_cap", "call_cap", "recipients", "tokens", "expiry",
-              "operations")
+PARAM_KEYS = ("payment_limit", "lifetime_spending_limit", "daily_spending_limit", "daily_volume_limit", "call_limit",
+              "destinations", "tokens", "expires_at", "operations")
 
-# One prefix statement after whitespace removal: `allowit::<rule>(ctx,ctx.params.get(allowit::<RULE>))?`.
-# rustfmt may add commas.
-PREFIX_CALL = re.compile(r"allowit::([a-z_]+)\(ctx,ctx\.params\.get\(allowit::([A-Z_]+),?\),?\)\?")
+# One prefix statement after whitespace removal: `allowit::<rule>(ctx,&ctx.params[allowit::<RULE>])?`.
+# rustfmt may add a comma.
+PREFIX_CALL = re.compile(r"allowit::([a-z_]+)\(ctx,&ctx\.params\[allowit::([A-Z_]+)\],?\)\?")
 EXECUTE = re.compile(r"\bpub\s+fn\s+execute\s*\(\s*ctx\s*:\s*&\s*AllowitContext\s*\)\s*->\s*allowit\s*::\s*Result(?:\s*<\s*\(\s*\)\s*>)?\s*\{")
 
 # Rust literals that can hide code from a plain scan: raw, byte, C and plain strings, then char
@@ -84,9 +84,9 @@ INTEGERS = tuple(sign + str(bits) for sign in "iu" for bits in (8, 16, 32, 64, 1
 # Primitive types whose width or representation differs between the backends.
 NOT_PORTABLE = frozenset(("usize", "isize", "f16", "f32", "f64", "f128"))
 # `AllowitError` variants in code order; their contract error codes are 101 onward.
-ERRORS = ("MissingParam", "TransactionCapExceeded", "SpentCapExceeded", "DaySpentCapExceeded", "DayTotalCapExceeded",
-          "CallCapExceeded", "RecipientNotAllowed", "TokenNotAllowed", "Expired", "Unpriced", "InvalidParam",
-          "InvalidState", "Overflow", "Unsupported", "OperationNotAllowed", "Panicked")
+ERRORS = ("MissingParam", "PaymentLimitExceeded", "LifetimeSpendingLimitExceeded", "DailySpendingLimitExceeded",
+          "DailyVolumeLimitExceeded", "CallLimitExceeded", "DestinationNotAllowed", "TokenNotAllowed", "Expired", "Unpriced",
+          "InvalidParam", "InvalidState", "Overflow", "Unsupported", "OperationNotAllowed", "Panicked")
 VALUES = ("Int", "Bool", "Str", "Addr", "List")
 ENUMS = {"AllowitOperation": ("transfer", "swap", "deposit", "redeem", "custom"), "AllowitError": ERRORS, "AllowitRule": PARAM_KEYS,
          "AllowitValue": VALUES}
@@ -99,9 +99,10 @@ SERVER_TYPES = ("AllowitPrice", "AllowitFetch", "AllowitInternetSearch", "Allowi
 STRUCT_FIELDS = frozenset(("from", "to", "amount", "price", "slip", "method", "url", "data", "pubkey", "query", "id",
                            "deny_below", "allow_above"))
 ALLOWIT_FUNCTIONS = PARAM_KEYS + ("param", "arg", "get_state", "set_state") + SERVER_FUNCTIONS
-# `AllowitParams` is absent on purpose: naming it would reach the backend map, whose keys and
-# methods differ. Params and args are read only with `.get(key)`; the host backend also keeps that
-# map private, so the std-only compile rejects `.0` on any params or args value.
+# `AllowitParams` and `AllowitArgs` are absent on purpose: naming them would reach the backend map,
+# whose keys and methods differ. Params are read only by key, `ctx.params[key]`, and args only with
+# `allowit::arg`; both admit `.contains(key)`. The host backend also keeps both maps private, so the
+# std-only compile rejects `.0` on any params or args value.
 # `String` and `Vec` are the backend text and list types that `param` and `arg` read; like a list from
 # `AllowitValue::List`, they admit only comparison, `clone`, matching and `for`.
 ALLOWIT_TYPES = ("AllowitContext", "AllowitError", "AllowitOperation", "AllowitRequest", "AllowitRule", "AllowitValue",
@@ -128,11 +129,14 @@ PATHS = FUNCTION_PATHS | frozenset(
 # Context and request fields. `ctx.state` is read only through `allowit::get_state`.
 FIELDS = frozenset(("env", "params", "request", "operation", "asset", "recipient", "amount", "token_in", "amount_in",
                     "token_out", "min_out", "now", "expires_at", "spent_units", "gas_units", "unpriced", "args"))
-# Methods allowed only on one receiver field: `get` reads params and args by key, as in
-# `ctx.params.get` or `ctx.request.args.get`. The receiver must be that field access, and the file
-# must not declare these names: on a list or a string bound to `params` or `args`, `get` would take
-# a pointer-width index on the host.
-FIELD_METHODS = {"get": ("params", "args")}
+# Methods allowed only on one receiver field: `contains` tells whether params or args set a key, as
+# in `ctx.params.contains` or `ctx.request.args.contains`. The receiver must be that field access,
+# and the file must not declare these names: on a list bound to `params` or `args`, `contains` would
+# be a Soroban list method that the host list lacks.
+FIELD_METHODS = {"contains": ("params", "args")}
+# The only indexed receiver: `ctx.params[key]`. `AllowitParams` indexes only by key text, so the
+# std-only compile rejects any other index; every other indexing takes a pointer-width `usize`.
+INDEXED_FIELD = "params"
 FIELD_NAMES = frozenset(name for fields in FIELD_METHODS.values() for name in fields)
 # Methods of `Option`, `Result`, fixed-width integers, `bool` and `Ordering` that take and return
 # no pointer-width value and no backend list.
@@ -405,7 +409,7 @@ def portable(code, strings):
         if not before.endswith("->"):
             reject("a struct expression or pattern of `AllowitContext`")
     if MAP_FIELD.search(code):
-        reject("the map inside params or args; read them with `.get(key)`")
+        reject("the map inside params or args; read params as `ctx.params[key]` and args with `allowit::arg`")
     spans = list(TOKEN.finditer(code))
     tokens = [span[0] for span in spans]
     # Literals are `0` here: a present message must be exactly one of them.
@@ -419,10 +423,12 @@ def portable(code, strings):
             if message:
                 # The message token follows the earlier argument groups and their commas.
                 plain_braces(strings.get(spans[k + 3 + sum(len(group) + 1 for group in args[:index])].start(), ""))
-    for before, token in zip(tokens, tokens[1:]):
+    for k in range(1, len(tokens)):
+        before, token = tokens[k - 1], tokens[k]
         if token == "[" and (before in (")", "]", "?") or before[:1].isdigit()
-                             or IDENT.fullmatch(before) and before not in RUST_KEYWORDS):
-            reject("indexing, whose index is a pointer-width `usize`")
+                             or IDENT.fullmatch(before) and before not in RUST_KEYWORDS) \
+                and not (before == INDEXED_FIELD and k > 1 and tokens[k - 2] == "."):
+            reject("indexing other than `ctx.params[key]`, whose index is a pointer-width `usize`")
     allowlisted(code)
 
 
@@ -494,7 +500,7 @@ def checked_code(source):
 
 def standard_prefix(source):
     """Return the standard prefix of authored policy source: the consecutive leading statements of
-    `execute` of the exact form `allowit::<rule>(ctx, ctx.params.get(allowit::<RULE>))?;`, each rule
+    `execute` of the exact form `allowit::<rule>(ctx, &ctx.params[allowit::<RULE>])?;`, each rule
     with its own canonical key. Any other statement ends it; a rule may still read any key there."""
     text = checked_code(source)
     found = list(EXECUTE.finditer(text))

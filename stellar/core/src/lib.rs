@@ -1369,7 +1369,7 @@ enum PacketBounds {
 /// Time bounds of a packet. A new packet has no lower bound, so a transaction that is signed
 /// before the next ledger closes is never `txTOO_EARLY`. Its upper bound excludes the expiry
 /// second, because Stellar's `maxTime` is inclusive while the request expiry, the policy
-/// wallet's `expires_at <= now` check and the portable `expiry` rule are exclusive: a
+/// wallet's `expires_at <= now` check and the portable `expires_at` rule are exclusive: a
 /// transaction that the network includes is never past its expiry. Retained packets keep their
 /// original bounds.
 fn transaction_bounds(

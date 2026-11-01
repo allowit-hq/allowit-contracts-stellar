@@ -3,7 +3,8 @@ extern crate std;
 use super::tests::*;
 use super::*;
 use allowit::{
-    AllowitStandardState, CALL_CAP, DAY_SPENT_CAP, DAY_TOTAL_CAP, RECIPIENTS, SPENT_CAP,
+    AllowitStandardState, CALL_LIMIT, DAILY_SPENDING_LIMIT, DAILY_VOLUME_LIMIT, DESTINATIONS,
+    LIFETIME_SPENDING_LIMIT,
 };
 use allowit_wallet_protocol::AllowitExpense;
 use soroban_sdk::{IntoVal, testutils::Address as _, vec};
@@ -24,8 +25,8 @@ fn allow_recipient(f: &Fixture, vault: &Address) {
     }
     let mut d = f.deployment();
     // Common's explicitly selected recipient rule must also allow the deposit target.
-    let recipients = addresses(&f.env, &[vault, &f.recipient]);
-    set_param(&mut d.params, RECIPIENTS, Some(recipients));
+    let destinations = addresses(&f.env, &[vault, &f.recipient]);
+    set_param(&mut d.params, DESTINATIONS, Some(destinations));
     f.auth(&[&f.owner], "deploy_policy", (d.clone(),).into_val(&f.env));
     f.client().deploy_policy(&d);
 }
@@ -250,7 +251,7 @@ fn no_operation_leaves_the_wallet_a_token_allowance() {
         assert_no_allowance(&f, &vaults, "transfer");
         // Custom admits no deposit.
         if wasm != CUSTOM {
-            allow_recipients(&f, &[&honest, &approving, &f.recipient]);
+            allow_destinations(&f, &[&honest, &approving, &f.recipient]);
             assert!(execute(&f, &request(&f, &honest, 50, 50)).is_ok());
             assert_no_allowance(&f, &vaults, "deposit");
             assert!(execute(&f, &request(&f, &approving, 50, 50)).is_err());
@@ -323,7 +324,7 @@ fn rule_input_carries_typed_operations_and_the_vault_as_recipient() {
     e.operation = deposit;
     e.expense = AllowitExpense::Priced(expense);
     set_param(&mut e.args, "invoice", Some(AllowitValue::Int(7)));
-    let ctx = rule_input(&f.env, &state, &e);
+    let ctx = rule_input(&f.env, &state, &e).unwrap();
     assert_eq!((ctx.request.now, ctx.request.expires_at), (86_410, 86_500));
     assert_eq!(ctx.request.operation, AllowitOperation::deposit);
     assert_eq!(ctx.request.recipient, vault);
@@ -332,10 +333,10 @@ fn rule_input_carries_typed_operations_and_the_vault_as_recipient() {
     assert_eq!((ctx.request.spent_units, ctx.request.gas_units), (3, 2));
     assert!(!ctx.request.unpriced);
     assert_eq!(ctx.state, state.policy_state);
-    assert_eq!(ctx.params.0, state.params);
+    assert_eq!(ctx.params.map(), &state.params);
     assert_eq!(ctx.request.args.0, e.args);
     e.expense = AllowitExpense::Unpriced;
-    let unpriced = rule_input(&f.env, &state, &e);
+    let unpriced = rule_input(&f.env, &state, &e).unwrap();
     assert!(unpriced.request.unpriced);
     assert_eq!(
         (unpriced.request.spent_units, unpriced.request.gas_units),
@@ -356,7 +357,7 @@ fn ordinary_recipient_allowlist_admits_multiple_vaults_and_denies_other_targets(
     let mut d = f.deployment();
     set_param(
         &mut d.params,
-        RECIPIENTS,
+        DESTINATIONS,
         Some(addresses(&f.env, &[&a, &b])),
     );
     f.auth(&[&f.owner], "deploy_policy", (d.clone(),).into_val(&f.env));
@@ -417,7 +418,11 @@ fn expense_and_gross_cap_denials_and_valuation_bound_roll_back_atomic_effects() 
         let v = vault(&f, 11, None);
         allow_recipient(&f, &v);
         let mut d = f.deployment();
-        let key = [SPENT_CAP, DAY_SPENT_CAP, DAY_TOTAL_CAP][field];
+        let key = [
+            LIFETIME_SPENDING_LIMIT,
+            DAILY_SPENDING_LIMIT,
+            DAILY_VOLUME_LIMIT,
+        ][field];
         set_param(&mut d.params, key, Some(AllowitValue::Int(limit)));
         f.auth(&[&f.owner], "deploy_policy", (d.clone(),).into_val(&f.env));
         f.client().deploy_policy(&d);
@@ -477,7 +482,11 @@ fn standard_prefix_digest_hashes_its_documented_tuple_and_binds_context() {
         &env,
         "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ",
     );
-    let rules = vec![&env, AllowitRule::spent_cap, AllowitRule::recipients];
+    let rules = vec![
+        &env,
+        AllowitRule::lifetime_spending_limit,
+        AllowitRule::destinations,
+    ];
     // The documented definition, built from raw XDR values: SHA-256 of the vector (domain, kind,
     // module, asset, rules), where each rule is a one-symbol vector of its name.
     let symbol = |name: &str| ScVal::Symbol(name.try_into().unwrap());
@@ -488,8 +497,8 @@ fn standard_prefix_digest_hashes_its_documented_tuple_and_binds_context() {
         ScVal::Bytes([1u8; 32].to_vec().try_into().unwrap()),
         ScVal::Address(ScAddress::from(&asset)),
         list(std::vec![
-            list(std::vec![symbol("spent_cap")]),
-            list(std::vec![symbol("recipients")]),
+            list(std::vec![symbol("lifetime_spending_limit")]),
+            list(std::vec![symbol("destinations")]),
         ]),
     ]);
     let encoded = WriteXdr::to_xdr(&tuple, Limits::none()).unwrap();
@@ -501,7 +510,11 @@ fn standard_prefix_digest_hashes_its_documented_tuple_and_binds_context() {
         standard_prefix_digest(&env, &kind, &module, &asset, &rules),
         expected
     );
-    let reversed = vec![&env, AllowitRule::recipients, AllowitRule::spent_cap];
+    let reversed = vec![
+        &env,
+        AllowitRule::destinations,
+        AllowitRule::lifetime_spending_limit,
+    ];
     assert_ne!(
         standard_prefix_digest(&env, &kind, &module, &asset, &reversed),
         expected
@@ -529,8 +542,8 @@ fn owner_params_update_preserves_prefix_code_usage_and_revokes_old_revision() {
     let code = f.wallet.executable();
     let inflight = f.execution(1);
     let mut d = f.deployment();
-    set_param(&mut d.params, SPENT_CAP, None);
-    set_param(&mut d.params, DAY_SPENT_CAP, None);
+    set_param(&mut d.params, LIFETIME_SPENDING_LIMIT, None);
+    set_param(&mut d.params, DAILY_SPENDING_LIMIT, None);
     f.auth(&[&f.owner], "deploy_policy", (d.clone(),).into_val(&f.env));
     f.client().deploy_policy(&d);
     assert_eq!(f.wallet.executable(), code);
@@ -547,8 +560,16 @@ fn owner_params_update_preserves_prefix_code_usage_and_revokes_old_revision() {
     assert_eq!(f.history().day_total, 70);
     assert_eq!(f.history().calls, 2);
     let mut d = f.deployment();
-    set_param(&mut d.params, SPENT_CAP, Some(AllowitValue::Int(75)));
-    set_param(&mut d.params, DAY_SPENT_CAP, Some(AllowitValue::Int(75)));
+    set_param(
+        &mut d.params,
+        LIFETIME_SPENDING_LIMIT,
+        Some(AllowitValue::Int(75)),
+    );
+    set_param(
+        &mut d.params,
+        DAILY_SPENDING_LIMIT,
+        Some(AllowitValue::Int(75)),
+    );
     f.auth(&[&f.owner], "deploy_policy", (d.clone(),).into_val(&f.env));
     f.client().deploy_policy(&d);
     let next = f.execution(6);
@@ -567,10 +588,10 @@ fn disabled_caps_keep_unpriced_history_and_daily_unknown_expires_only_at_rollove
     use soroban_sdk::testutils::Ledger;
     let f = Fixture::new(COMMON, false);
     let mut d = f.deployment();
-    set_param(&mut d.params, SPENT_CAP, None);
-    set_param(&mut d.params, DAY_SPENT_CAP, None);
-    set_param(&mut d.params, DAY_TOTAL_CAP, None);
-    set_param(&mut d.params, CALL_CAP, None);
+    set_param(&mut d.params, LIFETIME_SPENDING_LIMIT, None);
+    set_param(&mut d.params, DAILY_SPENDING_LIMIT, None);
+    set_param(&mut d.params, DAILY_VOLUME_LIMIT, None);
+    set_param(&mut d.params, CALL_LIMIT, None);
     f.auth(&[&f.owner], "deploy_policy", (d.clone(),).into_val(&f.env));
     f.client().deploy_policy(&d);
     let mut e = f.execution(20);
@@ -582,7 +603,11 @@ fn disabled_caps_keep_unpriced_history_and_daily_unknown_expires_only_at_rollove
     assert_eq!(history.spent, 0); // Unpriced is an explicit liability, never a zero-cost assertion.
     assert!(history.unpriced && history.day_unpriced);
     let mut d = f.deployment();
-    set_param(&mut d.params, SPENT_CAP, Some(AllowitValue::Int(1000)));
+    set_param(
+        &mut d.params,
+        LIFETIME_SPENDING_LIMIT,
+        Some(AllowitValue::Int(1000)),
+    );
     f.auth(&[&f.owner], "deploy_policy", (d.clone(),).into_val(&f.env));
     f.client().deploy_policy(&d);
     assert_eq!(
@@ -591,9 +616,17 @@ fn disabled_caps_keep_unpriced_history_and_daily_unknown_expires_only_at_rollove
     );
     assert_eq!(f.history(), history);
     let mut d = f.deployment();
-    set_param(&mut d.params, SPENT_CAP, None);
-    set_param(&mut d.params, DAY_SPENT_CAP, Some(AllowitValue::Int(1000)));
-    set_param(&mut d.params, DAY_TOTAL_CAP, Some(AllowitValue::Int(1000)));
+    set_param(&mut d.params, LIFETIME_SPENDING_LIMIT, None);
+    set_param(
+        &mut d.params,
+        DAILY_SPENDING_LIMIT,
+        Some(AllowitValue::Int(1000)),
+    );
+    set_param(
+        &mut d.params,
+        DAILY_VOLUME_LIMIT,
+        Some(AllowitValue::Int(1000)),
+    );
     f.auth(&[&f.owner], "deploy_policy", (d.clone(),).into_val(&f.env));
     f.client().deploy_policy(&d);
     assert_eq!(
@@ -609,16 +642,16 @@ fn disabled_caps_keep_unpriced_history_and_daily_unknown_expires_only_at_rollove
     assert!(!history.day_unpriced && history.unpriced);
 }
 #[test]
-fn reenabled_call_cap_counts_operations_while_disabled() {
+fn reenabled_call_limit_counts_operations_while_disabled() {
     let f = Fixture::new(COMMON, false);
     let mut d = f.deployment();
-    set_param(&mut d.params, CALL_CAP, None);
+    set_param(&mut d.params, CALL_LIMIT, None);
     f.auth(&[&f.owner], "deploy_policy", (d.clone(),).into_val(&f.env));
     f.client().deploy_policy(&d);
     f.transfer(1);
     f.transfer(1);
     let mut d = f.deployment();
-    set_param(&mut d.params, CALL_CAP, Some(AllowitValue::Int(2)));
+    set_param(&mut d.params, CALL_LIMIT, Some(AllowitValue::Int(2)));
     f.auth(&[&f.owner], "deploy_policy", (d.clone(),).into_val(&f.env));
     f.client().deploy_policy(&d);
     assert_eq!(
@@ -685,13 +718,13 @@ fn reentry_refused(env: &Env) -> bool {
     std::format!("{events:?}").contains("Contract re-entry is not allowed")
 }
 
-/// Install `recipients` as the `recipients` param through an owner packet.
-fn allow_recipients(f: &Fixture, recipients: &[&Address]) {
+/// Install `destinations` as the `destinations` param through an owner packet.
+fn allow_destinations(f: &Fixture, destinations: &[&Address]) {
     let mut d = f.deployment();
     set_param(
         &mut d.params,
-        RECIPIENTS,
-        Some(addresses(&f.env, recipients)),
+        DESTINATIONS,
+        Some(addresses(&f.env, destinations)),
     );
     f.auth(&[&f.owner], "deploy_policy", (d.clone(),).into_val(&f.env));
     f.client().deploy_policy(&d);
@@ -743,7 +776,7 @@ fn reentrant_vault_cannot_use_the_x402_path_during_an_operation() {
     add_account(&f.env, &f.skey);
     let hostile = vault(&f, 13, None);
     let honest = vault(&f, 0, None);
-    allow_recipients(&f, &[&hostile, &honest, &f.recipient]);
+    allow_destinations(&f, &[&hostile, &honest, &f.recipient]);
     // The hostile vault pulls one more unit from the wallet through the token, which asks the
     // wallet's x402 `__check_auth` for an agent and server approval.
     let pull_args: Vec<Val> = (f.wallet.clone(), hostile.clone(), 1i128).into_val(&f.env);
@@ -852,7 +885,7 @@ fn admit_stores_before_effects<P: AllowitPolicy>(wasm: &[u8]) {
         f.env.as_contract(&f.wallet, || {
             let state = state(&f.env).unwrap();
             validate_operation(&f.env, &e, &state).unwrap();
-            let ctx = rule_input(&f.env, &state, &e);
+            let ctx = rule_input(&f.env, &state, &e).unwrap();
             let want = allowit::post_flight(&ctx, AllowitTier::Standard).unwrap();
             admit::<P>(&f.env, &e, state).unwrap();
             let stored = load(&f.env, None).unwrap();

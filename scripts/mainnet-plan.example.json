@@ -30,14 +30,14 @@
   "forbidden_recipient": "REPLACE_FORBIDDEN_G_ADDRESS",
   "policy_instance": "REPLACE_NONZERO_64_HEX",
   "params": {
-    "recipients": [
+    "destinations": [
       "REPLACE_RECIPIENT_G_ADDRESS"
     ],
-    "transaction_cap": 10000,
-    "day_total_cap": 20020000,
-    "spent_cap": 20020000,
-    "call_cap": 2,
-    "expiry": 0
+    "payment_limit": 10000,
+    "daily_volume_limit": 20020000,
+    "lifetime_spending_limit": 20020000,
+    "call_limit": 2,
+    "expires_at": 0
   },
   "fund_stroops": 20000,
   "payment_stroops": 10000,

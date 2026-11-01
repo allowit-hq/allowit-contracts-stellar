@@ -7,14 +7,16 @@ use allowit::{AllowitContext, AllowitError, AllowitParams, AllowitRequest, Allow
 use soroban_sdk::{Address, Env, Map, String, Symbol, contract, contractimpl, panic_with_error};
 #[contract]
 pub struct AllowitEngine;
-/// Engine executable release, independent of parent administration. Version 4 takes the context
+/// Engine executable release, independent of parent administration. Version 5 takes the context
 /// fields `params` (the owner's key => value params), `state` (the free-form current policy state)
 /// and `request` as separate arguments, because the context carries the contract `Env`; its
 /// `AllowitRequest` names general operations and carries the swap and redeem facts `token_in`,
-/// `amount_in`, `token_out` and `min_out`. Version 3 took the same arguments with a request that
-/// named Stellar operations and lacked those facts. It replaces the
+/// `amount_in`, `token_out` and `min_out`. Its methods carry the canonical rule names, such as
+/// `payment_limit` and `destinations`. Version 4 took the same arguments under the earlier rule
+/// names. Version 3 took the same arguments with a request that named Stellar operations and
+/// lacked those facts. It replaces the
 /// release 1 ABI, `(request: EngineRequest, state: EngineState)`; release 2 was never released.
-const ENGINE_VERSION: u32 = 4;
+const ENGINE_VERSION: u32 = 5;
 /// Contract error code of the test fixture veto. It is outside `allowit::AllowitError`.
 pub const TEST_DENY: u32 = 1000;
 /// Test fixture veto: every rule aborts with `TEST_DENY`. Used only to prove reference upgrades
@@ -24,20 +26,21 @@ fn vetoed(env: &Env) {
         panic_with_error!(env, soroban_sdk::Error::from_contract_error(TEST_DENY));
     }
 }
-/// Rule input with this contract's `Env`, after the test fixture veto.
+/// Rule input with this contract's `Env`, after the test fixture veto. Params that no wallet
+/// stores, such as more than `allowit::MAX_PARAMS` entries, are `InvalidParam`.
 fn context(
     env: Env,
     params: Map<Symbol, AllowitValue>,
     state: Map<Symbol, AllowitValue>,
     request: AllowitRequest,
-) -> AllowitContext {
+) -> Result<AllowitContext, AllowitError> {
     vetoed(&env);
-    AllowitContext {
+    Ok(AllowitContext {
+        params: AllowitParams::new(&env, params)?,
         env,
-        params: AllowitParams(params),
         state,
         request,
-    }
+    })
 }
 #[contractimpl]
 impl AllowitEngine {
@@ -46,95 +49,95 @@ impl AllowitEngine {
         let _ = env;
         ENGINE_VERSION
     }
-    /// Run `allowit::transaction_cap(&ctx, ctx.params.get(allowit::TRANSACTION_CAP))`; returns the headroom left for this operation.
-    pub fn transaction_cap(
+    /// Run `allowit::payment_limit(&ctx, &ctx.params[allowit::PAYMENT_LIMIT])`; returns the headroom left for this operation.
+    pub fn payment_limit(
         env: Env,
         params: Map<Symbol, AllowitValue>,
         state: Map<Symbol, AllowitValue>,
         request: AllowitRequest,
     ) -> Result<i128, AllowitError> {
-        let ctx = context(env, params, state, request);
-        allowit::transaction_cap(&ctx, ctx.params.get(allowit::TRANSACTION_CAP))
+        let ctx = context(env, params, state, request)?;
+        allowit::payment_limit(&ctx, &ctx.params[allowit::PAYMENT_LIMIT])
     }
-    /// Run `allowit::spent_cap(&ctx, ctx.params.get(allowit::SPENT_CAP))`; returns the cumulative expense headroom.
-    pub fn spent_cap(
+    /// Run `allowit::lifetime_spending_limit(&ctx, &ctx.params[allowit::LIFETIME_SPENDING_LIMIT])`; returns the cumulative expense headroom.
+    pub fn lifetime_spending_limit(
         env: Env,
         params: Map<Symbol, AllowitValue>,
         state: Map<Symbol, AllowitValue>,
         request: AllowitRequest,
     ) -> Result<i128, AllowitError> {
-        let ctx = context(env, params, state, request);
-        allowit::spent_cap(&ctx, ctx.params.get(allowit::SPENT_CAP))
+        let ctx = context(env, params, state, request)?;
+        allowit::lifetime_spending_limit(&ctx, &ctx.params[allowit::LIFETIME_SPENDING_LIMIT])
     }
-    /// Run `allowit::day_spent_cap(&ctx, ctx.params.get(allowit::DAY_SPENT_CAP))`; returns the UTC-day expense headroom.
-    pub fn day_spent_cap(
+    /// Run `allowit::daily_spending_limit(&ctx, &ctx.params[allowit::DAILY_SPENDING_LIMIT])`; returns the UTC-day expense headroom.
+    pub fn daily_spending_limit(
         env: Env,
         params: Map<Symbol, AllowitValue>,
         state: Map<Symbol, AllowitValue>,
         request: AllowitRequest,
     ) -> Result<i128, AllowitError> {
-        let ctx = context(env, params, state, request);
-        allowit::day_spent_cap(&ctx, ctx.params.get(allowit::DAY_SPENT_CAP))
+        let ctx = context(env, params, state, request)?;
+        allowit::daily_spending_limit(&ctx, &ctx.params[allowit::DAILY_SPENDING_LIMIT])
     }
-    /// Run `allowit::day_total_cap(&ctx, ctx.params.get(allowit::DAY_TOTAL_CAP))`; returns the UTC-day gross headroom.
-    pub fn day_total_cap(
+    /// Run `allowit::daily_volume_limit(&ctx, &ctx.params[allowit::DAILY_VOLUME_LIMIT])`; returns the UTC-day gross headroom.
+    pub fn daily_volume_limit(
         env: Env,
         params: Map<Symbol, AllowitValue>,
         state: Map<Symbol, AllowitValue>,
         request: AllowitRequest,
     ) -> Result<i128, AllowitError> {
-        let ctx = context(env, params, state, request);
-        allowit::day_total_cap(&ctx, ctx.params.get(allowit::DAY_TOTAL_CAP))
+        let ctx = context(env, params, state, request)?;
+        allowit::daily_volume_limit(&ctx, &ctx.params[allowit::DAILY_VOLUME_LIMIT])
     }
-    /// Run `allowit::call_cap(&ctx, ctx.params.get(allowit::CALL_CAP))`; returns the operations left.
-    pub fn call_cap(
+    /// Run `allowit::call_limit(&ctx, &ctx.params[allowit::CALL_LIMIT])`; returns the operations left.
+    pub fn call_limit(
         env: Env,
         params: Map<Symbol, AllowitValue>,
         state: Map<Symbol, AllowitValue>,
         request: AllowitRequest,
     ) -> Result<u64, AllowitError> {
-        let ctx = context(env, params, state, request);
-        allowit::call_cap(&ctx, ctx.params.get(allowit::CALL_CAP))
+        let ctx = context(env, params, state, request)?;
+        allowit::call_limit(&ctx, &ctx.params[allowit::CALL_LIMIT])
     }
-    /// Run `allowit::recipients(&ctx, ctx.params.get(allowit::RECIPIENTS))`; returns the matched recipient.
-    pub fn recipients(
+    /// Run `allowit::destinations(&ctx, &ctx.params[allowit::DESTINATIONS])`; returns the matched recipient.
+    pub fn destinations(
         env: Env,
         params: Map<Symbol, AllowitValue>,
         state: Map<Symbol, AllowitValue>,
         request: AllowitRequest,
     ) -> Result<Address, AllowitError> {
-        let ctx = context(env, params, state, request);
-        allowit::recipients(&ctx, ctx.params.get(allowit::RECIPIENTS))
+        let ctx = context(env, params, state, request)?;
+        allowit::destinations(&ctx, &ctx.params[allowit::DESTINATIONS])
     }
-    /// Run `allowit::tokens(&ctx, ctx.params.get(allowit::TOKENS))`; returns the matched asset.
+    /// Run `allowit::tokens(&ctx, &ctx.params[allowit::TOKENS])`; returns the matched asset.
     pub fn tokens(
         env: Env,
         params: Map<Symbol, AllowitValue>,
         state: Map<Symbol, AllowitValue>,
         request: AllowitRequest,
     ) -> Result<Address, AllowitError> {
-        let ctx = context(env, params, state, request);
-        allowit::tokens(&ctx, ctx.params.get(allowit::TOKENS))
+        let ctx = context(env, params, state, request)?;
+        allowit::tokens(&ctx, &ctx.params[allowit::TOKENS])
     }
-    /// Run `allowit::expiry(&ctx, ctx.params.get(allowit::EXPIRY))`; returns the seconds left.
-    pub fn expiry(
+    /// Run `allowit::expires_at(&ctx, &ctx.params[allowit::EXPIRES_AT])`; returns the seconds left.
+    pub fn expires_at(
         env: Env,
         params: Map<Symbol, AllowitValue>,
         state: Map<Symbol, AllowitValue>,
         request: AllowitRequest,
     ) -> Result<u64, AllowitError> {
-        let ctx = context(env, params, state, request);
-        allowit::expiry(&ctx, ctx.params.get(allowit::EXPIRY))
+        let ctx = context(env, params, state, request)?;
+        allowit::expires_at(&ctx, &ctx.params[allowit::EXPIRES_AT])
     }
-    /// Run `allowit::operations(&ctx, ctx.params.get(allowit::OPERATIONS))`; returns the request's op name.
+    /// Run `allowit::operations(&ctx, &ctx.params[allowit::OPERATIONS])`; returns the request's op name.
     pub fn operations(
         env: Env,
         params: Map<Symbol, AllowitValue>,
         state: Map<Symbol, AllowitValue>,
         request: AllowitRequest,
     ) -> Result<String, AllowitError> {
-        let ctx = context(env.clone(), params, state, request);
-        let op = allowit::operations(&ctx, ctx.params.get(allowit::OPERATIONS))?;
+        let ctx = context(env.clone(), params, state, request)?;
+        let op = allowit::operations(&ctx, &ctx.params[allowit::OPERATIONS])?;
         Ok(String::from_str(&env, op))
     }
 }

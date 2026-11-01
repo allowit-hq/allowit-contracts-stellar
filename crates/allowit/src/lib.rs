@@ -7,33 +7,36 @@
 //! /// Let my agent pay our invoices. Cap its total spending and pay only vendors I approve.
 //! pub fn execute(ctx: &AllowitContext) -> allowit::Result {
 //!     // "Cap its total spending"
-//!     allowit::spent_cap(ctx, ctx.params.get(allowit::SPENT_CAP))?;
+//!     allowit::lifetime_spending_limit(ctx, &ctx.params[allowit::LIFETIME_SPENDING_LIMIT])?;
 //!     // "pay only vendors I approve"
-//!     allowit::recipients(ctx, ctx.params.get(allowit::RECIPIENTS))?;
+//!     allowit::destinations(ctx, &ctx.params[allowit::DESTINATIONS])?;
 //!     Ok(())
 //! }
 //! ```
 //!
 //! `AllowitContext` is plain data: `env`, `params`, `state` and `request`. `params` holds the
-//! owner's constructor params, key => `AllowitValue`; an absent key is unset. `state` is the
-//! current policy state, before this operation: one free-form map with standard keys (`spent`,
-//! `day_spent`, `day_total`, `calls`, `day`, `unpriced`, `day_unpriced`) and policy-defined keys.
-//! `request.args` holds the agent's execution params for this call. Params, state and args share
-//! the one value type `AllowitValue`.
+//! owner's constructor params, key => `AllowitValue`; an absent key is unset. Policy reads a param
+//! by key, `ctx.params[allowit::DESTINATIONS]` or `ctx.params["destinations"]`, and indexing an
+//! unset key panics with `MissingParam`. `ctx.params.contains(key)` tells whether a key is set.
+//! `state` is the current policy state, before this operation: one free-form map with standard
+//! keys (`spent`, `day_spent`, `day_total`, `calls`, `day`, `unpriced`, `day_unpriced`) and
+//! policy-defined keys. `request.args` holds the agent's execution params for this call. Params,
+//! state and args share the one value type `AllowitValue`.
 //!
-//! A rule takes the looked-up param value and decodes it: an unset param is `MissingParam` and a
-//! value of the wrong type or range is `InvalidParam`. Rules add the request's own contribution to
-//! the current values and return their passing constraint or an `AllowitError`. Only an error that
-//! the policy propagates with `?` ends the run. A policy may catch a rule error, read it and
-//! continue. `operations` admits the request's op only when the owner's `operations` param names
-//! it, and returns the op name, such as `"transfer"`, for a `match`.
+//! A rule takes the param value and decodes it: a value of the wrong type or range is
+//! `InvalidParam`. Rules add the request's own contribution to the current values and return their
+//! passing constraint or an `AllowitError`. Only an error that the policy propagates with `?` ends
+//! the run. A policy may catch a rule error, read it and continue. `operations` admits the
+//! request's op only when the owner's `operations` param names it, and returns the op name, such
+//! as `"transfer"`, for a `match`.
 //!
 //! `param` and `arg` read an owner param or an agent arg as the type of its binding:
 //! `let cap: i128 = allowit::param(ctx, "swap_cap");`. They panic when the key is unset
-//! (`MissingParam`) or the value has another type or range (`InvalidParam`). A panic, also from
-//! `panic!`, `assert!`, `unreachable!` or an integer overflow, is a hard stop: the run denies and
-//! its writes are discarded. Onchain the contract call aborts, with the `AllowitError` code for a
-//! failed read. On the host `evaluate` catches the panic and returns that error or `Panicked`.
+//! (`MissingParam`) or the value has another type or range (`InvalidParam`). A panic, also from an
+//! unset `ctx.params[key]`, `panic!`, `assert!`, `unreachable!` or an integer overflow, is a hard
+//! stop: the run denies and its writes are discarded. Onchain the contract call aborts, with the
+//! `AllowitError` code for a failed read. On the host `evaluate` catches the panic and returns that
+//! error or `Panicked`.
 //!
 //! After approval, the wallet and the server run the same `post_flight`: it rolls the UTC day
 //! over, counts the call, adds spent and gross amounts, marks unpriced operations, then applies
@@ -46,16 +49,18 @@
 //! standard contract runs the leading canonical calls, supplied by the owner as `rules`, through
 //! `preflight`, which skips absent params.
 //!
-//! Portable authored code uses rule calls, `param`, `arg`, `get_state` and `set_state`, typed
-//! scalar fields and enum comparisons. `scripts/policy_source.py` admits only an allowlist of names,
-//! paths and methods that give the same result on both backends.
+//! Portable authored code uses rule calls, `ctx.params[key]`, `contains`, `param`, `arg`,
+//! `get_state` and `set_state`, typed scalar fields and enum comparisons.
+//! `scripts/policy_source.py` admits only an allowlist of names, paths and methods that give the
+//! same result on both backends.
 //!
 //! Types and rule logic are written once in `core.rs` and compiled per backend. Each backend binds
-//! `Address`, `AllowitEnv`, `Map`, `String`, `Symbol` and `Vec`. Feature `soroban` (default) uses
-//! host values, contract types and the Soroban `Env`, and buffers policy writes in contract
-//! temporary storage until `post_flight`. Feature `std` uses text addresses, heap maps and
-//! vectors, and a host `AllowitEnv` that buffers policy writes. The selected backend backs the
-//! crate root, which authored policy names.
+//! `Address`, `AllowitEnv`, `Map`, `String`, `Symbol` and `Vec`, and defines `AllowitParams`.
+//! Feature `soroban` (default) uses host values, contract types and the Soroban `Env`, decodes the
+//! params once per run so that indexing returns a reference, and buffers policy writes in contract
+//! temporary storage until `post_flight`. Feature `std` uses text addresses, heap maps, heap
+//! lists that iterate by clone like the onchain `Vec`, and a host `AllowitEnv` that buffers policy
+//! writes. The selected backend backs the crate root, which authored policy names.
 //!
 //! The server-only enrichment functions (`price`, `fetch`, `internet_search`,
 //! `marketplace_search`, `request_screening`, `systemone`, `clear_systemone_context`) exist only
@@ -74,7 +79,7 @@
 //! use allowit::prelude::*;
 //! /// Control for the test below: the same policy without the server-only call compiles onchain.
 //! pub fn execute(ctx: &AllowitContext) -> allowit::Result {
-//!     allowit::spent_cap(ctx, ctx.params.get(allowit::SPENT_CAP))?;
+//!     allowit::lifetime_spending_limit(ctx, &ctx.params[allowit::LIFETIME_SPENDING_LIMIT])?;
 //!     Ok(())
 //! }
 //! ```
@@ -83,7 +88,7 @@
 //! use allowit::prelude::*;
 //! /// A Custom policy that calls a server-only function does not build onchain.
 //! pub fn execute(ctx: &AllowitContext) -> allowit::Result {
-//!     allowit::spent_cap(ctx, ctx.params.get(allowit::SPENT_CAP))?;
+//!     allowit::lifetime_spending_limit(ctx, &ctx.params[allowit::LIFETIME_SPENDING_LIMIT])?;
 //!     allowit::clear_systemone_context(ctx)?;
 //!     Ok(())
 //! }
@@ -98,6 +103,48 @@
 //! pub fn execute(ctx: &AllowitContext) -> allowit::Result {
 //!     allowit::reentry_transfer(ctx, 1)?;
 //!     Ok(())
+//! }
+//! ```
+//!
+//! A `for` loop over a list binds owned values on both backends, also when the list borrows from
+//! `ctx.params[key]`: the host list iterates by clone, as the onchain `Vec` does. The
+//! `scripts/tests` std-only compile checks the same loops.
+//!
+//! ```
+//! use allowit::prelude::*;
+//! /// Pay only listed vendors or suppliers.
+//! pub fn execute(ctx: &AllowitContext) -> allowit::Result {
+//!     let wanted = AllowitValue::Addr(ctx.request.recipient.clone());
+//!     if let AllowitValue::List(items) = &ctx.params["vendors"] {
+//!         for item in items {
+//!             if item == wanted {
+//!                 return Ok(());
+//!             }
+//!         }
+//!     }
+//!     let suppliers: Vec<Address> = allowit::param(ctx, "suppliers");
+//!     for supplier in &suppliers {
+//!         if supplier == ctx.request.recipient {
+//!             return Ok(());
+//!         }
+//!     }
+//!     Err(AllowitError::DestinationNotAllowed)
+//! }
+//! ```
+//!
+//! ```compile_fail,E0614
+//! use allowit::prelude::*;
+//! /// A loop item is no reference, so a dereference does not build on either backend.
+//! pub fn execute(ctx: &AllowitContext) -> allowit::Result {
+//!     let wanted = AllowitValue::Addr(ctx.request.recipient.clone());
+//!     if let AllowitValue::List(items) = &ctx.params["vendors"] {
+//!         for item in items {
+//!             if *item == wanted {
+//!                 return Ok(());
+//!             }
+//!         }
+//!     }
+//!     Err(AllowitError::DestinationNotAllowed)
 //! }
 //! ```
 #[cfg(feature = "std")]
@@ -132,9 +179,9 @@ pub mod soroban {
             $item
         };
     }
-    /// Make `AllowitParams` a Soroban contract type with a public map, which the wallet builds
-    /// from stored params and request args.
-    macro_rules! params {
+    /// Make `AllowitArgs` a Soroban contract type with a public map, which the wallet builds from
+    /// the request args.
+    macro_rules! args {
         ($(#[$meta:meta])* $name:ident($($map:tt)*)) => {
             #[soroban_sdk::contracttype]
             $(#[$meta])*
@@ -145,6 +192,56 @@ pub mod soroban {
         };
     }
     include!("core.rs");
+
+    /// The owner's params, read by key: `ctx.params[allowit::DESTINATIONS]`. A Soroban map
+    /// decodes a value on every read, so `new` decodes the at most `MAX_PARAMS` entries once per
+    /// run and indexing returns a reference to the decoded value.
+    #[derive(Clone)]
+    pub struct AllowitParams {
+        env: AllowitEnv,
+        map: AllowitMap,
+        entries: [Option<(Symbol, AllowitValue)>; MAX_PARAMS as usize],
+    }
+
+    impl AllowitParams {
+        /// The params of `map`, decoded. More than `MAX_PARAMS` entries or an entry that does
+        /// not decode is `InvalidParam`.
+        pub fn new(env: &AllowitEnv, map: AllowitMap) -> Result<Self> {
+            if count(&map) > MAX_PARAMS {
+                return Err(AllowitError::InvalidParam);
+            }
+            let mut entries = core::array::from_fn(|_| None);
+            for (slot, entry) in entries.iter_mut().zip(map.try_iter()) {
+                *slot = Some(entry.map_err(|_| AllowitError::InvalidParam)?);
+            }
+            Ok(Self {
+                env: env.clone(),
+                map,
+                entries,
+            })
+        }
+
+        /// The key => value map that the wallet stores.
+        pub fn map(&self) -> &AllowitMap {
+            &self.map
+        }
+    }
+
+    /// The decoded value of `key` in `params`, or `None` when it is unset or no map can hold the
+    /// key.
+    fn find<'a>(params: &'a AllowitParams, key: &str) -> Option<&'a AllowitValue> {
+        if !key_ok(key) {
+            return None;
+        }
+        let key = Symbol::new(&params.env, key);
+        let mut entries = params.entries.iter().flatten();
+        entries.find(|(k, _)| *k == key).map(|(_, value)| value)
+    }
+
+    /// Abort the whole contract call with `MissingParam` for unset param `key`.
+    fn missing(params: &AllowitParams, key: &str) -> ! {
+        fail(&params.env, AllowitError::MissingParam, key)
+    }
 
     /// Temporary-storage key of the running operation's policy writes. `post_flight` removes it,
     /// and a failed operation rolls it back, so it never outlives the transaction.
@@ -275,7 +372,8 @@ pub mod soroban {
 #[cfg(feature = "std")]
 pub mod host {
     use alloc::collections::BTreeMap;
-    pub use alloc::{string::String, vec::Vec};
+    pub use alloc::string::String;
+    use core::cell::Cell;
     use std::sync::{Arc, Mutex, MutexGuard};
 
     /// Exact account or contract identity, held as the text that its rail supplies. It compares
@@ -297,18 +395,66 @@ pub mod host {
         }
     }
 
+    /// Host list. Like the onchain `Vec`, iterating a borrowed list yields owned clones, so
+    /// `for item in items` binds an owned `AllowitValue` on both backends, also when `items`
+    /// borrows from `ctx.params[key]`. It has no `Deref` to a slice, so authored code that needs a
+    /// slice fails the std-only compile as it fails onchain. The server reads it with `as_slice`.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct Vec<T>(alloc::vec::Vec<T>);
+
+    impl<T> Vec<T> {
+        /// The items, for the server.
+        pub fn as_slice(&self) -> &[T] {
+            &self.0
+        }
+    }
+
+    impl<T> From<alloc::vec::Vec<T>> for Vec<T> {
+        /// The list of these items.
+        fn from(items: alloc::vec::Vec<T>) -> Self {
+            Self(items)
+        }
+    }
+
+    impl<T> FromIterator<T> for Vec<T> {
+        /// The list of the iterated items.
+        fn from_iter<I: IntoIterator<Item = T>>(items: I) -> Self {
+            Self(items.into_iter().collect())
+        }
+    }
+
+    impl<T> IntoIterator for Vec<T> {
+        /// An owned item.
+        type Item = T;
+        /// The items in order.
+        type IntoIter = alloc::vec::IntoIter<T>;
+        /// The items in order.
+        fn into_iter(self) -> Self::IntoIter {
+            self.0.into_iter()
+        }
+    }
+
+    impl<'a, T: Clone> IntoIterator for &'a Vec<T> {
+        /// A clone of an item, as the onchain `Vec` decodes one.
+        type Item = T;
+        /// Clones of the items in order.
+        type IntoIter = core::iter::Cloned<core::slice::Iter<'a, T>>;
+        /// Clones of the items in order.
+        fn into_iter(self) -> Self::IntoIter {
+            self.0.iter().cloned()
+        }
+    }
+
     /// Host map: keys are text checked like onchain map keys.
     type Map<K, V> = BTreeMap<K, V>;
     /// Host map key.
     type Symbol = String;
 
     /// Host environment of policy evaluations. It buffers the policy's `set_state` writes for
-    /// `post_flight` and records the error of a failed `param` or `arg` read; clones share both.
-    /// `evaluate` clears them before a run and the writes on denial.
+    /// `post_flight`; clones share the buffer. `evaluate` clears it before a run and on denial.
     #[derive(Clone, Debug)]
     pub struct AllowitEnv {
         writes: Arc<Mutex<AllowitMap>>,
-        failure: Arc<Mutex<Option<AllowitError>>>,
     }
 
     impl AllowitEnv {
@@ -317,7 +463,6 @@ pub mod host {
         pub fn new() -> Self {
             Self {
                 writes: Arc::new(Mutex::new(BTreeMap::new())),
-                failure: Arc::new(Mutex::new(None)),
             }
         }
 
@@ -327,13 +472,13 @@ pub mod host {
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
         }
+    }
 
-        /// The error of the last failed `param` or `arg` read.
-        fn failure(&self) -> MutexGuard<'_, Option<AllowitError>> {
-            self.failure
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-        }
+    std::thread_local! {
+        /// The error of the last failed read on this thread: an unset `ctx.params[key]` or a
+        /// failed `param` or `arg` read. A policy runs on the thread of its `evaluate` call, and
+        /// indexing has no `AllowitEnv`, so the record is per thread.
+        static FAILURE: Cell<Option<AllowitError>> = const { Cell::new(None) };
     }
 
     /// Keep a `core.rs` value type a plain Rust type.
@@ -348,9 +493,9 @@ pub mod host {
             $item
         };
     }
-    /// Keep the map of `AllowitParams` private to this crate, so the std-only compile of
-    /// authored policy rejects any read other than `get`. The server converts with `From`.
-    macro_rules! params {
+    /// Keep the map of `AllowitArgs` private to this crate, so the std-only compile of authored
+    /// policy rejects any read other than `arg` and `contains`. The server converts with `From`.
+    macro_rules! args {
         ($(#[$meta:meta])* $name:ident($($map:tt)*)) => {
             $(#[$meta])*
             pub struct $name(
@@ -361,20 +506,50 @@ pub mod host {
     }
     include!("core.rs");
 
-    /// The server builds params and args from a key => value map.
-    impl From<AllowitMap> for AllowitParams {
-        /// Params holding `map`.
-        fn from(map: AllowitMap) -> Self {
-            Self(map)
+    /// The owner's params, read by key: `ctx.params[allowit::DESTINATIONS]`. The map stays
+    /// private to this crate, so the std-only compile of authored policy rejects any read other
+    /// than indexing, `contains` and `param`. The server converts with `From`. It derives only
+    /// `Clone`, as the Soroban type does, so the std-only compile also rejects comparison.
+    #[derive(Clone)]
+    pub struct AllowitParams(pub(crate) AllowitMap);
+
+    impl AllowitParams {
+        /// The key => value map.
+        pub(crate) fn map(&self) -> &AllowitMap {
+            &self.0
         }
     }
 
-    /// The server reads back the key => value map of params or args.
-    impl From<AllowitParams> for AllowitMap {
-        /// The map of `params`.
-        fn from(params: AllowitParams) -> Self {
-            params.0
-        }
+    /// The server converts params and args to and from key => value maps.
+    macro_rules! map_conversions {
+        ($($name:ident),*) => {$(
+            /// The server builds this from a key => value map.
+            impl From<AllowitMap> for $name {
+                /// The value holding `map`.
+                fn from(map: AllowitMap) -> Self {
+                    Self(map)
+                }
+            }
+            /// The server reads back the key => value map.
+            impl From<$name> for AllowitMap {
+                /// The map of `value`.
+                fn from(value: $name) -> Self {
+                    value.0
+                }
+            }
+        )*};
+    }
+    map_conversions!(AllowitParams, AllowitArgs);
+
+    /// The value of `key` in `params`, or `None` when it is unset or no map can hold the key.
+    fn find<'a>(params: &'a AllowitParams, key: &str) -> Option<&'a AllowitValue> {
+        key_ok(key).then(|| params.0.get(key)).flatten()
+    }
+
+    /// Record `MissingParam` for `evaluate` and panic with a message that names unset param `key`.
+    #[track_caller]
+    fn missing(_params: &AllowitParams, key: &str) -> ! {
+        stop(AllowitError::MissingParam, key)
     }
 
     /// The value of `key` in `map`, or `None` when it is absent or no map can hold the key.
@@ -413,17 +588,24 @@ pub mod host {
 
     /// Record `error` for `evaluate` and panic with a message that names it and `key`.
     #[track_caller]
-    fn fail(env: &AllowitEnv, error: AllowitError, key: &str) -> ! {
-        *env.failure() = Some(error);
+    fn fail(_env: &AllowitEnv, error: AllowitError, key: &str) -> ! {
+        stop(error, key)
+    }
+
+    /// Record `error` for this thread's `guarded` run and panic with a message that names it and
+    /// `key`.
+    #[track_caller]
+    fn stop(error: AllowitError, key: &str) -> ! {
+        FAILURE.set(Some(error));
         panic!("allowit: {error:?} for `{key}`")
     }
 
-    /// Run the policy and turn a panic into a denial: the recorded error of a failed `param` or
-    /// `arg` read, or `Panicked`. The process keeps running.
-    fn guarded(env: &AllowitEnv, run: impl FnOnce() -> Result) -> Result {
-        env.failure().take();
+    /// Run the policy and turn a panic into a denial: the recorded error of a failed read, or
+    /// `Panicked`. The process keeps running.
+    fn guarded(_env: &AllowitEnv, run: impl FnOnce() -> Result) -> Result {
+        FAILURE.take();
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
-            .unwrap_or_else(|_| Err(env.failure().take().unwrap_or(AllowitError::Panicked)))
+            .unwrap_or_else(|_| Err(FAILURE.take().unwrap_or(AllowitError::Panicked)))
     }
 
     /// Read a `List` of `Addr` values as addresses; any other value is `InvalidParam`.
@@ -451,11 +633,8 @@ pub mod host {
     }
 
     /// Run `check` on each item of a list.
-    fn each_item(
-        items: &Vec<AllowitValue>,
-        mut check: impl FnMut(AllowitValue) -> Result,
-    ) -> Result {
-        items.iter().try_for_each(|item| check(item.clone()))
+    fn each_item(items: &Vec<AllowitValue>, check: impl FnMut(AllowitValue) -> Result) -> Result {
+        items.into_iter().try_for_each(check)
     }
 
     /// Buffer one policy write for `post_flight`.

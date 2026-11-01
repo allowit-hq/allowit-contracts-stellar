@@ -72,7 +72,7 @@ SHA-256 of that file. Owner `deploy_policy` packets take the same two options fo
 Every tier requires one self-contained, portable source file. The tooling rejects every
 construct listed in [One portable policy source](architecture.md#one-portable-policy-source), such
 as macros other than the assertion and `matches!` macros, writes to `ctx.env`, the map inside params
-and args, list methods, indexing and pointer-width methods. Simple and Common store only standard
+and args, list methods, indexing other than `ctx.params[key]` and pointer-width methods. Simple and Common store only standard
 state, so the tool rejects their packets when the source calls `allowit::set_state`. It also runs the std-only
 compile described there, so it needs `rustc`. For `--tier custom`, also build the
 reviewed custom Wasm from the same file, which is the Soroban compile.
@@ -83,17 +83,17 @@ underscores. An absent key is unset. The tool infers each value's `AllowitValue`
 object such as `{"Str": "GA..."}` names the type explicitly. A value holds at most 64 nested values,
 and a text at most 256 bytes. All params encode in at most 16 KiB, counted as the wallet counts
 them: 40 bytes per key, 80 per value and each text padded to four bytes. Full allowlists fit beside
-every other canonical param and 28 `operations` entries of the longest form. Simple and Common admit only the canonical keys `transaction_cap`,
-`spent_cap`, `day_spent_cap`, `day_total_cap` (nonnegative integers), `call_cap`, `expiry`
-(unsigned 64-bit integers), `recipients` and `tokens` (address lists), and `operations` (`"*"` or
+every other canonical param and 28 `operations` entries of the longest form. Simple and Common admit only the canonical keys `payment_limit`,
+`lifetime_spending_limit`, `daily_spending_limit`, `daily_volume_limit` (nonnegative integers), `call_limit`, `expires_at`
+(unsigned 64-bit integers), `destinations` and `tokens` (address lists), and `operations` (`"*"` or
 a list of op names, such as `["transfer"]`). Custom admits its policy's
 own keys, such as `vendor_cap`. A Custom policy state holds at most 39 keys, the seven standard keys
 and 32 policy keys, and 16 KiB counted the same way. No call deletes a state key, and
 `deploy_policy` keeps the state, so a policy write past either bound denies every operation that
 makes it. The standard
-preflight skips an absent selected rule; full policy code denies it. The tool accepts such a packet and prints a warning.
+preflight skips an absent selected rule; full policy code stops with `MissingParam` when it reads it. The tool accepts such a packet and prints a warning.
 Legacy names such as `per_transfer`, `daily_limit` or `max_calls` reject on the standard tiers.
-Negative caps reject at standard configuration. Code changes defer the new tier validation to
+Negative limits reject at standard configuration. Code changes defer the new tier validation to
 delegated admission.
 Duplicate JSON keys reject. Fund the wallet only with its
 installed asset. `recover` transfers only that asset. A forward swap can leave the wallet holding
@@ -111,7 +111,7 @@ one. Use null for unchanged code. A non-null `wasm_hash` also requires `--wasm P
 the tool refuses Wasm without `allowit_custody_layout` metadata equal to 4. Code for another custody
 layout cannot read the stored State, so such a change, including a rollback to an earlier release,
 locks custody permanently. Recover funds before any change across layouts. Deployment preserves
-pause and policy state. A changed owner must also authorize. `x402_enabled` enables custom-account authorization: the agent can then send a plain x402 `asset.transfer`, a plain `router.swap_exact_tokens_for_tokens` or a plain `vault.redeem`, and the wallet's `__check_auth` applies the policy to it. Enable it for payments only when swaps and redeems are also acceptable. On Common and Custom the `operations` and `recipients` rules can still deny them; on Simple only the server's offchain policy does. Enabled custom-account authorization requires distinct G-agent and G-server keys and both signatures.
+pause and policy state. A changed owner must also authorize. `x402_enabled` enables custom-account authorization: the agent can then send a plain x402 `asset.transfer`, a plain `router.swap_exact_tokens_for_tokens` or a plain `vault.redeem`, and the wallet's `__check_auth` applies the policy to it. Enable it for payments only when swaps and redeems are also acceptable. On Common and Custom the `operations` and `destinations` rules can still deny them; on Simple only the server's offchain policy does. Enabled custom-account authorization requires distinct G-agent and G-server keys and both signatures.
 False disables all three plain calls without changing direct two-role execution authorization. Classic signer rotation and `shutdown-wallet` do not revoke raw-key delegation. The contract wallet owner must disable `x402_enabled`, pause, or replace the agent/server address through `deploy_policy`.
 
 Owner passthrough uses `invoke(contract, function, args, auth)`. Prepare this exact call with the

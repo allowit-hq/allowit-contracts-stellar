@@ -11,10 +11,10 @@ mod catching;
 mod policy;
 #[path = "policy-vectors.rs"]
 mod vectors;
-use allowit::prelude::*;
+// The prelude without its list type `Vec`, so test plumbing keeps the standard `Vec`.
 use allowit::{
-    AllowitEnv, AllowitMap, AllowitParams, AllowitRule, AllowitStandardState, AllowitTier, DAY,
-    RULES,
+    Address, AllowitArgs, AllowitContext, AllowitEnv, AllowitError, AllowitMap, AllowitOperation,
+    AllowitRequest, AllowitRule, AllowitStandardState, AllowitTier, AllowitValue, DAY, RULES,
 };
 use vectors::{Op, Ops, Outcome, Vector};
 
@@ -25,21 +25,39 @@ fn map(s: &AllowitStandardState) -> AllowitMap {
     s.write(&mut state).unwrap();
     state
 }
-/// A key => value map of `entries`, without the absent ones.
-fn params(entries: Vec<(&str, Option<AllowitValue>)>) -> AllowitParams {
+/// Params or args of `entries`, without the absent ones.
+fn params<T: From<AllowitMap>>(entries: Vec<(&str, Option<AllowitValue>)>) -> T {
     let present = entries
         .into_iter()
         .filter_map(|(k, v)| Some((k.to_string(), v?)));
-    AllowitParams::from(present.collect::<AllowitMap>())
+    T::from(present.collect::<AllowitMap>())
 }
 /// Set or, with `None`, unset `key` in params or args, as the server rebuilds them.
-fn put(params: &mut AllowitParams, key: &str, value: Option<AllowitValue>) {
+fn put<T: Clone + From<AllowitMap>>(params: &mut T, key: &str, value: Option<AllowitValue>)
+where
+    AllowitMap: From<T>,
+{
     let mut map = AllowitMap::from(params.clone());
     match value {
         Some(value) => map.insert(key.to_string(), value),
         None => map.remove(key),
     };
     *params = map.into();
+}
+/// The result of `run` as an error code. A panic that names a failed read, such as an unset
+/// `ctx.params[key]` (`allowit: MissingParam for `key``), stops `run` with that error, as
+/// `evaluate` does; any other panic is `Panicked`.
+fn stopped<T>(run: impl FnOnce() -> allowit::Result<T>) -> core::result::Result<T, u32> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
+    result
+        .unwrap_or_else(|panic| {
+            let message = panic.downcast_ref::<String>().map_or("", String::as_str);
+            let read = [AllowitError::MissingParam, AllowitError::InvalidParam]
+                .into_iter()
+                .find(|e| message.starts_with(&format!("allowit: {e:?} for ")));
+            Err(read.unwrap_or(AllowitError::Panicked))
+        })
+        .map_err(|e| e as u32)
 }
 /// A `List` of `Addr` values.
 fn list(items: Vec<Address>) -> AllowitValue {
@@ -64,14 +82,14 @@ fn context() -> AllowitContext {
     AllowitContext {
         env: AllowitEnv::new(),
         params: params(vec![
-            (allowit::TRANSACTION_CAP, int(10)),
-            (allowit::SPENT_CAP, int(30)),
-            (allowit::DAY_SPENT_CAP, int(20)),
-            (allowit::DAY_TOTAL_CAP, int(20)),
-            (allowit::CALL_CAP, int(2)),
-            (allowit::RECIPIENTS, Some(list(vec![recipient.clone()]))),
+            (allowit::PAYMENT_LIMIT, int(10)),
+            (allowit::LIFETIME_SPENDING_LIMIT, int(30)),
+            (allowit::DAILY_SPENDING_LIMIT, int(20)),
+            (allowit::DAILY_VOLUME_LIMIT, int(20)),
+            (allowit::CALL_LIMIT, int(2)),
+            (allowit::DESTINATIONS, Some(list(vec![recipient.clone()]))),
             (allowit::TOKENS, Some(list(vec![asset.clone()]))),
-            (allowit::EXPIRY, int(NOW + 100)),
+            (allowit::EXPIRES_AT, int(NOW + 100)),
             (
                 allowit::OPERATIONS,
                 Some(operations(&Ops::List(vec!["transfer"]))),
@@ -112,20 +130,23 @@ fn edit(c: &mut AllowitContext, change: impl FnOnce(&mut AllowitStandardState)) 
 #[test]
 fn approval_passes_with_exact_constraints() {
     let c = context();
-    let p = |key| c.params.get(key);
+    let p = |key| &c.params[key];
     assert_eq!(policy::execute(&c), Ok(()));
+    assert_eq!(allowit::payment_limit(&c, p(allowit::PAYMENT_LIMIT)), Ok(0));
     assert_eq!(
-        allowit::transaction_cap(&c, p(allowit::TRANSACTION_CAP)),
+        allowit::lifetime_spending_limit(&c, p(allowit::LIFETIME_SPENDING_LIMIT)),
+        Ok(10)
+    );
+    assert_eq!(
+        allowit::daily_spending_limit(&c, p(allowit::DAILY_SPENDING_LIMIT)),
         Ok(0)
     );
-    assert_eq!(allowit::spent_cap(&c, p(allowit::SPENT_CAP)), Ok(10));
-    assert_eq!(allowit::day_spent_cap(&c, p(allowit::DAY_SPENT_CAP)), Ok(0));
-    assert_eq!(allowit::call_cap(&c, p(allowit::CALL_CAP)), Ok(0));
+    assert_eq!(allowit::call_limit(&c, p(allowit::CALL_LIMIT)), Ok(0));
     assert_eq!(
-        allowit::recipients(&c, p(allowit::RECIPIENTS)),
+        allowit::destinations(&c, p(allowit::DESTINATIONS)),
         Ok(c.request.recipient.clone())
     );
-    assert_eq!(allowit::expiry(&c, p(allowit::EXPIRY)), Ok(100));
+    assert_eq!(allowit::expires_at(&c, p(allowit::EXPIRES_AT)), Ok(100));
 }
 #[test]
 fn approval_branch_policy_caps_deposits() {
@@ -133,19 +154,31 @@ fn approval_branch_policy_caps_deposits() {
     edit(&mut c, |s| s.spent = 21);
     assert_eq!(branch::execute(&c), Ok(()));
     c.request.operation = AllowitOperation::deposit;
-    assert_eq!(branch::execute(&c), Err(AllowitError::SpentCapExceeded));
+    assert_eq!(
+        branch::execute(&c),
+        Err(AllowitError::LifetimeSpendingLimitExceeded)
+    );
 }
 #[test]
 fn approval_denies_absent_params() {
     let mut c = context();
     put(&mut c.params, allowit::TOKENS, None);
-    assert_eq!(policy::execute(&c), Err(AllowitError::MissingParam));
+    assert!(!c.params.contains(allowit::TOKENS) && c.params.contains(allowit::DESTINATIONS));
+    // Indexing the unset param stops the run; `evaluate` denies with `MissingParam`.
+    let custom = AllowitTier::Custom;
+    let missing = Err(AllowitError::MissingParam);
+    assert_eq!(allowit::evaluate(&c, policy::execute, custom), missing);
+    let code = AllowitError::MissingParam as u32;
+    assert_eq!(stopped(|| policy::execute(&c)), Err(code));
+    // A key that no map can hold is unset too.
+    let spaced = |c: &AllowitContext| allowit::call_limit(c, &c.params["call limit"]).map(drop);
+    assert_eq!(allowit::evaluate(&c, spaced, custom), missing);
     assert_eq!(allowit::preflight(&c, AllowitRule::tokens), Ok(()));
 }
 #[test]
 fn approval_continues_after_a_caught_rule_error_and_post_flight_applies_its_writes() {
     let mut c = context();
-    put(&mut c.params, allowit::DAY_SPENT_CAP, int(19));
+    put(&mut c.params, allowit::DAILY_SPENDING_LIMIT, int(19));
     let next = allowit::evaluate(&c, catching::execute, AllowitTier::Custom).unwrap();
     let mut after = c.clone();
     after.state = next;
@@ -164,7 +197,7 @@ fn approval_continues_after_a_caught_rule_error_and_post_flight_applies_its_writ
     after.state = allowit::post_flight(&c, AllowitTier::Custom).unwrap();
     assert_eq!(
         catching::execute(&after),
-        Err(AllowitError::DaySpentCapExceeded)
+        Err(AllowitError::DailySpendingLimitExceeded)
     );
 }
 #[test]
@@ -172,11 +205,15 @@ fn approval_reads_execution_params_and_custom_params() {
     let mut c = context();
     // The agent names an invoice; the owner's custom cap then bounds the payment.
     put(&mut c.request.args, vectors::INVOICE, int(7));
-    assert_eq!(catching::execute(&c), Err(AllowitError::MissingParam));
+    assert!(c.request.args.contains(vectors::INVOICE));
+    assert_eq!(
+        allowit::evaluate(&c, catching::execute, AllowitTier::Custom),
+        Err(AllowitError::MissingParam)
+    );
     put(&mut c.params, vectors::INVOICE_CAP, int(9));
     assert_eq!(
         catching::execute(&c),
-        Err(AllowitError::TransactionCapExceeded)
+        Err(AllowitError::PaymentLimitExceeded)
     );
     assert_eq!(allowit::param::<i128>(&c, vectors::INVOICE_CAP), 9);
     put(&mut c.request.args, vectors::INVOICE, None);
@@ -213,7 +250,7 @@ fn approval_evaluate_keeps_no_write_of_a_denied_run_on_a_reused_env() {
 }
 /// The documented per-op policy on the host: a transfer within the owner's `payment_cap`.
 fn per_op(ctx: &AllowitContext) -> allowit::Result {
-    match allowit::operations(ctx, ctx.params.get(allowit::OPERATIONS))? {
+    match allowit::operations(ctx, &ctx.params[allowit::OPERATIONS])? {
         "transfer" => {
             // "at most the payment cap per transfer"
             let amount: i128 = allowit::arg(ctx, "amount");
@@ -236,10 +273,10 @@ fn approval_typed_reads_return_the_binding_type_and_a_policy_panic_denies_withou
     let mut c = context();
     put(&mut c.params, "payment_cap", int(10));
     put(&mut c.request.args, "amount", int(10));
-    let recipients: Vec<Address> = allowit::param(&c, allowit::RECIPIENTS);
+    let destinations: allowit::Vec<Address> = allowit::param(&c, allowit::DESTINATIONS);
     let amount: u32 = allowit::arg(&c, "amount");
     let cap: u64 = allowit::param(&c, "payment_cap");
-    assert_eq!(recipients, vec![c.request.recipient.clone()]);
+    assert_eq!(destinations, vec![c.request.recipient.clone()].into());
     assert_eq!((amount, cap), (10, 10));
     let custom = AllowitTier::Custom;
     let next = allowit::evaluate(&c, writing_per_op, custom).unwrap();
@@ -258,12 +295,11 @@ fn approval_typed_reads_return_the_binding_type_and_a_policy_panic_denies_withou
     ];
     for (key, value, error) in cases {
         let mut bad = c.clone();
-        let map = if key == "amount" {
-            &mut bad.request.args
+        if key == "amount" {
+            put(&mut bad.request.args, key, value);
         } else {
-            &mut bad.params
-        };
-        put(map, key, value);
+            put(&mut bad.params, key, value);
+        }
         assert_eq!(
             allowit::evaluate(&bad, writing_per_op, custom),
             Err(error),
@@ -301,13 +337,13 @@ fn limits_empty_keys_are_invalid_param_as_onchain() {
 fn limits_boundary_denial_and_accounting() {
     let mut c = context();
     c.request.amount = 11;
-    assert_eq!(
-        policy::execute(&c),
-        Err(AllowitError::TransactionCapExceeded)
-    );
+    assert_eq!(policy::execute(&c), Err(AllowitError::PaymentLimitExceeded));
     let mut c = context();
     edit(&mut c, |s| s.day_spent = 11);
-    assert_eq!(policy::execute(&c), Err(AllowitError::DaySpentCapExceeded));
+    assert_eq!(
+        policy::execute(&c),
+        Err(AllowitError::DailySpendingLimitExceeded)
+    );
     let mut c = context();
     edit(&mut c, |s| s.unpriced = true);
     assert_eq!(policy::execute(&c), Err(AllowitError::Unpriced));
@@ -316,11 +352,11 @@ fn limits_boundary_denial_and_accounting() {
     assert_eq!(policy::execute(&c), Err(AllowitError::InvalidState));
     let mut c = context();
     edit(&mut c, |s| s.calls = 2);
-    assert_eq!(policy::execute(&c), Err(AllowitError::CallCapExceeded));
+    assert_eq!(policy::execute(&c), Err(AllowitError::CallLimitExceeded));
     let mut c = context();
     put(
         &mut c.params,
-        allowit::TRANSACTION_CAP,
+        allowit::PAYMENT_LIMIT,
         Some(AllowitValue::Bool(true)),
     );
     assert_eq!(policy::execute(&c), Err(AllowitError::InvalidParam));
@@ -407,7 +443,7 @@ fn host_context(v: &Vector) -> AllowitContext {
             AllowitValue::List(texts.collect()),
         );
     }
-    let mut args = params(vec![(
+    let mut args: AllowitArgs = params(vec![(
         vectors::INVOICE,
         v.invoice.then(|| AllowitValue::Int(1)),
     )]);
@@ -421,14 +457,26 @@ fn host_context(v: &Vector) -> AllowitContext {
     AllowitContext {
         env,
         params: params(vec![
-            (allowit::TRANSACTION_CAP, v.caps[0].map(AllowitValue::Int)),
-            (allowit::SPENT_CAP, v.caps[1].map(AllowitValue::Int)),
-            (allowit::DAY_SPENT_CAP, v.caps[2].map(AllowitValue::Int)),
-            (allowit::DAY_TOTAL_CAP, v.caps[3].map(AllowitValue::Int)),
-            (allowit::CALL_CAP, v.call_cap.map(AllowitValue::from)),
-            (allowit::RECIPIENTS, addresses(&v.recipients)),
+            (allowit::PAYMENT_LIMIT, v.caps[0].map(AllowitValue::Int)),
+            (
+                allowit::LIFETIME_SPENDING_LIMIT,
+                v.caps[1].map(AllowitValue::Int),
+            ),
+            (
+                allowit::DAILY_SPENDING_LIMIT,
+                v.caps[2].map(AllowitValue::Int),
+            ),
+            (
+                allowit::DAILY_VOLUME_LIMIT,
+                v.caps[3].map(AllowitValue::Int),
+            ),
+            (allowit::CALL_LIMIT, v.call_limit.map(AllowitValue::from)),
+            (allowit::DESTINATIONS, addresses(&v.destinations)),
             (allowit::TOKENS, addresses(&v.tokens)),
-            (allowit::EXPIRY, v.expiry.map(AllowitValue::from)),
+            (
+                allowit::EXPIRES_AT,
+                v.expires_at_param.map(AllowitValue::from),
+            ),
             (allowit::OPERATIONS, v.operations.as_ref().map(operations)),
             (vectors::INVOICE_CAP, v.invoice_cap.map(AllowitValue::Int)),
         ]),
@@ -482,7 +530,6 @@ fn preflight(c: &AllowitContext) -> allowit::Result {
 /// Every outcome of one vector on the host backend.
 fn host_outcome(v: &Vector) -> Outcome {
     let c = host_context(v);
-    let p = |key| c.params.get(key);
     let code = |e: AllowitError| e as u32;
     let index = |a: Address| {
         let i = (0..vectors::ADDRESSES).position(|i| address(i) == a);
@@ -495,23 +542,29 @@ fn host_outcome(v: &Vector) -> Outcome {
     };
     let evaluate = |tier| run(&catching::execute, tier);
     Outcome {
-        policy: policy::execute(&c).map_err(code),
-        branch: branch::execute(&c).map_err(code),
-        catching: catching::execute(&c).map_err(code),
+        policy: stopped(|| policy::execute(&c)),
+        branch: stopped(|| branch::execute(&c)),
+        catching: stopped(|| catching::execute(&c)),
         rules: vec![
-            allowit::transaction_cap(&c, p(allowit::TRANSACTION_CAP)).map(|v| v.to_string()),
-            allowit::spent_cap(&c, p(allowit::SPENT_CAP)).map(|v| v.to_string()),
-            allowit::day_spent_cap(&c, p(allowit::DAY_SPENT_CAP)).map(|v| v.to_string()),
-            allowit::day_total_cap(&c, p(allowit::DAY_TOTAL_CAP)).map(|v| v.to_string()),
-            allowit::call_cap(&c, p(allowit::CALL_CAP)).map(|v| v.to_string()),
-            allowit::recipients(&c, p(allowit::RECIPIENTS)).map(index),
-            allowit::tokens(&c, p(allowit::TOKENS)).map(index),
-            allowit::expiry(&c, p(allowit::EXPIRY)).map(|v| v.to_string()),
-            allowit::operations(&c, p(allowit::OPERATIONS)).map(|v| v.to_string()),
-        ]
-        .into_iter()
-        .map(|r| r.map_err(code))
-        .collect(),
+            stopped(|| allowit::payment_limit(&c, &c.params[allowit::PAYMENT_LIMIT]))
+                .map(|v| v.to_string()),
+            stopped(|| {
+                allowit::lifetime_spending_limit(&c, &c.params[allowit::LIFETIME_SPENDING_LIMIT])
+            })
+            .map(|v| v.to_string()),
+            stopped(|| allowit::daily_spending_limit(&c, &c.params[allowit::DAILY_SPENDING_LIMIT]))
+                .map(|v| v.to_string()),
+            stopped(|| allowit::daily_volume_limit(&c, &c.params[allowit::DAILY_VOLUME_LIMIT]))
+                .map(|v| v.to_string()),
+            stopped(|| allowit::call_limit(&c, &c.params[allowit::CALL_LIMIT]))
+                .map(|v| v.to_string()),
+            stopped(|| allowit::destinations(&c, &c.params[allowit::DESTINATIONS])).map(index),
+            stopped(|| allowit::tokens(&c, &c.params[allowit::TOKENS])).map(index),
+            stopped(|| allowit::expires_at(&c, &c.params[allowit::EXPIRES_AT]))
+                .map(|v| v.to_string()),
+            stopped(|| allowit::operations(&c, &c.params[allowit::OPERATIONS]))
+                .map(|v| v.to_string()),
+        ],
         preflight: RULES
             .into_iter()
             .map(|rule| allowit::preflight(&c, rule).map_err(code))
@@ -584,9 +637,9 @@ fn vectors_print_host_outcomes() {
         Ok("1/8/false/2/8/43/false/-".to_string())
     );
     let denied = |e: AllowitError| Err(e as u32);
-    let recipient = denied(AllowitError::RecipientNotAllowed);
+    let recipient = denied(AllowitError::DestinationNotAllowed);
     let token = denied(AllowitError::TokenNotAllowed);
-    let cap = denied(AllowitError::TransactionCapExceeded);
+    let cap = denied(AllowitError::PaymentLimitExceeded);
     assert_eq!(named("swap_unlisted_exchange").policy, recipient);
     assert_eq!(named("swap_other_token_not_allowed").policy, token);
     assert_eq!(
@@ -596,6 +649,6 @@ fn vectors_print_host_outcomes() {
     assert_eq!(named("swap_not_in_operations").policy, not_allowed);
     assert_eq!(named("redeem_not_in_operations").policy, not_allowed);
     assert_eq!(named("only_swaps").policy, not_allowed);
-    assert_eq!(named("swap_over_transaction_cap").policy, cap);
-    assert_eq!(named("reverse_swap_floor_over_transaction_cap").policy, cap);
+    assert_eq!(named("swap_over_payment_limit").policy, cap);
+    assert_eq!(named("reverse_swap_floor_over_payment_limit").policy, cap);
 }

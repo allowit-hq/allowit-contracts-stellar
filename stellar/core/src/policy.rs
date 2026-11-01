@@ -315,7 +315,9 @@ impl PolicyValue {
             AllowitValue::Bool(v) => Self::Bool(*v),
             AllowitValue::Str(v) => Self::Str(v.clone()),
             AllowitValue::Addr(v) => Self::Addr(v.as_str().into()),
-            AllowitValue::List(v) => Self::List(v.iter().map(PolicyValue::from_allowit).collect()),
+            AllowitValue::List(v) => {
+                Self::List(v.as_slice().iter().map(PolicyValue::from_allowit).collect())
+            }
         }
     }
 }
@@ -460,7 +462,7 @@ fn canonical_param(key: &str, encoded: &PolicyValue) -> Result<()> {
         ));
     }
     match key {
-        "recipients" | "tokens" => {
+        "destinations" | "tokens" => {
             let ok = matches!(encoded, PolicyValue::List(items)
                 if items.iter().all(|i| matches!(i, PolicyValue::Addr(_))));
             if !ok {
@@ -480,7 +482,7 @@ fn canonical_param(key: &str, encoded: &PolicyValue) -> Result<()> {
             }
         }
         _ => {
-            let bits = if ["call_cap", "expiry"].contains(&key) {
+            let bits = if ["call_limit", "expires_at"].contains(&key) {
                 64
             } else {
                 127
@@ -754,18 +756,21 @@ fn context(params: &PolicyParams, state: &PolicyParams, r: &RuleRequest) -> Allo
         },
     }
 }
-/// Run one canonical rule call `allowit::<rule>(ctx, ctx.params.get(allowit::<RULE>))?`.
+/// Run one canonical rule call `allowit::<rule>(ctx, &ctx.params[allowit::<RULE>])?`. An unset
+/// param panics with `MissingParam`, which `allowit::evaluate` returns.
 fn run_rule(ctx: &AllowitContext, rule: AllowitRule) -> allowit::Result {
-    let value = ctx.params.get(rule.key());
+    let value = &ctx.params[rule.key()];
     match rule {
-        AllowitRule::transaction_cap => allowit::transaction_cap(ctx, value).map(drop),
-        AllowitRule::spent_cap => allowit::spent_cap(ctx, value).map(drop),
-        AllowitRule::day_spent_cap => allowit::day_spent_cap(ctx, value).map(drop),
-        AllowitRule::day_total_cap => allowit::day_total_cap(ctx, value).map(drop),
-        AllowitRule::call_cap => allowit::call_cap(ctx, value).map(drop),
-        AllowitRule::recipients => allowit::recipients(ctx, value).map(drop),
+        AllowitRule::payment_limit => allowit::payment_limit(ctx, value).map(drop),
+        AllowitRule::lifetime_spending_limit => {
+            allowit::lifetime_spending_limit(ctx, value).map(drop)
+        }
+        AllowitRule::daily_spending_limit => allowit::daily_spending_limit(ctx, value).map(drop),
+        AllowitRule::daily_volume_limit => allowit::daily_volume_limit(ctx, value).map(drop),
+        AllowitRule::call_limit => allowit::call_limit(ctx, value).map(drop),
+        AllowitRule::destinations => allowit::destinations(ctx, value).map(drop),
         AllowitRule::tokens => allowit::tokens(ctx, value).map(drop),
-        AllowitRule::expiry => allowit::expiry(ctx, value).map(drop),
+        AllowitRule::expires_at => allowit::expires_at(ctx, value).map(drop),
         AllowitRule::operations => allowit::operations(ctx, value).map(drop),
     }
 }
@@ -1318,12 +1323,12 @@ pub(crate) mod gate {
     const NOT_PORTABLE: &[&str] = &["usize", "isize", "f16", "f32", "f64", "f128"];
     const ERRORS: &[&str] = &[
         "MissingParam",
-        "TransactionCapExceeded",
-        "SpentCapExceeded",
-        "DaySpentCapExceeded",
-        "DayTotalCapExceeded",
-        "CallCapExceeded",
-        "RecipientNotAllowed",
+        "PaymentLimitExceeded",
+        "LifetimeSpendingLimitExceeded",
+        "DailySpendingLimitExceeded",
+        "DailyVolumeLimitExceeded",
+        "CallLimitExceeded",
+        "DestinationNotAllowed",
         "TokenNotAllowed",
         "Expired",
         "Unpriced",
@@ -1388,8 +1393,10 @@ pub(crate) mod gate {
         "unpriced",
         "args",
     ];
-    /// `FIELD_METHODS`: `get` only on the `params` or `args` field.
+    /// `FIELD_METHODS`: `contains` only on the `params` or `args` field.
     const FIELD_NAMES: &[&str] = &["params", "args"];
+    /// `INDEXED_FIELD`: the only indexed receiver, `ctx.params[key]`.
+    const INDEXED_FIELD: &str = "params";
     const METHODS: &[&str] = &[
         "clone",
         "eq",
@@ -1453,7 +1460,7 @@ pub(crate) mod gate {
         "is_ne",
         "reverse",
         "then_some",
-        "get",
+        "contains",
     ];
     const OPERAND_END: &[&str] = &[")", "]", "?", "true", "false"];
 
@@ -1879,13 +1886,13 @@ pub(crate) mod gate {
                             "the method `{name}`, which is not on the portable allowlist"
                         )));
                     }
-                    if name == "get"
+                    if name == "contains"
                         && (i < 3
                             || !FIELD_NAMES.contains(&tokens[i - 2].as_str())
                             || tokens[i - 3] != ".")
                     {
                         return Err(reject(
-                            "the method `get` other than on the field `.params` or `.args`",
+                            "the method `contains` other than on the field `.params` or `.args`",
                         ));
                     }
                 } else if !FIELDS.contains(&name) {
@@ -2146,7 +2153,7 @@ pub(crate) mod gate {
         }
         if map_field(b) {
             return Err(reject(
-                "the map inside params or args; read them with `.get(key)`",
+                "the map inside params or args; read params as `ctx.params[key]` and args with `allowit::arg`",
             ));
         }
         let spans = tokens(code);
@@ -2171,14 +2178,17 @@ pub(crate) mod gate {
                 plain_braces(strings.get(&spans[at].0).map_or("", String::as_str))?;
             }
         }
-        for pair in toks.windows(2) {
-            let (before, token) = (pair[0].as_str(), pair[1].as_str());
+        for k in 1..toks.len() {
+            let (before, token) = (toks[k - 1].as_str(), toks[k].as_str());
             if token == "["
                 && (matches!(before, ")" | "]" | "?")
                     || before.as_bytes()[0].is_ascii_digit()
                     || (is_ident(before) && !keyword(before)))
+                && !(before == INDEXED_FIELD && k > 1 && toks[k - 2] == ".")
             {
-                return Err(reject("indexing, whose index is a pointer-width `usize`"));
+                return Err(reject(
+                    "indexing other than `ctx.params[key]`, whose index is a pointer-width `usize`",
+                ));
             }
         }
         allowlisted(code)
@@ -2225,7 +2235,7 @@ pub(crate) mod gate {
         }
         lit(skip_ws(chars, p), "{")
     }
-    /// `allowit::<rule>(ctx,ctx.params.get(allowit::<RULE>,?),?)?` on a whitespace-free statement.
+    /// `allowit::<rule>(ctx,&ctx.params[allowit::<RULE>],?)?` on a whitespace-free statement.
     fn prefix_call(statement: &str) -> Option<String> {
         let rest = statement.strip_prefix("allowit::")?;
         let name_len = rest
@@ -2236,7 +2246,7 @@ pub(crate) mod gate {
             return None;
         }
         let (name, rest) = rest.split_at(name_len);
-        let rest = rest.strip_prefix("(ctx,ctx.params.get(allowit::")?;
+        let rest = rest.strip_prefix("(ctx,&ctx.params[allowit::")?;
         let key_len = rest
             .bytes()
             .take_while(|b| b.is_ascii_uppercase() || *b == b'_')
@@ -2245,8 +2255,7 @@ pub(crate) mod gate {
             return None;
         }
         let (key, rest) = rest.split_at(key_len);
-        let rest = rest.strip_prefix(',').unwrap_or(rest);
-        let rest = rest.strip_prefix(')')?;
+        let rest = rest.strip_prefix(']')?;
         let rest = rest.strip_prefix(',').unwrap_or(rest);
         if rest != ")?" || name.to_uppercase() != key || !param_keys().contains(&name) {
             return None;
@@ -2376,7 +2385,7 @@ mod tests {
         assert!(!source_shape(&helper).unwrap().canonical_only);
         let renamed = SOURCE.replace(
             "use allowit::prelude::*;",
-            "use allowit::prelude::*;\nuse allowit::{transaction_cap as Ok};",
+            "use allowit::prelude::*;\nuse allowit::{payment_limit as Ok};",
         );
         // `policy_source.py` admits only `use allowit::prelude::*` and plain `allowit` type
         // imports, so a renamed or braced import fails the gate.
@@ -2425,8 +2434,8 @@ mod tests {
             ScVal::Bytes([1u8; 32].to_vec().try_into().unwrap()),
             ScVal::Address(address(asset).unwrap()),
             list(vec![
-                list(vec![symbol("spent_cap")]),
-                list(vec![symbol("recipients")]),
+                list(vec![symbol("lifetime_spending_limit")]),
+                list(vec![symbol("destinations")]),
             ]),
         ]);
         let expected = hash(tuple.to_xdr(Limits::none()).unwrap());
@@ -2434,7 +2443,7 @@ mod tests {
         let digest = |tier, module: [u8; 32], asset: &str, rules: [&str; 2]| {
             standard_prefix_digest(tier, &module, asset, &rules.map(String::from)).unwrap()
         };
-        let rules = ["spent_cap", "recipients"];
+        let rules = ["lifetime_spending_limit", "destinations"];
         assert_eq!(digest(PolicyTier::Common, [1; 32], asset, rules), expected);
         for other in [
             digest(PolicyTier::Simple, [1; 32], asset, rules),
@@ -2444,7 +2453,7 @@ mod tests {
                 PolicyTier::Common,
                 [1; 32],
                 asset,
-                ["recipients", "spent_cap"],
+                ["destinations", "lifetime_spending_limit"],
             ),
         ] {
             assert_ne!(other, expected);
@@ -2453,12 +2462,12 @@ mod tests {
     #[test]
     fn values_roundtrip_through_json_and_contract_encoding() {
         let params = params_from_json(
-            &serde_json::json!({"transaction_cap": 5, "recipients": [account_for_seed(&[3; 32])], "operations": "*"}),
+            &serde_json::json!({"payment_limit": 5, "destinations": [account_for_seed(&[3; 32])], "operations": "*"}),
             Some(PolicyTier::Common),
         )
         .unwrap();
         let json = serde_json::to_value(&params).unwrap();
-        assert_eq!(json["transaction_cap"], serde_json::json!({"Int": "5"}));
+        assert_eq!(json["payment_limit"], serde_json::json!({"Int": "5"}));
         assert_eq!(
             serde_json::from_value::<PolicyParams>(json).unwrap(),
             params
