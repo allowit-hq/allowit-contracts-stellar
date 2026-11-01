@@ -21,10 +21,10 @@
 //! custom param, as the standard contract does on admission. The server's evaluation therefore
 //! equals the stored state for every tier.
 extern crate std;
-use super::tests::{CATCHING, COMMON, CUSTOM, Fixture, SIMPLE};
+use super::tests::{CATCHING, COMMON, CUSTOM, Fixture, SIMPLE, transfer_args};
 use super::*;
 use allowit::{AllowitError, AllowitStandardState, AllowitTier, RULES};
-use allowit_wallet_protocol::AllowitPolicyInvocation;
+use allowit_wallet_protocol::{AllowitExpense, AllowitTransferArgs};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token::StellarAssetClient,
@@ -47,7 +47,7 @@ mod vectors {
     use super::std::{self, format, string::String, vec, vec::Vec};
     include!("../../../scripts/policy-vectors.rs");
 }
-use vectors::{Ops, Outcome, Vector};
+use vectors::{Op, Ops, Outcome, Vector};
 
 /// Every rule error, indexed by its code minus one.
 const ERRORS: [AllowitError; 16] = [
@@ -254,14 +254,19 @@ fn context(env: &Env, universe: &[Address], v: &Vector) -> AllowitContext {
         params: AllowitParams(params(env, universe, v)),
         state: state_map(env, v),
         request: AllowitRequest {
-            operation: if v.deposit {
-                AllowitOperation::sep56_deposit
-            } else {
-                AllowitOperation::sep41_transfer
+            operation: match v.op {
+                Op::Transfer => AllowitOperation::transfer,
+                Op::Deposit => AllowitOperation::deposit,
+                Op::Swap => AllowitOperation::swap,
+                Op::Redeem => AllowitOperation::redeem,
             },
             asset: universe[v.asset].clone(),
             recipient: universe[v.recipient].clone(),
             amount: v.amount,
+            token_in: universe[v.token_in].clone(),
+            amount_in: v.amount_in,
+            token_out: v.token_out.map(|i| universe[i].clone()),
+            min_out: v.min_out,
             now: v.now,
             expires_at: v.expires_at,
             spent_units: v.spent_units,
@@ -351,11 +356,22 @@ fn sample_prefix() -> List<AllowitRule> {
 }
 
 /// Whether every tier's owner configuration admits an `operations` value: `*` or a list of op names.
+/// A custom contract is ASCII letters or digits; a function adds underscores and has 1 to 32 bytes.
 fn operations_valid(ops: &Ops) -> bool {
+    let function = |f: &str| {
+        (1..=32).contains(&f.len()) && f.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    };
     let name = |name: &&str| {
         ["transfer", "swap", "deposit", "redeem", "custom"].contains(name)
-            || name.starts_with("custom.")
-            || name.starts_with("custom:")
+            || name.strip_prefix("custom.").is_some_and(function)
+            || name
+                .strip_prefix("custom:")
+                .and_then(|call| call.rsplit_once('.'))
+                .is_some_and(|(contract, f)| {
+                    !contract.is_empty()
+                        && contract.bytes().all(|b| b.is_ascii_alphanumeric())
+                        && function(f)
+                })
     };
     match ops {
         Ops::Text(text) => *text == "*",
@@ -363,8 +379,8 @@ fn operations_valid(ops: &Ops) -> bool {
     }
 }
 
-/// Whether the kernel and owner configuration can produce the vector: a transfer of the installed
-/// asset whose expense bounds, when priced, attest principal plus gas, with args that the kernel
+/// Whether the kernel and owner configuration can produce the vector through `execute` of a
+/// transfer: a transfer of the installed asset whose expense bounds, when priced, attest principal plus gas, with args that the kernel
 /// admits and params that every tier admits. The kernel rejects more args with
 /// `InvalidInvocation` before any policy runs.
 fn realizable(v: &Vector) -> bool {
@@ -373,7 +389,7 @@ fn realizable(v: &Vector) -> bool {
     } else {
         v.spent_units == 0 && v.gas_units == 0
     };
-    !v.deposit
+    v.op == Op::Transfer
         && v.extra_args + usize::from(v.invoice) <= vectors::MAX_ARGS
         && v.asset == vectors::ASSET
         && v.amount > 0
@@ -477,8 +493,6 @@ impl Wallet {
         let mut id = [0u8; 32];
         id[24..].copy_from_slice(&operation.to_be_bytes());
         let expense = AllowitExpenseBounds {
-            asset: self.f.asset.clone(),
-            decimals: 7,
             gas_units: v.gas_units,
             conversion_units: 0,
             spent_units: v.spent_units,
@@ -492,25 +506,23 @@ impl Wallet {
             } else {
                 BytesN::from_array(env, &[9; 32])
             },
-            expense: v.priced.then(|| expense.to_xdr(env)),
+            expense: if v.priced {
+                AllowitExpense::Priced(expense)
+            } else {
+                AllowitExpense::Unpriced
+            },
             policy_instance: b.policy_instance,
             operation_id: BytesN::from_array(env, &id),
             nonce: s.nonce,
             deployment_version: s.deployment_version,
             expires_at: v.expires_at,
             args: args(env, v),
-            invocation: AllowitPolicyInvocation {
-                module_digest: b.module_digest,
-                entrypoint: b.entrypoint,
-                argument_schema_digest: b.argument_schema_digest,
-                arguments: AllowitSep41TransferArgs {
-                    token: self.universe[v.asset].clone(),
-                    from: self.f.wallet.clone(),
-                    to: self.universe[v.recipient].clone(),
-                    amount: v.amount,
-                }
-                .to_xdr(env),
-            },
+            module_digest: b.module_digest,
+            operation: AllowitStellarOperation::Transfer(AllowitTransferArgs {
+                token: self.universe[v.asset].clone(),
+                to: self.universe[v.recipient].clone(),
+                amount: v.amount,
+            }),
         }
     }
     fn execute(&self, e: &AllowitExecutionRequest) -> Result<(), u32> {
@@ -622,7 +634,7 @@ fn one_vector_set_has_matching_outcomes_on_host_custom_standard_and_simple() {
             }
         }
     }
-    assert_eq!(realized, 48);
+    assert_eq!(realized, 49);
     // The deployed catching Wasm let these continue after a caught rule error and wrote its key.
     for name in ["over_day_spent_cap", "over_day_spent_cap_counted_once"] {
         assert!(caught.contains(&name), "{name} {caught:?}");
@@ -635,7 +647,6 @@ fn kernel_violations_reject_identically_in_every_contract() {
     let v = vectors::base();
     assert!(realizable(&v));
     for wallet in TIERS.map(Wallet::new) {
-        let env = &wallet.f.env;
         let tier = wallet.tier;
         let reject = |change: &dyn Fn(&mut AllowitExecutionRequest), paused: bool| {
             wallet.seed(&v, paused);
@@ -644,11 +655,8 @@ fn kernel_violations_reject_identically_in_every_contract() {
             wallet.execute(&e)
         };
         let transfer = |e: &mut AllowitExecutionRequest,
-                        edit: &dyn Fn(&mut AllowitSep41TransferArgs)| {
-            let mut args =
-                AllowitSep41TransferArgs::from_xdr(env, &e.invocation.arguments).unwrap();
-            edit(&mut args);
-            e.invocation.arguments = args.to_xdr(env);
+                        edit: &dyn Fn(&mut AllowitTransferArgs)| {
+            edit(transfer_args(e))
         };
         let other = wallet.universe[vectors::OTHER].clone();
         let asset = |e: &mut AllowitExecutionRequest| transfer(e, &|a| a.token = other.clone());

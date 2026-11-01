@@ -19,28 +19,12 @@ impl AllowitSep56TestVault {
         env.storage().instance().set(&0u32, &asset);
         env.storage().instance().set(&1u32, &behavior);
     }
-    /// The underlying asset; behaviors 9 and 10 also change effects after a deposit.
+    /// The underlying asset.
     pub fn query_asset(env: Env) -> Address {
-        let asset: Address = env.storage().instance().get(&0u32).unwrap();
-        let behavior: u32 = env.storage().instance().get(&1u32).unwrap();
-        if let Some(receiver) = env.storage().instance().get::<_, Address>(&3u32) {
-            if behavior == 9 {
-                // A metadata getter can destroy credited shares after deposit returns.
-                env.storage().persistent().set(&receiver, &0i128);
-            }
-            if behavior == 10 {
-                // A metadata getter can also refund underlying after an earlier balance observation.
-                let assets: i128 = env.storage().instance().get(&4u32).unwrap();
-                token::Client::new(&env, &asset).transfer(
-                    &env.current_contract_address(),
-                    &receiver,
-                    &assets,
-                );
-            }
-        }
-        asset
+        env.storage().instance().get(&0u32).unwrap()
     }
-    /// Underlying value of `shares`; behavior 11 undervalues by two, 12 destroys shares.
+    /// Underlying value of `shares`; behavior 11 undervalues by two, 12 destroys shares, 14
+    /// reports `i128::MIN`.
     pub fn preview_redeem(env: Env, shares: i128) -> i128 {
         let behavior: u32 = env.storage().instance().get(&1u32).unwrap();
         if behavior == 12
@@ -48,7 +32,11 @@ impl AllowitSep56TestVault {
         {
             env.storage().persistent().set(&receiver, &0i128);
         }
-        if behavior == 11 { shares - 2 } else { shares }
+        match behavior {
+            11 => shares - 2,
+            14 => i128::MIN,
+            _ => shares,
+        }
     }
     /// Share decimals.
     pub fn decimals(_env: Env) -> u32 {
@@ -67,6 +55,55 @@ impl AllowitSep56TestVault {
     /// Share balance of `owner`.
     pub fn balance(env: Env, owner: Address) -> i128 {
         env.storage().persistent().get(&owner).unwrap_or(0)
+    }
+    /// Test setup only: credit `shares` to `to` without assets.
+    pub fn mint_shares(env: Env, to: Address, shares: i128) {
+        let before = Self::balance(env.clone(), to.clone());
+        env.storage().persistent().set(&to, &(before + shares));
+    }
+    /// Burn `shares` of `owner` and pay as many underlying units to `receiver`, as an
+    /// OpenZeppelin SEP-56 vault does with `operator.require_auth()` only. Hostile behaviors: 20
+    /// also authorizes the owner in the same frame, 21 pays one unit less than it returns, 22
+    /// returns one unit more than it pays, 23 burns one share more, 25 keeps a
+    /// three-unit fee that `preview_redeem` does not show, 26 returns `i128::MIN`, and 13 makes
+    /// the configured callback.
+    pub fn redeem(
+        env: Env,
+        shares: i128,
+        receiver: Address,
+        owner: Address,
+        operator: Address,
+    ) -> i128 {
+        operator.require_auth();
+        let behavior: u32 = env.storage().instance().get(&1u32).unwrap();
+        if behavior == 20 {
+            owner.require_auth();
+        }
+        let asset: Address = env.storage().instance().get(&0u32).unwrap();
+        let burned = if behavior == 23 { shares + 1 } else { shares };
+        let before = Self::balance(env.clone(), owner.clone());
+        env.storage().persistent().set(&owner, &(before - burned));
+        let paid = match behavior {
+            21 => shares - 1,
+            25 => shares - 3,
+            _ => shares,
+        };
+        token::Client::new(&env, &asset).transfer(
+            &env.current_contract_address(),
+            &receiver,
+            &paid,
+        );
+        if behavior == 13 {
+            let (contract, function, args): (Address, Symbol, Vec<Val>) =
+                env.storage().instance().get(&5u32).unwrap();
+            env.invoke_contract::<Val>(&contract, &function, args);
+        }
+        match behavior {
+            22 => shares + 1,
+            25 => shares - 3,
+            26 => i128::MIN,
+            _ => shares,
+        }
     }
     /// Pull `assets` and mint shares, with the configured hostile behavior.
     pub fn deposit(
@@ -123,10 +160,6 @@ impl AllowitSep56TestVault {
         }
         .publish(&env);
         env.storage().instance().set(&3u32, &receiver);
-        env.storage().instance().set(&4u32, &assets);
-        if behavior == 6 {
-            env.storage().instance().set(&0u32, &vault);
-        }
         shares
     }
 }

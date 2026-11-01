@@ -7,8 +7,11 @@ pub const ASSET: usize = 0;
 pub const RECIPIENT: usize = 1;
 pub const VAULT: usize = 2;
 pub const OTHER: usize = 3;
+pub const EXCHANGE: usize = 4;
+/// A second token, which a swap buys or sells against the asset.
+pub const TOKEN: usize = 5;
 /// Universe size.
-pub const ADDRESSES: usize = 4;
+pub const ADDRESSES: usize = 6;
 /// UTC day length in seconds.
 const SECONDS_PER_DAY: u64 = 86_400;
 /// Request time of the base vector.
@@ -46,9 +49,18 @@ pub enum Ops {
     List(Vec<&'static str>),
 }
 
-/// An `operations` entry for one function of one contract: `custom:<contract>.<function>`.
-pub const POOL_CLAIM: &str =
-    "custom:CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.claim";
+/// The native operation of a vector.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Op {
+    Transfer,
+    Deposit,
+    Swap,
+    Redeem,
+}
+
+/// An `operations` entry for one function of one contract: `custom:<contract>.<function>`. The
+/// contract text is rail-neutral, so both backends accept it.
+pub const POOL_CLAIM: &str = "custom:pool.claim";
 
 /// One rule input: params, current state before the operation, and request with its args.
 /// A `None` param is absent.
@@ -73,10 +85,16 @@ pub struct Vector {
     pub day_unpriced: bool,
     /// The catching policy's own state key, if set.
     pub over: Option<u64>,
-    pub deposit: bool,
+    pub op: Op,
     pub asset: usize,
     pub recipient: usize,
     pub amount: i128,
+    /// The token that leaves the wallet and its exact units.
+    pub token_in: usize,
+    pub amount_in: i128,
+    /// The token that the wallet receives back and its minimum units.
+    pub token_out: Option<usize>,
+    pub min_out: i128,
     pub now: u64,
     pub expires_at: u64,
     pub spent_units: i128,
@@ -113,10 +131,14 @@ pub fn base() -> Vector {
         day_total: 3,
         day_unpriced: false,
         over: None,
-        deposit: false,
+        op: Op::Transfer,
         asset: ASSET,
         recipient: RECIPIENT,
         amount: 40,
+        token_in: ASSET,
+        amount_in: 40,
+        token_out: None,
+        min_out: 0,
         now: NOW,
         expires_at: NOW + 400,
         spent_units: 40,
@@ -129,6 +151,40 @@ pub fn base() -> Vector {
     }
 }
 
+/// Make `v` a deposit of its amount into the vault.
+fn deposit(v: &mut Vector) {
+    v.op = Op::Deposit;
+    v.recipient = VAULT;
+    v.token_out = Some(VAULT);
+    v.min_out = v.amount;
+}
+
+/// Make `v` a swap through the exchange that every rule admits: forward, 40 asset units for at
+/// least 37 of `TOKEN`, or reverse, 100 `TOKEN` units for at least 40 asset units, which count as
+/// its gross amount. A swap spends its 3-unit conversion bound.
+fn swap(v: &mut Vector, reverse: bool) {
+    v.op = Op::Swap;
+    v.recipient = EXCHANGE;
+    v.recipients = Some(vec![RECIPIENT, VAULT, EXCHANGE]);
+    v.tokens = Some(vec![ASSET, TOKEN]);
+    v.operations = Some(Ops::List(vec!["transfer", "swap", "redeem"]));
+    v.spent_units = 3;
+    (v.token_in, v.amount_in, v.token_out, v.min_out) = if reverse {
+        (TOKEN, 100, Some(ASSET), 40)
+    } else {
+        (ASSET, 40, Some(TOKEN), 37)
+    };
+}
+
+/// Make `v` a redeem of 30 vault shares for at least 40 asset units, its gross amount.
+fn redeem(v: &mut Vector) {
+    v.op = Op::Redeem;
+    v.recipient = VAULT;
+    v.operations = Some(Ops::List(vec!["redeem"]));
+    v.spent_units = 0;
+    (v.token_in, v.amount_in, v.token_out, v.min_out) = (VAULT, 30, Some(ASSET), 40);
+}
+
 fn edit(name: &'static str, change: fn(&mut Vector)) -> Vector {
     let mut v = base();
     v.name = name;
@@ -137,7 +193,8 @@ fn edit(name: &'static str, change: fn(&mut Vector)) -> Vector {
 }
 
 /// The shared vector set. Some vectors are host-only because the wallet kernel cannot produce
-/// them, such as a deposit into the transfer-only custom contract.
+/// them, such as an expired request or a negative amount. The wallet portability test also
+/// realizes only transfers; deposit, swap and redeem vectors run on the host backend there.
 pub fn vectors() -> Vec<Vector> {
     vec![
         base(),
@@ -157,18 +214,13 @@ pub fn vectors() -> Vec<Vector> {
             v.caps[3] = Some(45);
         }),
         edit("to_vault", |v| v.recipient = VAULT),
-        edit("deposit", |v| {
-            v.deposit = true;
-            v.recipient = VAULT;
-        }),
+        edit("deposit", deposit),
         edit("deposit_over_spent_cap", |v| {
-            v.deposit = true;
-            v.recipient = VAULT;
+            deposit(v);
             v.caps[1] = Some(44);
         }),
         edit("deposit_unset_spent_cap", |v| {
-            v.deposit = true;
-            v.recipient = VAULT;
+            deposit(v);
             v.caps[1] = None;
         }),
         edit("over_transaction_cap", |v| v.caps[0] = Some(39)),
@@ -245,9 +297,45 @@ pub fn vectors() -> Vec<Vector> {
             v.operations = Some(Ops::List(vec!["deposit"]))
         }),
         edit("deposit_only_deposits", |v| {
-            v.deposit = true;
-            v.recipient = VAULT;
+            deposit(v);
             v.operations = Some(Ops::List(vec!["deposit"]));
+        }),
+        // Swaps and redeems: the exchange and the vault are recipients, `tokens` also checks the
+        // token a swap trades against the asset, and a reverse swap or redeem counts its minimum
+        // asset output as its gross amount.
+        edit("swap", |v| swap(v, false)),
+        edit("reverse_swap", |v| swap(v, true)),
+        edit("swap_unlisted_exchange", |v| {
+            swap(v, false);
+            v.recipients = Some(vec![RECIPIENT, VAULT]);
+        }),
+        edit("swap_other_token_not_allowed", |v| {
+            swap(v, false);
+            v.tokens = Some(vec![ASSET]);
+        }),
+        edit("reverse_swap_other_token_not_allowed", |v| {
+            swap(v, true);
+            v.tokens = Some(vec![ASSET, OTHER]);
+        }),
+        edit("swap_not_in_operations", |v| {
+            swap(v, false);
+            v.operations = Some(Ops::List(vec!["transfer", "redeem"]));
+        }),
+        edit("swap_over_transaction_cap", |v| {
+            swap(v, false);
+            v.caps[0] = Some(39);
+        }),
+        edit("reverse_swap_floor_over_transaction_cap", |v| {
+            swap(v, true);
+            v.caps[0] = Some(39);
+        }),
+        edit("redeem", redeem),
+        edit("redeem_not_in_operations", |v| {
+            redeem(v);
+            v.operations = Some(Ops::List(vec!["transfer", "deposit", "swap"]));
+        }),
+        edit("only_swaps", |v| {
+            v.operations = Some(Ops::List(vec!["swap"]))
         }),
         edit("any_operation", |v| v.operations = Some(Ops::Text("*"))),
         // Custom-call forms never admit a native transfer.
@@ -263,6 +351,9 @@ pub fn vectors() -> Vec<Vector> {
         }),
         edit("unknown_operation", |v| {
             v.operations = Some(Ops::List(vec!["transfer", "pay"]))
+        }),
+        edit("custom_contract_not_alphanumeric", |v| {
+            v.operations = Some(Ops::List(vec!["transfer", "custom:po-ol.claim"]))
         }),
         // A custom param alone changes nothing; an `invoice` arg applies the invoice cap.
         edit("invoice_cap_without_invoice", |v| v.invoice_cap = Some(39)),

@@ -29,7 +29,7 @@ class ReleaseTests(unittest.TestCase):
         keys = [Keypair.from_raw_ed25519_seed(bytes([n]) * 32).public_key for n in range(1, 10)]
         self.plan = dict(schema=1, network='mainnet', network_passphrase=Network.PUBLIC_NETWORK_PASSPHRASE,
             source_revision=release.DEFAULT_REVISION,
-            policy_source_digest=release.digest(release.SMOKE_SOURCE), artifact_manifest='manifest.json',
+            artifact_manifest='manifest.json',
             owner=keys[0], admin=keys[1], agent=keys[2], recipient=keys[3], forbidden_recipient=keys[4], admin_members=keys[5:8], server=keys[8], asset=Asset.native().contract_id(Network.PUBLIC_NETWORK_PASSPHRASE), policy_instance='01'*32,
             params=dict(recipients=[keys[3]], transaction_cap=10000, day_total_cap=20020000, spent_cap=20020000, call_cap=2, expiry=2000000000),
             fund_stroops=20000, payment_stroops=10000, fee_caps_stroops=dict.fromkeys(release.STAGES, 10000000), total_fee_cap_stroops=70000000, artifacts={})
@@ -71,7 +71,8 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'schema 1'): self.load()
         del self.plan['codegen_revision']
         self.plan['policy_source_digest']='00'*32
-        with self.assertRaisesRegex(ValueError,'source differs'): self.load()
+        with self.assertRaisesRegex(ValueError,'schema 1'): self.load()
+        del self.plan['policy_source_digest']
 
     def test_reject_legacy_or_partial_param_names(self):
         for legacy in ('per_transfer','daily_limit','total_limit','max_calls','expires_at'):
@@ -178,8 +179,8 @@ class ReleaseTests(unittest.TestCase):
     def execution_packet(self):
         wallet=self.plan['asset']
         state=dict(nonce=0,deployment_version=0)
-        binding=dict(module_digest=self.hashes['wallet'],entrypoint='execute',argument_schema_digest=release.digest(release.SCHEMA))
-        request=release.execution(self.plan,wallet,state,binding,'ab'*32,90)
+        binding=dict(module_digest=self.hashes['wallet'])
+        request=release.execution(self.plan,state,binding,'ab'*32,90)
         tx=TransactionBuilder(Account(self.plan['agent'],1),Network.PUBLIC_NETWORK_PASSPHRASE,100).add_time_bounds(0,int(time.time())+300).append_invoke_contract_function_op(wallet,'execute',[request]).build()
         root=xdr.SorobanAuthorizedInvocation(xdr.SorobanAuthorizedFunction(xdr.SorobanAuthorizedFunctionType.SOROBAN_AUTHORIZED_FUNCTION_TYPE_CONTRACT_FN,contract_fn=tx.transaction.operations[0].host_function.invoke_contract),[])
         source=xdr.SorobanAuthorizationEntry(xdr.SorobanCredentials(xdr.SorobanCredentialsType.SOROBAN_CREDENTIALS_SOURCE_ACCOUNT),copy.deepcopy(root))
@@ -298,8 +299,8 @@ class ReleaseTests(unittest.TestCase):
                 token=scval.to_string('XLM'),deployment_version=scval.to_uint64(0),nonce=scval.to_uint64(0),paused=scval.to_bool(False)))
         binding=scval.to_struct(dict(engine_kind=scval.to_symbol(release.WALLET_KIND),contract_version=scval.to_uint32(release.ca.WALLET_CONTRACT_VERSION),
             policy_instance=scval.to_bytes(bytes.fromhex(self.plan['policy_instance'])),module_digest=scval.to_bytes(bytes.fromhex(self.hashes['wallet'])),
-            source_digest=scval.to_bytes(bytes.fromhex(expected['source_digest'])),argument_schema_digest=scval.to_bytes(hashlib.sha256(release.SCHEMA).digest()),
-            entrypoint=scval.to_symbol('execute')))
+            source_digest=scval.to_bytes(bytes.fromhex(expected['source_digest'])),
+            operations=scval.to_vec([scval.to_vec([scval.to_symbol(op)]) for op in ('transfer','swap','deposit','redeem')])))
         hashes={wallet:self.hashes['wallet'],parent:self.hashes['parent'],engine:self.hashes['engine']}
         def run(rules):
             def rpc(network,method,params=None):
@@ -323,26 +324,37 @@ class ReleaseTests(unittest.TestCase):
         for rules in (release.RULES[::-1],release.RULES[:-1],release.RULES+['tokens']):
             with self.assertRaisesRegex(ValueError,'params differ'): run(rules)
 
-    def test_prefix_digest_matches_the_contract_vector(self):
-        # crates/policy-wallet/src/sep56_tests.rs standard_prefix_digest_matches_independent_xdr_vector_and_binds_context
+    def test_prefix_digest_hashes_its_documented_tuple(self):
+        # The contract's definition, also checked in crates/policy-wallet/src/sep56_tests.rs: SHA-256 of
+        # the XDR vector (domain, kind, module, asset, rules), each rule a one-symbol vector.
         asset='CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ'
-        expected=bytes([66,101,232,202,129,105,213,21,159,38,227,129,92,65,30,68,142,108,9,16,21,190,226,11,50,204,7,142,89,244,155,255]).hex()
+        def symbol(name): return xdr.SCVal(xdr.SCValType.SCV_SYMBOL,sym=xdr.SCSymbol(name.encode()))
+        def vector(items): return xdr.SCVal(xdr.SCValType.SCV_VEC,vec=xdr.SCVec(items))
+        rules=vector([vector([symbol('spent_cap')]),vector([symbol('recipients')])])
+        tuple_=vector([symbol('allowit_std_prefix'),symbol('common_policy_engine'),xdr.SCVal(xdr.SCValType.SCV_BYTES,bytes=xdr.SCBytes(bytes([1])*32)),
+                       xdr.SCVal(xdr.SCValType.SCV_ADDRESS,address=Address(asset).to_xdr_sc_address()),rules])
+        expected=hashlib.sha256(tuple_.to_xdr_bytes()).hexdigest()
         self.assertEqual(release.prefix_digest('common_policy_engine','01'*32,asset,['spent_cap','recipients']),expected)
         self.assertNotEqual(release.prefix_digest('common_policy_engine','01'*32,asset,['recipients','spent_cap']),expected)
 
     def test_execution_binds_full_source_and_conservative_xlm_expense(self):
         state=dict(nonce=3,deployment_version=1)
-        binding=dict(module_digest=self.hashes['wallet'],entrypoint='execute',argument_schema_digest=release.digest(release.SCHEMA))
-        request=scval.from_struct(release.execution(self.plan,self.plan['asset'],state,binding,'ab'*32,90,day=7))
-        self.assertEqual(scval.to_native(request['source_hash']).hex(),self.plan['policy_source_digest'])
-        raw=scval.to_native(request['expense'])
-        cost={k:scval.to_native(v) for k,v in scval.from_struct(xdr.SCVal.from_xdr_bytes(raw)).items()}
+        binding=dict(module_digest=self.hashes['wallet'])
+        request=scval.from_struct(release.execution(self.plan,state,binding,'ab'*32,90,day=7))
+        self.assertEqual(scval.to_native(request['source_hash']),hashlib.sha256(release.SMOKE_SOURCE).digest())
+        priced,bounds=scval.from_enum(request['expense'])
+        self.assertEqual(priced,'Priced')
+        cost={k:scval.to_native(v) for k,v in scval.from_struct(bounds).items()}
         self.assertEqual(cost['gas_units'],10000000)
         self.assertEqual(cost['max_fee_stroops'],10000000)
         self.assertEqual(cost['spent_units'],10010000)
         self.assertEqual(cost['conversion_units'],0)
-        self.assertEqual((cost['decimals'],cost['observed_ledger'],cost['day']),(7,90,7))
-        self.assertEqual(xdr.SCVal.from_xdr_bytes(raw).to_xdr_bytes(),raw)
+        self.assertEqual((cost['observed_ledger'],cost['day']),(90,7))
+        name,transfer=scval.from_enum(request['operation'])
+        self.assertEqual(name,'Transfer')
+        self.assertEqual({k:scval.to_native(v) for k,v in scval.from_struct(transfer).items()},
+                         dict(token=Address(self.plan['asset']),to=Address(self.plan['recipient']),amount=self.plan['payment_stroops']))
+        self.assertEqual(scval.to_native(request['module_digest']).hex(),self.hashes['wallet'])
 
 
 if __name__=='__main__': unittest.main()

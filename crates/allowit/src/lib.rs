@@ -53,7 +53,7 @@
 //! Types and rule logic are written once in `core.rs` and compiled per backend. Each backend binds
 //! `Address`, `AllowitEnv`, `Map`, `String`, `Symbol` and `Vec`. Feature `soroban` (default) uses
 //! host values, contract types and the Soroban `Env`, and buffers policy writes in contract
-//! temporary storage until `post_flight`. Feature `std` uses StrKey addresses, heap maps and
+//! temporary storage until `post_flight`. Feature `std` uses text addresses, heap maps and
 //! vectors, and a host `AllowitEnv` that buffers policy writes. The selected backend backs the
 //! crate root, which authored policy names.
 //!
@@ -66,8 +66,9 @@
 //! with `overflow-checks = true`, as the contract release profile does, so that integer overflow
 //! in authored code panics and denies on both backends instead of wrapping on the host.
 //!
-//! Crate boundary: `core.rs` with the host backend becomes `sdk/core`; the Soroban backend with
-//! the policy wallet crates becomes `stellar/core`.
+//! Crate boundary: `core.rs` with the host backend becomes `sdk/core`; the Soroban backend moves
+//! with the policy wallet crates. `core.rs` names only general operations: each rail maps its
+//! native operations onto `AllowitOperation`.
 //!
 //! ```
 //! use allowit::prelude::*;
@@ -89,11 +90,11 @@
 //! ```
 //!
 //! A policy never re-enters the wallet. `reentry_transfer` exists only on rails that implement
-//! it; Stellar has none, so a policy that calls it does not compile:
+//! it; neither backend here has it, so a policy that calls it does not compile:
 //!
 //! ```compile_fail,E0425
 //! use allowit::prelude::*;
-//! /// A policy that re-enters the wallet does not build on Stellar.
+//! /// A policy that re-enters the wallet does not build onchain.
 //! pub fn execute(ctx: &AllowitContext) -> allowit::Result {
 //!     allowit::reentry_transfer(ctx, 1)?;
 //!     Ok(())
@@ -183,6 +184,11 @@ pub mod soroban {
         Some(bytes)
     }
 
+    /// The text of an address: its StrKey.
+    fn address_text(address: &Address) -> String {
+        address.to_string()
+    }
+
     /// Abort the whole contract call with contract error `error`. Every write of the call rolls back.
     fn fail(env: &AllowitEnv, error: AllowitError, _key: &str) -> ! {
         env.panic_with_error(error)
@@ -264,33 +270,34 @@ pub mod soroban {
     }
 }
 
-/// Host backend for the offchain server and SDK evaluator. Addresses are StrKey strings.
+/// Host backend for the offchain server and SDK evaluator. Addresses are text that the rail
+/// supplies.
 #[cfg(feature = "std")]
 pub mod host {
     use alloc::collections::BTreeMap;
     pub use alloc::{string::String, vec::Vec};
     use std::sync::{Arc, Mutex, MutexGuard};
 
-    /// Exact Stellar account or contract identity, held as its StrKey text. It compares only for
-    /// equality. Soroban orders addresses by `ScAddress`, so accounts sort before contracts, while
-    /// text would sort by StrKey; `Address` therefore has no order on the host, and authored code
-    /// that orders addresses fails the std-only compile.
+    /// Exact account or contract identity, held as the text that its rail supplies. It compares
+    /// only for equality. The onchain backend orders addresses by type, so accounts sort before
+    /// contracts, while text would sort by its characters; `Address` therefore has no order on the
+    /// host, and authored code that orders addresses fails the std-only compile.
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub struct Address(String);
 
     impl Address {
-        /// The address with this StrKey text. The server supplies a validated StrKey.
-        pub fn new(strkey: impl Into<String>) -> Self {
-            Self(strkey.into())
+        /// The address with this text. The rail supplies text that it has validated.
+        pub fn new(text: impl Into<String>) -> Self {
+            Self(text.into())
         }
 
-        /// The StrKey text of this address.
+        /// The text of this address.
         pub fn as_str(&self) -> &str {
             &self.0
         }
     }
 
-    /// Host map: keys are text checked like Soroban `Symbol`s.
+    /// Host map: keys are text checked like onchain map keys.
     type Map<K, V> = BTreeMap<K, V>;
     /// Host map key.
     type Symbol = String;
@@ -399,6 +406,11 @@ pub mod host {
         (text.len() <= MAX_TEXT as usize).then_some(text.as_bytes())
     }
 
+    /// The text of an address, as its rail supplied it.
+    fn address_text(address: &Address) -> String {
+        String::from(address.as_str())
+    }
+
     /// Record `error` for `evaluate` and panic with a message that names it and `key`.
     #[track_caller]
     fn fail(env: &AllowitEnv, error: AllowitError, key: &str) -> ! {
@@ -427,7 +439,7 @@ pub mod host {
         }
     }
 
-    /// Run `check` on each value of `map`. A key that no Soroban map could hold is `InvalidParam`.
+    /// Run `check` on each value of `map`. A key that no backend map holds is `InvalidParam`.
     fn each_value(map: &AllowitMap, mut check: impl FnMut(AllowitValue) -> Result) -> Result {
         for (key, value) in map {
             if !key_ok(key) {
@@ -463,7 +475,7 @@ pub mod host {
 
     /// Server-only enrichment. Each function takes its owner-written request, returns its passing
     /// constraint or an `AllowitError`, and is an API stub that the offchain server fills; here it
-    /// is `Unsupported`. The Soroban backend has none of them, so onchain policy cannot call one.
+    /// is `Unsupported`. The onchain backend has none of them, so onchain policy cannot call one.
     pub mod server {
         use super::{Address, AllowitContext, AllowitError, AllowitValue, Result};
 

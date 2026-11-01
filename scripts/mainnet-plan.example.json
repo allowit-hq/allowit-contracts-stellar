@@ -3,7 +3,6 @@
   "network": "mainnet",
   "network_passphrase": "Public Global Stellar Network ; September 2015",
   "source_revision": "REPLACE_REVIEWED_LAYOUT_4_REVISION",
-  "policy_source_digest": "7093245bda56b43e684a478454b5fcbaa60c64fedc13abb9d5dc246f4cfd80fa",
   "artifact_manifest": "manifest.json",
   "artifacts": {
     "engine": {
