@@ -72,7 +72,7 @@ SHA-256 of that file. Owner `deploy_policy` packets take the same two options fo
 Every tier requires one self-contained, portable source file. The tooling rejects every
 construct listed in [One portable policy source](architecture.md#one-portable-policy-source), such
 as macros other than the assertion and `matches!` macros, writes to `ctx.env`, the map inside params
-and args, list methods, indexing and pointer-width methods. Simple and Common store only standard
+and args, list methods, indexing other than `ctx.params[key]` and pointer-width methods. Simple and Common store only standard
 state, so the tool rejects their packets when the source calls `allowit::set_state`. It also runs the std-only
 compile described there, so it needs `rustc`. For `--tier custom`, also build the
 reviewed custom Wasm from the same file, which is the Soroban compile.
@@ -91,9 +91,9 @@ own keys, such as `vendor_cap`. A Custom policy state holds at most 39 keys, the
 and 32 policy keys, and 16 KiB counted the same way. No call deletes a state key, and
 `deploy_policy` keeps the state, so a policy write past either bound denies every operation that
 makes it. The standard
-preflight skips an absent selected rule; full policy code denies it. The tool accepts such a packet and prints a warning.
+preflight skips an absent selected rule; full policy code stops with `MissingParam` when it reads it. The tool accepts such a packet and prints a warning.
 Legacy names such as `per_transfer`, `daily_limit` or `max_calls` reject on the standard tiers.
-Negative caps reject at standard configuration. Code changes defer the new tier validation to
+Negative limits reject at standard configuration. Code changes defer the new tier validation to
 delegated admission.
 Duplicate JSON keys reject. Fund the wallet only with its
 installed asset. `recover` transfers only that asset. A forward swap can leave the wallet holding

@@ -36,7 +36,7 @@ Pick **Simple** when your server already runs the whole policy and you want the 
 
 ### The canonical rules
 
-The canonical rules live in `crates/allowit`. Each rule reads one value that the policy looks up in the owner's `params` map, and returns its passing constraint or an error. The standard contract admits only these nine keys, runs only the rules the owner lists, in that order, and skips a rule whose param is absent. An empty list means no onchain business checks, like Simple.
+The canonical rules live in `crates/allowit`. Each rule takes one value that the policy reads by key from the owner's `params`, such as `&ctx.params[allowit::DESTINATIONS]`, and returns its passing constraint or an error. The standard contract admits only these nine keys, runs only the rules the owner lists, in that order, and skips a rule whose param is absent. An empty list means no onchain business checks, like Simple.
 
 | Rule and param key | What it does |
 | --- | --- |
@@ -62,18 +62,19 @@ use allowit::prelude::*;
 /// I approve.
 pub fn execute(ctx: &AllowitContext) -> allowit::Result {
     // "Cap every payment"
-    allowit::payment_limit(ctx, ctx.params.get(allowit::PAYMENT_LIMIT))?;
+    allowit::payment_limit(ctx, &ctx.params[allowit::PAYMENT_LIMIT])?;
     // "cap its total spending"
-    allowit::lifetime_spending_limit(ctx, ctx.params.get(allowit::LIFETIME_SPENDING_LIMIT))?;
+    allowit::lifetime_spending_limit(ctx, &ctx.params[allowit::LIFETIME_SPENDING_LIMIT])?;
     // "pay only vendors I approve"
-    allowit::destinations(ctx, ctx.params.get(allowit::DESTINATIONS))?;
+    allowit::destinations(ctx, &ctx.params[allowit::DESTINATIONS])?;
     Ok(())
 }
 ```
 
 - `execute(ctx)` takes only the context. `AllowitContext` is plain data: the backend `env`, the owner's `params`, the current policy `state` and the `request`.
 - `params` and `request.args` are key => `AllowitValue` maps. The owner sets params at install and changes them by signed update. The agent supplies args per call.
-- A rule takes the looked-up value, so it may read any key, such as a custom `vendor_cap`.
+- Policy reads a param by key: `ctx.params[allowit::DESTINATIONS]` or `ctx.params["destinations"]`. An unset key stops the run with `MissingParam`. `ctx.params.contains(key)` and `ctx.request.args.contains(key)` tell whether a key is set.
+- A rule takes the param value, so it may read any key, such as `&ctx.params["vendor_cap"]`.
 - Only an error that the policy returns denies. A policy may catch a rule error and continue.
 - `allowit::param(ctx, key)` and `allowit::arg(ctx, key)` return the typed value of an owner param or an agent arg. They panic when the key is missing or mistyped. A panic denies the run and discards its writes.
 - After approval the wallet and the server run the same `allowit::post_flight`. It updates the standard state keys and applies the policy's `allowit::set_state` writes. Simple and Common never add or change a policy key, so their post-flight denies every policy write, on the server as onchain. Policy keys left by earlier Custom code stay unchanged.
