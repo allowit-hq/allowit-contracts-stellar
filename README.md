@@ -95,9 +95,9 @@ A separate **engine parent** contract can manage the code of a shared rule-check
 
 ## How an operation happens
 
-1. The agent builds an `AllowitExecutionRequest`: the wallet's policy identity and source hash, a fresh operation id, the wallet's current nonce and deployment version, an expiry, the exact SEP-41 transfer, SEP-56 deposit or redeem, or router swap arguments, optional expense bounds and its per-call `args`.
+1. The agent builds an `AllowitExecutionRequest`: the wallet's policy identity, source hash and module hash, a fresh operation id, the wallet's current nonce and deployment version, an expiry, the typed `operation` with its named arguments, expense bounds or `Unpriced`, and its per-call `args`. The operation is a `Transfer` (`token`, `to`, `amount`), a `Swap` (`router`, `amount_in`, `amount_out_min`, `path`, `deadline`), a `Deposit` (`vault`, `assets`, `min_shares`) or a `Redeem` (`vault`, `shares`, `min_assets`). The wallet is always the source, receiver and operator, so no argument names it.
 2. Agent and server both authorize `execute`.
-3. The wallet checks everything before it runs the policy: the installed module, entrypoint and argument schema; canonical argument encoding; the installed asset and the wallet as source; no replay of the operation id; not paused; nonce and deployment version current; not expired; positive amount; recipient is neither the wallet nor the issuer.
+3. The wallet checks everything before it runs the policy: an operation that this wallet runs; the policy identity and installed module; the installed asset; well-formed vaults, routers and paths; no replay of the operation id; not paused; nonce and deployment version current; not expired; positive amount; recipient is neither the wallet nor the issuer. Rules see only the general operation `transfer`, `swap`, `deposit` or `redeem`.
 4. The wallet runs its local policy (custody checks only on Simple, the standard prefix on Common, the compiled file on Custom) against the params and the current policy state.
 5. The post-flight state, the next nonce and the replay marker are written, then the token transfer, vault deposit or redeem, or router swap runs. A deposit grants the vault exactly one `transfer` of the checked amount and checks the returned shares. A swap grants the router exactly one `transfer` of `amount_in` to its pair and checks both token balances. A redeem checks the burned shares and the asset credit against `min_assets`. Everything commits together and a receipt comes back. If anything fails, nothing moves.
 
@@ -118,7 +118,7 @@ You need:
 git clone https://github.com/allowit-hq/allowit-contracts-stellar.git
 cd allowit-contracts-stellar
 
-python3 scripts/check-policy-bindings.py  # verify the custom policy argument schema binding
+python3 scripts/check-policy-bindings.py  # verify the custom policy source binding
 scripts/build-contracts.sh                # build the test fixtures and every Wasm
 cargo test --workspace --locked           # authorization, custody and portability regressions
 ```
@@ -155,7 +155,6 @@ __constructor(config)                         owner
 state()                                       anyone
 policy_state()                                anyone
 policy_binding()                              anyone
-policy_binding_for(argument_schema_digest)    anyone
 deposit_receipt(operation_id)                 anyone
 swap_receipt(operation_id)                    anyone
 redeem_receipt(operation_id)                  anyone

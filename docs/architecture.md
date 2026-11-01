@@ -28,7 +28,7 @@ structs and their generated clients carry it too: `AllowitSimplePolicyEngine`,
 as `allowit::Result`, `allowit::spent_cap` and `allowit::TRANSACTION_CAP`.
 
 Encodings carry struct field names and enum variant symbols, not type names. The prefix therefore
-leaves signed encodings, the standard prefix digest test vector and the stored layout unchanged.
+leaves signed encodings, the standard prefix digest and the stored layout unchanged.
 Type names are in the Wasm contract spec, so rebuilt Wasm has new module hashes and, because the
 standard `source_digest` hashes the module, new prefix-binding digests.
 
@@ -514,18 +514,24 @@ process keeps running.
 
 ## Source and configuration binding
 
-Fixed standard `source_digest` is SHA-256 of canonical XDR containing the domain
-`allowit_std_prefix`, implementation kind, actual module hash, immutable SAC, the transfer, deposit,
-router swap and redeem schema hashes and the ordered `Vec<AllowitRule>`. Each unit variant encodes as a one-symbol vector of its rule
-name; the param it reads is always its canonical key. It excludes param values and full source.
-The constructor and binding getter check it against the actual runtime module.
+Fixed standard `source_digest` is SHA-256 of the canonical XDR vector of the domain
+`allowit_std_prefix`, the implementation kind, the actual module hash, the immutable SAC and the
+ordered `Vec<AllowitRule>`. Each unit variant encodes as a one-symbol vector of its rule name; the
+param it reads is always its canonical key. It excludes param values and full source. The module
+hash fixes the operations that the code runs. The constructor and binding getter check the digest
+against the actual runtime module.
 
 Custom `source_digest` is the plain SHA-256 of the exact bytes of `crates/custom-policy/policy/policy.rs`.
 `build.rs` computes `SOURCE_HASH` from the file that the contract compiles verbatim, so they
-cannot drift. `ARGUMENT_SCHEMA_HASH`, `SWAP_SCHEMA_HASH` and `REDEEM_SCHEMA_HASH` admit
-`stellar::sep41_transfer`, `stellar::router_swap_exact_in` and `stellar::sep56_redeem`; Custom admits
-no deposit. The compiled policy's `operations` rule selects among them. The contract does not depend
-on SDK-generated code. `scripts/check-policy-bindings.py` checks the schema bindings.
+cannot drift. `AllowitCustom::OPERATIONS` lists transfer, swap and redeem; Custom runs no deposit.
+The compiled policy's `operations` rule selects among them. The contract does not depend on
+SDK-generated code. `scripts/check-policy-bindings.py` checks that the contract compiles and hashes
+its source verbatim.
+
+Every digest is computed from its definition, never typed in as a constant: `build.rs` hashes the
+policy source at build time, the wallet hashes the prefix tuple when the owner configures it and on
+every binding check, and the host reports the module hash. Tests recompute each digest from the
+same definition.
 
 The complete source has separate offline owner authorization, scoped to wallet, network, policy,
 prefix and monotonic source revision. Changing only that offchain suffix needs no chain call.
@@ -540,7 +546,7 @@ inflight packets. A changed prefix or executable requires a new owner binding.
 Owner packets bind their exact meaning. Struct decoding ignores extra keys and reads absent
 `Option` keys as `None`, so the constructor and `deploy_policy` require owner authorization for
 the canonical re-encoding of the decoded packet. A params map decodes as sent, so an absent key is
-unset. Bindings name the authored entrypoint `execute`. A packet with legacy, extra or absent keys fails
+unset. A packet with legacy, extra or absent keys fails
 authorization unless the owner signed that canonical form.
 
 `contract_version` 4 stores `params` and the free-form `policy_state` as key => `AllowitValue`
@@ -553,8 +559,8 @@ never locks recovery. `deploy_policy` carries `policy_state` over; an earlier la
 other values, so `deploy_policy` rejects it with `InvalidState`. No layout migrates implicitly: recover funds from an
 earlier layout and deploy a new wallet. A complete typed `deploy_policy` packet replaces params,
 rules and roles, keeps policy state, nonce, pause and asset, and writes version 4. Later versions
-reject even owner calls, because their kept fields may change meaning. New source and schema
-hashes need new owner bindings.
+reject even owner calls, because their kept fields may change meaning. New source hashes need new
+owner bindings.
 
 Earlier code reads State only in its own layout, so a `deploy_policy` code change from version 4
 to an earlier release permanently locks custody. Each
@@ -583,6 +589,43 @@ EngineState)`. Release 2 was never released. An `upgrade_engine` from a deployed
 engine to release 4 breaks every onchain caller of the earlier methods, so migrate or retire those
 callers first.
 
+## Typed operations
+
+`execute` and the intercepted door take one `AllowitExecutionRequest`. Its `operation` is an
+`AllowitStellarOperation`, whose variants carry named arguments:
+
+| Variant | Arguments | Native call |
+| --- | --- | --- |
+| `Transfer` | `token`, `to`, `amount` | SEP-41 `token.transfer(wallet, to, amount)` |
+| `Swap` | `router`, `amount_in`, `amount_out_min`, `path`, `deadline` | `router.swap_exact_tokens_for_tokens(amount_in, amount_out_min, path, wallet, deadline)` |
+| `Deposit` | `vault`, `assets`, `min_shares` | SEP-56 `vault.deposit(assets, wallet, wallet, wallet)` |
+| `Redeem` | `vault`, `shares`, `min_assets` | SEP-56 `vault.redeem(shares, wallet, wallet, wallet)` |
+
+The wallet is the source, owner, receiver and operator of every native call, so no argument names
+it. Soroban decodes the request as typed values: a wrong type, a missing argument or an unknown
+variant fails before the wallet runs. Struct decoding ignores an extra key, so a key such as a
+foreign `from` changes nothing. Agent and server sign the raw request through `require_auth` on
+`execute`, and the canonical encoding of the decoded request in `__check_auth`.
+
+`to_core()` maps each variant onto the general `AllowitOperation` that rules read: `transfer`,
+`swap`, `deposit` or `redeem`. The rail-neutral policy core never sees a SEP or router name. Each
+tier lists the operations it runs in `AllowitPolicy::OPERATIONS`, and `policy_binding().operations`
+reports them; a request for another operation is `UnsupportedOperation`. Simple and Common run all
+four; Custom runs transfer, swap and redeem.
+
+The request also carries `module_digest`, the wallet's Wasm SHA-256, so agent and server approve
+one exact executable, and `expense`, which is `Unpriced` or `Priced(AllowitExpenseBounds)`. In
+Stellar CLI JSON a transfer request is:
+
+```json
+{
+  "policy_instance": "0101…01", "source_hash": "0909…09", "operation_id": "0000…01",
+  "nonce": 0, "deployment_version": 0, "expires_at": 1767225600, "module_digest": "<wallet Wasm SHA-256>",
+  "operation": {"Transfer": {"token": "<asset SAC>", "to": "<recipient>", "amount": "100"}},
+  "expense": "Unpriced", "args": {}
+}
+```
+
 ## Expenses and native effects
 
 An external payment spends principal plus attributable gas. A deposit retains principal as shares.
@@ -590,24 +633,24 @@ Its conversion cost plus attributable gas counts toward spent limits. Daily tota
 plus separate gas; embedded conversion fees are not counted twice. Underlying units use seven
 decimals. Share units retain their independent native scale.
 
-`AllowitExecutionRequest.expense` is optional bounded canonical XDR of `AllowitExpenseBounds`: asset, decimals,
-gas units, conversion units, spent units, attributable fee ceiling, observation ledger and UTC day.
-Unknown fields, wrong types, noncanonical maps, extra data and oversized bytes reject.
-The server approves exact conservative economic ceilings. The kernel checks denomination, day,
+`AllowitExecutionRequest.expense` is `Unpriced` or `Priced(AllowitExpenseBounds)`. The bounds hold
+asset, decimals, gas units, conversion units, spent units, attributable fee ceiling, observation
+ledger and UTC day as typed fields. The server approves exact conservative economic ceilings. The kernel checks denomination, day,
 ledger, operation class, nonnegative units and the fee/gas identity. It cannot observe final
 transaction gas. XLM/stroop identity conversion is intrinsic; other gas conversions need an
 admitted trusted source. Onchain counters retain ceilings. The server separately settles actual
 expenses and temporary loss. No automatic onchain refund authority follows from that accounting.
 
 `execute` and the owner-enabled intercepted door require agent and server authority. The kernel
-checks source/module/schema, immutable asset, exact parties/amount, positive debit, pause, expiry,
-configuration version, execution nonce, single-use operation ID and the execution params' bounds
-independently of business checks.
-The intercepted door decodes its execution like `execute` and admits the canonical transfer, swap
-and redeem profiles, each only with its exact signed tree.
+checks the operation that the tier runs, policy identity, source and module, immutable asset,
+amounts, positive debit, pause, expiry, configuration version, execution nonce, single-use
+operation ID and the execution params' bounds independently of business checks.
+The intercepted door validates the same typed operation as `execute` and admits a transfer, swap
+or redeem, each only with its exact signed tree.
 State, effects and receipts commit atomically. Denials and native failures roll them back.
 
-SEP-56 deposits bind vault, assets, minimum shares and wallet source/operator/share receiver.
+SEP-56 deposits name vault, assets and minimum shares; the wallet is source, operator and share
+receiver.
 Ordinary `recipients` controls destination vaults; no separate vault list or code-hash pin applies.
 The vault must report the immutable underlying SAC. Custody authorizes one exact deeper
 `transfer(wallet, vault, assets)`. Extra debits, including a second debit later refunded, lack authority.
@@ -624,7 +667,8 @@ Owner `invoke` can redeem shares independently, and the agent can redeem them un
 
 A swap trades the asset for another token, or back, through an exact-input router such as
 Soroswap. A redeem burns SEP-56 vault shares for the asset. Both have two doors, and both doors run
-the same `decode_operation` and `admit`: the same invariants, rules, `post_flight` and state writes.
+the same `validate_operation` and `admit`: the same invariants, rules, `post_flight` and state
+writes.
 
 - **Intercepted.** The agent sends the plain call that a simple wallet would sign, and the wallet
   intercepts it in `__check_auth`:
@@ -646,18 +690,15 @@ the same `decode_operation` and `admit`: the same invariants, rules, `post_fligh
 
 ### Arguments and invariants
 
-`AllowitSwapArgs` (`allowit.stellar.router_swap_exact_in.v1`) holds `router`, `amount_in`,
-`amount_out_min`, `path`, `to` and `deadline`. `AllowitSep56RedeemArgs`
-(`allowit.stellar.sep56_redeem.v1`) holds `vault`, `shares`, `receiver`, `owner`, `operator` and
-`min_assets`. Both are canonical XDR in `invocation.arguments`, like transfers and deposits. The
-kernel checks, before any policy runs:
+`AllowitStellarOperation::Swap` holds `router`, `amount_in`, `amount_out_min`, `path` and
+`deadline`; `Redeem` holds `vault`, `shares` and `min_assets`. The wallet is the swap's receiver
+and the redeem's owner, operator and receiver. The kernel checks, before any policy runs:
 
-- Swap: `to` is the wallet; the router is neither the wallet nor the asset; the path holds 2 to
-  `MAX_SWAP_PATH` (4) tokens and not the wallet; exactly one endpoint is the asset; the other
-  endpoint is a Stellar Asset Contract (`UnsupportedAsset` otherwise); `amount_in` and
-  `amount_out_min` are positive; `deadline` is no later than `expires_at`.
-- Redeem: owner, operator and receiver are the wallet; the vault is neither the wallet nor the
-  asset; `shares` and `min_assets` are positive.
+- Swap: the router is neither the wallet nor the asset; the path holds 2 to `MAX_SWAP_PATH` (4)
+  tokens and not the wallet; exactly one endpoint is the asset; the other endpoint is a Stellar
+  Asset Contract (`UnsupportedAsset` otherwise); `amount_in` and `amount_out_min` are positive;
+  `deadline` is no later than `expires_at`.
+- Redeem: the vault is neither the wallet nor the asset; `shares` and `min_assets` are positive.
 
 A forward swap pays the asset; a reverse swap pays the other token and receives the asset. Only the
 asset leaves through transfers, deposits and forward swaps. A swap's other endpoint must be a
@@ -694,7 +735,7 @@ server co-signs at most one wallet entry per intercepted transaction. Such a vau
 ```
 agent tx: router.swap_exact_tokens_for_tokens(in, min, [asset, X], wallet, deadline)
   router: wallet.require_auth()  ->  wallet.__check_auth(payload, signature, [swap, transfer])
-            decode_operation -> match_contexts -> agent and server signatures -> admit
+            validate_operation -> match_contexts -> agent and server signatures -> admit
             (binding, replay, pause, nonce, version, expiry, expense, policy, post_flight)
             store state, nonce + 1 and the replay marker
   router: amounts.last() >= min, else the whole transaction rolls back
@@ -759,8 +800,8 @@ requires `preview - min(preview, assets) <= conversion_units`. The final read is
 
 Owner pause, configuration, recovery, upgrades and exact `invoke` bypass agent/server business checks
 and never call an engine. Owner authorization binds exact target, arguments and supplied subtrees.
-`policy_binding()` reports the default profile; `policy_binding_for(schema_digest)` checks another
-admitted profile. `state()` returns the custody State, and `policy_state()` the current policy
+`policy_binding()` reports the executable, the source binding and the operations that the wallet
+runs. `state()` returns the custody State, and `policy_state()` the current policy
 state map. Unknown stored layouts reject. Upgrades do not migrate state.
 
 Classic G-address multisig has no contract prefix enforcement. Owner-selected signer thresholds

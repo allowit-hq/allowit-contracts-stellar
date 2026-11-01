@@ -5,13 +5,10 @@ use allowit::{
     AllowitValue,
 };
 use allowit_wallet_protocol::{
-    ARGUMENT_SCHEMA_DESCRIPTOR, AllowitExecutionRequest, AllowitExpenseBounds,
-    AllowitPolicyBinding, AllowitSep41TransferArgs, AllowitSep56DepositArgs,
-    AllowitSep56DepositEvent, AllowitSep56DepositReceipt, AllowitSep56RedeemArgs,
-    AllowitSep56RedeemEvent, AllowitSep56RedeemReceipt, AllowitSwapArgs, AllowitSwapEvent,
-    AllowitSwapReceipt, AllowitTransferReceipt, MAX_ARGUMENT_BYTES, MAX_EXPENSE_BYTES,
-    MAX_SWAP_PATH, ROUTER_SWAP_SCHEMA_DESCRIPTOR, SEP56_DEPOSIT_SCHEMA_DESCRIPTOR,
-    SEP56_REDEEM_SCHEMA_DESCRIPTOR,
+    AllowitDepositArgs, AllowitExecutionRequest, AllowitExpenseBounds, AllowitPolicyBinding,
+    AllowitRedeemArgs, AllowitSep56DepositEvent, AllowitSep56DepositReceipt,
+    AllowitSep56RedeemEvent, AllowitSep56RedeemReceipt, AllowitStellarOperation, AllowitSwapArgs,
+    AllowitSwapEvent, AllowitSwapReceipt, AllowitTransferReceipt, MAX_SWAP_PATH,
 };
 use soroban_sdk::{
     Address, Bytes, BytesN, Env, Executable, IntoVal, Map, String, Symbol, TryFromVal, Val, Vec,
@@ -19,7 +16,7 @@ use soroban_sdk::{
     contracterror, contracttype,
     crypto::Hash,
     token,
-    xdr::{FromXdr, ToXdr},
+    xdr::ToXdr,
 };
 mod persistent;
 /// Instance-storage key of the custody State.
@@ -146,17 +143,12 @@ pub trait AllowitPolicy {
     const KIND: &'static str;
     /// Fixed standard implementations bind only their owner-approved initial preflight prefix.
     const STANDARD_PREFIX: bool = false;
+    /// The general operations that this implementation runs; transfers only unless it selects
+    /// more. The owner's `operations` param selects among them.
+    const OPERATIONS: &'static [AllowitOperation] = &[AllowitOperation::transfer];
     /// A bespoke implementation binds its compiled source. Fixed tiers use the owner's source digest.
     fn source_digest(_env: &Env) -> Option<BytesN<32>> {
         None
-    }
-    /// Default profile reported by policy_binding. Fixed tiers retain transfer as the default.
-    fn argument_schema_digest(env: &Env) -> BytesN<32> {
-        schema_digest(env, ARGUMENT_SCHEMA_DESCRIPTOR)
-    }
-    /// Admit only the compiled profile unless an implementation explicitly selects multiple native adapters.
-    fn admits_schema(env: &Env, digest: &BytesN<32>) -> bool {
-        *digest == Self::argument_schema_digest(env)
     }
     /// Check the owner-approved standard prefix. Only Common admits a nonempty list.
     fn validate(rules: &Vec<AllowitRule>) -> Result<(), AllowitWalletError> {
@@ -280,7 +272,10 @@ fn public_key(env: &Env, address: &Address) -> Result<BytesN<32>, AllowitWalletE
     encoded.slice(12..44).copy_into_slice(&mut key);
     Ok(BytesN::from_array(env, &key))
 }
-/// Pure standard-prefix binding. Param values and the owner-signed offchain suffix are excluded.
+/// Pure standard-prefix binding: SHA-256 of the canonical XDR of the domain `allowit_std_prefix`,
+/// the implementation kind, the module hash, the asset and the ordered rules. The module hash fixes
+/// the operations that the code runs. Param values and the owner-signed offchain suffix are
+/// excluded.
 pub fn standard_prefix_digest(
     env: &Env,
     kind: &Symbol,
@@ -295,10 +290,6 @@ pub fn standard_prefix_digest(
                 kind.clone(),
                 module.clone(),
                 asset.clone(),
-                schema_digest(env, ARGUMENT_SCHEMA_DESCRIPTOR),
-                schema_digest(env, SEP56_DEPOSIT_SCHEMA_DESCRIPTOR),
-                schema_digest(env, ROUTER_SWAP_SCHEMA_DESCRIPTOR),
-                schema_digest(env, SEP56_REDEEM_SCHEMA_DESCRIPTOR),
                 rules.clone(),
             )
                 .to_xdr(env),
@@ -367,21 +358,11 @@ fn decoded<T: IntoVal<Env, Val> + TryFromVal<Env, Val>>(
     }
     Ok(())
 }
-/// SHA-256 of a native argument schema descriptor.
-fn schema_digest(env: &Env, descriptor: &[u8]) -> BytesN<32> {
-    env.crypto()
-        .sha256(&Bytes::from_slice(env, descriptor))
-        .to_bytes()
-}
-/// The installed binding for one admitted argument schema.
-fn binding_for<P: AllowitPolicy>(
+/// The installed binding: executable, source binding and the operations that this code runs.
+fn binding<P: AllowitPolicy>(
     env: &Env,
     state: &AllowitState,
-    digest: BytesN<32>,
 ) -> Result<AllowitPolicyBinding, AllowitWalletError> {
-    if !P::admits_schema(env, &digest) {
-        return Err(AllowitWalletError::UnsupportedOperation);
-    }
     let Some(Executable::Wasm(module_digest)) = env.current_contract_address().executable() else {
         return Err(AllowitWalletError::InvalidState);
     };
@@ -393,30 +374,52 @@ fn binding_for<P: AllowitPolicy>(
     {
         return Err(AllowitWalletError::InvalidState);
     }
+    let mut operations = Vec::new(env);
+    for operation in P::OPERATIONS {
+        operations.push_back(operation.clone());
+    }
     Ok(AllowitPolicyBinding {
         engine_kind: Symbol::new(env, P::KIND),
         contract_version: CONTRACT_VERSION,
         policy_instance: state.policy_instance.clone(),
         module_digest,
         source_digest: state.source_digest.clone(),
-        argument_schema_digest: digest,
-        entrypoint: Symbol::new(env, "execute"),
+        operations,
     })
 }
-/// The installed binding for the default argument schema.
-fn binding<P: AllowitPolicy>(
-    env: &Env,
-    state: &AllowitState,
-) -> Result<AllowitPolicyBinding, AllowitWalletError> {
-    binding_for::<P>(env, state, P::argument_schema_digest(env))
-}
 
-/// Private native adapter dispatch. No opaque method, target or authorization tree is accepted.
-enum NativeOperation {
-    Transfer(AllowitSep41TransferArgs),
-    Deposit(AllowitSep56DepositArgs),
-    Swap(AllowitSwapArgs),
-    Redeem(AllowitSep56RedeemArgs),
+/// The one debit of an operation: `amount` of `token` leaves the wallet toward `to`. Deposits move
+/// `assets` to the vault, swaps move `amount_in` of the first path token toward the router, and
+/// redeems burn `shares` of the vault's share token.
+struct Debit {
+    token: Address,
+    to: Address,
+    amount: i128,
+}
+/// The debit of `operation` on a wallet of `asset`.
+fn debit(operation: &AllowitStellarOperation, asset: &Address) -> Debit {
+    match operation {
+        AllowitStellarOperation::Transfer(args) => Debit {
+            token: args.token.clone(),
+            to: args.to.clone(),
+            amount: args.amount,
+        },
+        AllowitStellarOperation::Swap(args) => Debit {
+            token: args.path.get_unchecked(0),
+            to: args.router.clone(),
+            amount: args.amount_in,
+        },
+        AllowitStellarOperation::Deposit(args) => Debit {
+            token: asset.clone(),
+            to: args.vault.clone(),
+            amount: args.assets,
+        },
+        AllowitStellarOperation::Redeem(args) => Debit {
+            token: args.vault.clone(),
+            to: args.vault.clone(),
+            amount: args.shares,
+        },
+    }
 }
 /// Request facts of one native operation, which rules read.
 struct Facts {
@@ -427,79 +430,42 @@ struct Facts {
     token_out: Option<Address>,
     min_out: i128,
 }
-impl NativeOperation {
-    /// The one debit of the operation as a transfer: deposits move `assets` to the vault, swaps
-    /// move `amount_in` of the first path token toward the router, and redeems burn `shares` of
-    /// the vault's share token.
-    fn debit(&self, asset: &Address) -> AllowitSep41TransferArgs {
-        match self {
-            Self::Transfer(args) => args.clone(),
-            Self::Deposit(args) => AllowitSep41TransferArgs {
-                token: asset.clone(),
-                from: args.from.clone(),
-                to: args.vault.clone(),
-                amount: args.assets,
-            },
-            Self::Swap(args) => AllowitSep41TransferArgs {
-                token: args.path.get_unchecked(0),
-                from: args.to.clone(),
-                to: args.router.clone(),
-                amount: args.amount_in,
-            },
-            Self::Redeem(args) => AllowitSep41TransferArgs {
-                token: args.vault.clone(),
-                from: args.owner.clone(),
-                to: args.vault.clone(),
-                amount: args.shares,
-            },
+/// The request facts of `operation`. A forward swap counts its asset input as the gross amount; a
+/// reverse swap and a redeem count their minimum asset output, a floor.
+fn facts(operation: &AllowitStellarOperation, asset: &Address) -> Facts {
+    let debit = debit(operation, asset);
+    let (recipient, amount, token_out, min_out) = match operation {
+        AllowitStellarOperation::Transfer(args) => (args.to.clone(), args.amount, None, 0),
+        AllowitStellarOperation::Swap(args) => {
+            let last = args.path.get_unchecked(args.path.len() - 1);
+            let amount = if debit.token == *asset {
+                args.amount_in
+            } else {
+                args.amount_out_min
+            };
+            let router = args.router.clone();
+            (router, amount, Some(last), args.amount_out_min)
         }
-    }
-    /// The typed operation that rules read.
-    fn kind(&self) -> AllowitOperation {
-        match self {
-            Self::Transfer(_) => AllowitOperation::transfer,
-            Self::Deposit(_) => AllowitOperation::deposit,
-            Self::Swap(_) => AllowitOperation::swap,
-            Self::Redeem(_) => AllowitOperation::redeem,
-        }
-    }
-    /// The request facts. A forward swap counts its asset input as the gross amount; a reverse
-    /// swap and a redeem count their minimum asset output, a floor.
-    fn facts(&self, asset: &Address) -> Facts {
-        let debit = self.debit(asset);
-        let (recipient, amount, token_out, min_out) = match self {
-            Self::Transfer(args) => (args.to.clone(), args.amount, None, 0),
-            Self::Deposit(args) => (
-                args.vault.clone(),
-                args.assets,
-                Some(args.vault.clone()),
-                args.min_shares,
-            ),
-            Self::Swap(args) => {
-                let last = args.path.get_unchecked(args.path.len() - 1);
-                let amount = if debit.token == *asset {
-                    args.amount_in
-                } else {
-                    args.amount_out_min
-                };
-                let router = args.router.clone();
-                (router, amount, Some(last), args.amount_out_min)
-            }
-            Self::Redeem(args) => (
-                args.vault.clone(),
-                args.min_assets,
-                Some(asset.clone()),
-                args.min_assets,
-            ),
-        };
-        Facts {
-            recipient,
-            amount,
-            token_in: debit.token,
-            amount_in: debit.amount,
-            token_out,
-            min_out,
-        }
+        AllowitStellarOperation::Deposit(args) => (
+            args.vault.clone(),
+            args.assets,
+            Some(args.vault.clone()),
+            args.min_shares,
+        ),
+        AllowitStellarOperation::Redeem(args) => (
+            args.vault.clone(),
+            args.min_assets,
+            Some(asset.clone()),
+            args.min_assets,
+        ),
+    };
+    Facts {
+        recipient,
+        amount,
+        token_in: debit.token,
+        amount_in: debit.amount,
+        token_out,
+        min_out,
     }
 }
 /// Whether `address` is a contract, not an account. A contract address never burns a classic asset.
@@ -507,84 +473,47 @@ fn is_contract(env: &Env, address: &Address) -> bool {
     let encoded = address.to_xdr(env);
     encoded.len() == 40 && encoded.slice(0..8) == Bytes::from_array(env, &[0, 0, 0, 18, 0, 0, 0, 1])
 }
-/// Decode the canonical native operation of a request; only the installed asset and wallet roles pass.
-fn decode_operation(
+/// Check the native operation of a request: a transfer moves the installed asset, a vault or
+/// router is neither the wallet nor the asset, and amounts are positive. The wallet supplies itself
+/// as every source, owner, receiver and operator.
+fn validate_operation(
     env: &Env,
     execution: &AllowitExecutionRequest,
     state: &AllowitState,
-) -> Result<NativeOperation, AllowitWalletError> {
-    let invocation = &execution.invocation;
-    if invocation.arguments.len() > MAX_ARGUMENT_BYTES {
-        return Err(AllowitWalletError::InvalidInvocation);
-    }
-    let schema = &invocation.argument_schema_digest;
+) -> Result<(), AllowitWalletError> {
     let wallet = env.current_contract_address();
-    if *schema == schema_digest(env, ARGUMENT_SCHEMA_DESCRIPTOR) {
-        let args = AllowitSep41TransferArgs::from_xdr(env, &invocation.arguments)
-            .map_err(|_| AllowitWalletError::InvalidInvocation)?;
-        if args.clone().to_xdr(env) != invocation.arguments
-            || args.token != state.asset
-            || args.from != wallet
-        {
-            return Err(AllowitWalletError::InvalidInvocation);
+    let (vault, amount, minimum) = match &execution.operation {
+        AllowitStellarOperation::Transfer(args) => {
+            return if args.token == state.asset {
+                Ok(())
+            } else {
+                Err(AllowitWalletError::InvalidInvocation)
+            };
         }
-        return Ok(NativeOperation::Transfer(args));
-    }
-    if *schema == schema_digest(env, ROUTER_SWAP_SCHEMA_DESCRIPTOR) {
-        return decode_swap(env, execution, state).map(NativeOperation::Swap);
-    }
-    if *schema == schema_digest(env, SEP56_REDEEM_SCHEMA_DESCRIPTOR) {
-        let args = AllowitSep56RedeemArgs::from_xdr(env, &invocation.arguments)
-            .map_err(|_| AllowitWalletError::InvalidInvocation)?;
-        if args.clone().to_xdr(env) != invocation.arguments
-            || args.receiver != wallet
-            || args.owner != wallet
-            || args.operator != wallet
-            || args.vault == wallet
-            || args.vault == state.asset
-        {
-            return Err(AllowitWalletError::InvalidInvocation);
-        }
-        if args.shares <= 0 || args.min_assets <= 0 {
-            return Err(AllowitWalletError::InvalidAmount);
-        }
-        return Ok(NativeOperation::Redeem(args));
-    }
-    if *schema != schema_digest(env, SEP56_DEPOSIT_SCHEMA_DESCRIPTOR) {
-        return Err(AllowitWalletError::UnsupportedOperation);
-    }
-    let args = AllowitSep56DepositArgs::from_xdr(env, &invocation.arguments)
-        .map_err(|_| AllowitWalletError::InvalidInvocation)?;
-    if args.clone().to_xdr(env) != invocation.arguments
-        || args.from != wallet
-        || args.receiver != wallet
-        || args.operator != wallet
-        || args.vault == wallet
-        || args.vault == state.asset
-    {
+        AllowitStellarOperation::Swap(args) => return validate_swap(env, execution, state, args),
+        AllowitStellarOperation::Deposit(args) => (&args.vault, args.assets, args.min_shares),
+        AllowitStellarOperation::Redeem(args) => (&args.vault, args.shares, args.min_assets),
+    };
+    if *vault == wallet || *vault == state.asset {
         return Err(AllowitWalletError::InvalidInvocation);
     }
-    if args.assets <= 0 || args.min_shares <= 0 {
+    if amount <= 0 || minimum <= 0 {
         return Err(AllowitWalletError::InvalidAmount);
     }
-    Ok(NativeOperation::Deposit(args))
+    Ok(())
 }
-/// Decode a canonical router swap: the wallet pays and receives, the path holds two to
-/// `MAX_SWAP_PATH` tokens without the wallet, exactly one endpoint is the asset, both endpoints
-/// are Stellar Asset Contracts, and the router deadline falls within the request expiry.
-fn decode_swap(
+/// Check a router swap: the path holds two to `MAX_SWAP_PATH` tokens without the wallet, exactly
+/// one endpoint is the asset, both endpoints are Stellar Asset Contracts, and the router deadline
+/// falls within the request expiry.
+fn validate_swap(
     env: &Env,
     execution: &AllowitExecutionRequest,
     state: &AllowitState,
-) -> Result<AllowitSwapArgs, AllowitWalletError> {
-    let invocation = &execution.invocation;
-    let args = AllowitSwapArgs::from_xdr(env, &invocation.arguments)
-        .map_err(|_| AllowitWalletError::InvalidInvocation)?;
+    args: &AllowitSwapArgs,
+) -> Result<(), AllowitWalletError> {
     let wallet = env.current_contract_address();
     let n = args.path.len();
-    if args.clone().to_xdr(env) != invocation.arguments
-        || args.to != wallet
-        || args.router == wallet
+    if args.router == wallet
         || args.router == state.asset
         || !(2..=MAX_SWAP_PATH).contains(&n)
         || args.deadline > execution.expires_at
@@ -614,7 +543,7 @@ fn decode_swap(
     if args.amount_in <= 0 || args.amount_out_min <= 0 {
         return Err(AllowitWalletError::InvalidAmount);
     }
-    Ok(args)
+    Ok(())
 }
 
 /// The SAC symbol of the asset, cached at construction for issuer checks.
@@ -709,30 +638,12 @@ fn move_tokens(
     }
     Ok(())
 }
-/// Decode optional canonical expense bounds.
-fn decode_expense(
-    env: &Env,
-    raw: Option<&Bytes>,
-) -> Result<Option<AllowitExpenseBounds>, AllowitWalletError> {
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
-    if raw.len() > MAX_EXPENSE_BYTES {
-        return Err(AllowitWalletError::InvalidInvocation);
-    }
-    let value = AllowitExpenseBounds::from_xdr(env, raw)
-        .map_err(|_| AllowitWalletError::InvalidInvocation)?;
-    if value.clone().to_xdr(env) != *raw {
-        return Err(AllowitWalletError::InvalidInvocation);
-    }
-    Ok(Some(value))
-}
 /// Check denomination, operation class and conservative signed cost identities. External facts remain server-attested.
 fn validate_expense(
     env: &Env,
     state: &AllowitState,
     expense: Option<&AllowitExpenseBounds>,
-    operation: &NativeOperation,
+    operation: &AllowitStellarOperation,
 ) -> Result<(), AllowitWalletError> {
     let Some(expense) = expense else {
         return Ok(());
@@ -761,20 +672,20 @@ fn validate_expense(
         return Err(AllowitWalletError::InvalidInvocation);
     }
     let principal = match operation {
-        NativeOperation::Transfer(args) => {
+        AllowitStellarOperation::Transfer(args) => {
             if expense.conversion_units != 0 {
                 return Err(AllowitWalletError::InvalidInvocation);
             }
             args.amount
         }
-        NativeOperation::Deposit(args) => {
+        AllowitStellarOperation::Deposit(args) => {
             if expense.conversion_units > args.assets {
                 return Err(AllowitWalletError::InvalidInvocation);
             }
             expense.conversion_units
         }
         // A forward swap pays the asset: its loss cannot exceed the input.
-        NativeOperation::Swap(args) => {
+        AllowitStellarOperation::Swap(args) => {
             if args.path.get_unchecked(0) == state.asset
                 && expense.conversion_units > args.amount_in
             {
@@ -782,7 +693,7 @@ fn validate_expense(
             }
             expense.conversion_units
         }
-        NativeOperation::Redeem(_) => expense.conversion_units,
+        AllowitStellarOperation::Redeem(_) => expense.conversion_units,
     };
     if expense.spent_units != checked(principal.checked_add(expense.gas_units))? {
         return Err(AllowitWalletError::InvalidInvocation);
@@ -794,7 +705,7 @@ fn validate_expense(
 fn deposit_tokens(
     env: &Env,
     asset: &Address,
-    args: &AllowitSep56DepositArgs,
+    args: &AllowitDepositArgs,
     expense: Option<&AllowitExpenseBounds>,
 ) -> Result<i128, AllowitWalletError> {
     use soroban_sdk::IntoVal;
@@ -826,16 +737,11 @@ fn deposit_tokens(
             sub_invocations: Vec::new(env),
         })
     ]);
+    // SEP-56 `deposit(assets, receiver, from, operator)`: the wallet is all three parties.
     let shares: i128 = env.invoke_contract(
         &args.vault,
         &Symbol::new(env, "deposit"),
-        (
-            args.assets,
-            args.receiver.clone(),
-            args.from.clone(),
-            args.operator.clone(),
-        )
-            .into_val(env),
+        (args.assets, wallet.clone(), wallet.clone(), wallet.clone()).into_val(env),
     );
     if let Some(expense) = expense {
         // The selected vault supplies this valuation. It is not a proof of future redemption or economic honesty.
@@ -940,7 +846,7 @@ fn swap_tokens(env: &Env, args: &AllowitSwapArgs) -> Result<i128, AllowitWalletE
 fn redeem_shares(
     env: &Env,
     asset: &Address,
-    args: &AllowitSep56RedeemArgs,
+    args: &AllowitRedeemArgs,
     expense: Option<&AllowitExpenseBounds>,
 ) -> Result<i128, AllowitWalletError> {
     let underlying: Address =
@@ -972,16 +878,11 @@ fn redeem_shares(
     if before_shares < args.shares {
         return Err(AllowitWalletError::InsufficientFunds);
     }
+    // SEP-56 `redeem(shares, receiver, owner, operator)`: the wallet is all three parties.
     let assets: i128 = env.invoke_contract(
         &args.vault,
         &Symbol::new(env, "redeem"),
-        (
-            args.shares,
-            args.receiver.clone(),
-            args.owner.clone(),
-            args.operator.clone(),
-        )
-            .into_val(env),
+        (args.shares, wallet.clone(), wallet.clone(), wallet.clone()).into_val(env),
     );
     // Finish foreign reads before the final asset balance. A vault getter is not trusted to be pure.
     let after_asset: Address =
@@ -1014,17 +915,16 @@ fn redeem_shares(
 fn rule_input(
     env: &Env,
     state: &AllowitState,
-    operation: &NativeOperation,
-    expense: Option<&AllowitExpenseBounds>,
     execution: &AllowitExecutionRequest,
 ) -> AllowitContext {
-    let facts = operation.facts(&state.asset);
+    let facts = facts(&execution.operation, &state.asset);
+    let expense = execution.expense.bounds();
     AllowitContext {
         env: env.clone(),
         params: AllowitParams(state.params.clone()),
         state: state.policy_state.clone(),
         request: AllowitRequest {
-            operation: operation.kind(),
+            operation: execution.operation.to_core(),
             asset: state.asset.clone(),
             recipient: facts.recipient,
             amount: facts.amount,
@@ -1045,30 +945,24 @@ fn rule_input(
 /// policy, then write post-flight state, nonce and replay marker before any external call.
 fn admit<P: AllowitPolicy>(
     env: &Env,
-    execution: AllowitExecutionRequest,
-    expense: Option<&AllowitExpenseBounds>,
+    execution: &AllowitExecutionRequest,
     mut state: AllowitState,
-    operation: &NativeOperation,
 ) -> Result<AllowitTransferReceipt, AllowitWalletError> {
-    let installed = binding_for::<P>(
-        env,
-        &state,
-        execution.invocation.argument_schema_digest.clone(),
-    )?;
-    let invocation = &execution.invocation;
+    if !P::OPERATIONS.contains(&execution.operation.to_core()) {
+        return Err(AllowitWalletError::UnsupportedOperation);
+    }
+    let installed = binding::<P>(env, &state)?;
     if execution.policy_instance != installed.policy_instance
         || execution.source_hash == BytesN::from_array(env, &[0; 32])
         || (!P::STANDARD_PREFIX && execution.source_hash != installed.source_digest)
         || execution.operation_id == BytesN::from_array(env, &[0; 32])
-        || invocation.module_digest != installed.module_digest
-        || invocation.entrypoint != installed.entrypoint
-        || invocation.argument_schema_digest != installed.argument_schema_digest
-        || invocation.arguments.len() > MAX_ARGUMENT_BYTES
+        || execution.module_digest != installed.module_digest
         || allowit::check_args(&execution.args).is_err()
     {
         return Err(AllowitWalletError::InvalidInvocation);
     }
-    let args = operation.debit(&state.asset);
+    let expense = execution.expense.bounds();
+    let args = debit(&execution.operation, &state.asset);
     let replay_key = Key::Operation(execution.operation_id.clone());
     if env.storage().persistent().has(&replay_key) {
         return Err(AllowitWalletError::Replay);
@@ -1091,14 +985,14 @@ fn admit<P: AllowitPolicy>(
     {
         return Err(AllowitWalletError::InvalidRecipient);
     }
-    validate_expense(env, &state, expense, operation)?;
+    validate_expense(env, &state, expense, &execution.operation)?;
     let nonce = checked(state.nonce.checked_add(1))?;
     // Code changes defer tier validation of the kept rules and params to this admission.
     P::validate(&state.rules)?;
     if P::STANDARD_PREFIX {
         checked_params::<P>(&state.params)?;
     }
-    let ctx = rule_input(env, &state, operation, expense, &execution);
+    let ctx = rule_input(env, &state, execution);
     P::check(&ctx, &state.rules)?;
     // The shared post-flight, then storage, precede token, router and vault calls. A later
     // failure in this transaction rolls all of it back.
@@ -1106,9 +1000,9 @@ fn admit<P: AllowitPolicy>(
     state.nonce = nonce;
     store(env, &state);
     let receipt = AllowitTransferReceipt {
-        operation_id: execution.operation_id,
+        operation_id: execution.operation_id.clone(),
         token: args.token,
-        from: args.from,
+        from: env.current_contract_address(),
         to: args.to,
         amount: args.amount,
         nonce: execution.nonce,
@@ -1162,18 +1056,11 @@ pub fn state(env: &Env) -> Result<AllowitState, AllowitWalletError> {
 pub fn policy_state(env: &Env) -> Result<Map<Symbol, AllowitValue>, AllowitWalletError> {
     Ok(load(env, None)?.policy_state)
 }
-/// Read the installed binding for the default argument schema.
+/// Read the installed binding: executable, source binding and the operations that this code runs.
 pub fn policy_binding<P: AllowitPolicy>(
     env: &Env,
 ) -> Result<AllowitPolicyBinding, AllowitWalletError> {
     binding::<P>(env, &load(env, None)?)
-}
-/// Return a native operation binding only when the installed policy admits that exact profile.
-pub fn policy_binding_for<P: AllowitPolicy>(
-    env: &Env,
-    argument_schema_digest: BytesN<32>,
-) -> Result<AllowitPolicyBinding, AllowitWalletError> {
-    binding_for::<P>(env, &load(env, None)?, argument_schema_digest)
 }
 /// Read the atomically retained actual share credit for a successful deposit operation.
 pub fn deposit_receipt(
@@ -1207,12 +1094,13 @@ pub fn execute<P: AllowitPolicy>(
     let state = load(env, None)?;
     state.agent.require_auth();
     state.server.require_auth();
-    let operation = decode_operation(env, &execution, &state)?;
-    let expense = decode_expense(env, execution.expense.as_ref())?;
+    validate_operation(env, &execution, &state)?;
     let asset = state.asset.clone();
-    let receipt = admit::<P>(env, execution, expense.as_ref(), state, &operation)?;
-    match operation {
-        NativeOperation::Swap(args) => {
+    let receipt = admit::<P>(env, &execution, state)?;
+    let expense = execution.expense.bounds();
+    let wallet = env.current_contract_address();
+    match execution.operation {
+        AllowitStellarOperation::Swap(args) => {
             let amount_out = swap_tokens(env, &args)?;
             let swapped = AllowitSwapReceipt {
                 operation_id: receipt.operation_id.clone(),
@@ -1237,15 +1125,15 @@ pub fn execute<P: AllowitPolicy>(
             }
             .publish(env);
         }
-        NativeOperation::Redeem(args) => {
-            let assets = redeem_shares(env, &asset, &args, expense.as_ref())?;
+        AllowitStellarOperation::Redeem(args) => {
+            let assets = redeem_shares(env, &asset, &args, expense)?;
             let redeemed = AllowitSep56RedeemReceipt {
                 operation_id: receipt.operation_id.clone(),
                 vault: args.vault,
                 asset,
-                owner: args.owner,
-                receiver: args.receiver,
-                operator: args.operator,
+                owner: wallet.clone(),
+                receiver: wallet.clone(),
+                operator: wallet,
                 shares: args.shares,
                 assets,
                 nonce: receipt.nonce,
@@ -1264,18 +1152,18 @@ pub fn execute<P: AllowitPolicy>(
             }
             .publish(env);
         }
-        NativeOperation::Transfer(_) => {
+        AllowitStellarOperation::Transfer(_) => {
             move_tokens(env, &receipt.token, &receipt.to, receipt.amount)?
         }
-        NativeOperation::Deposit(args) => {
-            let shares = deposit_tokens(env, &receipt.token, &args, expense.as_ref())?;
+        AllowitStellarOperation::Deposit(args) => {
+            let shares = deposit_tokens(env, &receipt.token, &args, expense)?;
             let deposited = AllowitSep56DepositReceipt {
                 operation_id: receipt.operation_id.clone(),
                 vault: args.vault,
                 asset: receipt.token.clone(),
-                from: args.from,
-                receiver: args.receiver,
-                operator: args.operator,
+                from: wallet.clone(),
+                receiver: wallet.clone(),
+                operator: wallet,
                 assets: args.assets,
                 shares,
                 nonce: receipt.nonce,
@@ -1444,12 +1332,12 @@ fn require_call(
 fn match_contexts(
     env: &Env,
     state: &AllowitState,
-    operation: &NativeOperation,
+    operation: &AllowitStellarOperation,
     contexts: &Vec<Context>,
 ) -> Result<(), AllowitWalletError> {
     let wallet = env.current_contract_address();
     let nodes = match operation {
-        NativeOperation::Swap(_) => 2,
+        AllowitStellarOperation::Swap(_) => 2,
         _ => 1,
     };
     if contexts.len() != nodes {
@@ -1457,16 +1345,18 @@ fn match_contexts(
     }
     let root = contract_context(contexts, 0)?;
     let args: Vec<Val> = match operation {
-        NativeOperation::Deposit(_) => return Err(AllowitWalletError::UnsupportedOperation),
-        NativeOperation::Transfer(a) => {
+        AllowitStellarOperation::Deposit(_) => {
+            return Err(AllowitWalletError::UnsupportedOperation);
+        }
+        AllowitStellarOperation::Transfer(a) => {
             require_call(env, &root, &state.asset, "transfer")?;
             (wallet.clone(), a.to.clone(), a.amount).into_val(env)
         }
-        NativeOperation::Redeem(a) => {
+        AllowitStellarOperation::Redeem(a) => {
             require_call(env, &root, &a.vault, "redeem")?;
             (a.shares, wallet.clone(), wallet.clone(), wallet.clone()).into_val(env)
         }
-        NativeOperation::Swap(a) => {
+        AllowitStellarOperation::Swap(a) => {
             require_call(env, &root, &a.router, "swap_exact_tokens_for_tokens")?;
             let debit = contract_context(contexts, 1)?;
             require_call(env, &debit, &a.path.get_unchecked(0), "transfer")?;
@@ -1543,37 +1433,28 @@ pub fn check_auth<P: AllowitPolicy>(
     if !state.x402_enabled {
         return Err(AllowitWalletError::UnsupportedOperation);
     }
-    // The same canonical decoding and kernel invariants as execute.
-    let operation = decode_operation(env, &authorization.execution, &state)?;
-    match_contexts(env, &state, &operation, &contexts)?;
+    // The same typed operation and kernel invariants as execute.
+    let execution = &authorization.execution;
+    validate_operation(env, execution, &state)?;
+    match_contexts(env, &state, &execution.operation, &contexts)?;
     verify_cosigners(env, &state, &payload, &authorization)?;
-    let expense = decode_expense(env, authorization.execution.expense.as_ref())?;
-    admit::<P>(
-        env,
-        authorization.execution,
-        expense.as_ref(),
-        state,
-        &operation,
-    )?;
+    admit::<P>(env, execution, state)?;
     Ok(())
 }
 
-/// The transfer, SEP-56 deposit, router swap and SEP-56 redeem schemas that the standard tiers admit.
-fn native_schema(env: &Env, digest: &BytesN<32>) -> bool {
-    *digest == schema_digest(env, ARGUMENT_SCHEMA_DESCRIPTOR)
-        || *digest == schema_digest(env, SEP56_DEPOSIT_SCHEMA_DESCRIPTOR)
-        || *digest == schema_digest(env, ROUTER_SWAP_SCHEMA_DESCRIPTOR)
-        || *digest == schema_digest(env, SEP56_REDEEM_SCHEMA_DESCRIPTOR)
-}
+/// Every native operation: the SEP-41 transfer, the router swap and the SEP-56 deposit and redeem.
+pub const NATIVE_OPERATIONS: &[AllowitOperation] = &[
+    AllowitOperation::transfer,
+    AllowitOperation::swap,
+    AllowitOperation::deposit,
+    AllowitOperation::redeem,
+];
 /// Fixed minimal policy: server approval is mandatory, with no onchain business predicates.
 pub struct AllowitSimple;
 impl AllowitPolicy for AllowitSimple {
     const KIND: &'static str = "simple_policy_engine";
     const STANDARD_PREFIX: bool = true;
-    /// Transfers, SEP-56 deposits, router swaps and SEP-56 redeems.
-    fn admits_schema(env: &Env, digest: &BytesN<32>) -> bool {
-        native_schema(env, digest)
-    }
+    const OPERATIONS: &'static [AllowitOperation] = NATIVE_OPERATIONS;
     /// No onchain rules: the kernel and the shared post-flight only.
     fn check(_ctx: &AllowitContext, _rules: &Vec<AllowitRule>) -> Result<(), AllowitWalletError> {
         Ok(())
@@ -1584,10 +1465,7 @@ pub struct AllowitCommon;
 impl AllowitPolicy for AllowitCommon {
     const KIND: &'static str = "common_policy_engine";
     const STANDARD_PREFIX: bool = true;
-    /// Transfers, SEP-56 deposits, router swaps and SEP-56 redeems.
-    fn admits_schema(env: &Env, digest: &BytesN<32>) -> bool {
-        native_schema(env, digest)
-    }
+    const OPERATIONS: &'static [AllowitOperation] = NATIVE_OPERATIONS;
     /// Any ordered list of typed rules. The kernel decodes each element before storing it.
     fn validate(_rules: &Vec<AllowitRule>) -> Result<(), AllowitWalletError> {
         Ok(())
@@ -1644,20 +1522,12 @@ macro_rules! policy_wallet {
             > {
                 $crate::policy_state(&env)
             }
-            /// Read the installed binding for the default argument schema.
+            /// Read the installed binding: executable, source binding and the operations it runs.
             pub fn policy_binding(
                 env: soroban_sdk::Env,
             ) -> Result<allowit_wallet_protocol::AllowitPolicyBinding, $crate::AllowitWalletError>
             {
                 $crate::policy_binding::<$policy>(&env)
-            }
-            /// Read the binding of one argument schema, if the installed policy admits it.
-            pub fn policy_binding_for(
-                env: soroban_sdk::Env,
-                argument_schema_digest: soroban_sdk::BytesN<32>,
-            ) -> Result<allowit_wallet_protocol::AllowitPolicyBinding, $crate::AllowitWalletError>
-            {
-                $crate::policy_binding_for::<$policy>(&env, argument_schema_digest)
             }
             /// Read the retained share credit of a successful deposit operation.
             pub fn deposit_receipt(

@@ -130,7 +130,7 @@ envelopes expire after five minutes. Save signed bytes before broadcast and reco
 hash after an uncertain response. The tool never signs, submits, restores or retries automatically.
 
 Use `read --contract POLICY_WALLET_ADDRESS --source "$OWNER" --method policy_binding` to inspect the contract
-release, policy instance, module/source digests and argument schema. `state` returns the custody
+release, policy instance, module/source digests and the operations that the wallet runs. `state` returns the custody
 State, including `params` and `policy_state`; `policy_state` returns the current policy state map
 alone. Archived data requires native restoration and is never reinitialized.
 The SDK rejects unavailable or ambiguous state observations before new signing. Owner pause,

@@ -1,4 +1,4 @@
-//! Source and schema bindings. The shared portability vectors run in `allowit-policy-wallet`:
+//! Source binding and operations. The shared portability vectors run in `allowit-policy-wallet`:
 //! `src/portability_tests.rs` compares the std-only host smoke with the Soroban backend and the
 //! custom, standard and simple contracts.
 extern crate std;
@@ -101,39 +101,16 @@ fn custom_runner_maps_the_policy_result() {
 }
 
 #[test]
-fn source_and_schema_bindings_match_their_exact_inputs() {
+fn source_binding_hashes_the_compiled_policy_and_custom_runs_no_deposit() {
     let env = Env::default();
     let source = Bytes::from_slice(&env, include_bytes!("../policy/policy.rs"));
     assert_eq!(env.crypto().sha256(&source).to_array(), SOURCE_HASH);
-    let schemas = [
-        (
-            allowit_wallet_protocol::ARGUMENT_SCHEMA_DESCRIPTOR,
-            ARGUMENT_SCHEMA_HASH,
-        ),
-        (
-            allowit_wallet_protocol::ROUTER_SWAP_SCHEMA_DESCRIPTOR,
-            SWAP_SCHEMA_HASH,
-        ),
-        (
-            allowit_wallet_protocol::SEP56_REDEEM_SCHEMA_DESCRIPTOR,
-            REDEEM_SCHEMA_HASH,
-        ),
-    ];
-    for ((descriptor, hash), operation) in schemas.into_iter().zip(ADMITTED_OPERATIONS) {
-        let schema = Bytes::from_slice(&env, descriptor);
-        assert_eq!(env.crypto().sha256(&schema).to_array(), hash);
-        let descriptor = core::str::from_utf8(descriptor).unwrap();
-        assert!(descriptor.contains(&operation.replace("::", ".")));
-        assert!(AllowitCustom::admits_schema(
-            &env,
-            &BytesN::from_array(&env, &hash)
-        ));
-    }
-    // Custom admits no deposit.
-    let deposit = Bytes::from_slice(
-        &env,
-        allowit_wallet_protocol::SEP56_DEPOSIT_SCHEMA_DESCRIPTOR,
+    assert_eq!(
+        AllowitCustom::OPERATIONS,
+        [
+            AllowitOperation::transfer,
+            AllowitOperation::swap,
+            AllowitOperation::redeem
+        ]
     );
-    let deposit = env.crypto().sha256(&deposit).to_bytes();
-    assert!(!AllowitCustom::admits_schema(&env, &deposit));
 }

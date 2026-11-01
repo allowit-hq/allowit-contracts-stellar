@@ -4,8 +4,9 @@ use allowit::{
     AllowitError, AllowitStandardState, CALL_CAP, DAY_SPENT_CAP, DAY_TOTAL_CAP, EXPIRY, OPERATIONS,
     RECIPIENTS, SPENT_CAP, TOKENS, TRANSACTION_CAP,
 };
-use allowit_wallet_protocol::AllowitPolicyInvocation;
+use allowit_wallet_protocol::{AllowitExpense, AllowitTransferArgs};
 use ed25519_dalek::{Signer, SigningKey};
+use soroban_sdk::xdr::FromXdr;
 use soroban_sdk::{
     IntoVal, Map, TryIntoVal, contract, contractimpl,
     testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke},
@@ -54,6 +55,14 @@ pub(super) fn set_param(
         None => {
             params.remove(key);
         }
+    }
+}
+
+/// The transfer arguments of `e`, for edits.
+pub(super) fn transfer_args(e: &mut AllowitExecutionRequest) -> &mut AllowitTransferArgs {
+    match &mut e.operation {
+        AllowitStellarOperation::Transfer(args) => args,
+        other => panic!("not a transfer: {other:?}"),
     }
 }
 
@@ -253,37 +262,28 @@ impl Fixture {
             } else {
                 BytesN::from_array(&self.env, &[9; 32])
             },
-            expense: Some(
-                AllowitExpenseBounds {
-                    asset: self.asset.clone(),
-                    decimals: 7,
-                    gas_units: 0,
-                    conversion_units: 0,
-                    spent_units: amount.max(0),
-                    max_fee_stroops: 0,
-                    observed_ledger: 1,
-                    day: self.env.ledger().timestamp() / 86_400,
-                }
-                .to_xdr(&self.env),
-            ),
+            expense: AllowitExpense::Priced(AllowitExpenseBounds {
+                asset: self.asset.clone(),
+                decimals: 7,
+                gas_units: 0,
+                conversion_units: 0,
+                spent_units: amount.max(0),
+                max_fee_stroops: 0,
+                observed_ledger: 1,
+                day: self.env.ledger().timestamp() / 86_400,
+            }),
             policy_instance: b.policy_instance,
             operation_id: BytesN::from_array(&self.env, &id),
             nonce: s.nonce,
             deployment_version: s.deployment_version,
             expires_at: self.env.ledger().timestamp() + 100,
             args: Map::new(&self.env),
-            invocation: AllowitPolicyInvocation {
-                module_digest: b.module_digest,
-                entrypoint: b.entrypoint,
-                argument_schema_digest: b.argument_schema_digest,
-                arguments: AllowitSep41TransferArgs {
-                    token: self.asset.clone(),
-                    from: self.wallet.clone(),
-                    to: self.recipient.clone(),
-                    amount,
-                }
-                .to_xdr(&self.env),
-            },
+            module_digest: b.module_digest,
+            operation: AllowitStellarOperation::Transfer(AllowitTransferArgs {
+                token: self.asset.clone(),
+                to: self.recipient.clone(),
+                amount,
+            }),
         }
     }
     /// Execution for a module whose binding no longer resolves.
@@ -293,25 +293,19 @@ impl Fixture {
         id[24..].copy_from_slice(&(s.nonce + 1).to_be_bytes());
         AllowitExecutionRequest {
             source_hash: BytesN::from_array(&self.env, &[9; 32]),
-            expense: None,
+            expense: AllowitExpense::Unpriced,
             policy_instance: s.policy_instance,
             operation_id: BytesN::from_array(&self.env, &id),
             nonce: s.nonce,
             deployment_version: s.deployment_version,
             expires_at: self.env.ledger().timestamp() + 100,
             args: Map::new(&self.env),
-            invocation: AllowitPolicyInvocation {
-                module_digest: module.clone(),
-                entrypoint: Symbol::new(&self.env, "execute"),
-                argument_schema_digest: schema_digest(&self.env, ARGUMENT_SCHEMA_DESCRIPTOR),
-                arguments: AllowitSep41TransferArgs {
-                    token: self.asset.clone(),
-                    from: self.wallet.clone(),
-                    to: self.recipient.clone(),
-                    amount,
-                }
-                .to_xdr(&self.env),
-            },
+            module_digest: module.clone(),
+            operation: AllowitStellarOperation::Transfer(AllowitTransferArgs {
+                token: self.asset.clone(),
+                to: self.recipient.clone(),
+                amount,
+            }),
         }
     }
     pub(super) fn auth(&self, actors: &[&Address], method: &str, args: Vec<Val>) {
@@ -1011,36 +1005,19 @@ fn owner_upgrades_exact_code_without_server_and_preserves_state() {
 fn request_bindings_reject_changed_fields_and_unexpected_effects() {
     let f = Fixture::new(SIMPLE, false);
     let e = f.execution(10);
-    for field in 0..14 {
+    for field in 0..10 {
         let mut bad = e.clone();
         match field {
             0 => bad.policy_instance = BytesN::from_array(&f.env, &[3; 32]),
-            1 => bad.invocation.module_digest = BytesN::from_array(&f.env, &[3; 32]),
-            2 => bad.invocation.argument_schema_digest = BytesN::from_array(&f.env, &[3; 32]),
-            3 => bad.invocation.entrypoint = Symbol::new(&f.env, "other"),
-            4 => bad.nonce += 1,
-            5 => bad.deployment_version += 1,
-            7 => bad.operation_id = BytesN::from_array(&f.env, &[0; 32]),
-            8 => bad
-                .invocation
-                .arguments
-                .append(&Bytes::from_array(&f.env, &[0; 4])),
-            9 => {
-                bad.invocation.arguments =
-                    Bytes::from_slice(&f.env, &std::vec![0; MAX_ARGUMENT_BYTES as usize + 1])
-            }
-            _ => {
-                let mut args =
-                    AllowitSep41TransferArgs::from_xdr(&f.env, &bad.invocation.arguments).unwrap();
-                match field {
-                    6 => args.from = f.recipient.clone(),
-                    10 => args.token = f.recipient.clone(),
-                    11 => args.to = f.wallet.clone(),
-                    12 => args.amount = 0,
-                    _ => args.amount = -1,
-                }
-                bad.invocation.arguments = args.to_xdr(&f.env);
-            }
+            1 => bad.module_digest = BytesN::from_array(&f.env, &[3; 32]),
+            2 => bad.source_hash = BytesN::from_array(&f.env, &[0; 32]),
+            3 => bad.nonce += 1,
+            4 => bad.deployment_version += 1,
+            5 => bad.operation_id = BytesN::from_array(&f.env, &[0; 32]),
+            6 => transfer_args(&mut bad).token = f.recipient.clone(),
+            7 => transfer_args(&mut bad).to = f.wallet.clone(),
+            8 => transfer_args(&mut bad).amount = 0,
+            _ => transfer_args(&mut bad).amount = -1,
         }
         f.auth(
             &[&f.agent, &f.server],
@@ -1057,10 +1034,7 @@ fn request_bindings_reject_changed_fields_and_unexpected_effects() {
         (e.clone(),).into_val(&f.env),
     );
     let mut changed = e;
-    let mut args =
-        AllowitSep41TransferArgs::from_xdr(&f.env, &changed.invocation.arguments).unwrap();
-    args.amount = 11;
-    changed.invocation.arguments = args.to_xdr(&f.env);
+    transfer_args(&mut changed).amount = 11;
     assert!(f.client().try_execute(&changed).is_err());
     assert_eq!(f.balance(), 1_000);
 }
@@ -1538,13 +1512,7 @@ pub(super) fn x402_request(
     amount: i128,
 ) -> (AllowitExecutionRequest, Context) {
     let mut e = f.execution(amount);
-    e.invocation.arguments = AllowitSep41TransferArgs {
-        token: f.asset.clone(),
-        from: f.wallet.clone(),
-        to: to.clone(),
-        amount,
-    }
-    .to_xdr(&f.env);
+    transfer_args(&mut e).to = to.clone();
     let context = Context::Contract(soroban_sdk::auth::ContractContext {
         contract: f.asset.clone(),
         fn_name: Symbol::new(&f.env, "transfer"),
@@ -1680,86 +1648,60 @@ fn a_panicking_wasm_policy_aborts_with_its_allowit_code_and_writes_nothing() {
 }
 
 #[test]
-fn x402_binds_the_transfer_schema_and_its_canonical_arguments() {
-    for wasm in [SIMPLE, COMMON] {
-        for case in 0..2 {
-            let f = Fixture::new(wasm, true);
-            let payload = BytesN::from_array(&f.env, &[7; 32]);
-            let (mut e, context) = x402_request(&f, &f.recipient, 10);
-            if case == 0 {
-                // Simple and Common admit the deposit profile, but never for a token transfer.
-                e.invocation.argument_schema_digest = f
-                    .env
-                    .crypto()
-                    .sha256(&Bytes::from_slice(
-                        &f.env,
-                        allowit_wallet_protocol::SEP56_DEPOSIT_SCHEMA_DESCRIPTOR,
-                    ))
-                    .to_bytes();
-            } else {
-                // Struct decoding ignores an extra key. Only the canonical encoding is accepted.
-                let args =
-                    AllowitSep41TransferArgs::from_xdr(&f.env, &e.invocation.arguments).unwrap();
-                let raw: Val = args.into_val(&f.env);
-                let mut fields = Map::<Symbol, Val>::try_from_val(&f.env, &raw).unwrap();
-                fields.set(Symbol::new(&f.env, "zzz"), 1u32.into_val(&f.env));
-                assert_eq!(
-                    AllowitSep41TransferArgs::from_xdr(&f.env, &fields.clone().to_xdr(&f.env)),
-                    Ok(
-                        AllowitSep41TransferArgs::from_xdr(&f.env, &e.invocation.arguments)
-                            .unwrap()
-                    )
-                );
-                e.invocation.arguments = fields.to_xdr(&f.env);
-            }
-            let result = f.env.try_invoke_contract_check_auth::<AllowitWalletError>(
-                &f.wallet,
-                &payload,
-                f.authorization(e, &payload).into_val(&f.env),
-                &vec![&f.env, context],
-            );
-            assert_eq!(
-                result,
-                Err(Ok(AllowitWalletError::InvalidInvocation)),
-                "case {case}"
-            );
-            assert_eq!(f.client().state().nonce, 0);
-            assert_eq!(f.balance(), 1_000);
-        }
+fn typed_arguments_name_no_wallet_party_so_an_extra_key_changes_nothing() {
+    for wasm in [SIMPLE, COMMON, CUSTOM] {
+        let f = Fixture::new(wasm, false);
+        let e = f.execution(10);
+        // The raw request adds a foreign `from` to the transfer arguments. Typed decoding ignores
+        // the key: the wallet still pays from itself, and agent and server sign the raw request.
+        let foreign = Address::generate(&f.env);
+        let mut transfer = Map::<Symbol, Val>::new(&f.env);
+        transfer.set(Symbol::new(&f.env, "token"), f.asset.into_val(&f.env));
+        transfer.set(Symbol::new(&f.env, "to"), f.recipient.into_val(&f.env));
+        transfer.set(Symbol::new(&f.env, "amount"), 10i128.into_val(&f.env));
+        transfer.set(Symbol::new(&f.env, "from"), foreign.into_val(&f.env));
+        let operation: Vec<Val> = vec![
+            &f.env,
+            Symbol::new(&f.env, "Transfer").into_val(&f.env),
+            transfer.into_val(&f.env),
+        ];
+        let raw: Val = e.into_val(&f.env);
+        let mut request = Map::<Symbol, Val>::try_from_val(&f.env, &raw).unwrap();
+        request.set(Symbol::new(&f.env, "operation"), operation.into_val(&f.env));
+        let args: Vec<Val> = (request,).into_val(&f.env);
+        f.auth(&[&f.agent, &f.server], "execute", args.clone());
+        let receipt: AllowitTransferReceipt =
+            f.env
+                .invoke_contract(&f.wallet, &Symbol::new(&f.env, "execute"), args);
+        assert_eq!(receipt.from, f.wallet);
+        assert_eq!(receipt.to, f.recipient);
+        assert_eq!(f.balance(), 990);
+        assert_eq!(token::Client::new(&f.env, &f.asset).balance(&foreign), 0);
     }
 }
 
 #[test]
-fn x402_rejects_a_canonical_deposit_authorization_for_a_token_transfer() {
+fn x402_rejects_a_deposit_authorization_for_a_token_transfer() {
     for wasm in [SIMPLE, COMMON] {
         let f = Fixture::new(wasm, true);
         let payload = BytesN::from_array(&f.env, &[8; 32]);
         let (mut e, context) = x402_request(&f, &f.recipient, 10);
         // A raw transfer to the vault would mint no shares and charge no principal.
-        e.invocation.argument_schema_digest =
-            schema_digest(&f.env, SEP56_DEPOSIT_SCHEMA_DESCRIPTOR);
-        e.invocation.arguments = AllowitSep56DepositArgs {
+        e.operation = AllowitStellarOperation::Deposit(AllowitDepositArgs {
             vault: f.recipient.clone(),
             assets: 10,
-            receiver: f.wallet.clone(),
-            from: f.wallet.clone(),
-            operator: f.wallet.clone(),
             min_shares: 10,
-        }
-        .to_xdr(&f.env);
-        e.expense = Some(
-            AllowitExpenseBounds {
-                asset: f.asset.clone(),
-                decimals: 7,
-                gas_units: 0,
-                conversion_units: 0,
-                spent_units: 0,
-                max_fee_stroops: 0,
-                observed_ledger: 1,
-                day: f.env.ledger().timestamp() / 86_400,
-            }
-            .to_xdr(&f.env),
-        );
+        });
+        e.expense = AllowitExpense::Priced(AllowitExpenseBounds {
+            asset: f.asset.clone(),
+            decimals: 7,
+            gas_units: 0,
+            conversion_units: 0,
+            spent_units: 0,
+            max_fee_stroops: 0,
+            observed_ledger: 1,
+            day: f.env.ledger().timestamp() / 86_400,
+        });
         assert_eq!(
             f.env.try_invoke_contract_check_auth::<AllowitWalletError>(
                 &f.wallet,
@@ -2167,12 +2109,11 @@ fn replayed_operation_with_changed_amount_or_expense_is_rejected_without_chargin
             let mut e = f.execution(if changed_expense { 10 } else { 11 });
             e.operation_id = first.operation_id.clone();
             if changed_expense {
-                let mut cost =
-                    AllowitExpenseBounds::from_xdr(&f.env, e.expense.as_ref().unwrap()).unwrap();
+                let mut cost = e.expense.bounds().unwrap().clone();
                 cost.gas_units = 1;
                 cost.max_fee_stroops = 1;
                 cost.spent_units = 11;
-                e.expense = Some(cost.to_xdr(&f.env));
+                e.expense = AllowitExpense::Priced(cost);
             }
             assert_eq!(execute_as_actors(&f, &e), Err(AllowitWalletError::Replay));
             assert_eq!(f.client().state(), before);
@@ -2237,9 +2178,9 @@ fn clock_regression_and_cross_day_expense_reject_before_rules_run() {
     assert_eq!(f.client().state(), before);
     f.env.ledger().with_mut(|l| l.timestamp += 86_400);
     let mut e = f.execution(10);
-    let mut cost = AllowitExpenseBounds::from_xdr(&f.env, e.expense.as_ref().unwrap()).unwrap();
+    let mut cost = e.expense.bounds().unwrap().clone();
     cost.day += 1;
-    e.expense = Some(cost.to_xdr(&f.env));
+    e.expense = AllowitExpense::Priced(cost);
     assert_eq!(
         execute_as_actors(&f, &e),
         Err(AllowitWalletError::InvalidInvocation)

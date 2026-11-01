@@ -21,10 +21,10 @@
 //! custom param, as the standard contract does on admission. The server's evaluation therefore
 //! equals the stored state for every tier.
 extern crate std;
-use super::tests::{CATCHING, COMMON, CUSTOM, Fixture, SIMPLE};
+use super::tests::{CATCHING, COMMON, CUSTOM, Fixture, SIMPLE, transfer_args};
 use super::*;
 use allowit::{AllowitError, AllowitStandardState, AllowitTier, RULES};
-use allowit_wallet_protocol::AllowitPolicyInvocation;
+use allowit_wallet_protocol::{AllowitExpense, AllowitTransferArgs};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token::StellarAssetClient,
@@ -497,25 +497,23 @@ impl Wallet {
             } else {
                 BytesN::from_array(env, &[9; 32])
             },
-            expense: v.priced.then(|| expense.to_xdr(env)),
+            expense: if v.priced {
+                AllowitExpense::Priced(expense)
+            } else {
+                AllowitExpense::Unpriced
+            },
             policy_instance: b.policy_instance,
             operation_id: BytesN::from_array(env, &id),
             nonce: s.nonce,
             deployment_version: s.deployment_version,
             expires_at: v.expires_at,
             args: args(env, v),
-            invocation: AllowitPolicyInvocation {
-                module_digest: b.module_digest,
-                entrypoint: b.entrypoint,
-                argument_schema_digest: b.argument_schema_digest,
-                arguments: AllowitSep41TransferArgs {
-                    token: self.universe[v.asset].clone(),
-                    from: self.f.wallet.clone(),
-                    to: self.universe[v.recipient].clone(),
-                    amount: v.amount,
-                }
-                .to_xdr(env),
-            },
+            module_digest: b.module_digest,
+            operation: AllowitStellarOperation::Transfer(AllowitTransferArgs {
+                token: self.universe[v.asset].clone(),
+                to: self.universe[v.recipient].clone(),
+                amount: v.amount,
+            }),
         }
     }
     fn execute(&self, e: &AllowitExecutionRequest) -> Result<(), u32> {
@@ -640,7 +638,6 @@ fn kernel_violations_reject_identically_in_every_contract() {
     let v = vectors::base();
     assert!(realizable(&v));
     for wallet in TIERS.map(Wallet::new) {
-        let env = &wallet.f.env;
         let tier = wallet.tier;
         let reject = |change: &dyn Fn(&mut AllowitExecutionRequest), paused: bool| {
             wallet.seed(&v, paused);
@@ -649,11 +646,8 @@ fn kernel_violations_reject_identically_in_every_contract() {
             wallet.execute(&e)
         };
         let transfer = |e: &mut AllowitExecutionRequest,
-                        edit: &dyn Fn(&mut AllowitSep41TransferArgs)| {
-            let mut args =
-                AllowitSep41TransferArgs::from_xdr(env, &e.invocation.arguments).unwrap();
-            edit(&mut args);
-            e.invocation.arguments = args.to_xdr(env);
+                        edit: &dyn Fn(&mut AllowitTransferArgs)| {
+            edit(transfer_args(e))
         };
         let other = wallet.universe[vectors::OTHER].clone();
         let asset = |e: &mut AllowitExecutionRequest| transfer(e, &|a| a.token = other.clone());

@@ -173,11 +173,11 @@ class LiveTestnetSwap(unittest.TestCase):
             recorded = self.server.simulate_transaction(tx)
             self.assertIsNone(recorded.error, recorded.error)
             entries = [xdr.SorobanAuthorizationEntry.from_xdr(raw) for raw in recorded.results[0].auth]
-            arguments = scval.to_struct({
+            # AllowitStellarOperation::Swap with its named arguments; the wallet is the receiver.
+            operation = scval.to_enum("Swap", scval.to_struct({
                 "router": scval.to_address(ROUTER), "amount_in": scval.to_int128(amount),
                 "amount_out_min": scval.to_int128(amount_out_min), "path": path,
-                "to": scval.to_address(wallet), "deadline": scval.to_uint64(expires)}).to_xdr_bytes()
-            schema = hashlib.sha256(release.SWAP_SCHEMA).digest()
+                "deadline": scval.to_uint64(expires)}))
             execution = scval.to_struct({
                 "policy_instance": scval.to_bytes(policy_instance),
                 "source_hash": scval.to_bytes(hashlib.sha256(b"live swap policy source").digest()),
@@ -185,10 +185,9 @@ class LiveTestnetSwap(unittest.TestCase):
                 "nonce": scval.to_uint64(0),
                 "deployment_version": scval.to_uint64(0),
                 "expires_at": scval.to_uint64(expires),
-                "invocation": scval.to_struct({
-                    "module_digest": scval.to_bytes(bytes.fromhex(module)), "entrypoint": scval.to_symbol("execute"),
-                    "argument_schema_digest": scval.to_bytes(schema), "arguments": scval.to_bytes(arguments)}),
-                "expense": scval.to_void(),
+                "module_digest": scval.to_bytes(bytes.fromhex(module)),
+                "operation": operation,
+                "expense": scval.to_enum("Unpriced", None),
                 "args": scval.to_map({}),
             })
 

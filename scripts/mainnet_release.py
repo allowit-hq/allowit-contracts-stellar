@@ -24,10 +24,6 @@ READ_METHODS = {"getNetwork", "getLatestLedger", "getLedgerEntries", "simulateTr
 # Earlier reviewed releases store other custody layouts. Re-pin a reviewed release of layout 4.
 DEFAULT_REVISION = None
 DEFAULT_HASHES = {}
-SCHEMA = b"allowit.stellar.sep41_transfer.v1:ScValMap(amount:i128,from:Address,to:Address,token:Address)"
-DEPOSIT_SCHEMA = b"allowit.stellar.sep56_deposit.v1:ScValMap(assets:i128,from:Address,min_shares:i128,operator:Address,receiver:Address,vault:Address)"
-SWAP_SCHEMA = b"allowit.stellar.router_swap_exact_in.v1:ScValMap(amount_in:i128,amount_out_min:i128,deadline:u64,path:Vec<Address>,router:Address,to:Address)"
-REDEEM_SCHEMA = b"allowit.stellar.sep56_redeem.v1:ScValMap(min_assets:i128,operator:Address,owner:Address,receiver:Address,shares:i128,vault:Address)"
 WALLET_KIND = "common_policy_engine"
 POLICY_DENIED = 18
 BUILD_SCRIPTS = ("build-contracts.sh", "check-policy-bindings.py", "policy_source.py")
@@ -138,13 +134,13 @@ def plain_params(native):
 
 
 def prefix_digest(kind, module, asset, rules):
-    """The contract's standard_prefix_digest: SHA-256 of canonical XDR of its binding tuple.
+    """The contract's standard_prefix_digest: SHA-256 of canonical XDR of its binding tuple
+    (domain, kind, module hash, asset, rules).
 
     The ordered rules are a Vec<AllowitRule>; each unit enum variant encodes as a one-symbol vector."""
     checks = scval.to_vec([scval.to_vec([scval.to_symbol(rule)]) for rule in rules])
-    schemas = [scval.to_bytes(hashlib.sha256(schema).digest()) for schema in (SCHEMA, DEPOSIT_SCHEMA, SWAP_SCHEMA, REDEEM_SCHEMA)]
     value = scval.to_vec([scval.to_symbol("allowit_std_prefix"), scval.to_symbol(kind), scval.to_bytes(bytes.fromhex(module)), scval.to_address(asset),
-                          *schemas, checks])
+                          checks])
     return digest(value.to_xdr_bytes())
 
 
@@ -218,9 +214,12 @@ def complete_execute(plan, prepared, signed_xdr):
     expiry = scval.to_native(original_request["expires_at"])
     if expiry > bounds.max_time:
         raise ValueError("Execution expiry exceeds the original transaction bounds")
-    cost = scval.from_struct(xdr.SCVal.from_xdr_bytes(scval.to_native(original_request["expense"])))
+    priced, bounds = scval.from_enum(original_request["expense"])
+    if priced != "Priced":
+        raise ValueError("Execution must carry expense bounds")
+    cost = scval.from_struct(bounds)
     observed, day = scval.to_native(cost["observed_ledger"]), scval.to_native(cost["day"])
-    expected = execution(plan,prepared["wallet"],state,binding,prepared["operation_id"],observed,expires_at=expiry,day=day)
+    expected = execution(plan,state,binding,prepared["operation_id"],observed,expires_at=expiry,day=day)
     if invocation.contract_address != Address(prepared["wallet"]).to_xdr_sc_address() or invocation.function_name.sc_symbol != b"execute" or invocation.args != [expected]:
         raise ValueError("Execution differs from the plan's exact transfer")
     if prepared["expected_receipt"] != expected_receipt(plan,prepared["wallet"],state,prepared["operation_id"]):
@@ -404,8 +403,8 @@ def wallet_state(plan, wallet, parent):
         raise ValueError("Wallet policy identity or executable differs from the plan")
     if binding["source_digest"] != expected["source_digest"] or binding["engine_kind"] != WALLET_KIND or int(binding["contract_version"]) != ca.WALLET_CONTRACT_VERSION:
         raise ValueError("Installed compiled policy differs from the plan")
-    if binding["entrypoint"] != "execute" or binding["argument_schema_digest"] != digest(SCHEMA):
-        raise ValueError("Wallet does not use the admitted transfer ABI")
+    if ["transfer"] not in binding["operations"]:
+        raise ValueError("Wallet does not run transfers")
     return state, binding
 
 
@@ -414,7 +413,7 @@ def raw_invoke(plan, source, contract, method, arguments):
     return TransactionBuilder(Account(source, int(account["sequence"])), wa.PASSPHRASE[plan["network"]], base_fee=100).add_time_bounds(0, int(time.time()) + 300).append_invoke_contract_function_op(contract, method, arguments).build().to_xdr()
 
 
-def execution(plan, wallet, state, binding, operation_id, observed_ledger, case="positive", expires_at=None, day=None):
+def execution(plan, state, binding, operation_id, observed_ledger, case="positive", expires_at=None, day=None):
     ca.code_hash(operation_id)
     if int(operation_id, 16) == 0:
         raise ValueError("Operation identity must be nonzero")
@@ -425,21 +424,23 @@ def execution(plan, wallet, state, binding, operation_id, observed_ledger, case=
     if expires > plan["params"]["expiry"]: raise ValueError("Execution exceeds the params expiry")
     if case != "expired" and expires <= now + 30:
         raise ValueError("The params must remain valid for at least 30 seconds")
-    arguments = scval.to_struct({"amount": scval.to_int128(amount), "from": scval.to_address(wallet), "to": scval.to_address(recipient), "token": scval.to_address(plan["asset"])}).to_xdr_bytes()
+    # The typed AllowitStellarOperation::Transfer with its named arguments; the wallet is the source.
+    transfer = scval.to_struct({"amount": scval.to_int128(amount), "to": scval.to_address(recipient), "token": scval.to_address(plan["asset"])})
     # Conservative XLM ceilings: the full execute fee cap is attributable gas; a payment spends principal plus gas.
     expense = scval.to_struct({"asset": scval.to_address(plan["asset"]), "decimals": scval.to_uint32(7), "gas_units": scval.to_int128(gas(plan)),
         "conversion_units": scval.to_int128(0), "spent_units": scval.to_int128(amount + gas(plan)), "max_fee_stroops": scval.to_uint32(gas(plan)),
-        "observed_ledger": scval.to_uint32(integer(observed_ledger, 1, 2**32 - 1)), "day": scval.to_uint64(now // 86_400 if day is None else day)}).to_xdr_bytes()
+        "observed_ledger": scval.to_uint32(integer(observed_ledger, 1, 2**32 - 1)), "day": scval.to_uint64(now // 86_400 if day is None else day)})
     request = scval.to_struct({
         "args": scval.to_map({}),
         "policy_instance": scval.to_bytes(bytes.fromhex(plan["policy_instance"])),
         "source_hash": scval.to_bytes(bytes.fromhex(plan["policy_source_digest"])),
-        "expense": scval.to_bytes(expense),
+        "expense": scval.to_enum("Priced", expense),
         "operation_id": scval.to_bytes(bytes.fromhex(operation_id)),
         "nonce": scval.to_uint64(int(state["nonce"])),
         "deployment_version": scval.to_uint64(int(state["deployment_version"]) + (1 if case == "stale-version" else 0)),
         "expires_at": scval.to_uint64(expires),
-        "invocation": scval.to_struct({"module_digest": scval.to_bytes(bytes.fromhex(binding["module_digest"])), "entrypoint": scval.to_symbol(binding["entrypoint"]), "argument_schema_digest": scval.to_bytes(bytes.fromhex(binding["argument_schema_digest"])), "arguments": scval.to_bytes(arguments)})})
+        "module_digest": scval.to_bytes(bytes.fromhex(binding["module_digest"])),
+        "operation": scval.to_enum("Transfer", transfer)})
     return request
 
 
@@ -511,7 +512,7 @@ def prepare(plan, base, stage, parent=None, wallet=None, operation_id=None):
             if not operation_id:
                 raise ValueError("Execution requires --operation-id")
             ledger = integer(int(rpc(network, "getLatestLedger")["sequence"]), 1, 2**32 - 1)
-            raw = raw_invoke(plan, source, wallet, "execute", [execution(plan, wallet, state, binding, operation_id, ledger)])
+            raw = raw_invoke(plan, source, wallet, "execute", [execution(plan, state, binding, operation_id, ledger)])
             expected = expected_receipt(plan, wallet, state, operation_id)
             calls, spent = usage(plan, wallet)
             effects = {"wallet": wallet, "wallet_balance": balance(plan, wallet), "recipient_balance": balance(plan, plan["recipient"]), "calls": calls, "spent_total": spent}
@@ -540,7 +541,7 @@ def simulate_cases(plan, parent, wallet, operation_id, replay_id=None):
     results = {}
     for case, code in cases.items():
         selected_id = replay_id if case == "replay" else operation_id
-        raw = raw_invoke(plan, plan["agent"], wallet, "execute", [execution(plan, wallet, state, binding, selected_id, ledger, case)])
+        raw = raw_invoke(plan, plan["agent"], wallet, "execute", [execution(plan, state, binding, selected_id, ledger, case)])
         response = rpc(plan["network"], "simulateTransaction", {"transaction": raw, "authMode": "record"})
         if code is None:
             if "error" in response:

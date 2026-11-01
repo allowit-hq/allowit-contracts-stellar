@@ -6,6 +6,7 @@ use super::tests::*;
 use super::*;
 use allowit::{AllowitStandardState, OPERATIONS, RECIPIENTS, TOKENS, TRANSACTION_CAP};
 use allowit_sep56_test_vault::AllowitSep56TestVaultClient;
+use allowit_wallet_protocol::AllowitExpense;
 use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
     InvokeError, contract, contractimpl,
@@ -155,7 +156,7 @@ fn set(f: &Fixture, key: &str, value: Option<AllowitValue>) {
 }
 const OPS: [&str; 4] = ["transfer", "deposit", "swap", "redeem"];
 /// Expense bounds of a conversion: conversion loss plus gas is spent.
-fn bounds(f: &Fixture, gas: i128, conversion: i128) -> Bytes {
+fn bounds(f: &Fixture, gas: i128, conversion: i128) -> AllowitExpenseBounds {
     AllowitExpenseBounds {
         asset: f.asset.clone(),
         decimals: 7,
@@ -166,7 +167,6 @@ fn bounds(f: &Fixture, gas: i128, conversion: i128) -> Bytes {
         observed_ledger: 1,
         day: f.env.ledger().timestamp() / 86_400,
     }
-    .to_xdr(&f.env)
 }
 fn path(env: &Env, tokens: &[&Address]) -> Vec<Address> {
     let mut path = Vec::new(env);
@@ -189,19 +189,18 @@ fn swap_request(
         amount_in,
         amount_out_min,
         path: path(&f.env, tokens),
-        to: f.wallet.clone(),
         deadline: e.expires_at,
     };
-    e.invocation.argument_schema_digest = schema_digest(&f.env, ROUTER_SWAP_SCHEMA_DESCRIPTOR);
-    e.invocation.arguments = args.clone().to_xdr(&f.env);
-    e.expense = Some(bounds(f, 0, 3));
+    e.operation = AllowitStellarOperation::Swap(args.clone());
+    e.expense = AllowitExpense::Priced(bounds(f, 0, 3));
     (e, args)
 }
-/// Replace the swap arguments of `e`.
-fn reswap(f: &Fixture, e: &mut AllowitExecutionRequest, edit: impl FnOnce(&mut AllowitSwapArgs)) {
-    let mut args = AllowitSwapArgs::from_xdr(&f.env, &e.invocation.arguments).unwrap();
-    edit(&mut args);
-    e.invocation.arguments = args.to_xdr(&f.env);
+/// Edit the swap arguments of `e`.
+fn reswap(e: &mut AllowitExecutionRequest, edit: impl FnOnce(&mut AllowitSwapArgs)) {
+    let AllowitStellarOperation::Swap(args) = &mut e.operation else {
+        panic!("not a swap");
+    };
+    edit(args);
 }
 fn redeem_request(
     f: &Fixture,
@@ -210,32 +209,22 @@ fn redeem_request(
     min_assets: i128,
 ) -> AllowitExecutionRequest {
     let mut e = f.execution(min_assets);
-    e.invocation.argument_schema_digest = schema_digest(&f.env, SEP56_REDEEM_SCHEMA_DESCRIPTOR);
-    e.invocation.arguments = AllowitSep56RedeemArgs {
+    e.operation = AllowitStellarOperation::Redeem(AllowitRedeemArgs {
         vault: vault.clone(),
         shares,
-        receiver: f.wallet.clone(),
-        owner: f.wallet.clone(),
-        operator: f.wallet.clone(),
         min_assets,
-    }
-    .to_xdr(&f.env);
-    e.expense = Some(bounds(f, 0, 0));
+    });
+    e.expense = AllowitExpense::Priced(bounds(f, 0, 0));
     e
 }
 fn deposit_request(f: &Fixture, vault: &Address, assets: i128) -> AllowitExecutionRequest {
     let mut e = f.execution(assets);
-    e.invocation.argument_schema_digest = schema_digest(&f.env, SEP56_DEPOSIT_SCHEMA_DESCRIPTOR);
-    e.invocation.arguments = AllowitSep56DepositArgs {
+    e.operation = AllowitStellarOperation::Deposit(AllowitDepositArgs {
         vault: vault.clone(),
         assets,
-        receiver: f.wallet.clone(),
-        from: f.wallet.clone(),
-        operator: f.wallet.clone(),
         min_shares: assets,
-    }
-    .to_xdr(&f.env);
-    e.expense = Some(bounds(f, 0, 0));
+    });
+    e.expense = AllowitExpense::Priced(bounds(f, 0, 0));
     e
 }
 /// The plain router call a simple wallet signs: the swap with its one debit to the pair.
@@ -619,9 +608,9 @@ fn swap_kernel_invariants_reject_before_any_policy() {
         let router = p.router.clone();
         let cases: [(&str, W, &Edit); 11] = [
             (
-                "receiver",
+                "router is the wallet",
                 W::InvalidInvocation,
-                &|a: &mut AllowitSwapArgs| a.to = f.recipient.clone(),
+                &|a: &mut AllowitSwapArgs| a.router = wallet.clone(),
             ),
             (
                 "no asset endpoint",
@@ -678,7 +667,7 @@ fn swap_kernel_invariants_reject_before_any_policy() {
         ];
         for (name, error, edit) in cases {
             let (mut e, a) = swap_request(&f, &p, &[&f.asset, &p.token], 50, 47);
-            reswap(&f, &mut e, edit);
+            reswap(&mut e, edit);
             let result = if x402 {
                 check(&f, &e, &swap_contexts(&f, &p, &a))
             } else {
@@ -689,12 +678,6 @@ fn swap_kernel_invariants_reject_before_any_policy() {
         if !x402 {
             continue;
         }
-        // Extra bytes are not the canonical encoding.
-        let (mut e, a) = swap_request(&f, &p, &[&f.asset, &p.token], 50, 47);
-        e.invocation
-            .arguments
-            .append(&Bytes::from_array(&f.env, &[0; 4]));
-        assert!(check(&f, &e, &swap_contexts(&f, &p, &a)).is_err());
         // A deposit has no intercepted form.
         let v = vault(&f, 0);
         let e = deposit_request(&f, &v, 50);
@@ -885,40 +868,18 @@ fn redeem_is_denied_by_operations_and_unknown_vaults_and_checks_its_tree() {
         }
         assert_eq!(check(&f, &e, &contexts), Ok(()));
     }
-    // Kernel invariants: wallet roles, the asset as vault and positive amounts.
+    // Kernel invariants: the wallet or the asset as vault and positive amounts.
     let f = Fixture::new(SIMPLE, true);
     let v = vault(&f, 0);
     let contexts = vec![&f.env, call(&f, &v, "redeem", redeem_call(&f, 40))];
-    for field in 0..6 {
-        let mut e = redeem_request(&f, &v, 40, 40);
-        let mut args = AllowitSep56RedeemArgs::from_xdr(&f.env, &e.invocation.arguments).unwrap();
-        let error = match field {
-            0 => {
-                args.receiver = f.recipient.clone();
-                W::InvalidInvocation
-            }
-            1 => {
-                args.owner = f.recipient.clone();
-                W::InvalidInvocation
-            }
-            2 => {
-                args.operator = f.recipient.clone();
-                W::InvalidInvocation
-            }
-            3 => {
-                args.vault = f.asset.clone();
-                W::InvalidInvocation
-            }
-            4 => {
-                args.shares = 0;
-                W::InvalidAmount
-            }
-            _ => {
-                args.min_assets = 0;
-                W::InvalidAmount
-            }
-        };
-        e.invocation.arguments = args.to_xdr(&f.env);
+    let cases = [
+        (f.wallet.clone(), 40, 40, W::InvalidInvocation),
+        (f.asset.clone(), 40, 40, W::InvalidInvocation),
+        (v.clone(), 0, 40, W::InvalidAmount),
+        (v.clone(), 40, 0, W::InvalidAmount),
+    ];
+    for (field, (vault, shares, min_assets, error)) in cases.into_iter().enumerate() {
+        let e = redeem_request(&f, &vault, shares, min_assets);
         assert_eq!(check(&f, &e, &contexts), Err(Ok(error)), "{field}");
     }
     assert_eq!(f.client().state().nonce, 0);
@@ -975,7 +936,7 @@ fn execute_redeem_checks_observed_effects_and_keeps_a_receipt() {
         allow(&f, &[&v], &[], &OPS);
         let before = f.client().state();
         let mut e = redeem_request(&f, &v, 40, 37);
-        e.expense = Some(bounds(&f, 0, conversion));
+        e.expense = AllowitExpense::Priced(bounds(&f, 0, conversion));
         assert_eq!(execute(&f, &e), result, "{conversion}");
         if result.is_ok() {
             assert_eq!((f.balance(), shares(&f, &v)), (1037, 60));
@@ -1048,23 +1009,23 @@ fn swap_and_redeem_expense_classes_are_checked() {
     let invalid = Err(Ok(AllowitWalletError::InvalidInvocation));
     // A forward swap cannot lose more than its input.
     let (mut e, _) = swap_request(&f, &p, &[&f.asset, &p.token], 50, 47);
-    e.expense = Some(bounds(&f, 0, 51));
+    e.expense = AllowitExpense::Priced(bounds(&f, 0, 51));
     assert_eq!(execute(&f, &e), invalid);
     // Spent units must equal conversion plus gas.
-    let mut cost = AllowitExpenseBounds::from_xdr(&f.env, &bounds(&f, 0, 3)).unwrap();
+    let mut cost = bounds(&f, 0, 3);
     cost.spent_units = 50;
     let (mut e, _) = swap_request(&f, &p, &[&f.asset, &p.token], 50, 47);
-    e.expense = Some(cost.clone().to_xdr(&f.env));
+    e.expense = AllowitExpense::Priced(cost.clone());
     assert_eq!(execute(&f, &e), invalid);
     let v = vault(&f, 0);
     allow(&f, &[&p.router, &v], &[&p.token], &OPS);
     let mut e = redeem_request(&f, &v, 40, 40);
-    e.expense = Some(cost.to_xdr(&f.env));
+    e.expense = AllowitExpense::Priced(cost);
     assert_eq!(execute(&f, &e), invalid);
     assert_eq!(f.client().state().nonce, 0);
     // Control: a redeem may count a conversion loss.
     let mut e = redeem_request(&f, &v, 40, 40);
-    e.expense = Some(bounds(&f, 0, 2));
+    e.expense = AllowitExpense::Priced(bounds(&f, 0, 2));
     assert_eq!(execute(&f, &e), Ok(()));
     assert_eq!(f.history().spent, 2);
 }
@@ -1155,16 +1116,16 @@ fn rule_input_carries_swap_and_redeem_facts() {
     let f = Fixture::new(COMMON, false);
     let p = pool(&f, 95, 0);
     let state = f.client().state();
-    let e = f.execution(1);
-    let forward = NativeOperation::Swap(AllowitSwapArgs {
+    let mut e = f.execution(1);
+    e.expense = AllowitExpense::Unpriced;
+    e.operation = AllowitStellarOperation::Swap(AllowitSwapArgs {
         router: p.router.clone(),
         amount_in: 50,
         amount_out_min: 47,
         path: path(&f.env, &[&f.asset, &p.token]),
-        to: f.wallet.clone(),
         deadline: 1,
     });
-    let ctx = rule_input(&f.env, &state, &forward, None, &e);
+    let ctx = rule_input(&f.env, &state, &e);
     let r = &ctx.request;
     assert_eq!(r.operation, AllowitOperation::swap);
     assert_eq!((r.recipient.clone(), r.amount), (p.router.clone(), 50));
@@ -1173,30 +1134,26 @@ fn rule_input_carries_swap_and_redeem_facts() {
         (r.token_out.clone(), r.min_out),
         (Some(p.token.clone()), 47)
     );
-    let reverse = NativeOperation::Swap(AllowitSwapArgs {
+    e.operation = AllowitStellarOperation::Swap(AllowitSwapArgs {
         router: p.router.clone(),
         amount_in: 100,
         amount_out_min: 40,
         path: path(&f.env, &[&p.token, &f.asset]),
-        to: f.wallet.clone(),
         deadline: 1,
     });
-    let ctx = rule_input(&f.env, &state, &reverse, None, &e);
+    let ctx = rule_input(&f.env, &state, &e);
     let r = &ctx.request;
     assert_eq!(
         (r.amount, r.token_in.clone(), r.amount_in),
         (40, p.token.clone(), 100)
     );
     assert_eq!(r.token_out, Some(f.asset.clone()));
-    let redeem = NativeOperation::Redeem(AllowitSep56RedeemArgs {
+    e.operation = AllowitStellarOperation::Redeem(AllowitRedeemArgs {
         vault: p.pair.clone(),
         shares: 30,
-        receiver: f.wallet.clone(),
-        owner: f.wallet.clone(),
-        operator: f.wallet.clone(),
         min_assets: 25,
     });
-    let ctx = rule_input(&f.env, &state, &redeem, None, &e);
+    let ctx = rule_input(&f.env, &state, &e);
     let r = &ctx.request;
     assert_eq!(r.operation, AllowitOperation::redeem);
     assert_eq!((r.recipient.clone(), r.amount), (p.pair.clone(), 25));
