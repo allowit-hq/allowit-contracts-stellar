@@ -105,9 +105,9 @@ fn checked(
         if expense.day != now / allowit::DAY {
             return Err("x402 expense bounds belong to another UTC day".into());
         }
-        // The kernel checks the day against the settlement ledger time, which can be as late as
-        // `expires_at`. Both signers would sign a request that fails after UTC midnight.
-        if request.expires_at / allowit::DAY != expense.day {
+        // The kernel checks the day against the settlement ledger time, which is before the
+        // exclusive `expires_at`. Both signers would sign a request that fails after UTC midnight.
+        if (request.expires_at - 1) / allowit::DAY != expense.day {
             return Err("Priced x402 settlement cannot cross its UTC expense day".into());
         }
     }

@@ -3325,14 +3325,17 @@ fn x402_packet_binds_both_raw_keys_and_the_complete_native_scope() {
         observed_ledger: late.state.custody.ledger,
         day: 1,
     });
-    for expires_at in [late_now + 200, 2 * 86_400] {
+    for expires_at in [late_now + 200, 2 * 86_400 + 1] {
         late.expires_at = expires_at;
         let error = x402::signing_digest(&late, late_now).unwrap_err();
         assert!(error.contains("cross its UTC expense day"), "{error}");
     }
-    late.expires_at = 2 * 86_400 - 1;
-    if let Err(error) = x402::signing_digest(&late, late_now) {
-        assert!(!error.contains("cross its UTC expense day"), "{error}");
+    // The expiry is exclusive: a request that expires at midnight settles before it.
+    for expires_at in [2 * 86_400 - 1, 2 * 86_400] {
+        late.expires_at = expires_at;
+        if let Err(error) = x402::signing_digest(&late, late_now) {
+            assert!(!error.contains("cross its UTC expense day"), "{error}");
+        }
     }
 }
 
