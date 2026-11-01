@@ -1092,8 +1092,11 @@ pub fn execute<P: AllowitPolicy>(
     execution: AllowitExecutionRequest,
 ) -> Result<AllowitTransferReceipt, AllowitWalletError> {
     let state = load(env, None)?;
-    state.agent.require_auth();
-    state.server.require_auth();
+    // Decoding ignores extra keys. Agent and server sign the canonical encoding of the decoded
+    // request, so a request whose meaning differs from what they signed fails auth.
+    let signed: Vec<Val> = (execution.clone(),).into_val(env);
+    state.agent.require_auth_for_args(signed.clone());
+    state.server.require_auth_for_args(signed);
     validate_operation(env, &execution, &state)?;
     let asset = state.asset.clone();
     let receipt = admit::<P>(env, &execution, state)?;

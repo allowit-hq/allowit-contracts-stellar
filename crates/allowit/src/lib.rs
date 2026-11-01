@@ -113,6 +113,16 @@ compile_error!(
     "Features `soroban` and `std` select different crate-root types; use `default-features = false`"
 );
 
+/// Whether `text` is the text of a contract address: a 56-character base32 StrKey that starts
+/// with `C`. Both backends hold addresses as StrKeys.
+fn contract_strkey_ok(text: &[u8]) -> bool {
+    text.len() == 56
+        && text[0] == b'C'
+        && text
+            .iter()
+            .all(|b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(b))
+}
+
 /// Onchain backend. Params, state, request facts and errors are Soroban contract types.
 #[cfg(feature = "soroban")]
 pub mod soroban {
@@ -183,6 +193,8 @@ pub mod soroban {
         text.copy_into_slice(bytes);
         Some(bytes)
     }
+
+    use super::contract_strkey_ok as contract_text_ok;
 
     /// The text of an address: its StrKey.
     fn address_text(address: &Address) -> String {
@@ -404,6 +416,8 @@ pub mod host {
     fn text_bytes<'a>(text: &'a String, _buf: &'a mut [u8; MAX_TEXT as usize]) -> Option<&'a [u8]> {
         (text.len() <= MAX_TEXT as usize).then_some(text.as_bytes())
     }
+
+    use super::contract_strkey_ok as contract_text_ok;
 
     /// The text of an address: its StrKey.
     fn address_text(address: &Address) -> String {

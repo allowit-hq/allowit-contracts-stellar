@@ -1648,12 +1648,12 @@ fn a_panicking_wasm_policy_aborts_with_its_allowit_code_and_writes_nothing() {
 }
 
 #[test]
-fn typed_arguments_name_no_wallet_party_so_an_extra_key_changes_nothing() {
+fn agent_and_server_sign_the_canonical_request_so_an_extra_key_fails_auth() {
     for wasm in [SIMPLE, COMMON, CUSTOM] {
         let f = Fixture::new(wasm, false);
         let e = f.execution(10);
-        // The raw request adds a foreign `from` to the transfer arguments. Typed decoding ignores
-        // the key: the wallet still pays from itself, and agent and server sign the raw request.
+        // The raw request adds a foreign `from` to the transfer arguments. Typed decoding drops
+        // the key, and agent and server must have signed the canonical decoded request.
         let foreign = Address::generate(&f.env);
         let mut transfer = Map::<Symbol, Val>::new(&f.env);
         transfer.set(Symbol::new(&f.env, "token"), f.asset.into_val(&f.env));
@@ -1665,14 +1665,31 @@ fn typed_arguments_name_no_wallet_party_so_an_extra_key_changes_nothing() {
             Symbol::new(&f.env, "Transfer").into_val(&f.env),
             transfer.into_val(&f.env),
         ];
-        let raw: Val = e.into_val(&f.env);
+        let raw: Val = e.clone().into_val(&f.env);
         let mut request = Map::<Symbol, Val>::try_from_val(&f.env, &raw).unwrap();
         request.set(Symbol::new(&f.env, "operation"), operation.into_val(&f.env));
         let args: Vec<Val> = (request,).into_val(&f.env);
+        let execute = Symbol::new(&f.env, "execute");
+        // A signature over the raw request does not cover its decoded meaning.
         f.auth(&[&f.agent, &f.server], "execute", args.clone());
-        let receipt: AllowitTransferReceipt =
+        assert!(
             f.env
-                .invoke_contract(&f.wallet, &Symbol::new(&f.env, "execute"), args);
+                .try_invoke_contract::<AllowitTransferReceipt, AllowitWalletError>(
+                    &f.wallet,
+                    &execute,
+                    args.clone(),
+                )
+                .is_err()
+        );
+        assert_eq!(f.client().state().nonce, 0);
+        assert_eq!(f.balance(), 1000);
+        // A signature over the canonical request covers it; the wallet still pays from itself.
+        f.auth(
+            &[&f.agent, &f.server],
+            "execute",
+            (e.clone(),).into_val(&f.env),
+        );
+        let receipt: AllowitTransferReceipt = f.env.invoke_contract(&f.wallet, &execute, args);
         assert_eq!(receipt.from, f.wallet);
         assert_eq!(receipt.to, f.recipient);
         assert_eq!(f.balance(), 990);

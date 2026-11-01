@@ -88,7 +88,7 @@ ERRORS = ("MissingParam", "TransactionCapExceeded", "SpentCapExceeded", "DaySpen
           "CallCapExceeded", "RecipientNotAllowed", "TokenNotAllowed", "Expired", "Unpriced", "InvalidParam",
           "InvalidState", "Overflow", "Unsupported", "OperationNotAllowed", "Panicked")
 VALUES = ("Int", "Bool", "Str", "Addr", "List")
-ENUMS = {"AllowitOperation": ("transfer", "swap", "deposit", "redeem"), "AllowitError": ERRORS, "AllowitRule": PARAM_KEYS,
+ENUMS = {"AllowitOperation": ("transfer", "swap", "deposit", "redeem", "custom"), "AllowitError": ERRORS, "AllowitRule": PARAM_KEYS,
          "AllowitValue": VALUES}
 # Server-only enrichment: allowed offchain; a Custom contract that calls one does not compile. Each
 # takes a request struct whose fields `STRUCT_FIELDS` lists.
@@ -109,7 +109,8 @@ ALLOWIT_TYPES = ("AllowitContext", "AllowitError", "AllowitOperation", "AllowitR
 TYPES = frozenset(ALLOWIT_TYPES + ("Option", "Some", "None", "Ok", "Err"))
 # Tuple constructors, which coerce to function pointers unless called.
 CONSTRUCTORS = frozenset(("Some", "Ok", "Err", "Option::Some", "Result::Ok", "Result::Err")
-                         + tuple(prefix + "AllowitValue::" + v for v in VALUES for prefix in ("", "allowit::")))
+                         + tuple(prefix + "AllowitValue::" + v for v in VALUES for prefix in ("", "allowit::"))
+                         + ("AllowitOperation::custom", "allowit::AllowitOperation::custom"))
 # Undeclared lowercase names that are types with one width and representation on both backends.
 PRIMITIVES = frozenset(INTEGERS + ("bool", "char", "str", "_"))
 # Prelude functions; the layout ones observe pointer widths and backend type sizes. Never local names.

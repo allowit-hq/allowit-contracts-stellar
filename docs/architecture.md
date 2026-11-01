@@ -379,7 +379,8 @@ rejects negative caps.
 The op names are the general operations of `AllowitOperation`: `transfer`, `swap`, `deposit`
 and `redeem`, plus three custom-call forms. `custom` admits any custom call, `custom.<function>`
 that function on any contract, and `custom:<contract>.<function>` that function on that contract
-instance. A function is 1 to 32 ASCII letters, digits or underscores, and a contract a `C` StrKey.
+instance. A function is 1 to 32 ASCII letters, digits or underscores. The backend supplies the
+contract text check: both Stellar backends accept a `C` StrKey.
 A custom call whose contract and function form no such name is admitted by no entry, not even
 `*`. The policy core names no rail operation. The Stellar wallet maps its native calls onto the
 general operations: a SEP-41 transfer is `transfer`, a SEP-56 deposit `deposit`, a router swap
@@ -603,9 +604,10 @@ callers first.
 
 The wallet is the source, owner, receiver and operator of every native call, so no argument names
 it. Soroban decodes the request as typed values: a wrong type, a missing argument or an unknown
-variant fails before the wallet runs. Struct decoding ignores an extra key, so a key such as a
-foreign `from` changes nothing. Agent and server sign the raw request through `require_auth` on
-`execute`, and the canonical encoding of the decoded request in `__check_auth`.
+variant fails before the wallet runs. Struct decoding ignores an extra key, so agent and server
+sign the canonical encoding of the decoded request: through `require_auth_for_args` on `execute`
+and in `__check_auth`. A request with an extra key, such as a foreign `from`, fails authorization
+unless they signed its canonical form.
 
 `to_core()` maps each variant onto the general `AllowitOperation` that rules read: `transfer`,
 `swap`, `deposit` or `redeem`. The rail-neutral policy core never sees a SEP or router name. Each

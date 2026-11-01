@@ -29,7 +29,7 @@ class ReleaseTests(unittest.TestCase):
         keys = [Keypair.from_raw_ed25519_seed(bytes([n]) * 32).public_key for n in range(1, 10)]
         self.plan = dict(schema=1, network='mainnet', network_passphrase=Network.PUBLIC_NETWORK_PASSPHRASE,
             source_revision=release.DEFAULT_REVISION,
-            policy_source_digest=release.digest(release.SMOKE_SOURCE), artifact_manifest='manifest.json',
+            artifact_manifest='manifest.json',
             owner=keys[0], admin=keys[1], agent=keys[2], recipient=keys[3], forbidden_recipient=keys[4], admin_members=keys[5:8], server=keys[8], asset=Asset.native().contract_id(Network.PUBLIC_NETWORK_PASSPHRASE), policy_instance='01'*32,
             params=dict(recipients=[keys[3]], transaction_cap=10000, day_total_cap=20020000, spent_cap=20020000, call_cap=2, expiry=2000000000),
             fund_stroops=20000, payment_stroops=10000, fee_caps_stroops=dict.fromkeys(release.STAGES, 10000000), total_fee_cap_stroops=70000000, artifacts={})
@@ -71,7 +71,8 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'schema 1'): self.load()
         del self.plan['codegen_revision']
         self.plan['policy_source_digest']='00'*32
-        with self.assertRaisesRegex(ValueError,'source differs'): self.load()
+        with self.assertRaisesRegex(ValueError,'schema 1'): self.load()
+        del self.plan['policy_source_digest']
 
     def test_reject_legacy_or_partial_param_names(self):
         for legacy in ('per_transfer','daily_limit','total_limit','max_calls','expires_at'):
@@ -340,7 +341,7 @@ class ReleaseTests(unittest.TestCase):
         state=dict(nonce=3,deployment_version=1)
         binding=dict(module_digest=self.hashes['wallet'])
         request=scval.from_struct(release.execution(self.plan,state,binding,'ab'*32,90,day=7))
-        self.assertEqual(scval.to_native(request['source_hash']).hex(),self.plan['policy_source_digest'])
+        self.assertEqual(scval.to_native(request['source_hash']),hashlib.sha256(release.SMOKE_SOURCE).digest())
         priced,bounds=scval.from_enum(request['expense'])
         self.assertEqual(priced,'Priced')
         cost={k:scval.to_native(v) for k,v in scval.from_struct(bounds).items()}

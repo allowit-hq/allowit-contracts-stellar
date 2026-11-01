@@ -1082,6 +1082,7 @@ class ContractAdmin(unittest.TestCase):
             # Tuple constructors as values coerce to function pointers.
             "    let a: fn(u64) -> Option<u64> = Some;\n",
             "    let a = if true { Ok } else { Err };\n",
+            "    let a = AllowitOperation::custom;\n",
             "    let a = Option::Some;\n",
             # A name the file does not declare.
             "    let a = undeclared;\n",
@@ -1094,10 +1095,22 @@ class ContractAdmin(unittest.TestCase):
                    "    let ok = n > 0u64 || m > 0u64;\n"
                    "    match ctx.request.operation {\n"
                    "        AllowitOperation::transfer | AllowitOperation::deposit if ok => {}\n"
+                   "        AllowitOperation::custom(_, _) => {}\n"
                    "        other => {\n            let _ = other;\n        }\n    }\n"
                    "    for k in 0u64..n.min(2u64) {\n        if let Some(v) = k.checked_add(m) {\n"
                    "            let _ = Some(v);\n        }\n    }\n")
         self.assertEqual(ca.standard_prefix(source(allowed, head)), ["recipients"])
+
+    def test_checker_enums_name_every_core_variant(self):
+        import re
+        import policy_source
+        core = (ROOT / "crates" / "allowit" / "src" / "core.rs").read_text()
+        for enum, variants in policy_source.ENUMS.items():
+            body = re.search(r"pub enum " + enum + r" \{(.*?)\n\s*\}", core, re.S)
+            self.assertIsNotNone(body, enum)
+            names = re.findall(r"^\s*([A-Za-z_]\w*)\s*(?:[(,=]|$)", re.sub(r"\s*//.*", "", body.group(1)), re.M)
+            with self.subTest(enum=enum):
+                self.assertEqual(tuple(names), variants)
 
     def test_wallet_code_changes_require_custody_layout_3(self):
         self.assertEqual(ca.custody_layout(meta_wasm((b"rsver", b"1.98.0"), (ca.CUSTODY_LAYOUT_KEY, b"3"))), 3)

@@ -1,9 +1,9 @@
 // Shared types and rules, included once per backend. The including module supplies `Address`,
 // `AllowitEnv`, `Map`, `String`, `Symbol` and `Vec`, the type macros `value!`, `error!` and
 // `params!`, the map primitives `lookup`, `insert`, `count`, `text_len`, `text_bytes`,
-// `each_value`, `each_item`, `address_text`, `record`, `take_writes` and `merge`, and the panic
-// primitives `fail` and `guarded`. Field types keep those names so contract specs name the
-// backend's native types.
+// `each_value`, `each_item`, `address_text`, `contract_text_ok`, `record`, `take_writes` and
+// `merge`, and the panic primitives `fail` and `guarded`. Field types keep those names so contract
+// specs name the backend's native types.
 
 /// UTC day length in seconds.
 pub const DAY: u64 = 86_400;
@@ -594,22 +594,17 @@ fn operation_match<T>(request: &AllowitRequest, seen: impl FnOnce(Option<&[u8]>)
 }
 
 /// Whether `name` is an op name: one of `OPERATION_NAMES`, `custom.<function>` or
-/// `custom:<contract>.<function>`, where a function is a `Symbol` and a contract a `C` StrKey.
+/// `custom:<contract>.<function>`, where a function is a key-like name and the backend's
+/// `contract_text_ok` accepts the contract text.
 pub(crate) fn op_name_ok(name: &[u8]) -> bool {
     if let Some(function) = name.strip_prefix(b"custom.") {
         return symbol_ok(function);
     }
-    match name
-        .strip_prefix(b"custom:")
-        .and_then(|call| call.split_at_checked(56))
-    {
-        Some((contract, function)) => {
-            contract[0] == b'C'
-                && contract
-                    .iter()
-                    .all(|b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(b))
-                && function.strip_prefix(b".").is_some_and(symbol_ok)
-        }
+    match name.strip_prefix(b"custom:") {
+        Some(call) => call
+            .iter()
+            .rposition(|b| *b == b'.')
+            .is_some_and(|dot| contract_text_ok(&call[..dot]) && symbol_ok(&call[dot + 1..])),
         None => OPERATION_NAMES.contains(&name),
     }
 }

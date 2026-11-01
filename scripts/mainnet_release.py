@@ -49,6 +49,8 @@ pub fn execute(ctx: &AllowitContext) -> allowit::Result {
 }
 """
 RULES = ca.standard_prefix(SMOKE_SOURCE.decode())
+# Executions carry this as `source_hash`: the SHA-256 of the literal source above.
+SMOKE_SOURCE_HASH = hashlib.sha256(SMOKE_SOURCE).digest()
 
 
 # Bind every delegated CLI operation to the same endpoint and passphrase as direct RPC reads.
@@ -264,7 +266,7 @@ def complete_execute(plan, prepared, signed_xdr):
 def load_plan(path):
     path = Path(path).resolve()
     plan = json.loads(path.read_text())
-    fields = {"schema", "network", "network_passphrase", "source_revision", "policy_source_digest", "artifact_manifest", "artifacts", "owner", "admin", "admin_members", "agent", "server", "asset", "recipient", "forbidden_recipient", "policy_instance", "params", "fund_stroops", "payment_stroops", "fee_caps_stroops", "total_fee_cap_stroops"}
+    fields = {"schema", "network", "network_passphrase", "source_revision", "artifact_manifest", "artifacts", "owner", "admin", "admin_members", "agent", "server", "asset", "recipient", "forbidden_recipient", "policy_instance", "params", "fund_stroops", "payment_stroops", "fee_caps_stroops", "total_fee_cap_stroops"}
     if set(plan) != fields or plan["schema"] != 1:
         raise ValueError("Plan fields must match schema 1 exactly")
     network = plan["network"]
@@ -277,8 +279,6 @@ def load_plan(path):
     if subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip() != plan["source_revision"]:
         # Tooling commits may follow the contract revision, but every build source must match it.
         subprocess.run(["git", "merge-base", "--is-ancestor", plan["source_revision"], "HEAD"], cwd=ROOT, check=True)
-    if plan["policy_source_digest"] != digest(SMOKE_SOURCE):
-        raise ValueError("Policy source differs from the plan")
     manifest_path = Path(plan["artifact_manifest"])
     if not manifest_path.is_absolute():
         manifest_path = path.parent / manifest_path
@@ -433,7 +433,7 @@ def execution(plan, state, binding, operation_id, observed_ledger, case="positiv
     request = scval.to_struct({
         "args": scval.to_map({}),
         "policy_instance": scval.to_bytes(bytes.fromhex(plan["policy_instance"])),
-        "source_hash": scval.to_bytes(bytes.fromhex(plan["policy_source_digest"])),
+        "source_hash": scval.to_bytes(SMOKE_SOURCE_HASH),
         "expense": scval.to_enum("Priced", expense),
         "operation_id": scval.to_bytes(bytes.fromhex(operation_id)),
         "nonce": scval.to_uint64(int(state["nonce"])),
