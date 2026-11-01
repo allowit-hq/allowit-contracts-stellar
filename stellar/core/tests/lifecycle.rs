@@ -981,7 +981,7 @@ fn retained_native_signed(prepared: PreparedOperation) -> SignedOperation {
     }
 }
 #[test]
-fn native_immediate_bounds_keep_exact_expiry_and_reject_other_lower_bounds() {
+fn native_immediate_bounds_exclude_the_expiry_second_and_reject_other_bounds() {
     let (c, r, s) = fixture(WalletRoute::Native, false);
     let p = prepare(&c, &r, &s, 86401, 86700).unwrap();
     let TransactionEnvelope::Tx(envelope) =
@@ -993,7 +993,7 @@ fn native_immediate_bounds_keep_exact_expiry_and_reject_other_lower_bounds() {
         envelope.tx.cond,
         stellar_xdr::Preconditions::Time(stellar_xdr::TimeBounds {
             min_time: stellar_xdr::TimePoint(0),
-            max_time: stellar_xdr::TimePoint(86700)
+            max_time: stellar_xdr::TimePoint(86699)
         })
     );
     validate_signed(&sign_native(&p), 86401).unwrap();
@@ -1003,9 +1003,18 @@ fn native_immediate_bounds_keep_exact_expiry_and_reject_other_lower_bounds() {
     for lower in [1, 86400, 86402, u64::MAX] {
         assert!(validate_prepared(&native_packet_bounds(p.clone(), lower, 86700), 86401).is_err());
     }
-    for upper in [86699, 86701] {
+    for upper in [86698, 86701] {
         assert!(validate_prepared(&native_packet_bounds(p.clone(), 0, upper), 86401).is_err());
     }
+    // A packet from before the exclusive upper bound stays readable but cannot be signed: its
+    // inclusive `maxTime` lets a payment settle in the second the request and policy expire.
+    let inclusive = native_packet_bounds(p.clone(), 0, 86700);
+    validate_prepared(&inclusive, 86401).unwrap();
+    assert!(
+        sign(&inclusive, &[2; 32], 86401)
+            .unwrap_err()
+            .contains("read-only")
+    );
 }
 #[test]
 fn retained_native_status_preserves_signed_bytes_without_new_authorization() {

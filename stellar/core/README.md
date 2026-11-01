@@ -55,7 +55,7 @@ Classic authorization verifies both customer and server role proofs. `SignedOper
 
 `prepare`, `sign` and `authorize` bind the exact request and signatures. Native transactions bind their operation ID in the hash memo. Soroban transactions use no memo and bind the same identity inside the signed `execute` arguments.
 
-New native bounds start at zero and end at the exact approved expiry. Retained native bounds may start at their original creation time. Validation preserves those signed bytes for status and refuses new authorization.
+New native and policy wallet bounds start at zero, so a transaction signed before the next ledger closes is never too early. They end one second before the approved expiry: Stellar's `maxTime` is inclusive, while the request expiry, the wallet's `expires_at <= now` check and the portable `expiry` rule are exclusive. Retained packets keep their original bounds: `[created_at, expires_at]`, or `[0, expires_at]` for native packets. Validation preserves those signed bytes for status, recovery and an unchanged resend, and refuses new authorization.
 
 Policy wallet preparation needs resource simulation before signing. Native configuration permits at most 1,000,000 stroops (0.1 XLM) in fees. The policy wallet ceiling is 10,000,000 stroops (1 XLM), because each wallet operation pays rent for a persistent replay entry at the network's longest lifetime. The exact request must cover the installed fee bound. Simulated resource fees plus inclusion fee must fit that bound. Preparation never increases it.
 

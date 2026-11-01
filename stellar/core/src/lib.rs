@@ -1197,7 +1197,7 @@ fn build(
     state: &TrustedState,
     now: u64,
     expires: u64,
-    retained_bounds: bool,
+    bounds: PacketBounds,
     packet: PacketUse,
 ) -> Result<Transaction> {
     let admit_policy = matches!(packet, PacketUse::Current);
@@ -1347,7 +1347,7 @@ fn build(
                 .checked_add(1)
                 .ok_or("Sequence overflow")?,
         ),
-        cond: Preconditions::Time(transaction_bounds(c, now, expires, retained_bounds)?),
+        cond: Preconditions::Time(transaction_bounds(c, now, expires, bounds)?),
         memo: if c.route == WalletRoute::Native {
             Memo::Hash(Hash(r.operation.nonce))
         } else {
@@ -1370,27 +1370,38 @@ fn build(
     }
     Ok(tx)
 }
-/// Time bounds of a new packet: no lower bound, so a transaction that is signed before the next
-/// ledger closes is never `txTOO_EARLY`. A policy wallet rejects `expires_at <= now`, so its upper
-/// bound excludes the expiry second: a transaction that the network includes always executes.
-/// Retained packets keep their original bounds `[created_at, expires_at]`. Historical wallet
-/// packets are read-only and always keep them.
+/// The time bounds a packet carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PacketBounds {
+    /// A new packet: `[0, expires_at - 1]`.
+    Current,
+    /// A retained packet: `[created_at, expires_at]`. Historical wallet packets always carry it.
+    Original,
+    /// A retained classic packet: `[0, expires_at]`.
+    UnboundedStart,
+}
+/// Time bounds of a packet. A new packet has no lower bound, so a transaction that is signed
+/// before the next ledger closes is never `txTOO_EARLY`. Its upper bound excludes the expiry
+/// second, because Stellar's `maxTime` is inclusive while the request expiry, the policy
+/// wallet's `expires_at <= now` check and the portable `expiry` rule are exclusive: a
+/// transaction that the network includes is never past its expiry. Retained packets keep their
+/// original bounds.
 fn transaction_bounds(
     c: &WalletConfig,
     now: u64,
     expires: u64,
-    retained_bounds: bool,
+    bounds: PacketBounds,
 ) -> Result<TimeBounds> {
-    let (min_time, max_time) = match c.route {
-        WalletRoute::Native if !retained_bounds => (0, expires),
-        WalletRoute::PolicyWallet if !retained_bounds => (
+    let (min_time, max_time) = match (&c.route, bounds) {
+        (WalletRoute::Odc, _) | (_, PacketBounds::Original) => (now, expires),
+        (_, PacketBounds::UnboundedStart) => (0, expires),
+        (_, PacketBounds::Current) => (
             0,
             expires
                 .checked_sub(1)
                 .filter(|max| *max > 0)
                 .ok_or("Invalid operation expiry")?,
         ),
-        _ => (now, expires),
     };
     Ok(TimeBounds {
         min_time: TimePoint(min_time),
@@ -1422,7 +1433,7 @@ pub fn prepare_with(
         state,
         now,
         expires_at,
-        false,
+        PacketBounds::Current,
         PacketUse::Current,
     )
 }
@@ -1434,10 +1445,10 @@ fn prepare_with_bounds(
     state: &TrustedState,
     now: u64,
     expires_at: u64,
-    retained_bounds: bool,
+    bounds: PacketBounds,
     packet: PacketUse,
 ) -> Result<PreparedOperation> {
-    let tx = build(c, r, terms, state, now, expires_at, retained_bounds, packet)?;
+    let tx = build(c, r, terms, state, now, expires_at, bounds, packet)?;
     Ok(PreparedOperation {
         version: 1,
         config: c.clone(),
@@ -1492,7 +1503,7 @@ pub(crate) fn prepare_for_native_preflight(
         state,
         now,
         expires_at,
-        false,
+        PacketBounds::Current,
         PacketUse::NativePreflight,
     )
 }
@@ -1542,7 +1553,7 @@ pub fn validate_retained_prepared(p: &PreparedOperation) -> Result<()> {
     if p.version != 1 {
         return Err("Unsupported retained operation version".into());
     }
-    let retained_bounds = retained_bounds(p)?;
+    let bounds = packet_bounds(p)?;
     let mut expected = prepare_with_bounds(
         &p.config,
         &p.request,
@@ -1550,7 +1561,7 @@ pub fn validate_retained_prepared(p: &PreparedOperation) -> Result<()> {
         &p.state,
         p.created_at,
         p.expires_at,
-        retained_bounds,
+        bounds,
         if retained_revision_packet(p)? {
             PacketUse::RetainedRevision
         } else {
@@ -1607,11 +1618,10 @@ fn retained_revision_packet(p: &PreparedOperation) -> Result<bool> {
         _ => Err("Unsupported retained policy wallet contract format".into()),
     }
 }
-/// Whether a packet carries the original bounds `[created_at, expires_at]` instead of the bounds
-/// of a new packet. Historical wallet packets always carry them.
-fn retained_bounds(p: &PreparedOperation) -> Result<bool> {
+/// The bounds a packet carries. Historical wallet packets always carry their original bounds.
+fn packet_bounds(p: &PreparedOperation) -> Result<PacketBounds> {
     if p.config.route == WalletRoute::Odc {
-        return Ok(false);
+        return Ok(PacketBounds::Original);
     }
     let TransactionEnvelope::Tx(envelope) = read(&p.transaction_xdr)? else {
         return Err("Unsupported transaction envelope".into());
@@ -1619,20 +1629,24 @@ fn retained_bounds(p: &PreparedOperation) -> Result<bool> {
     let Preconditions::Time(bounds) = envelope.tx.cond else {
         return Err("Transaction time bounds are required".into());
     };
-    let retained = TimeBounds {
-        min_time: TimePoint(p.created_at),
-        max_time: TimePoint(p.expires_at),
-    };
-    if bounds == transaction_bounds(&p.config, p.created_at, p.expires_at, false)? {
-        Ok(false)
-    } else if bounds == retained {
-        Ok(true)
+    let kinds: &[PacketBounds] = if p.config.route == WalletRoute::Native {
+        &[
+            PacketBounds::Current,
+            PacketBounds::UnboundedStart,
+            PacketBounds::Original,
+        ]
     } else {
-        Err("Transaction time bounds changed".into())
+        &[PacketBounds::Current, PacketBounds::Original]
+    };
+    for kind in kinds {
+        if bounds == transaction_bounds(&p.config, p.created_at, p.expires_at, *kind)? {
+            return Ok(*kind);
+        }
     }
+    Err("Transaction time bounds changed".into())
 }
 fn current_authorization_bounds(p: &PreparedOperation) -> Result<()> {
-    if retained_bounds(p)? {
+    if packet_bounds(p)? != PacketBounds::Current {
         return Err("Retained transaction time bounds are read-only".into());
     }
     Ok(())
