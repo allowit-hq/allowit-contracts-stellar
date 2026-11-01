@@ -49,14 +49,17 @@ calls roll back the state, version and executable changes together.
 
 The reference update changes the code used by subsequent engine calls. It does not replace the
 engine address or authorize wallet spending. An engine release that changes the interface or state
-interpretation breaks the callers that rely on the old one. Engine release 4 takes the
+interpretation breaks the callers that rely on the old one. Engine release 5 takes the
 `AllowitContext` fields `params`, `state` and `request` and returns each rule's pass value. Its
+methods carry the canonical rule names, such as `payment_limit` and `destinations`. Its
 `AllowitRequest` names the general operations `transfer`, `swap`, `deposit`, `redeem` and
 `custom(contract, function)`, and carries the swap and redeem facts `token_in`, `amount_in`,
-`token_out` and `min_out`. Release 3 took the same arguments with a request that named Stellar
-operations and lacked those facts, so a release 3 caller fails against release 4. Both replace the shipped release 1 interface, whose methods take
+`token_out` and `min_out`. Release 4 took the same arguments under the earlier rule names, so a release 4
+caller fails against release 5. Release 3 took
+the same arguments with a request that named Stellar operations and lacked those facts. All of them
+replace the shipped release 1 interface, whose methods take
 `(request: EngineRequest, state: EngineState)`. Release 2 was never released. `upgrade_engine` from
-a deployed release 1 or 3 engine to release 4 therefore breaks every onchain caller of that release.
+a deployed release 1, 3 or 4 engine to release 5 therefore breaks every onchain caller of that release.
 Wallets in this repository do not call the engine; migrate or retire other callers before that
 upgrade. A code hash identifies the exact executable. The parent administration version does not
 identify its release semantics.

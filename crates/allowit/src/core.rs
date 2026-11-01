@@ -105,22 +105,22 @@ mod types {
         /// Canonical rule. Each variant names its rule function and its canonical param key.
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
         pub enum AllowitRule {
-            /// `transaction_cap`: gross ceiling of one operation.
-            transaction_cap,
-            /// `spent_cap`: cumulative irreversible-expense ceiling.
-            spent_cap,
-            /// `day_spent_cap`: UTC-day irreversible-expense ceiling.
-            day_spent_cap,
-            /// `day_total_cap`: UTC-day gross amount plus gas ceiling.
-            day_total_cap,
-            /// `call_cap`: successful operation count ceiling.
-            call_cap,
-            /// `recipients`: permitted destinations.
-            recipients,
+            /// `payment_limit`: gross ceiling of one operation.
+            payment_limit,
+            /// `lifetime_spending_limit`: cumulative irreversible-expense ceiling.
+            lifetime_spending_limit,
+            /// `daily_spending_limit`: UTC-day irreversible-expense ceiling.
+            daily_spending_limit,
+            /// `daily_volume_limit`: UTC-day gross amount plus gas ceiling.
+            daily_volume_limit,
+            /// `call_limit`: successful operation count ceiling.
+            call_limit,
+            /// `destinations`: permitted destinations.
+            destinations,
             /// `tokens`: permitted underlying assets.
             tokens,
-            /// `expiry`: exclusive Unix timestamp of the params.
-            expiry,
+            /// `expires_at`: exclusive Unix timestamp of the params.
+            expires_at,
             /// `operations`: permitted op names.
             operations,
         }
@@ -157,18 +157,18 @@ mod types {
         pub enum AllowitError {
             /// The rule's param is unset.
             MissingParam = 101,
-            /// The amount exceeds `transaction_cap`.
-            TransactionCapExceeded = 102,
-            /// Lifetime expenses would exceed `spent_cap`.
-            SpentCapExceeded = 103,
-            /// Expenses of the UTC day would exceed `day_spent_cap`.
-            DaySpentCapExceeded = 104,
-            /// Gross amounts and gas of the UTC day would exceed `day_total_cap`.
-            DayTotalCapExceeded = 105,
-            /// This operation would exceed `call_cap`.
-            CallCapExceeded = 106,
-            /// The destination is not in `recipients`.
-            RecipientNotAllowed = 107,
+            /// The amount exceeds `payment_limit`.
+            PaymentLimitExceeded = 102,
+            /// Lifetime expenses would exceed `lifetime_spending_limit`.
+            LifetimeSpendingLimitExceeded = 103,
+            /// Expenses of the UTC day would exceed `daily_spending_limit`.
+            DailySpendingLimitExceeded = 104,
+            /// Gross amounts and gas of the UTC day would exceed `daily_volume_limit`.
+            DailyVolumeLimitExceeded = 105,
+            /// This operation would exceed `call_limit`.
+            CallLimitExceeded = 106,
+            /// The destination is not in `destinations`.
+            DestinationNotAllowed = 107,
             /// The asset is not in `tokens`.
             TokenNotAllowed = 108,
             /// The params or the request have expired.
@@ -211,22 +211,22 @@ pub mod prelude {
 }
 
 // Canonical param keys, read by the same-named rules.
-/// Canonical param key of `transaction_cap`: nonnegative `Int`.
-pub const TRANSACTION_CAP: &str = "transaction_cap";
-/// Canonical param key of `spent_cap`: nonnegative `Int`.
-pub const SPENT_CAP: &str = "spent_cap";
-/// Canonical param key of `day_spent_cap`: nonnegative `Int`.
-pub const DAY_SPENT_CAP: &str = "day_spent_cap";
-/// Canonical param key of `day_total_cap`: nonnegative `Int`.
-pub const DAY_TOTAL_CAP: &str = "day_total_cap";
-/// Canonical param key of `call_cap`: `Int` in the `u64` range.
-pub const CALL_CAP: &str = "call_cap";
-/// Canonical param key of `recipients`: `List` of `Addr`.
-pub const RECIPIENTS: &str = "recipients";
+/// Canonical param key of `payment_limit`: nonnegative `Int`.
+pub const PAYMENT_LIMIT: &str = "payment_limit";
+/// Canonical param key of `lifetime_spending_limit`: nonnegative `Int`.
+pub const LIFETIME_SPENDING_LIMIT: &str = "lifetime_spending_limit";
+/// Canonical param key of `daily_spending_limit`: nonnegative `Int`.
+pub const DAILY_SPENDING_LIMIT: &str = "daily_spending_limit";
+/// Canonical param key of `daily_volume_limit`: nonnegative `Int`.
+pub const DAILY_VOLUME_LIMIT: &str = "daily_volume_limit";
+/// Canonical param key of `call_limit`: `Int` in the `u64` range.
+pub const CALL_LIMIT: &str = "call_limit";
+/// Canonical param key of `destinations`: `List` of `Addr`.
+pub const DESTINATIONS: &str = "destinations";
 /// Canonical param key of `tokens`: `List` of `Addr`.
 pub const TOKENS: &str = "tokens";
-/// Canonical param key of `expiry`: `Int` in the `u64` range.
-pub const EXPIRY: &str = "expiry";
+/// Canonical param key of `expires_at`: `Int` in the `u64` range.
+pub const EXPIRES_AT: &str = "expires_at";
 /// Canonical param key of `operations`: `Str` `*`, or a `List` of `Str` op names.
 pub const OPERATIONS: &str = "operations";
 
@@ -275,14 +275,14 @@ pub const DAY_UNPRICED: &str = "day_unpriced";
 
 /// Every canonical rule, in param key order.
 pub const RULES: [AllowitRule; 9] = [
-    AllowitRule::transaction_cap,
-    AllowitRule::spent_cap,
-    AllowitRule::day_spent_cap,
-    AllowitRule::day_total_cap,
-    AllowitRule::call_cap,
-    AllowitRule::recipients,
+    AllowitRule::payment_limit,
+    AllowitRule::lifetime_spending_limit,
+    AllowitRule::daily_spending_limit,
+    AllowitRule::daily_volume_limit,
+    AllowitRule::call_limit,
+    AllowitRule::destinations,
     AllowitRule::tokens,
-    AllowitRule::expiry,
+    AllowitRule::expires_at,
     AllowitRule::operations,
 ];
 
@@ -291,14 +291,14 @@ impl AllowitRule {
     /// The canonical param key that the standard preflight reads for this rule: its own name.
     pub fn key(self) -> &'static str {
         match self {
-            AllowitRule::transaction_cap => TRANSACTION_CAP,
-            AllowitRule::spent_cap => SPENT_CAP,
-            AllowitRule::day_spent_cap => DAY_SPENT_CAP,
-            AllowitRule::day_total_cap => DAY_TOTAL_CAP,
-            AllowitRule::call_cap => CALL_CAP,
-            AllowitRule::recipients => RECIPIENTS,
+            AllowitRule::payment_limit => PAYMENT_LIMIT,
+            AllowitRule::lifetime_spending_limit => LIFETIME_SPENDING_LIMIT,
+            AllowitRule::daily_spending_limit => DAILY_SPENDING_LIMIT,
+            AllowitRule::daily_volume_limit => DAILY_VOLUME_LIMIT,
+            AllowitRule::call_limit => CALL_LIMIT,
+            AllowitRule::destinations => DESTINATIONS,
             AllowitRule::tokens => TOKENS,
-            AllowitRule::expiry => EXPIRY,
+            AllowitRule::expires_at => EXPIRES_AT,
             AllowitRule::operations => OPERATIONS,
         }
     }
@@ -498,8 +498,8 @@ pub fn check_params(params: &AllowitMap, tier: AllowitTier) -> Result {
 fn canonical_value(rule: AllowitRule, value: AllowitValue) -> Result {
     let value = Some(value);
     match rule {
-        AllowitRule::call_cap | AllowitRule::expiry => int::<u64>(value).map(|_| ()),
-        AllowitRule::recipients | AllowitRule::tokens => each_address(value, |_| ()),
+        AllowitRule::call_limit | AllowitRule::expires_at => int::<u64>(value).map(|_| ()),
+        AllowitRule::destinations | AllowitRule::tokens => each_address(value, |_| ()),
         AllowitRule::operations => each_op(value, |_| ()),
         _ => cap(value).map(|_| ()),
     }
@@ -711,26 +711,22 @@ fn left(cap: i128, used: i128, exceeded: AllowitError) -> Result<i128> {
 /// Bound the gross amount of one operation by the cap in `value`.
 ///
 /// Returns `cap - request.amount`. A negative cap or nonpositive amount is `InvalidParam`.
-pub fn transaction_cap(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<i128> {
+pub fn payment_limit(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<i128> {
     let cap = cap(value)?;
     if ctx.request.amount <= 0 {
         return Err(AllowitError::InvalidParam);
     }
-    left(
-        cap,
-        ctx.request.amount,
-        AllowitError::TransactionCapExceeded,
-    )
+    left(cap, ctx.request.amount, AllowitError::PaymentLimitExceeded)
 }
 
 /// Bound cumulative irreversible expenses: `spent + request.spent_units <= cap`.
 ///
 /// Returns the headroom left after this operation. Lifetime or request unpriced is `Unpriced`.
-pub fn spent_cap(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<i128> {
+pub fn lifetime_spending_limit(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<i128> {
     let cap = cap(value)?;
     let (s, r) = (standard(ctx)?, &ctx.request);
     let add = contribution(&[r.spent_units]);
-    let e = AllowitError::SpentCapExceeded;
+    let e = AllowitError::LifetimeSpendingLimitExceeded;
     accounting(cap, s.spent, s.unpriced || r.unpriced, add, e)
 }
 
@@ -738,12 +734,12 @@ pub fn spent_cap(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<i1
 /// `day_spent` is zero when the state belongs to an earlier day.
 ///
 /// Returns the headroom left after this operation. Unpriced today or in the request is `Unpriced`.
-pub fn day_spent_cap(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<i128> {
+pub fn daily_spending_limit(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<i128> {
     let cap = cap(value)?;
     let (day_spent, _, day_unpriced) = daily(ctx, &standard(ctx)?)?;
     let r = &ctx.request;
     let add = contribution(&[r.spent_units]);
-    let e = AllowitError::DaySpentCapExceeded;
+    let e = AllowitError::DailySpendingLimitExceeded;
     accounting(cap, day_spent, day_unpriced || r.unpriced, add, e)
 }
 
@@ -752,12 +748,12 @@ pub fn day_spent_cap(ctx: &AllowitContext, value: Option<AllowitValue>) -> Resul
 /// belong to principal and count once.
 ///
 /// Returns the headroom left after this operation. Unpriced today or in the request is `Unpriced`.
-pub fn day_total_cap(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<i128> {
+pub fn daily_volume_limit(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<i128> {
     let cap = cap(value)?;
     let (_, day_total, day_unpriced) = daily(ctx, &standard(ctx)?)?;
     let r = &ctx.request;
     let add = contribution(&[r.amount, r.gas_units]);
-    let e = AllowitError::DayTotalCapExceeded;
+    let e = AllowitError::DailyVolumeLimitExceeded;
     accounting(cap, day_total, day_unpriced || r.unpriced, add, e)
 }
 
@@ -765,14 +761,14 @@ pub fn day_total_cap(ctx: &AllowitContext, value: Option<AllowitValue>) -> Resul
 /// `calls + 1 <= cap`.
 ///
 /// Returns the operations left after this one. A zero cap always denies.
-pub fn call_cap(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<u64> {
+pub fn call_limit(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<u64> {
     let cap = int::<u64>(value)?;
     let next = standard(ctx)?
         .calls
         .checked_add(1)
         .ok_or(AllowitError::Overflow)?;
     if next > cap {
-        return Err(AllowitError::CallCapExceeded);
+        return Err(AllowitError::CallLimitExceeded);
     }
     Ok(cap - next)
 }
@@ -781,8 +777,8 @@ pub fn call_cap(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<u64
 /// exchange and custom calls their contract as the recipient.
 ///
 /// Returns the matched `request.recipient`. An empty list denies.
-pub fn recipients(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<Address> {
-    let e = AllowitError::RecipientNotAllowed;
+pub fn destinations(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<Address> {
+    let e = AllowitError::DestinationNotAllowed;
     allowed(value, &ctx.request.recipient, e)
 }
 
@@ -805,12 +801,12 @@ pub fn tokens(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<Addre
 
 /// Require unexpired params and request, with the request expiring no later than the params.
 ///
-/// Returns `expiry - request.now`, the seconds the params have left.
-pub fn expiry(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<u64> {
-    let expiry = int::<u64>(value)?;
+/// Returns `expires_at - request.now`, the seconds the params have left.
+pub fn expires_at(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<u64> {
+    let end = int::<u64>(value)?;
     let r = &ctx.request;
-    if r.now < expiry && r.now < r.expires_at && r.expires_at <= expiry {
-        Ok(expiry - r.now)
+    if r.now < end && r.now < r.expires_at && r.expires_at <= end {
+        Ok(end - r.now)
     } else {
         Err(AllowitError::Expired)
     }
@@ -897,14 +893,14 @@ pub fn preflight(ctx: &AllowitContext, rule: AllowitRule) -> Result {
     };
     let value = Some(value);
     match rule {
-        AllowitRule::transaction_cap => transaction_cap(ctx, value).map(|_| ()),
-        AllowitRule::spent_cap => spent_cap(ctx, value).map(|_| ()),
-        AllowitRule::day_spent_cap => day_spent_cap(ctx, value).map(|_| ()),
-        AllowitRule::day_total_cap => day_total_cap(ctx, value).map(|_| ()),
-        AllowitRule::call_cap => call_cap(ctx, value).map(|_| ()),
-        AllowitRule::recipients => recipients(ctx, value).map(|_| ()),
+        AllowitRule::payment_limit => payment_limit(ctx, value).map(|_| ()),
+        AllowitRule::lifetime_spending_limit => lifetime_spending_limit(ctx, value).map(|_| ()),
+        AllowitRule::daily_spending_limit => daily_spending_limit(ctx, value).map(|_| ()),
+        AllowitRule::daily_volume_limit => daily_volume_limit(ctx, value).map(|_| ()),
+        AllowitRule::call_limit => call_limit(ctx, value).map(|_| ()),
+        AllowitRule::destinations => destinations(ctx, value).map(|_| ()),
         AllowitRule::tokens => tokens(ctx, value).map(|_| ()),
-        AllowitRule::expiry => expiry(ctx, value).map(|_| ()),
+        AllowitRule::expires_at => expires_at(ctx, value).map(|_| ()),
         AllowitRule::operations => operations(ctx, value).map(|_| ()),
     }
 }

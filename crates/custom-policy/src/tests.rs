@@ -4,9 +4,9 @@
 extern crate std;
 use super::*;
 use allowit::{
-    AllowitOperation, AllowitParams, AllowitRequest, AllowitStandardState, AllowitValue, CALL_CAP,
-    DAY_SPENT_CAP, DAY_TOTAL_CAP, EXPIRY, OPERATIONS, RECIPIENTS, SPENT_CAP, TOKENS,
-    TRANSACTION_CAP,
+    AllowitOperation, AllowitParams, AllowitRequest, AllowitStandardState, AllowitValue,
+    CALL_LIMIT, DAILY_SPENDING_LIMIT, DAILY_VOLUME_LIMIT, DESTINATIONS, EXPIRES_AT,
+    LIFETIME_SPENDING_LIMIT, OPERATIONS, PAYMENT_LIMIT, TOKENS,
 };
 use soroban_sdk::{Address, Map, String, Symbol, testutils::Address as _, vec};
 
@@ -65,14 +65,14 @@ fn custom_runner_maps_the_policy_result() {
         Some(AllowitValue::List(vec![&env, name]))
     };
     for (key, value) in [
-        (TRANSACTION_CAP, int(10)),
-        (SPENT_CAP, int(15)),
-        (DAY_SPENT_CAP, int(10)),
-        (DAY_TOTAL_CAP, int(10)),
-        (CALL_CAP, int(1)),
-        (RECIPIENTS, list(&recipient)),
+        (PAYMENT_LIMIT, int(10)),
+        (LIFETIME_SPENDING_LIMIT, int(15)),
+        (DAILY_SPENDING_LIMIT, int(10)),
+        (DAILY_VOLUME_LIMIT, int(10)),
+        (CALL_LIMIT, int(1)),
+        (DESTINATIONS, list(&recipient)),
         (TOKENS, list(&asset)),
-        (EXPIRY, int(100)),
+        (EXPIRES_AT, int(100)),
         (OPERATIONS, ops("transfer")),
     ] {
         set(&mut ctx, key, value);
@@ -80,13 +80,13 @@ fn custom_runner_maps_the_policy_result() {
     let rules = Vec::new(&env);
     assert_eq!(AllowitCustom::check(&ctx, &rules), Ok(()));
     let mut denied = ctx.clone();
-    set(&mut denied, SPENT_CAP, int(14));
+    set(&mut denied, LIFETIME_SPENDING_LIMIT, int(14));
     assert_eq!(
         AllowitCustom::check(&denied, &rules),
         Err(AllowitWalletError::PolicyDenied)
     );
     let mut unset = ctx.clone();
-    set(&mut unset, EXPIRY, None);
+    set(&mut unset, EXPIRES_AT, None);
     assert_eq!(
         AllowitCustom::check(&unset, &rules),
         Err(AllowitWalletError::InvalidParam)

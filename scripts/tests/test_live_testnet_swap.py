@@ -4,7 +4,7 @@ The agent sends the plain `router.swap_exact_tokens_for_tokens(..., to=wallet, .
 simple wallet would sign. The wallet's `__check_auth` intercepts it, verifies the agent and server
 signatures and runs its onchain rules. The test makes a fresh classic test asset with its Stellar
 Asset Contract, adds XLM liquidity for it on Soroswap, deploys and funds a wallet from the local
-build, swaps once, and checks that a swap above the wallet's `transaction_cap` does not simulate.
+build, swaps once, and checks that a swap above the wallet's `payment_limit` does not simulate.
 
 Run it from the repository root after `scripts/build-contracts.sh`, with a funded testnet account:
 
@@ -33,7 +33,7 @@ RPC = os.environ.get("ALLOWIT_LIVE_RPC", "https://soroban-testnet.stellar.org")
 ROUTER = os.environ.get("ALLOWIT_LIVE_ROUTER", "CCJUD55AG6W5HAI5LRVNKAE5WDP5XGZBUDS5WNTIVDU7O264UZZE7BRD")
 PASSPHRASE = Network.TESTNET_NETWORK_PASSPHRASE
 WASM = ROOT / "target/wasm32v1-none/release/allowit_common_policy_engine.wasm"
-RULES = ["recipients", "tokens", "transaction_cap", "operations"]
+RULES = ["destinations", "tokens", "payment_limit", "operations"]
 XLM = 10_000_000
 
 
@@ -131,9 +131,9 @@ class LiveTestnetSwap(unittest.TestCase):
         policy_instance = secrets.token_bytes(32)
         params = sorted_map({
             "operations": value("List", scval.to_vec([value("Str", scval.to_string("swap"))])),
-            "recipients": addresses([ROUTER]),
+            "destinations": addresses([ROUTER]),
             "tokens": addresses([native, token]),
-            "transaction_cap": value("Int", scval.to_int128(20 * XLM)),
+            "payment_limit": value("Int", scval.to_int128(20 * XLM)),
         })
         config = scval.to_struct({
             "owner": scval.to_address(owner.public_key),
@@ -203,7 +203,7 @@ class LiveTestnetSwap(unittest.TestCase):
             tx.transaction.operations[0].auth = signed
             return tx
 
-        # Over the wallet's 20 XLM transaction cap: the enforcing simulation fails in `__check_auth`.
+        # Over the wallet's 20 XLM payment limit: the enforcing simulation fails in `__check_auth`.
         denied = self.server.simulate_transaction(swap(30 * XLM, secrets.token_bytes(32)))
         self.assertIsNotNone(denied.error)
         self.assertEqual(self.read(wallet, "state")["nonce"], 0)

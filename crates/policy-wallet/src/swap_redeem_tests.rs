@@ -4,7 +4,7 @@
 extern crate std;
 use super::tests::*;
 use super::*;
-use allowit::{AllowitStandardState, OPERATIONS, RECIPIENTS, TOKENS, TRANSACTION_CAP};
+use allowit::{AllowitStandardState, DESTINATIONS, OPERATIONS, PAYMENT_LIMIT, TOKENS};
 use allowit_sep56_test_vault::AllowitSep56TestVaultClient;
 use allowit_wallet_protocol::AllowitExpense;
 use ed25519_dalek::{Signer, SigningKey};
@@ -118,18 +118,18 @@ fn shares(f: &Fixture, vault: &Address) -> i128 {
 fn balance(f: &Fixture, token: &Address) -> i128 {
     token::Client::new(&f.env, token).balance(&f.wallet)
 }
-/// Install `recipients` and `tokens` beside the fixture's own and the `operations` list through an
+/// Install `destinations` and `tokens` beside the fixture's own and the `operations` list through an
 /// owner packet. Common also gets the `operations` rule, bound to its prefix digest.
-fn allow(f: &Fixture, recipients: &[&Address], tokens: &[&Address], ops: &[&str]) {
+fn allow(f: &Fixture, destinations: &[&Address], tokens: &[&Address], ops: &[&str]) {
     let mut d = f.deployment();
-    let mut all_recipients = std::vec![&f.recipient];
-    all_recipients.extend_from_slice(recipients);
+    let mut all_destinations = std::vec![&f.recipient];
+    all_destinations.extend_from_slice(destinations);
     let mut all_tokens = std::vec![&f.asset];
     all_tokens.extend_from_slice(tokens);
     set_param(
         &mut d.params,
-        RECIPIENTS,
-        Some(addresses(&f.env, &all_recipients)),
+        DESTINATIONS,
+        Some(addresses(&f.env, &all_destinations)),
     );
     set_param(&mut d.params, TOKENS, Some(addresses(&f.env, &all_tokens)));
     set_param(&mut d.params, OPERATIONS, Some(op_names(&f.env, ops)));
@@ -421,11 +421,11 @@ fn intercepted_swap_is_denied_by_operations_tokens_caps_and_unknown_routers() {
                 allow(&f, &[&p.router], &[&p.token], &["transfer", "redeem"])
             }),
             ("tokens", &|| allow(&f, &[&p.router], &[], &OPS)),
-            ("transaction_cap", &|| {
+            ("payment_limit", &|| {
                 allow(&f, &[&p.router], &[&p.token], &OPS);
-                set(&f, TRANSACTION_CAP, Some(AllowitValue::Int(49)));
+                set(&f, PAYMENT_LIMIT, Some(AllowitValue::Int(49)));
             }),
-            ("recipients", &|| allow(&f, &[], &[&p.token], &OPS)),
+            ("destinations", &|| allow(&f, &[], &[&p.token], &OPS)),
         ];
         for (name, configure) in cases {
             configure();
@@ -436,7 +436,7 @@ fn intercepted_swap_is_denied_by_operations_tokens_caps_and_unknown_routers() {
             assert_eq!(f.balance(), 1000, "{name}");
             assert_eq!(f.client().state().nonce, 0, "{name}");
             assert!(!marked(&f, &e), "{name}");
-            set(&f, TRANSACTION_CAP, Some(AllowitValue::Int(100)));
+            set(&f, PAYMENT_LIMIT, Some(AllowitValue::Int(100)));
         }
         // Control: the same swap passes once every rule admits it.
         allow(&f, &[&p.router], &[&p.token], &OPS);

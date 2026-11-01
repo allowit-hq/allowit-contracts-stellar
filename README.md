@@ -40,14 +40,14 @@ The canonical rules live in `crates/allowit`. Each rule reads one value that the
 
 | Rule and param key | What it does |
 | --- | --- |
-| `transaction_cap` | Caps the gross amount of one operation |
-| `spent_cap` | Caps cumulative irreversible expenses |
-| `day_spent_cap` | Caps irreversible expenses per UTC day |
-| `day_total_cap` | Caps gross amounts plus attributable gas per UTC day |
-| `call_cap` | Caps the number of successful operations; zero denies all |
-| `recipients` | Allows only listed destinations, including vaults and swap routers; an empty list denies all |
+| `payment_limit` | Caps the gross amount of one operation |
+| `lifetime_spending_limit` | Caps cumulative irreversible expenses |
+| `daily_spending_limit` | Caps irreversible expenses per UTC day |
+| `daily_volume_limit` | Caps gross amounts plus attributable gas per UTC day |
+| `call_limit` | Caps the number of successful operations; zero denies all |
+| `destinations` | Allows only listed destinations, including vaults and swap routers; an empty list denies all |
 | `tokens` | Allows only listed token contracts: the asset and any token a swap trades against it; an empty list denies all |
-| `expiry` | Denies from a Unix timestamp on, and requires each request to expire no later than it |
+| `expires_at` | Denies from a Unix timestamp on, and requires each request to expire no later than it |
 | `operations` | Allows only listed op names, such as `transfer`, `deposit`, `swap` or `redeem`, and returns the op name for a `match` |
 
 Value types, the standard state keys and error mapping are in [docs/architecture.md](docs/architecture.md).
@@ -62,11 +62,11 @@ use allowit::prelude::*;
 /// I approve.
 pub fn execute(ctx: &AllowitContext) -> allowit::Result {
     // "Cap every payment"
-    allowit::transaction_cap(ctx, ctx.params.get(allowit::TRANSACTION_CAP))?;
+    allowit::payment_limit(ctx, ctx.params.get(allowit::PAYMENT_LIMIT))?;
     // "cap its total spending"
-    allowit::spent_cap(ctx, ctx.params.get(allowit::SPENT_CAP))?;
+    allowit::lifetime_spending_limit(ctx, ctx.params.get(allowit::LIFETIME_SPENDING_LIMIT))?;
     // "pay only vendors I approve"
-    allowit::recipients(ctx, ctx.params.get(allowit::RECIPIENTS))?;
+    allowit::destinations(ctx, ctx.params.get(allowit::DESTINATIONS))?;
     Ok(())
 }
 ```

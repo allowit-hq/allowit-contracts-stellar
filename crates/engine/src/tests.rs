@@ -49,14 +49,14 @@ fn fixture(env: &Env) -> AllowitContext {
     let text = |op: &str| AllowitValue::Str(soroban_sdk::String::from_str(env, op));
     let list = |a: &Address| Some(AllowitValue::List(vec![env, AllowitValue::Addr(a.clone())]));
     for (key, value) in [
-        (allowit::TRANSACTION_CAP, int(100)),
-        (allowit::SPENT_CAP, int(45)),
-        (allowit::DAY_SPENT_CAP, int(50)),
-        (allowit::DAY_TOTAL_CAP, int(100)),
-        (allowit::CALL_CAP, int(3)),
-        (allowit::RECIPIENTS, list(&recipient)),
+        (allowit::PAYMENT_LIMIT, int(100)),
+        (allowit::LIFETIME_SPENDING_LIMIT, int(45)),
+        (allowit::DAILY_SPENDING_LIMIT, int(50)),
+        (allowit::DAILY_VOLUME_LIMIT, int(100)),
+        (allowit::CALL_LIMIT, int(3)),
+        (allowit::DESTINATIONS, list(&recipient)),
         (allowit::TOKENS, list(&asset)),
-        (allowit::EXPIRY, int(1_000)),
+        (allowit::EXPIRES_AT, int(1_000)),
         (
             allowit::OPERATIONS,
             Some(AllowitValue::List(vec![env, text("transfer")])),
@@ -79,44 +79,56 @@ fn compiled_engine_returns_bundled_pass_values_and_rule_errors() {
     // The exhaustive match fails to compile when a rule lacks its engine method.
     for rule in ALL {
         match rule {
-            AllowitRule::transaction_cap => {
-                let v = allowit::transaction_cap(c, p(allowit::TRANSACTION_CAP));
+            AllowitRule::payment_limit => {
+                let v = allowit::payment_limit(c, p(allowit::PAYMENT_LIMIT));
                 assert_eq!(
-                    (client.transaction_cap(&c.params.0, &c.state, &c.request), v),
+                    (client.payment_limit(&c.params.0, &c.state, &c.request), v),
                     (60, Ok(60))
                 );
             }
-            AllowitRule::spent_cap => {
-                let v = allowit::spent_cap(c, p(allowit::SPENT_CAP));
+            AllowitRule::lifetime_spending_limit => {
+                let v = allowit::lifetime_spending_limit(c, p(allowit::LIFETIME_SPENDING_LIMIT));
                 assert_eq!(
-                    (client.spent_cap(&c.params.0, &c.state, &c.request), v),
+                    (
+                        client.lifetime_spending_limit(&c.params.0, &c.state, &c.request),
+                        v
+                    ),
                     (0, Ok(0))
                 );
             }
-            AllowitRule::day_spent_cap => {
-                let v = allowit::day_spent_cap(c, p(allowit::DAY_SPENT_CAP));
+            AllowitRule::daily_spending_limit => {
+                let v = allowit::daily_spending_limit(c, p(allowit::DAILY_SPENDING_LIMIT));
                 assert_eq!(
-                    (client.day_spent_cap(&c.params.0, &c.state, &c.request), v),
+                    (
+                        client.daily_spending_limit(&c.params.0, &c.state, &c.request),
+                        v
+                    ),
                     (5, Ok(5))
                 );
             }
-            AllowitRule::day_total_cap => {
-                let v = allowit::day_total_cap(c, p(allowit::DAY_TOTAL_CAP));
+            AllowitRule::daily_volume_limit => {
+                let v = allowit::daily_volume_limit(c, p(allowit::DAILY_VOLUME_LIMIT));
                 assert_eq!(
-                    (client.day_total_cap(&c.params.0, &c.state, &c.request), v),
+                    (
+                        client.daily_volume_limit(&c.params.0, &c.state, &c.request),
+                        v
+                    ),
                     (57, Ok(57))
                 );
             }
-            AllowitRule::call_cap => {
-                let v = allowit::call_cap(c, p(allowit::CALL_CAP));
+            AllowitRule::call_limit => {
+                let v = allowit::call_limit(c, p(allowit::CALL_LIMIT));
                 assert_eq!(
-                    (client.call_cap(&c.params.0, &c.state, &c.request), v),
+                    (client.call_limit(&c.params.0, &c.state, &c.request), v),
                     (1, Ok(1))
                 );
             }
-            AllowitRule::recipients => {
-                let v = allowit::recipients(c, p(allowit::RECIPIENTS));
-                assert_eq!(Ok(client.recipients(&c.params.0, &c.state, &c.request)), v);
+            AllowitRule::destinations => {
+                let v = allowit::destinations(c, p(allowit::DESTINATIONS));
+                assert_eq!(
+                    Ok(client.destinations(&c.params.0, &c.state, &c.request)),
+                    v
+                );
                 assert_eq!(v, Ok(c.request.recipient.clone()));
             }
             AllowitRule::tokens => {
@@ -124,10 +136,10 @@ fn compiled_engine_returns_bundled_pass_values_and_rule_errors() {
                 assert_eq!(Ok(client.tokens(&c.params.0, &c.state, &c.request)), v);
                 assert_eq!(v, Ok(c.request.asset.clone()));
             }
-            AllowitRule::expiry => {
-                let v = allowit::expiry(c, p(allowit::EXPIRY));
+            AllowitRule::expires_at => {
+                let v = allowit::expires_at(c, p(allowit::EXPIRES_AT));
                 assert_eq!(
-                    (client.expiry(&c.params.0, &c.state, &c.request), v),
+                    (client.expires_at(&c.params.0, &c.state, &c.request), v),
                     (900, Ok(900))
                 );
             }
@@ -146,16 +158,16 @@ fn compiled_engine_returns_bundled_pass_values_and_rule_errors() {
     }
     set(
         &mut ctx,
-        allowit::DAY_TOTAL_CAP,
+        allowit::DAILY_VOLUME_LIMIT,
         Some(AllowitValue::Int(42)),
     );
     assert_eq!(
-        client.try_day_total_cap(&ctx.params.0, &ctx.state, &ctx.request),
-        Err(Ok(AllowitError::DayTotalCapExceeded))
+        client.try_daily_volume_limit(&ctx.params.0, &ctx.state, &ctx.request),
+        Err(Ok(AllowitError::DailyVolumeLimitExceeded))
     );
-    set(&mut ctx, allowit::SPENT_CAP, None);
+    set(&mut ctx, allowit::LIFETIME_SPENDING_LIMIT, None);
     assert_eq!(
-        client.try_spent_cap(&ctx.params.0, &ctx.state, &ctx.request),
+        client.try_lifetime_spending_limit(&ctx.params.0, &ctx.state, &ctx.request),
         Err(Ok(AllowitError::MissingParam))
     );
     let deposits = AllowitValue::List(vec![
@@ -171,13 +183,13 @@ fn compiled_engine_returns_bundled_pass_values_and_rule_errors() {
     // apply time that simulation did not see stays within the simulated footprint.
     let passing = fixture(&env);
     assert_eq!(
-        client.try_expiry(&passing.params.0, &passing.state, &passing.request),
+        client.try_expires_at(&passing.params.0, &passing.state, &passing.request),
         Ok(Ok(900))
     );
     let pass = env.cost_estimate().resources();
     assert_eq!(
-        client.try_day_total_cap(&ctx.params.0, &ctx.state, &ctx.request),
-        Err(Ok(AllowitError::DayTotalCapExceeded))
+        client.try_daily_volume_limit(&ctx.params.0, &ctx.state, &ctx.request),
+        Err(Ok(AllowitError::DailyVolumeLimitExceeded))
     );
     let fail = env.cost_estimate().resources();
     assert_eq!(fail.write_entries, 0);

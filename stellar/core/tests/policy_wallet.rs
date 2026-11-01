@@ -796,14 +796,14 @@ fn owner_submit(chain: &ModelChain, name: &str, xdr: &str) {
 fn params() -> PolicyParams {
     policy::params_from_json(
         &json!({
-            "transaction_cap": 50_000_000,
-            "spent_cap": 1_000_000_000,
-            "day_spent_cap": 500_000_000,
-            "day_total_cap": 500_000_000,
-            "call_cap": 10,
-            "recipients": [account_for_seed(&RECIPIENT), vault()],
+            "payment_limit": 50_000_000,
+            "lifetime_spending_limit": 1_000_000_000,
+            "daily_spending_limit": 500_000_000,
+            "daily_volume_limit": 500_000_000,
+            "call_limit": 10,
+            "destinations": [account_for_seed(&RECIPIENT), vault()],
             "tokens": [xlm()],
-            "expiry": NOW + 30 * 86_400,
+            "expires_at": NOW + 30 * 86_400,
             "operations": ["transfer", "deposit"],
         }),
         Some(PolicyTier::Common),
@@ -928,7 +928,7 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
             NOW + 300
         )
         .unwrap_err()
-        .contains("TransactionCapExceeded")
+        .contains("PaymentLimitExceeded")
     );
     // 5. A SEP-56 deposit: Simple and Common run it, Custom's code does not.
     let ledger = chain.0.lock().unwrap().ledger;
@@ -975,7 +975,7 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
     let mut lower = params();
     lower
         .0
-        .insert("transaction_cap".into(), PolicyValue::Int(20_000_000));
+        .insert("payment_limit".into(), PolicyValue::Int(20_000_000));
     let (deployment, check) =
         PolicyDeployment::for_source(&c, SOURCE, lower.clone(), false).unwrap();
     assert!(check.warnings.is_empty());
@@ -1008,7 +1008,7 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
             NOW + 300
         )
         .unwrap_err()
-        .contains("TransactionCapExceeded")
+        .contains("PaymentLimitExceeded")
     );
     // 8. Recovery of part of the balance to the owner.
     let recovered = owner_admin.vendor().config.owner.clone();

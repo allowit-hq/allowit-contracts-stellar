@@ -34,17 +34,17 @@ SMOKE_SOURCE = b"""use allowit::prelude::*;
 /// volume, cap total spending, allow only a few payments and stop when the params expire.
 pub fn execute(ctx: &AllowitContext) -> allowit::Result {
     // "Pay only the pinned recipient"
-    allowit::recipients(ctx, ctx.params.get(allowit::RECIPIENTS))?;
+    allowit::destinations(ctx, ctx.params.get(allowit::DESTINATIONS))?;
     // "cap each payment"
-    allowit::transaction_cap(ctx, ctx.params.get(allowit::TRANSACTION_CAP))?;
+    allowit::payment_limit(ctx, ctx.params.get(allowit::PAYMENT_LIMIT))?;
     // "cap the daily volume"
-    allowit::day_total_cap(ctx, ctx.params.get(allowit::DAY_TOTAL_CAP))?;
+    allowit::daily_volume_limit(ctx, ctx.params.get(allowit::DAILY_VOLUME_LIMIT))?;
     // "cap total spending"
-    allowit::spent_cap(ctx, ctx.params.get(allowit::SPENT_CAP))?;
+    allowit::lifetime_spending_limit(ctx, ctx.params.get(allowit::LIFETIME_SPENDING_LIMIT))?;
     // "allow only a few payments"
-    allowit::call_cap(ctx, ctx.params.get(allowit::CALL_CAP))?;
+    allowit::call_limit(ctx, ctx.params.get(allowit::CALL_LIMIT))?;
     // "stop when the params expire"
-    allowit::expiry(ctx, ctx.params.get(allowit::EXPIRY))?;
+    allowit::expires_at(ctx, ctx.params.get(allowit::EXPIRES_AT))?;
     Ok(())
 }
 """
@@ -117,11 +117,11 @@ def gas(plan):
 def smoke_params(plan):
     """Return the smoke params: exactly the selected rules' canonical keys, checked as Common does."""
     params = plan["params"]
-    if not isinstance(params, dict) or set(params) != set(RULES) or params["recipients"] != [plan["recipient"]]:
+    if not isinstance(params, dict) or set(params) != set(RULES) or params["destinations"] != [plan["recipient"]]:
         raise ValueError("Smoke params require exactly the selected canonical rule keys and pinned recipient")
-    for name in set(RULES) - {"recipients"}:
+    for name in set(RULES) - {"destinations"}:
         integer(params[name])
-    if params["day_total_cap"] < plan["payment_stroops"] + gas(plan):
+    if params["daily_volume_limit"] < plan["payment_stroops"] + gas(plan):
         raise ValueError("Smoke payment and gas exceed daily capacity")
     ca.params(params, "common")
     return params
@@ -311,14 +311,14 @@ def load_plan(path):
         raise ValueError("Policy identity must be nonzero")
     params = smoke_params(plan)
     native = Asset.native().contract_id(wa.PASSPHRASE[network])
-    if plan["asset"] != native or params["recipients"] != [plan["recipient"]]:
+    if plan["asset"] != native or params["destinations"] != [plan["recipient"]]:
         raise ValueError("Release smoke tests require native XLM and one pinned recipient")
     integer(plan["payment_stroops"])
     integer(plan["fund_stroops"])
-    if not plan["payment_stroops"] <= plan["fund_stroops"] <= params["spent_cap"] or plan["payment_stroops"] + gas(plan) > params["spent_cap"]:
-        raise ValueError("Payment, gas, funding and spent cap params are inconsistent")
-    if plan["payment_stroops"] > params["transaction_cap"]:
-        raise ValueError("Smoke payment exceeds the transaction cap")
+    if not plan["payment_stroops"] <= plan["fund_stroops"] <= params["lifetime_spending_limit"] or plan["payment_stroops"] + gas(plan) > params["lifetime_spending_limit"]:
+        raise ValueError("Payment, gas, funding and lifetime spending limit params are inconsistent")
+    if plan["payment_stroops"] > params["payment_limit"]:
+        raise ValueError("Smoke payment exceeds the payment limit")
     caps = plan["fee_caps_stroops"]
     if set(caps) != set(STAGES):
         raise ValueError("Set one fee cap for every release stage")
@@ -418,10 +418,10 @@ def execution(plan, state, binding, operation_id, observed_ledger, case="positiv
     if int(operation_id, 16) == 0:
         raise ValueError("Operation identity must be nonzero")
     recipient = plan["forbidden_recipient"] if case == "denied-recipient" else plan["recipient"]
-    amount = plan["params"]["transaction_cap"] + 1 if case == "over-limit" else plan["payment_stroops"]
+    amount = plan["params"]["payment_limit"] + 1 if case == "over-limit" else plan["payment_stroops"]
     now = int(time.time())
-    expires = expires_at if expires_at is not None else now - 1 if case == "expired" else min(now + 240, plan["params"]["expiry"])
-    if expires > plan["params"]["expiry"]: raise ValueError("Execution exceeds the params expiry")
+    expires = expires_at if expires_at is not None else now - 1 if case == "expired" else min(now + 240, plan["params"]["expires_at"])
+    if expires > plan["params"]["expires_at"]: raise ValueError("Execution expires after the expires_at param")
     if case != "expired" and expires <= now + 30:
         raise ValueError("The params must remain valid for at least 30 seconds")
     # The typed AllowitStellarOperation::Transfer with its named arguments; the wallet is the source.

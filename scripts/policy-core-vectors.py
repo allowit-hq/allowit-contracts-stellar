@@ -31,7 +31,7 @@ ITEMS = [
     "use allowit::AllowitError;",
     "use allowit::{AllowitError, AllowitValue};",
     "use allowit::{prelude::*, AllowitError};",
-    "use allowit::{transaction_cap as Ok};",
+    "use allowit::{payment_limit as Ok};",
     "use allowit::Bogus;",
     "const LIMIT: i128 = 5;",
     "const LIMIT: usize = 5;",
@@ -62,7 +62,7 @@ ITEMS = [
     "fn helper(ctx: &AllowitContext) -> bool { ctx.state.is_some() }",
     "fn helper(ctx: &AllowitContext) -> bool { ctx.request.amount > 0i128 }",
     "fn helper(ctx: &AllowitContext) -> bool { ctx.request.spent_units > ctx.request.gas_units }",
-    "fn helper(ctx: &AllowitContext) -> bool { ctx.params.get(allowit::TRANSACTION_CAP).is_some() }",
+    "fn helper(ctx: &AllowitContext) -> bool { ctx.params.get(allowit::PAYMENT_LIMIT).is_some() }",
     "fn helper(ctx: &AllowitContext) -> bool { ctx.request.args.get(\"x\").is_some() }",
     "fn helper(ctx: &AllowitContext) -> bool { ctx.request.get(\"x\").is_some() }",
     "fn helper(params: i128) -> i128 { params }",
@@ -127,7 +127,7 @@ ITEMS = [
     "fn helper(ctx: &AllowitContext) -> Option<AllowitValue> { allowit::get_state(ctx, \"k\") }",
     "fn helper() -> allowit::Result { Err(allowit::AllowitError::Unsupported) }",
     "fn helper() -> allowit::Result { Err(AllowitError::Bogus) }",
-    "fn helper() -> AllowitRule { AllowitRule::expiry }",
+    "fn helper() -> AllowitRule { AllowitRule::expires_at }",
     "fn helper() -> AllowitValue { allowit::AllowitValue::Bool(true) }",
     "fn helper() -> fn(bool) -> AllowitValue { AllowitValue::Bool }",
     "#[cfg(test)] fn helper() {}",
@@ -211,10 +211,10 @@ ITEMS = [
 STATEMENTS = [
     "let x = 1i128;",
     "allowit::set_state(ctx, \"k\", AllowitValue::Int(1i128))?;",
-    "allowit::transaction_cap(ctx, ctx.params.get(allowit::TRANSACTION_CAP))?;",
-    "allowit::spent_cap(ctx, ctx.params.get(allowit::TRANSACTION_CAP))?;",
-    "allowit::transaction_cap(ctx, ctx.params.get(allowit::TRANSACTION_CAP,),)?;",
-    "if ctx.request.amount > 5i128 { return Err(AllowitError::TransactionCapExceeded); }",
+    "allowit::payment_limit(ctx, ctx.params.get(allowit::PAYMENT_LIMIT))?;",
+    "allowit::lifetime_spending_limit(ctx, ctx.params.get(allowit::PAYMENT_LIMIT))?;",
+    "allowit::payment_limit(ctx, ctx.params.get(allowit::PAYMENT_LIMIT,),)?;",
+    "if ctx.request.amount > 5i128 { return Err(AllowitError::PaymentLimitExceeded); }",
     "assert!(ctx.request.amount >= 0i128);",
     "let n = ctx.request.args.get(\"n\").unwrap().len();",
     "let _ = ctx.request.now;",
@@ -290,8 +290,8 @@ VALUES = [
     {"Str": G}, {"Addr": G}, {"Addr": "x"}, {"Bool": True}, {"Bool": 1}, {"List": [G]},
     {"List": [{"Str": "a"}]}, {"Int": 1, "Str": "a"}, {"Bogus": 1}, {}, ["x"] * 64, ["x"] * 65,
 ]
-KEYS = ["transaction_cap", "spent_cap", "day_spent_cap", "day_total_cap", "call_cap", "recipients",
-        "tokens", "expiry", "operations", "custom", "k" * 32, "k" * 33, "bad-key", "", "T1"]
+KEYS = ["payment_limit", "lifetime_spending_limit", "daily_spending_limit", "daily_volume_limit", "call_limit", "destinations",
+        "tokens", "expires_at", "operations", "custom", "k" * 32, "k" * 33, "bad-key", "", "T1"]
 TIERS = [None, "simple", "common", "custom"]
 
 

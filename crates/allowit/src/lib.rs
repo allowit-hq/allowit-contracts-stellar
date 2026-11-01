@@ -7,9 +7,9 @@
 //! /// Let my agent pay our invoices. Cap its total spending and pay only vendors I approve.
 //! pub fn execute(ctx: &AllowitContext) -> allowit::Result {
 //!     // "Cap its total spending"
-//!     allowit::spent_cap(ctx, ctx.params.get(allowit::SPENT_CAP))?;
+//!     allowit::lifetime_spending_limit(ctx, ctx.params.get(allowit::LIFETIME_SPENDING_LIMIT))?;
 //!     // "pay only vendors I approve"
-//!     allowit::recipients(ctx, ctx.params.get(allowit::RECIPIENTS))?;
+//!     allowit::destinations(ctx, ctx.params.get(allowit::DESTINATIONS))?;
 //!     Ok(())
 //! }
 //! ```
@@ -74,7 +74,7 @@
 //! use allowit::prelude::*;
 //! /// Control for the test below: the same policy without the server-only call compiles onchain.
 //! pub fn execute(ctx: &AllowitContext) -> allowit::Result {
-//!     allowit::spent_cap(ctx, ctx.params.get(allowit::SPENT_CAP))?;
+//!     allowit::lifetime_spending_limit(ctx, ctx.params.get(allowit::LIFETIME_SPENDING_LIMIT))?;
 //!     Ok(())
 //! }
 //! ```
@@ -83,7 +83,7 @@
 //! use allowit::prelude::*;
 //! /// A Custom policy that calls a server-only function does not build onchain.
 //! pub fn execute(ctx: &AllowitContext) -> allowit::Result {
-//!     allowit::spent_cap(ctx, ctx.params.get(allowit::SPENT_CAP))?;
+//!     allowit::lifetime_spending_limit(ctx, ctx.params.get(allowit::LIFETIME_SPENDING_LIMIT))?;
 //!     allowit::clear_systemone_context(ctx)?;
 //!     Ok(())
 //! }

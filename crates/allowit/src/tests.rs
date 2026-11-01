@@ -15,14 +15,14 @@ impl Scope {}
 /// Fails to compile when a variant is added without extending `RULES`.
 fn position(rule: AllowitRule) -> usize {
     match rule {
-        AllowitRule::transaction_cap => 0,
-        AllowitRule::spent_cap => 1,
-        AllowitRule::day_spent_cap => 2,
-        AllowitRule::day_total_cap => 3,
-        AllowitRule::call_cap => 4,
-        AllowitRule::recipients => 5,
+        AllowitRule::payment_limit => 0,
+        AllowitRule::lifetime_spending_limit => 1,
+        AllowitRule::daily_spending_limit => 2,
+        AllowitRule::daily_volume_limit => 3,
+        AllowitRule::call_limit => 4,
+        AllowitRule::destinations => 5,
         AllowitRule::tokens => 6,
-        AllowitRule::expiry => 7,
+        AllowitRule::expires_at => 7,
         AllowitRule::operations => 8,
     }
 }
@@ -117,14 +117,14 @@ fn fixture(env: &Env) -> AllowitContext {
         },
     };
     for (key, value) in [
-        (TRANSACTION_CAP, int(100)),
-        (SPENT_CAP, int(1000)),
-        (DAY_SPENT_CAP, int(500)),
-        (DAY_TOTAL_CAP, int(600)),
-        (CALL_CAP, int(3)),
-        (RECIPIENTS, Some(list(env, &[&recipient]))),
+        (PAYMENT_LIMIT, int(100)),
+        (LIFETIME_SPENDING_LIMIT, int(1000)),
+        (DAILY_SPENDING_LIMIT, int(500)),
+        (DAILY_VOLUME_LIMIT, int(600)),
+        (CALL_LIMIT, int(3)),
+        (DESTINATIONS, Some(list(env, &[&recipient]))),
         (TOKENS, Some(list(env, &[&asset]))),
-        (EXPIRY, int(999_999)),
+        (EXPIRES_AT, int(999_999)),
         (OPERATIONS, ops(env, &["transfer"])),
     ] {
         set(&mut ctx, key, value);
@@ -137,17 +137,20 @@ fn rules_return_exact_passing_constraints_after_this_operation() {
     let env = Env::default();
     let ctx = fixture(&env);
     let p = |key| ctx.params.get(key);
-    assert_eq!(transaction_cap(&ctx, p(TRANSACTION_CAP)), Ok(60));
-    assert_eq!(spent_cap(&ctx, p(SPENT_CAP)), Ok(955));
-    assert_eq!(day_spent_cap(&ctx, p(DAY_SPENT_CAP)), Ok(455));
-    assert_eq!(day_total_cap(&ctx, p(DAY_TOTAL_CAP)), Ok(557));
-    assert_eq!(call_cap(&ctx, p(CALL_CAP)), Ok(1));
+    assert_eq!(payment_limit(&ctx, p(PAYMENT_LIMIT)), Ok(60));
     assert_eq!(
-        recipients(&ctx, p(RECIPIENTS)),
+        lifetime_spending_limit(&ctx, p(LIFETIME_SPENDING_LIMIT)),
+        Ok(955)
+    );
+    assert_eq!(daily_spending_limit(&ctx, p(DAILY_SPENDING_LIMIT)), Ok(455));
+    assert_eq!(daily_volume_limit(&ctx, p(DAILY_VOLUME_LIMIT)), Ok(557));
+    assert_eq!(call_limit(&ctx, p(CALL_LIMIT)), Ok(1));
+    assert_eq!(
+        destinations(&ctx, p(DESTINATIONS)),
         Ok(ctx.request.recipient.clone())
     );
     assert_eq!(tokens(&ctx, p(TOKENS)), Ok(ctx.request.asset.clone()));
-    assert_eq!(expiry(&ctx, p(EXPIRY)), Ok(999_999 - DAY - 100));
+    assert_eq!(expires_at(&ctx, p(EXPIRES_AT)), Ok(999_999 - DAY - 100));
     assert_eq!(operations(&ctx, p(OPERATIONS)), Ok("transfer"));
     for rule in RULES {
         assert_eq!(preflight(&ctx, rule), Ok(()));
@@ -157,14 +160,20 @@ fn rules_return_exact_passing_constraints_after_this_operation() {
     let mut gas = ctx.clone();
     gas.request.gas_units = 7;
     gas.request.spent_units = 47;
-    assert_eq!(spent_cap(&gas, p(SPENT_CAP)), Ok(948));
-    assert_eq!(day_total_cap(&gas, p(DAY_TOTAL_CAP)), Ok(550));
+    assert_eq!(
+        lifetime_spending_limit(&gas, p(LIFETIME_SPENDING_LIMIT)),
+        Ok(948)
+    );
+    assert_eq!(daily_volume_limit(&gas, p(DAILY_VOLUME_LIMIT)), Ok(550));
     // An empty state map is a fresh wallet: every standard value is zero.
     let mut fresh = ctx.clone();
     fresh.state = Map::new(&env);
-    assert_eq!(spent_cap(&fresh, p(SPENT_CAP)), Ok(960));
-    assert_eq!(day_total_cap(&fresh, p(DAY_TOTAL_CAP)), Ok(560));
-    assert_eq!(call_cap(&fresh, p(CALL_CAP)), Ok(2));
+    assert_eq!(
+        lifetime_spending_limit(&fresh, p(LIFETIME_SPENDING_LIMIT)),
+        Ok(960)
+    );
+    assert_eq!(daily_volume_limit(&fresh, p(DAILY_VOLUME_LIMIT)), Ok(560));
+    assert_eq!(call_limit(&fresh, p(CALL_LIMIT)), Ok(2));
 }
 
 #[test]
@@ -174,8 +183,8 @@ fn rules_read_any_key_and_param_returns_the_typed_value() {
     // A rule may read a custom key: the policy defines it.
     set(&mut ctx, "vendor_cap", int(39));
     assert_eq!(
-        transaction_cap(&ctx, ctx.params.get("vendor_cap")),
-        Err(AllowitError::TransactionCapExceeded)
+        payment_limit(&ctx, ctx.params.get("vendor_cap")),
+        Err(AllowitError::PaymentLimitExceeded)
     );
     assert_eq!(param::<i128>(&ctx, "vendor_cap"), 39);
     assert_eq!(param::<u32>(&ctx, "vendor_cap"), 39);
@@ -376,14 +385,23 @@ fn unset_params_deny_in_rules_and_skip_only_in_preflight() {
     let env = Env::default();
     let mut ctx = fixture(&env);
     ctx.params = AllowitParams(Map::new(&env));
-    assert_eq!(transaction_cap(&ctx, None), Err(AllowitError::MissingParam));
-    assert_eq!(spent_cap(&ctx, None), Err(AllowitError::MissingParam));
-    assert_eq!(day_spent_cap(&ctx, None), Err(AllowitError::MissingParam));
-    assert_eq!(day_total_cap(&ctx, None), Err(AllowitError::MissingParam));
-    assert_eq!(call_cap(&ctx, None), Err(AllowitError::MissingParam));
-    assert_eq!(recipients(&ctx, None), Err(AllowitError::MissingParam));
+    assert_eq!(payment_limit(&ctx, None), Err(AllowitError::MissingParam));
+    assert_eq!(
+        lifetime_spending_limit(&ctx, None),
+        Err(AllowitError::MissingParam)
+    );
+    assert_eq!(
+        daily_spending_limit(&ctx, None),
+        Err(AllowitError::MissingParam)
+    );
+    assert_eq!(
+        daily_volume_limit(&ctx, None),
+        Err(AllowitError::MissingParam)
+    );
+    assert_eq!(call_limit(&ctx, None), Err(AllowitError::MissingParam));
+    assert_eq!(destinations(&ctx, None), Err(AllowitError::MissingParam));
     assert_eq!(tokens(&ctx, None), Err(AllowitError::MissingParam));
-    assert_eq!(expiry(&ctx, None), Err(AllowitError::MissingParam));
+    assert_eq!(expires_at(&ctx, None), Err(AllowitError::MissingParam));
     assert_eq!(operations(&ctx, None), Err(AllowitError::MissingParam));
     // MissingParam precedes every request and state check.
     ctx.request.amount = 0;
@@ -393,26 +411,29 @@ fn unset_params_deny_in_rules_and_skip_only_in_preflight() {
         s.unpriced = true;
         s.calls = u64::MAX;
     });
-    assert_eq!(spent_cap(&ctx, None), Err(AllowitError::MissingParam));
-    assert_eq!(call_cap(&ctx, None), Err(AllowitError::MissingParam));
-    assert_eq!(expiry(&ctx, None), Err(AllowitError::MissingParam));
+    assert_eq!(
+        lifetime_spending_limit(&ctx, None),
+        Err(AllowitError::MissingParam)
+    );
+    assert_eq!(call_limit(&ctx, None), Err(AllowitError::MissingParam));
+    assert_eq!(expires_at(&ctx, None), Err(AllowitError::MissingParam));
     for rule in RULES {
         assert_eq!(preflight(&ctx, rule), Ok(()));
     }
     // A present param is checked by preflight exactly as by the rule.
-    set(&mut ctx, SPENT_CAP, int(1000));
+    set(&mut ctx, LIFETIME_SPENDING_LIMIT, int(1000));
     assert_eq!(
-        preflight(&ctx, AllowitRule::spent_cap),
+        preflight(&ctx, AllowitRule::lifetime_spending_limit),
         Err(AllowitError::Unpriced)
     );
-    set(&mut ctx, EXPIRY, int(u64::MAX.into()));
+    set(&mut ctx, EXPIRES_AT, int(u64::MAX.into()));
     assert_eq!(
-        preflight(&ctx, AllowitRule::expiry),
+        preflight(&ctx, AllowitRule::expires_at),
         Err(AllowitError::Expired)
     );
-    set(&mut ctx, CALL_CAP, int(u64::MAX.into()));
+    set(&mut ctx, CALL_LIMIT, int(u64::MAX.into()));
     assert_eq!(
-        preflight(&ctx, AllowitRule::call_cap),
+        preflight(&ctx, AllowitRule::call_limit),
         Err(AllowitError::Overflow)
     );
 }
@@ -426,24 +447,24 @@ fn params_of_the_wrong_type_or_range_are_invalid_param() {
     let address = Some(AllowitValue::Addr(ctx.request.recipient.clone()));
     let bad = Err(AllowitError::InvalidParam);
     for value in [text.clone(), flag.clone(), address.clone(), int(-1)] {
-        assert_eq!(transaction_cap(&ctx, value.clone()), bad);
-        assert_eq!(spent_cap(&ctx, value.clone()), bad);
-        assert_eq!(day_spent_cap(&ctx, value.clone()), bad);
-        assert_eq!(day_total_cap(&ctx, value), bad);
+        assert_eq!(payment_limit(&ctx, value.clone()), bad);
+        assert_eq!(lifetime_spending_limit(&ctx, value.clone()), bad);
+        assert_eq!(daily_spending_limit(&ctx, value.clone()), bad);
+        assert_eq!(daily_volume_limit(&ctx, value), bad);
     }
     for value in [text.clone(), int(-1), int(i128::from(u64::MAX) + 1)] {
         assert_eq!(
-            call_cap(&ctx, value.clone()),
+            call_limit(&ctx, value.clone()),
             Err(AllowitError::InvalidParam)
         );
-        assert_eq!(expiry(&ctx, value), Err(AllowitError::InvalidParam));
+        assert_eq!(expires_at(&ctx, value), Err(AllowitError::InvalidParam));
     }
     // A list must hold only addresses, wherever the match is.
     let recipient = AllowitValue::Addr(ctx.request.recipient.clone());
     let mixed = AllowitValue::List(vec![&env, recipient, AllowitValue::Int(1)]);
     for value in [address, int(1), Some(mixed)] {
         assert_eq!(
-            recipients(&ctx, value.clone()),
+            destinations(&ctx, value.clone()),
             Err(AllowitError::InvalidParam)
         );
         assert_eq!(tokens(&ctx, value), Err(AllowitError::InvalidParam));
@@ -454,41 +475,47 @@ fn params_of_the_wrong_type_or_range_are_invalid_param() {
 fn boundary_equality_passes_with_zero_headroom_and_one_more_denies() {
     let env = Env::default();
     let mut ctx = fixture(&env);
-    assert_eq!(transaction_cap(&ctx, int(40)), Ok(0));
-    assert_eq!(spent_cap(&ctx, int(45)), Ok(0));
-    assert_eq!(day_spent_cap(&ctx, int(45)), Ok(0));
-    assert_eq!(day_total_cap(&ctx, int(43)), Ok(0));
-    assert_eq!(call_cap(&ctx, int(2)), Ok(0));
+    assert_eq!(payment_limit(&ctx, int(40)), Ok(0));
+    assert_eq!(lifetime_spending_limit(&ctx, int(45)), Ok(0));
+    assert_eq!(daily_spending_limit(&ctx, int(45)), Ok(0));
+    assert_eq!(daily_volume_limit(&ctx, int(43)), Ok(0));
+    assert_eq!(call_limit(&ctx, int(2)), Ok(0));
     let r = ctx.request.clone();
     assert_eq!(
-        expiry(&ctx, int(r.expires_at.into())),
+        expires_at(&ctx, int(r.expires_at.into())),
         Ok(r.expires_at - r.now)
     );
     assert_eq!(
-        expiry(&ctx, int((r.now + 1).into())),
+        expires_at(&ctx, int((r.now + 1).into())),
         Err(AllowitError::Expired)
     );
     assert_eq!(
-        transaction_cap(&ctx, int(39)),
-        Err(AllowitError::TransactionCapExceeded)
+        payment_limit(&ctx, int(39)),
+        Err(AllowitError::PaymentLimitExceeded)
     );
     assert_eq!(
-        spent_cap(&ctx, int(44)),
-        Err(AllowitError::SpentCapExceeded)
+        lifetime_spending_limit(&ctx, int(44)),
+        Err(AllowitError::LifetimeSpendingLimitExceeded)
     );
     assert_eq!(
-        day_spent_cap(&ctx, int(44)),
-        Err(AllowitError::DaySpentCapExceeded)
+        daily_spending_limit(&ctx, int(44)),
+        Err(AllowitError::DailySpendingLimitExceeded)
     );
     assert_eq!(
-        day_total_cap(&ctx, int(42)),
-        Err(AllowitError::DayTotalCapExceeded)
+        daily_volume_limit(&ctx, int(42)),
+        Err(AllowitError::DailyVolumeLimitExceeded)
     );
-    assert_eq!(call_cap(&ctx, int(1)), Err(AllowitError::CallCapExceeded));
+    assert_eq!(
+        call_limit(&ctx, int(1)),
+        Err(AllowitError::CallLimitExceeded)
+    );
     // This operation counts as a call, so a zero cap always denies.
     ctx.state = Map::new(&env);
-    assert_eq!(call_cap(&ctx, int(0)), Err(AllowitError::CallCapExceeded));
-    assert_eq!(call_cap(&ctx, int(1)), Ok(0));
+    assert_eq!(
+        call_limit(&ctx, int(0)),
+        Err(AllowitError::CallLimitExceeded)
+    );
+    assert_eq!(call_limit(&ctx, int(1)), Ok(0));
 }
 
 #[test]
@@ -496,7 +523,11 @@ fn accounting_caps_check_only_the_facts_they_read() {
     let env = Env::default();
     let base = fixture(&env);
     type Cap = fn(&AllowitContext, Option<AllowitValue>) -> Result<i128>;
-    let caps: [Cap; 3] = [spent_cap, day_spent_cap, day_total_cap];
+    let caps: [Cap; 3] = [
+        lifetime_spending_limit,
+        daily_spending_limit,
+        daily_volume_limit,
+    ];
     let passing = [955, 955, 957];
     let edits: [fn(&mut AllowitContext); 11] = [
         |c| c.request.amount = 0,
@@ -512,7 +543,7 @@ fn accounting_caps_check_only_the_facts_they_read() {
         |c| c.request.gas_units = -1,
     ];
     use AllowitError::{InvalidParam as P, InvalidState as S, Unpriced as U};
-    // Expected result per edit, for spent_cap, day_spent_cap and day_total_cap. `None` passes,
+    // Expected result per edit, for lifetime_spending_limit, daily_spending_limit and daily_volume_limit. `None` passes,
     // `Some(Ok(v))` passes with `v`.
     let rolled = Some(Ok(1000 - 40));
     let expected: [[Option<core::result::Result<i128, AllowitError>>; 3]; 11] = [
@@ -540,24 +571,30 @@ fn accounting_caps_check_only_the_facts_they_read() {
     let mut ctx = base.clone();
     ctx.request.amount = 0;
     assert_eq!(
-        transaction_cap(&ctx, int(100)),
+        payment_limit(&ctx, int(100)),
         Err(AllowitError::InvalidParam)
     );
     // A standard key of another type is invalid state for every rule that reads state.
     let mut ctx = base.clone();
     ctx.state
         .set(Symbol::new(&env, "calls"), AllowitValue::Bool(true));
-    assert_eq!(call_cap(&ctx, int(3)), Err(AllowitError::InvalidState));
-    assert_eq!(spent_cap(&ctx, int(1000)), Err(AllowitError::InvalidState));
-    assert_eq!(transaction_cap(&ctx, int(100)), Ok(60));
+    assert_eq!(call_limit(&ctx, int(3)), Err(AllowitError::InvalidState));
+    assert_eq!(
+        lifetime_spending_limit(&ctx, int(1000)),
+        Err(AllowitError::InvalidState)
+    );
+    assert_eq!(payment_limit(&ctx, int(100)), Ok(60));
     // A negative count is outside its range.
     ctx.state
         .set(Symbol::new(&env, "calls"), AllowitValue::Int(-1));
-    assert_eq!(call_cap(&ctx, int(3)), Err(AllowitError::InvalidState));
+    assert_eq!(call_limit(&ctx, int(3)), Err(AllowitError::InvalidState));
     // Sums that leave the integer range overflow.
     let mut ctx = base.clone();
     edit(&mut ctx, |s| s.spent = i128::MAX);
-    assert_eq!(spent_cap(&ctx, int(1)), Err(AllowitError::Overflow));
+    assert_eq!(
+        lifetime_spending_limit(&ctx, int(1)),
+        Err(AllowitError::Overflow)
+    );
 }
 
 #[test]
@@ -568,17 +605,21 @@ fn preflight_enforces_every_present_param_with_its_rule_error() {
         let mut ctx = fixture(&env);
         let now = ctx.request.now;
         let (value, expected) = match rule {
-            AllowitRule::transaction_cap => (int(39), AllowitError::TransactionCapExceeded),
-            AllowitRule::spent_cap => (int(44), AllowitError::SpentCapExceeded),
-            AllowitRule::day_spent_cap => (int(44), AllowitError::DaySpentCapExceeded),
-            AllowitRule::day_total_cap => (int(42), AllowitError::DayTotalCapExceeded),
-            AllowitRule::call_cap => (int(1), AllowitError::CallCapExceeded),
-            AllowitRule::recipients => (
+            AllowitRule::payment_limit => (int(39), AllowitError::PaymentLimitExceeded),
+            AllowitRule::lifetime_spending_limit => {
+                (int(44), AllowitError::LifetimeSpendingLimitExceeded)
+            }
+            AllowitRule::daily_spending_limit => {
+                (int(44), AllowitError::DailySpendingLimitExceeded)
+            }
+            AllowitRule::daily_volume_limit => (int(42), AllowitError::DailyVolumeLimitExceeded),
+            AllowitRule::call_limit => (int(1), AllowitError::CallLimitExceeded),
+            AllowitRule::destinations => (
                 Some(list(&env, &[&other])),
-                AllowitError::RecipientNotAllowed,
+                AllowitError::DestinationNotAllowed,
             ),
             AllowitRule::tokens => (Some(list(&env, &[&other])), AllowitError::TokenNotAllowed),
-            AllowitRule::expiry => (int(now.into()), AllowitError::Expired),
+            AllowitRule::expires_at => (int(now.into()), AllowitError::Expired),
             AllowitRule::operations => (ops(&env, &["deposit"]), AllowitError::OperationNotAllowed),
         };
         set(&mut ctx, rule.key(), value);
@@ -597,15 +638,15 @@ fn allowlists_match_exact_addresses_and_empty_lists_deny() {
     let other = Address::generate(&env);
     let r = &ctx.request;
     assert_eq!(
-        recipients(&ctx, Some(list(&env, &[]))),
-        Err(AllowitError::RecipientNotAllowed)
+        destinations(&ctx, Some(list(&env, &[]))),
+        Err(AllowitError::DestinationNotAllowed)
     );
     assert_eq!(
-        recipients(&ctx, Some(list(&env, &[&other]))),
-        Err(AllowitError::RecipientNotAllowed)
+        destinations(&ctx, Some(list(&env, &[&other]))),
+        Err(AllowitError::DestinationNotAllowed)
     );
     assert_eq!(
-        recipients(&ctx, Some(list(&env, &[&other, &r.recipient]))),
+        destinations(&ctx, Some(list(&env, &[&other, &r.recipient]))),
         Ok(r.recipient.clone())
     );
     assert_eq!(
@@ -619,17 +660,23 @@ fn allowlists_match_exact_addresses_and_empty_lists_deny() {
 }
 
 #[test]
-fn expiry_bounds_params_and_request() {
+fn expires_at_bounds_params_and_request() {
     let env = Env::default();
     let mut ctx = fixture(&env);
     let now = ctx.request.now;
-    assert_eq!(expiry(&ctx, int(now.into())), Err(AllowitError::Expired));
+    assert_eq!(
+        expires_at(&ctx, int(now.into())),
+        Err(AllowitError::Expired)
+    );
     // A request cannot outlive the params.
     let last = ctx.request.expires_at - 1;
-    assert_eq!(expiry(&ctx, int(last.into())), Err(AllowitError::Expired));
+    assert_eq!(
+        expires_at(&ctx, int(last.into())),
+        Err(AllowitError::Expired)
+    );
     ctx.request.expires_at = now;
     assert_eq!(
-        expiry(&ctx, int((now + 10).into())),
+        expires_at(&ctx, int((now + 10).into())),
         Err(AllowitError::Expired)
     );
 }
@@ -682,19 +729,19 @@ fn standard_params_admit_only_canonical_keys_with_their_types() {
     assert_eq!(standard(&Map::new(&env)), Ok(()));
     // Zero caps and an empty allowlist are valid configuration that denies.
     let mut zero = ctx.params.0.clone();
-    zero.set(Symbol::new(&env, CALL_CAP), AllowitValue::Int(0));
-    zero.set(Symbol::new(&env, RECIPIENTS), list(&env, &[]));
+    zero.set(Symbol::new(&env, CALL_LIMIT), AllowitValue::Int(0));
+    zero.set(Symbol::new(&env, DESTINATIONS), list(&env, &[]));
     assert_eq!(standard(&zero), Ok(()));
     let text = AllowitValue::Str(String::from_str(&env, "x"));
     let address = AllowitValue::Addr(ctx.request.asset.clone());
     let too_big = AllowitValue::Int(i128::from(u64::MAX) + 1);
     let bad: [(&str, AllowitValue); 10] = [
         ("vendor_cap", AllowitValue::Int(1)),
-        (TRANSACTION_CAP, AllowitValue::Int(-1)),
-        (DAY_TOTAL_CAP, text.clone()),
-        (CALL_CAP, too_big.clone()),
-        (EXPIRY, AllowitValue::Bool(true)),
-        (RECIPIENTS, address.clone()),
+        (PAYMENT_LIMIT, AllowitValue::Int(-1)),
+        (DAILY_VOLUME_LIMIT, text.clone()),
+        (CALL_LIMIT, too_big.clone()),
+        (EXPIRES_AT, AllowitValue::Bool(true)),
+        (DESTINATIONS, address.clone()),
         (TOKENS, AllowitValue::List(vec![&env, text.clone()])),
         (OPERATIONS, text),
         (OPERATIONS, ops(&env, &["transfer", "pay"]).unwrap()),
@@ -720,7 +767,7 @@ fn standard_params_admit_only_canonical_keys_with_their_types() {
     // A custom key beside fewer than nine canonical keys passes the count check and still
     // rejects.
     let mut few = Map::new(&env);
-    few.set(Symbol::new(&env, TRANSACTION_CAP), AllowitValue::Int(1));
+    few.set(Symbol::new(&env, PAYMENT_LIMIT), AllowitValue::Int(1));
     few.set(Symbol::new(&env, "vendor_cap"), AllowitValue::Int(5));
     assert_eq!(standard(&few), Err(AllowitError::InvalidParam));
     assert_eq!(check_params(&few, AllowitTier::Custom), Ok(()));
@@ -784,7 +831,7 @@ fn params_args_and_state_stay_within_their_byte_budgets() {
     let mut standard = ctx.params.0.clone();
     let full: std::vec::Vec<Address> = (0..MAX_ITEMS).map(|_| Address::generate(&env)).collect();
     let full = list(&env, &full.iter().collect::<std::vec::Vec<_>>());
-    standard.set(Symbol::new(&env, RECIPIENTS), full.clone());
+    standard.set(Symbol::new(&env, DESTINATIONS), full.clone());
     standard.set(Symbol::new(&env, TOKENS), full);
     assert_eq!(standard.len(), 9);
     assert_eq!(check_params(&standard, AllowitTier::Standard), Ok(()));
@@ -923,7 +970,7 @@ fn evaluate_checks_standard_params_as_the_wallet_does() {
     let env = Env::default();
     let id = env.register(Scope, ());
     let mut ctx = fixture(&env);
-    ctx.params.0.remove(Symbol::new(&env, EXPIRY));
+    ctx.params.0.remove(Symbol::new(&env, EXPIRES_AT));
     ctx.params
         .0
         .set(Symbol::new(&env, "vendor_cap"), AllowitValue::Int(5));
@@ -967,10 +1014,10 @@ fn post_flight_bounds_the_number_of_state_keys() {
 
 /// Catches a spending cap error, reads it and continues; propagates the daily cap error.
 fn catching(ctx: &AllowitContext) -> Result {
-    if let Err(error) = spent_cap(ctx, ctx.params.get(SPENT_CAP)) {
+    if let Err(error) = lifetime_spending_limit(ctx, ctx.params.get(LIFETIME_SPENDING_LIMIT)) {
         set_state(ctx, "caught", error as u64)?;
     }
-    day_spent_cap(ctx, ctx.params.get(DAY_SPENT_CAP))?;
+    daily_spending_limit(ctx, ctx.params.get(DAILY_SPENDING_LIMIT))?;
     Ok(())
 }
 
@@ -980,14 +1027,17 @@ fn a_caught_rule_error_lets_the_policy_continue_and_only_a_returned_error_denies
     let id = env.register(Scope, ());
     let mut ctx = fixture(&env);
     env.as_contract(&id, || {
-        set(&mut ctx, SPENT_CAP, int(1));
+        set(&mut ctx, LIFETIME_SPENDING_LIMIT, int(1));
         assert_eq!(catching(&ctx), Ok(()));
         // The policy saw the error and recorded it; the Custom post-flight applies the write.
         let next = post_flight(&ctx, AllowitTier::Custom).unwrap();
-        let code = AllowitError::SpentCapExceeded as u64;
+        let code = AllowitError::LifetimeSpendingLimitExceeded as u64;
         assert_eq!(read::<u64>(&next, "caught"), Ok(Some(code)));
-        set(&mut ctx, DAY_SPENT_CAP, int(1));
-        assert_eq!(catching(&ctx), Err(AllowitError::DaySpentCapExceeded));
+        set(&mut ctx, DAILY_SPENDING_LIMIT, int(1));
+        assert_eq!(
+            catching(&ctx),
+            Err(AllowitError::DailySpendingLimitExceeded)
+        );
     });
 }
 
@@ -1012,9 +1062,9 @@ fn post_flight_adds_this_operation_to_current_state_then_applies_policy_writes()
         // Without policy writes, both tiers compute the same state.
         assert_eq!(post_flight(&ctx, AllowitTier::Standard), Ok(next.clone()));
         // A rule that passes on the current state holds on the post-flight state.
-        let left = spent_cap(&ctx, ctx.params.get(SPENT_CAP)).unwrap();
+        let left = lifetime_spending_limit(&ctx, ctx.params.get(LIFETIME_SPENDING_LIMIT)).unwrap();
         assert_eq!(1000 - s.spent, left);
-        let left = call_cap(&ctx, ctx.params.get(CALL_CAP)).unwrap();
+        let left = call_limit(&ctx, ctx.params.get(CALL_LIMIT)).unwrap();
         assert_eq!(3 - s.calls, left);
 
         // The next day rolls the daily values over; unpriced marks both liabilities.
@@ -1177,7 +1227,7 @@ fn post_flight_denies_policy_writes_that_leave_standard_state_undecodable() {
 /// Records a write, then denies unless the params set a call cap.
 fn writer(ctx: &AllowitContext) -> Result {
     set_state(ctx, "seen", 1u64)?;
-    call_cap(ctx, ctx.params.get(CALL_CAP))?;
+    call_limit(ctx, ctx.params.get(CALL_LIMIT))?;
     Ok(())
 }
 
@@ -1194,7 +1244,7 @@ fn evaluate_discards_writes_of_a_denied_or_stale_run() {
         assert_eq!(read::<u64>(&next, "stale"), Ok(None));
         assert_eq!(read::<u64>(&next, "seen"), Ok(Some(1)));
         // A denial returns its error and leaves no write behind.
-        set(&mut ctx, CALL_CAP, None);
+        set(&mut ctx, CALL_LIMIT, None);
         assert_eq!(
             evaluate(&ctx, writer, custom),
             Err(AllowitError::MissingParam)

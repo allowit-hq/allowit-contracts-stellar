@@ -25,7 +25,7 @@ Every public type that authored policy, SDK integrations or contract specs name 
 structs and their generated clients carry it too: `AllowitSimplePolicyEngine`,
 `AllowitCommonPolicyEngine`, `AllowitCustomPolicy`, `AllowitEngine`, `AllowitEngineParent`, and
 `AllowitEngineClient` and the other `*Client` types. Namespaced items keep their short names, such
-as `allowit::Result`, `allowit::spent_cap` and `allowit::TRANSACTION_CAP`.
+as `allowit::Result`, `allowit::lifetime_spending_limit` and `allowit::PAYMENT_LIMIT`.
 
 Encodings carry struct field names and enum variant symbols, not type names. The prefix therefore
 leaves signed encodings, the standard prefix digest and the stored layout unchanged.
@@ -43,11 +43,11 @@ use allowit::prelude::*;
 /// I approve.
 pub fn execute(ctx: &AllowitContext) -> allowit::Result {
     // "Cap every payment"
-    allowit::transaction_cap(ctx, ctx.params.get(allowit::TRANSACTION_CAP))?;
+    allowit::payment_limit(ctx, ctx.params.get(allowit::PAYMENT_LIMIT))?;
     // "cap its total spending"
-    allowit::spent_cap(ctx, ctx.params.get(allowit::SPENT_CAP))?;
+    allowit::lifetime_spending_limit(ctx, ctx.params.get(allowit::LIFETIME_SPENDING_LIMIT))?;
     // "pay only vendors I approve"
-    allowit::recipients(ctx, ctx.params.get(allowit::RECIPIENTS))?;
+    allowit::destinations(ctx, ctx.params.get(allowit::DESTINATIONS))?;
     Ok(())
 }
 ```
@@ -271,11 +271,11 @@ policy decides. Custom keys reach policy as `ctx.params.get("vendor_cap")` or as
 [Panics](#panics).
 
 The owner sets params at install and changes them with `deploy_policy`, without code redeployment.
-The canonical keys are `allowit::TRANSACTION_CAP`, `SPENT_CAP`, `DAY_SPENT_CAP`, `DAY_TOTAL_CAP`,
-`CALL_CAP`, `RECIPIENTS`, `TOKENS`, `EXPIRY` and `OPERATIONS`, each the name of its rule.
+The canonical keys are `allowit::PAYMENT_LIMIT`, `LIFETIME_SPENDING_LIMIT`, `DAILY_SPENDING_LIMIT`, `DAILY_VOLUME_LIMIT`,
+`CALL_LIMIT`, `DESTINATIONS`, `TOKENS`, `EXPIRES_AT` and `OPERATIONS`, each the name of its rule.
 `allowit::check_params` checks every owner write. Simple and Common admit only the canonical keys,
 each with the type its rule decodes: a nonnegative `Int` cap, an `Int` in the `u64` range for
-`call_cap` and `expiry`, a `List` of `Addr` for `recipients` and `tokens`, and `Str` `*` or a
+`call_limit` and `expires_at`, a `List` of `Addr` for `destinations` and `tokens`, and `Str` `*` or a
 `List` of `Str` op names for `operations`. Custom admits up to 32 keys, whose meaning its policy
 defines. Every value holds at most 64 nested values, and every text at most 256 bytes. Nothing
 checks that a rule reads its own key.
@@ -359,20 +359,20 @@ compile, because the Soroban backend has none of them.
 
 | Rule and canonical param key | Param value | Pass value |
 | --- | --- | --- |
-| `transaction_cap` | Nonnegative `Int` gross units for one operation | `cap - amount` |
-| `spent_cap` | Nonnegative `Int` cumulative irreversible-expense ceiling | `cap - (spent + spent_units)` |
-| `day_spent_cap` | Nonnegative `Int` UTC-day irreversible-expense ceiling | `cap - (today_spent + spent_units)` |
-| `day_total_cap` | Nonnegative `Int` UTC-day gross amount plus separate gas | `cap - (today_total + amount + gas_units)` |
-| `call_cap` | `Int` in the `u64` range: successful operation count ceiling; zero denies | `cap - (calls + 1)` |
-| `recipients` | `List` of `Addr`: permitted destinations, including vaults and swap routers; empty denies | Matched recipient |
+| `payment_limit` | Nonnegative `Int` gross units for one operation | `cap - amount` |
+| `lifetime_spending_limit` | Nonnegative `Int` cumulative irreversible-expense ceiling | `cap - (spent + spent_units)` |
+| `daily_spending_limit` | Nonnegative `Int` UTC-day irreversible-expense ceiling | `cap - (today_spent + spent_units)` |
+| `daily_volume_limit` | Nonnegative `Int` UTC-day gross amount plus separate gas | `cap - (today_total + amount + gas_units)` |
+| `call_limit` | `Int` in the `u64` range: successful operation count ceiling; zero denies | `cap - (calls + 1)` |
+| `destinations` | `List` of `Addr`: permitted destinations, including vaults and swap routers; empty denies | Matched recipient |
 | `tokens` | `List` of `Addr`: exact permitted token identities, the asset and any token a swap trades against it; empty denies | Matched asset |
-| `expiry` | `Int` in the `u64` range: exclusive Unix timestamp; request expiry cannot exceed it | `expiry - now` |
+| `expires_at` | `Int` in the `u64` range: exclusive Unix timestamp; request expiry cannot exceed it | `expires_at - now` |
 | `operations` | `Str` `*` for every op, or `List` of `Str` op names; empty denies | The request's op name |
 
 `today_spent` and `today_total` are the daily values when `state.day == now / 86400`, and zero for
 an earlier day. A later day is `InvalidState`. Each rule checks only the facts it reads. A negative
-cap is `InvalidParam`, as are a nonpositive `transaction_cap` amount and negative request units. A negative state value that a cap reads is `InvalidState`. Lifetime unpriced state or an
-unpriced request denies `spent_cap`; unpriced state of the day or an unpriced request denies both
+cap is `InvalidParam`, as are a nonpositive `payment_limit` amount and negative request units. A negative state value that a cap reads is `InvalidState`. Lifetime unpriced state or an
+unpriced request denies `lifetime_spending_limit`; unpriced state of the day or an unpriced request denies both
 daily caps (`Unpriced`). A sum outside its integer range is `Overflow`. Standard configuration
 rejects negative caps.
 
@@ -584,12 +584,13 @@ It holds no custody, params or policy state. No policy wallet, release tool or s
 calls it; offchain evaluation uses `allowit` directly. It remains the engine parent's administered
 checker for onchain callers that cannot bundle `allowit`. Its tests match `AllowitRule` exhaustively, so a
 new rule fails to compile until the engine exposes it. The `test-deny` fixture aborts every rule
-with contract error `TEST_DENY` (1000), outside `allowit::AllowitError`. `engine_version` 4 marks this ABI:
-its `AllowitRequest` names the general operations `transfer`, `swap`, `deposit`, `redeem` and
-`custom(contract, function)`, and carries `token_in`, `amount_in`, `token_out` and `min_out`.
-Release 3 named Stellar operations and lacked those facts. It replaces the shipped release 1 ABI, whose methods take `(request: EngineRequest, state:
-EngineState)`. Release 2 was never released. An `upgrade_engine` from a deployed release 1 or 3
-engine to release 4 breaks every onchain caller of the earlier methods, so migrate or retire those
+with contract error `TEST_DENY` (1000), outside `allowit::AllowitError`. `engine_version` 5 marks this ABI:
+its methods carry the canonical rule names, and its `AllowitRequest` names the general operations
+`transfer`, `swap`, `deposit`, `redeem` and `custom(contract, function)`, and carries `token_in`,
+`amount_in`, `token_out` and `min_out`. Release 4 used the earlier rule names. Release 3 named Stellar operations and lacked those facts. It
+replaces the shipped release 1 ABI, whose methods take `(request: EngineRequest, state:
+EngineState)`. Release 2 was never released. An `upgrade_engine` from a deployed release 1, 3 or 4
+engine to release 5 breaks every onchain caller of the earlier methods, so migrate or retire those
 callers first.
 
 ## Typed operations
@@ -655,7 +656,7 @@ State, effects and receipts commit atomically. Denials and native failures roll 
 
 SEP-56 deposits name vault, assets and minimum shares; the wallet is source, operator and share
 receiver.
-Ordinary `recipients` controls destination vaults; no separate vault list or code-hash pin applies.
+Ordinary `destinations` controls destination vaults; no separate vault list or code-hash pin applies.
 The vault must report the immutable underlying SAC. Custody authorizes one exact deeper
 `transfer(wallet, vault, assets)`. Extra debits, including a second debit later refunded, lack authority.
 Returned shares must match the observed balance credit and meet the minimum. Any conversion-loss
@@ -763,8 +764,8 @@ persistent `operation_id` marker, and `expires_at` with `deployment_version`.
 | swap, X to asset | router | `amount_out_min`, a floor | X / `amount_in` | asset / `amount_out_min` |
 | redeem | vault | `min_assets`, a floor | vault shares / `shares` | asset / `min_assets` |
 
-`recipients` allows routers and vaults; no separate list applies. `tokens` checks the asset and,
-for a swap, its other endpoint. `transaction_cap` and `day_total_cap` read the gross amount, so
+`destinations` allows routers and vaults; no separate list applies. `tokens` checks the asset and,
+for a swap, its other endpoint. `payment_limit` and `daily_volume_limit` read the gross amount, so
 their limits on reverse swaps and redeems are floors. Swaps and redeems follow the deposit expense
 model: `conversion_units` is the loss ceiling, and `spent_units` equals it plus `gas_units`. A
 forward swap's loss cannot exceed `amount_in`. An `execute` redeem checks its loss against the
@@ -798,7 +799,7 @@ requires `preview - min(preview, assets) <= conversion_units`. The final read is
   transaction. `amount_out_min` bounds a swap's loss and `min_assets` an `execute` redeem's; an
   intercepted redeem's loss has no onchain bound.
 - The strict execution nonce orders every operation across both doors.
-- Testnet resets change router and token addresses: update `recipients` and `tokens` with
+- Testnet resets change router and token addresses: update `destinations` and `tokens` with
   `deploy_policy`.
 
 ## Owner authority and public metadata

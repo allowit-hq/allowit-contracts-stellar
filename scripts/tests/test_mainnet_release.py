@@ -31,7 +31,7 @@ class ReleaseTests(unittest.TestCase):
             source_revision=release.DEFAULT_REVISION,
             artifact_manifest='manifest.json',
             owner=keys[0], admin=keys[1], agent=keys[2], recipient=keys[3], forbidden_recipient=keys[4], admin_members=keys[5:8], server=keys[8], asset=Asset.native().contract_id(Network.PUBLIC_NETWORK_PASSPHRASE), policy_instance='01'*32,
-            params=dict(recipients=[keys[3]], transaction_cap=10000, day_total_cap=20020000, spent_cap=20020000, call_cap=2, expiry=2000000000),
+            params=dict(destinations=[keys[3]], payment_limit=10000, daily_volume_limit=20020000, lifetime_spending_limit=20020000, call_limit=2, expires_at=2000000000),
             fund_stroops=20000, payment_stroops=10000, fee_caps_stroops=dict.fromkeys(release.STAGES, 10000000), total_fee_cap_stroops=70000000, artifacts={})
         files = [release.ROOT/n for n in ('Cargo.toml','Cargo.lock','rust-toolchain.toml')]
         files += list((release.ROOT/'crates').rglob('*.rs')) + list((release.ROOT/'crates').rglob('Cargo.toml'))
@@ -75,12 +75,12 @@ class ReleaseTests(unittest.TestCase):
         del self.plan['policy_source_digest']
 
     def test_reject_legacy_or_partial_param_names(self):
-        for legacy in ('per_transfer','daily_limit','total_limit','max_calls','expires_at'):
+        for legacy in ('per_transfer','daily_limit','total_limit','max_calls','deadline'):
             plan=copy.deepcopy(self.plan);plan['params'][legacy]=1
             with self.assertRaisesRegex(ValueError,'canonical rule'): release.smoke_params(plan)
-        plan=copy.deepcopy(self.plan);del plan['params']['call_cap']
+        plan=copy.deepcopy(self.plan);del plan['params']['call_limit']
         with self.assertRaisesRegex(ValueError,'canonical rule'): release.smoke_params(plan)
-        plan=copy.deepcopy(self.plan);plan['params']['day_total_cap']=10009999
+        plan=copy.deepcopy(self.plan);plan['params']['daily_volume_limit']=10009999
         with self.assertRaisesRegex(ValueError,'daily capacity'): release.smoke_params(plan)
 
     def test_deploy_wallet_prepare_binds_the_common_tier_and_smoke_source(self):
@@ -103,11 +103,11 @@ class ReleaseTests(unittest.TestCase):
         self.plan['total_fee_cap_stroops']=100
         with self.assertRaisesRegex(ValueError,'aggregate'): self.load()
 
-    def test_reject_funding_above_the_spent_cap_param(self):
+    def test_reject_funding_above_the_lifetime_spending_limit_param(self):
         self.plan['fund_stroops']=20020001
         with self.assertRaisesRegex(ValueError,'inconsistent'): self.load()
         self.plan['fund_stroops']=20000
-        self.plan['params']['spent_cap']=10009999
+        self.plan['params']['lifetime_spending_limit']=10009999
         with self.assertRaisesRegex(ValueError,'inconsistent'): self.load()
 
     def test_reject_network_and_signer_overlap(self):
@@ -235,12 +235,12 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(release.server_entry(tx,self.plan,signed=True),signed)
 
     def test_server_entry_rejects_changed_scope_nonce_expiry_key_and_signature(self):
-        for field in ['nonce','expiry','scope','key','signature']:
+        for field in ['nonce','expires_at','scope','key','signature']:
             with self.subTest(field=field):
                 packet,signed,state,binding=self.execution_packet()
                 cred=signed.credentials.address
                 if field=='nonce': cred.nonce=xdr.Int64(43)
-                elif field=='expiry': cred.signature_expiration_ledger=xdr.Uint32(151)
+                elif field=='expires_at': cred.signature_expiration_ledger=xdr.Uint32(151)
                 elif field=='scope': signed.root_invocation.function.contract_fn.function_name=xdr.SCSymbol(b'recover')
                 else:
                     value=scval.to_native(cred.signature)[0]
@@ -269,14 +269,14 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(config['server'],self.plan['server'])
         self.assertFalse(config['x402_enabled'])
         self.assertEqual(set(config['params']),set(release.RULES))
-        self.assertEqual(config['params']['transaction_cap'],10000)
-        self.assertNotIn('day_spent_cap',config['params'])
+        self.assertEqual(config['params']['payment_limit'],10000)
+        self.assertNotIn('daily_spending_limit',config['params'])
         self.assertNotIn('tokens',config['params'])
         self.assertEqual(config['source_digest'],release.prefix_digest(release.WALLET_KIND,self.hashes['wallet'],self.plan['asset'],release.RULES))
         self.assertEqual(release.SMOKE_SOURCE.decode().count('(ctx, ctx.params.get(allowit::'),len(release.RULES))
         cli=json.loads(release.ca.serialize({'config':config})[1])['params']
-        self.assertEqual(cli['recipients'],{'List':[{'Addr':self.plan['recipient']}]})
-        self.assertEqual(cli['spent_cap'],{'Int':'20020000'})
+        self.assertEqual(cli['destinations'],{'List':[{'Addr':self.plan['recipient']}]})
+        self.assertEqual(cli['lifetime_spending_limit'],{'Int':'20020000'})
 
     def test_wallet_state_accepts_a_real_encoded_state_and_rejects_other_rules(self):
         wallet,parent,engine=(StrKey.encode_contract(bytes([n])*32) for n in (21,22,23))
@@ -330,12 +330,12 @@ class ReleaseTests(unittest.TestCase):
         asset='CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ'
         def symbol(name): return xdr.SCVal(xdr.SCValType.SCV_SYMBOL,sym=xdr.SCSymbol(name.encode()))
         def vector(items): return xdr.SCVal(xdr.SCValType.SCV_VEC,vec=xdr.SCVec(items))
-        rules=vector([vector([symbol('spent_cap')]),vector([symbol('recipients')])])
+        rules=vector([vector([symbol('lifetime_spending_limit')]),vector([symbol('destinations')])])
         tuple_=vector([symbol('allowit_std_prefix'),symbol('common_policy_engine'),xdr.SCVal(xdr.SCValType.SCV_BYTES,bytes=xdr.SCBytes(bytes([1])*32)),
                        xdr.SCVal(xdr.SCValType.SCV_ADDRESS,address=Address(asset).to_xdr_sc_address()),rules])
         expected=hashlib.sha256(tuple_.to_xdr_bytes()).hexdigest()
-        self.assertEqual(release.prefix_digest('common_policy_engine','01'*32,asset,['spent_cap','recipients']),expected)
-        self.assertNotEqual(release.prefix_digest('common_policy_engine','01'*32,asset,['recipients','spent_cap']),expected)
+        self.assertEqual(release.prefix_digest('common_policy_engine','01'*32,asset,['lifetime_spending_limit','destinations']),expected)
+        self.assertNotEqual(release.prefix_digest('common_policy_engine','01'*32,asset,['destinations','lifetime_spending_limit']),expected)
 
     def test_execution_binds_full_source_and_conservative_xlm_expense(self):
         state=dict(nonce=3,deployment_version=1)

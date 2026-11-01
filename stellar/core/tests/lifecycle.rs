@@ -78,7 +78,7 @@ fn fixture_with_wallet(
     let recipient = account_for_seed(&[6; 32]);
     if portable {
         c.params = policy::params_from_json(
-            &json!({"recipients": [recipient]}),
+            &json!({"destinations": [recipient]}),
             Some(PolicyTier::Simple),
         )
         .unwrap();
@@ -411,7 +411,7 @@ fn classic_caps_keep_exact_local_math_while_odc_requires_native_preflight() {
                 &mut c,
                 PolicyTier::Common,
                 CAPPED,
-                json!({"recipients": [account_for_seed(&[6; 32])], "transaction_cap": 20_000_000}),
+                json!({"destinations": [account_for_seed(&[6; 32])], "payment_limit": 20_000_000}),
             );
             s.policy_state = Some(PolicyStateSnapshot {
                 params: c.params.clone(),
@@ -1383,7 +1383,7 @@ fn sc_map(fields: Vec<(&str, stellar_xdr::ScVal)>) -> stellar_xdr::ScVal {
     stellar_xdr::ScVal::Map(Some(entries.try_into().unwrap()))
 }
 /// Portable canonical-only source of the policy wallet fixtures.
-const PORTABLE: &str = "use allowit::prelude::*;\n/// Pay only recipients I approve.\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::recipients(ctx, ctx.params.get(allowit::RECIPIENTS))?;\n    Ok(())\n}\n";
+const PORTABLE: &str = "use allowit::prelude::*;\n/// Pay only destinations I approve.\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::destinations(ctx, ctx.params.get(allowit::DESTINATIONS))?;\n    Ok(())\n}\n";
 /// Layout 4 State of the fixture wallet.
 fn custody_scval(
     c: &WalletConfig,
@@ -2071,7 +2071,7 @@ fn full_policy_deployment_uses_one_versioned_owner_flow_and_owner_handoff_author
             source_digest: c.source_digest,
             rules: Vec::new(),
             params: policy::params_from_json(
-                &json!({"recipients": [account_for_seed(&[6; 32])], "call_cap": 20}),
+                &json!({"destinations": [account_for_seed(&[6; 32])], "call_limit": 20}),
                 Some(PolicyTier::Simple),
             )
             .unwrap(),
@@ -2588,11 +2588,11 @@ fn native_preflight_binds_new_signing_and_json_cannot_restore_it() {
             .unwrap_err()
             .contains("preflight")
     );
-    for change in ["amount", "expiry", "source", "spent"] {
+    for change in ["amount", "expires_at", "source", "spent"] {
         let mut changed = p.clone();
         match change {
             "amount" => changed.request.effect_bounds[0].max_debit = 1u64.into(),
-            "expiry" => changed.expires_at -= 1,
+            "expires_at" => changed.expires_at -= 1,
             "source" => changed.config.policy_source.push(' '),
             "spent" => {
                 changed
@@ -2872,8 +2872,8 @@ fn preflight_rpc(c: &WalletConfig, r: &ExecutionRequest, s: &TrustedState) -> Pr
         failure: "",
     }
 }
-const CAPPED: &str = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::recipients(ctx, ctx.params.get(allowit::RECIPIENTS))?;\n    allowit::transaction_cap(ctx, ctx.params.get(allowit::TRANSACTION_CAP))?;\n    Ok(())\n}\n";
-const SUFFIXED: &str = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::recipients(ctx, ctx.params.get(allowit::RECIPIENTS))?;\n    let cap: i128 = allowit::param(ctx, \"transaction_cap\");\n    if ctx.request.amount > cap {\n        return Err(AllowitError::TransactionCapExceeded);\n    }\n    Ok(())\n}\n";
+const CAPPED: &str = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::destinations(ctx, ctx.params.get(allowit::DESTINATIONS))?;\n    allowit::payment_limit(ctx, ctx.params.get(allowit::PAYMENT_LIMIT))?;\n    Ok(())\n}\n";
+const SUFFIXED: &str = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::destinations(ctx, ctx.params.get(allowit::DESTINATIONS))?;\n    let cap: i128 = allowit::param(ctx, \"payment_limit\");\n    if ctx.request.amount > cap {\n        return Err(AllowitError::PaymentLimitExceeded);\n    }\n    Ok(())\n}\n";
 
 #[test]
 fn simple_service_authorization_evaluates_the_full_policy() {
@@ -2884,7 +2884,7 @@ fn simple_service_authorization_evaluates_the_full_policy() {
         &mut c,
         PolicyTier::Simple,
         CAPPED,
-        json!({"recipients": [recipient], "transaction_cap": 1}),
+        json!({"destinations": [recipient], "payment_limit": 1}),
     );
     let rpc = preflight_rpc(&c, &r, &s);
     assert!(
@@ -2897,7 +2897,7 @@ fn simple_service_authorization_evaluates_the_full_policy() {
         &mut c,
         PolicyTier::Simple,
         SUFFIXED,
-        json!({"recipients": [recipient], "transaction_cap": 1}),
+        json!({"destinations": [recipient], "payment_limit": 1}),
     );
     let rpc = preflight_rpc(&c, &r, &s);
     let prepared = rpc::prepare(&rpc, &c, &r, None, 86401, 86700).unwrap();
@@ -2916,24 +2916,24 @@ fn simple_service_authorization_evaluates_the_full_policy() {
     );
     assert!(authorize_server(&prepared, &[3; 32], 86401, Some(usage)).is_err());
     let compiled = |ctx: &allowit::AllowitContext| -> allowit::Result {
-        allowit::recipients(ctx, ctx.params.get(allowit::RECIPIENTS))?;
-        let cap: i128 = allowit::param(ctx, "transaction_cap");
+        allowit::destinations(ctx, ctx.params.get(allowit::DESTINATIONS))?;
+        let cap: i128 = allowit::param(ctx, "payment_limit");
         if ctx.request.amount > cap {
-            return Err(allowit::AllowitError::TransactionCapExceeded);
+            return Err(allowit::AllowitError::PaymentLimitExceeded);
         }
         Ok(())
     };
     assert!(
         authorize_server_with(&prepared, &[3; 32], 86401, &compiled)
             .unwrap_err()
-            .contains("TransactionCapExceeded")
+            .contains("PaymentLimitExceeded")
     );
     assert!(sign(&prepared, &[2; 32], 86401).is_err());
     install(
         &mut c,
         PolicyTier::Simple,
         SUFFIXED,
-        json!({"recipients": [recipient], "transaction_cap": 100_000_000}),
+        json!({"destinations": [recipient], "payment_limit": 100_000_000}),
     );
     let rpc = preflight_rpc(&c, &r, &s);
     let prepared = rpc::prepare(&rpc, &c, &r, None, 86401, 86700).unwrap();
@@ -2949,7 +2949,7 @@ fn selected_implementations_bind_constructor_and_both_authorities() {
             &mut c,
             tier,
             CAPPED,
-            json!({"recipients": [account_for_seed(&[6; 32])], "transaction_cap": 100_000_000}),
+            json!({"destinations": [account_for_seed(&[6; 32])], "payment_limit": 100_000_000}),
         );
         let config = PolicyConfig::for_policy(&c, false).unwrap();
         assert_eq!(config.source_digest, c.source_digest);
@@ -2958,7 +2958,7 @@ fn selected_implementations_bind_constructor_and_both_authorities() {
         assert_eq!(
             config.rules,
             if tier == PolicyTier::Common {
-                vec!["recipients".to_string(), "transaction_cap".to_string()]
+                vec!["destinations".to_string(), "payment_limit".to_string()]
             } else {
                 vec![]
             }
@@ -3038,13 +3038,13 @@ fn common_installed_rules_cannot_omit_or_reorder_authored_checks() {
         &mut c,
         PolicyTier::Common,
         CAPPED,
-        json!({"recipients": [account_for_seed(&[6; 32])], "transaction_cap": 100_000_000}),
+        json!({"destinations": [account_for_seed(&[6; 32])], "payment_limit": 100_000_000}),
     );
     for rules in [
         vec![],
-        vec!["recipients"],
-        vec!["transaction_cap", "recipients"],
-        vec!["recipients", "recipients"],
+        vec!["destinations"],
+        vec!["payment_limit", "destinations"],
+        vec!["destinations", "destinations"],
     ] {
         let rpc = ChangedRules {
             base: PreflightRpc {
@@ -3272,7 +3272,7 @@ fn x402_packet_binds_both_raw_keys_and_the_complete_native_scope() {
         "nonce",
         "version",
         "operation",
-        "expiry",
+        "expires_at",
         "ledger",
         "scope",
         "network",
@@ -3290,7 +3290,7 @@ fn x402_packet_binds_both_raw_keys_and_the_complete_native_scope() {
             "nonce" => changed.state.custody.nonce += 1,
             "version" => changed.state.custody.deployment_version += 1,
             "operation" => changed.request.operation.nonce[0] ^= 1,
-            "expiry" => changed.expires_at -= 1,
+            "expires_at" => changed.expires_at -= 1,
             "network" => changed.config.network = "stellar:mainnet".into(),
             "ledger" | "scope" => {
                 let mut entry = entry.clone();
@@ -3371,10 +3371,10 @@ fn x402_server_approval_runs_the_full_simple_policy() {
         },
     };
     let compiled = |ctx: &allowit::AllowitContext| -> allowit::Result {
-        allowit::recipients(ctx, ctx.params.get(allowit::RECIPIENTS))?;
-        let cap: i128 = allowit::param(ctx, "transaction_cap");
+        allowit::destinations(ctx, ctx.params.get(allowit::DESTINATIONS))?;
+        let cap: i128 = allowit::param(ctx, "payment_limit");
         if ctx.request.amount > cap {
-            return Err(allowit::AllowitError::TransactionCapExceeded);
+            return Err(allowit::AllowitError::PaymentLimitExceeded);
         }
         Ok(())
     };
@@ -3383,7 +3383,7 @@ fn x402_server_approval_runs_the_full_simple_policy() {
             &mut c,
             PolicyTier::Simple,
             SUFFIXED,
-            json!({"recipients": [recipient], "transaction_cap": cap}),
+            json!({"destinations": [recipient], "payment_limit": cap}),
         );
         let mut custody = state.clone();
         custody.source_hash = c.source_hash;
@@ -3418,7 +3418,7 @@ fn x402_server_approval_runs_the_full_simple_policy() {
         if approved {
             assert_eq!(verdict.unwrap(), digest);
         } else {
-            assert!(verdict.unwrap_err().contains("TransactionCapExceeded"));
+            assert!(verdict.unwrap_err().contains("PaymentLimitExceeded"));
         }
     }
 }
@@ -3614,7 +3614,7 @@ fn owner_deployment_binds_common_rules_to_the_installed_source_prefix() {
     use allowit_stellar_wallet::admin::{OwnerAdmin, PolicyDeployment};
     let rpc = admin_fixture(4, Some(stellar_xdr::ScVal::U32(4)));
     let mut c = rpc.base.config.clone();
-    // The installed Common source has the prefix `recipients`.
+    // The installed Common source has the prefix `destinations`.
     c.tier = Some(PolicyTier::Common);
     let mut admin = OwnerAdmin {
         rpc: &rpc,
@@ -3623,7 +3623,7 @@ fn owner_deployment_binds_common_rules_to_the_installed_source_prefix() {
     };
     // A packet whose digest is derived from other rules matches its own digest but not the
     // source, so it would commit rules that differ from the installation.
-    let rules = vec!["spent_cap".to_string()];
+    let rules = vec!["lifetime_spending_limit".to_string()];
     let artifact = PolicyDeployment {
         owner: c.owner.clone(),
         agent: c.agent.clone(),
@@ -3650,12 +3650,12 @@ fn owner_deployment_binds_common_rules_to_the_installed_source_prefix() {
 fn owner_deployment_binds_common_rules_to_a_target_source() {
     use allowit_policy_sdk::admin::{DeployPolicy, DeploymentVersion};
     use allowit_stellar_wallet::admin::{OwnerAdmin, PolicyDeployment};
-    // The installed Common wallet binds the prefix `recipients` of its source.
+    // The installed Common wallet binds the prefix `destinations` of its source.
     let mut rpc = admin_fixture(4, Some(stellar_xdr::ScVal::U32(4)));
     let c = &mut rpc.base.config;
     c.tier = Some(PolicyTier::Common);
     c.rules = policy::tier_rules(PolicyTier::Common, &c.policy_source).unwrap();
-    assert_eq!(c.rules, ["recipients"]);
+    assert_eq!(c.rules, ["destinations"]);
     c.source_digest =
         policy::standard_prefix_digest(PolicyTier::Common, &c.module_digest, &c.asset, &c.rules)
             .unwrap();
@@ -3666,10 +3666,10 @@ fn owner_deployment_binds_common_rules_to_a_target_source() {
         config: &c,
         now: 86401,
     };
-    // A rules-only Common update: the target source adds `transaction_cap` to the prefix and
+    // A rules-only Common update: the target source adds `payment_limit` to the prefix and
     // keeps the installed code.
     let (artifact, _) = PolicyDeployment::for_source(&c, CAPPED, c.params.clone(), false).unwrap();
-    assert_eq!(artifact.rules, ["recipients", "transaction_cap"]);
+    assert_eq!(artifact.rules, ["destinations", "payment_limit"]);
     // The installed source does not bind the new prefix.
     let error = admin
         .deploy_policy(DeploymentVersion(3), artifact.clone())
