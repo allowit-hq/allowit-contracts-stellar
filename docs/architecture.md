@@ -236,13 +236,13 @@ redeem tests in `src/swap_redeem_tests.rs` run those operations through every co
 (another asset, payment to the wallet, request expiry, stale nonce, replay and pause) reject with the
 same kernel error in every contract.
 
-`scripts/build-contracts.sh` builds the test-feature fixtures (`engine_deny.wasm` and
-`custom_catching.wasm`) in their own target directory and copies them to `target/test-fixtures`,
-so the deployable release paths never hold a test artifact. The tests read every Wasm from the
-default `target/` directory, so the script ignores `CARGO_TARGET_DIR`. Run one build or
-`cargo test` at a time in a worktree; a lock directory stops a second concurrent build. Use another
-worktree for concurrent runs. The mainnet tooling rejects any artifact whose hash matches a test
-fixture.
+`scripts/build-contracts.sh` builds in the Cargo target directory, so a shared target directory
+reuses compiled dependencies across worktrees. The tests read every Wasm from `./target`, so the
+script copies the deployable Wasm to `target/wasm32v1-none/release` and the test-feature fixtures
+(`engine_deny.wasm` and `custom_catching.wasm`) to `target/test-fixtures`. The fixtures build in
+their own target directory, so the deployable release paths never hold a test artifact. A lock
+directory in the Cargo target directory runs one build at a time per target directory. The mainnet
+tooling rejects any artifact whose hash matches a test fixture.
 
 Portable authored code beyond canonical calls uses typed scalar fields, enum comparisons such as
 `ctx.request.operation == AllowitOperation::deposit`, matches on `AllowitValue`, and its own
