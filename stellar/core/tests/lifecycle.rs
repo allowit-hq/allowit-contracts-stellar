@@ -1383,7 +1383,7 @@ fn sc_map(fields: Vec<(&str, stellar_xdr::ScVal)>) -> stellar_xdr::ScVal {
     stellar_xdr::ScVal::Map(Some(entries.try_into().unwrap()))
 }
 /// Portable canonical-only source of the policy wallet fixtures.
-const PORTABLE: &str = "use allowit::prelude::*;\n/// Pay only destinations I approve.\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::destinations(ctx, ctx.params.get(allowit::DESTINATIONS))?;\n    Ok(())\n}\n";
+const PORTABLE: &str = "use allowit::prelude::*;\n/// Pay only destinations I approve.\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::destinations(ctx, &ctx.params[allowit::DESTINATIONS])?;\n    Ok(())\n}\n";
 /// Layout 4 State of the fixture wallet.
 fn custody_scval(
     c: &WalletConfig,
@@ -2872,8 +2872,8 @@ fn preflight_rpc(c: &WalletConfig, r: &ExecutionRequest, s: &TrustedState) -> Pr
         failure: "",
     }
 }
-const CAPPED: &str = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::destinations(ctx, ctx.params.get(allowit::DESTINATIONS))?;\n    allowit::payment_limit(ctx, ctx.params.get(allowit::PAYMENT_LIMIT))?;\n    Ok(())\n}\n";
-const SUFFIXED: &str = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::destinations(ctx, ctx.params.get(allowit::DESTINATIONS))?;\n    let cap: i128 = allowit::param(ctx, \"payment_limit\");\n    if ctx.request.amount > cap {\n        return Err(AllowitError::PaymentLimitExceeded);\n    }\n    Ok(())\n}\n";
+const CAPPED: &str = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::destinations(ctx, &ctx.params[allowit::DESTINATIONS])?;\n    allowit::payment_limit(ctx, &ctx.params[allowit::PAYMENT_LIMIT])?;\n    Ok(())\n}\n";
+const SUFFIXED: &str = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::destinations(ctx, &ctx.params[allowit::DESTINATIONS])?;\n    let cap: i128 = allowit::param(ctx, \"payment_limit\");\n    if ctx.request.amount > cap {\n        return Err(AllowitError::PaymentLimitExceeded);\n    }\n    Ok(())\n}\n";
 
 #[test]
 fn simple_service_authorization_evaluates_the_full_policy() {
@@ -2916,7 +2916,7 @@ fn simple_service_authorization_evaluates_the_full_policy() {
     );
     assert!(authorize_server(&prepared, &[3; 32], 86401, Some(usage)).is_err());
     let compiled = |ctx: &allowit::AllowitContext| -> allowit::Result {
-        allowit::destinations(ctx, ctx.params.get(allowit::DESTINATIONS))?;
+        allowit::destinations(ctx, &ctx.params[allowit::DESTINATIONS])?;
         let cap: i128 = allowit::param(ctx, "payment_limit");
         if ctx.request.amount > cap {
             return Err(allowit::AllowitError::PaymentLimitExceeded);
@@ -3371,7 +3371,7 @@ fn x402_server_approval_runs_the_full_simple_policy() {
         },
     };
     let compiled = |ctx: &allowit::AllowitContext| -> allowit::Result {
-        allowit::destinations(ctx, ctx.params.get(allowit::DESTINATIONS))?;
+        allowit::destinations(ctx, &ctx.params[allowit::DESTINATIONS])?;
         let cap: i128 = allowit::param(ctx, "payment_limit");
         if ctx.request.amount > cap {
             return Err(allowit::AllowitError::PaymentLimitExceeded);

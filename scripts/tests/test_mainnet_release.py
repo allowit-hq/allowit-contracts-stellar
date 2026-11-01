@@ -273,7 +273,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertNotIn('daily_spending_limit',config['params'])
         self.assertNotIn('tokens',config['params'])
         self.assertEqual(config['source_digest'],release.prefix_digest(release.WALLET_KIND,self.hashes['wallet'],self.plan['asset'],release.RULES))
-        self.assertEqual(release.SMOKE_SOURCE.decode().count('(ctx, ctx.params.get(allowit::'),len(release.RULES))
+        self.assertEqual(release.SMOKE_SOURCE.decode().count('(ctx, &ctx.params[allowit::'),len(release.RULES))
         cli=json.loads(release.ca.serialize({'config':config})[1])['params']
         self.assertEqual(cli['destinations'],{'List':[{'Addr':self.plan['recipient']}]})
         self.assertEqual(cli['lifetime_spending_limit'],{'Int':'20020000'})

@@ -324,7 +324,7 @@ fn rule_input_carries_typed_operations_and_the_vault_as_recipient() {
     e.operation = deposit;
     e.expense = AllowitExpense::Priced(expense);
     set_param(&mut e.args, "invoice", Some(AllowitValue::Int(7)));
-    let ctx = rule_input(&f.env, &state, &e);
+    let ctx = rule_input(&f.env, &state, &e).unwrap();
     assert_eq!((ctx.request.now, ctx.request.expires_at), (86_410, 86_500));
     assert_eq!(ctx.request.operation, AllowitOperation::deposit);
     assert_eq!(ctx.request.recipient, vault);
@@ -333,10 +333,10 @@ fn rule_input_carries_typed_operations_and_the_vault_as_recipient() {
     assert_eq!((ctx.request.spent_units, ctx.request.gas_units), (3, 2));
     assert!(!ctx.request.unpriced);
     assert_eq!(ctx.state, state.policy_state);
-    assert_eq!(ctx.params.0, state.params);
+    assert_eq!(ctx.params.map(), &state.params);
     assert_eq!(ctx.request.args.0, e.args);
     e.expense = AllowitExpense::Unpriced;
-    let unpriced = rule_input(&f.env, &state, &e);
+    let unpriced = rule_input(&f.env, &state, &e).unwrap();
     assert!(unpriced.request.unpriced);
     assert_eq!(
         (unpriced.request.spent_units, unpriced.request.gas_units),
@@ -885,7 +885,7 @@ fn admit_stores_before_effects<P: AllowitPolicy>(wasm: &[u8]) {
         f.env.as_contract(&f.wallet, || {
             let state = state(&f.env).unwrap();
             validate_operation(&f.env, &e, &state).unwrap();
-            let ctx = rule_input(&f.env, &state, &e);
+            let ctx = rule_input(&f.env, &state, &e).unwrap();
             let want = allowit::post_flight(&ctx, AllowitTier::Standard).unwrap();
             admit::<P>(&f.env, &e, state).unwrap();
             let stored = load(&f.env, None).unwrap();

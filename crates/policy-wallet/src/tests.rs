@@ -685,9 +685,11 @@ fn custom_policy_denies_an_absent_param_that_common_preflight_skips() {
             (e.clone(),).into_val(&f.env),
         );
         if wasm == CUSTOM {
+            // Indexing the unset param aborts the call with its `AllowitError` code.
+            let missing = allowit::AllowitError::MissingParam as u32;
             assert_eq!(
                 f.client().try_execute(&e),
-                Err(Ok(AllowitWalletError::InvalidParam))
+                Err(Err(soroban_sdk::InvokeError::Contract(missing)))
             );
             assert_eq!(f.history(), AllowitStandardState::default());
         } else {
@@ -1523,23 +1525,22 @@ fn x402_enforces_compiled_business_rules_without_committing() {
     for wasm in [COMMON, CUSTOM] {
         for case in 0..3 {
             let f = Fixture::new(wasm, true);
+            let denied = Ok(AllowitWalletError::PolicyDenied);
             let (to, amount, expected) = match case {
-                0 => (f.recipient.clone(), 101, AllowitWalletError::PolicyDenied),
-                1 => (
-                    Address::generate(&f.env),
-                    10,
-                    AllowitWalletError::PolicyDenied,
-                ),
+                0 => (f.recipient.clone(), 101, denied),
+                1 => (Address::generate(&f.env), 10, denied),
                 _ => {
                     let mut p = f.deployment();
                     set_param(&mut p.params, EXPIRES_AT, None);
                     f.auth(&[&f.owner], "deploy_policy", (p.clone(),).into_val(&f.env));
                     f.client().deploy_policy(&p);
-                    // Common preflight skips the unset field; Custom denies it.
+                    // Common preflight skips the unset field; Custom indexes it and aborts with
+                    // `MissingParam`.
+                    let missing = allowit::AllowitError::MissingParam as u32;
                     let expected = if wasm == CUSTOM {
-                        AllowitWalletError::InvalidParam
+                        Err(soroban_sdk::InvokeError::Contract(missing))
                     } else {
-                        AllowitWalletError::PolicyDenied
+                        denied
                     };
                     (
                         f.recipient.clone(),
@@ -1558,7 +1559,7 @@ fn x402_enforces_compiled_business_rules_without_committing() {
                     f.authorization(e, &payload).into_val(&f.env),
                     &vec![&f.env, context],
                 ),
-                Err(Ok(expected))
+                Err(expected)
             );
             assert_eq!(f.client().state(), before);
             assert_eq!(f.balance(), 1_000);

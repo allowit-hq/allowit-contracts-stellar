@@ -4,8 +4,8 @@ use allowit::prelude::*;
 /// its order number.
 pub fn execute(ctx: &AllowitContext) -> allowit::Result {
     // "only destinations I approve"
-    allowit::destinations(ctx, ctx.params.get(allowit::DESTINATIONS))?;
-    match allowit::daily_spending_limit(ctx, ctx.params.get(allowit::DAILY_SPENDING_LIMIT)) {
+    allowit::destinations(ctx, &ctx.params[allowit::DESTINATIONS])?;
+    match allowit::daily_spending_limit(ctx, &ctx.params[allowit::DAILY_SPENDING_LIMIT]) {
         // "It may exceed its daily spending cap twice"
         Err(AllowitError::DailySpendingLimitExceeded) => {
             // "count each time"
@@ -20,12 +20,12 @@ pub fn execute(ctx: &AllowitContext) -> allowit::Result {
         }
     }
     // "A payment that names an invoice"
-    if ctx.request.args.get("invoice").is_some() {
+    if ctx.request.args.contains("invoice") {
         // "must stay within my invoice cap"
-        allowit::payment_limit(ctx, ctx.params.get("invoice_cap"))?;
+        allowit::payment_limit(ctx, &ctx.params["invoice_cap"])?;
     }
     // "A refund"
-    if ctx.request.args.get("refund").is_some() {
+    if ctx.request.args.contains("refund") {
         // "must name its order number"
         let _order: u64 = allowit::arg(ctx, "order");
     }

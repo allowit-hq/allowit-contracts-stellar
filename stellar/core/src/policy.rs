@@ -754,9 +754,10 @@ fn context(params: &PolicyParams, state: &PolicyParams, r: &RuleRequest) -> Allo
         },
     }
 }
-/// Run one canonical rule call `allowit::<rule>(ctx, ctx.params.get(allowit::<RULE>))?`.
+/// Run one canonical rule call `allowit::<rule>(ctx, &ctx.params[allowit::<RULE>])?`. An unset
+/// param panics with `MissingParam`, which `allowit::evaluate` returns.
 fn run_rule(ctx: &AllowitContext, rule: AllowitRule) -> allowit::Result {
-    let value = ctx.params.get(rule.key());
+    let value = &ctx.params[rule.key()];
     match rule {
         AllowitRule::payment_limit => allowit::payment_limit(ctx, value).map(drop),
         AllowitRule::lifetime_spending_limit => {
@@ -1390,8 +1391,10 @@ pub(crate) mod gate {
         "unpriced",
         "args",
     ];
-    /// `FIELD_METHODS`: `get` only on the `params` or `args` field.
+    /// `FIELD_METHODS`: `contains` only on the `params` or `args` field.
     const FIELD_NAMES: &[&str] = &["params", "args"];
+    /// `INDEXED_FIELD`: the only indexed receiver, `ctx.params[key]`.
+    const INDEXED_FIELD: &str = "params";
     const METHODS: &[&str] = &[
         "clone",
         "eq",
@@ -1455,7 +1458,7 @@ pub(crate) mod gate {
         "is_ne",
         "reverse",
         "then_some",
-        "get",
+        "contains",
     ];
     const OPERAND_END: &[&str] = &[")", "]", "?", "true", "false"];
 
@@ -1881,13 +1884,13 @@ pub(crate) mod gate {
                             "the method `{name}`, which is not on the portable allowlist"
                         )));
                     }
-                    if name == "get"
+                    if name == "contains"
                         && (i < 3
                             || !FIELD_NAMES.contains(&tokens[i - 2].as_str())
                             || tokens[i - 3] != ".")
                     {
                         return Err(reject(
-                            "the method `get` other than on the field `.params` or `.args`",
+                            "the method `contains` other than on the field `.params` or `.args`",
                         ));
                     }
                 } else if !FIELDS.contains(&name) {
@@ -2148,7 +2151,7 @@ pub(crate) mod gate {
         }
         if map_field(b) {
             return Err(reject(
-                "the map inside params or args; read them with `.get(key)`",
+                "the map inside params or args; read params as `ctx.params[key]` and args with `allowit::arg`",
             ));
         }
         let spans = tokens(code);
@@ -2173,14 +2176,17 @@ pub(crate) mod gate {
                 plain_braces(strings.get(&spans[at].0).map_or("", String::as_str))?;
             }
         }
-        for pair in toks.windows(2) {
-            let (before, token) = (pair[0].as_str(), pair[1].as_str());
+        for k in 1..toks.len() {
+            let (before, token) = (toks[k - 1].as_str(), toks[k].as_str());
             if token == "["
                 && (matches!(before, ")" | "]" | "?")
                     || before.as_bytes()[0].is_ascii_digit()
                     || (is_ident(before) && !keyword(before)))
+                && !(before == INDEXED_FIELD && k > 1 && toks[k - 2] == ".")
             {
-                return Err(reject("indexing, whose index is a pointer-width `usize`"));
+                return Err(reject(
+                    "indexing other than `ctx.params[key]`, whose index is a pointer-width `usize`",
+                ));
             }
         }
         allowlisted(code)
@@ -2227,7 +2233,7 @@ pub(crate) mod gate {
         }
         lit(skip_ws(chars, p), "{")
     }
-    /// `allowit::<rule>(ctx,ctx.params.get(allowit::<RULE>,?),?)?` on a whitespace-free statement.
+    /// `allowit::<rule>(ctx,&ctx.params[allowit::<RULE>],?)?` on a whitespace-free statement.
     fn prefix_call(statement: &str) -> Option<String> {
         let rest = statement.strip_prefix("allowit::")?;
         let name_len = rest
@@ -2238,7 +2244,7 @@ pub(crate) mod gate {
             return None;
         }
         let (name, rest) = rest.split_at(name_len);
-        let rest = rest.strip_prefix("(ctx,ctx.params.get(allowit::")?;
+        let rest = rest.strip_prefix("(ctx,&ctx.params[allowit::")?;
         let key_len = rest
             .bytes()
             .take_while(|b| b.is_ascii_uppercase() || *b == b'_')
@@ -2247,8 +2253,7 @@ pub(crate) mod gate {
             return None;
         }
         let (key, rest) = rest.split_at(key_len);
-        let rest = rest.strip_prefix(',').unwrap_or(rest);
-        let rest = rest.strip_prefix(')')?;
+        let rest = rest.strip_prefix(']')?;
         let rest = rest.strip_prefix(',').unwrap_or(rest);
         if rest != ")?" || name.to_uppercase() != key || !param_keys().contains(&name) {
             return None;

@@ -1,8 +1,8 @@
 #![no_std]
 //! Owner-controlled custody mixins shared by fixed and bespoke policy wallets.
 use allowit::{
-    AllowitContext, AllowitOperation, AllowitParams, AllowitRequest, AllowitRule, AllowitTier,
-    AllowitValue,
+    AllowitArgs, AllowitContext, AllowitOperation, AllowitParams, AllowitRequest, AllowitRule,
+    AllowitTier, AllowitValue,
 };
 use allowit_wallet_protocol::{
     AllowitDepositArgs, AllowitExecutionRequest, AllowitExpenseBounds, AllowitPolicyBinding,
@@ -890,17 +890,18 @@ fn redeem_shares(
 }
 /// Rule input: contract environment, owner params, current policy state, authenticated request
 /// facts and the agent's execution params. Deposits and redeems name their vault, and swaps their
-/// router, as the recipient. A request without expense bounds is unpriced.
+/// router, as the recipient. A request without expense bounds is unpriced. The params decode once
+/// here; stored params that do not decode are `InvalidParam`.
 fn rule_input(
     env: &Env,
     state: &AllowitState,
     execution: &AllowitExecutionRequest,
-) -> AllowitContext {
+) -> Result<AllowitContext, AllowitWalletError> {
     let facts = facts(&execution.operation, &state.asset);
     let expense = execution.expense.bounds();
-    AllowitContext {
+    Ok(AllowitContext {
         env: env.clone(),
-        params: AllowitParams(state.params.clone()),
+        params: AllowitParams::new(env, state.params.clone())?,
         state: state.policy_state.clone(),
         request: AllowitRequest {
             operation: execution.operation.to_core(),
@@ -916,9 +917,9 @@ fn rule_input(
             spent_units: expense.map_or(0, |e| e.spent_units),
             gas_units: expense.map_or(0, |e| e.gas_units),
             unpriced: expense.is_none(),
-            args: AllowitParams(execution.args.clone()),
+            args: AllowitArgs(execution.args.clone()),
         },
-    }
+    })
 }
 /// Admit one delegated operation: check bindings, replay, pause, nonce and expense, run the
 /// policy, then write post-flight state, nonce and replay marker before any external call.
@@ -962,7 +963,7 @@ fn admit<P: AllowitPolicy>(
     if P::STANDARD_PREFIX {
         checked_params::<P>(&state.params)?;
     }
-    let ctx = rule_input(env, &state, execution);
+    let ctx = rule_input(env, &state, execution)?;
     P::check(&ctx, &state.rules)?;
     // The shared post-flight, then storage, precede token, router and vault calls. A later
     // failure in this transaction rolls all of it back.
@@ -1444,7 +1445,7 @@ impl AllowitPolicy for AllowitCommon {
     fn validate(_rules: &Vec<AllowitRule>) -> Result<(), AllowitWalletError> {
         Ok(())
     }
-    /// Run each prefix call `allowit::<rule>(ctx, ctx.params.get(allowit::<RULE>))?;` in owner
+    /// Run each prefix call `allowit::<rule>(ctx, &ctx.params[allowit::<RULE>])?;` in owner
     /// order. An absent param skips its rule here only; the full offchain policy denies it.
     fn check(ctx: &AllowitContext, rules: &Vec<AllowitRule>) -> Result<(), AllowitWalletError> {
         for rule in rules.iter() {

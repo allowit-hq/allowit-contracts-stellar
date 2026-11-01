@@ -1,9 +1,9 @@
 // Shared types and rules, included once per backend. The including module supplies `Address`,
-// `AllowitEnv`, `Map`, `String`, `Symbol` and `Vec`, the type macros `value!`, `error!` and
-// `params!`, the map primitives `lookup`, `insert`, `count`, `text_len`, `text_bytes`,
-// `each_value`, `each_item`, `address_text`, `record`, `take_writes` and `merge`, and the panic
-// primitives `fail` and `guarded`. Field types keep those names so contract
-// specs name the backend's native types.
+// `AllowitEnv`, `Map`, `String`, `Symbol` and `Vec`, the owner's params `AllowitParams`, the type
+// macros `value!`, `error!` and `args!`, the map primitives `lookup`, `insert`, `count`,
+// `text_len`, `text_bytes`, `each_value`, `each_item`, `address_text`, `record`, `take_writes` and
+// `merge`, the params primitives `find` and `missing`, and the panic primitives `fail` and
+// `guarded`. Field types keep those names so contract specs name the backend's native types.
 
 /// UTC day length in seconds.
 pub const DAY: u64 = 86_400;
@@ -16,7 +16,7 @@ pub use types::*;
 #[allow(non_camel_case_types)]
 mod types {
     /// Backend types that the contract types hold.
-    use super::{Address, AllowitEnv, AllowitMap, Map, String, Symbol, Vec};
+    use super::{Address, AllowitEnv, AllowitMap, AllowitParams, Map, String, Symbol, Vec};
 
     value! {
         /// One value of params, request args and policy state.
@@ -35,11 +35,11 @@ mod types {
         }
     }
 
-    params! {
-        /// Key => value params: the owner's constructor params in `ctx.params` and the agent's
-        /// execution params in `ctx.request.args`. An absent key is unset.
+    args! {
+        /// The agent's key => value execution params of one request, in `ctx.request.args`. An
+        /// absent key is unset. Policy reads them with `allowit::arg` and `contains`.
         #[derive(Clone, Debug, Eq, PartialEq)]
-        AllowitParams(Map<Symbol, AllowitValue>)
+        AllowitArgs(Map<Symbol, AllowitValue>)
     }
 
     value! {
@@ -97,7 +97,7 @@ mod types {
             pub unpriced: bool,
             /// The agent's execution params of this call, covered by the agent and server
             /// signatures. Never stored; canonical rules and the standard contract ignore them.
-            pub args: AllowitParams,
+            pub args: AllowitArgs,
         }
     }
 
@@ -142,6 +142,7 @@ mod types {
         /// The backend's environment.
         pub env: AllowitEnv,
         /// The owner's constructor params, set at install and changed by owner-signed update.
+        /// Policy reads them by key: `ctx.params[allowit::DESTINATIONS]`.
         pub params: AllowitParams,
         /// Current policy state, before this operation.
         pub state: AllowitMap,
@@ -155,7 +156,7 @@ mod types {
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
         #[repr(u32)]
         pub enum AllowitError {
-            /// The rule's param is unset.
+            /// A read param or arg is unset: `ctx.params[key]`, `param` or `arg`.
             MissingParam = 101,
             /// The amount exceeds `payment_limit`.
             PaymentLimitExceeded = 102,
@@ -304,12 +305,35 @@ impl AllowitRule {
     }
 }
 
-/// Lookup of params and args by key: the only read that authored policy has.
+/// Reads of the owner's params by key: `&ctx.params[allowit::DESTINATIONS]` or
+/// `&ctx.params["destinations"]`.
+impl core::ops::Index<&str> for AllowitParams {
+    /// One param value.
+    type Output = AllowitValue;
+    /// The value of `key`. An unset key, also one that no map can hold such as one with a space,
+    /// panics with `MissingParam`: the run stops and denies, and its writes are discarded.
+    #[track_caller]
+    fn index(&self, key: &str) -> &AllowitValue {
+        match find(self, key) {
+            Some(value) => value,
+            None => missing(self, key),
+        }
+    }
+}
+
+/// Presence of a param.
 impl AllowitParams {
-    /// The value of `key`, or `None` when it is unset. A key that no map can hold, such as one
-    /// with a space, is unset. Values are owned because onchain maps decode them on read.
-    pub fn get(&self, key: &str) -> Option<AllowitValue> {
-        lookup(&self.0, key)
+    /// Whether the owner set `key`. A key that no map can hold is unset.
+    pub fn contains(&self, key: &str) -> bool {
+        find(self, key).is_some()
+    }
+}
+
+/// Presence of an execution param.
+impl AllowitArgs {
+    /// Whether the agent set `key`. A key that no map can hold is unset.
+    pub fn contains(&self, key: &str) -> bool {
+        lookup(&self.0, key).is_some()
     }
 }
 
@@ -484,7 +508,7 @@ pub fn check_params(params: &AllowitMap, tier: AllowitTier) -> Result {
     for rule in RULES {
         if let Some(value) = lookup(params, rule.key()) {
             canonical += 1;
-            canonical_value(rule, value)?;
+            canonical_value(rule, &value)?;
         }
     }
     if canonical == count(params) {
@@ -495,13 +519,12 @@ pub fn check_params(params: &AllowitMap, tier: AllowitTier) -> Result {
 }
 
 /// Decode a canonical param as its rule does, without request or state facts.
-fn canonical_value(rule: AllowitRule, value: AllowitValue) -> Result {
-    let value = Some(value);
+fn canonical_value(rule: AllowitRule, value: &AllowitValue) -> Result {
     match rule {
         AllowitRule::call_limit | AllowitRule::expires_at => int::<u64>(value).map(|_| ()),
         AllowitRule::destinations | AllowitRule::tokens => each_address(value, |_| ()),
         AllowitRule::operations => each_op(value, |_| ()),
-        _ => cap(value).map(|_| ()),
+        _ => limit(value).map(|_| ()),
     }
 }
 
@@ -511,31 +534,30 @@ pub fn check_args(args: &AllowitMap) -> Result {
     check_map(args, MAX_ARGS, MAX_ARG_BYTES)
 }
 
-/// The integer of a set param: unset is `MissingParam`; another type or a value outside `T` is
-/// `InvalidParam`.
-fn int<T: TryFrom<i128>>(value: Option<AllowitValue>) -> Result<T> {
-    match value.ok_or(AllowitError::MissingParam)? {
-        AllowitValue::Int(n) => T::try_from(n).map_err(|_| AllowitError::InvalidParam),
+/// The integer of a param: another type or a value outside `T` is `InvalidParam`.
+fn int<T: TryFrom<i128>>(value: &AllowitValue) -> Result<T> {
+    match value {
+        AllowitValue::Int(n) => T::try_from(*n).map_err(|_| AllowitError::InvalidParam),
         _ => Err(AllowitError::InvalidParam),
     }
 }
 
-/// A set cap: a nonnegative `Int`.
-fn cap(value: Option<AllowitValue>) -> Result<i128> {
-    let cap = int::<i128>(value)?;
-    if cap < 0 {
+/// A limit: a nonnegative `Int`.
+fn limit(value: &AllowitValue) -> Result<i128> {
+    let limit = int::<i128>(value)?;
+    if limit < 0 {
         Err(AllowitError::InvalidParam)
     } else {
-        Ok(cap)
+        Ok(limit)
     }
 }
 
-/// Run `seen` on each address of a set `List` of `Addr`; any other value is `InvalidParam`.
-fn each_address(value: Option<AllowitValue>, mut seen: impl FnMut(Address)) -> Result {
-    let AllowitValue::List(items) = value.ok_or(AllowitError::MissingParam)? else {
+/// Run `seen` on each address of a `List` of `Addr`; any other value is `InvalidParam`.
+fn each_address(value: &AllowitValue, mut seen: impl FnMut(Address)) -> Result {
+    let AllowitValue::List(items) = value else {
         return Err(AllowitError::InvalidParam);
     };
-    each_item(&items, |item| match item {
+    each_item(items, |item| match item {
         AllowitValue::Addr(address) => {
             seen(address);
             Ok(())
@@ -544,8 +566,8 @@ fn each_address(value: Option<AllowitValue>, mut seen: impl FnMut(Address)) -> R
     })
 }
 
-/// Require `wanted` in a set allowlist. Every item must be an `Addr`; an empty list denies.
-fn allowed(value: Option<AllowitValue>, wanted: &Address, denied: AllowitError) -> Result<Address> {
+/// Require `wanted` in an allowlist. Every item must be an `Addr`; an empty list denies.
+fn allowed(value: &AllowitValue, wanted: &Address, denied: AllowitError) -> Result<Address> {
     let mut found = false;
     each_address(value, |address| found |= address == *wanted)?;
     if found {
@@ -625,16 +647,16 @@ pub(crate) fn admits(entry: &[u8], op: &[u8]) -> bool {
         || function.is_some() && (entry == b"custom" || entry.strip_prefix(b"custom.") == function)
 }
 
-/// Run `seen` on each entry of a set `operations` value: `Str` `*`, or a `List` of `Str` op names.
+/// Run `seen` on each entry of an `operations` value: `Str` `*`, or a `List` of `Str` op names.
 /// Any other value is `InvalidParam`.
-fn each_op(value: Option<AllowitValue>, mut seen: impl FnMut(&[u8])) -> Result {
+fn each_op(value: &AllowitValue, mut seen: impl FnMut(&[u8])) -> Result {
     let mut buf = [0; MAX_TEXT as usize];
-    match value.ok_or(AllowitError::MissingParam)? {
-        AllowitValue::Str(text) if text_bytes(&text, &mut buf) == Some(b"*".as_slice()) => {
+    match value {
+        AllowitValue::Str(text) if text_bytes(text, &mut buf) == Some(b"*".as_slice()) => {
             seen(b"*");
             Ok(())
         }
-        AllowitValue::List(items) => each_item(&items, |item| match item {
+        AllowitValue::List(items) => each_item(items, |item| match item {
             AllowitValue::Str(text) => match text_bytes(&text, &mut buf) {
                 Some(name) if op_name_ok(name) => {
                     seen(name);
@@ -682,9 +704,9 @@ fn daily(ctx: &AllowitContext, s: &AllowitStandardState) -> Result<(i128, i128, 
     }
 }
 
-/// Check one accounting cap: `used + add <= cap`, against only the facts it reads.
+/// Check one accounting limit: `used + add <= limit`, against only the facts it reads.
 fn accounting(
-    cap: i128,
+    limit: i128,
     used: i128,
     unpriced: bool,
     add: Result<i128>,
@@ -696,88 +718,96 @@ fn accounting(
     if unpriced {
         return Err(AllowitError::Unpriced);
     }
-    left(cap, sum(used, add?)?, exceeded)
+    left(limit, sum(used, add?)?, exceeded)
 }
 
-/// Remaining headroom of a nonnegative cap.
-fn left(cap: i128, used: i128, exceeded: AllowitError) -> Result<i128> {
-    if used > cap {
+/// Remaining headroom of a nonnegative limit.
+fn left(limit: i128, used: i128, exceeded: AllowitError) -> Result<i128> {
+    if used > limit {
         Err(exceeded)
     } else {
-        Ok(cap - used)
+        Ok(limit - used)
     }
 }
 
-/// Bound the gross amount of one operation by the cap in `value`.
+// Canonical rules. Each takes the param value that `&ctx.params[allowit::<KEY>]` reads, decodes it
+// and returns its passing constraint. A value of another type or range is `InvalidParam`.
+
+/// Bound the gross amount of one operation by the limit in `value`.
 ///
-/// Returns `cap - request.amount`. A negative cap or nonpositive amount is `InvalidParam`.
-pub fn payment_limit(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<i128> {
-    let cap = cap(value)?;
+/// Returns `limit - request.amount`. A negative limit or nonpositive amount is `InvalidParam`.
+pub fn payment_limit(ctx: &AllowitContext, value: &AllowitValue) -> Result<i128> {
+    let limit = limit(value)?;
     if ctx.request.amount <= 0 {
         return Err(AllowitError::InvalidParam);
     }
-    left(cap, ctx.request.amount, AllowitError::PaymentLimitExceeded)
+    left(
+        limit,
+        ctx.request.amount,
+        AllowitError::PaymentLimitExceeded,
+    )
 }
 
-/// Bound cumulative irreversible expenses: `spent + request.spent_units <= cap`.
+/// Bound cumulative irreversible expenses: `spent + request.spent_units <= limit`.
 ///
 /// Returns the headroom left after this operation. Lifetime or request unpriced is `Unpriced`.
-pub fn lifetime_spending_limit(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<i128> {
-    let cap = cap(value)?;
+pub fn lifetime_spending_limit(ctx: &AllowitContext, value: &AllowitValue) -> Result<i128> {
+    let limit = limit(value)?;
     let (s, r) = (standard(ctx)?, &ctx.request);
     let add = contribution(&[r.spent_units]);
     let e = AllowitError::LifetimeSpendingLimitExceeded;
-    accounting(cap, s.spent, s.unpriced || r.unpriced, add, e)
+    accounting(limit, s.spent, s.unpriced || r.unpriced, add, e)
 }
 
-/// Bound irreversible expenses on the request's UTC day: `day_spent + request.spent_units <= cap`.
-/// `day_spent` is zero when the state belongs to an earlier day.
+/// Bound irreversible expenses on the request's UTC day:
+/// `day_spent + request.spent_units <= limit`. `day_spent` is zero when the state belongs to an
+/// earlier day.
 ///
 /// Returns the headroom left after this operation. Unpriced today or in the request is `Unpriced`.
-pub fn daily_spending_limit(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<i128> {
-    let cap = cap(value)?;
+pub fn daily_spending_limit(ctx: &AllowitContext, value: &AllowitValue) -> Result<i128> {
+    let limit = limit(value)?;
     let (day_spent, _, day_unpriced) = daily(ctx, &standard(ctx)?)?;
     let r = &ctx.request;
     let add = contribution(&[r.spent_units]);
     let e = AllowitError::DailySpendingLimitExceeded;
-    accounting(cap, day_spent, day_unpriced || r.unpriced, add, e)
+    accounting(limit, day_spent, day_unpriced || r.unpriced, add, e)
 }
 
 /// Bound gross amounts plus separate attributable gas on the request's UTC day:
-/// `day_total + request.amount + request.gas_units <= cap`. Embedded deposit conversion fees
+/// `day_total + request.amount + request.gas_units <= limit`. Embedded deposit conversion fees
 /// belong to principal and count once.
 ///
 /// Returns the headroom left after this operation. Unpriced today or in the request is `Unpriced`.
-pub fn daily_volume_limit(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<i128> {
-    let cap = cap(value)?;
+pub fn daily_volume_limit(ctx: &AllowitContext, value: &AllowitValue) -> Result<i128> {
+    let limit = limit(value)?;
     let (_, day_total, day_unpriced) = daily(ctx, &standard(ctx)?)?;
     let r = &ctx.request;
     let add = contribution(&[r.amount, r.gas_units]);
     let e = AllowitError::DailyVolumeLimitExceeded;
-    accounting(cap, day_total, day_unpriced || r.unpriced, add, e)
+    accounting(limit, day_total, day_unpriced || r.unpriced, add, e)
 }
 
 /// Bound successful operations, including those made while this rule was skipped:
-/// `calls + 1 <= cap`.
+/// `calls + 1 <= limit`.
 ///
-/// Returns the operations left after this one. A zero cap always denies.
-pub fn call_limit(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<u64> {
-    let cap = int::<u64>(value)?;
+/// Returns the operations left after this one. A zero limit always denies.
+pub fn call_limit(ctx: &AllowitContext, value: &AllowitValue) -> Result<u64> {
+    let limit = int::<u64>(value)?;
     let next = standard(ctx)?
         .calls
         .checked_add(1)
         .ok_or(AllowitError::Overflow)?;
-    if next > cap {
+    if next > limit {
         return Err(AllowitError::CallLimitExceeded);
     }
-    Ok(cap - next)
+    Ok(limit - next)
 }
 
 /// Require an exact permitted destination. Deposits and redeems name their vault, swaps their
 /// exchange and custom calls their contract as the recipient.
 ///
 /// Returns the matched `request.recipient`. An empty list denies.
-pub fn destinations(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<Address> {
+pub fn destinations(ctx: &AllowitContext, value: &AllowitValue) -> Result<Address> {
     let e = AllowitError::DestinationNotAllowed;
     allowed(value, &ctx.request.recipient, e)
 }
@@ -786,7 +816,7 @@ pub fn destinations(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result
 /// token that a forward swap buys or a reverse swap sells.
 ///
 /// Returns the matched `request.asset`. An empty list denies.
-pub fn tokens(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<Address> {
+pub fn tokens(ctx: &AllowitContext, value: &AllowitValue) -> Result<Address> {
     let r = &ctx.request;
     let e = AllowitError::TokenNotAllowed;
     if r.operation == AllowitOperation::swap {
@@ -794,7 +824,7 @@ pub fn tokens(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<Addre
             Some(out) if r.token_in == r.asset => out.clone(),
             _ => r.token_in.clone(),
         };
-        allowed(value.clone(), &other, e)?;
+        allowed(value, &other, e)?;
     }
     allowed(value, &r.asset, e)
 }
@@ -802,7 +832,7 @@ pub fn tokens(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<Addre
 /// Require unexpired params and request, with the request expiring no later than the params.
 ///
 /// Returns `expires_at - request.now`, the seconds the params have left.
-pub fn expires_at(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<u64> {
+pub fn expires_at(ctx: &AllowitContext, value: &AllowitValue) -> Result<u64> {
     let end = int::<u64>(value)?;
     let r = &ctx.request;
     if r.now < end && r.now < r.expires_at && r.expires_at <= end {
@@ -820,7 +850,7 @@ pub fn expires_at(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<u
 ///
 /// Returns the request's op name for a `match`: `"transfer"`, `"swap"`, `"deposit"`, `"redeem"`
 /// or `"custom"`.
-pub fn operations(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<&str> {
+pub fn operations(ctx: &AllowitContext, value: &AllowitValue) -> Result<&'static str> {
     let mut found = false;
     operation_match(&ctx.request, |op| {
         each_op(value, |entry| {
@@ -842,14 +872,14 @@ pub fn operations(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<&
 /// denies, and its writes are discarded.
 #[track_caller]
 pub fn param<T: TryFrom<AllowitValue>>(ctx: &AllowitContext, key: &str) -> T {
-    typed(ctx, ctx.params.get(key), key)
+    typed(ctx, find(&ctx.params, key).cloned(), key)
 }
 
 /// The agent's execution param `key` of this request, from `ctx.request.args`, as `T`:
 /// `let amount: i128 = allowit::arg(ctx, "amount");`. It panics as `param` does.
 #[track_caller]
 pub fn arg<T: TryFrom<AllowitValue>>(ctx: &AllowitContext, key: &str) -> T {
-    typed(ctx, ctx.request.args.get(key), key)
+    typed(ctx, lookup(&ctx.request.args.0, key), key)
 }
 
 /// `value` of `key` as `T`, or a panic with `MissingParam` or `InvalidParam`. The host panic names
@@ -885,13 +915,12 @@ pub fn set_state(ctx: &AllowitContext, key: &str, value: impl Into<AllowitValue>
 }
 
 /// Standard-contract preflight of one canonical prefix call
-/// `allowit::<rule>(ctx, ctx.params.get(allowit::<RULE>))?;`. Only this runner skips a rule whose
-/// param is absent. It discards pass values.
+/// `allowit::<rule>(ctx, &ctx.params[allowit::<RULE>])?;`. Only this runner skips a rule whose
+/// param is absent instead of stopping with `MissingParam`. It discards pass values.
 pub fn preflight(ctx: &AllowitContext, rule: AllowitRule) -> Result {
-    let Some(value) = ctx.params.get(rule.key()) else {
+    let Some(value) = find(&ctx.params, rule.key()) else {
         return Ok(());
     };
-    let value = Some(value);
     match rule {
         AllowitRule::payment_limit => payment_limit(ctx, value).map(|_| ()),
         AllowitRule::lifetime_spending_limit => lifetime_spending_limit(ctx, value).map(|_| ()),
@@ -958,8 +987,8 @@ pub fn post_flight(ctx: &AllowitContext, tier: AllowitTier) -> Result<AllowitMap
 /// One policy evaluation, the server's entry point: clear stale writes, check the request's args
 /// and, for a `Standard` wallet, its params as the wallet does, run `execute`, then `post_flight`
 /// for the wallet's tier on approval. Args or params that the wallet rejects are `InvalidParam`.
-/// A panic of `execute` denies: on the host with the error of a failed `param` or `arg` read, or
-/// `Panicked`. A denial discards the policy's writes, so no write outlives it. The result is
+/// A panic of `execute` denies: on the host with the error of a failed `ctx.params[key]`, `param`
+/// or `arg` read, or `Panicked`. A denial discards the policy's writes, so no write outlives it. The result is
 /// exactly the state the wallet stores.
 pub fn evaluate(
     ctx: &AllowitContext,
@@ -971,7 +1000,7 @@ pub fn evaluate(
     // A standard wallet checks its stored params on every admission: a code change from Custom
     // keeps params that only the next admission validates.
     if tier == AllowitTier::Standard {
-        check_params(&ctx.params.0, tier)?;
+        check_params(ctx.params.map(), tier)?;
     }
     let run = guarded(&ctx.env, || execute(ctx));
     if run.is_err() {

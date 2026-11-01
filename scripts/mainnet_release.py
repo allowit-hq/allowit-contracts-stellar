@@ -34,17 +34,17 @@ SMOKE_SOURCE = b"""use allowit::prelude::*;
 /// volume, cap total spending, allow only a few payments and stop when the params expire.
 pub fn execute(ctx: &AllowitContext) -> allowit::Result {
     // "Pay only the pinned recipient"
-    allowit::destinations(ctx, ctx.params.get(allowit::DESTINATIONS))?;
+    allowit::destinations(ctx, &ctx.params[allowit::DESTINATIONS])?;
     // "cap each payment"
-    allowit::payment_limit(ctx, ctx.params.get(allowit::PAYMENT_LIMIT))?;
+    allowit::payment_limit(ctx, &ctx.params[allowit::PAYMENT_LIMIT])?;
     // "cap the daily volume"
-    allowit::daily_volume_limit(ctx, ctx.params.get(allowit::DAILY_VOLUME_LIMIT))?;
+    allowit::daily_volume_limit(ctx, &ctx.params[allowit::DAILY_VOLUME_LIMIT])?;
     // "cap total spending"
-    allowit::lifetime_spending_limit(ctx, ctx.params.get(allowit::LIFETIME_SPENDING_LIMIT))?;
+    allowit::lifetime_spending_limit(ctx, &ctx.params[allowit::LIFETIME_SPENDING_LIMIT])?;
     // "allow only a few payments"
-    allowit::call_limit(ctx, ctx.params.get(allowit::CALL_LIMIT))?;
+    allowit::call_limit(ctx, &ctx.params[allowit::CALL_LIMIT])?;
     // "stop when the params expire"
-    allowit::expires_at(ctx, ctx.params.get(allowit::EXPIRES_AT))?;
+    allowit::expires_at(ctx, &ctx.params[allowit::EXPIRES_AT])?;
     Ok(())
 }
 """

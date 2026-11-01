@@ -1125,7 +1125,7 @@ fn rule_input_carries_swap_and_redeem_facts() {
         path: path(&f.env, &[&f.asset, &p.token]),
         deadline: 1,
     });
-    let ctx = rule_input(&f.env, &state, &e);
+    let ctx = rule_input(&f.env, &state, &e).unwrap();
     let r = &ctx.request;
     assert_eq!(r.operation, AllowitOperation::swap);
     assert_eq!((r.recipient.clone(), r.amount), (p.router.clone(), 50));
@@ -1141,7 +1141,7 @@ fn rule_input_carries_swap_and_redeem_facts() {
         path: path(&f.env, &[&p.token, &f.asset]),
         deadline: 1,
     });
-    let ctx = rule_input(&f.env, &state, &e);
+    let ctx = rule_input(&f.env, &state, &e).unwrap();
     let r = &ctx.request;
     assert_eq!(
         (r.amount, r.token_in.clone(), r.amount_in),
@@ -1153,7 +1153,7 @@ fn rule_input_carries_swap_and_redeem_facts() {
         shares: 30,
         min_assets: 25,
     });
-    let ctx = rule_input(&f.env, &state, &e);
+    let ctx = rule_input(&f.env, &state, &e).unwrap();
     let r = &ctx.request;
     assert_eq!(r.operation, AllowitOperation::redeem);
     assert_eq!((r.recipient.clone(), r.amount), (p.pair.clone(), 25));

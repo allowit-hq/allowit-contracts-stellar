@@ -1,5 +1,7 @@
 use super::*;
-use allowit::{AllowitContext, AllowitOperation, AllowitParams, AllowitRequest, AllowitValue};
+use allowit::{
+    AllowitArgs, AllowitContext, AllowitOperation, AllowitParams, AllowitRequest, AllowitValue,
+};
 use allowit_wallet_engine::AllowitEngineClient;
 use soroban_sdk::{
     Bytes, IntoVal, Val, Vec,
@@ -58,13 +60,17 @@ fn context(env: &Env) -> AllowitContext {
     let asset = Address::generate(env);
     AllowitContext {
         env: env.clone(),
-        params: AllowitParams(soroban_sdk::Map::from_array(
+        params: AllowitParams::new(
             env,
-            [(
-                soroban_sdk::Symbol::new(env, allowit::PAYMENT_LIMIT),
-                AllowitValue::Int(10),
-            )],
-        )),
+            soroban_sdk::Map::from_array(
+                env,
+                [(
+                    soroban_sdk::Symbol::new(env, allowit::PAYMENT_LIMIT),
+                    AllowitValue::Int(10),
+                )],
+            ),
+        )
+        .unwrap(),
         state: soroban_sdk::Map::new(env),
         request: AllowitRequest {
             operation: AllowitOperation::transfer,
@@ -80,7 +86,7 @@ fn context(env: &Env) -> AllowitContext {
             spent_units: 1,
             gas_units: 0,
             unpriced: false,
-            args: AllowitParams(soroban_sdk::Map::new(env)),
+            args: AllowitArgs(soroban_sdk::Map::new(env)),
         },
     }
 }
@@ -91,7 +97,11 @@ fn payment_limit(
 ) -> Result<Result<i128, soroban_sdk::Error>, Result<allowit::AllowitError, soroban_sdk::InvokeError>>
 {
     let ctx = context(env);
-    AllowitEngineClient::new(env, engine).try_payment_limit(&ctx.params.0, &ctx.state, &ctx.request)
+    AllowitEngineClient::new(env, engine).try_payment_limit(
+        ctx.params.map(),
+        &ctx.state,
+        &ctx.request,
+    )
 }
 fn approved(env: &Env, engine: &Address) -> bool {
     payment_limit(env, engine).is_ok_and(|left| left == Ok(9))

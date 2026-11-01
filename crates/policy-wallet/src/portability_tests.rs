@@ -68,11 +68,29 @@ const ERRORS: [AllowitError; 16] = [
     AllowitError::OperationNotAllowed,
     AllowitError::Panicked,
 ];
-/// The wallet error of a rule error code.
+/// The contract error of a policy error code. A failed read, such as an unset `ctx.params[key]`,
+/// aborts the call with its own `AllowitError` code; a returned rule error maps to its wallet
+/// error.
 fn wallet_error(code: u32) -> u32 {
     let error = ERRORS[code as usize - 101];
     assert_eq!(error as u32, code);
+    if error == AllowitError::MissingParam {
+        return code;
+    }
     AllowitWalletError::from(error) as u32
+}
+/// The result of `run` inside `contract` as an error code. An abort, such as an unset
+/// `ctx.params[key]`, rolls the frame back and is its `AllowitError` code, as onchain.
+fn stopped<T>(
+    env: &Env,
+    contract: &Address,
+    run: impl FnOnce() -> allowit::Result<T>,
+) -> Result<T, u32> {
+    match env.try_as_contract::<_, AllowitError>(contract, run) {
+        Ok(result) => result.map_err(|e| e as u32),
+        Err(Ok(error)) => Err(error as u32),
+        Err(Err(other)) => panic!("{other:?}"),
+    }
 }
 
 /// Build the host smoke with plain `rustc` against `allowit` with only the `std` feature, run it
@@ -254,7 +272,7 @@ fn line(env: &Env, state: &Map<Symbol, AllowitValue>) -> Text {
 fn context(env: &Env, universe: &[Address], v: &Vector) -> AllowitContext {
     AllowitContext {
         env: env.clone(),
-        params: AllowitParams(params(env, universe, v)),
+        params: AllowitParams::new(env, params(env, universe, v)).unwrap(),
         state: state_map(env, v),
         request: AllowitRequest {
             operation: match v.op {
@@ -275,62 +293,68 @@ fn context(env: &Env, universe: &[Address], v: &Vector) -> AllowitContext {
             spent_units: v.spent_units,
             gas_units: v.gas_units,
             unpriced: !v.priced,
-            args: AllowitParams(args(env, v)),
+            args: AllowitArgs(args(env, v)),
         },
     }
 }
-/// Soroban backend outcome, inside a contract so policy writes have temporary storage.
+/// Soroban backend outcome. Each step runs in its own frame of the contract, so policy writes
+/// have temporary storage and an abort, such as an unset `ctx.params[key]`, has its error code.
 fn soroban_outcome(env: &Env, contract: &Address, universe: &[Address], v: &Vector) -> Outcome {
-    env.as_contract(contract, || {
-        let c = context(env, universe, v);
-        let p = |key| c.params.get(key);
-        let code = |e: AllowitError| e as u32;
-        let index = |a: Address| format!("@{}", universe.iter().position(|x| *x == a).unwrap());
-        let run = |execute: &dyn Fn(&AllowitContext) -> allowit::Result, tier| {
-            allowit::evaluate(&c, execute, tier)
-                .map(|state| line(env, &state))
-                .map_err(code)
-        };
-        let evaluate = |tier| run(&catching::execute, tier);
-        // The Common wallet's policy with the full canonical prefix.
-        let prefix = |c: &AllowitContext| {
-            RULES
-                .into_iter()
-                .try_for_each(|rule| allowit::preflight(c, rule))
-        };
-        let rules: List<Result<Text, u32>> = [
-            allowit::payment_limit(&c, p(allowit::PAYMENT_LIMIT)).map(|v| v.to_string()),
-            allowit::lifetime_spending_limit(&c, p(allowit::LIFETIME_SPENDING_LIMIT))
-                .map(|v| v.to_string()),
-            allowit::daily_spending_limit(&c, p(allowit::DAILY_SPENDING_LIMIT))
-                .map(|v| v.to_string()),
-            allowit::daily_volume_limit(&c, p(allowit::DAILY_VOLUME_LIMIT)).map(|v| v.to_string()),
-            allowit::call_limit(&c, p(allowit::CALL_LIMIT)).map(|v| v.to_string()),
-            allowit::destinations(&c, p(allowit::DESTINATIONS)).map(index),
-            allowit::tokens(&c, p(allowit::TOKENS)).map(index),
-            allowit::expires_at(&c, p(allowit::EXPIRES_AT)).map(|v| v.to_string()),
-            allowit::operations(&c, p(allowit::OPERATIONS)).map(|v| v.to_string()),
-        ]
-        .into_iter()
-        .map(|r| r.map_err(code))
-        .collect();
-        Outcome {
-            policy: sample::execute(&c).map_err(code),
-            branch: branch::execute(&c).map_err(code),
-            catching: catching::execute(&c).map_err(code),
-            rules,
-            preflight: RULES
-                .into_iter()
-                .map(|rule| allowit::preflight(&c, rule).map_err(code))
-                .collect(),
-            // The bare catching run above may have buffered a write; `evaluate` clears it first.
-            next: run(&|_| Ok(()), AllowitTier::Custom),
-            common: run(&prefix, AllowitTier::Standard),
-            simple: run(&|_| Ok(()), AllowitTier::Standard),
-            catching_next: evaluate(AllowitTier::Custom),
-            catching_standard: evaluate(AllowitTier::Standard),
-        }
-    })
+    let c = context(env, universe, v);
+    let code = |e: AllowitError| e as u32;
+    let index = |a: Address| format!("@{}", universe.iter().position(|x| *x == a).unwrap());
+    let run = |execute: &dyn Fn(&AllowitContext) -> allowit::Result, tier| {
+        stopped(env, contract, || allowit::evaluate(&c, execute, tier))
+            .map(|state| line(env, &state))
+    };
+    let evaluate = |tier| run(&catching::execute, tier);
+    // The Common wallet's policy with the full canonical prefix.
+    let prefix = |c: &AllowitContext| {
+        RULES
+            .into_iter()
+            .try_for_each(|rule| allowit::preflight(c, rule))
+    };
+    let stopped = |run: &dyn Fn() -> allowit::Result<Text>| stopped(env, contract, run);
+    let rules: List<Result<Text, u32>> = [
+        stopped(&|| {
+            allowit::payment_limit(&c, &c.params[allowit::PAYMENT_LIMIT]).map(|v| v.to_string())
+        }),
+        stopped(&|| {
+            allowit::lifetime_spending_limit(&c, &c.params[allowit::LIFETIME_SPENDING_LIMIT])
+                .map(|v| v.to_string())
+        }),
+        stopped(&|| {
+            allowit::daily_spending_limit(&c, &c.params[allowit::DAILY_SPENDING_LIMIT])
+                .map(|v| v.to_string())
+        }),
+        stopped(&|| {
+            allowit::daily_volume_limit(&c, &c.params[allowit::DAILY_VOLUME_LIMIT])
+                .map(|v| v.to_string())
+        }),
+        stopped(&|| allowit::call_limit(&c, &c.params[allowit::CALL_LIMIT]).map(|v| v.to_string())),
+        stopped(&|| allowit::destinations(&c, &c.params[allowit::DESTINATIONS]).map(index)),
+        stopped(&|| allowit::tokens(&c, &c.params[allowit::TOKENS]).map(index)),
+        stopped(&|| allowit::expires_at(&c, &c.params[allowit::EXPIRES_AT]).map(|v| v.to_string())),
+        stopped(&|| allowit::operations(&c, &c.params[allowit::OPERATIONS]).map(|v| v.to_string())),
+    ]
+    .into();
+    let unit = |result: Result<Text, u32>| result.map(drop);
+    Outcome {
+        policy: unit(stopped(&|| sample::execute(&c).map(|()| Text::new()))),
+        branch: unit(stopped(&|| branch::execute(&c).map(|()| Text::new()))),
+        catching: unit(stopped(&|| catching::execute(&c).map(|()| Text::new()))),
+        rules,
+        preflight: RULES
+            .into_iter()
+            .map(|rule| allowit::preflight(&c, rule).map_err(code))
+            .collect(),
+        // The bare catching run above may have buffered a write; `evaluate` clears it first.
+        next: run(&|_| Ok(()), AllowitTier::Custom),
+        common: run(&prefix, AllowitTier::Standard),
+        simple: run(&|_| Ok(()), AllowitTier::Standard),
+        catching_next: evaluate(AllowitTier::Custom),
+        catching_standard: evaluate(AllowitTier::Standard),
+    }
 }
 
 /// The leading canonical calls of the sample policy, as `scripts/policy_source.py` derives them
@@ -347,8 +371,8 @@ fn sample_prefix() -> List<AllowitRule> {
         }
         let call = line
             .strip_prefix("allowit::")
-            .and_then(|call| call.strip_suffix("))?;"))
-            .and_then(|call| call.split_once("(ctx, ctx.params.get(allowit::"));
+            .and_then(|call| call.strip_suffix("])?;"))
+            .and_then(|call| call.split_once("(ctx, &ctx.params[allowit::"));
         let Some(rule) = call.and_then(|(rule, key)| {
             let i = RULES.iter().position(|r| std::format!("{r:?}") == rule)?;
             (rule.to_uppercase() == key).then_some(RULES[i])
@@ -540,6 +564,8 @@ impl Wallet {
         match f.client().try_execute(e) {
             Ok(Ok(_)) => Ok(()),
             Err(Ok(error)) => Err(error as u32),
+            // A policy read that fails aborts with its `AllowitError` code.
+            Err(Err(soroban_sdk::InvokeError::Contract(code))) => Err(code),
             other => panic!("{:?} {:?}", self.tier, other.is_ok()),
         }
     }

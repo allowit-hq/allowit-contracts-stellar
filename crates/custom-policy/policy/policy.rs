@@ -5,22 +5,22 @@ use allowit::prelude::*;
 /// payments.
 pub fn execute(ctx: &AllowitContext) -> allowit::Result {
     // "Cap every payment"
-    allowit::payment_limit(ctx, ctx.params.get(allowit::PAYMENT_LIMIT))?;
+    allowit::payment_limit(ctx, &ctx.params[allowit::PAYMENT_LIMIT])?;
     // "cap its total spending"
-    allowit::lifetime_spending_limit(ctx, ctx.params.get(allowit::LIFETIME_SPENDING_LIMIT))?;
+    allowit::lifetime_spending_limit(ctx, &ctx.params[allowit::LIFETIME_SPENDING_LIMIT])?;
     // "cap its spending each day"
-    allowit::daily_spending_limit(ctx, ctx.params.get(allowit::DAILY_SPENDING_LIMIT))?;
+    allowit::daily_spending_limit(ctx, &ctx.params[allowit::DAILY_SPENDING_LIMIT])?;
     // "cap the daily volume it moves"
-    allowit::daily_volume_limit(ctx, ctx.params.get(allowit::DAILY_VOLUME_LIMIT))?;
+    allowit::daily_volume_limit(ctx, &ctx.params[allowit::DAILY_VOLUME_LIMIT])?;
     // "Limit how many payments it makes"
-    allowit::call_limit(ctx, ctx.params.get(allowit::CALL_LIMIT))?;
+    allowit::call_limit(ctx, &ctx.params[allowit::CALL_LIMIT])?;
     // "Pay only suppliers I approve"
-    allowit::destinations(ctx, ctx.params.get(allowit::DESTINATIONS))?;
+    allowit::destinations(ctx, &ctx.params[allowit::DESTINATIONS])?;
     // "use only USDC"
-    allowit::tokens(ctx, ctx.params.get(allowit::TOKENS))?;
+    allowit::tokens(ctx, &ctx.params[allowit::TOKENS])?;
     // "stop when the params expire"
-    allowit::expires_at(ctx, ctx.params.get(allowit::EXPIRES_AT))?;
+    allowit::expires_at(ctx, &ctx.params[allowit::EXPIRES_AT])?;
     // "only make payments"
-    allowit::operations(ctx, ctx.params.get(allowit::OPERATIONS))?;
+    allowit::operations(ctx, &ctx.params[allowit::OPERATIONS])?;
     Ok(())
 }
