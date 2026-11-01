@@ -493,8 +493,6 @@ impl Wallet {
         let mut id = [0u8; 32];
         id[24..].copy_from_slice(&operation.to_be_bytes());
         let expense = AllowitExpenseBounds {
-            asset: self.f.asset.clone(),
-            decimals: 7,
             gas_units: v.gas_units,
             conversion_units: 0,
             spent_units: v.spent_units,

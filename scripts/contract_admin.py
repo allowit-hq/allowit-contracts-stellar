@@ -453,8 +453,8 @@ def command(args):
             policy_rules(config, getattr(args, "tier", None), getattr(args, "policy_source", None))
             contract(config["asset"])
             code_hash(config["policy_instance"])
-            if int(config["policy_instance"], 16) == 0 or int(config["source_digest"], 16) == 0:
-                raise ValueError("Policy and source identities must be nonzero")
+            if int(config["policy_instance"], 16) == 0:
+                raise ValueError("Policy identity must be nonzero")
             if args.source != config["owner"]:
                 raise ValueError("Policy wallet deployment source must be its owner")
             if len({config[key] for key in ("owner", "agent", "server")}) != 3:

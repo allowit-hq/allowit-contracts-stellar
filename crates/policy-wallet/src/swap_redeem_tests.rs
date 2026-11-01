@@ -158,8 +158,6 @@ const OPS: [&str; 4] = ["transfer", "deposit", "swap", "redeem"];
 /// Expense bounds of a conversion: conversion loss plus gas is spent.
 fn bounds(f: &Fixture, gas: i128, conversion: i128) -> AllowitExpenseBounds {
     AllowitExpenseBounds {
-        asset: f.asset.clone(),
-        decimals: 7,
         gas_units: gas,
         conversion_units: conversion,
         spent_units: conversion + gas,
@@ -926,18 +924,20 @@ fn execute_redeem_checks_observed_effects_and_keeps_a_receipt() {
         assert_eq!(f.client().redeem_receipt(&e.operation_id), None);
         assert!(!marked(&f, &e));
     }
-    // A vault fee that its own preview hides must stay within the attested conversion bound.
-    for (conversion, result) in [
-        (2, Err(Ok(AllowitWalletError::InvalidEffects))),
-        (3, Ok(())),
+    // A vault fee that its own preview hides must stay within the attested conversion bound. A
+    // returned `i128::MIN` exceeds it without overflow.
+    for (behavior, conversion, result) in [
+        (25, 2, Err(Ok(AllowitWalletError::InvalidEffects))),
+        (25, 3, Ok(())),
+        (26, 3, Err(Ok(AllowitWalletError::InvalidEffects))),
     ] {
         let f = Fixture::new(COMMON, false);
-        let v = vault(&f, 25);
+        let v = vault(&f, behavior);
         allow(&f, &[&v], &[], &OPS);
         let before = f.client().state();
         let mut e = redeem_request(&f, &v, 40, 37);
         e.expense = AllowitExpense::Priced(bounds(&f, 0, conversion));
-        assert_eq!(execute(&f, &e), result, "{conversion}");
+        assert_eq!(execute(&f, &e), result, "{behavior} {conversion}");
         if result.is_ok() {
             assert_eq!((f.balance(), shares(&f, &v)), (1037, 60));
             assert_eq!(

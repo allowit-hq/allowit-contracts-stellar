@@ -63,7 +63,8 @@ Prepare `deploy-wallet --source "$OWNER" --config JSON --wasm PATH --wasm-hash H
 Select `allowit_simple_policy_engine.wasm`, `allowit_common_policy_engine.wasm`, or a reviewed
 `allowit_custom_policy.wasm`. Config contains exactly `owner`, `agent`, `server`, `asset`,
 `policy_instance`, `source_digest`, `rules`, `params`, and `x402_enabled`.
-The asset is an immutable native SAC. Identity and source digests are nonzero 32-byte hex strings.
+The asset is an immutable native SAC. `policy_instance` is a nonzero and `source_digest` a
+32-byte hex string.
 `rules` contains the ordered standard prefix of canonical rule names. The tool derives it from the
 authored `--policy-source` file and rejects any other list: Common binds the source's prefix,
 Simple and Custom bind an empty list. `--tier custom` also requires `source_digest` to be the

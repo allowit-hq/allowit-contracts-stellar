@@ -467,9 +467,10 @@ fn is_contract(address: &Address) -> bool {
         Some(AddressPayload::ContractIdHash(_))
     )
 }
-/// Check the native operation of a request: a transfer moves the installed asset, a vault or
-/// router is neither the wallet nor the asset, and amounts are positive. The wallet supplies itself
-/// as every source, owner, receiver and operator.
+/// Check the native operation of a request: a transfer moves a positive amount of the installed
+/// asset to neither the wallet nor the asset's classic issuer, a vault or router is neither the
+/// wallet nor the asset, and amounts are positive. The wallet supplies itself as every source,
+/// owner, receiver and operator.
 fn validate_operation(
     env: &Env,
     execution: &AllowitExecutionRequest,
@@ -478,11 +479,16 @@ fn validate_operation(
     let wallet = env.current_contract_address();
     let (vault, amount, minimum) = match &execution.operation {
         AllowitStellarOperation::Transfer(args) => {
-            return if args.token == state.asset {
-                Ok(())
-            } else {
-                Err(AllowitWalletError::InvalidInvocation)
-            };
+            if args.token != state.asset {
+                return Err(AllowitWalletError::InvalidInvocation);
+            }
+            if args.amount <= 0 {
+                return Err(AllowitWalletError::InvalidAmount);
+            }
+            if args.to == wallet || issuer_destination(env, &state.token, &state.asset, &args.to)? {
+                return Err(AllowitWalletError::InvalidRecipient);
+            }
+            return Ok(());
         }
         AllowitStellarOperation::Swap(args) => return validate_swap(env, execution, state, args),
         AllowitStellarOperation::Deposit(args) => (&args.vault, args.assets, args.min_shares),
@@ -634,7 +640,7 @@ fn move_tokens(
     }
     Ok(())
 }
-/// Check denomination, operation class and conservative signed cost identities. External facts remain server-attested.
+/// Check operation class and conservative signed cost identities. External facts remain server-attested.
 fn validate_expense(
     env: &Env,
     state: &AllowitState,
@@ -644,9 +650,7 @@ fn validate_expense(
     let Some(expense) = expense else {
         return Ok(());
     };
-    if expense.asset != state.asset
-        || expense.decimals != 7
-        || expense.gas_units < 0
+    if expense.gas_units < 0
         || expense.conversion_units < 0
         || expense.spent_units < 0
         || expense.observed_ledger == 0
@@ -715,9 +719,6 @@ fn deposit_tokens(
     if before_assets < args.assets {
         return Err(AllowitWalletError::InsufficientFunds);
     }
-    if before_shares < 0 {
-        return Err(AllowitWalletError::InvalidEffects);
-    }
     // The direct vault call is authorized by this invoking contract. Only this exact deeper transfer is delegated.
     env.authorize_as_current_contract(soroban_sdk::vec![
         env,
@@ -743,8 +744,8 @@ fn deposit_tokens(
             &Symbol::new(env, "preview_redeem"),
             (shares,).into_val(env),
         );
-        // A negative preview exceeds the loss bound, which never exceeds the assets.
-        if args.assets - args.assets.min(redeemable) > expense.conversion_units {
+        // An overflowing loss saturates above the bound, which never exceeds the assets.
+        if args.assets.saturating_sub(args.assets.min(redeemable)) > expense.conversion_units {
             return Err(AllowitWalletError::InvalidEffects);
         }
     }
@@ -872,7 +873,9 @@ fn redeem_shares(
     // The immutable SAC read is last: no untrusted vault code runs after these final observations.
     let after_assets = asset_client.balance(&wallet);
     let loss_exceeded = match (previewed, expense) {
-        (Some(value), Some(expense)) => value - value.min(assets) > expense.conversion_units,
+        (Some(value), Some(expense)) => {
+            value.saturating_sub(value.min(assets)) > expense.conversion_units
+        }
         _ => false,
     };
     // `min_assets` is positive, so this also rejects a nonpositive payout.
@@ -951,14 +954,6 @@ fn admit<P: AllowitPolicy>(
     let now = env.ledger().timestamp();
     if execution.expires_at <= now {
         return Err(AllowitWalletError::Expired);
-    }
-    if args.amount <= 0 {
-        return Err(AllowitWalletError::InvalidAmount);
-    }
-    if args.to == env.current_contract_address()
-        || issuer_destination(env, &state.token, &state.asset, &args.to)?
-    {
-        return Err(AllowitWalletError::InvalidRecipient);
     }
     validate_expense(env, &state, expense, &execution.operation)?;
     let nonce = checked(state.nonce.checked_add(1))?;

@@ -37,8 +37,6 @@ fn request(
 ) -> AllowitExecutionRequest {
     let mut e = f.execution(assets);
     e.expense = AllowitExpense::Priced(AllowitExpenseBounds {
-        asset: f.asset.clone(),
-        decimals: 7,
         gas_units: 0,
         conversion_units: 0,
         spent_units: 0,
@@ -313,8 +311,6 @@ fn rule_input_carries_typed_operations_and_the_vault_as_recipient() {
         min_shares: 5,
     });
     let expense = AllowitExpenseBounds {
-        asset: f.asset.clone(),
-        decimals: 7,
         gas_units: 2,
         conversion_units: 1,
         spent_units: 3,
@@ -382,8 +378,6 @@ fn set_cost(f: &Fixture, e: &mut AllowitExecutionRequest, gas: i128, conversion:
         _ => conversion,
     };
     e.expense = AllowitExpense::Priced(AllowitExpenseBounds {
-        asset: f.asset.clone(),
-        decimals: 7,
         gas_units: gas,
         conversion_units: conversion,
         spent_units: principal + gas,
@@ -434,7 +428,8 @@ fn expense_and_gross_cap_denials_and_valuation_bound_roll_back_atomic_effects() 
         assert_eq!(execute(&f, &e), Err(Ok(AllowitWalletError::PolicyDenied)));
         assert_unchanged(&f, &v, &e.operation_id, &before, &spent);
     }
-    for (behavior, conversion) in [(11, 1), (12, 0)] {
+    // A preview of `i128::MIN` exceeds the bound without overflow.
+    for (behavior, conversion) in [(11, 1), (12, 0), (14, 0)] {
         let f = Fixture::new_native(COMMON);
         let v = vault(&f, behavior, None);
         allow_recipient(&f, &v);
@@ -447,9 +442,9 @@ fn expense_and_gross_cap_denials_and_valuation_bound_roll_back_atomic_effects() 
     }
 }
 #[test]
-fn economic_class_denomination_gas_and_observation_facts_cannot_be_forged() {
+fn economic_class_gas_and_observation_facts_cannot_be_forged() {
     let f = Fixture::new_native(COMMON);
-    for mutation in 0..7 {
+    for mutation in 0..5 {
         let mut e = f.execution(50);
         set_cost(&f, &mut e, 3, 0);
         let mut c = e.expense.bounds().unwrap().clone();
@@ -460,10 +455,8 @@ fn economic_class_denomination_gas_and_observation_facts_cannot_be_forged() {
             } // Ordinary payment cannot claim swap classification.
             1 => c.spent_units = 1,
             2 => c.gas_units = 2,
-            3 => c.decimals = 6,
-            4 => c.day += 1,
-            5 => c.observed_ledger = 101,
-            _ => c.asset = f.recipient.clone(),
+            3 => c.day += 1,
+            _ => c.observed_ledger = 101,
         }
         e.expense = AllowitExpense::Priced(c);
         assert_eq!(
@@ -649,17 +642,15 @@ fn issued_asset_normalized_gas_is_signed_and_keeps_native_amount_checks() {
     assert_eq!(f.history().spent, 5);
     assert_eq!(f.history().day_total, 53);
     assert_eq!(f.balance(), 950);
-    for mutation in 0..5 {
+    for mutation in 0..3 {
         let f = Fixture::new(COMMON, false);
         let mut e = f.execution(50);
         set_cost(&f, &mut e, 3, 0);
         let mut cost = e.expense.bounds().unwrap().clone();
         cost.max_fee_stroops = 100;
         match mutation {
-            0 => cost.asset = f.recipient.clone(),
-            1 => cost.decimals = 6,
-            2 => cost.gas_units = -1,
-            3 => cost.gas_units = 0,
+            0 => cost.gas_units = -1,
+            1 => cost.gas_units = 0,
             _ => cost.max_fee_stroops = 0,
         };
         e.expense = AllowitExpense::Priced(cost);

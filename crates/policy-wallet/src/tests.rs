@@ -263,8 +263,6 @@ impl Fixture {
                 BytesN::from_array(&self.env, &[9; 32])
             },
             expense: AllowitExpense::Priced(AllowitExpenseBounds {
-                asset: self.asset.clone(),
-                decimals: 7,
                 gas_units: 0,
                 conversion_units: 0,
                 spent_units: amount.max(0),
@@ -1709,8 +1707,6 @@ fn x402_rejects_a_deposit_authorization_for_a_token_transfer() {
             min_shares: 10,
         });
         e.expense = AllowitExpense::Priced(AllowitExpenseBounds {
-            asset: f.asset.clone(),
-            decimals: 7,
             gas_units: 0,
             conversion_units: 0,
             spent_units: 0,

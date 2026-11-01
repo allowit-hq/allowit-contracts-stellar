@@ -209,10 +209,6 @@ pub struct AllowitSep56RedeemEvent {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AllowitExpenseBounds {
-    /// Immutable underlying SAC denomination, distinct from the share token.
-    pub asset: Address,
-    /// Exact underlying scale. This native custody profile requires seven.
-    pub decimals: u32,
     /// Conservative attributable gas ceiling in underlying units. Native XLM identity conversion is supported.
     pub gas_units: i128,
     /// Deposit, swap or redeem fee/slippage ceiling in underlying units. Transfers require zero.

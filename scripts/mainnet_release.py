@@ -427,7 +427,7 @@ def execution(plan, state, binding, operation_id, observed_ledger, case="positiv
     # The typed AllowitStellarOperation::Transfer with its named arguments; the wallet is the source.
     transfer = scval.to_struct({"amount": scval.to_int128(amount), "to": scval.to_address(recipient), "token": scval.to_address(plan["asset"])})
     # Conservative XLM ceilings: the full execute fee cap is attributable gas; a payment spends principal plus gas.
-    expense = scval.to_struct({"asset": scval.to_address(plan["asset"]), "decimals": scval.to_uint32(7), "gas_units": scval.to_int128(gas(plan)),
+    expense = scval.to_struct({"gas_units": scval.to_int128(gas(plan)),
         "conversion_units": scval.to_int128(0), "spent_units": scval.to_int128(amount + gas(plan)), "max_fee_stroops": scval.to_uint32(gas(plan)),
         "observed_ledger": scval.to_uint32(integer(observed_ledger, 1, 2**32 - 1)), "day": scval.to_uint64(now // 86_400 if day is None else day)})
     request = scval.to_struct({

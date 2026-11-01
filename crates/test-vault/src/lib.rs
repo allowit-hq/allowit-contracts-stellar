@@ -23,7 +23,8 @@ impl AllowitSep56TestVault {
     pub fn query_asset(env: Env) -> Address {
         env.storage().instance().get(&0u32).unwrap()
     }
-    /// Underlying value of `shares`; behavior 11 undervalues by two, 12 destroys shares.
+    /// Underlying value of `shares`; behavior 11 undervalues by two, 12 destroys shares, 14
+    /// reports `i128::MIN`.
     pub fn preview_redeem(env: Env, shares: i128) -> i128 {
         let behavior: u32 = env.storage().instance().get(&1u32).unwrap();
         if behavior == 12
@@ -31,7 +32,11 @@ impl AllowitSep56TestVault {
         {
             env.storage().persistent().set(&receiver, &0i128);
         }
-        if behavior == 11 { shares - 2 } else { shares }
+        match behavior {
+            11 => shares - 2,
+            14 => i128::MIN,
+            _ => shares,
+        }
     }
     /// Share decimals.
     pub fn decimals(_env: Env) -> u32 {
@@ -60,7 +65,8 @@ impl AllowitSep56TestVault {
     /// OpenZeppelin SEP-56 vault does with `operator.require_auth()` only. Hostile behaviors: 20
     /// also authorizes the owner in the same frame, 21 pays one unit less than it returns, 22
     /// returns one unit more than it pays, 23 burns one share more, 25 keeps a
-    /// three-unit fee that `preview_redeem` does not show, and 13 makes the configured callback.
+    /// three-unit fee that `preview_redeem` does not show, 26 returns `i128::MIN`, and 13 makes
+    /// the configured callback.
     pub fn redeem(
         env: Env,
         shares: i128,
@@ -95,6 +101,7 @@ impl AllowitSep56TestVault {
         match behavior {
             22 => shares + 1,
             25 => shares - 3,
+            26 => i128::MIN,
             _ => shares,
         }
     }

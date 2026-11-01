@@ -638,8 +638,8 @@ plus separate gas; embedded conversion fees are not counted twice. Underlying un
 decimals. Share units retain their independent native scale.
 
 `AllowitExecutionRequest.expense` is `Unpriced` or `Priced(AllowitExpenseBounds)`. The bounds hold
-asset, decimals, gas units, conversion units, spent units, attributable fee ceiling, observation
-ledger and UTC day as typed fields. The server approves exact conservative economic ceilings. The kernel checks denomination, day,
+gas units, conversion units, spent units, attributable fee ceiling, observation ledger and UTC day
+as typed fields, all in units of the wallet's installed asset. The server approves exact conservative economic ceilings. The kernel checks day,
 ledger, operation class, nonnegative units and the fee/gas identity. It cannot observe final
 transaction gas. XLM/stroop identity conversion is intrinsic; other gas conversions need an
 admitted trusted source. Onchain counters retain ceilings. The server separately settles actual
@@ -780,7 +780,7 @@ path token, the first equal to `amount_in`, the last at least `amount_out_min`; 
 a credit equal to the last returned amount. Both endpoints are Stellar Asset Contracts, so no
 untrusted code runs after the router returns.
 
-An `execute` redeem requires the vault to report the asset before and after the call, the share
+An `execute` redeem requires the vault to report the asset before the call, the share
 balance to fall by exactly `shares`, and the asset credit to equal the returned assets and be at
 least `min_assets`. With expense bounds it reads `preview_redeem(shares)` before the call and
 requires `preview - min(preview, assets) <= conversion_units`. The final read is the asset balance.

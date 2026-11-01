@@ -349,7 +349,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(cost['max_fee_stroops'],10000000)
         self.assertEqual(cost['spent_units'],10010000)
         self.assertEqual(cost['conversion_units'],0)
-        self.assertEqual((cost['decimals'],cost['observed_ledger'],cost['day']),(7,90,7))
+        self.assertEqual((cost['observed_ledger'],cost['day']),(90,7))
         name,transfer=scval.from_enum(request['operation'])
         self.assertEqual(name,'Transfer')
         self.assertEqual({k:scval.to_native(v) for k,v in scval.from_struct(transfer).items()},

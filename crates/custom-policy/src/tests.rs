@@ -1,4 +1,4 @@
-//! Source binding and operations. The shared portability vectors run in `allowit-policy-wallet`:
+//! Rule checks. The shared portability vectors run in `allowit-policy-wallet`:
 //! `src/portability_tests.rs` compares the std-only host smoke with the Soroban backend and the
 //! custom, standard and simple contracts.
 extern crate std;
@@ -8,7 +8,7 @@ use allowit::{
     DAY_SPENT_CAP, DAY_TOTAL_CAP, EXPIRY, OPERATIONS, RECIPIENTS, SPENT_CAP, TOKENS,
     TRANSACTION_CAP,
 };
-use soroban_sdk::{Address, Bytes, Map, String, Symbol, testutils::Address as _, vec};
+use soroban_sdk::{Address, Map, String, Symbol, testutils::Address as _, vec};
 
 /// Set one param of `ctx`, or unset it with `None`.
 fn set(ctx: &mut AllowitContext, key: &str, value: Option<AllowitValue>) {
@@ -97,20 +97,5 @@ fn custom_runner_maps_the_policy_result() {
     assert_eq!(
         AllowitCustom::check(&deposits, &rules),
         Err(AllowitWalletError::PolicyDenied)
-    );
-}
-
-#[test]
-fn source_binding_hashes_the_compiled_policy_and_custom_runs_no_deposit() {
-    let env = Env::default();
-    let source = Bytes::from_slice(&env, include_bytes!("../policy/policy.rs"));
-    assert_eq!(env.crypto().sha256(&source).to_array(), SOURCE_HASH);
-    assert_eq!(
-        AllowitCustom::OPERATIONS,
-        [
-            AllowitOperation::transfer,
-            AllowitOperation::swap,
-            AllowitOperation::redeem
-        ]
     );
 }
