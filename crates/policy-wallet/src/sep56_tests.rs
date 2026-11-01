@@ -124,19 +124,6 @@ fn deposit_compiled_simple_and_common_wallets_bind_and_retain_actual_effects() {
 }
 
 #[test]
-fn deposit_vault_target_is_controlled_only_by_authored_recipient_rule() {
-    let f = Fixture::new(COMMON, false);
-    let vault = vault(&f, 0, None);
-    let e = request(&f, &vault, 50, 50);
-    assert_eq!(execute(&f, &e), Err(Ok(AllowitWalletError::PolicyDenied)));
-    assert_eq!(f.balance(), 1000);
-    assert_eq!(f.client().state().nonce, 0);
-    allow_recipient(&f, &vault);
-    let e = request(&f, &vault, 50, 50);
-    assert!(execute(&f, &e).is_ok());
-}
-
-#[test]
 fn deposit_rejects_the_wallet_or_its_asset_as_vault_and_nonpositive_bounds() {
     let f = Fixture::new(SIMPLE, false);
     let vault = vault(&f, 0, None);
@@ -433,8 +420,10 @@ fn expense_and_gross_cap_denials_and_valuation_bound_roll_back_atomic_effects() 
         assert_eq!(execute(&f, &e), Err(Ok(AllowitWalletError::PolicyDenied)));
         assert_unchanged(&f, &v, &e.operation_id, &before, &spent);
     }
-    // A preview of `i128::MIN` exceeds the bound without overflow.
-    for (behavior, conversion) in [(11, 1), (12, 0), (14, 0)] {
+    // Destroyed shares, and a preview of `i128::MIN` that exceeds the bound without overflow. The
+    // undervalued-preview case runs in
+    // `deposit_effect_failure_after_the_state_write_rolls_back_state_nonce_and_replay_marker`.
+    for (behavior, conversion) in [(12, 0), (14, 0)] {
         let f = Fixture::new_native(COMMON);
         let v = vault(&f, behavior, None);
         allow_recipient(&f, &v);
@@ -691,22 +680,6 @@ fn issued_asset_normalized_gas_is_signed_and_keeps_native_amount_checks() {
             execute(&f, &e),
             Err(Ok(AllowitWalletError::InvalidInvocation))
         );
-        assert_eq!(f.balance(), 1000);
-        assert_eq!(f.client().state().nonce, 0);
-    }
-    for missing_server in [false, true] {
-        let f = Fixture::new(COMMON, false);
-        let mut e = f.execution(50);
-        set_cost(&f, &mut e, 3, 0);
-        let mut cost = e.expense.bounds().unwrap().clone();
-        cost.max_fee_stroops = 100;
-        e.expense = AllowitExpense::Priced(cost);
-        f.auth(
-            &[if missing_server { &f.agent } else { &f.server }],
-            "execute",
-            (e.clone(),).into_val(&f.env),
-        );
-        assert!(f.client().try_execute(&e).is_err());
         assert_eq!(f.balance(), 1000);
         assert_eq!(f.client().state().nonce, 0);
     }

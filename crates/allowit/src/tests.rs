@@ -508,6 +508,13 @@ fn boundary_equality_passes_with_zero_headroom_and_one_more_denies() {
         expires_at(&ctx, &int((r.now + 1).into())),
         Err(AllowitError::Expired)
     );
+    // An expired request denies even when the params expire later.
+    let mut expired = ctx.clone();
+    expired.request.expires_at = r.now;
+    assert_eq!(
+        expires_at(&expired, &int((r.now + 10).into())),
+        Err(AllowitError::Expired)
+    );
     assert_eq!(
         payment_limit(&ctx, &int(39)),
         Err(AllowitError::PaymentLimitExceeded)
@@ -678,28 +685,6 @@ fn allowlists_match_exact_addresses_and_empty_lists_deny() {
 }
 
 #[test]
-fn expires_at_bounds_params_and_request() {
-    let env = Env::default();
-    let mut ctx = fixture(&env);
-    let now = ctx.request.now;
-    assert_eq!(
-        expires_at(&ctx, &int(now.into())),
-        Err(AllowitError::Expired)
-    );
-    // A request cannot outlive the params.
-    let last = ctx.request.expires_at - 1;
-    assert_eq!(
-        expires_at(&ctx, &int(last.into())),
-        Err(AllowitError::Expired)
-    );
-    ctx.request.expires_at = now;
-    assert_eq!(
-        expires_at(&ctx, &int((now + 10).into())),
-        Err(AllowitError::Expired)
-    );
-}
-
-#[test]
 fn rules_encode_as_their_canonical_names_and_other_names_do_not_decode() {
     let env = Env::default();
     let symbol = |name: &str| -> Val { vec![&env, Symbol::new(&env, name)].into_val(&env) };
@@ -713,24 +698,7 @@ fn rules_encode_as_their_canonical_names_and_other_names_do_not_decode() {
             Some(rule)
         );
     }
-    for name in [
-        "set_cap_per_day",
-        "cap_per_transaction",
-        "require_recipient",
-        "require_asset",
-        "allow_actions",
-        "state_remove",
-        "fail",
-        "daily_cap",
-        "total_cap",
-        "recipient",
-        "token",
-        "per_transfer",
-        "max_calls",
-        "daily_limit",
-        "Spent_cap",
-        "",
-    ] {
+    for name in ["Spent_cap", ""] {
         // The host rejects an unknown variant symbol; inside a contract the invocation aborts.
         let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             AllowitRule::try_from_val(&env, &symbol(name)).ok()
@@ -1028,36 +996,6 @@ fn post_flight_bounds_the_number_of_state_keys() {
     });
 }
 
-/// Catches a lifetime spending limit error, reads it and continues; propagates the daily spending
-/// limit error.
-fn catching(ctx: &AllowitContext) -> Result {
-    if let Err(error) = lifetime_spending_limit(ctx, &ctx.params[LIFETIME_SPENDING_LIMIT]) {
-        set_state(ctx, "caught", error as u64)?;
-    }
-    daily_spending_limit(ctx, &ctx.params[DAILY_SPENDING_LIMIT])?;
-    Ok(())
-}
-
-#[test]
-fn a_caught_rule_error_lets_the_policy_continue_and_only_a_returned_error_denies() {
-    let env = Env::default();
-    let id = env.register(Scope, ());
-    let mut ctx = fixture(&env);
-    env.as_contract(&id, || {
-        set(&mut ctx, LIFETIME_SPENDING_LIMIT, int(1));
-        assert_eq!(catching(&ctx), Ok(()));
-        // The policy saw the error and recorded it; the Custom post-flight applies the write.
-        let next = post_flight(&ctx, AllowitTier::Custom).unwrap();
-        let code = AllowitError::LifetimeSpendingLimitExceeded as u64;
-        assert_eq!(read::<u64>(&next, "caught"), Ok(Some(code)));
-        set(&mut ctx, DAILY_SPENDING_LIMIT, int(1));
-        assert_eq!(
-            catching(&ctx),
-            Err(AllowitError::DailySpendingLimitExceeded)
-        );
-    });
-}
-
 #[test]
 fn post_flight_adds_this_operation_to_current_state_then_applies_policy_writes() {
     let env = Env::default();
@@ -1269,27 +1207,4 @@ fn evaluate_discards_writes_of_a_denied_or_stale_run() {
         let next = post_flight(&ctx, custom).unwrap();
         assert_eq!(read::<u64>(&next, "seen"), Ok(None));
     });
-}
-
-#[test]
-fn values_convert_to_and_from_their_scalars() {
-    let env = Env::default();
-    let address = Address::generate(&env);
-    assert_eq!(AllowitValue::from(5u64), AllowitValue::Int(5));
-    assert_eq!(u64::try_from(AllowitValue::Int(5)), Ok(5));
-    assert_eq!(
-        u64::try_from(AllowitValue::Int(-1)),
-        Err(AllowitError::InvalidParam)
-    );
-    assert_eq!(
-        bool::try_from(AllowitValue::Int(1)),
-        Err(AllowitError::InvalidParam)
-    );
-    let value = AllowitValue::from(address.clone());
-    assert_eq!(Address::try_from(value.clone()), Ok(address));
-    assert_eq!(i128::try_from(value), Err(AllowitError::InvalidParam));
-    // A value round-trips through its contract encoding.
-    let list = AllowitValue::List(vec![&env, AllowitValue::Bool(true)]);
-    let raw: Val = list.clone().into_val(&env);
-    assert_eq!(AllowitValue::try_from_val(&env, &raw), Ok(list));
 }

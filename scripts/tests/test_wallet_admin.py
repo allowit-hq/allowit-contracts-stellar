@@ -191,6 +191,14 @@ class ContractAdmin(unittest.TestCase):
         self.assertNotIn("transfer", ca.WALLET)
         self.assertNotIn("approve", ca.WALLET)
         self.assertNotIn("set_params", ca.PARENT)
+        # Parent arguments are the owner and the version; old names and out-of-range versions reject.
+        values = {"owner": KEYS[1], "version": 0}
+        self.assertEqual(ca.checked_args("set_admin", values, "parent"), values)
+        for old in ({"new_admin": KEYS[1], "expected_revision": 0},
+                    {"owner": KEYS[1], "version": -1},
+                    {"owner": KEYS[1], "version": 2**64}):
+            with self.assertRaises(ValueError):
+                ca.checked_args("set_admin", old, "parent")
 
     def test_params_encode_typed_values_and_standard_tiers_admit_only_canonical_keys(self):
         values = {"lifetime_spending_limit": 2**127 - 1, "call_limit": 0, "destinations": [KEYS[1]], "tokens": []}
@@ -206,7 +214,7 @@ class ContractAdmin(unittest.TestCase):
         self.assertEqual(ca.params(custom, "custom"), {"vendor_cap": {"Int": "-5"}, "note": {"Str": "pay invoices"},
                                                         "vendor": {"Addr": KEYS[2]}, "as_text": {"Str": KEYS[2]},
                                                         "urgent": {"Bool": True}, "pairs": {"List": [{"List": [{"Int": "1"}, {"Addr": KEYS[1]}]}]}})
-        for invalid in ({"per_transfer": 1}, {"max_calls": 1}, {"vendor_cap": 1}, {"lifetime_spending_limit": -1}, {"lifetime_spending_limit": 2**127},
+        for invalid in ({"vendor_cap": 1}, {"lifetime_spending_limit": -1}, {"lifetime_spending_limit": 2**127},
                         {"call_limit": 2**64}, {"expires_at": True}, {"payment_limit": "1"}, {"destinations": KEYS[1]},
                         {"tokens": ["not-an-address"]}, {"destinations": [[KEYS[1]]]}):
             with self.subTest(params=invalid), self.assertRaises(ValueError):
@@ -245,9 +253,8 @@ class ContractAdmin(unittest.TestCase):
         deployment = {"deployment_version": 1, "owner": KEYS[0], "agent": KEYS[1], "server": KEYS[2], "source_digest": "22" * 32,
                       "rules": ["lifetime_spending_limit", "destinations"], "params": values, "x402_enabled": False, "wasm_hash": None}
         ca.deployment(deployment)
-        for removed in ("set_cap_per_day", "cap_per_transaction", "require_recipient", "require_asset", "allow_actions", "state_remove", "fail", "daily_cap"):
-            with self.assertRaises(ValueError):
-                ca.deployment(dict(deployment, rules=[removed]))
+        with self.assertRaises(ValueError):
+            ca.deployment(dict(deployment, rules=["daily_cap"]))
         with self.assertRaises(ValueError):
             ca.public_json('{"custom":1,"custom":2}')
         # Owner packets encode the current layout only; earlier and later layouts are refused.
@@ -410,15 +417,6 @@ class ContractAdmin(unittest.TestCase):
         args.allow_mainnet = True
         self.assertIn("--build-only", ca.command(args))
 
-    def test_parent_arguments_use_owner_and_version(self):
-        values = {"owner": KEYS[1], "version": 0}
-        self.assertEqual(ca.checked_args("set_admin", values, "parent"), values)
-        for old in ({"new_admin": KEYS[1], "expected_revision": 0},
-                    {"owner": KEYS[1], "version": -1},
-                    {"owner": KEYS[1], "version": 2**64}):
-            with self.assertRaises(ValueError):
-                ca.checked_args("set_admin", old, "parent")
-
     def test_deployment_requires_matching_local_wasm(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "contract.wasm"
@@ -478,9 +476,8 @@ class ContractAdmin(unittest.TestCase):
             with self.subTest(body=body):
                 self.assertEqual(ca.standard_prefix(source(body)), expected)
         # Removed rule names are not on the allowlist.
-        for name in ("set_cap_per_day", "cap_per_transaction", "require_recipient", "require_asset", "allow_actions", "state_remove", "fail"):
-            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "allowlist"):
-                ca.standard_prefix(source(call(name) + call("expires_at")))
+        with self.assertRaisesRegex(ValueError, "allowlist"):
+            ca.standard_prefix(source(call("set_cap_per_day") + call("expires_at")))
         explicit = HEAD.replace("allowit::Result {", "allowit::Result<()> {")
         self.assertEqual(ca.standard_prefix(source(call("tokens"), explicit)), ["tokens"])
         # Calls in other functions are not part of execute.

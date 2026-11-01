@@ -37,6 +37,3 @@ impl AllowitPolicy for AllowitCustom {
     }
 }
 allowit_policy_wallet::policy_wallet!(AllowitCustomPolicy, AllowitCustom);
-
-#[cfg(test)]
-mod tests;

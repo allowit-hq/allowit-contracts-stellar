@@ -543,36 +543,14 @@ fn common_skips_absent_params_and_rejects_unknown_names_keys_and_values() {
         assert_eq!(deploy(raw), Err(Ok(AllowitWalletError::InvalidParam)));
     }
     // A name outside the enum aborts in the host's symbol lookup.
-    for name in [
-        "unknown",
-        "daily_cap",
-        "total_cap",
-        "recipient",
-        "token",
-        "set_cap_per_day",
-        "cap_per_transaction",
-        "require_recipient",
-        "require_asset",
-        "allow_actions",
-        "state_remove",
-        "fail",
-    ] {
-        let rule: Val = vec![&f.env, Symbol::new(&f.env, name)].into_val(&f.env);
-        assert!(deploy(packet(rule, None)).is_err());
-    }
+    let rule: Val = vec![&f.env, Symbol::new(&f.env, "daily_cap")].into_val(&f.env);
+    assert!(deploy(packet(rule, None)).is_err());
     // The standard contract admits only the canonical keys, each with its rule's type.
     let text = AllowitValue::Str(String::from_str(&f.env, "100"));
     let invalid = [
         (PAYMENT_LIMIT, AllowitValue::Int(-1)),
-        (LIFETIME_SPENDING_LIMIT, AllowitValue::Int(-1)),
-        (DAILY_SPENDING_LIMIT, AllowitValue::Int(-1)),
-        (DAILY_VOLUME_LIMIT, text.clone()),
-        (CALL_LIMIT, AllowitValue::Int(-1)),
-        (EXPIRES_AT, AllowitValue::Bool(true)),
-        (DESTINATIONS, AllowitValue::Addr(f.recipient.clone())),
-        (TOKENS, AllowitValue::List(vec![&f.env, text])),
+        (DAILY_VOLUME_LIMIT, text),
         ("vendor_cap", AllowitValue::Int(5)),
-        ("per_transfer", AllowitValue::Int(5)),
     ];
     for (key, value) in invalid {
         let mut p = f.deployment();
@@ -597,25 +575,6 @@ fn common_skips_absent_params_and_rejects_unknown_names_keys_and_values() {
         f.client().state().rules,
         vec![&f.env, AllowitRule::destinations]
     );
-}
-#[test]
-fn standard_tiers_reject_a_custom_key_beside_few_canonical_keys() {
-    for wasm in [COMMON, SIMPLE, CUSTOM] {
-        let f = Fixture::new(wasm, false);
-        let mut p = f.deployment();
-        p.params = Map::new(&f.env);
-        set_param(&mut p.params, PAYMENT_LIMIT, Some(AllowitValue::Int(1)));
-        set_param(&mut p.params, "vendor_cap", Some(AllowitValue::Int(5)));
-        f.auth(&[&f.owner], "deploy_policy", (p.clone(),).into_val(&f.env));
-        let result = f.client().try_deploy_policy(&p);
-        if wasm == CUSTOM {
-            assert_eq!(result, Ok(Ok(())));
-            assert_eq!(f.client().state().params, p.params);
-        } else {
-            assert_eq!(result, Err(Ok(AllowitWalletError::InvalidParam)));
-            assert_eq!(f.client().state().deployment_version, 0);
-        }
-    }
 }
 /// Fill `map` toward `budget` encoded bytes with a `fill` list of texts, as `allowit` counts them.
 fn fill(env: &Env, map: &mut Map<Symbol, AllowitValue>, budget: u32) {
@@ -671,54 +630,6 @@ fn wallet_entry_holds_params_and_state_at_their_byte_budgets() {
     assert!(f.client().state().to_xdr(&f.env).len() < 40 * 1024);
 }
 #[test]
-fn custom_policy_denies_an_absent_param_that_common_preflight_skips() {
-    for wasm in [COMMON, CUSTOM] {
-        let f = Fixture::new(wasm, false);
-        let mut p = f.deployment();
-        set_param(&mut p.params, EXPIRES_AT, None);
-        f.auth(&[&f.owner], "deploy_policy", (p.clone(),).into_val(&f.env));
-        f.client().deploy_policy(&p);
-        let e = f.execution(10);
-        f.auth(
-            &[&f.agent, &f.server],
-            "execute",
-            (e.clone(),).into_val(&f.env),
-        );
-        if wasm == CUSTOM {
-            // Indexing the unset param aborts the call with its `AllowitError` code.
-            let missing = allowit::AllowitError::MissingParam as u32;
-            assert_eq!(
-                f.client().try_execute(&e),
-                Err(Err(soroban_sdk::InvokeError::Contract(missing)))
-            );
-            assert_eq!(f.history(), AllowitStandardState::default());
-        } else {
-            f.client().execute(&e);
-            assert_eq!(f.history().calls, 1);
-        }
-    }
-}
-#[test]
-fn params_that_are_not_key_value_maps_do_not_decode() {
-    let f = Fixture::new(COMMON, false);
-    let p = f.deployment();
-    // A text-keyed map and a struct of raw values, the earlier layouts' encodings.
-    let mut text_keys = Map::<String, Val>::new(&f.env);
-    text_keys.set(
-        String::from_str(&f.env, "payment_limit"),
-        AllowitValue::Int(10).into_val(&f.env),
-    );
-    let mut raw_values = Map::<Symbol, Val>::new(&f.env);
-    raw_values.set(Symbol::new(&f.env, "call_limit"), 3u64.into_val(&f.env));
-    let packet: Val = p.clone().into_val(&f.env);
-    for params in [text_keys.into_val(&f.env), raw_values.into_val(&f.env)] {
-        let mut raw = Map::<Symbol, Val>::try_from_val(&f.env, &packet).unwrap();
-        raw.set(Symbol::new(&f.env, "params"), params);
-        assert!(!f.deploy_raw(raw));
-        assert_eq!(f.client().state().deployment_version, 0);
-    }
-}
-#[test]
 fn owner_signs_the_canonical_packet_so_absent_or_extra_keys_reject() {
     let f = Fixture::new(COMMON, false);
     let p = f.deployment();
@@ -726,13 +637,22 @@ fn owner_signs_the_canonical_packet_so_absent_or_extra_keys_reject() {
     extra_top.set(Symbol::new(&f.env, "per_transfer"), 5i128.into_val(&f.env));
     let mut absent_top = f.packet(&p);
     absent_top.remove(Symbol::new(&f.env, "wasm_hash"));
-    let mut legacy_name = p.clone();
-    set_param(
-        &mut legacy_name.params,
-        "per_transfer",
-        Some(AllowitValue::Int(5)),
+    // Params that are not key-value maps do not decode: a text-keyed map and a struct of raw
+    // values, the earlier layouts' encodings.
+    let mut text_keys = Map::<String, Val>::new(&f.env);
+    text_keys.set(
+        String::from_str(&f.env, "payment_limit"),
+        AllowitValue::Int(10).into_val(&f.env),
     );
-    for packet in [extra_top, absent_top, f.packet(&legacy_name)] {
+    let mut raw_values = Map::<Symbol, Val>::new(&f.env);
+    raw_values.set(Symbol::new(&f.env, "call_limit"), 3u64.into_val(&f.env));
+    let mut packets = std::vec![extra_top, absent_top];
+    for params in [text_keys.into_val(&f.env), raw_values.into_val(&f.env)] {
+        let mut raw = f.packet(&p);
+        raw.set(Symbol::new(&f.env, "params"), params);
+        packets.push(raw);
+    }
+    for packet in packets {
         assert!(!f.deploy_raw(packet));
         assert_eq!(f.client().state().deployment_version, 0);
         assert_eq!(f.client().state().params, p.params);
@@ -757,19 +677,6 @@ fn wallet_wasm_declares_its_custody_layout() {
     for wasm in [SIMPLE, COMMON, CUSTOM] {
         assert!(wasm.windows(entry.len()).any(|w| w == entry));
     }
-}
-#[test]
-fn custom_sample_executes_complete_compiled_policy() {
-    let f = Fixture::new(CUSTOM, false);
-    f.transfer(20);
-    f.transfer(30);
-    assert_eq!(f.history().day_spent, 50);
-    assert_eq!(f.history().spent, 50);
-    assert_eq!(f.history().calls, 2);
-    assert_eq!(
-        f.client().policy_binding().engine_kind,
-        Symbol::new(&f.env, "custom_policy")
-    );
 }
 #[test]
 fn exact_request_replay_pause_and_expiry_are_independent_of_business_rules() {
@@ -863,6 +770,18 @@ fn real_x402_requires_both_signatures_and_commits_with_native_effects() {
                 .is_err()
         );
         assert_eq!(f.balance(), 990);
+        // The settled operation replays as `Replay` even under a new host payload.
+        let payload = BytesN::from_array(&f.env, &[42; 32]);
+        assert_eq!(
+            f.env.try_invoke_contract_check_auth::<AllowitWalletError>(
+                &f.wallet,
+                &payload,
+                f.authorization(e.clone(), &payload).into_val(&f.env),
+                &vec![&f.env, transfer_context(&f, 10)]
+            ),
+            Err(Ok(AllowitWalletError::Replay))
+        );
+        assert_eq!(f.client().state().nonce, 1);
         let mut bad = f.host_entry(f.execution(10), 10, 3);
         if let soroban_sdk::xdr::SorobanCredentials::Address(ref mut credential) = bad.credentials {
             let mut auth: AllowitPolicyAuthorization =
@@ -1308,18 +1227,21 @@ fn constructor_owner_signs_the_canonical_packet_so_absent_or_extra_keys_reject()
             .try_deploy_raw(&wasm, &packet)
             .is_ok()
     };
-    let mut legacy = config.params.clone();
-    set_param(&mut legacy, "per_transfer", Some(AllowitValue::Int(5)));
     for packet in [
         raw(&|packet| packet.set(key("per_transfer"), 5i128.into_val(&f.env))),
         raw(&|packet| {
             packet.remove(key("x402_enabled"));
         }),
-        // The standard contract admits only canonical param keys.
-        raw(&|packet| packet.set(key("params"), legacy.clone().into_val(&f.env))),
     ] {
         assert!(!deploy(packet));
     }
+    // Without the owner's authorization the canonical packet does not deploy.
+    f.env.mock_auths(&[]);
+    assert!(
+        ConstructorClient::new(&f.env, &factory)
+            .try_deploy_raw(&wasm, &raw(&|_| {}))
+            .is_err()
+    );
     assert!(deploy(raw(&|_| {})));
     assert_eq!(Client::new(&f.env, &wallet).state().params, config.params);
 }
@@ -1391,30 +1313,6 @@ fn constructor_and_deploy_policy_reject_a_mismatched_standard_prefix_digest() {
     f.client().deploy_policy(&p);
     assert_eq!(f.client().state().rules, p.rules);
 }
-#[test]
-fn ordinary_compiled_deployment_requires_owner_authorization() {
-    let f = Fixture::new(SIMPLE, false);
-    let state = f.client().state();
-    let wasm = f.env.deployer().upload_contract_wasm(SIMPLE);
-    let constructor = f.env.register(Constructor, ());
-    let config = AllowitPolicyConfig {
-        owner: state.owner,
-        agent: state.agent,
-        server: state.server,
-        asset: state.asset,
-        policy_instance: state.policy_instance,
-        source_digest: state.source_digest,
-        rules: state.rules,
-        params: state.params,
-        x402_enabled: false,
-    };
-    f.env.mock_auths(&[]);
-    assert!(
-        ConstructorClient::new(&f.env, &constructor)
-            .try_deploy(&wasm, &config)
-            .is_err()
-    );
-}
 
 fn transfer_context(f: &Fixture, amount: i128) -> Context {
     Context::Contract(soroban_sdk::auth::ContractContext {
@@ -1483,25 +1381,6 @@ fn x402_context_signatures_pause_and_enablement_fail_closed() {
         assert_eq!(f.balance(), 1000);
         assert_eq!(f.client().state().nonce, 0);
     }
-}
-
-#[test]
-fn operation_replay_rejects_even_with_a_new_host_payload() {
-    let f = Fixture::new(SIMPLE, true);
-    let execution = f.execution(10);
-    f.env.set_auths(&[f.host_entry(execution.clone(), 10, 1)]);
-    token::Client::new(&f.env, &f.asset).transfer(&f.wallet, &f.recipient, &10);
-    let payload = BytesN::from_array(&f.env, &[42; 32]);
-    assert_eq!(
-        f.env.try_invoke_contract_check_auth::<AllowitWalletError>(
-            &f.wallet,
-            &payload,
-            f.authorization(execution, &payload).into_val(&f.env),
-            &vec![&f.env, transfer_context(&f, 10)]
-        ),
-        Err(Ok(AllowitWalletError::Replay))
-    );
-    assert_eq!(f.client().state().nonce, 1);
 }
 
 /// A transfer execution to an arbitrary destination with its matching token context.

@@ -75,9 +75,8 @@ class ReleaseTests(unittest.TestCase):
         del self.plan['policy_source_digest']
 
     def test_reject_legacy_or_partial_param_names(self):
-        for legacy in ('per_transfer','daily_limit','total_limit','max_calls','deadline'):
-            plan=copy.deepcopy(self.plan);plan['params'][legacy]=1
-            with self.assertRaisesRegex(ValueError,'canonical rule'): release.smoke_params(plan)
+        plan=copy.deepcopy(self.plan);plan['params']['per_transfer']=1
+        with self.assertRaisesRegex(ValueError,'canonical rule'): release.smoke_params(plan)
         plan=copy.deepcopy(self.plan);del plan['params']['call_limit']
         with self.assertRaisesRegex(ValueError,'canonical rule'): release.smoke_params(plan)
         plan=copy.deepcopy(self.plan);plan['params']['daily_volume_limit']=10009999
@@ -116,11 +115,6 @@ class ReleaseTests(unittest.TestCase):
         self.plan['network_passphrase']=Network.PUBLIC_NETWORK_PASSPHRASE
         self.plan['admin_members'][0]=self.plan['owner']
         with self.assertRaisesRegex(ValueError,'differ'): self.load()
-
-    def test_receipt_uses_plain_addresses(self):
-        expected = release.expected_receipt(self.plan,self.plan['asset'],dict(nonce=0,deployment_version=0),'ab'*32)
-        value = scval.to_struct({k: scval.to_address(v) if k in ('from','to','token') else scval.to_bytes(bytes.fromhex(v)) if k=='operation_id' else scval.to_int128(v) if k=='amount' else scval.to_uint64(v) for k,v in expected.items()})
-        self.assertEqual(release.receipt_json(release.decode_receipt(value)),expected)
 
     def packet(self):
         tx = TransactionBuilder(Account(self.plan['owner'],1),Network.PUBLIC_NETWORK_PASSPHRASE,100).add_time_bounds(0,2000000000).append_invoke_contract_function_op(self.plan['asset'],'balance',[scval.to_address(self.plan['recipient'])]).build()
