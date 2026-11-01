@@ -457,10 +457,10 @@ impl NativeOperation {
     /// The typed operation that rules read.
     fn kind(&self) -> AllowitOperation {
         match self {
-            Self::Transfer(_) => AllowitOperation::sep41_transfer,
-            Self::Deposit(_) => AllowitOperation::sep56_deposit,
-            Self::Swap(_) => AllowitOperation::router_swap_exact_in,
-            Self::Redeem(_) => AllowitOperation::sep56_redeem,
+            Self::Transfer(_) => AllowitOperation::transfer,
+            Self::Deposit(_) => AllowitOperation::deposit,
+            Self::Swap(_) => AllowitOperation::swap,
+            Self::Redeem(_) => AllowitOperation::redeem,
         }
     }
     /// The request facts. A forward swap counts its asset input as the gross amount; a reverse

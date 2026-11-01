@@ -362,7 +362,7 @@ fn rule_input_carries_typed_operations_and_the_vault_as_recipient() {
     set_param(&mut e.args, "invoice", Some(AllowitValue::Int(7)));
     let ctx = rule_input(&f.env, &state, &deposit, Some(&expense), &e);
     assert_eq!((ctx.request.now, ctx.request.expires_at), (86_410, 86_500));
-    assert_eq!(ctx.request.operation, AllowitOperation::sep56_deposit);
+    assert_eq!(ctx.request.operation, AllowitOperation::deposit);
     assert_eq!(ctx.request.recipient, vault);
     assert_eq!(ctx.request.asset, f.asset);
     assert_eq!(ctx.request.amount, 5);
@@ -383,7 +383,7 @@ fn rule_input_carries_typed_operations_and_the_vault_as_recipient() {
         to: f.recipient.clone(),
         amount: 1,
     });
-    assert_eq!(transfer.kind(), AllowitOperation::sep41_transfer);
+    assert_eq!(transfer.kind(), AllowitOperation::transfer);
 }
 
 #[test]

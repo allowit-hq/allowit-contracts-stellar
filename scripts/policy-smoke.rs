@@ -86,7 +86,7 @@ fn context() -> AllowitContext {
             ..Default::default()
         }),
         request: AllowitRequest {
-            operation: AllowitOperation::sep41_transfer,
+            operation: AllowitOperation::transfer,
             asset,
             recipient,
             amount: 10,
@@ -132,7 +132,7 @@ fn approval_branch_policy_caps_deposits() {
     let mut c = context();
     edit(&mut c, |s| s.spent = 21);
     assert_eq!(branch::execute(&c), Ok(()));
-    c.request.operation = AllowitOperation::sep56_deposit;
+    c.request.operation = AllowitOperation::deposit;
     assert_eq!(branch::execute(&c), Err(AllowitError::SpentCapExceeded));
 }
 #[test]
@@ -435,10 +435,10 @@ fn host_context(v: &Vector) -> AllowitContext {
         state,
         request: AllowitRequest {
             operation: match v.op {
-                Op::Transfer => AllowitOperation::sep41_transfer,
-                Op::Deposit => AllowitOperation::sep56_deposit,
-                Op::Swap => AllowitOperation::router_swap_exact_in,
-                Op::Redeem => AllowitOperation::sep56_redeem,
+                Op::Transfer => AllowitOperation::transfer,
+                Op::Deposit => AllowitOperation::deposit,
+                Op::Swap => AllowitOperation::swap,
+                Op::Redeem => AllowitOperation::redeem,
             },
             asset: address(v.asset),
             recipient: address(v.recipient),

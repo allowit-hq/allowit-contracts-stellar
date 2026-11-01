@@ -1166,7 +1166,7 @@ fn rule_input_carries_swap_and_redeem_facts() {
     });
     let ctx = rule_input(&f.env, &state, &forward, None, &e);
     let r = &ctx.request;
-    assert_eq!(r.operation, AllowitOperation::router_swap_exact_in);
+    assert_eq!(r.operation, AllowitOperation::swap);
     assert_eq!((r.recipient.clone(), r.amount), (p.router.clone(), 50));
     assert_eq!((r.token_in.clone(), r.amount_in), (f.asset.clone(), 50));
     assert_eq!(
@@ -1198,7 +1198,7 @@ fn rule_input_carries_swap_and_redeem_facts() {
     });
     let ctx = rule_input(&f.env, &state, &redeem, None, &e);
     let r = &ctx.request;
-    assert_eq!(r.operation, AllowitOperation::sep56_redeem);
+    assert_eq!(r.operation, AllowitOperation::redeem);
     assert_eq!((r.recipient.clone(), r.amount), (p.pair.clone(), 25));
     assert_eq!((r.token_in.clone(), r.amount_in), (p.pair.clone(), 30));
     assert_eq!(

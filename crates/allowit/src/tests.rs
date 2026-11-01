@@ -100,7 +100,7 @@ fn fixture(env: &Env) -> AllowitContext {
             },
         ),
         request: AllowitRequest {
-            operation: AllowitOperation::sep41_transfer,
+            operation: AllowitOperation::transfer,
             asset: asset.clone(),
             recipient: recipient.clone(),
             amount: 40,
@@ -279,7 +279,7 @@ fn operations_admit_named_ops_star_and_custom_forms() {
     ] {
         assert_eq!(operations(&ctx, ops(&env, names)), not, "{names:?}");
     }
-    ctx.request.operation = AllowitOperation::sep56_deposit;
+    ctx.request.operation = AllowitOperation::deposit;
     assert_eq!(operations(&ctx, ops(&env, &["deposit"])), Ok("deposit"));
     assert_eq!(operations(&ctx, ops(&env, &["transfer"])), not);
     assert_eq!(operations(&ctx, None), Err(AllowitError::MissingParam));
@@ -334,6 +334,37 @@ fn operations_admit_named_ops_star_and_custom_forms() {
     for value in invalid {
         assert_eq!(operations(&ctx, value.clone()), bad, "{value:?}");
     }
+}
+
+#[test]
+fn operations_admit_a_custom_call_by_its_contract_and_function() {
+    let env = Env::default();
+    let mut ctx = fixture(&env);
+    let pool = Address::generate(&env);
+    let mut strkey = [0u8; 56];
+    pool.to_string().copy_into_slice(&mut strkey);
+    let named = std::format!("custom:{}.swap", core::str::from_utf8(&strkey).unwrap());
+    let other = std::format!("custom:C{}.swap", "A".repeat(55));
+    let call =
+        |function: &str| AllowitOperation::custom(pool.clone(), String::from_str(&env, function));
+    ctx.request.operation = call("swap");
+    let not = Err(AllowitError::OperationNotAllowed);
+    assert_eq!(operations(&ctx, Some(text_value(&env, "*"))), Ok("custom"));
+    for entry in ["custom", "custom.swap", named.as_str()] {
+        assert_eq!(
+            operations(&ctx, ops(&env, &[entry])),
+            Ok("custom"),
+            "{entry}"
+        );
+    }
+    for entry in ["swap", "transfer", "custom.claim", other.as_str()] {
+        assert_eq!(operations(&ctx, ops(&env, &[entry])), not, "{entry}");
+    }
+    // A call that no op name can express, such as a function that is not a `Symbol`, is admitted
+    // by no entry, not even `*`.
+    ctx.request.operation = call("a-b");
+    assert_eq!(operations(&ctx, Some(text_value(&env, "*"))), not);
+    assert_eq!(operations(&ctx, ops(&env, &["custom"])), not);
 }
 
 #[test]

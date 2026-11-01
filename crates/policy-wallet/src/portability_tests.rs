@@ -255,10 +255,10 @@ fn context(env: &Env, universe: &[Address], v: &Vector) -> AllowitContext {
         state: state_map(env, v),
         request: AllowitRequest {
             operation: match v.op {
-                Op::Transfer => AllowitOperation::sep41_transfer,
-                Op::Deposit => AllowitOperation::sep56_deposit,
-                Op::Swap => AllowitOperation::router_swap_exact_in,
-                Op::Redeem => AllowitOperation::sep56_redeem,
+                Op::Transfer => AllowitOperation::transfer,
+                Op::Deposit => AllowitOperation::deposit,
+                Op::Swap => AllowitOperation::swap,
+                Op::Redeem => AllowitOperation::redeem,
             },
             asset: universe[v.asset].clone(),
             recipient: universe[v.recipient].clone(),

@@ -237,7 +237,7 @@ worktree for concurrent runs. The mainnet tooling rejects any artifact whose has
 fixture.
 
 Portable authored code beyond canonical calls uses typed scalar fields, enum comparisons such as
-`ctx.request.operation == AllowitOperation::sep56_deposit`, matches on `AllowitValue`, and its own
+`ctx.request.operation == AllowitOperation::deposit`, matches on `AllowitValue`, and its own
 state keys. Backend list methods differ (`len` returns `u32` onchain and `usize` on the host), so
 the tooling admits no list method.
 
@@ -249,7 +249,7 @@ computes it:
 | `env` | Backend environment: the contract's Soroban `Env` onchain, an `AllowitEnv` on the host |
 | `params` | The owner's constructor params, key => `AllowitValue`. An absent key is unset |
 | `state` | Current policy state before this operation: one free-form map of standard and policy-defined keys |
-| `request` | Typed `AllowitOperation`, immutable asset, recipient (payee, vault or router), amount, `token_in` and `amount_in` that leave the wallet, `token_out` and `min_out` that it receives back, `now`, `expires_at`, `spent_units` and `gas_units` from the validated expense bounds, or `unpriced`, and the agent's `args` |
+| `request` | Typed general `AllowitOperation` (`transfer`, `swap`, `deposit`, `redeem` or `custom`), immutable asset, recipient (payee, vault or router), amount, `token_in` and `amount_in` that leave the wallet, `token_out` and `min_out` that it receives back, `now`, `expires_at`, `spent_units` and `gas_units` from the validated expense bounds, or `unpriced`, and the agent's `args` |
 
 Params, state and args share one value type, `AllowitValue`: `Int(i128)`, `Bool(bool)`,
 `Str(String)`, `Addr(Address)` and `List(Vec<AllowitValue>)`. Onchain a map is
@@ -376,12 +376,14 @@ unpriced request denies `spent_cap`; unpriced state of the day or an unpriced re
 daily caps (`Unpriced`). A sum outside its integer range is `Overflow`. Standard configuration
 rejects negative caps.
 
-The op names are `transfer`, `swap`, `deposit` and `redeem`, plus three custom-call forms:
-`custom` admits any custom call, `custom.<function>` that function on any contract, and
-`custom:<contract>.<function>` that function on that contract instance. A function is 1 to 32
-ASCII letters, digits or underscores, and a contract a `C` StrKey. The native operations map to
-`transfer` (SEP-41 transfer), `deposit` (SEP-56 deposit), `swap` (router swap) and `redeem`
-(SEP-56 redeem). `operations` returns the request's op
+The op names are the general operations of `AllowitOperation`: `transfer`, `swap`, `deposit`
+and `redeem`, plus three custom-call forms. `custom` admits any custom call, `custom.<function>`
+that function on any contract, and `custom:<contract>.<function>` that function on that contract
+instance. A function is 1 to 32 ASCII letters, digits or underscores, and a contract a `C` StrKey.
+A custom call whose contract and function form no such name is admitted by no entry, not even
+`*`. The policy core names no rail operation. The Stellar wallet maps its native calls onto the
+general operations: a SEP-41 transfer is `transfer`, a SEP-56 deposit `deposit`, a router swap
+`swap` and a SEP-56 redeem `redeem`. `operations` returns the request's op
 name, so a policy can `match` it; an op outside the list is `OperationNotAllowed`. Any other value,
 such as `Str` `transfer` or an unknown name, is `InvalidParam`. Even transfers need the param: a
 policy that should only swap or run custom code leaves `transfer` out.
@@ -574,8 +576,9 @@ calls it; offchain evaluation uses `allowit` directly. It remains the engine par
 checker for onchain callers that cannot bundle `allowit`. Its tests match `AllowitRule` exhaustively, so a
 new rule fails to compile until the engine exposes it. The `test-deny` fixture aborts every rule
 with contract error `TEST_DENY` (1000), outside `allowit::AllowitError`. `engine_version` 4 marks this ABI:
-its `AllowitRequest` carries `token_in`, `amount_in`, `token_out` and `min_out`, which release 3
-lacked. It replaces the shipped release 1 ABI, whose methods take `(request: EngineRequest, state:
+its `AllowitRequest` names the general operations `transfer`, `swap`, `deposit`, `redeem` and
+`custom(contract, function)`, and carries `token_in`, `amount_in`, `token_out` and `min_out`.
+Release 3 named Stellar operations and lacked those facts. It replaces the shipped release 1 ABI, whose methods take `(request: EngineRequest, state:
 EngineState)`. Release 2 was never released. An `upgrade_engine` from a deployed release 1 or 3
 engine to release 4 breaks every onchain caller of the earlier methods, so migrate or retire those
 callers first.

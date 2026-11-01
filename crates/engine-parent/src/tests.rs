@@ -67,7 +67,7 @@ fn context(env: &Env) -> AllowitContext {
         )),
         state: soroban_sdk::Map::new(env),
         request: AllowitRequest {
-            operation: AllowitOperation::sep41_transfer,
+            operation: AllowitOperation::transfer,
             asset: asset.clone(),
             recipient: Address::generate(env),
             amount: 1,

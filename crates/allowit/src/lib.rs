@@ -66,8 +66,9 @@
 //! with `overflow-checks = true`, as the contract release profile does, so that integer overflow
 //! in authored code panics and denies on both backends instead of wrapping on the host.
 //!
-//! Crate boundary: `core.rs` with the host backend becomes `sdk/core`; the Soroban backend with
-//! the policy wallet crates becomes `stellar/core`.
+//! Crate boundary: `core.rs` with the host backend becomes `sdk/core`; the Soroban backend moves
+//! with the policy wallet crates. `core.rs` names only general operations: each rail maps its
+//! native operations onto `AllowitOperation`.
 //!
 //! ```
 //! use allowit::prelude::*;
@@ -89,11 +90,11 @@
 //! ```
 //!
 //! A policy never re-enters the wallet. `reentry_transfer` exists only on rails that implement
-//! it; Stellar has none, so a policy that calls it does not compile:
+//! it; neither backend here has it, so a policy that calls it does not compile:
 //!
 //! ```compile_fail,E0425
 //! use allowit::prelude::*;
-//! /// A policy that re-enters the wallet does not build on Stellar.
+//! /// A policy that re-enters the wallet does not build onchain.
 //! pub fn execute(ctx: &AllowitContext) -> allowit::Result {
 //!     allowit::reentry_transfer(ctx, 1)?;
 //!     Ok(())
@@ -181,6 +182,11 @@ pub mod soroban {
         let bytes = buf.get_mut(..text.len() as usize)?;
         text.copy_into_slice(bytes);
         Some(bytes)
+    }
+
+    /// The text of an address: its StrKey.
+    fn address_text(address: &Address) -> String {
+        address.to_string()
     }
 
     /// Abort the whole contract call with contract error `error`. Every write of the call rolls back.
@@ -271,7 +277,7 @@ pub mod host {
     pub use alloc::{string::String, vec::Vec};
     use std::sync::{Arc, Mutex, MutexGuard};
 
-    /// Exact Stellar account or contract identity, held as its StrKey text. It compares only for
+    /// Exact account or contract identity, held as its StrKey text. It compares only for
     /// equality. Soroban orders addresses by `ScAddress`, so accounts sort before contracts, while
     /// text would sort by StrKey; `Address` therefore has no order on the host, and authored code
     /// that orders addresses fails the std-only compile.
@@ -397,6 +403,11 @@ pub mod host {
     /// The bytes of a text value, or `None` beyond `MAX_TEXT` bytes.
     fn text_bytes<'a>(text: &'a String, _buf: &'a mut [u8; MAX_TEXT as usize]) -> Option<&'a [u8]> {
         (text.len() <= MAX_TEXT as usize).then_some(text.as_bytes())
+    }
+
+    /// The text of an address: its StrKey.
+    fn address_text(address: &Address) -> String {
+        String::from(address.as_str())
     }
 
     /// Record `error` for `evaluate` and panic with a message that names it and `key`.

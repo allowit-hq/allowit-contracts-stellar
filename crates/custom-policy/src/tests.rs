@@ -37,7 +37,7 @@ fn custom_runner_maps_the_policy_result() {
         params: AllowitParams(Map::new(&env)),
         state,
         request: AllowitRequest {
-            operation: AllowitOperation::sep41_transfer,
+            operation: AllowitOperation::transfer,
             asset: asset.clone(),
             recipient: recipient.clone(),
             amount: 10,

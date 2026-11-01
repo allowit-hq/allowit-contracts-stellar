@@ -88,7 +88,7 @@ ERRORS = ("MissingParam", "TransactionCapExceeded", "SpentCapExceeded", "DaySpen
           "CallCapExceeded", "RecipientNotAllowed", "TokenNotAllowed", "Expired", "Unpriced", "InvalidParam",
           "InvalidState", "Overflow", "Unsupported", "OperationNotAllowed", "Panicked")
 VALUES = ("Int", "Bool", "Str", "Addr", "List")
-ENUMS = {"AllowitOperation": ("sep41_transfer", "sep56_deposit", "router_swap_exact_in", "sep56_redeem"), "AllowitError": ERRORS, "AllowitRule": PARAM_KEYS,
+ENUMS = {"AllowitOperation": ("transfer", "swap", "deposit", "redeem"), "AllowitError": ERRORS, "AllowitRule": PARAM_KEYS,
          "AllowitValue": VALUES}
 # Server-only enrichment: allowed offchain; a Custom contract that calls one does not compile. Each
 # takes a request struct whose fields `STRUCT_FIELDS` lists.

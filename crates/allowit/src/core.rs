@@ -1,8 +1,9 @@
 // Shared types and rules, included once per backend. The including module supplies `Address`,
 // `AllowitEnv`, `Map`, `String`, `Symbol` and `Vec`, the type macros `value!`, `error!` and
 // `params!`, the map primitives `lookup`, `insert`, `count`, `text_len`, `text_bytes`,
-// `each_value`, `each_item`, `record`, `take_writes` and `merge`, and the panic primitives `fail`
-// and `guarded`. Field types keep those names so Soroban contract specs name native types.
+// `each_value`, `each_item`, `address_text`, `record`, `take_writes` and `merge`, and the panic
+// primitives `fail` and `guarded`. Field types keep those names so contract specs name the
+// backend's native types.
 
 /// UTC day length in seconds.
 pub const DAY: u64 = 86_400;
@@ -27,7 +28,7 @@ mod types {
             Bool(bool),
             /// Text of at most `MAX_TEXT` bytes.
             Str(String),
-            /// Exact Stellar account or contract.
+            /// Exact account or contract.
             Addr(Address),
             /// Ordered values, such as the addresses of an allowlist.
             List(Vec<AllowitValue>),
@@ -42,18 +43,21 @@ mod types {
     }
 
     value! {
-        /// Kernel-selected native operation. Variants keep the canonical `stellar::<name>` names.
-        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        /// Kernel-selected operation. Each rail maps its native operations onto these variants,
+        /// whose names are the op names of `operations`.
+        #[derive(Clone, Debug, Eq, PartialEq)]
         pub enum AllowitOperation {
-            /// SEP-41 token transfer to a recipient.
-            sep41_transfer,
-            /// SEP-56 deposit into a vault, which is the recipient.
-            sep56_deposit,
-            /// Exact-input swap through a router, which is the recipient. One path endpoint is the
-            /// asset: a forward swap pays it, a reverse swap receives it.
-            router_swap_exact_in,
-            /// SEP-56 redeem of vault shares for the asset. The vault is the recipient.
-            sep56_redeem,
+            /// Token transfer to a recipient.
+            transfer,
+            /// Exact-input swap through an exchange, which is the recipient. One end of the swap is
+            /// the asset: a forward swap pays it, a reverse swap receives it.
+            swap,
+            /// Deposit of the asset into a vault, which is the recipient.
+            deposit,
+            /// Redeem of vault shares for the asset. The vault is the recipient.
+            redeem,
+            /// Call of a function, the text, on a contract, which is the recipient.
+            custom(Address, String),
         }
     }
 
@@ -61,23 +65,23 @@ mod types {
         /// Authenticated request facts read by rules, and the agent's execution params.
         #[derive(Clone, Debug, Eq, PartialEq)]
         pub struct AllowitRequest {
-            /// Kernel-selected native operation.
+            /// Kernel-selected operation.
             pub operation: AllowitOperation,
             /// Immutable underlying asset contract.
             pub asset: Address,
-            /// Exact destination: the payment recipient, the deposit or redeem vault, or the swap
-            /// router.
+            /// Exact destination: the payment recipient, the deposit or redeem vault, the swap
+            /// exchange or the custom call's contract.
             pub recipient: Address,
             /// Positive gross amount in asset units: the transfer or deposit debit, the forward
             /// swap input, or the minimum asset output of a reverse swap or redeem.
             pub amount: i128,
-            /// Token that leaves the wallet: the asset, the reverse swap's first path token or the
+            /// Token that leaves the wallet: the asset, the token that a reverse swap pays or the
             /// redeemed vault shares.
             pub token_in: Address,
             /// Exact units of `token_in` that leave the wallet.
             pub amount_in: i128,
-            /// Token that the wallet receives back: the deposit vault's shares, the swap's last
-            /// path token or, for a redeem, the asset. `None` for a transfer.
+            /// Token that the wallet receives back: the deposit vault's shares, the token that a
+            /// swap buys or, for a redeem, the asset. `None` for a transfer.
             pub token_out: Option<Address>,
             /// Minimum units of `token_out` that the operation signs for; zero for a transfer.
             pub min_out: i128,
@@ -550,14 +554,43 @@ fn allowed(value: Option<AllowitValue>, wanted: &Address, denied: AllowitError) 
 /// `custom:<contract>.<function>`.
 const OPERATION_NAMES: [&[u8]; 5] = [b"transfer", b"swap", b"deposit", b"redeem", b"custom"];
 
-/// The op name of the request's native operation.
+/// The op name of the request's operation.
 fn operation_name(request: &AllowitRequest) -> &'static str {
-    match request.operation {
-        AllowitOperation::sep41_transfer => "transfer",
-        AllowitOperation::sep56_deposit => "deposit",
-        AllowitOperation::router_swap_exact_in => "swap",
-        AllowitOperation::sep56_redeem => "redeem",
+    match &request.operation {
+        AllowitOperation::transfer => "transfer",
+        AllowitOperation::swap => "swap",
+        AllowitOperation::deposit => "deposit",
+        AllowitOperation::redeem => "redeem",
+        AllowitOperation::custom(..) => "custom",
     }
+}
+
+/// Run `seen` on the name that `operations` entries match: the op name, or
+/// `custom:<contract>.<function>` for a custom call. `None` is a custom call that this grammar
+/// cannot name, which no entry admits.
+fn operation_match<T>(request: &AllowitRequest, seen: impl FnOnce(Option<&[u8]>) -> T) -> T {
+    let AllowitOperation::custom(contract, function) = &request.operation else {
+        return seen(Some(operation_name(request).as_bytes()));
+    };
+    let contract = address_text(contract);
+    let (mut contract_buf, mut function_buf) = ([0; MAX_TEXT as usize], [0; MAX_TEXT as usize]);
+    let mut name = [0; MAX_TEXT as usize];
+    let mut len = 0;
+    let parts = text_bytes(&contract, &mut contract_buf)
+        .zip(text_bytes(function, &mut function_buf))
+        .map(|(contract, function)| [b"custom:".as_slice(), contract, b".", function]);
+    let fits = parts.is_some_and(|parts| {
+        parts.iter().all(|part| {
+            let end = len + part.len();
+            let fits = end <= name.len();
+            if fits {
+                name[len..end].copy_from_slice(part);
+                len = end;
+            }
+            fits
+        })
+    });
+    seen(Some(&name[..len]).filter(|name| fits && op_name_ok(name)))
 }
 
 /// Whether `name` is an op name: one of `OPERATION_NAMES`, `custom.<function>` or
@@ -744,8 +777,8 @@ pub fn call_cap(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<u64
     Ok(cap - next)
 }
 
-/// Require an exact permitted destination. Deposits and redeems name their vault, and swaps their
-/// router, as the recipient.
+/// Require an exact permitted destination. Deposits and redeems name their vault, swaps their
+/// exchange and custom calls their contract as the recipient.
 ///
 /// Returns the matched `request.recipient`. An empty list denies.
 pub fn recipients(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<Address> {
@@ -753,14 +786,14 @@ pub fn recipients(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<A
     allowed(value, &ctx.request.recipient, e)
 }
 
-/// Require an exact permitted underlying asset contract and, for a swap, its other path endpoint:
-/// the token that a forward swap buys or a reverse swap sells.
+/// Require an exact permitted underlying asset contract and, for a swap, its other token: the
+/// token that a forward swap buys or a reverse swap sells.
 ///
 /// Returns the matched `request.asset`. An empty list denies.
 pub fn tokens(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<Address> {
     let r = &ctx.request;
     let e = AllowitError::TokenNotAllowed;
-    if r.operation == AllowitOperation::router_swap_exact_in {
+    if r.operation == AllowitOperation::swap {
         let other = match &r.token_out {
             Some(out) if r.token_in == r.asset => out.clone(),
             _ => r.token_in.clone(),
@@ -786,14 +819,19 @@ pub fn expiry(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<u64> 
 /// Require the request's operation in the `operations` value in `value`. `Str` `*` admits every
 /// op. A `List` of `Str` op names admits `transfer`, `swap`, `deposit` or `redeem` by name,
 /// `custom` any custom call, `custom.<function>` that function on any contract and
-/// `custom:<contract>.<function>` that function on that contract. An empty list denies.
+/// `custom:<contract>.<function>` that function on that contract. An empty list denies. No entry
+/// admits a custom call whose contract and function do not form such a name.
 ///
-/// Returns the request's op name for a `match`: `"transfer"` for a SEP-41 transfer, `"deposit"`
-/// for a SEP-56 deposit, `"swap"` for a router swap and `"redeem"` for a SEP-56 redeem.
+/// Returns the request's op name for a `match`: `"transfer"`, `"swap"`, `"deposit"`, `"redeem"`
+/// or `"custom"`.
 pub fn operations(ctx: &AllowitContext, value: Option<AllowitValue>) -> Result<&str> {
-    let op = operation_name(&ctx.request);
     let mut found = false;
-    each_op(value, |entry| found |= admits(entry, op.as_bytes()))?;
+    operation_match(&ctx.request, |op| {
+        each_op(value, |entry| {
+            found |= op.is_some_and(|op| admits(entry, op));
+        })
+    })?;
+    let op = operation_name(&ctx.request);
     if found {
         Ok(op)
     } else {

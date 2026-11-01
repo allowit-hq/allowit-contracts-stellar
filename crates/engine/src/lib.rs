@@ -10,8 +10,9 @@ pub struct AllowitEngine;
 /// Engine executable release, independent of parent administration. Version 4 takes the context
 /// fields `params` (the owner's key => value params), `state` (the free-form current policy state)
 /// and `request` as separate arguments, because the context carries the contract `Env`; its
-/// `AllowitRequest` carries the swap and redeem facts `token_in`, `amount_in`, `token_out` and
-/// `min_out`. Version 3 took the same arguments with a request without them. It replaces the
+/// `AllowitRequest` names general operations and carries the swap and redeem facts `token_in`,
+/// `amount_in`, `token_out` and `min_out`. Version 3 took the same arguments with a request that
+/// named Stellar operations and lacked those facts. It replaces the
 /// release 1 ABI, `(request: EngineRequest, state: EngineState)`; release 2 was never released.
 const ENGINE_VERSION: u32 = 4;
 /// Contract error code of the test fixture veto. It is outside `allowit::AllowitError`.

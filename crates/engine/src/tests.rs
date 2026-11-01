@@ -29,7 +29,7 @@ fn fixture(env: &Env) -> AllowitContext {
         params: AllowitParams(Map::new(env)),
         state,
         request: AllowitRequest {
-            operation: AllowitOperation::sep41_transfer,
+            operation: AllowitOperation::transfer,
             asset: asset.clone(),
             recipient: recipient.clone(),
             amount: 40,

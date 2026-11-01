@@ -471,7 +471,7 @@ class ContractAdmin(unittest.TestCase):
             ("    // limits\n" + call("call_cap") + "    /* then */ " + call("call_cap"), ["call_cap", "call_cap"]),
             # Any other statement ends the prefix.
             ("    let left = allowit::spent_cap(ctx, ctx.params.get(allowit::SPENT_CAP))?;\n" + call("expiry"), []),
-            (call("expiry") + "    if ctx.request.operation == AllowitOperation::sep56_deposit {\n" + call("spent_cap") + "    }\n", ["expiry"]),
+            (call("expiry") + "    if ctx.request.operation == AllowitOperation::deposit {\n" + call("spent_cap") + "    }\n", ["expiry"]),
             (call("expiry") + "    allowit::spent_cap(ctx, ctx.params.get(allowit::SPENT_CAP));\n" + call("tokens"), ["expiry"]),
         ]
         for body, expected in vectors:
@@ -1093,7 +1093,7 @@ class ContractAdmin(unittest.TestCase):
         allowed = ("    let n: u64 = ctx.request.now | 1u64;\n    let mut m = n;\n    m |= 2u64;\n"
                    "    let ok = n > 0u64 || m > 0u64;\n"
                    "    match ctx.request.operation {\n"
-                   "        AllowitOperation::sep41_transfer | AllowitOperation::sep56_deposit if ok => {}\n"
+                   "        AllowitOperation::transfer | AllowitOperation::deposit if ok => {}\n"
                    "        other => {\n            let _ = other;\n        }\n    }\n"
                    "    for k in 0u64..n.min(2u64) {\n        if let Some(v) = k.checked_add(m) {\n"
                    "            let _ = Some(v);\n        }\n    }\n")
