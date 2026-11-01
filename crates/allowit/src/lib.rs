@@ -184,16 +184,6 @@ pub mod soroban {
         Some(bytes)
     }
 
-    /// Whether `text` is the text of a contract address: a 56-character base32 StrKey that starts
-    /// with `C`.
-    fn contract_text_ok(text: &[u8]) -> bool {
-        text.len() == 56
-            && text[0] == b'C'
-            && text
-                .iter()
-                .all(|b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(b))
-    }
-
     /// The text of an address: its StrKey.
     fn address_text(address: &Address) -> String {
         address.to_string()
@@ -414,12 +404,6 @@ pub mod host {
     /// The bytes of a text value, or `None` beyond `MAX_TEXT` bytes.
     fn text_bytes<'a>(text: &'a String, _buf: &'a mut [u8; MAX_TEXT as usize]) -> Option<&'a [u8]> {
         (text.len() <= MAX_TEXT as usize).then_some(text.as_bytes())
-    }
-
-    /// Whether `text` can be the text of a contract address: 1 or more ASCII letters or digits.
-    /// The rail that builds each `Address` checks its own address format.
-    fn contract_text_ok(text: &[u8]) -> bool {
-        !text.is_empty() && text.iter().all(u8::is_ascii_alphanumeric)
     }
 
     /// The text of an address, as its rail supplied it.

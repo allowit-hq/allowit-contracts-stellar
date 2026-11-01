@@ -306,9 +306,11 @@ fn operations_admit_named_ops_star_and_custom_forms() {
     ] {
         assert!(op_name_ok(name.as_bytes()), "{name}");
     }
+    // The contract text is rail-neutral: any ASCII letters or digits, as on the host backend.
+    for name in ["custom:pool.claim", "custom:c1.swap"] {
+        assert!(op_name_ok(name.as_bytes()), "{name}");
+    }
     let long = std::format!("custom.{}", "f".repeat(33));
-    let lower = custom.replacen("custom:C", "custom:c", 1);
-    let short = std::format!("{}.swap", &pool[..pool.len() - 1]);
     for name in [
         "",
         "*",
@@ -316,10 +318,12 @@ fn operations_admit_named_ops_star_and_custom_forms() {
         "Transfer",
         "custom.",
         "custom:",
+        "custom:.swap",
+        "custom:po-ol.swap",
+        "custom:po_ol.swap",
+        "custom:pool.",
         "custom.a-b",
         &long,
-        &lower,
-        &short,
     ] {
         assert!(!op_name_ok(name.as_bytes()), "{name}");
     }
@@ -784,7 +788,8 @@ fn params_args_and_state_stay_within_their_byte_budgets() {
     standard.set(Symbol::new(&env, TOKENS), full);
     assert_eq!(standard.len(), 9);
     assert_eq!(check_params(&standard, AllowitTier::Standard), Ok(()));
-    // Beside full allowlists, 28 `operations` entries of the longest form fit and 29 do not.
+    // Beside full allowlists, 28 `operations` entries that name a Stellar contract's longest
+    // function fit and 29 do not.
     let longest = std::format!("custom:C{}.{}", "A".repeat(55), "f".repeat(32));
     for (n, fits) in [(28, Ok(())), (29, invalid)] {
         let names = std::vec![longest.as_str(); n];

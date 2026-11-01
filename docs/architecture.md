@@ -155,8 +155,8 @@ compiles:
   forbidden, so a source `#[allow]`, `#[expect]` or `#[warn]` on it also fails. A path into `soroban_sdk`, a wallet crate or any other crate fails there. So does a call to a
   Soroban `Env` or `Address` method, also through an alias such as `let e = &ctx.env;`, an
   address comparison with `<`, `min`, `max`, `sort` or `binary_search`, and a `std` prelude item
-  such as `vec!`. On the host, `Address` is a StrKey newtype that compares only for equality:
-  Soroban orders addresses by `ScAddress`, so accounts sort before contracts, while text would
+  such as `vec!`. On the host, `Address` holds the text that its rail supplies, a StrKey on Stellar,
+  and compares only for equality: Soroban orders addresses by `ScAddress`, so accounts sort before contracts, while text would
   sort by StrKey. `scripts/policy_source.py` runs this compile in `check-policy-bindings.py`, and
   so in `scripts/build-contracts.sh`, and in `scripts/contract_admin.py` for the owner packets of
   every tier. These tools need `rustc` (from `RUSTC` or `PATH`). The portability test below and the
@@ -191,7 +191,7 @@ wallets.
 
 `allowit` has two backends that share one rule implementation. Feature `soroban` (default) uses
 Soroban `Address`, `Vec`, `Map`, `Env` and contract types. Feature `std` uses heap strings, maps
-and vectors for the host evaluator; addresses are unordered StrKey newtypes and the environment is
+and vectors for the host evaluator; addresses are unordered rail-supplied texts and the environment is
 a host `AllowitEnv`, which buffers the policy's state writes. The selected backend backs the crate root that authored policy names. The offchain
 server depends on `allowit = { default-features = false, features = ["std"] }` and builds with
 `overflow-checks = true`. Enabling both backends is a compile error, so a server cannot silently
@@ -379,11 +379,10 @@ rejects negative caps.
 The op names are the general operations of `AllowitOperation`: `transfer`, `swap`, `deposit`
 and `redeem`, plus three custom-call forms. `custom` admits any custom call, `custom.<function>`
 that function on any contract, and `custom:<contract>.<function>` that function on that contract
-instance. A function is 1 to 32 ASCII letters, digits or underscores. Each backend supplies the
-contract text check. The Soroban backend accepts only a `C` StrKey. The rail-neutral host backend
-accepts 1 or more ASCII letters or digits, because the rail checks each address it supplies; so an
-`operations` entry with a malformed Stellar contract is `InvalidParam` onchain but matches nothing on
-the host. `contract_admin.py` rejects such an entry before the owner sets it.
+instance. A function is 1 to 32 ASCII letters, digits or underscores. A contract is 1 or more
+ASCII letters or digits on both backends. The core does not check a rail's address format: the rail
+checks each address that it supplies, so an entry that names no address of the rail matches no
+request. For Stellar, `contract_admin.py` accepts only a `C` StrKey before the owner sets the entry.
 A custom call whose contract and function form no such name is admitted by no entry, not even
 `*`. The policy core names no rail operation. The Stellar wallet maps its native calls onto the
 general operations: a SEP-41 transfer is `transfer`, a SEP-56 deposit `deposit`, a router swap

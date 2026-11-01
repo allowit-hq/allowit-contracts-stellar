@@ -58,9 +58,9 @@ pub enum Op {
     Redeem,
 }
 
-/// An `operations` entry for one function of one contract: `custom:<contract>.<function>`.
-pub const POOL_CLAIM: &str =
-    "custom:CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.claim";
+/// An `operations` entry for one function of one contract: `custom:<contract>.<function>`. The
+/// contract text is rail-neutral, so both backends accept it.
+pub const POOL_CLAIM: &str = "custom:pool.claim";
 
 /// One rule input: params, current state before the operation, and request with its args.
 /// A `None` param is absent.
@@ -351,6 +351,9 @@ pub fn vectors() -> Vec<Vector> {
         }),
         edit("unknown_operation", |v| {
             v.operations = Some(Ops::List(vec!["transfer", "pay"]))
+        }),
+        edit("custom_contract_not_alphanumeric", |v| {
+            v.operations = Some(Ops::List(vec!["transfer", "custom:po-ol.claim"]))
         }),
         // A custom param alone changes nothing; an `invoice` arg applies the invoice cap.
         edit("invoice_cap_without_invoice", |v| v.invoice_cap = Some(39)),

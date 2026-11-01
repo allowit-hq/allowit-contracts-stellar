@@ -1,8 +1,8 @@
 // Shared types and rules, included once per backend. The including module supplies `Address`,
 // `AllowitEnv`, `Map`, `String`, `Symbol` and `Vec`, the type macros `value!`, `error!` and
 // `params!`, the map primitives `lookup`, `insert`, `count`, `text_len`, `text_bytes`,
-// `each_value`, `each_item`, `address_text`, `contract_text_ok`, `record`, `take_writes` and
-// `merge`, and the panic primitives `fail` and `guarded`. Field types keep those names so contract
+// `each_value`, `each_item`, `address_text`, `record`, `take_writes` and `merge`, and the panic
+// primitives `fail` and `guarded`. Field types keep those names so contract
 // specs name the backend's native types.
 
 /// UTC day length in seconds.
@@ -407,6 +407,13 @@ fn symbol_ok(name: &[u8]) -> bool {
     (1..=32).contains(&name.len()) && name.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_')
 }
 
+/// Whether `text` can name a contract in an op name: 1 or more ASCII letters or digits. The rail
+/// that builds each `Address` checks its own address format, so a text that is no address of the
+/// rail matches no request.
+fn contract_text_ok(text: &[u8]) -> bool {
+    !text.is_empty() && text.iter().all(u8::is_ascii_alphanumeric)
+}
+
 /// The typed value of state `key`, or `None`. An invalid key is `InvalidParam`; a value of
 /// another type or range is `InvalidState`.
 pub(crate) fn read<V: TryFrom<AllowitValue>>(state: &AllowitMap, key: &str) -> Result<Option<V>> {
@@ -594,8 +601,8 @@ fn operation_match<T>(request: &AllowitRequest, seen: impl FnOnce(Option<&[u8]>)
 }
 
 /// Whether `name` is an op name: one of `OPERATION_NAMES`, `custom.<function>` or
-/// `custom:<contract>.<function>`, where a function is a key-like name and the backend's
-/// `contract_text_ok` accepts the contract text.
+/// `custom:<contract>.<function>`, where a function is a key-like name and `contract_text_ok`
+/// accepts the contract text.
 pub(crate) fn op_name_ok(name: &[u8]) -> bool {
     if let Some(function) = name.strip_prefix(b"custom.") {
         return symbol_ok(function);

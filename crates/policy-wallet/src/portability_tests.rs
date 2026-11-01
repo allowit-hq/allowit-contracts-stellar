@@ -356,11 +356,22 @@ fn sample_prefix() -> List<AllowitRule> {
 }
 
 /// Whether every tier's owner configuration admits an `operations` value: `*` or a list of op names.
+/// A custom contract is ASCII letters or digits; a function adds underscores and has 1 to 32 bytes.
 fn operations_valid(ops: &Ops) -> bool {
+    let function = |f: &str| {
+        (1..=32).contains(&f.len()) && f.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    };
     let name = |name: &&str| {
         ["transfer", "swap", "deposit", "redeem", "custom"].contains(name)
-            || name.starts_with("custom.")
-            || name.starts_with("custom:")
+            || name.strip_prefix("custom.").is_some_and(function)
+            || name
+                .strip_prefix("custom:")
+                .and_then(|call| call.rsplit_once('.'))
+                .is_some_and(|(contract, f)| {
+                    !contract.is_empty()
+                        && contract.bytes().all(|b| b.is_ascii_alphanumeric())
+                        && function(f)
+                })
     };
     match ops {
         Ops::Text(text) => *text == "*",

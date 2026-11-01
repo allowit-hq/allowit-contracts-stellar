@@ -154,8 +154,9 @@ def wallet_layout(state):
 
 CAPS = {"transaction_cap", "spent_cap", "day_spent_cap", "day_total_cap"}
 LISTS = {"recipients", "tokens"}
-# One `operations` entry, as the Soroban backend of `allowit` checks it: a plain op name, `custom.<function>` or
-# `custom:<contract>.<function>`.
+# One `operations` entry: a plain op name, `custom.<function>` or `custom:<contract>.<function>`. `allowit`
+# accepts any ASCII letters or digits as the contract; this Stellar tool also requires a `C` StrKey,
+# so that the entry can match a Stellar contract.
 OPERATION = re.compile(r"transfer|swap|deposit|redeem|custom|custom\.[A-Za-z0-9_]{1,32}|custom:C[A-Z2-7]{55}\.[A-Za-z0-9_]{1,32}")
 # Bounds that the wallet contract enforces: `allowit::MAX_PARAMS`, `MAX_ITEMS`, `MAX_TEXT` and
 # `MAX_PARAM_BYTES`. A value's encoded size counts `VALUE_BYTES` per value plus each text padded to
