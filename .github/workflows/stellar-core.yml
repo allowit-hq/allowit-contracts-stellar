@@ -1,0 +1,83 @@
+name: Stellar core
+on:
+  push:
+    branches: [main]
+    paths:
+      - "stellar/core/**"
+      - "crates/allowit/**"
+      - "crates/protocol/**"
+      - "crates/policy-wallet/**"
+      - "crates/custom-policy/policy/**"
+      - "scripts/policy_source.py"
+      - "scripts/contract_admin.py"
+      - "scripts/build-contracts.sh"
+      - ".github/workflows/stellar-core.yml"
+  pull_request:
+    paths:
+      - "stellar/core/**"
+      - "crates/allowit/**"
+      - "crates/protocol/**"
+      - "crates/policy-wallet/**"
+      - "crates/custom-policy/policy/**"
+      - "scripts/policy_source.py"
+      - "scripts/contract_admin.py"
+      - "scripts/build-contracts.sh"
+      - ".github/workflows/stellar-core.yml"
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: stellar-core-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  stellar-core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: stellar/core -> target
+      - run: cargo fmt --manifest-path stellar/core/Cargo.toml --check
+      - run: cargo test --locked --manifest-path stellar/core/Cargo.toml
+      - run: cargo clippy --locked --manifest-path stellar/core/Cargo.toml --all-targets -- -D warnings
+  vectors:
+    # The stellar/core suite compares only the step shape of the recorded policy wallet
+    # vectors. Regenerate them from the release Wasm, require the committed file to match,
+    # then replay the committed bytes in the contract crate.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: stellar-core-vectors
+          workspaces: |
+            . -> target
+            stellar/core -> target
+      - name: Install pinned Stellar CLI
+        run: |
+          curl -fsSL https://github.com/stellar/stellar-cli/releases/download/v28.1.0/stellar-cli-28.1.0-x86_64-unknown-linux-gnu.tar.gz -o /tmp/stellar.tar.gz
+          echo 'c1680deee94301d33ada7a17f98411e642a4248c727afbd2e43050d345746462  /tmp/stellar.tar.gz' | sha256sum -c -
+          mkdir /tmp/stellar-cli
+          tar -xzf /tmp/stellar.tar.gz -C /tmp/stellar-cli
+          echo /tmp/stellar-cli >> "$GITHUB_PATH"
+          rustup target add wasm32v1-none --toolchain 1.98.0
+      - name: Build all contract Wasm
+        run: scripts/build-contracts.sh
+      - name: Regenerate policy wallet vectors from the release Wasm
+        run: |
+          ALLOWIT_UPDATE_VECTORS=1 cargo test --locked --manifest-path stellar/core/Cargo.toml --test policy_wallet
+          git diff --exit-code stellar/core/tests/fixtures/policy-wallet-vectors.txt
+      - name: Replay the committed vectors on the wallet Wasm
+        run: cargo test --locked -p allowit-policy-wallet core_vectors

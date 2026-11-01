@@ -1603,3 +1603,6 @@ mod portability_tests;
 
 #[cfg(test)]
 mod swap_redeem_tests;
+
+#[cfg(test)]
+mod core_vectors_tests;

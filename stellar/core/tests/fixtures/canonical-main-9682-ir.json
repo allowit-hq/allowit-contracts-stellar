@@ -1,0 +1,26 @@
+{
+  "version": "1.0.0",
+  "statements": [
+    {
+      "kind": "expression",
+      "value": {
+        "kind": "call",
+        "name": "Ok",
+        "args": [
+          {
+            "kind": "unit"
+          }
+        ],
+        "span": {
+          "start": 80,
+          "end": 82
+        }
+      },
+      "semicolon": false,
+      "span": {
+        "start": 80,
+        "end": 86
+      }
+    }
+  ]
+}
