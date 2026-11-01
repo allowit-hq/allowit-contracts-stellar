@@ -609,13 +609,31 @@ impl DeployPolicy for OwnerAdmin<'_> {
     type Artifact = PolicyDeployment;
     type Output = PreparedOwnerOperation;
     type Error = String;
-    /// Prepare a complete owner update at the next version without a code change. The packet
-    /// must keep the installed tier binding: a Common prefix digest of the installed code, or the
-    /// Custom source digest. Use `deploy_code` to install new code.
+    /// Prepare a complete owner update at the next version without a code change, bound to the
+    /// installed policy source. Use `deploy_policy_source` to bind a new source, and
+    /// `deploy_code` to install new code.
     fn deploy_policy(
         &mut self,
         version: DeploymentVersion,
         artifact: PolicyDeployment,
+    ) -> Result<PreparedOwnerOperation> {
+        let source = self.config.policy_source.clone();
+        self.deploy_policy_source(version, artifact, &source)
+    }
+}
+impl OwnerAdmin<'_> {
+    /// Prepare a complete owner update at the next version without a code change, bound to the
+    /// target policy `source`, as `contract_admin.py` binds an owner packet to
+    /// `--policy-source`. The packet keeps the installed code: a Common packet carries the
+    /// standard prefix digest of the installed code over the target source's prefix, so a
+    /// rules-only Common update needs no new code. A Custom wallet binds its compiled source, so
+    /// its target source must be the installed source. `config` still describes the installed
+    /// binding, which the snapshot verifies on chain.
+    pub fn deploy_policy_source(
+        &mut self,
+        version: DeploymentVersion,
+        artifact: PolicyDeployment,
+        source: &str,
     ) -> Result<PreparedOwnerOperation> {
         if artifact.wasm_hash.is_some() {
             return Err("Use deploy_code with the Wasm bytes to install new code".into());
@@ -626,7 +644,7 @@ impl DeployPolicy for OwnerAdmin<'_> {
             &self.config.module_digest,
             &self.config.asset,
             &artifact.rules,
-            &self.config.policy_source,
+            source,
         )?;
         if artifact.source_digest != digest
             || (tier != PolicyTier::Common && !artifact.rules.is_empty())
@@ -635,11 +653,16 @@ impl DeployPolicy for OwnerAdmin<'_> {
                 "Deployment rules and source digest differ from the installed tier binding".into(),
             );
         }
-        // `contract_admin.py` binds every owner packet to its authored source: the Common rules
-        // are the standard prefix of the installed source, and standard tiers write no state.
+        if tier == PolicyTier::Custom && digest != self.config.source_digest {
+            return Err(
+                "A Custom wallet binds its compiled source; new source needs new code".into(),
+            );
+        }
+        // The Common rules are the standard prefix of the target source, and standard tiers
+        // write no state.
         let check = policy::policy_rules(
             tier,
-            &self.config.policy_source,
+            source,
             &artifact.rules,
             &artifact.source_digest,
             &artifact.params,

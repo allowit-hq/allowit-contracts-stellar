@@ -3095,6 +3095,68 @@ fn policy_wallet_rpc_revalidation_fixture_matches() {
 }
 
 #[test]
+fn policy_wallet_packets_omit_the_lower_bound_and_the_expiry_second() {
+    use stellar_xdr::{Limits, Preconditions, ReadXdr, TimeBounds, TimePoint, TransactionEnvelope};
+    fn bounds(xdr: &str) -> TimeBounds {
+        let TransactionEnvelope::Tx(envelope) =
+            TransactionEnvelope::from_xdr_base64(xdr, Limits::none()).unwrap()
+        else {
+            panic!()
+        };
+        let Preconditions::Time(bounds) = envelope.tx.cond else {
+            panic!()
+        };
+        bounds
+    }
+    // A new packet is valid before the next ledger closes and never lands in the expiry second,
+    // where the wallet rejects `expires_at <= now` after the fee is charged.
+    let rpc = preflight_fixture();
+    let prepared = rpc::prepare(&rpc, &rpc.base.config, &rpc.request, None, 86401, 86700).unwrap();
+    let prepared = server_ready(&prepared);
+    assert_eq!(
+        bounds(&prepared.transaction_xdr),
+        TimeBounds {
+            min_time: TimePoint(0),
+            max_time: TimePoint(86699),
+        }
+    );
+    let signed = authorize(
+        &prepared,
+        &[sign(&prepared, &[2; 32], 86402).unwrap()],
+        86402,
+    )
+    .unwrap();
+    validate_signed(&signed, 86402).unwrap();
+    // A packet with other bounds is a changed packet.
+    let mut changed = prepared.clone();
+    changed.expires_at = 86699;
+    assert!(validate_retained_prepared(&changed).is_err());
+
+    // A packet signed with the original bounds `[created_at, expires_at]` keeps its exact bytes
+    // for status, recovery and an unchanged resend, but it cannot be signed again.
+    let retained: Value = serde_json::from_str(include_str!(
+        "fixtures/stellar-policy-wallet-retained-bounds.json"
+    ))
+    .unwrap();
+    let old: PreparedOperation = serde_json::from_value(retained["prepared"].clone()).unwrap();
+    let old_signed: SignedOperation = serde_json::from_value(retained["signed"].clone()).unwrap();
+    assert_eq!(
+        bounds(&old.transaction_xdr),
+        TimeBounds {
+            min_time: TimePoint(86401),
+            max_time: TimePoint(86700),
+        }
+    );
+    validate_retained_prepared(&old).unwrap();
+    validate_retained_signed(&old_signed).unwrap();
+    validate_signed(&old_signed, 86402).unwrap();
+    let revalidated = rpc::revalidate_prepared(&preflight_fixture(), &old, 86402).unwrap();
+    assert_eq!(revalidated.transaction_xdr, old.transaction_xdr);
+    let error = sign(&revalidated, &[2; 32], 86402).unwrap_err();
+    assert!(error.contains("read-only"), "{error}");
+}
+
+#[test]
 fn direct_server_account_must_exist_and_authorize_its_current_threshold() {
     struct ServerRpc {
         base: PreflightRpc,
@@ -3587,6 +3649,63 @@ fn owner_deployment_binds_common_rules_to_the_installed_source_prefix() {
         .deploy_policy(DeploymentVersion(3), artifact)
         .unwrap_err();
     assert!(error.contains("standard prefix derived"), "{error}");
+}
+
+#[test]
+fn owner_deployment_binds_common_rules_to_a_target_source() {
+    use allowit_policy_sdk::admin::{DeployPolicy, DeploymentVersion};
+    use allowit_stellar_wallet::admin::{OwnerAdmin, PolicyDeployment};
+    // The installed Common wallet binds the prefix `recipients` of its source.
+    let mut rpc = admin_fixture(4, Some(stellar_xdr::ScVal::U32(4)));
+    let c = &mut rpc.base.config;
+    c.tier = Some(PolicyTier::Common);
+    c.rules = policy::tier_rules(PolicyTier::Common, &c.policy_source).unwrap();
+    assert_eq!(c.rules, ["recipients"]);
+    c.source_digest =
+        policy::standard_prefix_digest(PolicyTier::Common, &c.module_digest, &c.asset, &c.rules)
+            .unwrap();
+    validate_config(c).unwrap();
+    let c = rpc.base.config.clone();
+    let mut admin = OwnerAdmin {
+        rpc: &rpc,
+        config: &c,
+        now: 86401,
+    };
+    // A rules-only Common update: the target source adds `transaction_cap` to the prefix and
+    // keeps the installed code.
+    let (artifact, _) = PolicyDeployment::for_source(&c, CAPPED, c.params.clone(), false).unwrap();
+    assert_eq!(artifact.rules, ["recipients", "transaction_cap"]);
+    // The installed source does not bind the new prefix.
+    let error = admin
+        .deploy_policy(DeploymentVersion(3), artifact.clone())
+        .unwrap_err();
+    assert!(error.contains("standard prefix derived"), "{error}");
+    // Rules from another source do not bind the target source.
+    let error = admin
+        .deploy_policy_source(DeploymentVersion(3), artifact.clone(), PORTABLE)
+        .unwrap_err();
+    assert!(error.contains("standard prefix derived"), "{error}");
+    let prepared = admin
+        .deploy_policy_source(DeploymentVersion(3), artifact.clone(), CAPPED)
+        .unwrap();
+    assert_eq!(prepared.function, "deploy_policy");
+    // A Custom wallet binds its compiled source, so a new source needs new code.
+    let mut custom = c.clone();
+    custom.tier = Some(PolicyTier::Custom);
+    let mut admin = OwnerAdmin {
+        rpc: &rpc,
+        config: &custom,
+        now: 86401,
+    };
+    let artifact = PolicyDeployment {
+        source_digest: hash(CAPPED),
+        rules: Vec::new(),
+        ..artifact
+    };
+    let error = admin
+        .deploy_policy_source(DeploymentVersion(3), artifact, CAPPED)
+        .unwrap_err();
+    assert!(error.contains("new code"), "{error}");
 }
 
 #[test]
