@@ -508,8 +508,9 @@ pub mod host {
 
     /// The owner's params, read by key: `ctx.params[allowit::DESTINATIONS]`. The map stays
     /// private to this crate, so the std-only compile of authored policy rejects any read other
-    /// than indexing, `contains` and `param`. The server converts with `From`.
-    #[derive(Clone, Debug, Eq, PartialEq)]
+    /// than indexing, `contains` and `param`. The server converts with `From`. It derives only
+    /// `Clone`, as the Soroban type does, so the std-only compile also rejects comparison.
+    #[derive(Clone)]
     pub struct AllowitParams(pub(crate) AllowitMap);
 
     impl AllowitParams {

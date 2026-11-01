@@ -1062,11 +1062,15 @@ class ContractAdmin(unittest.TestCase):
         fn = "fn f(params: &AllowitContext) -> bool {{ {} }}\n".format
         with self.assertRaisesRegex(ValueError, "self-contained"):
             ca.standard_prefix(fn("params.request.args.contains(\"k\")") + source("", head))
-        # The map inside params or args is private on the host, through a clone or a binding too.
+        # The map inside params or args is private on the host, through a clone or a binding too,
+        # and params has no comparison on either backend.
         with tempfile.TemporaryDirectory() as directory:
             policy = Path(directory) / "policy.rs"
             for body in ("    for (_, v) in ctx.params.clone().0 {\n        let _ = v;\n    }\n",
-                         "    let p = ctx.request.args.clone();\n    for (_, w) in p.0 {\n        let _ = w;\n    }\n"):
+                         "    let p = ctx.request.args.clone();\n    for (_, w) in p.0 {\n        let _ = w;\n    }\n",
+                         # The Soroban params type has no `PartialEq`, so the host type has none.
+                         "    if ctx.params == ctx.params.clone() {\n        return Ok(());\n    }\n",
+                         "    assert!(ctx.params != ctx.params);\n"):
                 with self.subTest(body=body):
                     policy.write_text(source(body, head))
                     with self.assertRaisesRegex(ValueError, "std-only compile"):

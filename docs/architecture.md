@@ -139,7 +139,7 @@ Beside the allowlist, the tooling rejects:
   `.args`, and the file may not declare `params` or `args` as a binding or function name: on a
   list, `contains` is a Soroban method that the host list lacks. A struct expression or pattern
   of `AllowitContext`, which would reach `state`, and struct update syntax `..` reject. The host
-  list has no methods, and Soroban and heap strings have different methods with the same names,
+  list offers authored code no methods (the server reads it with `as_slice`), and Soroban and heap strings have different methods with the same names,
   for example `len` returns `u32` onchain and `usize` on the host, so a list from
   `AllowitValue::List`, and a `Vec` or `String` that `param` or `arg` returns, admits only
   comparison, `clone`, matching and `for`.
@@ -246,7 +246,7 @@ fixture.
 
 Portable authored code beyond canonical calls uses typed scalar fields, enum comparisons such as
 `ctx.request.operation == AllowitOperation::deposit`, matches on `AllowitValue`, and its own
-state keys. The host list has no methods and `String::len` returns `u32` onchain and `usize` on
+state keys. The host list offers authored code no methods and `String::len` returns `u32` onchain and `usize` on
 the host, so the tooling admits no list or text method.
 
 `AllowitContext` is the complete rule input. It is plain data without methods. The wallet or server
