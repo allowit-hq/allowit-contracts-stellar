@@ -582,13 +582,13 @@ pub(crate) fn map_field<'a>(value: &'a ScVal, name: &str) -> Result<&'a ScVal> {
         .ok_or_else(|| format!("Missing contract field {name}"))
 }
 /// The transfer receipt that `execute` returns for this exact packet: a deposit reports its
-/// underlying debit to the vault.
+/// underlying debit to the vault, and a redeem its share debit at the vault.
 pub fn expected_receipt(p: &PreparedOperation) -> Result<TransferReceipt> {
     let operation = operation_from_request(&p.config, &p.request)?;
     let (to, amount) = operation.debit();
     Ok(TransferReceipt {
         operation_id: p.request.operation.nonce,
-        token: p.config.asset.clone(),
+        token: operation.debit_token(&p.config.asset).into(),
         from: p.config.wallet.clone(),
         to: to.into(),
         amount,
@@ -994,11 +994,15 @@ fn historical_wallet_state(
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ExecutionReceipt {
-    /// The replay marker's transfer receipt: for a deposit, the underlying debit to the vault.
+    /// The replay marker's transfer receipt: for a deposit, the underlying debit to the vault;
+    /// for a redeem, the share debit at the vault.
     pub transfer: TransferReceipt,
     /// The settled share credit of a deposit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deposit: Option<DepositReceipt>,
+    /// The settled asset credit of a redeem.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redeem: Option<RedeemReceipt>,
 }
 fn persistent_entry(rpc: &dyn Rpc, key: &LedgerKey) -> Result<Option<ScVal>> {
     let encoded = xdr(key)?;
@@ -1049,15 +1053,21 @@ pub fn operation_receipt(
         return Ok(None);
     };
     let transfer = TransferReceipt::from_scval(&transfer)?;
-    if transfer.operation_id != *operation_id
-        || transfer.from != c.wallet
-        || transfer.token != c.asset
-    {
-        return Err("Receipt differs from the requested operation".into());
-    }
     let deposit = persistent_entry(rpc, &contract::deposit_key(&c.wallet, operation_id)?)?
         .map(|value| DepositReceipt::from_scval(&value))
         .transpose()?;
+    let redeem = persistent_entry(rpc, &contract::redeem_key(&c.wallet, operation_id)?)?
+        .map(|value| RedeemReceipt::from_scval(&value))
+        .transpose()?;
+    // A redeem debits the vault's shares; every other operation debits the asset.
+    let token = redeem.as_ref().map_or(&c.asset, |r| &r.vault);
+    if transfer.operation_id != *operation_id
+        || transfer.from != c.wallet
+        || transfer.token != *token
+        || (deposit.is_some() && redeem.is_some())
+    {
+        return Err("Receipt differs from the requested operation".into());
+    }
     if let Some(d) = &deposit
         && (d.operation_id != *operation_id
             || d.vault != transfer.to
@@ -1066,7 +1076,19 @@ pub fn operation_receipt(
     {
         return Err("Deposit receipt differs from its transfer receipt".into());
     }
-    Ok(Some(ExecutionReceipt { transfer, deposit }))
+    if let Some(r) = &redeem
+        && (r.operation_id != *operation_id
+            || r.vault != transfer.to
+            || r.shares != transfer.amount
+            || r.nonce != transfer.nonce)
+    {
+        return Err("Redeem receipt differs from its transfer receipt".into());
+    }
+    Ok(Some(ExecutionReceipt {
+        transfer,
+        deposit,
+        redeem,
+    }))
 }
 
 /// Bounded polling of a submitted transaction.

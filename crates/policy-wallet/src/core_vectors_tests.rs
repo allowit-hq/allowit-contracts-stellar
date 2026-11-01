@@ -2,8 +2,8 @@
 //! Simple, Common and Custom wallet Wasm.
 //!
 //! `stellar/core/tests/policy_wallet.rs` runs each tier's complete workflow (create, transfer,
-//! SEP-56 deposit, pause, resume, params update, transfer and recovery) and records every
-//! transaction, the host result it expects and the wallet State it computes after it. Here each
+//! SEP-56 deposit and redeem, pause, resume, params update, transfer and recovery) and records
+//! every transaction, the host result it expects and the wallet State it computes after it. Here each
 //! recorded host function runs with its exact recorded authorization entries and transaction
 //! source: the service entry carries its real Ed25519 account signature, and the agent and owner
 //! authorize as the source account. The host result and the stored State must equal the
@@ -136,6 +136,7 @@ fn simple_wallet_executes_the_signer_workflow() {
             "create",
             "transfer",
             "deposit",
+            "redeem",
             "pause",
             "resume",
             "params",
@@ -153,6 +154,7 @@ fn common_wallet_executes_the_signer_workflow() {
             "create",
             "transfer",
             "deposit",
+            "redeem",
             "pause",
             "resume",
             "params",

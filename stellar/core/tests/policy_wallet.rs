@@ -1,6 +1,6 @@
 //! End-to-end policy wallet workflows of all three tiers through the public API, against a
-//! model Stellar RPC: upload, create, discover, transfer, deposit, receipts, pause, params
-//! update and recovery. The run records `fixtures/policy-wallet-vectors.txt`, which
+//! model Stellar RPC: upload, create, discover, transfer, deposit, redeem, receipts, pause,
+//! params update and recovery. The run records `fixtures/policy-wallet-vectors.txt`, which
 //! `crates/policy-wallet/src/core_vectors_tests.rs` executes on the Soroban host with the real
 //! wallet Wasm.
 //!
@@ -46,21 +46,6 @@ fn de<T: ReadXdr>(v: &str) -> T {
 fn hexs(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
-fn wf(value: &str) -> AccountId {
-    match address(value).unwrap() {
-        x::ScAddress::Account(x::AccountId(x::PublicKey::PublicKeyTypeEd25519(k))) => AccountId {
-            chain: Chain::Stellar,
-            kind: AccountKind::Wallet,
-            address: k.0,
-        },
-        x::ScAddress::Contract(id) => AccountId {
-            chain: Chain::Stellar,
-            kind: AccountKind::Contract,
-            address: id.0.0,
-        },
-        _ => panic!(),
-    }
-}
 fn field<'a>(v: &'a x::ScVal, name: &str) -> &'a x::ScVal {
     let x::ScVal::Map(Some(m)) = v else { panic!() };
     &m.iter()
@@ -90,7 +75,8 @@ struct Wallet {
     state: CustodyState,
     balance: i128,
     shares: i128,
-    receipts: BTreeMap<[u8; 32], (x::ScVal, Option<x::ScVal>)>,
+    /// Stored receipts by ledger key variant (`Operation`, `Deposit` or `Redeem`) and operation.
+    receipts: BTreeMap<(String, [u8; 32]), x::ScVal>,
 }
 #[derive(Default)]
 struct Model {
@@ -248,13 +234,11 @@ impl rpc::Rpc for ModelChain {
                                 return None;
                             };
                             let id = digest(&parts[1]);
-                            let (transfer, deposit) = w.receipts.get(&id)?;
-                            match &parts[0] {
-                                x::ScVal::Symbol(s) if s.0.as_slice() == b"Operation" => {
-                                    transfer.clone()
-                                }
-                                _ => deposit.clone()?,
-                            }
+                            let x::ScVal::Symbol(variant) = &parts[0] else {
+                                return None;
+                            };
+                            let variant = String::from_utf8(variant.0.to_vec()).ok()?;
+                            w.receipts.get(&(variant, id))?.clone()
                         };
                         Some(x::LedgerEntryData::ContractData(x::ContractDataEntry {
                             ext: x::ExtensionPoint::V0,
@@ -473,10 +457,20 @@ impl rpc::Rpc for ModelChain {
 }
 /// The receipt `execute` returns for `request` on `w`.
 fn receipt_of(w: &Wallet, request: &x::ScVal) -> x::ScVal {
-    let (to, amount) = match operation(request) {
-        (name, args) if name == "Transfer" => (addr(field(args, "to")), int(field(args, "amount"))),
-        (name, args) if name == "Deposit" => {
-            (addr(field(args, "vault")), int(field(args, "assets")))
+    let asset = w.state.asset.clone();
+    let (token, to, amount) = match operation(request) {
+        (name, args) if name == "Transfer" => {
+            (asset, addr(field(args, "to")), int(field(args, "amount")))
+        }
+        (name, args) if name == "Deposit" => (
+            asset,
+            addr(field(args, "vault")),
+            int(field(args, "assets")),
+        ),
+        // A redeem debits the vault's shares at the vault.
+        (name, args) if name == "Redeem" => {
+            let vault = addr(field(args, "vault"));
+            (vault.clone(), vault, int(field(args, "shares")))
         }
         _ => panic!(),
     };
@@ -488,7 +482,7 @@ fn receipt_of(w: &Wallet, request: &x::ScVal) -> x::ScVal {
     };
     TransferReceipt {
         operation_id: digest(field(request, "operation_id")),
-        token: w.state.asset.clone(),
+        token,
         from: w.address.clone(),
         to,
         amount,
@@ -612,29 +606,40 @@ fn execute(w: &mut Wallet, request: &x::ScVal, now: u64) -> x::ScVal {
     };
     let args = PolicyParams::from_scval(field(request, "args")).unwrap();
     let (name, operation_args) = operation(request);
-    let deposit = name == "Deposit";
-    let vault = deposit.then(|| allowit::Address::new(addr(field(operation_args, "vault"))));
+    let asset = allowit::Address::new(w.state.asset.clone());
+    let debit = int(field(&receipt, "amount"));
+    let minimum = |key| int(field(operation_args, key));
+    let vault = || allowit::Address::new(addr(field(operation_args, "vault")));
+    // The wallet's facts: a redeem's gross amount is its minimum asset output.
+    let (op, amount, token_out, min_out) = match name.as_str() {
+        "Transfer" => (allowit::AllowitOperation::transfer, debit, None, 0),
+        "Deposit" => (
+            allowit::AllowitOperation::deposit,
+            debit,
+            Some(vault()),
+            minimum("min_shares"),
+        ),
+        "Redeem" => (
+            allowit::AllowitOperation::redeem,
+            minimum("min_assets"),
+            Some(asset.clone()),
+            minimum("min_assets"),
+        ),
+        _ => panic!(),
+    };
     let ctx = allowit::AllowitContext {
         env: allowit::AllowitEnv::new(),
         params: w.state.params.allowit().into(),
         state: w.state.policy_state.allowit(),
         request: allowit::AllowitRequest {
-            operation: if deposit {
-                allowit::AllowitOperation::deposit
-            } else {
-                allowit::AllowitOperation::transfer
-            },
-            asset: allowit::Address::new(w.state.asset.clone()),
+            operation: op,
+            asset,
             recipient: allowit::Address::new(addr(field(&receipt, "to"))),
-            amount: int(field(&receipt, "amount")),
-            token_in: allowit::Address::new(w.state.asset.clone()),
-            amount_in: int(field(&receipt, "amount")),
-            token_out: vault,
-            min_out: if deposit {
-                int(field(operation_args, "min_shares"))
-            } else {
-                0
-            },
+            amount,
+            token_in: allowit::Address::new(addr(field(&receipt, "token"))),
+            amount_in: debit,
+            token_out,
+            min_out,
             now,
             expires_at: *expires_at,
             spent_units: spent,
@@ -650,91 +655,56 @@ fn execute(w: &mut Wallet, request: &x::ScVal, now: u64) -> x::ScVal {
     };
     w.state.policy_state = PolicyParams::from_allowit(&allowit::post_flight(&ctx, tier).unwrap());
     w.state.nonce += 1;
-    let amount = int(field(&receipt, "amount"));
-    w.balance -= amount;
     let id = digest(field(request, "operation_id"));
-    let share = deposit.then(|| {
-        w.shares += amount;
-        DepositReceipt {
-            operation_id: id,
-            vault: addr(field(&receipt, "to")),
-            asset: w.state.asset.clone(),
-            from: w.address.clone(),
-            receiver: w.address.clone(),
-            operator: w.address.clone(),
-            assets: amount,
-            shares: amount,
-            nonce: *nonce,
-            deployment_version: w.state.deployment_version,
+    let vault = addr(field(&receipt, "to"));
+    // The model vault converts one to one.
+    let sep56 = match name.as_str() {
+        "Transfer" => {
+            w.balance -= debit;
+            None
         }
-        .scval()
-        .unwrap()
-    });
-    w.receipts.insert(id, (receipt.clone(), share));
+        "Deposit" => {
+            w.balance -= debit;
+            w.shares += debit;
+            let deposit = DepositReceipt {
+                operation_id: id,
+                vault,
+                asset: w.state.asset.clone(),
+                from: w.address.clone(),
+                receiver: w.address.clone(),
+                operator: w.address.clone(),
+                assets: debit,
+                shares: debit,
+                nonce: *nonce,
+                deployment_version: w.state.deployment_version,
+            };
+            Some(("Deposit", deposit.scval().unwrap()))
+        }
+        _ => {
+            w.shares -= debit;
+            w.balance += debit;
+            let redeem = RedeemReceipt {
+                operation_id: id,
+                vault,
+                asset: w.state.asset.clone(),
+                owner: w.address.clone(),
+                receiver: w.address.clone(),
+                operator: w.address.clone(),
+                shares: debit,
+                assets: debit,
+                nonce: *nonce,
+                deployment_version: w.state.deployment_version,
+            };
+            Some(("Redeem", redeem.scval().unwrap()))
+        }
+    };
+    w.receipts.insert(("Operation".into(), id), receipt.clone());
+    if let Some((variant, value)) = sep56 {
+        w.receipts.insert((variant.into(), id), value);
+    }
     receipt
 }
 
-/// One canonical request of the agent.
-fn request(c: &WalletConfig, id: u8, deposit: Option<i128>, amount: i128) -> ExecutionRequest {
-    let (instruction, beneficiary) = match deposit {
-        None => (
-            NativeInstruction::StellarCall {
-                contract: wf(&c.asset),
-                schema_digest: [0; 32],
-                function: "transfer".into(),
-                arguments: vec![
-                    AbiValue::Account(wf(&c.wallet)),
-                    AbiValue::Account(wf(&account_for_seed(&RECIPIENT))),
-                    AbiValue::Signed128(amount),
-                ],
-            },
-            account_for_seed(&RECIPIENT),
-        ),
-        Some(min_shares) => (
-            NativeInstruction::StellarCall {
-                contract: wf(&vault()),
-                schema_digest: [0; 32],
-                function: "deposit".into(),
-                arguments: vec![
-                    AbiValue::Signed128(amount),
-                    AbiValue::Account(wf(&c.wallet)),
-                    AbiValue::Account(wf(&c.wallet)),
-                    AbiValue::Account(wf(&c.wallet)),
-                    AbiValue::Signed128(min_shares),
-                ],
-            },
-            vault(),
-        ),
-    };
-    let units = u64::try_from(amount).unwrap();
-    ExecutionRequest {
-        operation: OperationRef {
-            policy_instance: c.policy_instance,
-            nonce: [id; 32],
-        },
-        input: ExecutionInput::Instructions(vec![instruction]),
-        effect_bounds: vec![WorkflowEffectBound {
-            asset: WorkflowAsset::Token(AssetId {
-                network: network_id(NETWORK).unwrap(),
-                token: wf(&c.asset),
-            }),
-            source: wf(&c.wallet),
-            beneficiary: wf(&beneficiary),
-            max_debit: units.into(),
-            min_credit: units.into(),
-            max_burn: 0u64.into(),
-        }],
-        fee_bounds: Some(vec![WorkflowFeeBound {
-            payer: wf(&c.agent),
-            asset: WorkflowAsset::Native {
-                chain: Chain::Stellar,
-                network: network_id(NETWORK).unwrap(),
-            },
-            max_fee: u64::from(MAX_FEE).into(),
-        }]),
-        evidence: vec![],
-    }
-}
 fn terms(principal: i128, ledger: u32) -> ExecutionTerms {
     ExecutionTerms {
         args: PolicyParams::default(),
@@ -804,7 +774,7 @@ fn params() -> PolicyParams {
             "destinations": [account_for_seed(&RECIPIENT), vault()],
             "tokens": [xlm()],
             "expires_at": NOW + 30 * 86_400,
-            "operations": ["transfer", "deposit"],
+            "operations": ["transfer", "deposit", "redeem"],
         }),
         Some(PolicyTier::Common),
     )
@@ -896,8 +866,9 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
     assert!(!found.paused);
     assert_eq!(found.state.contract_version, Some(CONTRACT_VERSION));
     // 4. A transfer, priced with server-attested gas in XLM.
+    let recipient = account_for_seed(&RECIPIENT);
     let ledger = chain.0.lock().unwrap().ledger;
-    let transfer = request(&c, 1, None, 10_000_000);
+    let transfer = request::transfer(&c, [1; 32], &recipient, 10_000_000).unwrap();
     let receipt = run(
         &chain,
         &c,
@@ -906,7 +877,7 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
         "transfer",
     )
     .unwrap();
-    assert_eq!(receipt.transfer.to, account_for_seed(&RECIPIENT));
+    assert_eq!(receipt.transfer.to, recipient);
     assert!(receipt.deposit.is_none());
     let standard = chain.state().policy_state;
     assert_eq!(standard.get("calls"), Some(&PolicyValue::Int(1)));
@@ -916,7 +887,7 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
     );
     // A transfer over the cap is denied on the host before any signature.
     let ledger = chain.0.lock().unwrap().ledger;
-    let over = request(&c, 9, None, 60_000_000);
+    let over = request::transfer(&c, [9; 32], &recipient, 60_000_000).unwrap();
     assert!(
         rpc::prepare_with(
             &chain,
@@ -930,9 +901,10 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
         .unwrap_err()
         .contains("PaymentLimitExceeded")
     );
-    // 5. A SEP-56 deposit: Simple and Common run it, Custom's code does not.
+    // 5. A SEP-56 deposit, then a redeem of part of its shares: Simple and Common run both,
+    // Custom's code runs no deposit.
     let ledger = chain.0.lock().unwrap().ledger;
-    let deposit = request(&c, 2, Some(5_000_000), 5_000_000);
+    let deposit = request::deposit(&c, [2; 32], &vault(), 5_000_000, 5_000_000).unwrap();
     let priced = ExecutionTerms {
         args: PolicyParams::default(),
         expense: Some(ExpenseBounds::xlm(0, 0, MAX_FEE, ledger - 1, NOW).unwrap()),
@@ -950,6 +922,20 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
             (shares.vault.as_str(), shares.assets, shares.shares),
             (vault().as_str(), 5_000_000, 5_000_000)
         );
+        let ledger = chain.0.lock().unwrap().ledger;
+        let redeem = request::redeem(&c, [5; 32], &vault(), 2_000_000, 2_000_000).unwrap();
+        let priced = ExecutionTerms {
+            args: PolicyParams::default(),
+            expense: Some(ExpenseBounds::xlm(0, 0, MAX_FEE, ledger - 1, NOW).unwrap()),
+        };
+        let receipt = run(&chain, &c, &redeem, &priced, "redeem").unwrap();
+        assert_eq!(
+            (receipt.transfer.token.as_str(), receipt.transfer.amount),
+            (vault().as_str(), 2_000_000)
+        );
+        let assets = receipt.redeem.unwrap();
+        assert_eq!((assets.shares, assets.assets), (2_000_000, 2_000_000));
+        assert!(receipt.deposit.is_none());
     }
     // 6. The owner pauses and resumes at the next deployment versions.
     let mut owner_admin = Admin::new(OwnerAdmin {
@@ -985,7 +971,7 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
     owner_submit(&chain, "params", &updated.transaction_xdr);
     assert_eq!(chain.state().params, lower);
     let ledger = chain.0.lock().unwrap().ledger;
-    let again = request(&c, 3, None, 15_000_000);
+    let again = request::transfer(&c, [3; 32], &recipient, 15_000_000).unwrap();
     let receipt = run(
         &chain,
         &c,
@@ -996,7 +982,7 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
     .unwrap();
     assert_eq!(receipt.transfer.deployment_version, 3);
     let ledger = chain.0.lock().unwrap().ledger;
-    let blocked = request(&c, 4, None, 25_000_000);
+    let blocked = request::transfer(&c, [4; 32], &recipient, 25_000_000).unwrap();
     assert!(
         rpc::prepare_with(
             &chain,
@@ -1037,7 +1023,7 @@ fn simple_common_and_custom_wallets_run_the_complete_workflow() {
         let names: Vec<_> = steps.iter().map(|s| s.0.as_str()).collect();
         let mut expected = vec!["upload", "create", "transfer"];
         if tier != PolicyTier::Custom {
-            expected.push("deposit");
+            expected.extend(["deposit", "redeem"]);
         }
         expected.extend(["pause", "resume", "params", "transfer_v3", "recover"]);
         assert_eq!(names, expected);
@@ -1102,7 +1088,7 @@ fn recorded_vectors_decode_to_the_exact_workflow_packets() {
                 );
             }
             (x::HostFunction::InvokeContract(call), name)
-                if name.starts_with("transfer") || name == "deposit" =>
+                if name.starts_with("transfer") || name == "deposit" || name == "redeem" =>
             {
                 assert_eq!(call.function_name.0.as_slice(), b"execute");
                 assert_eq!(digest(field(&call.args[0], "source_hash")), hash(SOURCE));
@@ -1113,5 +1099,5 @@ fn recorded_vectors_decode_to_the_exact_workflow_packets() {
             _ => panic!("unexpected recorded step {}", parts[1]),
         }
     }
-    assert_eq!(executions, 8);
+    assert_eq!(executions, 10);
 }

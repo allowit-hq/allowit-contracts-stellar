@@ -681,17 +681,18 @@ pub fn policy_rules(
 pub struct RuleRequest {
     pub operation: OperationKind,
     pub asset: String,
-    /// The payment recipient or the deposit vault.
+    /// The payment recipient or the vault.
     pub recipient: String,
-    /// The gross underlying debit.
+    /// The gross underlying debit, or a redeem's minimum underlying credit.
     pub amount: i128,
-    /// Token that leaves the wallet: the asset.
+    /// Token that leaves the wallet: the asset, or the vault's shares for a redeem.
     pub token_in: String,
     /// Exact units of `token_in` that leave the wallet.
     pub amount_in: i128,
-    /// Token that the wallet receives back: the deposit vault's shares, or none for a transfer.
+    /// Token that the wallet receives back: the deposit vault's shares, the asset for a redeem,
+    /// or none for a transfer.
     pub token_out: Option<String>,
-    /// Minimum units of `token_out`: the deposit's minimum shares, or zero for a transfer.
+    /// Minimum units of `token_out`, or zero for a transfer.
     pub min_out: i128,
     pub now: u64,
     pub expires_at: u64,
@@ -708,18 +709,19 @@ impl RuleRequest {
         expense: Option<ExpenseBounds>,
         args: PolicyParams,
     ) -> Self {
-        let (recipient, amount) = operation.debit();
-        let (token_out, min_out) = match operation {
-            StellarOperation::Transfer(_) => (None, 0),
-            StellarOperation::Deposit(d) => (Some(d.vault.clone()), d.min_shares),
+        let (recipient, amount_in) = operation.debit();
+        let (amount, token_out, min_out) = match operation {
+            StellarOperation::Transfer(_) => (amount_in, None, 0),
+            StellarOperation::Deposit(d) => (amount_in, Some(d.vault.clone()), d.min_shares),
+            StellarOperation::Redeem(r) => (r.min_assets, Some(asset.into()), r.min_assets),
         };
         Self {
             operation: operation.kind(),
             asset: asset.into(),
             recipient: recipient.into(),
             amount,
-            token_in: asset.into(),
-            amount_in: amount,
+            token_in: operation.debit_token(asset).into(),
+            amount_in,
             token_out,
             min_out,
             now,
