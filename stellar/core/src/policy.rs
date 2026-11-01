@@ -75,23 +75,15 @@ pub enum PolicyLanguage {
 }
 
 /// Canonical param keys, which are also the canonical rule names, in `allowit::RULES` order.
-pub const PARAM_KEYS: [&str; 9] = [
-    "transaction_cap",
-    "spent_cap",
-    "day_spent_cap",
-    "day_total_cap",
-    "call_cap",
-    "recipients",
-    "tokens",
-    "expiry",
-    "operations",
-];
-const MAX_PARAMS: usize = 32;
-const MAX_ITEMS: usize = 64;
-const MAX_TEXT: usize = 256;
-const KEY_BYTES: usize = 40;
-const VALUE_BYTES: usize = 80;
-const MAX_PARAM_BYTES: usize = 16 * 1024;
+pub fn param_keys() -> [&'static str; allowit::RULES.len()] {
+    allowit::RULES.map(AllowitRule::key)
+}
+const MAX_PARAMS: usize = allowit::MAX_PARAMS as usize;
+const MAX_ITEMS: usize = allowit::MAX_ITEMS as usize;
+const MAX_TEXT: usize = allowit::MAX_TEXT as usize;
+const KEY_BYTES: usize = allowit::KEY_BYTES as usize;
+const VALUE_BYTES: usize = allowit::VALUE_BYTES as usize;
+const MAX_PARAM_BYTES: usize = allowit::MAX_PARAM_BYTES as usize;
 
 /// One owner param, execution arg or policy state value: the JSON form of `AllowitValue`.
 /// It serializes as one key naming its type, with `Int` as a decimal string: `{"Int":"5"}`,
@@ -430,7 +422,7 @@ pub fn params_from_json(
 ) -> Result<PolicyParams> {
     let standard = tier.is_some_and(PolicyTier::standard);
     let limit = if standard {
-        PARAM_KEYS.len()
+        allowit::RULES.len()
     } else {
         MAX_PARAMS
     };
@@ -461,10 +453,10 @@ pub fn params_from_json(
 }
 /// Check one canonical param of a standard tier, with the messages of `contract_admin.py`.
 fn canonical_param(key: &str, encoded: &PolicyValue) -> Result<()> {
-    if !PARAM_KEYS.contains(&key) {
+    if !param_keys().contains(&key) {
         return Err(format!(
             "Simple and Common params admit only the canonical keys: {}",
-            PARAM_KEYS.join(", ")
+            param_keys().join(", ")
         ));
     }
     match key {
@@ -515,7 +507,10 @@ pub fn parse_rules(rules: &[String]) -> Result<Vec<AllowitRule>> {
                 .copied()
                 .find(|rule| rule.key() == name)
                 .ok_or_else(|| {
-                    format!("Rules must name canonical rules: {}", PARAM_KEYS.join(", "))
+                    format!(
+                        "Rules must name canonical rules: {}",
+                        param_keys().join(", ")
+                    )
                 })
         })
         .collect()
@@ -552,17 +547,10 @@ pub fn rules_from_scval(value: &ScVal) -> Result<Vec<String>> {
     Ok(rules)
 }
 
-/// SHA-256 of the native transfer argument schema.
-pub fn transfer_schema_digest() -> [u8; 32] {
-    hash(TRANSFER_SCHEMA)
-}
-/// SHA-256 of the SEP-56 deposit argument schema.
-pub fn deposit_schema_digest() -> [u8; 32] {
-    hash(DEPOSIT_SCHEMA)
-}
 /// The standard prefix binding of a Simple or Common wallet: `standard_prefix_digest` of the
-/// policy wallet crate. It binds the engine kind, executable, asset, both native schemas and the
-/// ordered rules, not param values or the offchain suffix.
+/// policy wallet crate, the SHA-256 of the canonical XDR of the domain `allowit_std_prefix`, the
+/// engine kind, the executable, the asset and the ordered rules. The executable fixes the
+/// operations that the code runs. Param values and the offchain suffix are excluded.
 pub fn standard_prefix_digest(
     tier: PolicyTier,
     module_digest: &[u8; 32],
@@ -575,8 +563,6 @@ pub fn standard_prefix_digest(
             value_symbol(tier.kind())?,
             value_bytes(module_digest)?,
             ScVal::Address(address(asset)?),
-            value_bytes(&transfer_schema_digest())?,
-            value_bytes(&deposit_schema_digest())?,
             rules_scval(rules)?,
         ]
         .try_into()
@@ -697,10 +683,49 @@ pub struct RuleRequest {
     pub recipient: String,
     /// The gross underlying debit.
     pub amount: i128,
+    /// Token that leaves the wallet: the asset.
+    pub token_in: String,
+    /// Exact units of `token_in` that leave the wallet.
+    pub amount_in: i128,
+    /// Token that the wallet receives back: the deposit vault's shares, or none for a transfer.
+    pub token_out: Option<String>,
+    /// Minimum units of `token_out`: the deposit's minimum shares, or zero for a transfer.
+    pub min_out: i128,
     pub now: u64,
     pub expires_at: u64,
     pub expense: Option<ExpenseBounds>,
     pub args: PolicyParams,
+}
+impl RuleRequest {
+    /// The facts of `operation` on a wallet of `asset`, as the wallet's `facts` builds them.
+    pub fn new(
+        operation: &StellarOperation,
+        asset: &str,
+        now: u64,
+        expires_at: u64,
+        expense: Option<ExpenseBounds>,
+        args: PolicyParams,
+    ) -> Self {
+        let (recipient, amount) = operation.debit();
+        let (token_out, min_out) = match operation {
+            StellarOperation::Transfer(_) => (None, 0),
+            StellarOperation::Deposit(d) => (Some(d.vault.clone()), d.min_shares),
+        };
+        Self {
+            operation: operation.kind(),
+            asset: asset.into(),
+            recipient: recipient.into(),
+            amount,
+            token_in: asset.into(),
+            amount_in: amount,
+            token_out,
+            min_out,
+            now,
+            expires_at,
+            expense,
+            args,
+        }
+    }
 }
 /// A compiled evaluator of the exact installed source, supplied by a host that compiled it
 /// through the server build gate. It is used only when the source is not canonical-only.
@@ -712,13 +737,14 @@ fn context(params: &PolicyParams, state: &PolicyParams, r: &RuleRequest) -> Allo
         params: params.allowit().into(),
         state: state.allowit(),
         request: AllowitRequest {
-            operation: match r.operation {
-                OperationKind::Transfer => allowit::AllowitOperation::sep41_transfer,
-                OperationKind::Deposit => allowit::AllowitOperation::sep56_deposit,
-            },
+            operation: r.operation.allowit(),
             asset: allowit::Address::new(r.asset.clone()),
             recipient: allowit::Address::new(r.recipient.clone()),
             amount: r.amount,
+            token_in: allowit::Address::new(r.token_in.clone()),
+            amount_in: r.amount_in,
+            token_out: r.token_out.clone().map(allowit::Address::new),
+            min_out: r.min_out,
             now: r.now,
             expires_at: r.expires_at,
             spent_units: r.expense.as_ref().map_or(0, |e| e.spent_units),
@@ -766,10 +792,6 @@ pub fn evaluate(
     evaluator: Option<PortableEvaluator>,
 ) -> Result<Evaluation> {
     let ctx = context(params, state, request);
-    request.args.check_args()?;
-    if tier.standard() {
-        params.check(tier)?;
-    }
     for rule in parse_rules(rules)? {
         allowit::preflight(&ctx, rule).map_err(|e| format!("Policy prefix denied: {e:?}"))?;
     }
@@ -788,7 +810,12 @@ pub fn evaluate(
             tier.allowit(),
         )
     } else {
-        // The onchain prefix alone still produces the standard post-flight state.
+        // `allowit::evaluate` checks args and standard params; the prefix-only path checks them
+        // here. The onchain prefix alone still produces the standard post-flight state.
+        request.args.check_args()?;
+        if tier.standard() {
+            params.check(tier)?;
+        }
         allowit::post_flight(&ctx, tier.allowit())
             .map_err(|e| format!("Policy state rejected: {e:?}"))?;
         return Ok(Evaluation::Prefix);
@@ -1350,6 +1377,10 @@ pub(crate) mod gate {
         "asset",
         "recipient",
         "amount",
+        "token_in",
+        "amount_in",
+        "token_out",
+        "min_out",
         "now",
         "expires_at",
         "spent_units",
@@ -1439,7 +1470,7 @@ pub(crate) mod gate {
         static NAMES: std::sync::OnceLock<Names> = std::sync::OnceLock::new();
         NAMES.get_or_init(|| {
             let set = |items: Vec<String>| items.into_iter().collect::<HashSet<_>>();
-            let functions: Vec<String> = PARAM_KEYS
+            let functions: Vec<String> = param_keys()
                 .iter()
                 .chain(["param", "arg", "get_state", "set_state"].iter())
                 .chain(SERVER_FUNCTIONS.iter())
@@ -1460,7 +1491,7 @@ pub(crate) mod gate {
             ]
             .map(String::from)
             .to_vec();
-            allowit_types.extend(PARAM_KEYS.iter().map(|k| k.to_uppercase()));
+            allowit_types.extend(param_keys().iter().map(|k| k.to_uppercase()));
             allowit_types.extend(SERVER_TYPES.iter().map(|t| t.to_string()));
             let mut types = allowit_types.clone();
             types.extend(["Option", "Some", "None", "Ok", "Err"].map(String::from));
@@ -1474,10 +1505,11 @@ pub(crate) mod gate {
             ]
             .map(String::from)
             .to_vec();
-            for v in VALUES {
-                for prefix in ["", "allowit::"] {
+            for prefix in ["", "allowit::"] {
+                for v in VALUES {
                     constructors.push(format!("{prefix}AllowitValue::{v}"));
                 }
+                constructors.push(format!("{prefix}AllowitOperation::custom"));
             }
             let mut primitives: Vec<String> = INTEGERS.iter().map(|t| t.to_string()).collect();
             primitives.extend(["bool", "char", "str", "_"].map(String::from));
@@ -1492,9 +1524,12 @@ pub(crate) mod gate {
             let mut paths = function_paths.clone();
             paths.extend(allowit_types.iter().map(|t| format!("allowit::{t}")));
             paths.push("allowit::prelude".into());
-            let rules: Vec<&str> = PARAM_KEYS.to_vec();
+            let rules: Vec<&str> = param_keys().to_vec();
             let enums: [(&str, &[&str]); 4] = [
-                ("AllowitOperation", &["sep41_transfer", "sep56_deposit"]),
+                (
+                    "AllowitOperation",
+                    &["transfer", "swap", "deposit", "redeem", "custom"],
+                ),
                 ("AllowitError", ERRORS),
                 ("AllowitRule", &rules),
                 ("AllowitValue", VALUES),
@@ -2213,7 +2248,7 @@ pub(crate) mod gate {
         let rest = rest.strip_prefix(',').unwrap_or(rest);
         let rest = rest.strip_prefix(')')?;
         let rest = rest.strip_prefix(',').unwrap_or(rest);
-        if rest != ")?" || name.to_uppercase() != key || !PARAM_KEYS.contains(&name) {
+        if rest != ")?" || name.to_uppercase() != key || !param_keys().contains(&name) {
             return None;
         }
         Some(name.into())
@@ -2320,7 +2355,7 @@ mod tests {
     #[test]
     fn canonical_source_has_the_full_prefix_and_is_canonical_only() {
         let shape = source_shape(SOURCE).unwrap();
-        assert_eq!(shape.prefix, PARAM_KEYS.map(String::from).to_vec());
+        assert_eq!(shape.prefix, param_keys().map(String::from).to_vec());
         assert!(shape.canonical_only);
         assert!(!shape.writes_state);
     }
@@ -2332,7 +2367,7 @@ mod tests {
             "{SOURCE}\nfn Ok(_: ()) -> allowit::Result {{ Err(allowit::AllowitError::MissingParam) }}\n"
         );
         let shape = source_shape(&shadowed).unwrap();
-        assert_eq!(shape.prefix.len(), PARAM_KEYS.len());
+        assert_eq!(shape.prefix.len(), allowit::RULES.len());
         assert!(!shape.canonical_only);
         let helper = SOURCE.replace(
             "use allowit::prelude::*;",
@@ -2377,23 +2412,43 @@ mod tests {
         }
     }
     #[test]
-    fn standard_prefix_digest_matches_the_contract_vector() {
-        // `standard_prefix_digest_matches_independent_xdr_vector_and_binds_context` in
-        // crates/policy-wallet/src/sep56_tests.rs.
-        let digest = standard_prefix_digest(
-            PolicyTier::Common,
-            &[1; 32],
-            "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ",
-            &["spent_cap".into(), "recipients".into()],
-        )
-        .unwrap();
-        assert_eq!(
-            digest,
-            [
-                66, 101, 232, 202, 129, 105, 213, 21, 159, 38, 227, 129, 92, 65, 30, 68, 142, 108,
-                9, 16, 21, 190, 226, 11, 50, 204, 7, 142, 89, 244, 155, 255,
-            ]
-        );
+    fn standard_prefix_digest_hashes_its_documented_tuple_and_binds_context() {
+        // As `standard_prefix_digest_hashes_its_documented_tuple_and_binds_context` in
+        // crates/policy-wallet/src/sep56_tests.rs: SHA-256 of the XDR vector (domain, kind,
+        // module, asset, rules), where each rule is a one-symbol vector of its name.
+        let asset = "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ";
+        let symbol = |name: &str| ScVal::Symbol(name.try_into().unwrap());
+        let list = |items: Vec<ScVal>| ScVal::Vec(Some(items.try_into().unwrap()));
+        let tuple = list(vec![
+            symbol("allowit_std_prefix"),
+            symbol("common_policy_engine"),
+            ScVal::Bytes([1u8; 32].to_vec().try_into().unwrap()),
+            ScVal::Address(address(asset).unwrap()),
+            list(vec![
+                list(vec![symbol("spent_cap")]),
+                list(vec![symbol("recipients")]),
+            ]),
+        ]);
+        let expected = hash(tuple.to_xdr(Limits::none()).unwrap());
+        let xlm = sac_address("stellar:testnet", &Asset::Native).unwrap();
+        let digest = |tier, module: [u8; 32], asset: &str, rules: [&str; 2]| {
+            standard_prefix_digest(tier, &module, asset, &rules.map(String::from)).unwrap()
+        };
+        let rules = ["spent_cap", "recipients"];
+        assert_eq!(digest(PolicyTier::Common, [1; 32], asset, rules), expected);
+        for other in [
+            digest(PolicyTier::Simple, [1; 32], asset, rules),
+            digest(PolicyTier::Common, [3; 32], asset, rules),
+            digest(PolicyTier::Common, [1; 32], &xlm, rules),
+            digest(
+                PolicyTier::Common,
+                [1; 32],
+                asset,
+                ["recipients", "spent_cap"],
+            ),
+        ] {
+            assert_ne!(other, expected);
+        }
     }
     #[test]
     fn values_roundtrip_through_json_and_contract_encoding() {

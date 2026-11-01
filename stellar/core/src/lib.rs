@@ -24,12 +24,6 @@ pub mod x402;
 pub type Result<T> = std::result::Result<T, String>;
 
 pub const PROFILE: &str = "allowit-stellar-wallet-v1";
-/// Native SEP-41 transfer argument schema of `crates/protocol`.
-pub const TRANSFER_SCHEMA: &[u8] = b"allowit.stellar.sep41_transfer.v1:ScValMap(amount:i128,from:Address,to:Address,token:Address)";
-/// Native SEP-56 deposit argument schema of `crates/protocol`. The vault is its share token.
-pub const DEPOSIT_SCHEMA: &[u8] = b"allowit.stellar.sep56_deposit.v1:ScValMap(assets:i128,from:Address,min_shares:i128,operator:Address,receiver:Address,vault:Address)";
-/// The transfer schema under its historical name.
-pub const ARGUMENT_SCHEMA: &[u8] = TRANSFER_SCHEMA;
 const MAX_BYTES: usize = 1_048_576;
 
 pub fn hash(bytes: impl AsRef<[u8]>) -> [u8; 32] {
@@ -220,22 +214,57 @@ impl WalletConfig {
         self.tier.map(PolicyTier::engine)
     }
 }
-/// Native operation kinds that policy wallets admit.
+/// The general operations of the policy core, which policy wallet bindings list and rules read.
+/// This crate prepares transfers and deposits.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum OperationKind {
-    /// SEP-41 transfer to a recipient.
+    /// Token transfer to a recipient.
     Transfer,
-    /// SEP-56 deposit into a vault, which is also the share token.
+    /// Exact-input swap through an exchange.
+    Swap,
+    /// Deposit of the asset into a vault, which is also the share token.
     Deposit,
+    /// Redeem of vault shares for the asset.
+    Redeem,
 }
 impl OperationKind {
-    /// SHA-256 of the native argument schema of this operation.
-    pub fn schema_digest(self) -> [u8; 32] {
+    /// The op name: the `AllowitOperation` variant and the `operations` entry.
+    pub fn name(self) -> &'static str {
         match self {
-            Self::Transfer => hash(TRANSFER_SCHEMA),
-            Self::Deposit => hash(DEPOSIT_SCHEMA),
+            Self::Transfer => "transfer",
+            Self::Swap => "swap",
+            Self::Deposit => "deposit",
+            Self::Redeem => "redeem",
         }
+    }
+    /// The `AllowitOperation` of the policy core.
+    pub fn allowit(self) -> allowit::AllowitOperation {
+        match self {
+            Self::Transfer => allowit::AllowitOperation::transfer,
+            Self::Swap => allowit::AllowitOperation::swap,
+            Self::Deposit => allowit::AllowitOperation::deposit,
+            Self::Redeem => allowit::AllowitOperation::redeem,
+        }
+    }
+    /// Contract encoding of the unit `AllowitOperation` variant: a one-symbol vector.
+    pub fn scval(self) -> Result<ScVal> {
+        Ok(ScVal::Vec(Some(
+            vec![value_symbol(self.name())?].try_into().map_err(err)?,
+        )))
+    }
+    /// Decode a unit `AllowitOperation` variant.
+    pub fn from_scval(value: &ScVal) -> Result<Self> {
+        let ScVal::Vec(Some(items)) = value else {
+            return Err("Expected an operation variant".into());
+        };
+        let [ScVal::Symbol(name)] = items.as_slice() else {
+            return Err("Expected an operation variant".into());
+        };
+        [Self::Transfer, Self::Swap, Self::Deposit, Self::Redeem]
+            .into_iter()
+            .find(|op| op.name().as_bytes() == name.0.as_slice())
+            .ok_or_else(|| "Unknown policy wallet operation".into())
     }
 }
 /// Request-bound conservative economic ceilings in the wallet asset, attested by the server
@@ -273,7 +302,7 @@ impl ExpenseBounds {
             spent_units: principal.checked_add(gas).ok_or("Expense overflow")?,
             max_fee_stroops,
             observed_ledger,
-            day: now / 86_400,
+            day: now / allowit::DAY,
         })
     }
 }
@@ -511,15 +540,12 @@ pub struct Transfer {
     pub amount: i128,
     pub native: bool,
 }
-/// One SEP-56 deposit of the wallet asset into `vault`. Receiver, source and operator are the
-/// wallet itself.
+/// One SEP-56 deposit of the wallet asset into `vault`. The wallet is its source, receiver and
+/// operator.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Deposit {
     pub vault: String,
     pub assets: i128,
-    pub receiver: String,
-    pub from: String,
-    pub operator: String,
     pub min_shares: i128,
 }
 /// The admitted native operation of one request.
@@ -540,15 +566,6 @@ impl StellarOperation {
         match self {
             Self::Transfer(t) => (&t.recipient, t.amount),
             Self::Deposit(d) => (&d.vault, d.assets),
-        }
-    }
-    /// Canonical native arguments of the selected schema.
-    fn arguments(&self, c: &WalletConfig) -> Result<Vec<u8>> {
-        match self {
-            Self::Transfer(t) => {
-                contract::transfer_args(&c.asset, &c.wallet, &t.recipient, t.amount)
-            }
-            Self::Deposit(d) => contract::deposit_args(d),
         }
     }
 }
@@ -694,68 +711,58 @@ fn decode_operation(
             amount: i128::from(*stroops),
             native: true,
         }),
+        // The contract, function and typed arguments identify a Stellar call. Its schema digest
+        // names no contract schema, so this crate does not read it.
         NativeInstruction::StellarCall {
             contract,
-            schema_digest,
             function,
             arguments,
-        } if *schema_digest == hash(TRANSFER_SCHEMA) => {
-            if workflow_address(contract)? != c.asset
-                || function != "transfer"
-                || arguments.len() != 3
-            {
-                return Err("Unknown Stellar module, schema or method".into());
-            }
-            let [
-                AbiValue::Account(from),
-                AbiValue::Account(to),
-                AbiValue::Signed128(units),
-            ] = arguments.as_slice()
-            else {
-                return Err("Invalid SEP-41 arguments".into());
-            };
-            StellarOperation::Transfer(Transfer {
+            ..
+        } => match (function.as_str(), arguments.as_slice()) {
+            (
+                "transfer",
+                [
+                    AbiValue::Account(from),
+                    AbiValue::Account(to),
+                    AbiValue::Signed128(units),
+                ],
+            ) if workflow_address(contract)? == c.asset => StellarOperation::Transfer(Transfer {
                 token: c.asset.clone(),
                 source: workflow_address(from)?,
                 recipient: workflow_address(to)?,
                 amount: *units,
                 native: false,
-            })
-        }
-        NativeInstruction::StellarCall {
-            contract,
-            schema_digest,
-            function,
-            arguments,
-        } if *schema_digest == hash(DEPOSIT_SCHEMA) => {
-            if c.route != WalletRoute::PolicyWallet
-                || function != "deposit"
-                || contract.kind != AccountKind::Contract
-            {
-                return Err("SEP-56 deposits require a policy wallet and a vault contract".into());
+            }),
+            (
+                "deposit",
+                [
+                    AbiValue::Signed128(assets),
+                    AbiValue::Account(receiver),
+                    AbiValue::Account(from),
+                    AbiValue::Account(operator),
+                    AbiValue::Signed128(min_shares),
+                ],
+            ) => {
+                if c.route != WalletRoute::PolicyWallet || contract.kind != AccountKind::Contract {
+                    return Err(
+                        "SEP-56 deposits require a policy wallet and a vault contract".into(),
+                    );
+                }
+                for party in [receiver, from, operator] {
+                    if workflow_address(party)? != c.wallet {
+                        return Err(
+                            "Deposit receiver, source and operator must be the wallet".into()
+                        );
+                    }
+                }
+                StellarOperation::Deposit(Deposit {
+                    vault: workflow_address(contract)?,
+                    assets: *assets,
+                    min_shares: *min_shares,
+                })
             }
-            let [
-                AbiValue::Signed128(assets),
-                AbiValue::Account(receiver),
-                AbiValue::Account(from),
-                AbiValue::Account(operator),
-                AbiValue::Signed128(min_shares),
-            ] = arguments.as_slice()
-            else {
-                return Err("Invalid SEP-56 deposit arguments".into());
-            };
-            StellarOperation::Deposit(Deposit {
-                vault: workflow_address(contract)?,
-                assets: *assets,
-                receiver: workflow_address(receiver)?,
-                from: workflow_address(from)?,
-                operator: workflow_address(operator)?,
-                min_shares: *min_shares,
-            })
-        }
-        NativeInstruction::StellarCall { .. } => {
-            return Err("Unknown Stellar module, schema or method".into());
-        }
+            _ => return Err("Unknown Stellar contract, method or arguments".into()),
+        },
         _ => return Err("Unsupported Stellar instruction".into()),
     };
     let (beneficiary, units, native) = match &operation {
@@ -773,13 +780,8 @@ fn decode_operation(
             (&transfer.recipient, transfer.amount, transfer.native)
         }
         StellarOperation::Deposit(deposit) => {
-            if deposit.receiver != c.wallet
-                || deposit.from != c.wallet
-                || deposit.operator != c.wallet
-                || deposit.vault == c.wallet
-                || deposit.vault == c.asset
-            {
-                return Err("Deposit receiver, source and operator must be the wallet and the vault another contract".into());
+            if deposit.vault == c.wallet || deposit.vault == c.asset {
+                return Err("The deposit vault must be another contract".into());
             }
             if deposit.assets <= 0 || deposit.min_shares <= 0 {
                 return Err("Deposit assets and minimum shares must be positive".into());
@@ -971,23 +973,21 @@ fn verify_classic_portable(
     ] {
         standard.0.insert(key.into(), value);
     }
-    let request = policy::RuleRequest {
-        operation: OperationKind::Transfer,
-        asset: c.asset.clone(),
-        recipient: t.recipient.clone(),
-        amount: t.amount,
+    let request = policy::RuleRequest::new(
+        &StellarOperation::Transfer(t.clone()),
+        &c.asset,
         now,
         expires_at,
-        expense: Some(ExpenseBounds {
+        Some(ExpenseBounds {
             gas_units: 0,
             conversion_units: 0,
             spent_units: t.amount,
             max_fee_stroops: 0,
             observed_ledger: state.ledger,
-            day: now / 86_400,
+            day: now / allowit::DAY,
         }),
-        args: terms.args.clone(),
-    };
+        terms.args.clone(),
+    );
     let evaluation = policy::evaluate(
         PolicyTier::Simple,
         &shape,
@@ -1017,7 +1017,7 @@ fn validate_expense(
         || expense.spent_units < 0
         || expense.observed_ledger == 0
         || expense.observed_ledger > state.ledger
-        || expense.day != now / 86_400
+        || expense.day != now / allowit::DAY
     {
         return Err(
             "Expense bounds have negative units, a future observation or another day".into(),
@@ -1047,7 +1047,7 @@ fn validate_expense(
     if Some(expense.spent_units) != principal.checked_add(expense.gas_units) {
         return Err("Expense spent units must be principal plus gas".into());
     }
-    contract::expense_bounds(&c.asset, expense).map(drop)
+    Ok(())
 }
 fn verify_wallet_portable(
     c: &WalletConfig,
@@ -1073,17 +1073,14 @@ fn verify_wallet_portable(
         validate_expense(c, expense, operation, state, now)?;
     }
     let shape = policy::source_shape(&c.policy_source)?;
-    let (recipient, amount) = operation.debit();
-    let request = policy::RuleRequest {
-        operation: operation.kind(),
-        asset: c.asset.clone(),
-        recipient: recipient.into(),
-        amount,
+    let request = policy::RuleRequest::new(
+        operation,
+        &c.asset,
         now,
         expires_at,
-        expense: terms.expense.clone(),
-        args: terms.args.clone(),
-    };
+        terms.expense.clone(),
+        terms.args.clone(),
+    );
     policy::evaluate(
         tier,
         &shape,
@@ -1107,6 +1104,10 @@ fn transaction_hash(network: &str, tx: &Transaction) -> Result<[u8; 32]> {
         .map_err(err)?,
     ))
 }
+/// The transfer argument schema that historical ODC packets and bindings name. Retained ODC
+/// bytes are rebuilt exactly, so this one historical descriptor stays.
+pub(crate) const ODC_TRANSFER_SCHEMA: &[u8] =
+    b"allowit.stellar.sep41_transfer.v1:ScValMap(amount:i128,from:Address,to:Address,token:Address)";
 /// Historical transfer arguments of retained ODC packets.
 fn legacy_transfer_args(c: &WalletConfig, t: &Transfer) -> Result<ScVal> {
     value_map(vec![
@@ -1131,7 +1132,7 @@ fn legacy_wallet_request(
         ("entrypoint", value_symbol("_execute")?),
         (
             "argument_schema_digest",
-            value_bytes(&hash(TRANSFER_SCHEMA))?,
+            value_bytes(&hash(ODC_TRANSFER_SCHEMA))?,
         ),
         ("arguments", value_bytes(&args)?),
     ])?;
@@ -1152,7 +1153,7 @@ fn legacy_wallet_request(
     ])
 }
 /// The layout 4 `AllowitExecutionRequest` of one operation: the full source identity, the
-/// selected native schema and arguments, the optional expense bounds and the execution args.
+/// executable, the typed native operation, the expense and the execution args.
 pub(crate) fn policy_wallet_request(
     c: &WalletConfig,
     r: &ExecutionRequest,
@@ -1161,7 +1162,6 @@ pub(crate) fn policy_wallet_request(
     operation: &StellarOperation,
     expires: u64,
 ) -> Result<ScVal> {
-    let arguments = operation.arguments(c)?;
     contract::execution_request(contract::ExecutionPacket {
         policy_instance: &c.policy_instance,
         source_hash: &c.source_hash,
@@ -1169,16 +1169,9 @@ pub(crate) fn policy_wallet_request(
         nonce: state.nonce,
         deployment_version: state.deployment_version,
         expires_at: expires,
-        invocation: contract::invocation(
-            &c.module_digest,
-            &operation.kind().schema_digest(),
-            &arguments,
-        )?,
-        expense: terms
-            .expense
-            .as_ref()
-            .map(|e| contract::expense_bounds(&c.asset, e))
-            .transpose()?,
+        module_digest: &c.module_digest,
+        operation: contract::operation(&c.asset, operation)?,
+        expense: contract::expense(terms.expense.as_ref())?,
         args: &terms.args,
     })
 }
@@ -1239,22 +1232,14 @@ fn build(
     if admit_policy {
         verify_operation(c, r, terms, state, now, expires, None)?;
     }
-    if terms.expense.is_some()
-        && expires
-            > (now / 86400)
-                .checked_add(1)
-                .and_then(|day| day.checked_mul(86400))
-                .ok_or("UTC boundary overflow")?
-    {
+    let day_end = (now / allowit::DAY)
+        .checked_add(1)
+        .and_then(|day| day.checked_mul(allowit::DAY))
+        .ok_or("UTC boundary overflow")?;
+    if terms.expense.is_some() && expires > day_end {
         return Err("Priced execution cannot cross its UTC expense day".into());
     }
-    if c.route == WalletRoute::Native
-        && expires
-            > (now / 86400)
-                .checked_add(1)
-                .and_then(|day| day.checked_mul(86400))
-                .ok_or("UTC boundary overflow")?
-    {
+    if c.route == WalletRoute::Native && expires > day_end {
         return Err("Native approval cannot cross its UTC budget day".into());
     }
     if expires <= now || expires > now.checked_add(300).ok_or("Expiry overflow")? {
@@ -1375,7 +1360,8 @@ fn build(
 enum PacketBounds {
     /// A new packet: `[0, expires_at - 1]`.
     Current,
-    /// A retained packet: `[created_at, expires_at]`. Historical wallet packets always carry it.
+    /// A retained classic packet: `[created_at, expires_at]`. Historical wallet packets always
+    /// carry it.
     Original,
     /// A retained classic packet: `[0, expires_at]`.
     UnboundedStart,
@@ -1629,6 +1615,7 @@ fn packet_bounds(p: &PreparedOperation) -> Result<PacketBounds> {
     let Preconditions::Time(bounds) = envelope.tx.cond else {
         return Err("Transaction time bounds are required".into());
     };
+    // Every policy wallet packet of the typed request carries the current bounds.
     let kinds: &[PacketBounds] = if p.config.route == WalletRoute::Native {
         &[
             PacketBounds::Current,
@@ -1636,7 +1623,7 @@ fn packet_bounds(p: &PreparedOperation) -> Result<PacketBounds> {
             PacketBounds::Original,
         ]
     } else {
-        &[PacketBounds::Current, PacketBounds::Original]
+        &[PacketBounds::Current]
     };
     for kind in kinds {
         if bounds == transaction_bounds(&p.config, p.created_at, p.expires_at, *kind)? {

@@ -334,7 +334,7 @@ impl OwnerAdmin<'_> {
                 .as_ref()
                 .ok_or("Missing policy wallet custody state")?;
             PolicyBinding::from_scval(&rpc::readonly_call(self.rpc, c, &owner, "policy_binding")?)?
-                .verify(c, &hash(TRANSFER_SCHEMA))?;
+                .verify(c, OperationKind::Transfer)?;
             rpc::verify_custody(c, state)?;
         }
         Ok(Snapshot {

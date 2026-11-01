@@ -197,6 +197,7 @@ docs/                     Architecture, engine parent, administration, mainnet
 
 - [allowit.xyz](https://allowit.xyz) tells the story and holds the official narrative.
 - [allowit-sdk](https://github.com/allowit-hq/allowit-sdk) is the policy language and runtime. The `crates/allowit` core with its host backend becomes its `sdk/core`, for the offchain server and SDK evaluator.
+- [allowit-core](https://github.com/allowit-hq/allowit-core) holds the typed execution request and the policy compiler (crate `allowit-sdk`) that `stellar/core` builds on.
 - [allowit-contracts-solana](https://github.com/allowit-hq/allowit-contracts-solana) is the Solana sibling.
 - [allowit-cli](https://github.com/allowit-hq/allowit-cli) is the Go CLI for evaluating and executing actions under a policy.
 

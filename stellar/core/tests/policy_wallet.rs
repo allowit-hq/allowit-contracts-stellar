@@ -151,22 +151,33 @@ impl ModelChain {
             .clone()
     }
 }
-fn binding(w: &Wallet, schema: [u8; 32]) -> x::ScVal {
+/// The binding of `w`: Simple and Common run every operation, Custom no deposit.
+fn binding(w: &Wallet) -> x::ScVal {
+    use OperationKind::*;
     PolicyBinding {
         engine_kind: w.tier.kind().into(),
         contract_version: CONTRACT_VERSION,
         policy_instance: w.state.policy_instance,
         module_digest: w.module,
         source_digest: w.state.source_digest,
-        argument_schema_digest: schema,
-        entrypoint: "execute".into(),
+        operations: if w.tier == PolicyTier::Custom {
+            vec![Transfer, Swap, Redeem]
+        } else {
+            vec![Transfer, Swap, Deposit, Redeem]
+        },
     }
     .scval()
     .unwrap()
 }
-fn admits(tier: PolicyTier, schema: &[u8; 32]) -> bool {
-    *schema == OperationKind::Transfer.schema_digest()
-        || (tier != PolicyTier::Custom && *schema == OperationKind::Deposit.schema_digest())
+/// The variant name and arguments of the request's `AllowitStellarOperation`.
+fn operation(request: &x::ScVal) -> (String, &x::ScVal) {
+    let x::ScVal::Vec(Some(v)) = field(request, "operation") else {
+        panic!()
+    };
+    let [x::ScVal::Symbol(name), args] = v.as_slice() else {
+        panic!()
+    };
+    (String::from_utf8(name.0.to_vec()).unwrap(), args)
 }
 fn account_entry(a: &AccountState) -> x::LedgerEntryData {
     x::LedgerEntryData::Account(x::AccountEntry {
@@ -350,16 +361,7 @@ impl rpc::Rpc for ModelChain {
                             );
                         }
                         match function.as_str() {
-                            "policy_binding" => {
-                                (binding(w, OperationKind::Transfer.schema_digest()), vec![])
-                            }
-                            "policy_binding_for" => {
-                                let schema = digest(&call.args[0]);
-                                if !admits(w.tier, &schema) {
-                                    return Ok(json!({"error": "HostError: Error(Contract, #16)"}));
-                                }
-                                (binding(w, schema), vec![])
-                            }
+                            "policy_binding" => (binding(w), vec![]),
                             "execute" => {
                                 let request = &call.args[0];
                                 if w.state.paused {
@@ -471,24 +473,12 @@ impl rpc::Rpc for ModelChain {
 }
 /// The receipt `execute` returns for `request` on `w`.
 fn receipt_of(w: &Wallet, request: &x::ScVal) -> x::ScVal {
-    let invocation = field(request, "invocation");
-    let arguments: x::ScVal = {
-        let x::ScVal::Bytes(b) = field(invocation, "arguments") else {
-            panic!()
-        };
-        x::ScVal::from_xdr(b.as_slice(), Limits::none()).unwrap()
-    };
-    let schema = digest(field(invocation, "argument_schema_digest"));
-    let (to, amount) = if schema == OperationKind::Transfer.schema_digest() {
-        (
-            addr(field(&arguments, "to")),
-            int(field(&arguments, "amount")),
-        )
-    } else {
-        (
-            addr(field(&arguments, "vault")),
-            int(field(&arguments, "assets")),
-        )
+    let (to, amount) = match operation(request) {
+        (name, args) if name == "Transfer" => (addr(field(args, "to")), int(field(args, "amount"))),
+        (name, args) if name == "Deposit" => {
+            (addr(field(args, "vault")), int(field(args, "assets")))
+        }
+        _ => panic!(),
     };
     let x::ScVal::U64(nonce) = field(request, "nonce") else {
         panic!()
@@ -613,35 +603,38 @@ fn execute(w: &mut Wallet, request: &x::ScVal, now: u64) -> x::ScVal {
         panic!()
     };
     let (spent, gas, unpriced) = match field(request, "expense") {
-        x::ScVal::Bytes(b) => {
-            let e = x::ScVal::from_xdr(b.as_slice(), Limits::none()).unwrap();
-            (
-                int(field(&e, "spent_units")),
-                int(field(&e, "gas_units")),
-                false,
-            )
-        }
+        x::ScVal::Vec(Some(v)) if v.len() == 2 => (
+            int(field(&v[1], "spent_units")),
+            int(field(&v[1], "gas_units")),
+            false,
+        ),
         _ => (0, 0, true),
     };
     let args = PolicyParams::from_scval(field(request, "args")).unwrap();
-    let schema = digest(field(
-        field(request, "invocation"),
-        "argument_schema_digest",
-    ));
-    let deposit = schema == OperationKind::Deposit.schema_digest();
+    let (name, operation_args) = operation(request);
+    let deposit = name == "Deposit";
+    let vault = deposit.then(|| allowit::Address::new(addr(field(operation_args, "vault"))));
     let ctx = allowit::AllowitContext {
         env: allowit::AllowitEnv::new(),
         params: w.state.params.allowit().into(),
         state: w.state.policy_state.allowit(),
         request: allowit::AllowitRequest {
             operation: if deposit {
-                allowit::AllowitOperation::sep56_deposit
+                allowit::AllowitOperation::deposit
             } else {
-                allowit::AllowitOperation::sep41_transfer
+                allowit::AllowitOperation::transfer
             },
             asset: allowit::Address::new(w.state.asset.clone()),
             recipient: allowit::Address::new(addr(field(&receipt, "to"))),
             amount: int(field(&receipt, "amount")),
+            token_in: allowit::Address::new(w.state.asset.clone()),
+            amount_in: int(field(&receipt, "amount")),
+            token_out: vault,
+            min_out: if deposit {
+                int(field(operation_args, "min_shares"))
+            } else {
+                0
+            },
             now,
             expires_at: *expires_at,
             spent_units: spent,
@@ -687,7 +680,7 @@ fn request(c: &WalletConfig, id: u8, deposit: Option<i128>, amount: i128) -> Exe
         None => (
             NativeInstruction::StellarCall {
                 contract: wf(&c.asset),
-                schema_digest: OperationKind::Transfer.schema_digest(),
+                schema_digest: [0; 32],
                 function: "transfer".into(),
                 arguments: vec![
                     AbiValue::Account(wf(&c.wallet)),
@@ -700,7 +693,7 @@ fn request(c: &WalletConfig, id: u8, deposit: Option<i128>, amount: i128) -> Exe
         Some(min_shares) => (
             NativeInstruction::StellarCall {
                 contract: wf(&vault()),
-                schema_digest: OperationKind::Deposit.schema_digest(),
+                schema_digest: [0; 32],
                 function: "deposit".into(),
                 arguments: vec![
                     AbiValue::Signed128(amount),
@@ -937,7 +930,7 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
         .unwrap_err()
         .contains("TransactionCapExceeded")
     );
-    // 5. A SEP-56 deposit: Simple and Common admit it, Custom's compiled schema does not.
+    // 5. A SEP-56 deposit: Simple and Common run it, Custom's code does not.
     let ledger = chain.0.lock().unwrap().ledger;
     let deposit = request(&c, 2, Some(5_000_000), 5_000_000);
     let priced = ExecutionTerms {
@@ -948,7 +941,7 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
         assert!(
             run(&chain, &c, &deposit, &priced, "deposit")
                 .unwrap_err()
-                .contains("binding")
+                .contains("does not run deposit")
         );
     } else {
         let receipt = run(&chain, &c, &deposit, &priced, "deposit").unwrap();

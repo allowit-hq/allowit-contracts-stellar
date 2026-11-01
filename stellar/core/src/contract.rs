@@ -7,19 +7,9 @@ use crate::*;
 
 /// Custody layout this crate reads and writes.
 pub const CONTRACT_VERSION: u32 = 4;
-/// Most canonical bytes of the native operation arguments.
-pub const MAX_ARGUMENT_BYTES: usize = 1024;
-/// Most canonical bytes of the expense bounds.
-pub const MAX_EXPENSE_BYTES: usize = 1024;
 
 pub(crate) fn struct_value(entries: Vec<(&str, ScVal)>) -> Result<ScVal> {
     value_map(entries)
-}
-fn bytes_of(value: &ScVal) -> Result<Vec<u8>> {
-    value.to_xdr(limits()).map_err(err)
-}
-fn option<T>(value: Option<T>, f: impl FnOnce(T) -> Result<ScVal>) -> Result<ScVal> {
-    value.map(f).transpose().map(|v| v.unwrap_or(ScVal::Void))
 }
 fn string(value: &ScVal) -> Result<String> {
     match value {
@@ -71,50 +61,52 @@ fn exact_keys(value: &ScVal, keys: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// `AllowitSep41TransferArgs` canonical XDR.
-pub fn transfer_args(token: &str, from: &str, to: &str, amount: i128) -> Result<Vec<u8>> {
-    bytes_of(&struct_value(vec![
-        ("amount", i128_value(amount)),
-        ("from", ScVal::Address(address(from)?)),
-        ("to", ScVal::Address(address(to)?)),
-        ("token", ScVal::Address(address(token)?)),
-    ])?)
+/// One unit enum variant with its payload: `[Symbol(variant), payload]`.
+fn variant(name: &str, payload: ScVal) -> Result<ScVal> {
+    Ok(ScVal::Vec(Some(
+        vec![value_symbol(name)?, payload].try_into().map_err(err)?,
+    )))
 }
-/// `AllowitSep56DepositArgs` canonical XDR.
-pub fn deposit_args(d: &Deposit) -> Result<Vec<u8>> {
-    bytes_of(&struct_value(vec![
-        ("assets", i128_value(d.assets)),
-        ("from", ScVal::Address(address(&d.from)?)),
-        ("min_shares", i128_value(d.min_shares)),
-        ("operator", ScVal::Address(address(&d.operator)?)),
-        ("receiver", ScVal::Address(address(&d.receiver)?)),
-        ("vault", ScVal::Address(address(&d.vault)?)),
-    ])?)
-}
-/// `AllowitExpenseBounds` canonical XDR for the wallet asset.
-pub fn expense_bounds(asset: &str, e: &ExpenseBounds) -> Result<Vec<u8>> {
-    bytes_of(&struct_value(vec![
-        ("asset", ScVal::Address(address(asset)?)),
-        ("conversion_units", i128_value(e.conversion_units)),
-        ("day", ScVal::U64(e.day)),
-        ("decimals", ScVal::U32(7)),
-        ("gas_units", i128_value(e.gas_units)),
-        ("max_fee_stroops", ScVal::U32(e.max_fee_stroops)),
-        ("observed_ledger", ScVal::U32(e.observed_ledger)),
-        ("spent_units", i128_value(e.spent_units)),
-    ])?)
-}
-/// `AllowitPolicyInvocation` for one native operation.
-pub fn invocation(module_digest: &[u8; 32], schema: &[u8; 32], arguments: &[u8]) -> Result<ScVal> {
-    if arguments.len() > MAX_ARGUMENT_BYTES {
-        return Err("Native operation arguments exceed the contract bound".into());
+/// `AllowitStellarOperation` of one native operation. The wallet is every source, receiver and
+/// operator, so no argument names it.
+pub fn operation(asset: &str, operation: &StellarOperation) -> Result<ScVal> {
+    match operation {
+        StellarOperation::Transfer(t) => variant(
+            "Transfer",
+            struct_value(vec![
+                ("amount", i128_value(t.amount)),
+                ("to", ScVal::Address(address(&t.recipient)?)),
+                ("token", ScVal::Address(address(asset)?)),
+            ])?,
+        ),
+        StellarOperation::Deposit(d) => variant(
+            "Deposit",
+            struct_value(vec![
+                ("assets", i128_value(d.assets)),
+                ("min_shares", i128_value(d.min_shares)),
+                ("vault", ScVal::Address(address(&d.vault)?)),
+            ])?,
+        ),
     }
-    struct_value(vec![
-        ("argument_schema_digest", value_bytes(schema)?),
-        ("arguments", value_bytes(arguments)?),
-        ("entrypoint", value_symbol("execute")?),
-        ("module_digest", value_bytes(module_digest)?),
-    ])
+}
+/// `AllowitExpense`: `Unpriced`, or `Priced` with the server-approved `AllowitExpenseBounds`.
+pub fn expense(expense: Option<&ExpenseBounds>) -> Result<ScVal> {
+    let Some(e) = expense else {
+        return Ok(ScVal::Vec(Some(
+            vec![value_symbol("Unpriced")?].try_into().map_err(err)?,
+        )));
+    };
+    variant(
+        "Priced",
+        struct_value(vec![
+            ("conversion_units", i128_value(e.conversion_units)),
+            ("day", ScVal::U64(e.day)),
+            ("gas_units", i128_value(e.gas_units)),
+            ("max_fee_stroops", ScVal::U32(e.max_fee_stroops)),
+            ("observed_ledger", ScVal::U32(e.observed_ledger)),
+            ("spent_units", i128_value(e.spent_units)),
+        ])?,
+    )
 }
 /// Every field of one `AllowitExecutionRequest`.
 pub struct ExecutionPacket<'a> {
@@ -124,25 +116,21 @@ pub struct ExecutionPacket<'a> {
     pub nonce: u64,
     pub deployment_version: u64,
     pub expires_at: u64,
-    pub invocation: ScVal,
-    pub expense: Option<Vec<u8>>,
+    pub module_digest: &'a [u8; 32],
+    pub operation: ScVal,
+    pub expense: ScVal,
     pub args: &'a PolicyParams,
 }
 /// `AllowitExecutionRequest`.
 pub fn execution_request(p: ExecutionPacket) -> Result<ScVal> {
-    if p.expense
-        .as_ref()
-        .is_some_and(|e| e.len() > MAX_EXPENSE_BYTES)
-    {
-        return Err("Expense bounds exceed the contract bound".into());
-    }
     struct_value(vec![
         ("args", p.args.scval()?),
         ("deployment_version", ScVal::U64(p.deployment_version)),
-        ("expense", option(p.expense, |e| value_bytes(&e))?),
+        ("expense", p.expense),
         ("expires_at", ScVal::U64(p.expires_at)),
-        ("invocation", p.invocation),
+        ("module_digest", value_bytes(p.module_digest)?),
         ("nonce", ScVal::U64(p.nonce)),
+        ("operation", p.operation),
         ("operation_id", value_bytes(p.operation_id)?),
         ("policy_instance", value_bytes(p.policy_instance)?),
         ("source_hash", value_bytes(p.source_hash)?),
@@ -403,8 +391,8 @@ pub struct PolicyBinding {
     pub policy_instance: [u8; 32],
     pub module_digest: [u8; 32],
     pub source_digest: [u8; 32],
-    pub argument_schema_digest: [u8; 32],
-    pub entrypoint: String,
+    /// The general operations that the installed code runs.
+    pub operations: Vec<OperationKind>,
 }
 impl PolicyBinding {
     pub fn from_scval(value: &ScVal) -> Result<Self> {
@@ -412,51 +400,65 @@ impl PolicyBinding {
         exact_keys(
             value,
             &[
-                "argument_schema_digest",
                 "contract_version",
                 "engine_kind",
-                "entrypoint",
                 "module_digest",
+                "operations",
                 "policy_instance",
                 "source_digest",
             ],
         )?;
+        let ScVal::Vec(Some(operations)) = map_field(value, "operations")? else {
+            return Err("Expected the binding's operation list".into());
+        };
         Ok(Self {
             engine_kind: symbol_text(map_field(value, "engine_kind")?)?,
             contract_version: u32_field(map_field(value, "contract_version")?)?,
             policy_instance: digest_field(map_field(value, "policy_instance")?)?,
             module_digest: digest_field(map_field(value, "module_digest")?)?,
             source_digest: digest_field(map_field(value, "source_digest")?)?,
-            argument_schema_digest: digest_field(map_field(value, "argument_schema_digest")?)?,
-            entrypoint: symbol_text(map_field(value, "entrypoint")?)?,
+            operations: operations
+                .iter()
+                .map(OperationKind::from_scval)
+                .collect::<Result<_>>()?,
         })
     }
     pub fn scval(&self) -> Result<ScVal> {
         struct_value(vec![
-            (
-                "argument_schema_digest",
-                value_bytes(&self.argument_schema_digest)?,
-            ),
             ("contract_version", ScVal::U32(self.contract_version)),
             ("engine_kind", value_symbol(&self.engine_kind)?),
-            ("entrypoint", value_symbol(&self.entrypoint)?),
             ("module_digest", value_bytes(&self.module_digest)?),
+            (
+                "operations",
+                ScVal::Vec(Some(
+                    self.operations
+                        .iter()
+                        .map(|op| op.scval())
+                        .collect::<Result<Vec<_>>>()?
+                        .try_into()
+                        .map_err(err)?,
+                )),
+            ),
             ("policy_instance", value_bytes(&self.policy_instance)?),
             ("source_digest", value_bytes(&self.source_digest)?),
         ])
     }
-    /// Check this binding against the installation for one argument schema.
-    pub fn verify(&self, c: &WalletConfig, schema: &[u8; 32]) -> Result<()> {
+    /// Check this binding against the installation and require that its code runs `operation`.
+    pub fn verify(&self, c: &WalletConfig, operation: OperationKind) -> Result<()> {
         let tier = c.tier.ok_or("Selected policy tier is required")?;
         if self.engine_kind != tier.kind()
             || self.contract_version != CONTRACT_VERSION
             || self.policy_instance != c.policy_instance
             || self.module_digest != c.module_digest
             || self.source_digest != c.source_digest
-            || self.argument_schema_digest != *schema
-            || self.entrypoint != "execute"
         {
             return Err("Installed policy binding differs from the installation".into());
+        }
+        if !self.operations.contains(&operation) {
+            return Err(format!(
+                "The installed policy wallet does not run {}",
+                operation.name()
+            ));
         }
         Ok(())
     }

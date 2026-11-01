@@ -98,7 +98,7 @@ fn fixture_with_wallet(
     let instruction = if usdc {
         NativeInstruction::StellarCall {
             contract: wf(&c.asset),
-            schema_digest: hash(ARGUMENT_SCHEMA),
+            schema_digest: [0; 32],
             function: "transfer".into(),
             arguments: vec![
                 AbiValue::Account(wf(&c.wallet)),
@@ -1413,16 +1413,22 @@ fn custody_scval(
     .scval()
     .unwrap()
 }
-/// The installed binding of the fixture wallet for one schema.
-fn binding_scval(c: &WalletConfig, schema: [u8; 32]) -> stellar_xdr::ScVal {
+/// The installed binding of the fixture wallet: Simple and Common run every operation, Custom
+/// no deposit.
+fn binding_scval(c: &WalletConfig) -> stellar_xdr::ScVal {
+    use OperationKind::*;
+    let tier = c.tier.unwrap();
     allowit_stellar_wallet::contract::PolicyBinding {
-        engine_kind: c.tier.unwrap().kind().into(),
+        engine_kind: tier.kind().into(),
         contract_version: CONTRACT_VERSION,
         policy_instance: c.policy_instance,
         module_digest: c.module_digest,
         source_digest: c.source_digest,
-        argument_schema_digest: schema,
-        entrypoint: "execute".into(),
+        operations: if tier == PolicyTier::Custom {
+            vec![Transfer, Swap, Redeem]
+        } else {
+            vec![Transfer, Swap, Deposit, Redeem]
+        },
     }
     .scval()
     .unwrap()
@@ -1517,7 +1523,7 @@ impl rpc::Rpc for PolicyWalletAccountRpc {
                     panic!()
                 };
                 assert_eq!(call.function_name.0.as_slice(), b"policy_binding");
-                let binding = binding_scval(c, hash(TRANSFER_SCHEMA));
+                let binding = binding_scval(c);
                 Ok(json!({"results":[{"xdr":binding.to_xdr_base64(Limits::none()).unwrap()}]}))
             }
             _ => Err("unexpected RPC".into()),
@@ -1835,7 +1841,7 @@ impl rpc::Rpc for AdminRpc {
             };
             let function = String::from_utf8(call.function_name.0.to_vec()).unwrap();
             if function == "policy_binding" {
-                let mut binding = binding_scval(&self.base.config, hash(TRANSFER_SCHEMA));
+                let mut binding = binding_scval(&self.base.config);
                 let ScVal::Map(Some(map)) = &mut binding else {
                     panic!()
                 };
@@ -3140,29 +3146,6 @@ fn policy_wallet_packets_omit_the_lower_bound_and_the_expiry_second() {
     let mut changed = prepared.clone();
     changed.expires_at = 86699;
     assert!(validate_retained_prepared(&changed).is_err());
-
-    // A packet signed with the original bounds `[created_at, expires_at]` keeps its exact bytes
-    // for status, recovery and an unchanged resend, but it cannot be signed again.
-    let retained: Value = serde_json::from_str(include_str!(
-        "fixtures/stellar-policy-wallet-retained-bounds.json"
-    ))
-    .unwrap();
-    let old: PreparedOperation = serde_json::from_value(retained["prepared"].clone()).unwrap();
-    let old_signed: SignedOperation = serde_json::from_value(retained["signed"].clone()).unwrap();
-    assert_eq!(
-        bounds(&old.transaction_xdr),
-        TimeBounds {
-            min_time: TimePoint(86401),
-            max_time: TimePoint(86700),
-        }
-    );
-    validate_retained_prepared(&old).unwrap();
-    validate_retained_signed(&old_signed).unwrap();
-    validate_signed(&old_signed, 86402).unwrap();
-    let revalidated = rpc::revalidate_prepared(&preflight_fixture(), &old, 86402).unwrap();
-    assert_eq!(revalidated.transaction_xdr, old.transaction_xdr);
-    let error = sign(&revalidated, &[2; 32], 86402).unwrap_err();
-    assert!(error.contains("read-only"), "{error}");
 }
 
 #[test]

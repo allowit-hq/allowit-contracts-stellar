@@ -142,8 +142,8 @@ pub fn prepare(
         expires_at,
     )
 }
-/// `prepare` with execution args and expense bounds. A deposit first checks that the installed
-/// policy admits the SEP-56 schema.
+/// `prepare` with execution args and expense bounds. An operation other than a transfer first
+/// checks that the installed code runs it.
 pub fn prepare_with(
     rpc: &dyn Rpc,
     c: &WalletConfig,
@@ -159,15 +159,8 @@ pub fn prepare_with(
     }
     let operation = operation_from_request(c, request)?;
     if operation.kind() != OperationKind::Transfer {
-        let binding = PolicyBinding::from_scval(&readonly_result(&readonly_simulation(
-            rpc,
-            c,
-            &state.source,
-            &c.wallet,
-            "policy_binding_for",
-            vec![value_bytes(&operation.kind().schema_digest())?],
-        )?)?)?;
-        binding.verify(c, &operation.kind().schema_digest())?;
+        PolicyBinding::from_scval(&readonly_call(rpc, c, &state.source, "policy_binding")?)?
+            .verify(c, operation.kind())?;
     }
     let intent = prepare_for_native_preflight(c, request, terms, &state, now, expires_at)?;
     simulate(rpc, &intent)
@@ -899,7 +892,7 @@ fn current_wallet_state(
         return Err("Customer is not a current policy wallet agent account signer".into());
     }
     PolicyBinding::from_scval(&readonly_call(rpc, c, &source, "policy_binding")?)?
-        .verify(c, &hash(TRANSFER_SCHEMA))?;
+        .verify(c, OperationKind::Transfer)?;
     if require_customer_quorum {
         let server = get_account(rpc, &c.server)?;
         server.validate_signer_quorum(&[&c.server], server.medium_threshold)?;
@@ -967,7 +960,8 @@ fn historical_wallet_state(
     if digest_field(map_field(&binding, "policy_instance")?)? != c.policy_instance
         || digest_field(map_field(&binding, "module_digest")?)? != c.module_digest
         || digest_field(map_field(&binding, "source_digest")?)? != c.source_hash
-        || digest_field(map_field(&binding, "argument_schema_digest")?)? != hash(TRANSFER_SCHEMA)
+        || digest_field(map_field(&binding, "argument_schema_digest")?)?
+            != hash(ODC_TRANSFER_SCHEMA)
         || map_field(&binding, "entrypoint")? != &value_symbol("_execute")?
     {
         return Err("Compiled policy binding differs from installation".into());
