@@ -4,7 +4,6 @@ import json
 import re
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,21 +29,16 @@ def _checked_file(root, revision, relative):
 
 @functools.lru_cache(maxsize=1)
 def core_root():
-    manifest = tomllib.loads((ROOT / "Cargo.toml").read_text())
-    declaration = manifest["workspace"]["dependencies"]["allowit"]
-    tag = declaration.get("tag", "")
-    if declaration.get("git") != CANONICAL or not re.fullmatch(r"v\d+\.\d+\.\d+", tag):
-        raise ValueError("The portable library must name a released canonical Core tag")
     metadata = json.loads(_run(["cargo", "metadata", "--locked", "--format-version", "1"]))
     candidates = [package for package in metadata["packages"] if package["name"] == "allowit"]
     if len(candidates) != 1:
         raise ValueError("The build must resolve exactly one portable Core library")
     package = candidates[0]
-    expected_source = "git+" + CANONICAL + "?tag=" + tag + "#"
     source = package.get("source") or ""
-    revision = source.removeprefix(expected_source)
-    if not source.startswith(expected_source) or not re.fullmatch(r"[0-9a-f]{40}", revision):
-        raise ValueError("The portable library is not the declared canonical Core release")
+    identity = re.fullmatch(r"git\+" + re.escape(CANONICAL) + r"\?tag=(v\d+\.\d+\.\d+)#([0-9a-f]{40})", source)
+    if identity is None:
+        raise ValueError("The portable library must resolve to a released canonical Core tag")
+    revision = identity.group(2)
     root = Path(package["manifest_path"]).resolve().parents[2]
     if _run(["git", "-C", str(root), "rev-parse", "HEAD"]).decode().strip() != revision:
         raise ValueError("Core checkout does not match its locked release")
