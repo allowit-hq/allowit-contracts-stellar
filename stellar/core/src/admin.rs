@@ -1,6 +1,7 @@
 //! Owner preparation for the layout 4 policy wallet interface: Wasm upload, wallet creation and
 //! owner calls. Preparation simulates and checks every authorization; it never signs. The owner
-//! signs with `sign_owner_transaction`, then SDK engine submits and observes its exact native hash.
+//! validates its business intent with `owner_intent` before signing through a caller capability.
+//! SDK engine submits and observes the exact native hash.
 use crate::contract::{CustodyState, KeptState, PolicyBinding};
 use crate::*;
 use allowit_policy_sdk::admin::{DeployPolicy, DeploymentVersion, RecoverFunds, SetPause};
@@ -1332,8 +1333,9 @@ impl Deployer<'_> {
         self.prepared(&account, "create_wallet", wasm_hash, Some(wallet), tx)
     }
 }
-/// Sign an unsigned prepared transaction as its G-account source. The seed must own the
-/// transaction source; nothing else is signed.
+/// Low-level source-account signing. This checks unsigned v1 envelope ownership only; it does
+/// not validate the business intent, fees or expiry. Use [`crate::owner_intent`] to validate an
+/// untrusted prepared packet against independently approved intent before requesting a signature.
 pub fn sign_owner_transaction(
     network: &str,
     transaction_xdr: &str,
