@@ -209,7 +209,7 @@ docs/                     Architecture, engine parent, administration, mainnet
 
 ## Contributing
 
-Pull requests run the portable policy checks and the chain-free policy smoke tests. A pull request that changes `stellar/core` also runs its format, test and clippy checks. The full Wasm build and `cargo test --workspace --locked` run on a schedule and on demand. Before you open a pull request:
+Pull requests run the portable policy checks and the chain-free policy smoke tests. A pull request that changes `stellar/core` also runs its format, test and clippy checks. The full Wasm build and `cargo test --workspace --locked` run for pull requests, pushes, scheduled checks and manual runs. Before you open a pull request:
 
 ```sh
 python3 scripts/check-policy-bindings.py
