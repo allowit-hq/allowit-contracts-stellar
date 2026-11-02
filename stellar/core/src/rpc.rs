@@ -506,6 +506,51 @@ pub fn validate_receipt(
     }
     Ok(())
 }
+/// Verify an exact policy-wallet envelope using its chain receipt after key rotation.
+/// This checks native identity and the retained server authorization, without current signing admission.
+/// A failed enclosing transaction does not revoke its reusable address authorization.
+pub fn validate_settled_policy_packet(
+    signed: &SignedOperation,
+    receipt: &VerifiedReceipt,
+) -> Result<()> {
+    let prepared = &signed.prepared;
+    if prepared.config.route != WalletRoute::PolicyWallet {
+        return Err("Chain-only recovery requires a policy wallet packet".into());
+    }
+    validate_retained_prepared(prepared)?;
+    validate_receipt(
+        receipt,
+        &prepared.config.network,
+        &prepared.transaction_hash,
+    )?;
+    if signed.transaction_hash != prepared.transaction_hash
+        || signed.transaction_xdr != receipt.envelope_xdr
+    {
+        return Err("The settlement envelope differs from the verified receipt".into());
+    }
+    let (TransactionEnvelope::Tx(envelope), TransactionEnvelope::Tx(unsigned)) = (
+        read(&signed.transaction_xdr)?,
+        read(&prepared.transaction_xdr)?,
+    ) else {
+        return Err("Unsupported settlement envelope".into());
+    };
+    if envelope.tx != unsigned.tx {
+        return Err("The settlement transaction differs from its original packet".into());
+    }
+    let Some(OperationBody::InvokeHostFunction(op)) =
+        unsigned.tx.operations.first().map(|op| &op.body)
+    else {
+        return Err("The policy invocation is missing".into());
+    };
+    // Retained preparation validates the exact server scope/signature when present.
+    // Settlement recovery additionally requires that authorization to be present.
+    if !matches!(op.auth.get(1).map(|entry| &entry.credentials), Some(SorobanCredentials::Address(credentials)) if credentials.signature != ScVal::Void)
+    {
+        return Err("The original server authorization is unsigned".into());
+    }
+    Ok(())
+}
+
 /// Read a verified terminal receipt. Absence remains unknown and does not release reservations.
 pub fn receipt_by_hash(
     rpc: &dyn Rpc,

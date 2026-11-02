@@ -1649,6 +1649,18 @@ fn current_authorization_bounds(p: &PreparedOperation) -> Result<()> {
     Ok(())
 }
 pub fn sign(p: &PreparedOperation, seed: &[u8; 32], now: u64) -> Result<DetachedSignature> {
+    sign_with(p, &account_for_seed(seed), now, |digest| {
+        Ok(SigningKey::from_bytes(seed).sign(digest).to_bytes())
+    })
+}
+/// Sign through a caller-owned key capability after native admission checks.
+/// The capability receives only the exact transaction hash and must return its Ed25519 signature.
+pub fn sign_with(
+    p: &PreparedOperation,
+    signer: &str,
+    now: u64,
+    sign_hash: impl FnOnce(&[u8; 32]) -> Result<[u8; 64]>,
+) -> Result<DetachedSignature> {
     validate_prepared(p, now)?;
     current_authorization_bounds(p)?;
     validate_signing_policy(p, now)?;
@@ -1658,7 +1670,6 @@ pub fn sign(p: &PreparedOperation, seed: &[u8; 32], now: u64) -> Result<Detached
     if p.config.route == WalletRoute::PolicyWallet {
         authorization::server_signature(p, true)?;
     }
-    let signer = account_for_seed(seed);
     let allowed = if p.config.route == WalletRoute::Native {
         signer == p.config.agent || signer == p.config.server
     } else {
@@ -1667,12 +1678,14 @@ pub fn sign(p: &PreparedOperation, seed: &[u8; 32], now: u64) -> Result<Detached
     if !allowed {
         return Err("Signer has no automated role".into());
     }
+    let signature = sign_hash(&p.transaction_hash)?;
+    VerifyingKey::from_bytes(&account_key(signer)?)
+        .map_err(err)?
+        .verify_strict(&p.transaction_hash, &EdSignature::from_bytes(&signature))
+        .map_err(|_| "Signing capability returned an invalid signature")?;
     Ok(DetachedSignature {
-        signer,
-        signature: SigningKey::from_bytes(seed)
-            .sign(&p.transaction_hash)
-            .to_bytes()
-            .to_vec(),
+        signer: signer.into(),
+        signature: signature.to_vec(),
     })
 }
 fn transaction_signers(p: &PreparedOperation, candidates: &[&str]) -> Result<Vec<String>> {

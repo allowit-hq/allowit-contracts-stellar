@@ -3862,3 +3862,78 @@ fn uncertain_submission_errors_name_the_transaction_hash() {
         );
     }
 }
+
+#[test]
+fn caller_owned_signing_runs_only_after_admission_and_verifies_the_exact_hash() {
+    use ed25519_dalek::{Signer, SigningKey};
+    let (config, request, state) = fixture(WalletRoute::Native, false);
+    let prepared = prepare(&config, &request, &state, 86401, 86700).unwrap();
+    let signed = sign_with(&prepared, &config.agent, 86401, |hash| {
+        assert_eq!(*hash, prepared.transaction_hash);
+        Ok(SigningKey::from_bytes(&[2; 32]).sign(hash).to_bytes())
+    })
+    .unwrap();
+    assert_eq!(signed, sign(&prepared, &[2; 32], 86401).unwrap());
+    assert!(sign_with(&prepared, &config.agent, 86401, |_| Ok([0; 64])).is_err());
+    assert!(
+        sign_with(&prepared, &config.owner, 86401, |_| panic!(
+            "unauthorized signer reached key capability"
+        ))
+        .is_err()
+    );
+    let mut retired = prepared;
+    retired.config.language = PolicyLanguage::Legacy;
+    assert!(
+        sign_with(&retired, &config.agent, 86401, |_| panic!(
+            "retired policy reached key capability"
+        ))
+        .is_err()
+    );
+}
+
+#[test]
+fn chain_receipt_recovers_the_exact_policy_packet_without_new_signing_admission() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "fixtures/stellar-policy-wallet-revalidation-rpc.json"
+    ))
+    .unwrap();
+    let signed: SignedOperation = serde_json::from_value(fixture["signed"].clone()).unwrap();
+    let chain = FakeRpc {
+        calls: Mutex::new(vec![]),
+        signed: signed.clone(),
+        fail_send: false,
+    };
+    let receipt = rpc::receipt_by_hash(
+        &chain,
+        &signed.prepared.config.network,
+        &signed.transaction_hash,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(validate_prepared(&signed.prepared, 90_000).is_err());
+    rpc::validate_settled_policy_packet(&signed, &receipt).unwrap();
+    let mut changed = signed.clone();
+    changed.transaction_hash[0] ^= 1;
+    assert!(rpc::validate_settled_policy_packet(&changed, &receipt).is_err());
+    let (config, request, state) = self::fixture(WalletRoute::PolicyWallet, false);
+    let unsigned = prepare(&config, &request, &state, 86401, 86700).unwrap();
+    let unsigned = SignedOperation {
+        transaction_xdr: unsigned.transaction_xdr.clone(),
+        transaction_hash: unsigned.transaction_hash,
+        prepared: unsigned,
+        role_signatures: vec![],
+    };
+    let chain = FakeRpc {
+        calls: Mutex::new(vec![]),
+        signed: unsigned.clone(),
+        fail_send: false,
+    };
+    let receipt = rpc::receipt_by_hash(&chain, &config.network, &unsigned.transaction_hash)
+        .unwrap()
+        .unwrap();
+    assert!(
+        rpc::validate_settled_policy_packet(&unsigned, &receipt)
+            .unwrap_err()
+            .contains("unsigned")
+    );
+}
