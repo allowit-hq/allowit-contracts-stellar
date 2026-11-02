@@ -36,7 +36,7 @@ Policy wallet custody calls the layout 4 `execute` entrypoint (`CONTRACT_VERSION
 
 `policy::source_shape` re-exports the Core portable gate: one self-contained file, `allowit` as the only path root, the macro, attribute and identifier allowlists, and one `pub fn execute(ctx: &AllowitContext) -> allowit::Result`. It returns the standard prefix, whether the source is canonical-only and whether it writes state. `policy::params_from_json` matches `scripts/contract_admin.py` `params`, and `policy::policy_rules` matches its `policy_rules`. `tests/policy_vectors.rs` replays native param vectors and checks native owner binding to the shared gate. Generic Rust/Python source-gate vectors live in Core. The std-only host compile stays in the server build gate.
 
-`policy::evaluate` runs a policy on the host as the wallet does. A Common wallet runs its standard prefix first. A canonical-only source, or any source with a compiled evaluator, then runs in full. Otherwise the result is `Evaluation::Prefix`: only the onchain part ran. The legacy `allowit::v1` compiler verifies only legacy-language classic installs.
+`policy::evaluate` runs a policy on the host as the wallet does. A Common wallet runs its standard prefix first. A canonical-only source, or any source with a compiled evaluator, then runs in full. Otherwise the result is `Evaluation::Prefix`: only the onchain part ran. Fresh classic installs admit only canonical portable source and canonical params.
 
 ## Owner setup
 
