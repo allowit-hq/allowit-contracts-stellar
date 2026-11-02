@@ -2,7 +2,15 @@
 
 *Prepare, authorize and settle a policy-bound Stellar transfer, deposit or redeem, with the agent and the service each holding their own key.*
 
-`allowit-stellar-wallet` is the Stellar rail core. It turns a canonical execution request into an exact Stellar transaction, routes it through the custody the owner chose (a classic G-address account or a policy wallet contract), collects the two required authorizations, and keeps the signed bytes so an uncertain broadcast can be recovered instead of repeated. The custody contracts themselves live in the [`crates/`](../../crates) folder of this repository; the engine of the [Allowit SDK](https://github.com/allowit-hq/allowit-sdk) composes this crate on the agent's behalf.
+`allowit-stellar-wallet` is the Stellar rail core. It maps a canonical execution request to an exact Stellar transaction and requires agent and server authorization.
+Custody uses the owner's classic G-address account or policy wallet contract. The custody contracts live in [`crates/`](../../crates).
+The rail's recovery rules preserve the original signed bytes and transaction identity after an uncertain broadcast.
+
+The [SDK engine](https://github.com/allowit-hq/allowit-sdk/tree/main/engine) composes this crate for both CLI and server callers.
+It owns reusable offchain preparation, execution, status and recovery workflows.
+This rail core owns Stellar encoding, signatures, simulation, receipts and transaction validity and finality rules.
+Common HTTP/JSON-RPC transport and journal primitives belong to [Allowit core](https://github.com/allowit-hq/allowit-core).
+Callers provide RPC, signing and storage bindings. Each actor retains its private keys and policy authority.
 
 Run its checks with:
 
