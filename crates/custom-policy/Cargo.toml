@@ -17,7 +17,7 @@ test-catching = []
 [dependencies]
 soroban-sdk = { workspace = true }
 allowit-wallet-protocol = { path = "../protocol" }
-allowit = { path = "../allowit" }
+allowit = { workspace = true }
 allowit-policy-wallet = { path = "../policy-wallet" }
 
 [build-dependencies]

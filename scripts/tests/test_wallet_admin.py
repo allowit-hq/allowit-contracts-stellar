@@ -1131,7 +1131,8 @@ class ContractAdmin(unittest.TestCase):
     def test_checker_enums_name_every_core_variant(self):
         import re
         import policy_source
-        core = (ROOT / "crates" / "allowit" / "src" / "core.rs").read_text()
+        from core_sources import core_root
+        core = (core_root() / "crates" / "allowit" / "src" / "core.rs").read_text()
         for enum, variants in policy_source.ENUMS.items():
             body = re.search(r"pub enum " + enum + r" \{(.*?)\n\s*\}", core, re.S)
             self.assertIsNotNone(body, enum)

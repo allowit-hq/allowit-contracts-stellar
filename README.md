@@ -36,7 +36,7 @@ Pick **Simple** when your server already runs the whole policy and you want the 
 
 ### The canonical rules
 
-The canonical rules live in `crates/allowit`. Each rule takes one value that the policy reads by key from the owner's `params`, such as `&ctx.params[allowit::DESTINATIONS]`, and returns its passing constraint or an error. The standard contract admits only these nine keys, runs only the rules the owner lists, in that order, and skips a rule whose param is absent. An empty list means no onchain business checks, like Simple.
+The canonical rules live in the portable `allowit` package in [Allowit core](https://github.com/allowit-hq/allowit-core/tree/main/crates/allowit). Each rule takes one value that the policy reads by key from the owner's `params`, such as `&ctx.params[allowit::DESTINATIONS]`, and returns its passing constraint or an error. The standard contract admits only these nine keys, runs only the rules the owner lists, in that order, and skips a rule whose param is absent. An empty list means no onchain business checks, like Simple.
 
 | Rule and param key | What it does |
 | --- | --- |
@@ -54,7 +54,7 @@ Value types, the standard state keys and error mapping are in [docs/architecture
 
 ## Write a policy
 
-Policy source is ordinary synchronous Rust against `crates/allowit`. The offchain server and `AllowitCustomPolicy` compile the same file verbatim:
+Policy source is ordinary synchronous Rust against the same released portable `allowit` package. The offchain server and `AllowitCustomPolicy` compile the same file verbatim:
 
 ```rust
 use allowit::prelude::*;
@@ -180,7 +180,6 @@ The step-by-step guide, including params encoding and owner handoffs, is in [doc
 
 ```
 crates/
-  allowit/                Portable policy core, canonical rules and the host and Soroban backends
   protocol/               Shared request, receipt and binding types
   policy-wallet/          Custody core, owner operations and the policy_wallet! macro
   simple-policy-engine/   AllowitSimplePolicyEngine contract
@@ -197,10 +196,9 @@ docs/                     Architecture, engine parent, administration, mainnet
 ## Part of Allowit
 
 - [allowit.xyz](https://allowit.xyz) tells the story and holds the official narrative.
-- [allowit-sdk](https://github.com/allowit-hq/allowit-sdk) is the policy language and runtime. The `crates/allowit` core with its host backend becomes its `sdk/core`, for the offchain server and SDK evaluator.
-- [allowit-core](https://github.com/allowit-hq/allowit-core) holds the typed execution request and the policy compiler (crate `allowit-sdk`) that `stellar/core` builds on.
+- [allowit-sdk](https://github.com/allowit-hq/allowit-sdk) provides shared execution workflows for CLI and server callers. The CLI owns local keys and terminal interaction.
+- [allowit-core](https://github.com/allowit-hq/allowit-core) owns the portable policy library and source gate, plus common host transport and store primitives. Stellar owns native request DTOs and wallet implementation selectors.
 - [allowit-contracts-solana](https://github.com/allowit-hq/allowit-contracts-solana) is the Solana sibling.
-- [allowit-cli](https://github.com/allowit-hq/allowit-cli) is the Go CLI for evaluating and executing actions under a policy.
 
 ## Documentation
 
@@ -228,7 +226,7 @@ cargo test --locked --manifest-path stellar/core/Cargo.toml
 cargo clippy --locked --manifest-path stellar/core/Cargo.toml --all-targets -- -D warnings
 ```
 
-`stellar/core` pins the `allowit-core` release tag `v0.1.0`. Releases of this repository are annotated git tags `vX.Y.Z`: set `version` in `Cargo.toml` and `stellar/core/Cargo.toml`, merge, then tag the merge commit with `git tag -a vX.Y.Z -m vX.Y.Z <commit> && git push origin vX.Y.Z`.
+All packages consume the same `allowit-core` release tag `v0.2.0`. Releases of this repository are annotated git tags `vX.Y.Z`: set `version` in `Cargo.toml` and `stellar/core/Cargo.toml`, merge, then tag the merge commit with `git tag -a vX.Y.Z -m vX.Y.Z <commit> && git push origin vX.Y.Z`.
 
 Keep contract code, the `stellar/core` rail crate, build and API documentation and release inputs here. [AGENTS.md](AGENTS.md) describes the repository scope.
 

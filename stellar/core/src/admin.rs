@@ -1,6 +1,6 @@
 //! Owner preparation for the layout 4 policy wallet interface: Wasm upload, wallet creation and
 //! owner calls. Preparation simulates and checks every authorization; it never signs. The owner
-//! signs with `sign_owner_transaction`, then `rpc::send_and_poll` submits and waits.
+//! signs with `sign_owner_transaction`, then SDK engine submits and observes its exact native hash.
 use crate::contract::{CustodyState, KeptState, PolicyBinding};
 use crate::*;
 use allowit_policy_sdk::admin::{DeployPolicy, DeploymentVersion, RecoverFunds, SetPause};

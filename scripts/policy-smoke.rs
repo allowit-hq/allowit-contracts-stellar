@@ -1,5 +1,5 @@
 //! Compile the authored custom policies against the allowit host backend without chain dependencies.
-//! rustc --edition=2024 -Coverflow-checks=on --crate-type=rlib --crate-name=allowit --cfg 'feature="std"' crates/allowit/src/lib.rs
+//! Compile the exact Core portable library selected by scripts/core_sources.py, then this test.
 //! rustc --edition=2024 -Coverflow-checks=on --test --extern allowit=liballowit.rlib scripts/policy-smoke.rs
 //! `cargo test` in `allowit-policy-wallet` runs these commands, then compares the
 //! `vectors_print_host_outcomes` lines with the Soroban backend and the wallet contracts.

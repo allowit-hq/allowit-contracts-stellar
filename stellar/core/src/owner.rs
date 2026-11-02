@@ -175,6 +175,99 @@ pub fn validate_native_setup(v: &NativeSetup) -> Result<()> {
     Ok(())
 }
 
+/// Read the native setup profile from Horizon without granting any authority.
+/// Only a fresh funded Testnet account without additional entries is admitted.
+pub fn fresh_testnet_owner_account(owner: &str, endpoint: Option<&str>) -> Result<AccountState> {
+    account_key(owner)?;
+    let origin = service_origin(endpoint, "https://horizon-testnet.stellar.org")?;
+    if service_json(&format!("{origin}/"))?["network_passphrase"] != passphrase("stellar:testnet")?
+    {
+        return Err("Stellar endpoint network differs".into());
+    }
+    let state = service_json(&format!("{origin}/accounts/{owner}"))?;
+    if state["account_id"] != owner
+        || state["subentry_count"] != 0
+        || state["signers"].as_array().is_none_or(|v| v.len() != 1)
+        || state["signers"][0]["key"] != owner
+        || state["signers"][0]["type"] != "ed25519_public_key"
+        || state["signers"][0]["weight"] != 1
+    {
+        return Err(
+            "Setup requires a fresh funded owner account without signers, offers or trustlines"
+                .into(),
+        );
+    }
+    let threshold = |key| {
+        state["thresholds"][key]
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| "Invalid current thresholds".to_owned())
+    };
+    let parsed = AccountState {
+        address: owner.into(),
+        sequence: state["sequence"]
+            .as_str()
+            .and_then(|v| v.parse().ok())
+            .ok_or("Invalid account sequence")?,
+        master_weight: 1,
+        low_threshold: threshold("low_threshold")?,
+        medium_threshold: threshold("med_threshold")?,
+        high_threshold: threshold("high_threshold")?,
+        signers: vec![],
+    };
+    check_fresh(&parsed)?;
+    Ok(parsed)
+}
+
+/// Ask the Testnet faucet once. An uncertain response is not permission to repeat funding blindly.
+pub fn fund_testnet_account(account: &str, endpoint: Option<&str>) -> Result<String> {
+    account_key(account)?;
+    let origin = service_origin(endpoint, "https://friendbot.stellar.org")?;
+    let response = service_json(&format!("{origin}/?addr={account}"))?;
+    let hash = response["hash"]
+        .as_str()
+        .ok_or("Friendbot did not return a transaction hash; check the account balance")?;
+    unhex::<32>(hash)?;
+    Ok(hash.into())
+}
+fn service_origin(endpoint: Option<&str>, default: &str) -> Result<String> {
+    allowit_policy_sdk::client::config::parse_origin(
+        endpoint.filter(|v| !v.is_empty()).unwrap_or(default),
+    )
+    .map_err(|_| "Stellar service endpoint must be an HTTPS or local HTTP origin".into())
+}
+fn service_json(url: &str) -> Result<serde_json::Value> {
+    use allowit_policy_sdk::transport::{
+        http::{HttpClient, Method, Request},
+        rpc::Options,
+    };
+    let client = HttpClient::new(Options {
+        timeout: std::time::Duration::from_secs(30),
+        max_response_bytes: 1_048_576,
+        no_proxy: false,
+        connect_timeout: None,
+    })
+    .map_err(|_| "Cannot initialize Stellar service transport")?;
+    let response = client
+        .send_success_body(
+            Request {
+                method: Method::Get,
+                url,
+                headers: &[],
+                body: None,
+            },
+            None,
+        )
+        .map_err(|_| "Stellar service result is unavailable or uncertain")?;
+    if !(200..300).contains(&response.status) {
+        return Err(format!(
+            "Stellar service refused the request (HTTP {})",
+            response.status
+        ));
+    }
+    serde_json::from_slice(&response.body).map_err(|_| "Invalid Stellar service response".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

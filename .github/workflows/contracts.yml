@@ -15,7 +15,7 @@ jobs:
   policy:
     if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-24.04
-    timeout-minutes: 1
+    timeout-minutes: 3
     strategy:
       fail-fast: false
       matrix:
@@ -24,13 +24,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: Swatinem/rust-cache@v2
       - name: Test portable policy behavior
         shell: bash
         run: |
           set -euo pipefail
           python3 scripts/check-policy-bindings.py
-          rustfmt --edition 2024 --check crates/allowit/src/core.rs scripts/policy-smoke.rs scripts/policy-vectors.rs
-          rustc --edition=2024 -Coverflow-checks=on --crate-type=rlib --crate-name=allowit --cfg 'feature="std"' crates/allowit/src/lib.rs -o "$RUNNER_TEMP/liballowit.rlib"
+          rustfmt --edition 2024 --check scripts/policy-smoke.rs scripts/policy-vectors.rs
+          allowit_src=$(python3 scripts/core_sources.py --portable-lib)
+          rustc --edition=2024 -Coverflow-checks=on --crate-type=rlib --crate-name=allowit --cfg 'feature="std"' "$allowit_src" -o "$RUNNER_TEMP/liballowit.rlib"
           rustc --edition=2024 -Coverflow-checks=on --test --extern allowit="$RUNNER_TEMP/liballowit.rlib" scripts/policy-smoke.rs -o "$RUNNER_TEMP/policy-smoke"
           "$RUNNER_TEMP/policy-smoke" "${{ matrix.flow }}" --nocapture | tee "$RUNNER_TEMP/policy.log"
           grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed' "$RUNNER_TEMP/policy.log"
@@ -50,7 +53,7 @@ jobs:
         run: |
           python3 scripts/check-policy-bindings.py
           cargo fmt --all --check
-          rustfmt --edition 2024 --check crates/allowit/src/core.rs scripts/policy-smoke.rs scripts/policy-vectors.rs
+          rustfmt --edition 2024 --check scripts/policy-smoke.rs scripts/policy-vectors.rs
       - name: Install pinned Stellar CLI
         run: |
           curl -fsSL https://github.com/stellar/stellar-cli/releases/download/v28.1.0/stellar-cli-28.1.0-x86_64-unknown-linux-gnu.tar.gz -o /tmp/stellar.tar.gz

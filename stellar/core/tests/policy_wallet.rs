@@ -711,17 +711,6 @@ fn terms(principal: i128, ledger: u32) -> ExecutionTerms {
         expense: Some(ExpenseBounds::xlm(principal, 0, MAX_FEE, ledger - 1, NOW).unwrap()),
     }
 }
-#[derive(Default)]
-struct Store(Option<(SignedOperation, OperationStatus)>);
-impl rpc::OperationStore for Store {
-    fn record(&mut self, _: [u8; 32], s: &SignedOperation, status: OperationStatus) -> Result<()> {
-        self.0 = Some((s.clone(), status));
-        Ok(())
-    }
-    fn load(&self, _: [u8; 32]) -> Result<Option<(SignedOperation, OperationStatus)>> {
-        Ok(self.0.clone())
-    }
-}
 /// Agent and service run one operation: prepare, service authorization, enforce simulation,
 /// agent signature, submission and receipt.
 fn run(
@@ -737,11 +726,12 @@ fn run(
     let proof = sign(&simulated, &AGENT, NOW)?;
     let signed = authorize(&simulated, &[proof], NOW)?;
     chain.step(name);
-    let mut store = Store::default();
-    let status = rpc::submit(chain, &mut store, &signed, NOW)?;
-    assert_eq!(status, OperationStatus::Submitted);
     assert_eq!(
-        rpc::recover(chain, &mut store, r.operation.nonce)?,
+        rpc::broadcast(chain, &signed, NOW)?,
+        rpc::Broadcast::Submitted
+    );
+    assert_eq!(
+        rpc::status_by_hash(chain, &c.network, &signed.transaction_hash)?,
         OperationStatus::Confirmed
     );
     let receipt = rpc::operation_receipt(chain, c, &r.operation.nonce)?.ok_or("no receipt")?;
@@ -751,16 +741,14 @@ fn run(
 fn owner_submit(chain: &ModelChain, name: &str, xdr: &str) {
     chain.step(name);
     let signed = sign_owner_transaction(NETWORK, xdr, &OWNER).unwrap();
-    let receipt = rpc::send_and_poll(
-        chain,
-        NETWORK,
-        &signed,
-        rpc::Poll {
-            attempts: 2,
-            interval: std::time::Duration::ZERO,
-        },
-    )
-    .unwrap();
+    assert_eq!(
+        rpc::send_transaction(chain, NETWORK, &signed).unwrap(),
+        rpc::Broadcast::Submitted
+    );
+    let hash = rpc::signed_transaction_hash(NETWORK, &signed).unwrap();
+    let receipt = rpc::receipt_by_hash(chain, NETWORK, &hash)
+        .unwrap()
+        .unwrap();
     assert_eq!(receipt.status, OperationStatus::Confirmed);
 }
 fn params() -> PolicyParams {

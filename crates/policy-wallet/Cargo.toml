@@ -13,7 +13,7 @@ crate-type = ["rlib"]
 # `hazmat-address` gives `Address::to_payload`, which tells accounts from contracts.
 soroban-sdk = { workspace = true, features = ["hazmat-address"] }
 allowit-wallet-protocol = { path = "../protocol" }
-allowit = { path = "../allowit" }
+allowit = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
