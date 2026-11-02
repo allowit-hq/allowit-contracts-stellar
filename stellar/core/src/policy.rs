@@ -4,10 +4,28 @@
 //! the canonical prefix onchain; Custom runs its whole compiled policy. This module derives the
 //! prefix from source exactly as `scripts/policy_source.py` does, checks owner params as
 //! `scripts/contract_admin.py` does, and evaluates canonical policies with the `allowit` host
-//! backend. The legacy compiler stays only for legacy-language classic installs.
+//! backend. Retired source languages remain readable only for signed-packet recovery.
 use crate::*;
 use allowit::{AllowitContext, AllowitRequest, AllowitRule, AllowitTier, AllowitValue};
 use std::collections::BTreeMap;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyEngine {
+    SimplePolicyEngine,
+    CommonPolicyEngine,
+    CustomPolicy,
+}
+
+impl PolicyEngine {
+    pub fn symbol(self) -> &'static str {
+        match self {
+            Self::SimplePolicyEngine => "simple_policy_engine",
+            Self::CommonPolicyEngine => "common_policy_engine",
+            Self::CustomPolicy => "custom_policy",
+        }
+    }
+}
 
 /// Wallet tier: the installed policy engine of a policy wallet.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -67,7 +85,7 @@ impl From<PolicyEngine> for PolicyTier {
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum PolicyLanguage {
-    /// `allowit::v1` source compiled by the legacy SDK compiler. Classic custody only.
+    /// Historical compiler source, retained only to decode signed packets.
     #[default]
     Legacy,
     /// Portable source that `allowit` compiles on the host and onchain.

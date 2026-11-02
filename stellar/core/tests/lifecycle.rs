@@ -1,4 +1,4 @@
-use allowit_policy_sdk::typed_workflow::*;
+use allowit_stellar_wallet::workflow::*;
 use allowit_stellar_wallet::*;
 use serde_json::{Value, json};
 use std::sync::Mutex;
@@ -43,12 +43,7 @@ fn fixture_with_wallet(
         Contract(contract).to_string()
     };
     let portable = route == WalletRoute::PolicyWallet;
-    let source = if portable {
-        PORTABLE.to_string()
-    } else {
-        "use allowit::v1::prelude::*; async fn _execute(ctx: &Context) -> PolicyResult { Ok(()) }"
-            .to_string()
-    };
+    let source = PORTABLE.to_string();
     let mut c = WalletConfig {
         network: "stellar:testnet".into(),
         policy_instance: [7; 32],
@@ -58,11 +53,7 @@ fn fixture_with_wallet(
         server: engine.clone(),
         route: route.clone(),
         tier: portable.then_some(PolicyTier::Simple),
-        language: if portable {
-            PolicyLanguage::Portable
-        } else {
-            PolicyLanguage::Legacy
-        },
+        language: PolicyLanguage::Portable,
         rules: vec![],
         params: PolicyParams::default(),
         source_digest: [0; 32],
@@ -76,12 +67,12 @@ fn fixture_with_wallet(
     };
     c.asset = sac_address(&c.network, &asset_xdr(&c).unwrap()).unwrap();
     let recipient = account_for_seed(&[6; 32]);
+    c.params = policy::params_from_json(
+        &json!({"destinations": [recipient]}),
+        Some(PolicyTier::Simple),
+    )
+    .unwrap();
     if portable {
-        c.params = policy::params_from_json(
-            &json!({"destinations": [recipient]}),
-            Some(PolicyTier::Simple),
-        )
-        .unwrap();
         c.source_digest =
             policy::standard_prefix_digest(PolicyTier::Simple, &c.module_digest, &c.asset, &[])
                 .unwrap();
@@ -404,7 +395,12 @@ fn classic_caps_keep_exact_local_math_while_odc_requires_native_preflight() {
     for route in [WalletRoute::Native, WalletRoute::PolicyWallet] {
         let (mut c, mut r, mut s) = fixture(route.clone(), true);
         if route == WalletRoute::Native {
-            c.policy_source="use allowit::v1::prelude::*; async fn _execute(ctx: &Context) -> PolicyResult { allowit::cap_per_transaction(ctx, \"2\", \"USDC\")?; Ok(()) }".into();
+            c.policy_source = CAPPED.into();
+            c.params = policy::params_from_json(
+                &json!({"destinations": [account_for_seed(&[6;32])], "payment_limit": 20_000_000}),
+                Some(PolicyTier::Simple),
+            )
+            .unwrap();
             c.source_hash = hash(&c.policy_source);
         } else {
             install(
@@ -581,16 +577,11 @@ fn requests_reject_other_rails_unbounded_fees_extra_effects_and_wrong_asset() {
     let (c, mut r, s) = fixture(WalletRoute::Native, false);
     r.effect_bounds.push(r.effect_bounds[0].clone());
     assert!(prepare(&c, &r, &s, 86401, 86700).is_err());
-    let (c, mut r, s) = fixture(WalletRoute::Native, false);
-    let ExecutionInput::Instructions(v) = &mut r.input else {
-        panic!()
-    };
-    v[0] = NativeInstruction::SolanaNativeTransfer {
-        source: wf(&c.wallet),
-        destination: wf(&account_for_seed(&[6; 32])),
-        lamports: 20_000_000,
-    };
-    assert!(prepare(&c, &r, &s, 86401, 86700).is_err());
+    let (c, r, _) = fixture(WalletRoute::Native, false);
+    let mut foreign = serde_json::to_value(r).unwrap();
+    foreign["effect_bounds"][0]["source"]["chain"] = json!("Solana");
+    assert!(serde_json::from_value::<ExecutionRequest>(foreign).is_err());
+    assert_eq!(c.network, "stellar:testnet");
 }
 #[test]
 fn redeems_admit_only_positive_amounts_for_the_wallet_on_a_policy_wallet() {
@@ -2868,27 +2859,26 @@ fn exact_pre_task_records_preserve_request_bytes_hashes_signatures_and_status_re
         );
         assert_eq!(*rpc.calls.lock().unwrap(), vec!["getTransaction"]);
     }
-    let program: allowit_policy_sdk::Program =
-        serde_json::from_str(include_str!("fixtures/canonical-main-9682-ir.json")).unwrap();
-    let metadata: Value =
-        serde_json::from_str(include_str!("fixtures/canonical-main-9682-metadata.json")).unwrap();
-    allowit_policy_sdk::validate_program(&program).unwrap();
-    assert_eq!(
-        allowit_policy_sdk::canonical_ir_hash(&program).unwrap(),
-        metadata["ir_hash"].as_str().unwrap()
-    );
 }
 
 #[test]
-fn classic_route_clearly_rejects_stateful_engine_calls_without_fake_validation() {
-    let (mut c, r, mut state) = fixture(WalletRoute::Native, true);
-    c.policy_source = include_str!("fixtures/stellar-local-state-policy.rs").into();
-    c.source_hash = hash(&c.policy_source);
-    state.source_hash = c.source_hash;
+fn retired_classic_language_cannot_prepare_or_sign_but_retained_bytes_remain_valid() {
+    let (mut config, request, state) = fixture(WalletRoute::Native, false);
+    config.language = PolicyLanguage::Legacy;
     assert!(
-        prepare(&c, &r, &state, 86401, 86700)
+        prepare(&config, &request, &state, 86401, 86700)
             .unwrap_err()
-            .contains("cannot enforce")
+            .contains("Retired policy language")
+    );
+    let signed: SignedOperation = serde_json::from_str(include_str!(
+        "fixtures/canonical-main-9682-native-signed.json"
+    ))
+    .unwrap();
+    validate_retained_signed(&signed).unwrap();
+    assert!(
+        sign(&signed.prepared, &[2; 32], signed.prepared.created_at)
+            .unwrap_err()
+            .contains("Retired policy language")
     );
 }
 

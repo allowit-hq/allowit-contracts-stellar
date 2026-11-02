@@ -8,9 +8,9 @@
 //! `ALLOWIT_UPDATE_VECTORS=1 cargo test --test policy_wallet` in `stellar/core`.
 use allowit::AllowitTier;
 use allowit_policy_sdk::admin::{Admin, DeploymentVersion};
-use allowit_policy_sdk::typed_workflow::*;
 use allowit_stellar_wallet::admin::*;
 use allowit_stellar_wallet::contract::{CustodyState, PolicyBinding};
+use allowit_stellar_wallet::workflow::*;
 use allowit_stellar_wallet::*;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;

@@ -1,6 +1,6 @@
 //! Stellar adapters for the existing typed execution request and operation lifecycle.
 //! Native and policy wallet custody use the same authored policy and exact operation identity.
-use allowit_policy_sdk::typed_workflow::{
+use crate::workflow::{
     AbiValue, AccountId as WorkflowAccount, AccountKind, Amount256, Chain, ExecutionInput,
     ExecutionRequest, NativeInstruction, WorkflowAsset,
 };
@@ -10,16 +10,16 @@ use sha2::{Digest, Sha256};
 use stellar_strkey::{Contract, Strkey, ed25519};
 use stellar_xdr::*;
 
-pub use allowit_policy_sdk::PolicyEngine;
 pub mod admin;
 mod authorization;
 pub mod contract;
 pub mod owner;
 pub mod policy;
 pub mod request;
+pub mod workflow;
 pub use authorization::{authorize_server, authorize_server_with, sign_account_entry};
 pub use contract::{CONTRACT_VERSION, DepositReceipt, RedeemReceipt, TransferReceipt};
-pub use policy::{PolicyLanguage, PolicyParams, PolicyTier, PolicyValue};
+pub use policy::{PolicyEngine, PolicyLanguage, PolicyParams, PolicyTier, PolicyValue};
 pub mod rpc;
 pub mod x402;
 pub type Result<T> = std::result::Result<T, String>;
@@ -106,13 +106,9 @@ pub fn address_text(value: &ScAddress) -> Result<String> {
     }
 }
 fn workflow_address(value: &WorkflowAccount) -> Result<String> {
-    if value.chain != Chain::Stellar {
-        return Err("Wrong request rail".into());
-    }
     match value.kind {
         AccountKind::Wallet => Ok(ed25519::PublicKey(value.address).to_string()),
         AccountKind::Contract => Ok(Contract(value.address).to_string()),
-        _ => Err("Unsupported Stellar account kind".into()),
     }
 }
 fn value_symbol(v: &str) -> Result<ScVal> {
@@ -606,6 +602,11 @@ pub fn max_fee_ceiling(route: &WalletRoute) -> u32 {
 }
 
 pub fn validate_config(c: &WalletConfig) -> Result<()> {
+    validate_config_for(c, true)
+}
+// Retained packets prove transport/effect identity. Their original owner-approved source
+// binding belongs to the caller's durable record; current source admission cannot replace it.
+fn validate_config_for(c: &WalletConfig, admit_source: bool) -> Result<()> {
     passphrase(&c.network)?;
     if c.policy_instance == [0; 32]
         || c.source_hash != hash(c.policy_source.as_bytes())
@@ -643,10 +644,10 @@ pub fn validate_config(c: &WalletConfig) -> Result<()> {
     if c.asset != sac_address(&c.network, &asset_xdr(c)?)? {
         return Err("SAC does not match installed native asset identity".into());
     }
-    if c.route == WalletRoute::PolicyWallet {
+    if admit_source && c.route == WalletRoute::PolicyWallet {
         validate_portable_install(c)?;
     }
-    if c.route == WalletRoute::Native && c.language == PolicyLanguage::Portable {
+    if admit_source && c.route == WalletRoute::Native && c.language == PolicyLanguage::Portable {
         validate_classic_portable_install(c)?;
     }
     Ok(())
@@ -710,7 +711,7 @@ fn decode_operation(
     r: &ExecutionRequest,
     retained: bool,
 ) -> Result<StellarOperation> {
-    validate_config(c)?;
+    validate_config_for(c, !retained)?;
     if r.operation.policy_instance != c.policy_instance || r.operation.nonce == [0; 32] {
         return Err("Operation installation or identity differs".into());
     }
@@ -795,7 +796,6 @@ fn decode_operation(
             }
             _ => return Err("Unknown Stellar contract, method or arguments".into()),
         },
-        _ => return Err("Unsupported Stellar instruction".into()),
     };
     let native = match &operation {
         StellarOperation::Transfer(transfer) => {
@@ -908,8 +908,7 @@ pub fn sac_address(network: &str, asset: &Asset) -> Result<String> {
     });
     Ok(Contract(hash(preimage.to_xdr(limits()).map_err(err)?)).to_string())
 }
-/// Check one exact transfer against the installed policy before signing. Classic legacy
-/// installs use the legacy compiler; portable installs use `verify_operation`.
+/// Check one exact transfer against the portable installed policy before signing.
 pub fn verify_policy(
     c: &WalletConfig,
     r: &ExecutionRequest,
@@ -921,7 +920,7 @@ pub fn verify_policy(
 }
 /// Check one exact operation and its terms against the installed policy before signing.
 ///
-/// Classic legacy-language installs run the legacy compiler. Portable installs check the tier
+/// Retired source languages cannot authorize execution. Portable installs check the tier
 /// binding, owner params, execution args and expense bounds, run the Common prefix as the
 /// contract does and evaluate the full policy on the host when the source is canonical-only or
 /// `evaluator` compiles it. `Evaluation::Prefix` means only the onchain part ran: a Custom wallet
@@ -939,14 +938,7 @@ pub fn verify_operation(
     let operation = operation_from_request(c, r)?;
     match (&c.route, c.language) {
         (WalletRoute::Native, PolicyLanguage::Legacy) => {
-            let StellarOperation::Transfer(t) = operation else {
-                unreachable!()
-            };
-            if !terms.is_empty() {
-                return Err("Classic custody carries no execution args or expense bounds".into());
-            }
-            verify_legacy(c, &t, state, now)?;
-            Ok(policy::Evaluation::Full(PolicyParams::default()))
+            Err("Retired policy language cannot authorize new execution".into())
         }
         (WalletRoute::Native, PolicyLanguage::Portable) => {
             let StellarOperation::Transfer(t) = operation else {
@@ -959,32 +951,6 @@ pub fn verify_operation(
         }
         (WalletRoute::Odc, _) => Err("Historical wallet packets are read-only".into()),
     }
-}
-fn verify_legacy(c: &WalletConfig, t: &Transfer, state: &TrustedState, now: u64) -> Result<()> {
-    let policy = allowit_policy_sdk::compile_stellar_policy(&c.policy_source).map_err(err)?;
-    if policy.uses_named_state() || !policy.explicit_engine_checks.is_empty() {
-        return Err(
-            "Classic/native custody cannot enforce named-state or shared-engine policy calls"
-                .into(),
-        );
-    }
-    if policy.source_hash != c.source_hash
-        || !policy.evaluate(&allowit_policy_sdk::StellarPolicyContext {
-            asset: c.asset.clone(),
-            recipient: t.recipient.clone(),
-            token: c.asset_symbol.clone(),
-            decimals: 7,
-            amount: t.amount,
-            spent_daily: state.spent_daily,
-            spent_total: state.spent_total,
-            calls: state.calls,
-            now,
-            spent_day: state.spent_day,
-        })
-    {
-        return Err("Authored policy rejected this exact Stellar operation".into());
-    }
-    Ok(())
 }
 /// Classic custody enforces nothing onchain, so the full portable policy must run on the host.
 /// Params come from the owner-approved installation and standard state from the durable
