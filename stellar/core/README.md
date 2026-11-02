@@ -24,6 +24,26 @@ The rest of this page is the reference for how the crate behaves.
 
 The `workflow` module owns Stellar native request DTOs and their JSON encoding. `PolicyEngine` selects the Stellar wallet implementation. Generic owner capability traits remain in Allowit core. Fresh preparation and signing require portable source; historical compiler-language packets are decoded only to verify their original hashes, signatures and settlement. Read-only recovery does not rerun current source admission. The caller must bind the packet to its durable original owner-approved record.
 
+## Architecture
+
+The rail crate owns native encoding, signing and chain semantics. SDK engine depends on vendor
+capabilities and core primitives. Shared workflow coordination remains in SDK engine.
+
+```mermaid
+flowchart TB
+    Engine["[allowit-sdk]<br/>crate @allowit/sdk/engine<br/>All other shared logic"]
+    Vendor["crate + npm @allowit/vendor/*<br/>Native contracts · signing · chain semantics<br/>SVG graphics · web components"]
+    Core["[allowit-core]<br/>crate + npm @allowit/sdk/core<br/>Common types · policy rules · primitives<br/>TypeScript interfaces"]
+
+    Engine -->|crate| Vendor
+    Engine -->|crate| Core
+    Vendor -->|crate + npm| Core
+```
+
+Solid arrows are dependencies. Dashed arrows are runtime calls / connections.
+This view follows the [canonical responsibility diagram][responsibility-model].
+Use the [Cargo manifest](Cargo.toml) for Rust build package names.
+
 ## Request profile and custody
 
 This crate maps the canonical `ExecutionRequest` to one admitted native operation: a SEP-41 transfer, or a SEP-56 deposit into or redeem from a vault for a policy wallet. A Stellar call is identified by its contract, its function (`transfer`, `deposit` or `redeem`) and its typed arguments; the request's `schema_digest` names no contract schema and is not read. The wallet is the receiver, holder and operator of each SEP-56 call. The one effect bound is the debit: the wallet asset to the recipient or vault, or for a redeem the vault's own shares. `request::transfer`, `request::deposit` and `request::redeem` build these requests from the wallet configuration, the trusted state, an operation ID and typed amounts, and return only a request that decodes. A policy wallet's fee payer is its current agent account from the trusted state, which can differ from the configured customer signer. Native classic custody checks the current account weights and applicable transaction and payment thresholds. The 3/1/1 weights and 2/2/3 thresholds are deployment templates, not admission requirements. Classic custody admits only a transfer.
@@ -84,3 +104,5 @@ The owner must enable x402. Its raw Ed25519 keys need no funded G-accounts. Nati
 An owner handoff returns the new owner in `pending_authorizers`. Its transaction cannot be submitted yet, and its hash is provisional. The new owner signs its recorded entry with a `signature_expiration_ledger` after the latest ledger. `OwnerAdmin::complete_owner_handoff` checks that entry and its signature, simulates again in enforce mode for the final fee and resources, and returns the final transaction and hash. The current owner signs only that transaction.
 
 `recover` moves the full balance observed at preparation. An agent payment that settles first makes it fail with `InsufficientFunds`. Pause automation with `set_pause` before a recovery.
+
+[responsibility-model]: https://github.com/allowit-hq/allowit-project/blob/main/wiki/allowit/architecture.md#dependency-direction
