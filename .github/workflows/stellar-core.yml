@@ -4,6 +4,7 @@ on:
     branches: [main]
     paths:
       - "stellar/core/**"
+      - "crates/policy/**"
       - "crates/protocol/**"
       - "crates/policy-wallet/**"
       - "crates/custom-policy/policy/**"
@@ -17,6 +18,7 @@ on:
   pull_request:
     paths:
       - "stellar/core/**"
+      - "crates/policy/**"
       - "crates/protocol/**"
       - "crates/policy-wallet/**"
       - "crates/custom-policy/policy/**"

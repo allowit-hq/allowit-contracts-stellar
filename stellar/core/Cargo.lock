@@ -4,13 +4,13 @@ version = 4
 
 [[package]]
 name = "allowit"
-version = "0.2.0"
-source = "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.2.0#6aa4235e6229e18d1f9780a6a9fdf80aceb0f348"
+version = "0.3.0"
+source = "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.3.0#56e8a0755a20bf2cc786c4ad0d5822c1a9ac63cb"
 
 [[package]]
 name = "allowit-sdk"
-version = "0.2.0"
-source = "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.2.0#6aa4235e6229e18d1f9780a6a9fdf80aceb0f348"
+version = "0.3.0"
+source = "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.3.0#56e8a0755a20bf2cc786c4ad0d5822c1a9ac63cb"
 dependencies = [
  "allowit",
  "libc",
@@ -23,7 +23,7 @@ dependencies = [
 
 [[package]]
 name = "allowit-stellar-wallet"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "allowit",
  "allowit-sdk",
