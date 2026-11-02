@@ -14,6 +14,7 @@ pub mod admin;
 mod authorization;
 pub mod contract;
 pub mod owner;
+pub mod owner_intent;
 pub mod policy;
 pub mod request;
 pub mod workflow;

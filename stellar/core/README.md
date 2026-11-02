@@ -73,7 +73,13 @@ Policy wallet custody calls the layout 4 `execute` entrypoint (`CONTRACT_VERSION
 - `upload_wasm` prepares `UploadContractWasm` of wallet code that declares custody layout 4 (`check_wallet_code`).
 - `create_wallet` prepares `CreateContractV2` with the constructor packet. The owner is the transaction source and must be owner-only. `wallet_address` derives the wallet address from the owner and salt.
 
-`admin::validate_auth` admits only the exact authorization scope of the host function. `admin::check_assembled` applies the `contract_admin.py` `prepare_xdr` intent checks to an assembled transaction: an unsigned v1 transaction from the source with one host function, where simulation added only authorization, resources and their fee within the ceiling. `admin::sign_owner_transaction` signs an unsigned prepared transaction as its G-account source. `rpc::send_transaction` sends existing signed bytes once and reports the native broadcast result. SDK engine persists intent and controls polling and exact-byte retries.
+`admin::validate_auth` admits only the exact authorization scope of the host function. `admin::check_assembled` applies the `contract_admin.py` `prepare_xdr` intent checks to an assembled transaction: an unsigned v1 transaction from the source with one host function, where simulation added only authorization, resources and their fee within the ceiling.
+
+Before signing an untrusted owner step, construct `owner_intent::ExpectedOwnerIntent` from the owner's selected policy, reviewed executable, destination and amount. Its limits name the network, owner, independently observed next sequence, fee ceiling and latest expiry. `validate_owner_transaction` compares the complete unsigned XDR and step metadata with that intent. It supports exact Wasm uploads, policy-wallet creation, funding transfers and the existing three-operation native setup. Creation checks the selected tier, source binding, params, roles, asset, executable and salt-derived wallet. `validate_deployment` also checks the deployment metadata; `validate_native_setup` also checks the native setup identity digest and complete reconstruction. Server-supplied business fields must not become the caller's expected values.
+
+Validation returns a sealed in-memory proof. Its consuming `sign_with` method sends only the approved transaction hash to a caller-owned signing capability, then strictly verifies the returned owner Ed25519 signature before attaching it. Expired proofs cannot call the signer. Reloaded JSON requires validation again. `admin::sign_owner_transaction` remains a low-level seed helper: it checks unsigned source ownership and does not validate business intent, fees or expiry.
+
+`rpc::send_transaction` sends existing signed bytes once and reports the native broadcast result. SDK engine persists intent and controls polling and exact-byte retries. Native validation and signing neither publish nor submit a packet.
 
 ## Service and agent authorization
 
