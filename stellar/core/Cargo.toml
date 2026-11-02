@@ -19,6 +19,7 @@ serde_json = { version = "1", features = ["arbitrary_precision"] }
 sha2 = "0.10"
 stellar-strkey = "0.0.13"
 stellar-xdr = { version = "=28.0.0", features = ["std", "base64"] }
+zeroize = "1.9.1"
 
 # Every Allowit workspace uses this profile block, so a shared target directory
 # builds each shared crate once. Release builds keep overflow checks, which the

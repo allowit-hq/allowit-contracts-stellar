@@ -21,6 +21,7 @@ pub use authorization::{authorize_server, authorize_server_with, sign_account_en
 pub use contract::{CONTRACT_VERSION, DepositReceipt, RedeemReceipt, TransferReceipt};
 pub use policy::{PolicyEngine, PolicyLanguage, PolicyParams, PolicyTier, PolicyValue};
 pub mod rpc;
+pub mod signing;
 pub mod x402;
 pub type Result<T> = std::result::Result<T, String>;
 

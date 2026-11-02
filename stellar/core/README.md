@@ -24,6 +24,15 @@ The rest of this page is the reference for how the crate behaves.
 
 The `workflow` module owns Stellar native request DTOs and their JSON encoding. `PolicyEngine` selects the Stellar wallet implementation. Generic owner capability traits remain in Allowit core. Fresh preparation and signing require portable source; historical compiler-language packets are decoded only to verify their original hashes, signatures and settlement. Read-only recovery does not rerun current source admission. The caller must bind the packet to its durable original owner-approved record.
 
+## Native key and message signing
+
+`signing::LocalSigner` owns native key decoding, encoding and digest signing.
+Its private seed is zeroizing, non-serializable and non-printable. The caller owns private-file storage and signing authority.
+`signing::validate_key_identity` checks native public metadata. `verify_digest` verifies the exact native signature.
+`signing::signed_message_digest` owns SEP-53 domain separation. `sign_in_message_times` binds the exact owner, Origin and nonce.
+SDK engine checks timestamp freshness, HTTP sessions and workflow authority.
+`signing::request_digest` and `request_proof` encode the exact execution-service proof without performing transport.
+
 ## Request profile and custody
 
 This crate maps the canonical `ExecutionRequest` to one admitted native operation: a SEP-41 transfer, or a SEP-56 deposit into or redeem from a vault for a policy wallet. A Stellar call is identified by its contract, its function (`transfer`, `deposit` or `redeem`) and its typed arguments; the request's `schema_digest` names no contract schema and is not read. The wallet is the receiver, holder and operator of each SEP-56 call. The one effect bound is the debit: the wallet asset to the recipient or vault, or for a redeem the vault's own shares. `request::transfer`, `request::deposit` and `request::redeem` build these requests from the wallet configuration, the trusted state, an operation ID and typed amounts, and return only a request that decodes. A policy wallet's fee payer is its current agent account from the trusted state, which can differ from the configured customer signer. Native classic custody checks the current account weights and applicable transaction and payment thresholds. The 3/1/1 weights and 2/2/3 thresholds are deployment templates, not admission requirements. Classic custody admits only a transfer.
