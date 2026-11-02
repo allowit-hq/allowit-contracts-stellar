@@ -22,14 +22,15 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "allowit"
-version = "0.1.0"
+version = "0.2.0"
+source = "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.2.0#6aa4235e6229e18d1f9780a6a9fdf80aceb0f348"
 dependencies = [
  "soroban-sdk",
 ]
 
 [[package]]
 name = "allowit-common-policy-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "allowit-policy-wallet",
  "allowit-wallet-protocol",
@@ -39,7 +40,7 @@ dependencies = [
 
 [[package]]
 name = "allowit-custom-policy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "allowit",
  "allowit-policy-wallet",
@@ -51,7 +52,7 @@ dependencies = [
 
 [[package]]
 name = "allowit-engine-parent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "allowit",
  "allowit-wallet-engine",
@@ -60,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "allowit-policy-wallet"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "allowit",
  "allowit-sep56-test-vault",
@@ -71,14 +72,14 @@ dependencies = [
 
 [[package]]
 name = "allowit-sep56-test-vault"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "soroban-sdk",
 ]
 
 [[package]]
 name = "allowit-simple-policy-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "allowit-policy-wallet",
  "allowit-wallet-protocol",
@@ -88,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "allowit-wallet-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "allowit",
  "soroban-sdk",
@@ -96,7 +97,7 @@ dependencies = [
 
 [[package]]
 name = "allowit-wallet-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "allowit",
  "soroban-sdk",

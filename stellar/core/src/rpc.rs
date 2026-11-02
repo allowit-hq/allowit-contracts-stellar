@@ -1,9 +1,10 @@
-//! Bounded JSON-RPC transport. Submission never retries an uncertain transaction.
+//! Stellar RPC protocol, native observations and transaction validity.
+//! Common transport owns HTTP bounds; SDK engine owns persistence, polling and retry workflows.
 use crate::contract::{CustodyState, PolicyBinding};
 use crate::*;
+use allowit_policy_sdk::transport::rpc::{EnvelopeValidation, ErrorKind, RpcClient};
 use serde_json::{Value, json};
 use std::{
-    io::Read,
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
@@ -14,62 +15,43 @@ fn transaction_hash_for(network: &str, tx: &Transaction) -> Result<[u8; 32]> {
 pub trait Rpc: Send + Sync {
     fn call(&self, method: &str, params: Value) -> Result<Value>;
 }
+/// Stellar JSON-RPC protocol adapter over the bounded common host transport.
 pub struct HttpRpc {
-    url: String,
-    client: reqwest::blocking::Client,
+    client: RpcClient,
     id: AtomicU64,
 }
 impl HttpRpc {
     pub fn new(url: &str) -> Result<Self> {
-        let parsed = reqwest::Url::parse(url).map_err(err)?;
-        if !parsed.username().is_empty()
-            || parsed.password().is_some()
-            || parsed.fragment().is_some()
-            || !(parsed.scheme() == "https"
-                || (parsed.scheme() == "http"
-                    && matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))))
-        {
-            return Err("RPC requires HTTPS or local HTTP without credentials".into());
-        }
         Ok(Self {
-            url: url.into(),
-            client: reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .map_err(err)?,
+            client: RpcClient::new(url, Duration::from_secs(30), MAX_BYTES)
+                .map_err(|_| "RPC requires HTTPS or local HTTP without credentials")?
+                .accept_success_statuses(),
             id: AtomicU64::new(1),
         })
     }
 }
 impl Rpc for HttpRpc {
     fn call(&self, method: &str, params: Value) -> Result<Value> {
-        let id = self.id.fetch_add(1, Ordering::Relaxed);
-        let response = self
-            .client
-            .post(&self.url)
-            .json(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
-            .send()
-            .map_err(|_| "Stellar RPC transport result is unknown")?;
-        if !response.status().is_success() {
-            return Err("Stellar RPC rejected the HTTP request".into());
-        }
-        let mut bytes = Vec::new();
-        response
-            .take((MAX_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map_err(err)?;
-        if bytes.len() > MAX_BYTES {
-            return Err("RPC response exceeds limit".into());
-        }
-        let value: Value = serde_json::from_slice(&bytes).map_err(err)?;
-        if value["id"] != id || value["jsonrpc"] != "2.0" || value.get("error").is_some() {
-            return Err("Invalid or failed Stellar RPC response".into());
-        }
-        value
-            .get("result")
-            .cloned()
-            .ok_or("Missing RPC result".into())
+        self.client
+            .call_with_id(
+                method,
+                &params,
+                self.id.fetch_add(1, Ordering::Relaxed),
+                EnvelopeValidation::StrictIdentity,
+                None,
+            )
+            .map_err(|error| {
+                match error.kind {
+                    ErrorKind::Http => "Stellar RPC rejected the HTTP request",
+                    ErrorKind::Size => "RPC response exceeds limit",
+                    ErrorKind::MissingResult => "Missing RPC result",
+                    ErrorKind::Json | ErrorKind::Envelope | ErrorKind::Refused => {
+                        "Invalid or failed Stellar RPC response"
+                    }
+                    _ => "Stellar RPC transport result is unknown",
+                }
+                .into()
+            })
     }
 }
 pub fn get_account(rpc: &dyn Rpc, address: &str) -> Result<AccountState> {
@@ -355,78 +337,51 @@ pub fn revalidate_prepared(
     validate_prepared(&validated, now)?;
     Ok(validated)
 }
-pub trait OperationStore {
-    fn record(
-        &mut self,
-        operation_id: [u8; 32],
-        signed: &SignedOperation,
-        status: OperationStatus,
-    ) -> Result<()>;
-    fn load(&self, operation_id: [u8; 32]) -> Result<Option<(SignedOperation, OperationStatus)>>;
+/// Native outcome of one `sendTransaction` attempt. Persistence and retry policy belong to SDK engine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Broadcast {
+    Submitted,
+    RetryLater,
+    Rejected { error_result_xdr: Option<String> },
+    Unknown,
 }
-/// Persist exact signed bytes before broadcast. An uncertain response retains them for lookup.
-/// A later call for the same operation looks up the original hash first. While that
-/// transaction is not on the ledger and the signed operation is still valid, the call resends
-/// the retained bytes. They keep their sequence number and hash, so the network includes them
-/// at most once. It never re-signs or replaces the transaction.
-pub fn submit(
-    rpc: &dyn Rpc,
-    store: &mut dyn OperationStore,
-    signed: &SignedOperation,
-    now: u64,
-) -> Result<OperationStatus> {
-    let id = signed.prepared.request.operation.nonce;
-    if let Some((previous, status)) = store.load(id)? {
-        if previous != *signed {
-            return Err("Operation ID already binds different signed bytes".into());
-        }
-        validate_retained_signed(&previous)?;
-        if matches!(status, OperationStatus::Confirmed | OperationStatus::Failed) {
-            return Ok(status);
-        }
-        if status != OperationStatus::Prepared {
-            let observed = status_by_hash(
-                rpc,
-                &signed.prepared.config.network,
-                &signed.transaction_hash,
-            )?;
-            // NOT_FOUND after TRY_AGAIN_LATER, a lost response or a dropped pending transaction:
-            // resend the same bytes only while they are still valid.
-            if observed != OperationStatus::SubmissionUnknown
-                || validate_signed(signed, now).is_err()
-            {
-                store.record(id, signed, observed.clone())?;
-                return Ok(observed);
-            }
-        }
-    }
+/// Validate a new signed operation and send its exact bytes once.
+pub fn broadcast(rpc: &dyn Rpc, signed: &SignedOperation, now: u64) -> Result<Broadcast> {
     validate_signed(signed, now)?;
-    store.record(id, signed, OperationStatus::SubmissionUnknown)?;
-    match rpc.call(
-        "sendTransaction",
-        json!({"transaction":signed.transaction_xdr}),
-    ) {
-        Ok(v) => {
-            if v["hash"].as_str() != Some(hex(&signed.transaction_hash).as_str()) {
-                return Ok(OperationStatus::SubmissionUnknown);
-            }
-            let status = match v["status"].as_str() {
-                Some("PENDING" | "DUPLICATE") => OperationStatus::Submitted,
-                Some("ERROR") => status_by_hash(
-                    rpc,
-                    &signed.prepared.config.network,
-                    &signed.transaction_hash,
-                )
-                .unwrap_or(OperationStatus::SubmissionUnknown),
-                // The network did not accept the transaction. A later submit resends it.
-                Some("TRY_AGAIN_LATER") => OperationStatus::SubmissionUnknown,
-                _ => OperationStatus::SubmissionUnknown,
-            };
-            store.record(id, signed, status.clone())?;
-            Ok(status)
-        }
-        Err(_) => Ok(OperationStatus::SubmissionUnknown),
+    send_transaction(
+        rpc,
+        &signed.prepared.config.network,
+        &signed.transaction_xdr,
+    )
+}
+/// Hash a signed native transaction without rebuilding or authorizing it.
+pub fn signed_transaction_hash(network: &str, envelope_xdr: &str) -> Result<[u8; 32]> {
+    let TransactionEnvelope::Tx(envelope) = read(envelope_xdr)? else {
+        return Err("Expected a signed v1 transaction".into());
+    };
+    // Exact-hash PreAuthTx quorum can legitimately need zero envelope signatures.
+    // This helper establishes transaction identity. The caller validates authority.
+    transaction_hash_for(network, &envelope.tx)
+}
+/// Send an already signed native envelope once and decode only the native response.
+/// The caller validates owner/agent authority before passing bytes to this transport operation.
+pub fn send_transaction(rpc: &dyn Rpc, network: &str, envelope_xdr: &str) -> Result<Broadcast> {
+    let expected = hex(&signed_transaction_hash(network, envelope_xdr)?);
+    let value = match rpc.call("sendTransaction", json!({"transaction":envelope_xdr})) {
+        Ok(value) => value,
+        Err(_) => return Ok(Broadcast::Unknown),
+    };
+    if value["hash"].as_str() != Some(expected.as_str()) {
+        return Ok(Broadcast::Unknown);
     }
+    Ok(match value["status"].as_str() {
+        Some("PENDING" | "DUPLICATE") => Broadcast::Submitted,
+        Some("TRY_AGAIN_LATER") => Broadcast::RetryLater,
+        Some("ERROR") => Broadcast::Rejected {
+            error_result_xdr: value["errorResultXdr"].as_str().map(String::from),
+        },
+        _ => Broadcast::Unknown,
+    })
 }
 pub fn status_by_hash(
     rpc: &dyn Rpc,
@@ -506,6 +461,51 @@ pub fn validate_receipt(
     }
     Ok(())
 }
+/// Verify an exact policy-wallet envelope using its chain receipt after key rotation.
+/// This checks native identity and the retained server authorization, without current signing admission.
+/// A failed enclosing transaction does not revoke its reusable address authorization.
+pub fn validate_settled_policy_packet(
+    signed: &SignedOperation,
+    receipt: &VerifiedReceipt,
+) -> Result<()> {
+    let prepared = &signed.prepared;
+    if prepared.config.route != WalletRoute::PolicyWallet {
+        return Err("Chain-only recovery requires a policy wallet packet".into());
+    }
+    validate_retained_prepared(prepared)?;
+    validate_receipt(
+        receipt,
+        &prepared.config.network,
+        &prepared.transaction_hash,
+    )?;
+    if signed.transaction_hash != prepared.transaction_hash
+        || signed.transaction_xdr != receipt.envelope_xdr
+    {
+        return Err("The settlement envelope differs from the verified receipt".into());
+    }
+    let (TransactionEnvelope::Tx(envelope), TransactionEnvelope::Tx(unsigned)) = (
+        read(&signed.transaction_xdr)?,
+        read(&prepared.transaction_xdr)?,
+    ) else {
+        return Err("Unsupported settlement envelope".into());
+    };
+    if envelope.tx != unsigned.tx {
+        return Err("The settlement transaction differs from its original packet".into());
+    }
+    let Some(OperationBody::InvokeHostFunction(op)) =
+        unsigned.tx.operations.first().map(|op| &op.body)
+    else {
+        return Err("The policy invocation is missing".into());
+    };
+    // Retained preparation validates the exact server scope/signature when present.
+    // Settlement recovery additionally requires that authorization to be present.
+    if !matches!(op.auth.get(1).map(|entry| &entry.credentials), Some(SorobanCredentials::Address(credentials)) if credentials.signature != ScVal::Void)
+    {
+        return Err("The original server authorization is unsigned".into());
+    }
+    Ok(())
+}
+
 /// Read a verified terminal receipt. Absence remains unknown and does not release reservations.
 pub fn receipt_by_hash(
     rpc: &dyn Rpc,
@@ -536,31 +536,6 @@ pub fn receipt_by_hash(
             .into(),
     }))
 }
-pub fn recover(
-    rpc: &dyn Rpc,
-    store: &mut dyn OperationStore,
-    operation_id: [u8; 32],
-) -> Result<OperationStatus> {
-    let (signed, previous) = store.load(operation_id)?.ok_or("No retained operation")?;
-    if signed.prepared.request.operation.nonce != operation_id {
-        return Err("Retained operation identity differs".into());
-    }
-    validate_retained_signed(&signed)?;
-    if matches!(
-        previous,
-        OperationStatus::Confirmed | OperationStatus::Failed
-    ) {
-        return Ok(previous);
-    }
-    let status = status_by_hash(
-        rpc,
-        &signed.prepared.config.network,
-        &signed.transaction_hash,
-    )?;
-    store.record(operation_id, &signed, status.clone())?;
-    Ok(status)
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NativeAccounting {
@@ -1089,81 +1064,4 @@ pub fn operation_receipt(
         deposit,
         redeem,
     }))
-}
-
-/// Bounded polling of a submitted transaction.
-#[derive(Clone, Copy, Debug)]
-pub struct Poll {
-    pub attempts: u32,
-    pub interval: Duration,
-}
-impl Default for Poll {
-    fn default() -> Self {
-        Self {
-            attempts: 30,
-            interval: Duration::from_secs(2),
-        }
-    }
-}
-/// Submit signed transaction bytes and poll the original hash until a terminal result.
-/// `TRY_AGAIN_LATER` resends the same bytes. An unknown result after `poll.attempts` is an error
-/// that names the hash; the caller looks it up again and never re-signs a replacement.
-pub fn send_and_poll(
-    rpc: &dyn Rpc,
-    network: &str,
-    envelope_xdr: &str,
-    poll: Poll,
-) -> Result<VerifiedReceipt> {
-    let TransactionEnvelope::Tx(envelope) = read(envelope_xdr)? else {
-        return Err("Expected a signed v1 transaction".into());
-    };
-    if envelope.signatures.is_empty() {
-        return Err("Transaction is unsigned".into());
-    }
-    let expected = transaction_hash_for(network, &envelope.tx)?;
-    let id = hex(&expected);
-    // Once bytes may have reached the network, a failed call leaves the result unknown: name the
-    // hash, so the caller reconciles it before preparing any replacement.
-    let unknown = |e: String| {
-        format!("Transaction {id} result is unknown ({e}); look it up again before any replacement")
-    };
-    let mut sent = false;
-    for attempt in 0..poll.attempts.max(1) {
-        if attempt > 0 {
-            std::thread::sleep(poll.interval);
-        }
-        if !sent {
-            let v = rpc
-                .call("sendTransaction", json!({"transaction":envelope_xdr}))
-                .map_err(unknown)?;
-            if v["hash"].as_str() != Some(id.as_str()) {
-                return Err(unknown(
-                    "Stellar RPC returned another transaction hash".into(),
-                ));
-            }
-            match v["status"].as_str() {
-                Some("PENDING" | "DUPLICATE") => sent = true,
-                Some("TRY_AGAIN_LATER") => continue,
-                Some("ERROR") => {
-                    if let Some(receipt) =
-                        receipt_by_hash(rpc, network, &expected).map_err(unknown)?
-                    {
-                        return Ok(receipt);
-                    }
-                    return Err(format!(
-                        "Stellar rejected transaction {id}: {}",
-                        v["errorResultXdr"].as_str().unwrap_or("no result")
-                    ));
-                }
-                _ => return Err(unknown("Unknown sendTransaction status".into())),
-            }
-        }
-        if let Some(receipt) = receipt_by_hash(rpc, network, &expected).map_err(unknown)? {
-            return Ok(receipt);
-        }
-    }
-    Err(format!(
-        "Transaction {} has no terminal result yet; look it up again before any replacement",
-        hex(&expected)
-    ))
 }

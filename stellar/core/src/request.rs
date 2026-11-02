@@ -3,10 +3,8 @@
 //! service checks. Classic custody pays fees from the wallet account. A policy wallet pays them
 //! from its current agent account, the transaction source in the trusted state, which can differ
 //! from the configured customer signer.
+use crate::workflow::{AssetId, OperationRef, WorkflowEffectBound, WorkflowFeeBound};
 use crate::*;
-use allowit_policy_sdk::typed_workflow::{
-    AssetId, OperationRef, WorkflowEffectBound, WorkflowFeeBound,
-};
 
 /// A canonical G account or C contract as a workflow account.
 pub fn account(value: &str) -> Result<WorkflowAccount> {

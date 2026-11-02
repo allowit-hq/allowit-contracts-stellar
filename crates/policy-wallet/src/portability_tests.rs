@@ -103,6 +103,17 @@ fn host_lines() -> List<Text> {
     std::fs::create_dir_all(&out).unwrap();
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
     let lib = out.join("liballowit.rlib");
+    let resolved = Command::new("python3")
+        .args(["scripts/core_sources.py", "--portable-lib"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(
+        resolved.status.success(),
+        "{}",
+        Text::from_utf8_lossy(&resolved.stderr)
+    );
+    let portable_lib = Text::from_utf8(resolved.stdout).unwrap();
     let bin = out.join("policy-smoke");
     let run = |command: &mut Command| {
         let output = command.current_dir(&root).output().unwrap();
@@ -122,12 +133,9 @@ fn host_lines() -> List<Text> {
             "--crate-type=rlib",
             "--crate-name=allowit",
         ])
-        .args([
-            "--cfg",
-            "feature=\"std\"",
-            "crates/allowit/src/lib.rs",
-            "-o",
-        ])
+        .args(["--cfg", "feature=\"std\""])
+        .arg(portable_lib.trim())
+        .arg("-o")
         .arg(&lib));
     run(Command::new(&rustc)
         .args([

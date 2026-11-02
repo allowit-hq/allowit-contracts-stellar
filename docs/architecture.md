@@ -34,7 +34,7 @@ standard `source_digest` hashes the module, new prefix-binding digests.
 
 ## One portable policy source
 
-Policy source is ordinary synchronous Rust against `crates/allowit`. The offchain server and
+Policy source is ordinary synchronous Rust against the portable `allowit` package from Allowit core. The offchain server and
 `AllowitCustomPolicy` compile the file verbatim:
 
 ```rust
@@ -831,7 +831,7 @@ control native transactions. Its policy source and economic checks run offchain 
 
 ## Crate boundaries
 
-`crates/allowit` holds the shared rule core (`core.rs`) and both backends. The core with the host
+The portable `allowit` package in [Allowit core](https://github.com/allowit-hq/allowit-core/tree/main/crates/allowit) holds the shared rule core (`core.rs`) and both backends. The core with the host
 backend becomes `sdk/core` in the SDK repository, for the offchain server and SDK evaluator. The
 Soroban backend with the policy wallet, protocol, custom policy and engine crates becomes
 `stellar/core`. Authored policy names only `allowit::`, so the split does not change policy source.

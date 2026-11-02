@@ -4,22 +4,26 @@ on:
     branches: [main]
     paths:
       - "stellar/core/**"
-      - "crates/allowit/**"
       - "crates/protocol/**"
       - "crates/policy-wallet/**"
       - "crates/custom-policy/policy/**"
       - "scripts/policy_source.py"
+      - "scripts/core_sources.py"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - "scripts/contract_admin.py"
       - "scripts/build-contracts.sh"
       - ".github/workflows/stellar-core.yml"
   pull_request:
     paths:
       - "stellar/core/**"
-      - "crates/allowit/**"
       - "crates/protocol/**"
       - "crates/policy-wallet/**"
       - "crates/custom-policy/policy/**"
       - "scripts/policy_source.py"
+      - "scripts/core_sources.py"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - "scripts/contract_admin.py"
       - "scripts/build-contracts.sh"
       - ".github/workflows/stellar-core.yml"

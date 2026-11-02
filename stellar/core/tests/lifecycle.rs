@@ -1,4 +1,4 @@
-use allowit_policy_sdk::typed_workflow::*;
+use allowit_stellar_wallet::workflow::*;
 use allowit_stellar_wallet::*;
 use serde_json::{Value, json};
 use std::sync::Mutex;
@@ -43,12 +43,7 @@ fn fixture_with_wallet(
         Contract(contract).to_string()
     };
     let portable = route == WalletRoute::PolicyWallet;
-    let source = if portable {
-        PORTABLE.to_string()
-    } else {
-        "use allowit::v1::prelude::*; async fn _execute(ctx: &Context) -> PolicyResult { Ok(()) }"
-            .to_string()
-    };
+    let source = PORTABLE.to_string();
     let mut c = WalletConfig {
         network: "stellar:testnet".into(),
         policy_instance: [7; 32],
@@ -58,11 +53,7 @@ fn fixture_with_wallet(
         server: engine.clone(),
         route: route.clone(),
         tier: portable.then_some(PolicyTier::Simple),
-        language: if portable {
-            PolicyLanguage::Portable
-        } else {
-            PolicyLanguage::Legacy
-        },
+        language: PolicyLanguage::Portable,
         rules: vec![],
         params: PolicyParams::default(),
         source_digest: [0; 32],
@@ -76,12 +67,12 @@ fn fixture_with_wallet(
     };
     c.asset = sac_address(&c.network, &asset_xdr(&c).unwrap()).unwrap();
     let recipient = account_for_seed(&[6; 32]);
+    c.params = policy::params_from_json(
+        &json!({"destinations": [recipient]}),
+        Some(PolicyTier::Simple),
+    )
+    .unwrap();
     if portable {
-        c.params = policy::params_from_json(
-            &json!({"destinations": [recipient]}),
-            Some(PolicyTier::Simple),
-        )
-        .unwrap();
         c.source_digest =
             policy::standard_prefix_digest(PolicyTier::Simple, &c.module_digest, &c.asset, &[])
                 .unwrap();
@@ -404,7 +395,12 @@ fn classic_caps_keep_exact_local_math_while_odc_requires_native_preflight() {
     for route in [WalletRoute::Native, WalletRoute::PolicyWallet] {
         let (mut c, mut r, mut s) = fixture(route.clone(), true);
         if route == WalletRoute::Native {
-            c.policy_source="use allowit::v1::prelude::*; async fn _execute(ctx: &Context) -> PolicyResult { allowit::cap_per_transaction(ctx, \"2\", \"USDC\")?; Ok(()) }".into();
+            c.policy_source = CAPPED.into();
+            c.params = policy::params_from_json(
+                &json!({"destinations": [account_for_seed(&[6;32])], "payment_limit": 20_000_000}),
+                Some(PolicyTier::Simple),
+            )
+            .unwrap();
             c.source_hash = hash(&c.policy_source);
         } else {
             install(
@@ -483,34 +479,17 @@ fn odc_uses_execute_and_exact_module_schema_payload() {
     changed.module_digest[0] ^= 1;
     assert!(prepare(&c, &r, &changed, 86401, 86700).is_err());
 }
-#[derive(Default)]
-struct Store {
-    value: Option<(SignedOperation, OperationStatus)>,
-}
-impl rpc::OperationStore for Store {
-    fn record(&mut self, _: [u8; 32], s: &SignedOperation, status: OperationStatus) -> Result<()> {
-        if self
-            .value
-            .as_ref()
-            .is_some_and(|(previous, _)| previous != s)
-        {
-            return Err("rebound operation".into());
-        }
-        self.value = Some((s.clone(), status));
-        Ok(())
-    }
-    fn load(&self, _: [u8; 32]) -> Result<Option<(SignedOperation, OperationStatus)>> {
-        Ok(self.value.clone())
-    }
-}
 struct FakeRpc {
     calls: Mutex<Vec<String>>,
     signed: SignedOperation,
     fail_send: bool,
 }
 impl rpc::Rpc for FakeRpc {
-    fn call(&self, method: &str, _: Value) -> Result<Value> {
+    fn call(&self, method: &str, params: Value) -> Result<Value> {
         self.calls.lock().unwrap().push(method.into());
+        if method == "sendTransaction" {
+            assert_eq!(params, json!({"transaction":self.signed.transaction_xdr}));
+        }
         match method {
             "sendTransaction" if self.fail_send => Err("connection lost".into()),
             "sendTransaction" => {
@@ -537,43 +516,6 @@ impl rpc::Rpc for FakeRpc {
     }
 }
 #[test]
-fn unknown_broadcast_recovers_original_transaction_without_resigning() {
-    let (c, r, s) = fixture(WalletRoute::Native, false);
-    let p = prepare(&c, &r, &s, 86401, 86700).unwrap();
-    let signed = sign_native(&p);
-    let rpc = FakeRpc {
-        calls: Mutex::new(vec![]),
-        signed: signed.clone(),
-        fail_send: true,
-    };
-    let mut store = Store::default();
-    assert_eq!(
-        rpc::submit(&rpc, &mut store, &signed, 86401).unwrap(),
-        OperationStatus::SubmissionUnknown
-    );
-    assert_eq!(
-        rpc::recover(&rpc, &mut store, r.operation.nonce).unwrap(),
-        OperationStatus::Confirmed
-    );
-    assert_eq!(
-        *rpc.calls.lock().unwrap(),
-        vec!["sendTransaction", "getTransaction"]
-    );
-    assert_eq!(
-        rpc::submit(&rpc, &mut store, &signed, 86401).unwrap(),
-        OperationStatus::Confirmed
-    );
-    assert_eq!(
-        rpc.calls
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|m| m.as_str() == "sendTransaction")
-            .count(),
-        1
-    );
-}
-#[test]
 fn requests_reject_other_rails_unbounded_fees_extra_effects_and_wrong_asset() {
     let (c, mut r, s) = fixture(WalletRoute::Native, false);
     r.fee_bounds = None;
@@ -581,16 +523,11 @@ fn requests_reject_other_rails_unbounded_fees_extra_effects_and_wrong_asset() {
     let (c, mut r, s) = fixture(WalletRoute::Native, false);
     r.effect_bounds.push(r.effect_bounds[0].clone());
     assert!(prepare(&c, &r, &s, 86401, 86700).is_err());
-    let (c, mut r, s) = fixture(WalletRoute::Native, false);
-    let ExecutionInput::Instructions(v) = &mut r.input else {
-        panic!()
-    };
-    v[0] = NativeInstruction::SolanaNativeTransfer {
-        source: wf(&c.wallet),
-        destination: wf(&account_for_seed(&[6; 32])),
-        lamports: 20_000_000,
-    };
-    assert!(prepare(&c, &r, &s, 86401, 86700).is_err());
+    let (c, r, _) = fixture(WalletRoute::Native, false);
+    let mut foreign = serde_json::to_value(r).unwrap();
+    foreign["effect_bounds"][0]["source"]["chain"] = json!("Solana");
+    assert!(serde_json::from_value::<ExecutionRequest>(foreign).is_err());
+    assert_eq!(c.network, "stellar:testnet");
 }
 #[test]
 fn redeems_admit_only_positive_amounts_for_the_wallet_on_a_policy_wallet() {
@@ -632,156 +569,8 @@ fn redeems_admit_only_positive_amounts_for_the_wallet_on_a_policy_wallet() {
     }
 }
 
-struct ErrorAfterBroadcast {
-    inner: FakeRpc,
-    wrong_hash: bool,
-    not_found: bool,
-}
-impl rpc::Rpc for ErrorAfterBroadcast {
-    fn call(&self, method: &str, params: Value) -> Result<Value> {
-        if method == "sendTransaction" {
-            self.inner.calls.lock().unwrap().push(method.into());
-            return Ok(
-                json!({"status":"ERROR","hash":if self.wrong_hash{"wrong".into()}else{hex(&self.inner.signed.transaction_hash)},"errorResultXdr":"not proof of nonexecution"}),
-            );
-        }
-        if method == "getTransaction" && self.not_found {
-            self.inner.calls.lock().unwrap().push(method.into());
-            return Ok(json!({"status":"NOT_FOUND"}));
-        }
-        self.inner.call(method, params)
-    }
-}
-#[test]
-fn submission_error_reconciles_original_hash_and_terminal_state_is_sticky() {
-    let (c, r, s) = fixture(WalletRoute::Native, false);
-    let signed = sign_native(&prepare(&c, &r, &s, 86401, 86700).unwrap());
-    let rpc = ErrorAfterBroadcast {
-        inner: FakeRpc {
-            calls: Mutex::new(vec![]),
-            signed: signed.clone(),
-            fail_send: false,
-        },
-        wrong_hash: false,
-        not_found: false,
-    };
-    let mut store = Store::default();
-    assert_eq!(
-        rpc::submit(&rpc, &mut store, &signed, 86401).unwrap(),
-        OperationStatus::Confirmed
-    );
-    let disappeared = ErrorAfterBroadcast {
-        inner: FakeRpc {
-            calls: Mutex::new(vec![]),
-            signed,
-            fail_send: false,
-        },
-        wrong_hash: false,
-        not_found: true,
-    };
-    assert_eq!(
-        rpc::recover(&disappeared, &mut store, r.operation.nonce).unwrap(),
-        OperationStatus::Confirmed
-    );
-    assert!(disappeared.inner.calls.lock().unwrap().is_empty());
-}
-#[test]
-fn hash_mismatch_and_unresolved_error_retain_uncertainty() {
-    let (c, r, s) = fixture(WalletRoute::Native, false);
-    let signed = sign_native(&prepare(&c, &r, &s, 86401, 86700).unwrap());
-    for wrong_hash in [true, false] {
-        let rpc = ErrorAfterBroadcast {
-            inner: FakeRpc {
-                calls: Mutex::new(vec![]),
-                signed: signed.clone(),
-                fail_send: false,
-            },
-            wrong_hash,
-            not_found: true,
-        };
-        let mut store = Store::default();
-        assert_eq!(
-            rpc::submit(&rpc, &mut store, &signed, 86401).unwrap(),
-            OperationStatus::SubmissionUnknown
-        );
-        assert_eq!(
-            rpc::recover(&rpc, &mut store, r.operation.nonce).unwrap(),
-            OperationStatus::SubmissionUnknown
-        );
-    }
-}
 /// sendTransaction answers TRY_AGAIN_LATER first, then PENDING. getTransaction answers
 /// NOT_FOUND, as for a transaction the network never accepted.
-struct BusyRpc {
-    inner: FakeRpc,
-    busy: Mutex<bool>,
-}
-impl rpc::Rpc for BusyRpc {
-    fn call(&self, method: &str, params: Value) -> Result<Value> {
-        let hash = hex(&self.inner.signed.transaction_hash);
-        match method {
-            "sendTransaction" => {
-                self.inner.calls.lock().unwrap().push(method.into());
-                let mut busy = self.busy.lock().unwrap();
-                let status = if *busy { "TRY_AGAIN_LATER" } else { "PENDING" };
-                *busy = false;
-                Ok(json!({"hash":hash,"status":status}))
-            }
-            "getTransaction" => {
-                self.inner.calls.lock().unwrap().push(method.into());
-                Ok(json!({"status":"NOT_FOUND"}))
-            }
-            _ => self.inner.call(method, params),
-        }
-    }
-}
-#[test]
-fn try_again_later_resends_the_same_bytes_until_expiry() {
-    let (c, r, s) = fixture(WalletRoute::Native, false);
-    let signed = sign_native(&prepare(&c, &r, &s, 86401, 86700).unwrap());
-    let rpc = BusyRpc {
-        inner: FakeRpc {
-            calls: Mutex::new(vec![]),
-            signed: signed.clone(),
-            fail_send: false,
-        },
-        busy: Mutex::new(true),
-    };
-    let mut store = Store::default();
-    assert_eq!(
-        rpc::submit(&rpc, &mut store, &signed, 86401).unwrap(),
-        OperationStatus::SubmissionUnknown
-    );
-    // The original hash is not on the ledger and the operation is still valid: resend it.
-    assert_eq!(
-        rpc::submit(&rpc, &mut store, &signed, 86500).unwrap(),
-        OperationStatus::Submitted
-    );
-    assert_eq!(
-        *rpc.inner.calls.lock().unwrap(),
-        vec!["sendTransaction", "getTransaction", "sendTransaction"]
-    );
-    assert_eq!(store.value.as_ref().unwrap().0, signed);
-    // After expiry the bytes stay retained for lookup and are not sent again.
-    assert_eq!(
-        rpc::submit(&rpc, &mut store, &signed, 86700).unwrap(),
-        OperationStatus::SubmissionUnknown
-    );
-    assert_eq!(
-        rpc.inner
-            .calls
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|m| m.as_str() == "sendTransaction")
-            .count(),
-        2
-    );
-    assert_eq!(
-        store.value.as_ref().unwrap().1,
-        OperationStatus::SubmissionUnknown
-    );
-}
 struct AccountRpc {
     config: WalletConfig,
     account: AccountState,
@@ -1078,14 +867,10 @@ fn retained_native_status_preserves_signed_bytes_without_new_authorization() {
         signed: signed.clone(),
         fail_send: false,
     };
-    let mut store = Store {
-        value: Some((signed.clone(), OperationStatus::SubmissionUnknown)),
-    };
     assert_eq!(
-        rpc::recover(&rpc, &mut store, r.operation.nonce).unwrap(),
+        rpc::status_by_hash(&rpc, &c.network, &signed.transaction_hash).unwrap(),
         OperationStatus::Confirmed
     );
-    assert_eq!(store.value.as_ref().unwrap().0, signed);
     let mut rewritten = signed.clone();
     let TransactionEnvelope::Tx(mut envelope) =
         TransactionEnvelope::from_xdr_base64(&signed.transaction_xdr, Limits::none()).unwrap()
@@ -1235,10 +1020,8 @@ fn native_submission_requires_service_approval_when_agent_alone_meets_thresholds
             signed: changed.clone(),
             fail_send: false,
         };
-        let mut store = Store { value: None };
-        assert!(rpc::submit(&rpc, &mut store, &changed, 86401).is_err());
+        assert!(rpc::broadcast(&rpc, &changed, 86401).is_err());
         assert!(rpc.calls.lock().unwrap().is_empty());
-        assert!(store.value.is_none());
     }
     // A record from before role proofs stays readable for recovery but cannot be broadcast.
     let mut legacy = out.clone();
@@ -1315,6 +1098,20 @@ fn current_exact_preauthorization_does_not_add_unused_ed25519_signatures() {
     };
     assert!(env.signatures.is_empty());
     validate_signed(&out, 86401).unwrap();
+    let rpc = FakeRpc {
+        calls: Mutex::new(vec![]),
+        signed: out.clone(),
+        fail_send: false,
+    };
+    assert_eq!(
+        rpc::broadcast(&rpc, &out, 86401).unwrap(),
+        rpc::Broadcast::Submitted
+    );
+    assert_eq!(*rpc.calls.lock().unwrap(), vec!["sendTransaction"]);
+    assert_eq!(
+        rpc::signed_transaction_hash(&c.network, &out.transaction_xdr).unwrap(),
+        original.transaction_hash
+    );
 }
 #[test]
 fn odc_current_agent_account_may_have_a_different_customer_signer() {
@@ -1737,31 +1534,14 @@ fn retained_packet_validation_does_not_recompile_source_or_grant_execution() {
         signed: signed.clone(),
         fail_send: false,
     };
-    assert!(rpc::submit(&rpc, &mut Store::default(), &signed, 86401).is_err());
+    assert!(rpc::broadcast(&rpc, &signed, 86401).is_err());
     assert!(rpc.calls.lock().unwrap().is_empty());
-    let mut store = Store {
-        value: Some((signed.clone(), OperationStatus::SubmissionUnknown)),
-    };
     assert_eq!(
-        rpc::submit(&rpc, &mut store, &signed, 90000).unwrap(),
+        rpc::status_by_hash(&rpc, &c.network, &signed.transaction_hash).unwrap(),
         OperationStatus::Confirmed
     );
     assert_eq!(*rpc.calls.lock().unwrap(), vec!["getTransaction"]);
-    assert_eq!(
-        serde_json::to_vec(&store.value.as_ref().unwrap().0).unwrap(),
-        original
-    );
-    assert_eq!(
-        rpc::recover(&rpc, &mut store, r.operation.nonce).unwrap(),
-        OperationStatus::Confirmed
-    );
-    assert_eq!(*rpc.calls.lock().unwrap(), vec!["getTransaction"]);
-    let mut changed = signed.clone();
-    changed.prepared.config.policy_source.push(' ');
-    assert!(validate_retained_signed(&changed).is_err());
-    let mut changed = signed;
-    changed.transaction_hash[0] ^= 1;
-    assert!(validate_retained_signed(&changed).is_err());
+    assert_eq!(serde_json::to_vec(&signed).unwrap(), original);
 }
 
 struct AdminRpc {
@@ -2859,36 +2639,37 @@ fn exact_pre_task_records_preserve_request_bytes_hashes_signatures_and_status_re
             signed: signed.clone(),
             fail_send: false,
         };
-        let mut store = Store {
-            value: Some((signed.clone(), OperationStatus::Submitted)),
-        };
         assert_eq!(
-            rpc::recover(&rpc, &mut store, signed.prepared.request.operation.nonce).unwrap(),
+            rpc::status_by_hash(
+                &rpc,
+                &signed.prepared.config.network,
+                &signed.transaction_hash
+            )
+            .unwrap(),
             OperationStatus::Confirmed
         );
         assert_eq!(*rpc.calls.lock().unwrap(), vec!["getTransaction"]);
     }
-    let program: allowit_policy_sdk::Program =
-        serde_json::from_str(include_str!("fixtures/canonical-main-9682-ir.json")).unwrap();
-    let metadata: Value =
-        serde_json::from_str(include_str!("fixtures/canonical-main-9682-metadata.json")).unwrap();
-    allowit_policy_sdk::validate_program(&program).unwrap();
-    assert_eq!(
-        allowit_policy_sdk::canonical_ir_hash(&program).unwrap(),
-        metadata["ir_hash"].as_str().unwrap()
-    );
 }
 
 #[test]
-fn classic_route_clearly_rejects_stateful_engine_calls_without_fake_validation() {
-    let (mut c, r, mut state) = fixture(WalletRoute::Native, true);
-    c.policy_source = include_str!("fixtures/stellar-local-state-policy.rs").into();
-    c.source_hash = hash(&c.policy_source);
-    state.source_hash = c.source_hash;
+fn retired_classic_language_cannot_prepare_or_sign_but_retained_bytes_remain_valid() {
+    let (mut config, request, state) = fixture(WalletRoute::Native, false);
+    config.language = PolicyLanguage::Legacy;
     assert!(
-        prepare(&c, &r, &state, 86401, 86700)
+        prepare(&config, &request, &state, 86401, 86700)
             .unwrap_err()
-            .contains("cannot enforce")
+            .contains("Retired policy language")
+    );
+    let signed: SignedOperation = serde_json::from_str(include_str!(
+        "fixtures/canonical-main-9682-native-signed.json"
+    ))
+    .unwrap();
+    validate_retained_signed(&signed).unwrap();
+    assert!(
+        sign(&signed.prepared, &[2; 32], signed.prepared.created_at)
+            .unwrap_err()
+            .contains("Retired policy language")
     );
 }
 
@@ -3796,79 +3577,76 @@ fn owner_preparation_refuses_address_v2_entries_that_the_handoff_cannot_sign() {
 }
 
 #[test]
-fn uncertain_submission_errors_name_the_transaction_hash() {
-    use stellar_xdr::*;
-    struct Failing(&'static str);
-    impl rpc::Rpc for Failing {
-        fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
-            match (method, self.0) {
-                ("sendTransaction", "send") => Err("transport timeout".into()),
-                ("sendTransaction", _) => {
-                    let TransactionEnvelope::Tx(env) =
-                        read::<TransactionEnvelope>(params["transaction"].as_str().unwrap())?
-                    else {
-                        panic!()
-                    };
-                    let hash = hash(
-                        TransactionSignaturePayload {
-                            network_id: Hash(network_id("stellar:testnet")?),
-                            tagged_transaction: TransactionSignaturePayloadTaggedTransaction::Tx(
-                                env.tx,
-                            ),
-                        }
-                        .to_xdr(Limits::none())
-                        .unwrap(),
-                    );
-                    Ok(json!({"hash": hex(&hash), "status": "PENDING"}))
-                }
-                _ => Err("transport timeout".into()),
-            }
-        }
-    }
-    let tx = Transaction {
-        source_account: MuxedAccount::Ed25519(Uint256(
-            account_key(&account_for_seed(&[1; 32])).unwrap(),
-        )),
-        fee: 100,
-        seq_num: SequenceNumber(1),
-        cond: Preconditions::None,
-        memo: Memo::None,
-        operations: VecM::default(),
-        ext: TransactionExt::V0,
-    };
-    let id = hex(&hash(
-        TransactionSignaturePayload {
-            network_id: Hash(network_id("stellar:testnet").unwrap()),
-            tagged_transaction: TransactionSignaturePayloadTaggedTransaction::Tx(tx.clone()),
-        }
-        .to_xdr(Limits::none())
-        .unwrap(),
-    ));
-    let envelope = xdr(&TransactionEnvelope::Tx(TransactionV1Envelope {
-        tx,
-        signatures: vec![DecoratedSignature {
-            hint: SignatureHint([0; 4]),
-            signature: Signature(vec![0; 64].try_into().unwrap()),
-        }]
-        .try_into()
-        .unwrap(),
-    }))
+fn caller_owned_signing_runs_only_after_admission_and_verifies_the_exact_hash() {
+    use ed25519_dalek::{Signer, SigningKey};
+    let (config, request, state) = fixture(WalletRoute::Native, false);
+    let prepared = prepare(&config, &request, &state, 86401, 86700).unwrap();
+    let signed = sign_with(&prepared, &config.agent, 86401, |hash| {
+        assert_eq!(*hash, prepared.transaction_hash);
+        Ok(SigningKey::from_bytes(&[2; 32]).sign(hash).to_bytes())
+    })
     .unwrap();
-    // A send whose response is lost and a poll that fails both leave the result unknown.
-    for stage in ["send", "poll"] {
-        let error = rpc::send_and_poll(
-            &Failing(stage),
-            "stellar:testnet",
-            &envelope,
-            rpc::Poll {
-                attempts: 1,
-                interval: std::time::Duration::ZERO,
-            },
-        )
-        .unwrap_err();
-        assert!(
-            error.contains(&id) && error.contains("before any replacement"),
-            "{stage}: {error}"
-        );
-    }
+    assert_eq!(signed, sign(&prepared, &[2; 32], 86401).unwrap());
+    assert!(sign_with(&prepared, &config.agent, 86401, |_| Ok([0; 64])).is_err());
+    assert!(
+        sign_with(&prepared, &config.owner, 86401, |_| panic!(
+            "unauthorized signer reached key capability"
+        ))
+        .is_err()
+    );
+    let mut retired = prepared;
+    retired.config.language = PolicyLanguage::Legacy;
+    assert!(
+        sign_with(&retired, &config.agent, 86401, |_| panic!(
+            "retired policy reached key capability"
+        ))
+        .is_err()
+    );
+}
+
+#[test]
+fn chain_receipt_recovers_the_exact_policy_packet_without_new_signing_admission() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "fixtures/stellar-policy-wallet-revalidation-rpc.json"
+    ))
+    .unwrap();
+    let signed: SignedOperation = serde_json::from_value(fixture["signed"].clone()).unwrap();
+    let chain = FakeRpc {
+        calls: Mutex::new(vec![]),
+        signed: signed.clone(),
+        fail_send: false,
+    };
+    let receipt = rpc::receipt_by_hash(
+        &chain,
+        &signed.prepared.config.network,
+        &signed.transaction_hash,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(validate_prepared(&signed.prepared, 90_000).is_err());
+    rpc::validate_settled_policy_packet(&signed, &receipt).unwrap();
+    let mut changed = signed.clone();
+    changed.transaction_hash[0] ^= 1;
+    assert!(rpc::validate_settled_policy_packet(&changed, &receipt).is_err());
+    let (config, request, state) = self::fixture(WalletRoute::PolicyWallet, false);
+    let unsigned = prepare(&config, &request, &state, 86401, 86700).unwrap();
+    let unsigned = SignedOperation {
+        transaction_xdr: unsigned.transaction_xdr.clone(),
+        transaction_hash: unsigned.transaction_hash,
+        prepared: unsigned,
+        role_signatures: vec![],
+    };
+    let chain = FakeRpc {
+        calls: Mutex::new(vec![]),
+        signed: unsigned.clone(),
+        fail_send: false,
+    };
+    let receipt = rpc::receipt_by_hash(&chain, &config.network, &unsigned.transaction_hash)
+        .unwrap()
+        .unwrap();
+    assert!(
+        rpc::validate_settled_policy_packet(&unsigned, &receipt)
+            .unwrap_err()
+            .contains("unsigned")
+    );
 }

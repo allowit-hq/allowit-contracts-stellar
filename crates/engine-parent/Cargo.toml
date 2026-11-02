@@ -15,4 +15,4 @@ soroban-sdk.workspace = true
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 allowit-wallet-engine = { path = "../engine" }
-allowit = { path = "../allowit" }
+allowit = { workspace = true }
