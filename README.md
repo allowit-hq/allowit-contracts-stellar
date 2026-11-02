@@ -25,19 +25,15 @@ SDK engine composes the shared workflows. Core owns common policy rules, types a
 flowchart TB
     UI["[allowit-engine]<br/>npm @allowit/ui<br/>Shared policy web components"]
     Engine["[allowit-sdk]<br/>crate @allowit/sdk/engine<br/>All other shared logic"]
-    Vendor["crate + npm @allowit/vendor/*<br/>Native contracts · signing · chain semantics<br/>SVG graphics · web components"]
+    Vendor["[allowit-contracts-stellar]<br/>crate + npm @allowit/vendor/stellar<br/>Native contracts · signing · chain semantics<br/>SVG graphics · web components"]
     Core["[allowit-core]<br/>crate + npm @allowit/sdk/core<br/>Common types · policy rules · primitives<br/>TypeScript interfaces"]
 
-    UI -->|npm| Core
     UI -->|npm| Vendor
     Engine -->|crate| Vendor
-    Engine -->|crate| Core
     Vendor -->|crate + npm| Core
 ```
 
-Solid arrows are dependencies. Dashed arrows are runtime calls / connections.
-This view follows the [canonical responsibility diagram][responsibility-model].
-Use the [Cargo manifest](Cargo.toml) for Rust build package names.
+[Full architecture][responsibility-model].
 
 ## Overview
 

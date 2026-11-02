@@ -31,18 +31,17 @@ capabilities and core primitives. Shared workflow coordination remains in SDK en
 
 ```mermaid
 flowchart TB
+    UI["[allowit-engine]<br/>npm @allowit/ui<br/>Shared policy web components"]
     Engine["[allowit-sdk]<br/>crate @allowit/sdk/engine<br/>All other shared logic"]
-    Vendor["crate + npm @allowit/vendor/*<br/>Native contracts · signing · chain semantics<br/>SVG graphics · web components"]
+    Vendor["[allowit-contracts-stellar]<br/>crate + npm @allowit/vendor/stellar<br/>Native contracts · signing · chain semantics<br/>SVG graphics · web components"]
     Core["[allowit-core]<br/>crate + npm @allowit/sdk/core<br/>Common types · policy rules · primitives<br/>TypeScript interfaces"]
 
+    UI -->|npm| Vendor
     Engine -->|crate| Vendor
-    Engine -->|crate| Core
     Vendor -->|crate + npm| Core
 ```
 
-Solid arrows are dependencies. Dashed arrows are runtime calls / connections.
-This view follows the [canonical responsibility diagram][responsibility-model].
-Use the [Cargo manifest](Cargo.toml) for Rust build package names.
+[Architecture](../../README.md#architecture).
 
 ## Request profile and custody
 
@@ -104,5 +103,3 @@ The owner must enable x402. Its raw Ed25519 keys need no funded G-accounts. Nati
 An owner handoff returns the new owner in `pending_authorizers`. Its transaction cannot be submitted yet, and its hash is provisional. The new owner signs its recorded entry with a `signature_expiration_ledger` after the latest ledger. `OwnerAdmin::complete_owner_handoff` checks that entry and its signature, simulates again in enforce mode for the final fee and resources, and returns the final transaction and hash. The current owner signs only that transaction.
 
 `recover` moves the full balance observed at preparation. An agent payment that settles first makes it fail with `InsufficientFunds`. Pause automation with `set_pause` before a recovery.
-
-[responsibility-model]: https://github.com/allowit-hq/allowit-project/blob/main/wiki/allowit/architecture.md#dependency-direction
