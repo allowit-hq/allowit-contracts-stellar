@@ -359,9 +359,8 @@ pub fn signed_transaction_hash(network: &str, envelope_xdr: &str) -> Result<[u8;
     let TransactionEnvelope::Tx(envelope) = read(envelope_xdr)? else {
         return Err("Expected a signed v1 transaction".into());
     };
-    if envelope.signatures.is_empty() {
-        return Err("Transaction is unsigned".into());
-    }
+    // Exact-hash PreAuthTx quorum can legitimately need zero envelope signatures.
+    // This helper establishes transaction identity. The caller validates authority.
     transaction_hash_for(network, &envelope.tx)
 }
 /// Send an already signed native envelope once and decode only the native response.

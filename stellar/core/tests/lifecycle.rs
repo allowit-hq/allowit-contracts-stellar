@@ -485,8 +485,11 @@ struct FakeRpc {
     fail_send: bool,
 }
 impl rpc::Rpc for FakeRpc {
-    fn call(&self, method: &str, _: Value) -> Result<Value> {
+    fn call(&self, method: &str, params: Value) -> Result<Value> {
         self.calls.lock().unwrap().push(method.into());
+        if method == "sendTransaction" {
+            assert_eq!(params, json!({"transaction":self.signed.transaction_xdr}));
+        }
         match method {
             "sendTransaction" if self.fail_send => Err("connection lost".into()),
             "sendTransaction" => {
@@ -1095,6 +1098,20 @@ fn current_exact_preauthorization_does_not_add_unused_ed25519_signatures() {
     };
     assert!(env.signatures.is_empty());
     validate_signed(&out, 86401).unwrap();
+    let rpc = FakeRpc {
+        calls: Mutex::new(vec![]),
+        signed: out.clone(),
+        fail_send: false,
+    };
+    assert_eq!(
+        rpc::broadcast(&rpc, &out, 86401).unwrap(),
+        rpc::Broadcast::Submitted
+    );
+    assert_eq!(*rpc.calls.lock().unwrap(), vec!["sendTransaction"]);
+    assert_eq!(
+        rpc::signed_transaction_hash(&c.network, &out.transaction_xdr).unwrap(),
+        original.transaction_hash
+    );
 }
 #[test]
 fn odc_current_agent_account_may_have_a_different_customer_signer() {
