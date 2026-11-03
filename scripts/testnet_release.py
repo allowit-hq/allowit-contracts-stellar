@@ -5,6 +5,7 @@ import copy
 from datetime import datetime, timezone
 from dataclasses import dataclass
 import hashlib
+from importlib.metadata import version
 import json
 import os
 from pathlib import Path
@@ -12,10 +13,12 @@ import re
 import subprocess
 import sys
 import tomllib
+import time
+import tempfile
 from urllib.error import HTTPError
 from urllib.request import urlopen
 
-from stellar_sdk import Address, Asset, Keypair, Network, StrKey, TransactionEnvelope, scval, xdr
+from stellar_sdk import Account, Address, Asset, Keypair, Network, StrKey, TransactionBuilder, TransactionEnvelope, scval, xdr
 from stellar_sdk import SorobanServer
 from stellar_sdk.soroban_rpc import GetTransactionStatus
 
@@ -44,17 +47,24 @@ MAX_FUTURE_SKEW = 30
 MAX_ENDPOINT_LAG = 12  # Ledgers between the two fixed public services.
 
 
-def public_env():
-    """Public tools never receive Stellar credentials or signing overrides."""
-    return {key: value for key, value in os.environ.items() if not key.startswith("STELLAR_")}
+def public_env(github=False):
+    """Public tools receive only explicit tool paths and, for gh, its scoped token."""
+    names = {"PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "TMPDIR", "TMP", "TEMP", "SYSTEMROOT", "LANG", "LC_ALL"}
+    if github:
+        names.add("GH_TOKEN")
+    return {key: value for key, value in os.environ.items() if key in names}
 
 
 def public_run(args, **kwargs):
-    return subprocess.run(args, env=public_env(), **kwargs)
+    return subprocess.run(args, env=public_env(args[0] == "gh"), **kwargs)
 
 
 def public_output(args, **kwargs):
-    return subprocess.check_output(args, env=public_env(), **kwargs)
+    return subprocess.check_output(args, env=public_env(args[0] == "gh"), **kwargs)
+
+
+def utc_seconds():
+    return time.time()
 
 
 def workflow_attempt():
@@ -62,10 +72,6 @@ def workflow_attempt():
     if any(not re.fullmatch(r"[1-9][0-9]{0,19}", value) for value in values):
         raise ValueError("An exact GitHub workflow run and attempt are required")
     return ":".join(values)
-
-
-def attempt_filename(manifest, attempt):
-    return "testnet-attempt-" + manifest["tag"] + "-" + attempt.replace(":", "-") + ".json"
 
 
 @dataclass(frozen=True)
@@ -97,7 +103,7 @@ def public_json_url(path):
 
 
 def check_ledger_age(close_time):
-    age = datetime.now(timezone.utc).timestamp() - close_time
+    age = utc_seconds() - close_time
     if not -MAX_FUTURE_SKEW <= age <= MAX_LEDGER_AGE:
         raise ValueError("Public Testnet ledger header is stale or in the future")
 
@@ -107,12 +113,12 @@ def network_identity(rpc, recorded=None):
     if rpc.get_network().passphrase != PASSPHRASE:
         raise ValueError("RPC is not Stellar Testnet")
     root = public_json_url("/")
-    first, latest = root.get("history_elder_ledger"), root.get("history_latest_ledger")
+    first, latest = 128, root.get("history_latest_ledger")
     if root.get("network_passphrase") != PASSPHRASE or type(first) is not int or type(latest) is not int or not 1 <= first <= latest:
         raise ValueError("Public history is not a valid Testnet generation")
     if recorded is not None:
         first = recorded.get("ledger")
-        if type(first) is not int or first < 1 or recorded.get("source") != HORIZON + "/ledgers/" + str(first) or not HEX.fullmatch(recorded.get("hash", "")):
+        if first != 128 or recorded.get("source") != HORIZON + "/ledgers/128" or not HEX.fullmatch(recorded.get("hash", "")):
             raise ValueError("Invalid recorded Testnet generation anchor")
     try:
         anchor = public_json_url("/ledgers/" + str(first))
@@ -149,7 +155,7 @@ def network_identity(rpc, recorded=None):
     return {"network": "stellar:testnet", "network_id": Network(PASSPHRASE).network_id().hex(),
         "rpc": RPC, "horizon": HORIZON, "passphrase": PASSPHRASE,
         "generation": generation,
-        "genesis_available": first == 1,
+        "genesis_available": False,
         "observed": {"ledger": recent_sequence, "hash": recent["hash"], "observed_at": now,
             "close_time": close_time,
             "horizon_header_xdr": recent["header_xdr"], "rpc_header_xdr": matches[0].header_xdr}}
@@ -158,7 +164,8 @@ def network_identity(rpc, recorded=None):
 def check_network_metadata(identity):
     expected = {"network": "stellar:testnet", "network_id": Network(PASSPHRASE).network_id().hex(),
         "rpc": RPC, "horizon": HORIZON, "passphrase": PASSPHRASE}
-    if any(identity.get(key) != value for key, value in expected.items()) or identity.get("genesis_available") is not (identity.get("generation", {}).get("ledger") == 1):
+    generation = identity.get("generation", {})
+    if any(identity.get(key) != value for key, value in expected.items()) or identity.get("genesis_available") is not False or generation.get("ledger") != 128 or generation.get("source") != HORIZON + "/ledgers/128" or not HEX.fullmatch(generation.get("hash", "")):
         raise ValueError("Recorded Testnet network metadata is inconsistent")
 
 
@@ -169,8 +176,8 @@ def same_generation(left, right):
             for key in ("ledger", "hash", "source", "closed_at"))
 
 
-def deployment_filename(manifest, identity):
-    return "testnet-deployment-" + manifest["tag"] + "-" + identity["generation"]["hash"] + ".json"
+def deployment_filename(manifest, identity, attempt):
+    return "testnet-deployment-" + manifest["tag"] + "-" + identity["generation"]["hash"] + "-" + attempt.replace(":", "-") + ".json"
 
 
 def source_equal(left, right):
@@ -185,7 +192,7 @@ def read_public(path):
 
 
 def gh_json(path, missing=False):
-    result = public_run(["gh", "api", path], capture_output=True, text=True)
+    result = public_run(["gh", "api", path], capture_output=True, text=True, timeout=30)
     data = ca.public_json(result.stdout)
     if result.returncode:
         if missing and data.get("status") == "404":
@@ -194,166 +201,56 @@ def gh_json(path, missing=False):
     return data
 
 
-def canonical_run(run):
-    if run.get("path") != ".github/workflows/testnet-release.yml" or run.get("event") != "workflow_run" or run.get("head_repository", {}).get("full_name") != "allowit-hq/allowit-contracts-stellar":
-        raise ValueError("Prior checkpoint belongs to another workflow")
-    head = run.get("head_sha", "")
-    if not SHA.fullmatch(head) or public_run(["git", "merge-base", "--is-ancestor", head, "refs/release/main"], capture_output=True).returncode:
-        raise ValueError("Prior deployment checkpoint is not from canonical main")
-    return head
+def current_authority(manifest):
+    """Check this build and controller attempt, never lifetime Actions history."""
+    check_canonical_tag(manifest)
+    root = Path(__file__).resolve().parents[1]
+    automation = git(root, "rev-parse", "HEAD")
+    if automation != os.environ.get("GITHUB_WORKFLOW_SHA"):
+        raise ValueError("Controller source differs from the executing workflow")
+    if version("stellar-sdk") != "16.1.0" or public_run(["git", "-C", str(root), "diff", "--quiet", "HEAD", "--", "scripts",
+        ".github/workflows/testnet-release.yml"], capture_output=True).returncode:
+        raise ValueError("Controller files or native SDK differ from the approved source")
+    for commit in (automation, manifest["revision"], manifest["workflow_revision"]):
+        if public_run(["git", "-C", str(root), "merge-base", "--is-ancestor", commit, "refs/release/main"], capture_output=True).returncode:
+            raise ValueError("Release inputs must belong to canonical main")
+    attempt = workflow_attempt()
+    current = gh_json("repos/allowit-hq/allowit-contracts-stellar/actions/runs/" + attempt.split(":")[0] + "/attempts/" + attempt.split(":")[1])
+    if (current.get("path") != ".github/workflows/testnet-release.yml" or current.get("event") != "workflow_run"
+        or current.get("head_repository", {}).get("full_name") != "allowit-hq/allowit-contracts-stellar"
+        or current.get("head_branch") != "main" or current.get("head_sha") != automation
+        or current.get("run_attempt") != int(attempt.split(":")[1])):
+        raise ValueError("Current controller attempt is not canonical main")
+    run_id, run_attempt = (os.environ.get(name, "") for name in ("RELEASE_BUILD_RUN_ID", "RELEASE_BUILD_RUN_ATTEMPT"))
+    if any(not re.fullmatch(r"[1-9][0-9]{0,19}", value) for value in (run_id, run_attempt)):
+        raise ValueError("An exact successful build attempt is required")
+    event = read_public(Path(os.environ["GITHUB_EVENT_PATH"]))
+    trigger = event.get("workflow_run", {})
+    if trigger.get("id") != int(run_id) or trigger.get("run_attempt") != int(run_attempt):
+        raise ValueError("Selected build attempt differs from the current workflow trigger")
+    built = gh_json("repos/allowit-hq/allowit-contracts-stellar/actions/runs/" + run_id + "/attempts/" + run_attempt)
+    if (built.get("path") != ".github/workflows/release.yml" or built.get("event") not in ("push", "workflow_dispatch")
+        or built.get("head_repository", {}).get("full_name") != "allowit-hq/allowit-contracts-stellar"
+        or built.get("head_sha") != manifest["workflow_revision"]
+        or (built.get("event") == "push" and (built.get("head_branch") != manifest["tag"] or built.get("head_sha") != manifest["revision"]))
+        or (built.get("event") == "workflow_dispatch" and built.get("head_branch") != "main")
+        or built.get("conclusion") != "success"
+        or built.get("run_attempt") != int(run_attempt)):
+        raise ValueError("Release bundle has no matching successful canonical build")
+    return {"automation": automation, "controller_attempt": attempt, "build_run": run_id + ":" + run_attempt}
 
 
-def published_coverage(output):
-    """Use the last immutable public attempt checkpoint as the durable history anchor."""
-    candidates = []
-    for page in range(1, 11):
-        releases = gh_json("repos/allowit-hq/allowit-contracts-stellar/releases?per_page=100&page=" + str(page))
-        for release in releases:
-            if release.get("draft"):
-                continue
-            for asset in release.get("assets", []):
-                match = re.fullmatch(r"testnet-attempt-(v[0-9]+\.[0-9]+\.[0-9]+)-([1-9][0-9]*)-([1-9][0-9]*)\.json", asset["name"])
-                if match and match[1] == release["tag_name"]:
-                    candidates.append((int(match[2]), int(match[3]), release["tag_name"], asset["name"]))
-        if len(releases) < 100:
-            break
-    else:
-        raise ValueError("Published history discovery exceeds limit")
-    if not candidates:
-        return None
-    run_id, attempt, tag, name = max(candidates)
-    latest, reference, expected, seen = None, None, None, set()
-    for depth in range(100):
-        if name in seen:
-            raise ValueError("Published checkpoint history contains a cycle")
-        seen.add(name)
-        target = output / str(depth)
-        target.mkdir(parents=True)
-        public_run(["gh", "release", "download", tag, "--repo", "allowit-hq/allowit-contracts-stellar", "--pattern", name,
-            "--pattern", "source-manifest.json", "--dir", str(target)], check=True, capture_output=True)
-        path = target / name
-        checkpoint, source = read_public(path), read_public(target / "source-manifest.json")
-        if expected is not None and digest(path.read_bytes()) != expected:
-            raise ValueError("Published checkpoint history hash differs")
-        run = gh_json("repos/allowit-hq/allowit-contracts-stellar/actions/runs/" + str(run_id) + "/attempts/" + str(attempt))
-        head = canonical_run(run)
-        if checkpoint.get("status") != "VERIFIED" or checkpoint.get("workflow_attempt") != str(run_id) + ":" + str(attempt) or not source_equal(checkpoint.get("source", {}), source) or source.get("tag") != tag or source.get("repository") != REPOSITORY or checkpoint.get("deployment_automation_revision") != head:
-            raise ValueError("Published attempt provenance differs")
-        check_canonical_tag(source)
-        coverage = checkpoint.get("covered_attempts")
-        if not isinstance(coverage, list) or checkpoint["workflow_attempt"] not in coverage or any(not re.fullmatch(r"[1-9][0-9]*:[1-9][0-9]*", key) for key in coverage):
-            raise ValueError("Published attempt coverage is incomplete")
-        if latest is None:
-            latest = checkpoint
-            reference = {"tag": tag, "file": name, "sha256": digest(path.read_bytes())}
-        elif not set(coverage).issubset(latest["covered_attempts"]):
-            raise ValueError("Published checkpoint lost earlier attempt coverage")
-        link = checkpoint.get("history_anchor")
-        if link is None:
-            return latest, reference
-        tag, name, expected = link["tag"], link["file"], link["sha256"]
-        match = re.fullmatch(r"testnet-attempt-" + re.escape(tag) + r"-([1-9][0-9]*)-([1-9][0-9]*)\.json", name)
-        if not TAG.fullmatch(tag) or match is None or not HEX.fullmatch(expected):
-            raise ValueError("Published history anchor identity is invalid")
-        run_id, attempt = int(match[1]), int(match[2])
-    raise ValueError("Published checkpoint history exceeds limit")
+def build_record(manifest, attempt):
+    return {"schema": 1, "repository": REPOSITORY, "build_attempt": attempt,
+        **{key: manifest[key] for key in IDENTITY_KEYS}}
 
 
-def fetch_previous(manifest, output):
-    """Prove history from canonical runs, then recover public receipts before signing."""
-    current = workflow_attempt()
-    current_run = gh_json("repos/allowit-hq/allowit-contracts-stellar/actions/runs/" + current.split(":")[0])
-    canonical_run(current_run)
-    if current_run.get("run_attempt") != int(current.split(":")[1]):
-        raise ValueError("Current workflow attempt identity differs")
-    output.mkdir(parents=True, exist_ok=False)
-    publication = published_coverage(output / "history-anchor")
-    anchor = publication[0] if publication else None
-    covered = set(anchor["covered_attempts"]) if anchor else set()
-    checkpoints, available = {}, set()
-    release = gh_json("repos/allowit-hq/allowit-contracts-stellar/releases/tags/" + manifest["tag"], missing=True)
-    if release is not None:
-        published = output / "published"
-        published.mkdir()
-        patterns = ["source-manifest.json", "sample-policy.rs", "testnet-deployment-" + manifest["tag"] + "-*.json", *CONTRACTS.values()]
-        patterns += [asset["name"] for asset in release.get("assets", []) if asset["name"].startswith("testnet-attempt-" + manifest["tag"] + "-")]
-        public_run(["gh", "release", "download", manifest["tag"], "--repo", "allowit-hq/allowit-contracts-stellar",
-            *[arg for pattern in patterns for arg in ("--pattern", pattern)], "--dir", str(published)], check=True, capture_output=True)
-        if not source_equal(check_bundle(published), manifest) or not list(published.glob("testnet-deployment-*.json")):
-            raise ValueError("Published release artifacts or deployment identity differ")
-        for path in published.glob("testnet-*.json"):
-            checkpoints[str(path.relative_to(output))] = digest(path.read_bytes())
-    prefix = "stellar-testnet-checkpoint-" + manifest["tag"] + "-"
-    for page in range(1, 11):
-        records = gh_json("repos/allowit-hq/allowit-contracts-stellar/actions/artifacts?per_page=100&page=" + str(page))["artifacts"]
-        for item in records:
-            if not item["name"].startswith(prefix):
-                continue
-            match = re.fullmatch(re.escape(prefix) + r"([1-9][0-9]*)-([1-9][0-9]*)", item["name"])
-            if match is None or int(match[1]) != item["workflow_run"]["id"]:
-                raise ValueError("Prior checkpoint run/attempt identity differs")
-            key = match[1] + ":" + match[2]
-            run = gh_json("repos/allowit-hq/allowit-contracts-stellar/actions/runs/" + match[1])
-            if canonical_run(run) != item["workflow_run"]["head_sha"] or int(match[2]) > run.get("run_attempt", 0):
-                raise ValueError("Prior checkpoint source differs")
-            if key in covered:
-                continue
-            if item["expired"]:
-                raise ValueError("Prior signing checkpoint expired; operator reconciliation is required")
-            target = output / ("run-" + str(item["id"]))
-            public_run(["gh", "run", "download", match[1], "--repo", "allowit-hq/allowit-contracts-stellar",
-                "--name", item["name"], "--dir", str(target)], check=True, capture_output=True)
-            path = target / "testnet-deployment.json"
-            if read_public(path).get("workflow_attempt") != key:
-                raise ValueError("Downloaded checkpoint does not identify its authenticated attempt")
-            checkpoints[str(path.relative_to(output))] = digest(path.read_bytes())
-            available.add(key)
-        if len(records) < 100:
-            break
-    else:
-        raise ValueError("Checkpoint discovery exceeds limit")
-    # Artifact deletion removes the artifact object itself. Run/attempt history is independent.
-    for page in range(1, 11):
-        runs = gh_json("repos/allowit-hq/allowit-contracts-stellar/actions/workflows/testnet-release.yml/runs?per_page=100&page=" + str(page))["workflow_runs"]
-        for run in runs:
-            canonical_run(run)
-            count = run.get("run_attempt")
-            if type(count) is not int or not 1 <= count <= 100:
-                raise ValueError("Workflow attempt history is unavailable")
-            for attempt in range(1, count + 1):
-                key = str(run["id"]) + ":" + str(attempt)
-                if key == current or key in covered:
-                    continue
-                jobs = gh_json("repos/allowit-hq/allowit-contracts-stellar/actions/runs/" + str(run["id"]) + "/attempts/" + str(attempt) + "/jobs?per_page=100")["jobs"]
-                signers = [job for job in jobs if job["name"] == "testnet"]
-                if not signers and jobs and all(job["name"] in ("verify", "publish") and job.get("status") == "completed" for job in jobs):
-                    covered.add(key)  # A publisher-only retry never receives the signing environment.
-                    continue
-                if len(jobs) >= 100 or len(signers) != 1:
-                    raise ValueError("Potential signing history is unavailable; operator reconciliation is required")
-                job = signers[0]
-                if job.get("status") != "completed":
-                    raise ValueError("Prior signing attempt is still active")
-                deployment_steps = [step for step in job.get("steps", []) if step["name"] == "Deploy exact release to Testnet and verify native readback"]
-                never_signed = job.get("conclusion") == "skipped" or len(deployment_steps) == 1 and deployment_steps[0].get("conclusion") == "skipped"
-                if not never_signed and key not in available:
-                    raise ValueError("Potential signing attempt has no authenticated checkpoint; operator reconciliation is required")
-                covered.add(key)
-        if len(runs) < 100:
-            break
-    else:
-        raise ValueError("Workflow history discovery exceeds limit")
-    bootstrap = {read_public(output / path).get("bootstrap_attempt") for path in checkpoints}
-    if anchor:
-        bootstrap.add(anchor.get("bootstrap_attempt"))
-    if len(bootstrap) > 1 or bootstrap and (None in bootstrap):
-        raise ValueError("Authenticated bootstrap history is inconsistent")
-    write(output / "attempt-history.json", {"source": manifest, "current_attempt": current,
-        "covered_attempts": sorted(covered), "checkpoints": checkpoints,
-        "bootstrap_attempt": next(iter(bootstrap)) if bootstrap else current,
-        "published_anchor": anchor is not None, "history_anchor": publication[1] if publication else None,
-        "anchor_roles": {key: anchor[key] for key in ("owner", "agent", "server")} if anchor else None,
-        "first_use": not anchor and not checkpoints})
+def current_bundle(directory):
+    manifest = check_bundle(directory)
+    authority = current_authority(manifest)
+    if read_public(directory / "release-build.json") != build_record(manifest, authority["build_run"]):
+        raise ValueError("Downloaded artifact belongs to another build attempt")
+    return manifest, authority
 
 
 def write(path, value, private=False):
@@ -443,6 +340,7 @@ def bundle(source, identity, output):
     (output / "sample-policy.rs").write_bytes(data)
     result["sample_policy"] = {"file": "sample-policy.rs", "sha256": digest(data), "rules": rules}
     write(output / "source-manifest.json", result)
+    write(output / "release-build.json", build_record(result, workflow_attempt()))
     return result
 
 
@@ -495,7 +393,7 @@ def config_for(manifest, kind, owner, agent, server):
         "call_limit": 10, "destinations": [agent], "tokens": [asset],
         "expires_at": 4_102_444_800, "operations": ["transfer"]}
     source = manifest["sample_policy"]["sha256"] if kind == "custom" else ca.prefix_digest(KINDS[kind], module, asset, rules)
-    instance = digest(canonical(["allowit_testnet_release_v1", manifest["revision"], kind, module, owner, agent, server]))
+    instance = digest(canonical(["allowit_testnet_release_v1", manifest["tag"], kind, owner]))
     return {"owner": owner, "agent": agent, "server": server, "asset": asset,
         "policy_instance": instance, "source_digest": source, "rules": rules, "params": params, "x402_enabled": False}
 
@@ -507,8 +405,12 @@ def check_constructor(create, config, module, salt):
     preimage = create.contract_id_preimage
     if preimage.type != xdr.ContractIDPreimageType.CONTRACT_ID_PREIMAGE_FROM_ADDRESS or preimage.from_address.address != Address(config["owner"]).to_xdr_sc_address() or preimage.from_address.salt.uint256 != salt:
         raise ValueError("Constructor owner or deterministic salt differs")
-    # Encode caller-owned intent independently of the CLI/spec decoder. Preserve every
-    # AllowitValue tag, including nested Addr versus Str with identical printable bytes.
+    if create.constructor_args[0].to_xdr_bytes() != config_scval(config).to_xdr_bytes():
+        raise ValueError("Constructor native XDR differs from the release intent")
+
+
+def config_scval(config):
+    """Encode the intended variants independently of native simulation."""
     params = {}
     for name, value in config["params"].items():
         if name in ("destinations", "tokens", "operations"):
@@ -521,421 +423,419 @@ def check_constructor(create, config, module, salt):
         source_digest=scval.to_bytes(bytes.fromhex(config["source_digest"])),
         rules=scval.to_vec([scval.to_enum(rule, None) for rule in config["rules"]]),
         params=scval.to_struct(params), x402_enabled=scval.to_bool(config["x402_enabled"]))
-    if create.constructor_args[0].to_xdr_bytes() != scval.to_struct(fields).to_xdr_bytes():
-        raise ValueError("Constructor native XDR differs from the release intent")
+    return scval.to_struct(fields)
 
 
-def authorize_history(manifest, previous, owner, agent, server):
-    attempt = workflow_attempt()
-    if previous is None:
-        raise ValueError("Authenticated attempt history is required before deployment")
-    history = read_public(previous / "attempt-history.json")
-    if history.get("current_attempt") != attempt or not source_equal(history.get("source", {}), manifest):
-        raise ValueError("Authenticated attempt history differs from this release/run")
-    if type(history.get("first_use")) is not bool or type(history.get("published_anchor")) is not bool:
-        raise ValueError("Authenticated history classification is invalid")
-    if history["published_anchor"]:
-        if history.get("anchor_roles") != {"owner": owner, "agent": agent, "server": server}:
-            raise ValueError("Published release roles differ; operator reconciliation is required")
-    elif history.get("bootstrap_attempt") != os.environ.get("STELLAR_TESTNET_BOOTSTRAP_ATTEMPT", "") or (
-        history["first_use"] and history["bootstrap_attempt"] != attempt):
-        raise ValueError("First deployment requires its one-time protected bootstrap attempt")
-    checkpoints = []
-    for relative, expected in history["checkpoints"].items():
-        path = previous / relative
-        if not path.resolve().is_relative_to(previous.resolve()):
-            raise ValueError("Checkpoint path escapes authenticated history")
-        data = read_public(path)
-        if digest(path.read_bytes()) != expected:
-            raise ValueError("Checkpoint bytes differ from authenticated history")
-        if not source_equal(data.get("source", {}), manifest) or any(data.get(k) != v for k, v in
-            (("owner", owner), ("agent", agent), ("server", server), ("network", "stellar:testnet"))):
-            raise ValueError("Prior deployment source, roles or network differ; stop before mutation")
-        for kind, item in data.get("wallets", {}).items():
-            if kind not in KINDS or item.get("config") != config_for(manifest, kind, owner, agent, server):
-                raise ValueError("Prior wallet configuration differs; stop before mutation")
-        checkpoints.append(data)
-    return history, checkpoints
+def code_key(value):
+    return xdr.LedgerKey(xdr.LedgerEntryType.CONTRACT_CODE,
+        contract_code=xdr.LedgerKeyContractCode(xdr.Hash(bytes.fromhex(value))))
+
+
+def instance_key(wallet):
+    return xdr.LedgerKey(xdr.LedgerEntryType.CONTRACT_DATA, contract_data=xdr.LedgerKeyContractData(
+        Address(wallet).to_xdr_sc_address(), xdr.SCVal(xdr.SCValType.SCV_LEDGER_KEY_CONTRACT_INSTANCE),
+        xdr.ContractDataDurability.PERSISTENT))
+
+
+def wallet_intent(manifest, kind, owner, agent, server):
+    config = config_for(manifest, kind, owner, agent, server)
+    salt = bytes.fromhex(digest(canonical(["allowit_testnet_release_salt_v1", manifest["tag"], kind, owner])))
+    return config, salt, contract_id(owner, salt)
+
+
+def native_header(rpc, sequence):
+    items = rpc.get_ledgers(start_ledger=sequence, limit=1).ledgers
+    if len(items) != 1 or items[0].sequence != sequence:
+        raise ValueError("Native snapshot header is unavailable")
+    item = items[0]
+    native = xdr.LedgerHeaderHistoryEntry.from_xdr(item.header_xdr)
+    header = native.header
+    if header.ledger_seq.uint32 != sequence or native.hash.hash.hex() != item.hash or digest(header.to_xdr_bytes()) != item.hash:
+        raise ValueError("Native snapshot header differs from its identity")
+    check_ledger_age(header.scp_value.close_time.time_point.uint64)
+    return {"ledger": sequence, "hash": item.hash, "header_xdr": item.header_xdr}
+
+
+def nonrestoring(simulation):
+    if simulation.error or simulation.restore_preamble is not None or not simulation.transaction_data:
+        raise ValueError("Simulation did not prove an eligible non-restoring action")
+    data = xdr.SorobanTransactionData.from_xdr(simulation.transaction_data)
+    if data.ext.v not in (0, 1) or (data.ext.v == 1 and (
+        data.ext.resource_ext is None or data.ext.resource_ext.archived_soroban_entries)):
+        raise ValueError("Archived or unknown Soroban resources prohibit creation")
+    return data
 
 
 class Deployment:
-    def __init__(self, directory, output, private, key, agent, server, previous=None):
+    def __init__(self, directory, output, private, key, agent, server):
         self.directory, self.output, self.private, self.key = directory, output, private, key
-        self.manifest = check_bundle(directory)
+        self.manifest, self.authority = current_bundle(directory)
         for address in (key.public_key, agent, server):
             ca.account(address)
         if len({key.public_key, agent, server}) != 3:
             raise ValueError("Release owner, agent and server must differ")
         self.agent, self.server = agent, server
-        self.attempt = workflow_attempt()
-        self.history, self.previous = authorize_history(self.manifest, previous, key.public_key, agent, server)
         self.rpc = SorobanServer(RPC)
-        self.current_previous = []
-        identity = None
-        for checkpoint in self.previous:
-            prior_identity = checkpoint["network_identity"]
-            check_network_metadata(prior_identity)
-            observed = network_identity(self.rpc, prior_identity["generation"])
-            if observed["generation"]["hash"] == prior_identity["generation"]["hash"]:
-                if not same_generation(observed, prior_identity):
-                    raise ValueError("Recorded Testnet generation metadata is inconsistent")
-                if identity is not None and not same_generation(identity, observed):
-                    raise ValueError("Recorded Testnet generation anchors are inconsistent")
-                identity = observed
-                self.current_previous.append(checkpoint)
-            # Only a different native hash at THIS checkpoint's retained sequence proves reset.
-            # network_identity refuses an unavailable or invalid retained anchor.
-        if identity is None:
-            identity = network_identity(self.rpc)
-        self.public = {"schema": 1, "network": "stellar:testnet", "rpc": RPC,
-            "source": self.manifest, "owner": key.public_key, "agent": agent, "server": server,
-            "deployment_automation_revision": git(Path(__file__).resolve().parents[1], "rev-parse", "HEAD"),
-            "workflow_attempt": self.attempt, "bootstrap_attempt": self.history["bootstrap_attempt"],
-            "covered_attempts": sorted(set(self.history["covered_attempts"]) | {self.attempt}),
-            "history_anchor": self.history.get("history_anchor"),
-            "code": {}, "wallets": {}, "transactions": [],
-            "network_identity": identity, "status": "IN_PROGRESS",
-            "scope": "Release-controlled initialized smoke wallets; no user wallet, user funds, or Mainnet deployment. Shared engine/parent code is uploaded only."}
+        # This starts after the workflow's global signer slot and environment admission.
+        self.slot_entered = utc_seconds()
+        self.identity = network_identity(self.rpc)
+        self.intents = {kind: wallet_intent(self.manifest, kind, key.public_key, agent, server) for kind in KINDS}
+        self.account_key = xdr.LedgerKey(xdr.LedgerEntryType.ACCOUNT,
+            account=xdr.LedgerKeyAccount(key.xdr_account_id()))
+        self.asset_key = instance_key(Asset.native().contract_id(PASSPHRASE))
+        self.keys = [self.account_key, self.asset_key]
+        self.keys += [code_key(value) for value in dict.fromkeys(item["sha256"] for item in self.manifest["artifacts"].values())]
+        self.keys += [instance_key(intent[2]) for intent in self.intents.values()]
+        self.completed = set()
+        self.expected_sequence = None
+        self.snapshot_number = 0
+        self.public = {"schema": 1, "network": "stellar:testnet", "rpc": RPC, "source": self.manifest,
+            "owner": key.public_key, "agent": agent, "server": server,
+            "deployment_automation_revision": self.authority["automation"], "workflow_attempt": workflow_attempt(),
+            "build_attempt": self.authority["build_run"], "network_identity": self.identity,
+            "signer_slot_entered_at": self.slot_entered,
+            "code": {}, "wallets": {}, "transactions": [], "status": "IN_PROGRESS",
+            "scope": "Current initialized release smoke resources, not historical receipt completeness or owner acceptance. No wallet funding or payment execution."}
         private.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if private.is_symlink() or private.stat().st_mode & 0o077:
-            raise ValueError("Private transaction directory must have mode0700")
-        if private.resolve().is_relative_to(directory.resolve()) or output.exists() or any(private.glob("*.json")):
-            raise ValueError("Use separate fresh private and public checkpoint paths; preserve earlier packets")
+        if private.is_symlink() or private.stat().st_mode & 0o077 or private.resolve().is_relative_to(directory.resolve()):
+            raise ValueError("Use a separate private transaction directory with mode0700")
+        if output.exists() or any(private.iterdir()):
+            raise ValueError("Use fresh run paths and preserve earlier packets")
 
     def save(self):
         write(self.output, self.public)
+        self.snapshot_number += 1
+        snapshot = self.output.with_name(self.output.stem + "-snapshot-" + str(self.snapshot_number).zfill(3) + ".json")
+        immutable(snapshot, canonical(self.public) + b"\n")
 
-    def reconcile_previous(self):
-        """Resolve original hashes before any rerun can fund, sign or submit another transaction."""
-        records = {}
-        for checkpoint in self.current_previous:
-            for record in checkpoint.get("transactions", []):
-                tx_hash, expires = record.get("transaction_hash"), record.get("expires_at")
-                if not HEX.fullmatch(tx_hash or "") or type(expires) is not int or expires <= 0 or record.get("status") not in {
-                    "prepared", "unknown", "SUCCESS", "FAILED", "EXPIRED_UNCONFIRMED"} or record.get("stage") not in {
-                    *("upload-" + kind for kind in CONTRACTS), *("deploy-" + kind for kind in KINDS)}:
-                    raise ValueError("Prior transaction identity is incomplete; operator reconciliation is required")
-                old = records.get(tx_hash)
-                if old is not None:
-                    if any(old.get(k) != record.get(k) for k in ("stage", "expires_at", "fee_cap_stroops")) or (
-                        old.get("status") in ("SUCCESS", "FAILED") and record.get("status") in ("SUCCESS", "FAILED") and
-                        any(old.get(k) != record.get(k) for k in ("status", "ledger"))):
-                        raise ValueError("Prior transaction records conflict")
-                    if old.get("status") == "SUCCESS" or old.get("status") == "FAILED" and record.get("status") != "SUCCESS":
-                        continue
-                records[tx_hash] = copy.deepcopy(record)
-        close_time = self.public["network_identity"]["observed"]["close_time"]
-        for tx_hash, record in records.items():
-            receipt = self.rpc.get_transaction(tx_hash)
-            if receipt.status in (GetTransactionStatus.SUCCESS, GetTransactionStatus.FAILED):
-                envelope = TransactionEnvelope.from_xdr(receipt.envelope_xdr, PASSPHRASE)
-                if envelope.hash_hex() != tx_hash or envelope.transaction.source.account_id != self.key.public_key or not receipt.ledger or envelope.transaction.preconditions.time_bounds.max_time != record["expires_at"]:
-                    raise ValueError("Prior transaction receipt differs from the original identity")
-                status = "SUCCESS" if receipt.status == GetTransactionStatus.SUCCESS else "FAILED"
-                if record.get("status") in ("SUCCESS", "FAILED") and (record["status"] != status or record.get("ledger") != receipt.ledger):
-                    raise ValueError("Prior settled transaction receipt changed")
-                record.update(status=status, ledger=receipt.ledger)
-            elif record.get("status") in ("SUCCESS", "FAILED"):
-                # Canonical-main checkpoints authenticate retained receipts beyond RPC retention.
-                # Preflight must still prove the corresponding successful live state exists.
-                if type(record.get("ledger")) is not int or not 0 < record["ledger"] <= self.public["network_identity"]["observed"]["ledger"]:
-                    raise ValueError("Prior settled transaction ledger is invalid")
-            elif close_time <= record["expires_at"]:
-                raise ValueError("Prior submission remains uncertain; preserve its original hash " + tx_hash)
-            else:
-                record["status"] = "EXPIRED_UNCONFIRMED"
-                record["expiry_confirmed_by_ledger"] = self.public["network_identity"]["observed"]["ledger"]
-        self.public["transactions"] = list(records.values())
+    def current(self):
+        if current_bundle(self.directory) != (self.manifest, self.authority):
+            raise ValueError("Current release source or automation changed")
+        observed = network_identity(self.rpc, self.identity["generation"])
+        if not same_generation(observed, self.identity):
+            raise ValueError("Testnet generation changed; a fresh run and barrier are required")
+        self.identity = observed
+        self.public["network_identity"] = observed
 
-    def guard_mutation(self, plan, pending=None):
-        for action in plan:
-            if not action.create:
-                observed = self.observe(action)
-                if observed is None:
-                    raise ValueError("Observed release state disappeared after preflight")
-                if action.resource == "wallet":
-                    self.wallet_readback(action.kind, self.wallet_intent(action.kind)[0], action.key, observed)
-        identity = network_identity(self.rpc, self.public["network_identity"]["generation"])
-        if not same_generation(identity, self.public["network_identity"]):
-            raise ValueError("Testnet generation changed before mutation")
-        if pending is not None and (pending not in plan or not pending.create or self.observe(pending) is not None):
-            raise ValueError("Planned creation is no longer eligible")
-        check_canonical_tag(self.manifest)
-        check_ledger_age(identity["observed"]["close_time"])
-        self.public["network_identity"] = identity
+    def snapshot(self):
+        response = self.rpc.get_ledger_entries(self.keys)
+        if type(response.latest_ledger) is not int or response.latest_ledger < self.identity["observed"]["ledger"]:
+            raise ValueError("Resource snapshot precedes the verified native header")
+        evidence = native_header(self.rpc, response.latest_ledger)
+        requested = {key.to_xdr() for key in self.keys}
+        entries = {}
+        for item in response.entries:
+            if item.key not in requested or item.key in entries:
+                raise ValueError("Resource snapshot has an unexpected or duplicate key")
+            entries[item.key] = (item, xdr.LedgerEntryData.from_xdr(item.xdr))
+        return response.latest_ledger, entries, evidence
 
-    def observe(self, action):
-        if action.resource == "account":
-            return self.account_state()
+    def account_state(self, snapshot):
+        found = snapshot[1].get(self.account_key.to_xdr())
+        if found is None:
+            return None
+        data = found[1]
+        account = data.account
+        if data.type != xdr.LedgerEntryType.ACCOUNT or account.account_id != self.key.xdr_account_id() or account.signers or account.thresholds.thresholds != b"\x01\x00\x00\x00":
+            raise ValueError("Use the configured dedicated master-only Testnet account")
+        return account.seq_num.sequence_number.int64
+
+    def resource(self, action, snapshot):
+        found = snapshot[1].get((code_key(action.key) if action.resource == "code" else instance_key(action.key)).to_xdr())
+        if found is None:
+            return None  # Ambiguous until exact native simulation proves eligible absence.
+        item, data = found
+        if type(item.live_until_ledger_seq) is not int or item.live_until_ledger_seq <= snapshot[0]:
+            raise ValueError("Release resource is expired or its lifetime is unknown")
         if action.resource == "code":
-            return self.code(action.key)
-        return self.instance(action.key, self.manifest["artifacts"][action.kind]["sha256"])
+            if data.type != xdr.LedgerEntryType.CONTRACT_CODE or data.contract_code.hash.hash.hex() != action.key or digest(data.contract_code.code) != action.key:
+                raise ValueError("Native code readback differs from the release")
+            return {"sha256": action.key, "bytes": len(data.contract_code.code), "ledger": snapshot[0], "live_until_ledger": item.live_until_ledger_seq}
+        if data.type != xdr.LedgerEntryType.CONTRACT_DATA or data.contract_data.contract != Address(action.key).to_xdr_sc_address() or data.contract_data.key != instance_key(action.key).contract_data.key or data.contract_data.durability != xdr.ContractDataDurability.PERSISTENT or data.contract_data.val.type != xdr.SCValType.SCV_CONTRACT_INSTANCE:
+            raise ValueError("Wallet is not the exact persistent contract instance")
+        instance = data.contract_data.val.instance
+        module = self.manifest["artifacts"][action.kind]["sha256"]
+        if instance.executable.type != xdr.ContractExecutableType.CONTRACT_EXECUTABLE_WASM or instance.executable.wasm_hash.hash.hex() != module:
+            raise ValueError("Existing deterministic wallet uses different code")
+        storage = instance.storage.sc_map if instance.storage is not None else []
+        if len(storage) != 1 or storage[0].key.to_xdr_bytes() != scval.to_uint32(0).to_xdr_bytes():
+            raise ValueError("Wallet instance has an unknown storage layout")
+        config = self.intents[action.kind][0]
+        fields = scval.from_struct(config_scval(config))
+        fields.update(policy_state=scval.to_map({}), contract_version=scval.to_uint32(ca.WALLET_CONTRACT_VERSION),
+            token=scval.to_string("XLM"), deployment_version=scval.to_uint64(0), nonce=scval.to_uint64(0), paused=scval.to_bool(False))
+        if storage[0].val.to_xdr_bytes() != scval.to_struct(fields).to_xdr_bytes():
+            raise ValueError("Wallet native configuration or pristine state differs")
+        return {"contract": action.key, "wasm_sha256": module, "ledger": snapshot[0], "live_until_ledger": item.live_until_ledger_seq,
+            "config": config, "state": {**config, "params": ca.params(config["params"], action.kind), "policy_state": {},
+                "contract_version": ca.WALLET_CONTRACT_VERSION, "token": "XLM", "deployment_version": 0, "nonce": 0, "paused": False},
+            "state_xdr": storage[0].val.to_xdr(), "funding": "No release funds are transferred to smoke wallets."}
 
-    def planned_observation(self, action):
-        observed = self.observe(action)
-        if (observed is None) != action.create:
-            raise ValueError("Release resource presence changed after its immutable preflight plan")
-        return observed
-
-    def wallet_intent(self, kind):
-        config = config_for(self.manifest, kind, self.key.public_key, self.agent, self.server)
-        salt = bytes.fromhex(digest(canonical(["allowit_testnet_release_salt_v1", self.manifest["tag"], config])))
-        return config, salt, contract_id(self.key.public_key, salt)
-
-    def wallet_readback(self, kind, config, wallet, observed):
-        state = self.read_state(wallet)
-        for field in ("owner", "agent", "server", "asset", "policy_instance", "source_digest", "rules", "x402_enabled"):
-            if state.get(field) != config[field]:
-                raise ValueError("Wallet state differs from release configuration: " + field)
-        if state.get("params") != ca.params(config["params"], kind) or state.get("contract_version") != ca.WALLET_CONTRACT_VERSION:
-            raise ValueError("Wallet parameters or custody layout differ")
-        return {**observed, "config": config, "state": state,
-            "funding": "No release funds are transferred to smoke wallets."}
+    def asset_present(self, snapshot):
+        found = snapshot[1].get(self.asset_key.to_xdr())
+        if found is None or found[1].type != xdr.LedgerEntryType.CONTRACT_DATA:
+            raise ValueError("The required native asset contract is absent")
+        item, data = found
+        if data.contract_data.contract != self.asset_key.contract_data.contract or data.contract_data.key != self.asset_key.contract_data.key or data.contract_data.durability != xdr.ContractDataDurability.PERSISTENT or data.contract_data.val.type != xdr.SCValType.SCV_CONTRACT_INSTANCE or data.contract_data.val.instance.executable.type != xdr.ContractExecutableType.CONTRACT_EXECUTABLE_STELLAR_ASSET:
+            raise ValueError("The required asset is not the exact native SAC")
+        if type(item.live_until_ledger_seq) is not int or item.live_until_ledger_seq <= snapshot[0]:
+            raise ValueError("Native asset lifetime is unavailable")
 
     def preflight(self):
-        """Freeze CREATE/REUSE decisions. Later reads cannot create new actions."""
-        verified = any(item.get("status") == "VERIFIED" for item in self.current_previous)
-        settled = {r["stage"] for r in self.public["transactions"] if r["status"] == "SUCCESS"}
-        account = self.account_state()
-        if account is None and (self.previous or self.history["published_anchor"]):
-            raise ValueError("Previously used release account is missing")
+        self.current()
+        snapshot = self.snapshot()
+        self.asset_present(snapshot)
+        account = self.account_state(snapshot)
         plan = [Action("account", "owner", self.key.public_key, account is None)]
-        for kind, descriptor in self.manifest["artifacts"].items():
-            observed = self.code(descriptor["sha256"])
-            required = verified or "upload-" + kind in settled or any(kind in item.get("code", {}) for item in self.current_previous)
-            if observed is None:
-                if required:
-                    raise ValueError("Previously verified release code is missing or archived")
-            elif observed["bytes"] != descriptor["bytes"]:
-                raise ValueError("Code readback differs from the release artifact")
-            else:
-                self.public["code"][kind] = observed
-            if not any(action.key == descriptor["sha256"] for action in plan):
-                plan.append(Action("code", kind, descriptor["sha256"], observed is None))
-        for kind in KINDS:
-            config, _, wallet = self.wallet_intent(kind)
-            observed = self.instance(wallet, self.manifest["artifacts"][kind]["sha256"])
-            required = verified or "deploy-" + kind in settled or any(kind in item.get("wallets", {}) for item in self.current_previous)
-            if observed is None:
-                if required:
-                    raise ValueError("Previously verified release wallet is missing or archived")
-            else:
-                if not required:
-                    raise ValueError("Cannot adopt an existing wallet without authenticated deployment history")
-                self.public["wallets"][kind] = self.wallet_readback(kind, config, wallet, observed)
-            plan.append(Action("wallet", kind, wallet, observed is None))
+        for kind, item in self.manifest["artifacts"].items():
+            if not any(a.key == item["sha256"] for a in plan):
+                action = Action("code", kind, item["sha256"], False)
+                plan.append(Action("code", kind, action.key, self.resource(action, snapshot) is None))
+        for kind, intent in self.intents.items():
+            action = Action("wallet", kind, intent[2], False)
+            plan.append(Action("wallet", kind, action.key, self.resource(action, snapshot) is None))
+        self.expected_sequence = account
+        self.public["plan"] = [{"resource": a.resource, "kind": a.kind, "key": a.key, "mode": "CONDITIONAL" if a.create else "REUSE"} for a in plan]
         return tuple(plan)
 
-    def account_state(self):
-        key = xdr.LedgerKey(xdr.LedgerEntryType.ACCOUNT, account=xdr.LedgerKeyAccount(self.key.xdr_account_id()))
-        found = self.entry(key)
-        if found is None:
-            return None
-        account = found[2].account
-        if account is None or account.account_id != self.key.xdr_account_id() or account.signers or account.thresholds.thresholds != b"\x01\x00\x00\x00":
-            raise ValueError("Use a dedicated master-key-only Testnet release account")
-        return found
+    def guard(self, plan, pending=None):
+        self.current()
+        snapshot = self.snapshot()
+        self.asset_present(snapshot)
+        if self.account_state(snapshot) != self.expected_sequence:
+            raise ValueError("Dedicated operator sequence or presence changed")
+        for action in plan[1:]:
+            observed = self.resource(action, snapshot)
+            if not action.create or action in self.completed:
+                if observed is None:
+                    raise ValueError("A frozen or completed resource disappeared")
+            elif observed is not None:
+                raise ValueError("A conditional target appeared after preflight")
+        if pending is not None and (pending not in plan or not pending.create or pending in self.completed):
+            raise ValueError("Action is not an eligible frozen target")
+        return snapshot
 
-    def ensure_account(self, action, plan):
-        if self.planned_observation(action) is None:
-            self.guard_mutation(plan, pending=action)
-            ca.cli_run(["--config-dir", str(self.private / "cli"), "keys", "add", "release-owner", "--public-key", self.key.public_key])
-            self.cli(["keys", "fund", "release-owner"])
-        if self.account_state() is None:
-            raise ValueError("Testnet release account is not funded")
+    def quiesce(self, plan):
+        started = time.monotonic()
+        while True:
+            self.current()
+            snapshot = self.snapshot()
+            self.asset_present(snapshot)
+            self.account_state(snapshot)
+            # Prior bounded envelopes may settle while this new controller waits.
+            # Targets stay fixed. Every resource that was live must remain valid.
+            for action in plan[1:]:
+                observed = self.resource(action, snapshot)
+                if not action.create and observed is None:
+                    raise ValueError("A reused resource disappeared during the signer barrier")
+            if self.identity["observed"]["close_time"] > self.slot_entered + 450:
+                self.public["quiescence"] = {"slot_entered_at": self.slot_entered, "barrier_close_time": self.identity["observed"]["close_time"], "barrier_ledger": self.identity["observed"]["ledger"]}
+                return self.preflight()
+            if time.monotonic() - started > 900:
+                raise ValueError("Observed native ledger time did not cross the signer barrier")
+            time.sleep(5)
 
-    def entry(self, key):
-        response = self.rpc.get_ledger_entries([key])
-        if len(response.entries) > 1:
-            raise ValueError("RPC returned duplicate ledger entries")
-        if not response.entries:
-            return None
-        item = response.entries[0]
-        if item.key != key.to_xdr():
-            raise ValueError("RPC returned another ledger key")
-        return response, item, xdr.LedgerEntryData.from_xdr(item.xdr)
+    def ensure_account(self, plan):
+        if plan[0].create:
+            self.guard(plan, plan[0])
+            # Fixed endpoint and configured public address. The secret never enters Friendbot.
+            from urllib.parse import urlencode
+            url = "https://friendbot.stellar.org?" + urlencode({"addr": self.key.public_key})
+            with urlopen(url, timeout=30) as response:
+                if response.geturl() != url or len(response.read(256 * 1024 + 1)) > 256 * 1024:
+                    raise ValueError("Unexpected Friendbot response")
+            self.current()
+            snapshot = self.snapshot()
+            self.expected_sequence = self.account_state(snapshot)
+            if self.expected_sequence is None:
+                raise ValueError("Dedicated Testnet operator creation is unconfirmed")
+            self.completed.add(plan[0])
+        self.guard(plan)
 
-    def code(self, value):
-        key = xdr.LedgerKey(xdr.LedgerEntryType.CONTRACT_CODE, contract_code=xdr.LedgerKeyContractCode(xdr.Hash(bytes.fromhex(value))))
-        found = self.entry(key)
-        if found is None:
-            return None
-        response, item, data = found
-        if data.type != xdr.LedgerEntryType.CONTRACT_CODE or data.contract_code.hash.hash.hex() != value or digest(data.contract_code.code) != value:
-            raise ValueError("Onchain code differs from the release")
-        if type(item.live_until_ledger_seq) is not int or item.live_until_ledger_seq <= response.latest_ledger:
-            raise ValueError("Release code is expired or its lifetime is unavailable")
-        return {"sha256": value, "bytes": len(data.contract_code.code), "ledger": response.latest_ledger,
-            "live_until_ledger": item.live_until_ledger_seq}
+    def prepare(self, action, plan):
+        self.guard(plan, action)
+        close = self.identity["observed"]["close_time"]
+        builder = TransactionBuilder(Account(self.key.public_key, self.expected_sequence), PASSPHRASE, base_fee=100).add_time_bounds(0, close + 300)
+        if action.resource == "code":
+            data = (self.directory / self.manifest["artifacts"][action.kind]["file"]).read_bytes()
+            if digest(data) != action.key:
+                raise ValueError("Upload bytes differ from the exact release")
+            raw = builder.append_upload_contract_wasm_op(data).build()
+        else:
+            config, salt, wallet = self.intents[action.kind]
+            if wallet != action.key:
+                raise ValueError("Frozen wallet target changed")
+            raw = builder.append_create_contract_op(self.manifest["artifacts"][action.kind]["sha256"], self.key.public_key,
+                constructor_args=[config_scval(config)], salt=salt).build()
+            check_constructor(raw.transaction.operations[0].host_function.create_contract_v2, config,
+                self.manifest["artifacts"][action.kind]["sha256"], salt)
+        simulation = self.rpc.simulate_transaction(raw, use_upgraded_auth=False)
+        if simulation.latest_ledger < self.identity["observed"]["ledger"]:
+            raise ValueError("Native simulation is older than the verified network observation")
+        nonrestoring(simulation)
+        prepared = self.rpc.prepare_transaction(raw, simulation)
+        tx = prepared.transaction
+        if prepared.signatures or not tx.v1 or len(tx.operations) != 1 or tx.soroban_data is None:
+            raise ValueError("Simulation changed the native transaction shape")
+        nonrestoring(simulation)
+        ext = tx.soroban_data.ext
+        if ext.v not in (0, 1) or (ext.v == 1 and (ext.resource_ext is None or ext.resource_ext.archived_soroban_entries)):
+            raise ValueError("Assembled transaction requests archive restoration")
+        if tx.fee > MAX_FEE or tx.soroban_data.resource_fee.int64 < 0 or tx.soroban_data.resource_fee.int64 > MAX_FEE:
+            raise ValueError("Native simulation exceeds the release fee cap")
+        ca.validate_auth(tx.operations[0], network="testnet")
+        normalized = copy.deepcopy(tx)
+        normalized.fee = raw.transaction.fee
+        normalized.soroban_data = raw.transaction.soroban_data
+        normalized.operations[0].auth = raw.transaction.operations[0].auth
+        if normalized.to_xdr_object().to_xdr_bytes() != raw.transaction.to_xdr_object().to_xdr_bytes() or tx.fee < raw.transaction.fee:
+            raise ValueError("Simulation changed exact release intent")
+        target = code_key(action.key) if action.resource == "code" else instance_key(action.key)
+        if target not in tx.soroban_data.resources.footprint.read_write:
+            raise ValueError("Simulation did not classify the exact creation target")
+        return prepared
 
-    def instance(self, wallet, expected):
-        key = xdr.LedgerKey(xdr.LedgerEntryType.CONTRACT_DATA,
-            contract_data=xdr.LedgerKeyContractData(Address(wallet).to_xdr_sc_address(), xdr.SCVal(xdr.SCValType.SCV_LEDGER_KEY_CONTRACT_INSTANCE), xdr.ContractDataDurability.PERSISTENT))
-        found = self.entry(key)
-        if found is None:
-            return None
-        response, item, data = found
-        if data.type != xdr.LedgerEntryType.CONTRACT_DATA or data.contract_data.val.type != xdr.SCValType.SCV_CONTRACT_INSTANCE:
-            raise ValueError("Wallet readback is not a native contract instance")
-        instance = data.contract_data.val.instance
-        if instance.executable.type != xdr.ContractExecutableType.CONTRACT_EXECUTABLE_WASM or instance.executable.wasm_hash.hash.hex() != expected:
-            raise ValueError("Existing deterministic wallet uses different code")
-        if type(item.live_until_ledger_seq) is not int or item.live_until_ledger_seq <= response.latest_ledger:
-            raise ValueError("Release wallet is expired or its lifetime is unavailable")
-        return {"contract": wallet, "wasm_sha256": expected, "ledger": response.latest_ledger,
-            "live_until_ledger": item.live_until_ledger_seq}
-
-    def cli(self, args, packet=None):
-        args = list(args)
-        at = args.index("--") if "--" in args else len(args)
-        args[at:at] = ["--rpc-url", RPC, "--network-passphrase", PASSPHRASE]
-        return ca.cli_run(["--config-dir", str(self.private / "cli"), *args], input_data=packet)
-
-    def submit(self, stage, raw, *, plan, action, candidate=None, expected_wasm=None):
-        if action not in plan or not action.create or stage != ("upload-" if action.resource == "code" else "deploy-") + action.kind:
-            raise ValueError("Transaction is not an authorized preflight creation")
-        # The native preparation helper permits simulation to add only auth/resources/fees.
-        original = ca.cli_run
-        def configured(args, input_data=None):
-            args = list(args)
-            if "--network" in args:
-                at = args.index("--network")
-                args[at:at + 2] = ["--rpc-url", RPC, "--network-passphrase", PASSPHRASE]
-            return original(["--config-dir", str(self.private / "cli"), *args], input_data=input_data)
-        ca.cli_run = configured
-        try:
-            unsigned = ca.prepare_xdr(raw, self.key.public_key, "testnet", max_fee=MAX_FEE,
-                candidate=candidate, expected_wasm=expected_wasm)
-        finally:
-            ca.cli_run = original
-        envelope = TransactionEnvelope.from_xdr(unsigned, PASSPHRASE)
-        self.guard_mutation(plan, pending=action)
-        envelope.sign(self.key)
-        signed = envelope.to_xdr()
-        tx_hash = envelope.hash_hex()
-        # Retain exact signed bytes privately before any transmission; never publish them.
-        write(self.private / (stage + ".json"), {"unsigned_xdr": unsigned, "signed_xdr": signed, "hash": tx_hash}, private=True)
-        record = {"stage": stage, "transaction_hash": tx_hash, "status": "prepared",
-            "fee_cap_stroops": envelope.transaction.fee,
-            "expires_at": envelope.transaction.preconditions.time_bounds.max_time}
+    def submit(self, action, plan):
+        prepared = self.prepare(action, plan)
+        self.guard(plan, action)
+        if prepared.transaction.sequence != self.expected_sequence + 1 or prepared.transaction.preconditions.time_bounds.max_time > self.identity["observed"]["close_time"] + 300 or prepared.transaction.preconditions.time_bounds.max_time <= self.identity["observed"]["close_time"]:
+            raise ValueError("Prepared sequence or native validity changed")
+        prepared.sign(self.key)
+        signed, tx_hash = prepared.to_xdr(), prepared.hash_hex()
+        stage = ("upload-" if action.resource == "code" else "deploy-") + action.kind
+        immutable(self.private / (stage + ".json"), canonical({"signed_xdr": signed, "hash": tx_hash}) + b"\n", private=True)
+        record = {"stage": stage, "transaction_hash": tx_hash, "sequence": prepared.transaction.sequence,
+            "expires_at": prepared.transaction.preconditions.time_bounds.max_time, "fee_cap_stroops": prepared.transaction.fee, "status": "prepared"}
         self.public["transactions"].append(record)
         self.save()
-        self.guard_mutation(plan, pending=action)
+        self.guard(plan, action)
+        record["status"] = "unknown"
+        self.save()
         try:
-            self.cli(["tx", "send"], signed)
-        except subprocess.CalledProcessError:
-            # CLI owns submission/polling. Never generate a replacement transaction here.
-            record["status"] = "unknown"
-            self.save()
-            raise ValueError("Submission uncertain; inspect retained transaction " + tx_hash) from None
-        receipt = self.rpc.get_transaction(tx_hash)
-        if receipt.status != GetTransactionStatus.SUCCESS or receipt.envelope_xdr != signed or not receipt.ledger:
-            raise ValueError("Transaction lacks an exact successful Testnet receipt")
-        record.update(status="SUCCESS", ledger=receipt.ledger)
-        self.save()
-
-    def read_state(self, wallet):
-        raw = self.cli(["contract", "invoke", "--id", wallet, "--source-account", self.key.public_key, "--send=no", "--", "state"])
-        return json.loads(raw)
-
-    def run(self):
-        self.reconcile_previous()
-        plan = self.preflight()
-        self.save()
-        self.guard_mutation(plan)
-        self.ensure_account(plan[0], plan)
-        for action in plan[1:]:
-            observed = self.planned_observation(action)
-            kind = action.kind
-            descriptor = self.manifest["artifacts"][kind]
-            expected = descriptor["sha256"]
-            if action.resource == "code":
-                if action.create:
-                    raw = self.cli(["contract", "upload", "--wasm", str(self.directory / descriptor["file"]),
-                        "--optimize=false", "--source-account", self.key.public_key, "--build-only"])
-                    host = TransactionEnvelope.from_xdr(raw, PASSPHRASE).transaction.operations[0].host_function
-                    if host.type != xdr.HostFunctionType.HOST_FUNCTION_TYPE_UPLOAD_CONTRACT_WASM or digest(host.wasm) != expected:
-                        raise ValueError("Upload bytes differ from the release artifact")
-                    self.submit("upload-" + kind, raw, plan=plan, action=action)
-                observed = self.code(expected)
-                if observed is None or observed["bytes"] != descriptor["bytes"]:
-                    raise ValueError("Code upload has no exact onchain readback")
-                for name, item in self.manifest["artifacts"].items():
-                    if item["sha256"] == expected:
-                        self.public["code"][name] = observed
+            sent = self.rpc.send_transaction(signed)
+            if sent.hash != tx_hash:
+                raise ValueError("Broadcast returned another transaction identity")
+            for _ in range(30):
+                receipt = self.rpc.get_transaction(tx_hash)
+                if receipt.status in (GetTransactionStatus.SUCCESS, GetTransactionStatus.FAILED):
+                    if receipt.transaction_hash != tx_hash or receipt.envelope_xdr != signed or not receipt.ledger or not receipt.result_xdr:
+                        raise ValueError("Native receipt differs from the exact original packet")
+                    result = xdr.TransactionResult.from_xdr(receipt.result_xdr)
+                    if (receipt.status == GetTransactionStatus.SUCCESS) != (result.result.code == xdr.TransactionResultCode.txSUCCESS):
+                        raise ValueError("Native receipt result and status disagree")
+                    self.current()
+                    if not 0 < receipt.ledger <= self.rpc.get_latest_ledger().sequence:
+                        raise ValueError("Receipt ledger is not in current native history")
+                    header = native_header(self.rpc, receipt.ledger)
+                    record.update(status=receipt.status.value, ledger=receipt.ledger, result_xdr=receipt.result_xdr, ledger_header=header)
+                    self.save()
+                    if receipt.status != GetTransactionStatus.SUCCESS:
+                        raise ValueError("Original release transaction failed; inspect its recorded sequence")
+                    break
+                time.sleep(2)
             else:
-                config, salt, wallet = self.wallet_intent(kind)
-                if action.create:
-                    args = ["contract", "deploy", "--wasm", str(self.directory / CONTRACTS[kind]), "--optimize=false",
-                        "--salt", salt.hex(), "--source-account", self.key.public_key, "--build-only", "--", *ca.serialize({"config": config})]
-                    at = args.index("--")
-                    args[at:at] = ["--rpc-url", RPC, "--network-passphrase", PASSPHRASE]
-                    raw = ca.cli_run(["--config-dir", str(self.private / "cli"), *args])
-                    create = TransactionEnvelope.from_xdr(raw, PASSPHRASE).transaction.operations[0].host_function.create_contract_v2
-                    check_constructor(create, config, expected, salt)
-                    if Address.from_xdr_sc_address(ca.deployment_address(create, "testnet")).address != wallet:
-                        raise ValueError("Native constructor target differs from the release")
-                    self.submit("deploy-" + kind, raw, expected_wasm=expected, plan=plan, action=action)
-                observed = self.instance(wallet, expected)
-                if observed is None:
-                    raise ValueError("Wallet has no onchain readback")
-                self.public["wallets"][kind] = self.wallet_readback(kind, config, wallet, observed)
+                raise ValueError("Original transaction has no confirmed receipt")
+        except Exception:
             self.save()
-        final_identity = network_identity(self.rpc, self.public["network_identity"]["generation"])
-        if not same_generation(final_identity, self.public["network_identity"]):
-            raise ValueError("Testnet generation changed during deployment")
-        self.public["network_identity"] = final_identity
-        self.public["status"] = "VERIFIED"
+            raise ValueError("Submission is unresolved or failed; preserve original hash " + tx_hash) from None
+        self.current()
+        snapshot = self.snapshot()
+        if self.account_state(snapshot) != prepared.transaction.sequence or self.resource(action, snapshot) is None:
+            raise ValueError("Successful transaction has no exact account/resource readback")
+        self.expected_sequence = prepared.transaction.sequence
+        self.completed.add(action)
+        self.guard(plan)
+
+    def final_readback(self, plan):
+        snapshot = self.guard(plan)
+        self.public["code"], self.public["wallets"] = {}, {}
+        for action in plan[1:]:
+            observed = self.resource(action, snapshot)
+            if observed is None:
+                raise ValueError("Final coherent readback is missing a desired resource")
+            observed["observation"] = "created-this-run" if action in self.completed else "observed-existing"
+            if action.resource == "code":
+                for kind, item in self.manifest["artifacts"].items():
+                    if item["sha256"] == action.key:
+                        self.public["code"][kind] = observed
+            else:
+                self.public["wallets"][action.kind] = observed
+        self.public["resource_observation"] = snapshot[2]
+        self.current()
+        self.public["status"] = "RESOURCE_STATE_VERIFIED"
         self.public["verified_at"] = datetime.now(timezone.utc).isoformat()
         self.save()
         return self.public
 
+    def run(self):
+        plan = self.preflight()
+        self.save()
+        if any(action.create for action in plan):
+            plan = self.quiesce(plan)
+            self.guard(plan)
+            self.ensure_account(plan)
+            for action in plan[1:]:
+                if action.create:
+                    self.submit(action, plan)
+        return self.final_readback(plan)
 
-def publish(directory, previous):
-    manifest = check_bundle(directory)
-    files = list(directory.glob("testnet-deployment-*.json"))
+
+def immutable(path, data, private=False):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700 if private else 0o755)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600 if private else 0o644)
+    except FileExistsError:
+        if path.is_symlink() or path.read_bytes() != data:
+            raise ValueError("An immutable run snapshot already has different bytes") from None
+        return
+    with os.fdopen(fd, "wb") as output:
+        output.write(data)
+        output.flush()
+        os.fsync(output.fileno())
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def publish(directory):
+    manifest, authority = current_bundle(directory)
+    files = list(directory.glob("testnet-deployment-v*.json"))
     if len(files) != 1:
-        raise ValueError("Expected one versioned public deployment manifest")
+        raise ValueError("Expected one immutable per-run deployment snapshot")
     deployment = read_public(files[0])
-    if deployment.get("status") != "VERIFIED" or not source_equal(deployment.get("source", {}), manifest):
-        raise ValueError("Deployment is not the verified release")
-    if files[0].name != deployment_filename(manifest, deployment["network_identity"]):
-        raise ValueError("Deployment manifest filename differs from its generation")
-    attempt = deployment.get("workflow_attempt", "")
-    if not re.fullmatch(r"[1-9][0-9]*:[1-9][0-9]*", attempt) or attempt not in deployment.get("covered_attempts", []):
-        raise ValueError("Deployment has no authenticated workflow attempt coverage")
-    attempt_file = directory / attempt_filename(manifest, attempt)
-    write(attempt_file, deployment)
-    check_canonical_tag(manifest)
-    published = previous / "published"
-    if published.exists():
-        if not source_equal(read_public(published / "source-manifest.json"), manifest):
-            raise ValueError("Published release artifacts differ")
-        existing = published / files[0].name
-        if existing.exists():
-            old = read_public(existing)
-            if not same_generation(old["network_identity"], deployment["network_identity"]) or any(old.get(k) != deployment.get(k) for k in ("owner", "agent", "server")) or any(
-                any(old["wallets"][kind][k] != deployment["wallets"][kind][k] for k in ("contract", "wasm_sha256", "config")) for kind in KINDS):
-                raise ValueError("Published deployment identity differs")
-        else:
-            public_run(["gh", "release", "upload", manifest["tag"], str(files[0]), "--repo", "allowit-hq/allowit-contracts-stellar"], check=True, capture_output=True)
-        old_attempt = published / attempt_file.name
-        if old_attempt.exists():
-            if old_attempt.read_bytes() != attempt_file.read_bytes():
-                raise ValueError("Immutable published attempt checkpoint differs")
-        else:
-            public_run(["gh", "release", "upload", manifest["tag"], str(attempt_file), "--repo", "allowit-hq/allowit-contracts-stellar"], check=True, capture_output=True)
-    else:
+    if deployment.get("status") != "RESOURCE_STATE_VERIFIED" or deployment.get("source") != manifest or deployment.get("workflow_attempt") != workflow_attempt() or deployment.get("build_attempt") != authority["build_run"] or deployment.get("deployment_automation_revision") != authority["automation"]:
+        raise ValueError("Snapshot does not verify current desired release state")
+    if files[0].name != deployment_filename(manifest, deployment["network_identity"], workflow_attempt()):
+        raise ValueError("Snapshot name differs from its exact run/generation")
+    check_network_metadata(deployment["network_identity"])
+    existing = gh_json("repos/allowit-hq/allowit-contracts-stellar/releases/tags/" + manifest["tag"], missing=True)
+    assets = [directory / name for name in CONTRACTS.values()] + [directory / "sample-policy.rs", directory / "source-manifest.json", files[0]]
+    if existing is None:
         notes = directory.parent / "release-notes.md"
-        notes.write_text("Exact release artifacts and dedicated operator smoke wallets are verified on Stellar Testnet.\n\n"
-            "These wallets do not establish the human owner's app acceptance.\n\nSee source-manifest.json and " + files[0].name + " for code, configuration, generation and receipts.\n")
-        assets = [directory / filename for filename in CONTRACTS.values()] + [directory / "sample-policy.rs", directory / "source-manifest.json", files[0], attempt_file]
-        public_run(["gh", "release", "create", manifest["tag"], "--repo", "allowit-hq/allowit-contracts-stellar", "--verify-tag", "--title", manifest["tag"],
-            "--notes-file", str(notes), *map(str, assets)], check=True, capture_output=True)
+        notes.write_text("Current release code and initialized smoke-wallet state were verified on Stellar Testnet.\n"
+            "The snapshot records this run's original transaction outcomes. Receipt-less reuse is observed-existing.\n")
+        current_bundle(directory)
+        public_run(["gh", "release", "create", manifest["tag"], "--repo", "allowit-hq/allowit-contracts-stellar", "--verify-tag", "--title", manifest["tag"], "--notes-file", str(notes), *map(str, assets)], check=True, capture_output=True)
+        return
+    names = {item["name"] for item in existing.get("assets", [])}
+    with tempfile.TemporaryDirectory() as temporary:
+        for path in assets:
+            if path.name in names:
+                public_run(["gh", "release", "download", manifest["tag"], "--repo", "allowit-hq/allowit-contracts-stellar", "--pattern", path.name, "--dir", temporary], check=True, capture_output=True)
+                old = Path(temporary) / path.name
+                same = source_equal(read_public(old), manifest) if path.name == "source-manifest.json" else old.read_bytes() == path.read_bytes()
+                if not same:
+                    raise ValueError("Immutable published release asset differs")
+            else:
+                current_bundle(directory)
+                public_run(["gh", "release", "upload", manifest["tag"], str(path), "--repo", "allowit-hq/allowit-contracts-stellar"], check=True, capture_output=True)
 
 
 def main():
-    # Remove the owner credential before any public verification or child process.
+    # Remove the private owner secret before public validation or any child process.
     secret = os.environ.pop("STELLAR_TESTNET_OWNER_SECRET", "")
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
@@ -948,26 +848,13 @@ def main():
     build.add_argument("--source", type=Path, required=True)
     build.add_argument("--identity", type=Path, required=True)
     build.add_argument("--output", type=Path, required=True)
-    previous = commands.add_parser("previous")
-    previous.add_argument("--bundle", type=Path, required=True)
-    previous.add_argument("--output", type=Path, required=True)
     publication = commands.add_parser("publish")
     publication.add_argument("--bundle", type=Path, required=True)
-    publication.add_argument("--previous", type=Path, required=True)
-    authorization = commands.add_parser("authorize")
-    authorization.add_argument("--bundle", type=Path, required=True)
-    authorization.add_argument("--previous", type=Path, required=True)
-    for role in ("owner", "agent", "server"):
-        authorization.add_argument("--" + role, required=True)
     deploy = commands.add_parser("deploy")
-    deploy.add_argument("--bundle", type=Path, required=True)
-    deploy.add_argument("--identity", type=Path, required=True)
-    deploy.add_argument("--output", type=Path, required=True)
-    deploy.add_argument("--private", type=Path, required=True)
-    deploy.add_argument("--owner", required=True)
-    deploy.add_argument("--agent", required=True)
-    deploy.add_argument("--server", required=True)
-    deploy.add_argument("--previous", type=Path, required=True)
+    for name in ("bundle", "identity", "output", "private"):
+        deploy.add_argument("--" + name, type=Path, required=True)
+    for role in ("owner", "agent", "server"):
+        deploy.add_argument("--" + role, required=True)
     args = parser.parse_args()
     if args.action != "deploy":
         secret = ""
@@ -977,38 +864,31 @@ def main():
         for key, value in result.items():
             print(key + "=" + value)
     elif args.action == "bundle":
-        bundle(args.source, json.loads(args.identity.read_text()), args.output)
-    elif args.action == "previous":
-        fetch_previous(check_bundle(args.bundle), args.output)
+        bundle(args.source, read_public(args.identity), args.output)
     elif args.action == "publish":
-        publish(args.bundle, args.previous)
-    elif args.action == "authorize":
-        authorize_history(check_bundle(args.bundle), args.previous, ca.account(args.owner), ca.account(args.agent), ca.account(args.server))
-        print("Public workflow history and one-time setup authorization checked.")
+        publish(args.bundle)
     else:
-        manifest = check_bundle(args.bundle)
-        identity = json.loads(args.identity.read_text())
-        if any(manifest.get(key) != value for key, value in identity.items()):
+        manifest, _ = current_bundle(args.bundle)
+        identity = read_public(args.identity)
+        if set(identity) != IDENTITY_KEYS or any(manifest[key] != value for key, value in identity.items()):
             raise ValueError("Deployment bundle is not the verified release")
-        check_canonical_tag(manifest)
+        current_authority(manifest)
         try:
             key = Keypair.from_secret(secret)
         except Exception:
-            raise ValueError("A dedicated Testnet release owner secret is required") from None
+            raise ValueError("A dedicated Testnet operator secret is required") from None
         finally:
             secret = ""
         if key.public_key != ca.account(args.owner):
-            raise ValueError("Release secret does not match its configured public owner")
-        result = Deployment(args.bundle, args.output, args.private, key, args.agent, args.server, args.previous).run()
-        write(args.output.parent / deployment_filename(manifest, result["network_identity"]), result)
-        print("Verified release contracts on Stellar Testnet.")
+            raise ValueError("Secret differs from the independently configured operator")
+        result = Deployment(args.bundle, args.output, args.private, key, args.agent, args.server).run()
+        immutable(args.output.parent / deployment_filename(manifest, result["network_identity"], workflow_attempt()), canonical(result) + b"\n")
+        print("Current release resource state verified on Stellar Testnet.")
 
 
 if __name__ == "__main__":
     try:
         main()
-    except (ValueError, KeyError, subprocess.CalledProcessError) as error:
-        # Do not print native CLI packet output or secret parse diagnostics.
-        message = str(error) if isinstance(error, ValueError) else "Release command failed; inspect the public checkpoint."
-        print(message, file=sys.stderr)
+    except Exception:
+        print("Release stopped. Inspect the immutable public checkpoints; preserve original signed packets.", file=sys.stderr)
         sys.exit(1)
