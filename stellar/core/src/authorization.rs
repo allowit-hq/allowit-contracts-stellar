@@ -118,6 +118,12 @@ pub fn sign_account_entry(
     Ok(signed)
 }
 
+/// Validate the retained service authorization without signing or changing the packet.
+/// This does not establish current source authority, execution validity or settlement.
+pub fn validate_server_authorization(p: &PreparedOperation) -> Result<()> {
+    server_signature(p, true).map(|_| ())
+}
+
 pub(crate) fn server_signature(p: &PreparedOperation, require_signed: bool) -> Result<ScVal> {
     let TransactionEnvelope::Tx(envelope) = read(&p.transaction_xdr)? else {
         return Err("Expected a policy transaction".into());
