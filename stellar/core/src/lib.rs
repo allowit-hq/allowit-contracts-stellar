@@ -777,6 +777,14 @@ pub fn transfer_from_request(c: &WalletConfig, r: &ExecutionRequest) -> Result<T
 pub fn operation_from_request(c: &WalletConfig, r: &ExecutionRequest) -> Result<StellarOperation> {
     decode_operation(c, r, false)
 }
+/// Read the effect of an original retained request. This grants no fresh execution authority.
+pub fn retained_operation_from_request(
+    c: &WalletConfig,
+    r: &ExecutionRequest,
+) -> Result<StellarOperation> {
+    decode_operation(c, r, true)
+}
+
 fn decode_operation(
     c: &WalletConfig,
     r: &ExecutionRequest,
