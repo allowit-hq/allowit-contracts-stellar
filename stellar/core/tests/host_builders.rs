@@ -806,6 +806,14 @@ fn external_owner_bytes_match_retained_identity_without_fresh_admission() {
     let c = config();
     let chain = Chain::new(&c);
     let mut packet = deployer(&chain).fund(&c, 500).unwrap();
+    let mut persisted = serde_json::to_value(&packet).unwrap();
+    assert_eq!(
+        serde_json::from_value::<OwnerTransaction>(persisted.clone()).unwrap(),
+        packet
+    );
+    assert!(persisted.get("transactionXdr").is_some());
+    persisted["unexpected"] = json!(true);
+    assert!(serde_json::from_value::<OwnerTransaction>(persisted).is_err());
     let x::TransactionEnvelope::Tx(mut original) = read(&packet.transaction_xdr).unwrap() else {
         panic!()
     };

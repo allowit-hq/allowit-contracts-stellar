@@ -13,7 +13,8 @@ const MAX_FOOTPRINT: usize = 256;
 
 /// Untrusted common fields of a server-prepared owner step. SDK clients parse the server's
 /// hexadecimal transaction hash into `transaction_hash`; no field is signing authority.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OwnerTransaction {
     pub network: String,
     pub action: String,
