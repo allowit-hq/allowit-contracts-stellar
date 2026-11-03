@@ -69,6 +69,36 @@ pub fn get_account(rpc: &dyn Rpc, address: &str) -> Result<AccountState> {
         )?))),
     });
     let value = rpc.call("getLedgerEntries", json!({"keys":[xdr(&key)?]}))?;
+    account_from_response(&value, address)
+}
+/// A native source account dated by the entry response and fresh bracketing heads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountObservation {
+    pub account: AccountState,
+    pub ledger: u32,
+}
+pub fn observe_account(rpc: &dyn Rpc, network: &str, address: &str) -> Result<AccountObservation> {
+    owner_observation::network(rpc, network)?;
+    let before = owner_observation::head(rpc)?;
+    let key = LedgerKey::Account(LedgerKeyAccount {
+        account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(account_key(
+            address,
+        )?))),
+    });
+    let value = rpc.call("getLedgerEntries", json!({"keys":[xdr(&key)?]}))?;
+    let ledger = owner_observation::ledger(&value["latestLedger"])?;
+    let account = account_from_response(&value, address)?;
+    account.validate_structure()?;
+    if value["entries"][0]
+        .get("key")
+        .is_some_and(|v| v.as_str() != xdr(&key).ok().as_deref())
+    {
+        return Err("Native account response key differs".into());
+    }
+    owner_observation::current(rpc, before, ledger)?;
+    Ok(AccountObservation { account, ledger })
+}
+fn account_from_response(value: &Value, address: &str) -> Result<AccountState> {
     let entries = value["entries"]
         .as_array()
         .ok_or("Missing account entries")?;
@@ -404,6 +434,7 @@ fn verify_settlement(
     network: &str,
     transaction_hash: &[u8; 32],
 ) -> Result<OperationStatus> {
+    validate_response_identity(v, transaction_hash)?;
     if matches!(v["status"].as_str(), Some("SUCCESS" | "FAILED")) {
         let envelope: TransactionEnvelope = read(
             v["envelopeXdr"]
@@ -437,6 +468,40 @@ fn verify_settlement(
         Some("NOT_FOUND") => OperationStatus::SubmissionUnknown,
         _ => return Err("Unknown Stellar settlement state".into()),
     })
+}
+// Retained receipts can lack RPC range metadata. Every supplied native field must still agree.
+fn validate_response_identity(v: &Value, expected_hash: &[u8; 32]) -> Result<()> {
+    if let Some(value) = v.get("txHash")
+        && unhex::<32>(value.as_str().ok_or("Invalid response transaction hash")?)?
+            != *expected_hash
+    {
+        return Err("Response transaction hash differs from the original".into());
+    }
+    let ledger = |name: &str| -> Result<Option<u32>> {
+        v.get(name)
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| "Invalid native response ledger".into())
+            })
+            .transpose()
+    };
+    let (oldest, latest, settled) = (
+        ledger("oldestLedger")?,
+        ledger("latestLedger")?,
+        ledger("ledger")?,
+    );
+    if let (Some(oldest), Some(latest)) = (oldest, latest)
+        && (oldest > latest || settled.is_some_and(|n| n < oldest || n > latest))
+    {
+        return Err("Settlement ledger is outside the native response history".into());
+    }
+    if oldest.is_some() != latest.is_some() {
+        return Err("Incomplete native response history interval".into());
+    }
+    Ok(())
 }
 /// A chain result bound to the requested network and exact transaction bytes.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

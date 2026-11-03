@@ -68,6 +68,7 @@ struct Chain {
     bad: u8,
     raw: Mutex<Vec<x::Transaction>>,
     receipt: Value,
+    network: String,
 }
 impl Chain {
     fn new(c: &WalletConfig) -> Self {
@@ -122,6 +123,7 @@ impl Chain {
         }
         Self {
             entries,
+            network: c.network.clone(),
             bad: 0,
             raw: Mutex::new(vec![]),
             receipt: json!({"status":"NOT_FOUND","oldestLedger":1,"latestLedger":120,"latestLedgerCloseTime":NOW+301}),
@@ -131,7 +133,7 @@ impl Chain {
 impl Rpc for Chain {
     fn call(&self, method: &str, params: Value) -> n::Result<Value> {
         Ok(match method {
-            "getNetwork" => json!({"passphrase":passphrase(NETWORK)?}),
+            "getNetwork" => json!({"passphrase":passphrase(&self.network)?}),
             "getLatestLedger" => json!({"sequence":120}),
             "getLedgerEntries" => {
                 json!({"latestLedger":120,"entries":params["keys"].as_array().unwrap().iter().filter_map(|k|self.entries.get(k.as_str().unwrap())).collect::<Vec<_>>()})
@@ -355,8 +357,8 @@ fn observation_and_original_settlement_do_not_invent_missing_entries_or_receipts
     assert!(rpc::contract_exists(&chain, NETWORK, &c.wallet).unwrap());
     let packet = deployer(&chain).fund(&c, 500).unwrap();
     assert_eq!(
-        rpc::owner_settlement(&chain, NETWORK, &packet.transaction_xdr, 120).unwrap(),
-        rpc::OwnerSettlement::NeverApplied
+        rpc::owner_settlement(&chain, NETWORK, &packet.transaction_xdr).unwrap(),
+        rpc::OwnerSettlement::Unknown
     );
     for (field, value) in [
         ("latestLedgerCloseTime", json!(NOW + 300)),
@@ -365,10 +367,12 @@ fn observation_and_original_settlement_do_not_invent_missing_entries_or_receipts
     ] {
         let old = chain.receipt[field].clone();
         chain.receipt[field] = value;
-        assert_eq!(
-            rpc::owner_settlement(&chain, NETWORK, &packet.transaction_xdr, 120).unwrap(),
-            rpc::OwnerSettlement::Unknown
-        );
+        let result = rpc::owner_settlement(&chain, NETWORK, &packet.transaction_xdr);
+        if field == "oldestLedger" {
+            assert!(result.is_err());
+        } else {
+            assert_eq!(result.unwrap(), rpc::OwnerSettlement::Unknown);
+        }
         chain.receipt[field] = old;
     }
     let key = xdr(&keys(&c)[0]).unwrap();
@@ -443,13 +447,13 @@ fn owner_readiness_and_native_diagnostics_remain_distinct_from_signing() {
     let outer = stellar_strkey::Contract([8; 32]).to_string();
     let inner = stellar_strkey::Contract([9; 32]).to_string();
     let text = format!(
-        "contract:{outer}, topics:[error, Error(Contract, #8)]\ncontract:{inner}, topics:[error, Error(Contract, #7)]"
+        "HostError: Error(Contract, #7)\ncontract:{outer}, topics:[error, Error(Contract, #8)]\ncontract:{inner}, topics:[error, Error(Contract, #7)]"
     );
     assert_eq!(
         rpc::simulation_fault(&text, &[]).unwrap(),
         rpc::ContractFault {
             code: 7,
-            contract: Some(inner)
+            contract: None
         }
     );
     assert_eq!(
@@ -467,4 +471,387 @@ fn owner_readiness_and_native_diagnostics_remain_distinct_from_signing() {
         500
     );
     assert!(rpc::vault_redeemable(&chain, &c, &source, &outer, -1).is_err());
+}
+
+struct Mixed<'a> {
+    chain: &'a Chain,
+    mode: u8,
+    seen: std::sync::atomic::AtomicUsize,
+    original: String,
+}
+impl Rpc for Mixed<'_> {
+    fn call(&self, method: &str, params: Value) -> n::Result<Value> {
+        let mut r = self.chain.call(method, params)?;
+        if method == "getTransaction" && self.mode == 0 {
+            // First native lookup missed just before ingestion, then the separately sampled range advanced.
+            // A second lookup after the advertised horizon finds the originally signed transaction.
+            let count = self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if count == 0 {
+                r["latestLedger"] = json!(122);
+                r["latestLedgerCloseTime"] = json!(NOW + 302);
+            } else {
+                let tr = x::TransactionResult {
+                    fee_charged: 1100,
+                    result: x::TransactionResultResult::TxSuccess(Default::default()),
+                    ext: x::TransactionResultExt::V0,
+                };
+                r = json!({"status":"SUCCESS","ledger":121,"envelopeXdr":self.original,"resultXdr":xdr(&tr)?});
+            }
+        }
+        if self.mode == 1 && method == "getTransaction" {
+            r["txHash"] = json!(hex(&[19; 32]));
+        }
+        if self.mode == 4 && method == "getTransaction" {
+            r["latestLedger"] = json!(u64::MAX);
+        }
+        if self.mode == 2 && method == "simulateTransaction" {
+            r["latestLedger"] = json!(1);
+        }
+        if self.mode == 3
+            && method == "getLedgerEntries"
+            && r["entries"].as_array().is_some_and(|v| v.len() == 1)
+        {
+            r["latestLedger"] = json!(1);
+        }
+        if self.mode == 5 && method == "simulateTransaction" {
+            r.as_object_mut().unwrap().remove("latestLedger");
+        }
+        if self.mode == 6 && method == "simulateTransaction" {
+            r["latestLedger"] = json!(121);
+        }
+        if matches!(self.mode, 7 | 8)
+            && method == "getLedgerEntries"
+            && r["entries"].as_array().is_some_and(|v| v.len() == 1)
+        {
+            if self.mode == 7 {
+                r.as_object_mut().unwrap().remove("latestLedger");
+            } else {
+                r["latestLedger"] = json!(121);
+            }
+        }
+        if self.mode == 9
+            && method == "getLedgerEntries"
+            && r["entries"].as_array().is_some_and(|v| v.len() == 1)
+        {
+            let mut data: x::LedgerEntryData = read(r["entries"][0]["xdr"].as_str().unwrap())?;
+            if let x::LedgerEntryData::Account(a) = &mut data {
+                if self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                    a.seq_num.0 += 1;
+                }
+                r["entries"][0]["xdr"] = json!(xdr(&data)?);
+            }
+        }
+        if self.mode == 10
+            && method == "getLatestLedger"
+            && self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0
+        {
+            r["sequence"] = json!(119);
+        }
+        Ok(r)
+    }
+}
+#[test]
+fn history_miss_stays_unknown_until_original_receipt() {
+    let c = config();
+    let chain = Chain::new(&c);
+    let p = deployer(&chain).fund(&c, 500).unwrap();
+    let signed = sign_owner_transaction(NETWORK, &p.transaction_xdr, &[11; 32]).unwrap();
+    let mixed = Mixed {
+        chain: &chain,
+        mode: 0,
+        seen: 0.into(),
+        original: signed.clone(),
+    };
+    assert_eq!(
+        rpc::owner_settlement(&mixed, NETWORK, &signed).unwrap(),
+        rpc::OwnerSettlement::Unknown
+    );
+    assert!(matches!(
+        rpc::owner_settlement(&mixed, NETWORK, &signed).unwrap(),
+        rpc::OwnerSettlement::Settled(_)
+    ));
+}
+#[test]
+fn contradictory_hash_and_invalid_history_ledgers_reject() {
+    let c = config();
+    let chain = Chain::new(&c);
+    let p = deployer(&chain).fund(&c, 500).unwrap();
+    for mode in [1, 4] {
+        let m = Mixed {
+            chain: &chain,
+            mode,
+            seen: 0.into(),
+            original: String::new(),
+        };
+        assert!(rpc::owner_settlement(&m, NETWORK, &p.transaction_xdr).is_err());
+    }
+}
+#[test]
+fn builders_reject_stale_missing_future_and_changed_observations() {
+    let c = config();
+    let chain = Chain::new(&c);
+    for mode in [2, 3, 5, 6, 7, 8, 9, 10] {
+        let mixed = Mixed {
+            chain: &chain,
+            mode,
+            seen: 0.into(),
+            original: String::new(),
+        };
+        let d = Deployer {
+            rpc: &mixed,
+            network: NETWORK,
+            now: NOW,
+            max_fee_stroops: 10_000,
+        };
+        assert!(d.fund(&c, 500).is_err(), "fund mode{mode}");
+        mixed.seen.store(0, std::sync::atomic::Ordering::SeqCst);
+        assert!(d.extend_wallet(&c, 999).is_err(), "extend mode{mode}");
+    }
+}
+struct Advancing<'a> {
+    chain: &'a Chain,
+    heads: std::sync::atomic::AtomicUsize,
+}
+impl Rpc for Advancing<'_> {
+    fn call(&self, m: &str, p: Value) -> n::Result<Value> {
+        let mut v = self.chain.call(m, p)?;
+        if m == "getLatestLedger" {
+            v["sequence"] =
+                json!(120 + self.heads.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
+        }
+        if m == "getLedgerEntries" {
+            for e in v["entries"].as_array_mut().unwrap() {
+                e["liveUntilLedgerSeq"] = json!(120);
+            }
+        }
+        Ok(v)
+    }
+}
+#[test]
+fn resource_visibility_rejects_expiry_at_closing_head() {
+    let c = config();
+    let chain = Chain::new(&c);
+    let moving = Advancing {
+        chain: &chain,
+        heads: 0.into(),
+    };
+    assert!(rpc::code_uploaded(&moving, NETWORK, &c.module_digest).is_err());
+    assert_eq!(moving.heads.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+#[test]
+fn public_aliases_preserve_literal_packet_network() {
+    let mut c = config();
+    c.network = "stellar:mainnet".into();
+    c.asset = sac_address(&c.network, &x::Asset::Native).unwrap();
+    c.wallet = wallet_address(&c.network, &c.owner, &wallet_salt(&c.policy_instance)).unwrap();
+    c.source_digest = policy::installed_source_digest(
+        c.tier.unwrap(),
+        &c.module_digest,
+        &c.asset,
+        &c.rules,
+        &c.policy_source,
+    )
+    .unwrap();
+    validate_config(&c).unwrap();
+    let chain = Chain::new(&c);
+    let d = Deployer {
+        rpc: &chain,
+        network: "stellar:pubnet",
+        now: NOW,
+        max_fee_stroops: 10_000,
+    };
+    assert_eq!(
+        network_id(d.network).unwrap(),
+        network_id(&c.network).unwrap()
+    );
+    assert_eq!(d.fund(&c, 500).unwrap().network, c.network);
+    assert_eq!(d.extend_wallet(&c, 999).unwrap().network, c.network);
+    let mut other = c.clone();
+    other.network = "stellar:pubnet".into();
+    let opposite = Deployer {
+        network: "stellar:mainnet",
+        ..d
+    };
+    assert_eq!(opposite.fund(&other, 500).unwrap().network, other.network);
+    assert_eq!(
+        opposite.extend_wallet(&other, 999).unwrap().network,
+        other.network
+    );
+    let wrong = Deployer {
+        network: NETWORK,
+        ..opposite
+    };
+    assert!(wrong.fund(&c, 500).is_err());
+    assert!(wrong.extend_wallet(&c, 999).is_err());
+}
+
+#[test]
+fn unsigned_funding_does_not_establish_destination_trust() {
+    let c = config();
+    let mut chain = Chain::new(&c);
+    chain.entries.remove(&xdr(&keys(&c)[0]).unwrap());
+    assert!(!rpc::contract_exists(&chain, NETWORK, &c.wallet).unwrap());
+    assert!(deployer(&chain).fund(&c, 500).is_ok());
+}
+#[test]
+fn terminal_host_error_controls_fault_classification() {
+    let event = x::DiagnosticEvent {
+        in_successful_contract_call: true,
+        event: x::ContractEvent {
+            ext: x::ExtensionPoint::V0,
+            contract_id: Some(x::ContractId(x::Hash([7; 32]))),
+            type_: x::ContractEventType::Contract,
+            body: x::ContractEventBody::V0(x::ContractEventV0 {
+                topics: vec![
+                    x::ScVal::Symbol(x::ScSymbol(b"error".to_vec().try_into().unwrap())),
+                    x::ScVal::Error(x::ScError::Contract(7)),
+                ]
+                .try_into()
+                .unwrap(),
+                data: x::ScVal::Void,
+            }),
+        },
+    };
+    for terminal in [
+        "HostError: Error(Budget, ExceededLimit)",
+        "HostError: Error(Budget, ExceededLimit)\nEvent log: Error(Contract, #7)",
+    ] {
+        assert!(rpc::simulation_fault(terminal, &[xdr(&event).unwrap()]).is_none());
+    }
+    let actual =
+        rpc::simulation_fault("HostError: Error(Contract, #8)", &[xdr(&event).unwrap()]).unwrap();
+    assert_eq!(
+        actual,
+        rpc::ContractFault {
+            code: 8,
+            contract: None
+        }
+    );
+}
+
+#[test]
+fn terminal_receipts_keep_success_and_failure_distinct_and_reject_contradictory_ranges() {
+    let c = config();
+    let mut chain = Chain::new(&c);
+    let packet = deployer(&chain).fund(&c, 500).unwrap();
+    let signed = sign_owner_transaction(NETWORK, &packet.transaction_xdr, &[11; 32]).unwrap();
+    for failed in [false, true] {
+        let result = x::TransactionResult {
+            fee_charged: 1100,
+            result: if failed {
+                x::TransactionResultResult::TxFailed(Default::default())
+            } else {
+                x::TransactionResultResult::TxSuccess(Default::default())
+            },
+            ext: x::TransactionResultExt::V0,
+        };
+        let valid = json!({"status":if failed {"FAILED"} else {"SUCCESS"},"txHash":hex(&packet.transaction_hash),"oldestLedger":120,"latestLedger":122,"ledger":121,"envelopeXdr":signed,"resultXdr":xdr(&result).unwrap()});
+        chain.receipt = valid.clone();
+        let rpc::OwnerSettlement::Settled(receipt) =
+            rpc::owner_settlement(&chain, NETWORK, &packet.transaction_xdr).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            receipt.status,
+            if failed {
+                OperationStatus::Failed
+            } else {
+                OperationStatus::Confirmed
+            }
+        );
+        for (key, value) in [
+            ("txHash", json!(hex(&[19; 32]))),
+            ("ledger", json!(123)),
+            ("ledger", json!(119)),
+            ("ledger", json!(0)),
+            ("oldestLedger", json!(u64::MAX)),
+            ("latestLedger", json!(0)),
+        ] {
+            chain.receipt = valid.clone();
+            chain.receipt[key] = value;
+            assert!(
+                rpc::owner_settlement(&chain, NETWORK, &packet.transaction_xdr).is_err(),
+                "{key}"
+            );
+        }
+    }
+}
+#[test]
+fn inclusive_resource_ttl_must_survive_the_closing_head() {
+    let c = config();
+    let mut chain = Chain::new(&c);
+    for key in keys(&c) {
+        chain.entries.get_mut(&xdr(&key).unwrap()).unwrap()["liveUntilLedgerSeq"] = json!(120);
+    }
+    assert!(rpc::code_uploaded(&chain, NETWORK, &c.module_digest).unwrap());
+    assert!(rpc::contract_exists(&chain, NETWORK, &c.wallet).unwrap());
+    assert_eq!(
+        rpc::wallet_lifetime(&chain, NETWORK, &c.wallet, &c.module_digest)
+            .unwrap()
+            .code_live_until,
+        120
+    );
+    let moving = || Advancing {
+        chain: &chain,
+        heads: 0.into(),
+    };
+    assert!(rpc::code_uploaded(&moving(), NETWORK, &c.module_digest).is_err());
+    assert!(rpc::contract_exists(&moving(), NETWORK, &c.wallet).is_err());
+    assert!(rpc::wallet_lifetime(&moving(), NETWORK, &c.wallet, &c.module_digest).is_err());
+}
+
+#[test]
+fn external_owner_bytes_match_retained_identity_without_fresh_admission() {
+    let c = config();
+    let chain = Chain::new(&c);
+    let mut packet = deployer(&chain).fund(&c, 500).unwrap();
+    let x::TransactionEnvelope::Tx(mut original) = read(&packet.transaction_xdr).unwrap() else {
+        panic!()
+    };
+    original.tx.cond = x::Preconditions::Time(x::TimeBounds {
+        min_time: x::TimePoint(0),
+        max_time: x::TimePoint(1),
+    });
+    packet.expires_at = 1;
+    packet.transaction_hash = transaction_hash(NETWORK, &original.tx).unwrap();
+    packet.transaction_xdr = xdr(&x::TransactionEnvelope::Tx(original)).unwrap();
+    let signed = sign_owner_transaction(NETWORK, &packet.transaction_xdr, &[11; 32]).unwrap();
+    assert_eq!(
+        validate_signed_owner_transaction(&packet, &signed).unwrap(),
+        packet.transaction_hash
+    );
+    let x::TransactionEnvelope::Tx(envelope) = read(&signed).unwrap() else {
+        panic!()
+    };
+    for variant in 0..6 {
+        let mut changed = envelope.clone();
+        let mut sigs = changed.signatures.to_vec();
+        match variant {
+            0 => sigs.clear(),
+            1 => sigs[0].hint.0 = [0; 4],
+            2 => sigs[0].signature = x::Signature(vec![0; 64].try_into().unwrap()),
+            3 => sigs.push(sigs[0].clone()),
+            4 => sigs[0].signature = x::Signature(vec![0; 63].try_into().unwrap()),
+            _ => changed.tx.fee += 1,
+        }
+        changed.signatures = sigs.try_into().unwrap();
+        assert!(
+            validate_signed_owner_transaction(
+                &packet,
+                &xdr(&x::TransactionEnvelope::Tx(changed)).unwrap()
+            )
+            .is_err(),
+            "variant{variant}"
+        );
+    }
+    let mut changed = packet.clone();
+    changed.transaction_hash = [9; 32];
+    assert!(validate_signed_owner_transaction(&changed, &signed).is_err());
+    changed = packet.clone();
+    changed.network = "stellar:pubnet".into();
+    assert!(validate_signed_owner_transaction(&changed, &signed).is_err());
+    changed = packet;
+    changed.transaction_xdr = signed.clone();
+    assert!(validate_signed_owner_transaction(&changed, &signed).is_err());
 }

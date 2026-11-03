@@ -22,6 +22,45 @@ pub struct OwnerTransaction {
     pub expires_at: u64,
 }
 
+/// Match external owner-signed bytes to the exact retained unsigned v1 transaction and digest.
+/// This checks one real source-owner signature, not current roles, expiry, source admission or
+/// settlement. Fresh broadcast requires independent current authority and validity checks.
+pub fn validate_signed_owner_transaction(
+    original: &OwnerTransaction,
+    signed_xdr: &str,
+) -> Result<[u8; 32]> {
+    if original.transaction_xdr.len() > MAX_OWNER_XDR || signed_xdr.len() > MAX_OWNER_XDR {
+        return Err("Owner transaction exceeds limit".into());
+    }
+    let (TransactionEnvelope::Tx(unsigned), TransactionEnvelope::Tx(signed)) =
+        (read(&original.transaction_xdr)?, read(signed_xdr)?)
+    else {
+        return Err("Expected original and signed v1 owner transactions".into());
+    };
+    if !unsigned.signatures.is_empty() || unsigned.tx != signed.tx {
+        return Err("Signed owner transaction differs from the retained original".into());
+    }
+    let digest = transaction_hash(&original.network, &unsigned.tx)?;
+    if digest != original.transaction_hash {
+        return Err("Retained owner transaction hash differs".into());
+    }
+    let MuxedAccount::Ed25519(key) = &unsigned.tx.source_account else {
+        return Err("Expected a native G-account owner source".into());
+    };
+    let [signature] = signed.signatures.as_slice() else {
+        return Err("Exactly one source-owner signature is required".into());
+    };
+    if signature.hint.0 != key.0[28..] {
+        return Err("Owner signature hint differs".into());
+    }
+    signing::verify_digest(
+        &ed25519::PublicKey(key.0).to_string(),
+        &digest,
+        signature.signature.as_slice(),
+    )?;
+    Ok(digest)
+}
+
 /// Independent caller constraints. `next_sequence` is the freshly observed source sequence
 /// plus one; `valid_until` is the owner's latest acceptable expiry, not the server's value.
 #[derive(Clone, Debug, PartialEq, Eq)]

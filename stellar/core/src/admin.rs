@@ -1141,19 +1141,36 @@ pub struct PreparedDeployment {
 pub struct Deployer<'a> {
     pub rpc: &'a dyn rpc::Rpc,
     pub network: &'a str,
+    /// Current trusted preparation time, supplied by the caller rather than a prepared packet.
     pub now: u64,
     /// Total fee ceiling in stroops, simulation resources included.
     pub max_fee_stroops: u32,
 }
 impl Deployer<'_> {
     fn account(&self, source: &str) -> Result<AccountState> {
-        passphrase(self.network)?;
-        if self.rpc.call("getNetwork", json!({}))?["passphrase"] != passphrase(self.network)? {
-            return Err("Stellar RPC network differs from the selected network".into());
+        Ok(rpc::observe_account(self.rpc, self.network, source)?.account)
+    }
+    // Date simulation resources and re-read the source. Neither this observation nor the
+    // unsigned result replaces the caller's independent check immediately before signing.
+    fn simulate(
+        &self,
+        source: &AccountState,
+        transaction: &str,
+        record: bool,
+    ) -> Result<serde_json::Value> {
+        let before = rpc::owner_observation::head(self.rpc)?;
+        let mut params = json!({"transaction":transaction});
+        if record {
+            params["authMode"] = json!("record");
         }
-        let account = rpc::get_account(self.rpc, source)?;
-        account.validate_structure()?;
-        Ok(account)
+        let response = self.rpc.call("simulateTransaction", params)?;
+        let observed = rpc::owner_observation::ledger(&response["latestLedger"])?;
+        rpc::owner_observation::current(self.rpc, before, observed)?;
+        let after = rpc::observe_account(self.rpc, self.network, &source.address)?;
+        if after.account != *source || after.ledger < observed || after.ledger - observed > 1 {
+            return Err("Owner account or simulation changed during native preparation".into());
+        }
+        Ok(response)
     }
     /// Simulate `host` from `source` in record mode, check the recorded authorization and the
     /// assembled intent, and return the assembled unsigned transaction and the simulated result.
@@ -1188,10 +1205,7 @@ impl Deployer<'_> {
             tx: raw.clone(),
             signatures: VecM::default(),
         }))?;
-        let response = self.rpc.call(
-            "simulateTransaction",
-            json!({"transaction":raw_xdr,"authMode":"record"}),
-        )?;
+        let response = self.simulate(source, &raw_xdr, true)?;
         if response.get("error").is_some_and(|v| !v.is_null()) {
             return Err("Deployment simulation rejected the transaction".into());
         }

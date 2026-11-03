@@ -2738,6 +2738,12 @@ fn simple_service_authorization_evaluates_the_full_policy() {
             .contains("compiled evaluator")
     );
     assert!(authorize_server(&prepared, &[3; 32], 86401, Some(usage)).is_err());
+    assert!(
+        authorize_server_using(&prepared, &c.server, 86401, None, |_| {
+            panic!("A prefix-only result must not call the service signer")
+        })
+        .is_err()
+    );
     let compiled = |ctx: &allowit::AllowitContext| -> allowit::Result {
         allowit::destinations(ctx, &ctx.params[allowit::DESTINATIONS])?;
         let cap: i128 = allowit::param(ctx, "payment_limit");
@@ -2751,6 +2757,12 @@ fn simple_service_authorization_evaluates_the_full_policy() {
             .unwrap_err()
             .contains("PaymentLimitExceeded")
     );
+    assert!(
+        authorize_server_using(&prepared, &c.server, 86401, Some(&compiled), |_| {
+            panic!("A denied full policy must not call the service signer")
+        })
+        .is_err()
+    );
     assert!(sign(&prepared, &[2; 32], 86401).is_err());
     install(
         &mut c,
@@ -2760,7 +2772,13 @@ fn simple_service_authorization_evaluates_the_full_policy() {
     );
     let rpc = preflight_rpc(&c, &r, &s);
     let prepared = rpc::prepare(&rpc, &c, &r, None, 86401, 86700).unwrap();
-    authorize_server_with(&prepared, &[3; 32], 86401, &compiled).unwrap();
+    let seeded = authorize_server_with(&prepared, &[3; 32], 86401, &compiled).unwrap();
+    let external = authorize_server_using(&prepared, &c.server, 86401, Some(&compiled), |digest| {
+        use ed25519_dalek::{Signer, SigningKey};
+        Ok(SigningKey::from_bytes(&[3; 32]).sign(digest).to_bytes())
+    })
+    .unwrap();
+    assert_eq!(seeded, external);
 }
 
 #[test]
@@ -3648,5 +3666,56 @@ fn chain_receipt_recovers_the_exact_policy_packet_without_new_signing_admission(
         rpc::validate_settled_policy_packet(&unsigned, &receipt)
             .unwrap_err()
             .contains("unsigned")
+    );
+}
+
+#[test]
+fn service_capability_preserves_seed_bytes_and_never_signs_denied_packets() {
+    use ed25519_dalek::{Signer, SigningKey};
+    use std::cell::Cell;
+    let rpc = preflight_fixture();
+    let p = rpc::prepare(&rpc, &rpc.base.config, &rpc.request, None, 86401, 86700).unwrap();
+    let calls = Cell::new(0);
+    let service = account_for_seed(&[3; 32]);
+    let callback = |digest: &[u8; 32]| {
+        calls.set(calls.get() + 1);
+        Ok(SigningKey::from_bytes(&[3; 32]).sign(digest).to_bytes())
+    };
+    let seeded = authorize_server(&p, &[3; 32], 86401, None).unwrap();
+    let external = authorize_server_using(&p, &service, 86401, None, callback).unwrap();
+    assert_eq!(seeded, external);
+    assert_eq!(calls.get(), 1);
+    for bad in 0..4 {
+        let mut changed = p.clone();
+        let mut now = 86401;
+        let mut signer = service.clone();
+        match bad {
+            0 => now = p.expires_at,
+            1 => signer = account_for_seed(&[4; 32]),
+            2 => changed.transaction_xdr = "broken".into(),
+            _ => changed.config.source_hash = [9; 32],
+        }
+        let invoked = Cell::new(false);
+        assert!(
+            authorize_server_using(&changed, &signer, now, None, |_| {
+                invoked.set(true);
+                Ok([0; 64])
+            })
+            .is_err()
+        );
+        assert!(!invoked.get());
+    }
+    assert!(authorize_server_using(&p, &service, 86401, None, |_| Ok([0; 64])).is_err());
+    assert!(
+        authorize_server_using(&p, &service, 86401, None, |h| Ok(SigningKey::from_bytes(
+            &[4; 32]
+        )
+        .sign(h)
+        .to_bytes()))
+        .is_err()
+    );
+    assert!(
+        authorize_server_using(&p, &service, 86401, None, |_| Err("caller declined".into()))
+            .is_err()
     );
 }

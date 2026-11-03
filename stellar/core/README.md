@@ -80,11 +80,15 @@ Policy wallet custody calls the layout 4 `execute` entrypoint (`CONTRACT_VERSION
 
 `admin::PolicyInstallation::wallet_config` derives the native asset contract, source binding, rules and wallet address from admitted public installation inputs. `admin::wallet_salt` preserves the policy-instance address domain. `PolicyValue::from_core` and `to_core` preserve the common value variant and check native address encoding. SDK adapters convert common inputs here. They retain source admission, orchestration and storage.
 
-Funding and renewal return `owner_intent::OwnerTransaction` after native simulation and complete intent validation. They neither sign nor submit. `PreparedOwnerOperation::owner_transaction` refuses a pending owner handoff. Its metadata conversion grants no signing authority.
+Funding and renewal return `owner_intent::OwnerTransaction` after native simulation and complete intent validation. They neither sign nor submit. Fresh builders date source and simulation observations with bracketing native heads. They reread the source before returning and reject changed accounts or stale resources.
 
-`rpc::code_uploaded` and `contract_exists` check exact live entries at a current ledger. A missing live entry does not prove it never existed. `rpc::owner_settlement` observes the original transaction hash. It reports `NeverApplied` only when native history covers preparation through a ledger closed after expiry. Missing coverage remains `Unknown`.
+`rpc::observe_account` exposes the dated account separately. Native network identity admits the pubnet/mainnet alias while packet fields retain the selected config spelling. `PreparedOwnerOperation::owner_transaction` refuses a pending owner handoff. Its metadata conversion grants no signing authority.
 
-SDK callers retain the original packet and own retries. `rpc::vault_redeemable` reads SEP-56 valuation without authorizing a transfer. `rpc::simulation_fault` decodes native contract diagnostics for caller-owned error presentation.
+Before presenting funding or renewal and again before signing, SDK callers independently match current destination custody, source, code, parameters, roles, asset and pause state. A successful asset transfer simulation does not attest its recipient. The native unsigned builder can construct funding for an absent destination. Callers decide automatic renewal eligibility with `WalletLifetime::needs_renewal`. These preparations neither authorize a signature nor release a reservation.
+
+`rpc::code_uploaded` and `contract_exists` check exact live entries at a current ledger. A missing live entry does not prove it never existed. `rpc::owner_settlement` observes the original transaction hash. A missing hash remains `Unknown`, including after expiry. Only a verified native success or failed receipt is terminal. Supplied response hashes and native ledger ranges must agree with that receipt.
+
+SDK callers retain the original packet and own retries. `rpc::vault_redeemable` reads SEP-56 valuation without authorizing a transfer. `rpc::simulation_fault` reads only the terminal contract error code. Events and log hints cannot establish the originating contract. Budget and transport failures remain separate from contract errors.
 
 `admin::validate_auth` admits only the exact authorization scope of the host function. `admin::check_assembled` applies the `contract_admin.py` `prepare_xdr` intent checks to an assembled transaction: an unsigned v1 transaction from the source with one host function, where simulation added only authorization, resources and their fee within the ceiling.
 
@@ -98,7 +102,11 @@ Validation returns a sealed in-memory proof. Its consuming `sign_with` method se
 
 `rpc::send_transaction` sends existing signed bytes once and reports the native broadcast result. SDK engine persists intent and controls polling and exact-byte retries. Native validation and signing neither publish nor submit a packet.
 
+`owner_intent::validate_signed_owner_transaction` matches an external signed v1 envelope to the retained original transaction and network digest. It requires one valid source-owner signature. It establishes no settlement or new business approval. Historical observation imposes no current expiry, role or source-admission gate. Fresh broadcast separately requires current authority and validity checks.
+
 ## Service and agent authorization
+
+`authorize_server_using` accepts a declared server public identity and a caller-owned sign-hash capability. It applies the same native preflight and full-policy evaluator gates as the seed helpers before invoking the capability. It strictly verifies the returned signature. The seed helpers delegate to this path and preserve their transaction bytes. SDK adapters can keep private server keys outside the common facade.
 
 `AccountState::validate_roles` checks the fixed classic setup against independently selected owner, agent and server identities. `validate_authority_signatures` checks every distinct current positive-weight Ed25519 signer and the current high threshold. These checks serve fresh admission and signing. Historical packet validation remains separate. `signing::verify_request_proof` checks the existing native proof domain against the exact path, canonical body and time. The caller still decides whether that signer can perform the requested action.
 

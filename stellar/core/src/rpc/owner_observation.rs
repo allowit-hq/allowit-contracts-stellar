@@ -32,29 +32,29 @@ impl WalletLifetime {
         )
     }
 }
-pub(super) fn ledger(value: &Value) -> Result<u32> {
+pub(crate) fn ledger(value: &Value) -> Result<u32> {
     value
         .as_u64()
         .and_then(|v| u32::try_from(v).ok())
         .filter(|v| *v > 0)
         .ok_or_else(|| "Missing or invalid current ledger".into())
 }
-pub(super) fn network(rpc: &dyn Rpc, selected: &str) -> Result<()> {
+pub(crate) fn network(rpc: &dyn Rpc, selected: &str) -> Result<()> {
     if rpc.call("getNetwork", json!({}))?["passphrase"].as_str() != Some(passphrase(selected)?) {
         return Err("Owner observation RPC network differs".into());
     }
     Ok(())
 }
-pub(super) fn head(rpc: &dyn Rpc) -> Result<u32> {
+pub(crate) fn head(rpc: &dyn Rpc) -> Result<u32> {
     ledger(&rpc.call("getLatestLedger", json!({}))?["sequence"])
 }
-pub(super) fn current(rpc: &dyn Rpc, before: u32, observed: u32) -> Result<()> {
+pub(crate) fn current(rpc: &dyn Rpc, before: u32, observed: u32) -> Result<u32> {
     let after = head(rpc)?;
     if after < before || observed < before || observed > after || after.saturating_sub(observed) > 1
     {
         return Err("Owner observation ledger is stale, future or inconsistent".into());
     }
-    Ok(())
+    Ok(after)
 }
 
 /// Observe `balance(holder)` on the selected SEP-41 asset using an independent G simulation source.
@@ -230,7 +230,10 @@ pub fn wallet_lifetime(
     {
         return Err("Wallet lifetime is expired or exceeds the network limit".into());
     }
-    current(rpc, before, observed)?;
+    let closing = current(rpc, before, observed)?;
+    if instance < closing || code < closing {
+        return Err("Wallet lifetime expired before the closing observation".into());
+    }
     Ok(WalletLifetime {
         ledger: observed,
         max_entry_ttl: max,

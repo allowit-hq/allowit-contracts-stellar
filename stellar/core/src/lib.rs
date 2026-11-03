@@ -19,7 +19,9 @@ pub mod owner_intent;
 pub mod policy;
 pub mod request;
 pub mod workflow;
-pub use authorization::{authorize_server, authorize_server_with, sign_account_entry};
+pub use authorization::{
+    authorize_server, authorize_server_using, authorize_server_with, sign_account_entry,
+};
 pub use contract::{CONTRACT_VERSION, DepositReceipt, RedeemReceipt, TransferReceipt};
 pub use policy::{PolicyEngine, PolicyLanguage, PolicyParams, PolicyTier, PolicyValue};
 pub mod rpc;

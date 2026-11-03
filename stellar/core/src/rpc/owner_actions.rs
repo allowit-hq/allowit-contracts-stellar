@@ -33,8 +33,8 @@ fn live_entry(rpc: &dyn Rpc, network: &str, key: LedgerKey) -> Result<bool> {
     let entries = value["entries"]
         .as_array()
         .ok_or("Missing native entries")?;
-    let result = match entries.as_slice() {
-        [] => false,
+    let live_until = match entries.as_slice() {
+        [] => None,
         [entry] => {
             if entry
                 .get("key")
@@ -65,29 +65,26 @@ fn live_entry(rpc: &dyn Rpc, network: &str, key: LedgerKey) -> Result<bool> {
             if !matches {
                 return Err("Native entry differs from the selected resource".into());
             }
-            if owner_observation::ledger(&entry["liveUntilLedgerSeq"])? < observed {
-                return Err("Native resource is archived or expired".into());
-            }
-            true
+            Some(owner_observation::ledger(&entry["liveUntilLedgerSeq"])?)
         }
         _ => return Err("Unexpected native entry count".into()),
     };
-    owner_observation::current(rpc, before, observed)?;
-    Ok(result)
+    let closing = owner_observation::current(rpc, before, observed)?;
+    if live_until.is_some_and(|until| until < closing) {
+        return Err("Native resource is archived or expired at the closing observation".into());
+    }
+    Ok(live_until.is_some())
 }
-/// Result of observing the original owner transaction. NeverApplied needs continuous native
-/// RPC history from preparation through a ledger closed after the transaction's expiry.
+/// Only a verified native receipt is terminal. A missing lookup or expiry cannot prove absence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OwnerSettlement {
     Settled(VerifiedReceipt),
-    NeverApplied,
     Unknown,
 }
 pub fn owner_settlement(
     rpc: &dyn Rpc,
     network: &str,
     original_xdr: &str,
-    prepared_ledger: u32,
 ) -> Result<OwnerSettlement> {
     owner_observation::network(rpc, network)?;
     let TransactionEnvelope::Tx(envelope) = read(original_xdr)? else {
@@ -95,45 +92,14 @@ pub fn owner_settlement(
     };
     let digest = transaction_hash_for(network, &envelope.tx)?;
     let reply = rpc.call("getTransaction", json!({"hash":hex(&digest)}))?;
+    validate_response_identity(&reply, &digest)?;
     match reply["status"].as_str() {
         Some("SUCCESS" | "FAILED") => {
             let receipt = receipt_from_response(&reply, network, &digest)?
                 .ok_or("Missing terminal owner receipt")?;
             Ok(OwnerSettlement::Settled(receipt))
         }
-        Some("NOT_FOUND") => {
-            let number = |field: &str| {
-                reply[field]
-                    .as_str()
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .or_else(|| reply[field].as_u64())
-            };
-            let bounds = match &envelope.tx.cond {
-                Preconditions::Time(b) => Some(b),
-                Preconditions::V2(p) => p.time_bounds.as_ref(),
-                _ => None,
-            };
-            Ok(
-                match (
-                    bounds,
-                    number("latestLedgerCloseTime"),
-                    number("oldestLedger"),
-                    number("latestLedger"),
-                ) {
-                    (Some(b), Some(close), Some(oldest), Some(latest))
-                        if b.max_time.0 > 0
-                            && prepared_ledger > 0
-                            && close > b.max_time.0
-                            && oldest > 0
-                            && oldest <= u64::from(prepared_ledger)
-                            && latest >= u64::from(prepared_ledger) =>
-                    {
-                        OwnerSettlement::NeverApplied
-                    }
-                    _ => OwnerSettlement::Unknown,
-                },
-            )
-        }
+        Some("NOT_FOUND") => Ok(OwnerSettlement::Unknown),
         _ => Err("Unknown native owner settlement state".into()),
     }
 }

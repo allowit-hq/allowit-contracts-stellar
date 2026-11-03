@@ -86,6 +86,7 @@ impl PreparedOwnerOperation {
 impl Deployer<'_> {
     fn owner_packet(
         &self,
+        network: &str,
         account: &AccountState,
         tx: Transaction,
         action: OwnerAction,
@@ -100,7 +101,7 @@ impl Deployer<'_> {
             _ => return Err("Unsupported owner preparation".into()),
         };
         let packet = OwnerTransaction {
-            network: self.network.into(),
+            network: network.into(),
             action: name.into(),
             transaction_hash: transaction_hash(self.network, &tx)?,
             transaction_xdr: xdr(&TransactionEnvelope::Tx(TransactionV1Envelope {
@@ -113,7 +114,7 @@ impl Deployer<'_> {
             &packet,
             &ExpectedOwnerIntent {
                 limits: OwnerLimits {
-                    network: self.network.into(),
+                    network: network.into(),
                     owner: account.address.clone(),
                     next_sequence: account.sequence.checked_add(1).ok_or("Sequence overflow")?,
                     max_fee_stroops: self.max_fee_stroops,
@@ -126,8 +127,13 @@ impl Deployer<'_> {
         Ok(packet)
     }
     /// Prepare one exact SEP-41 owner-to-wallet transfer. Nothing is signed or sent.
+    /// The caller must independently match current destination custody, source, code, params,
+    /// roles, asset and pause state before presenting and again before signing this packet.
+    /// A successful SAC simulation does not attest the receiving wallet, which may be absent.
     pub fn fund(&self, config: &WalletConfig, units: i128) -> Result<OwnerTransaction> {
-        if self.network != config.network || config.route != WalletRoute::PolicyWallet || units <= 0
+        if network_id(self.network)? != network_id(&config.network)?
+            || config.route != WalletRoute::PolicyWallet
+            || units <= 0
         {
             return Err(
                 "Funding requires a positive amount on the selected policy-wallet network".into(),
@@ -155,6 +161,7 @@ impl Deployer<'_> {
             return Err("Funding simulation returned another effect result".into());
         }
         self.owner_packet(
+            &config.network,
             &source,
             tx,
             OwnerAction::Fund {
@@ -166,8 +173,12 @@ impl Deployer<'_> {
         )
     }
     /// Renew exactly the current instance and code to the independently observed native limit.
+    /// The caller owns automatic-renewal eligibility and current destination/authority checks
+    /// before presentation and again before fresh signing. Preparation grants no signing authority.
     pub fn extend_wallet(&self, config: &WalletConfig, extend_to: u32) -> Result<OwnerTransaction> {
-        if self.network != config.network || config.route != WalletRoute::PolicyWallet {
+        if network_id(self.network)? != network_id(&config.network)?
+            || config.route != WalletRoute::PolicyWallet
+        {
             return Err("Lifetime renewal requires the selected policy-wallet network".into());
         }
         let lifetime = rpc::wallet_lifetime(
@@ -220,7 +231,11 @@ impl Deployer<'_> {
             .map_err(err)?,
             ext: TransactionExt::V1(footprint),
         };
-        let response = self.rpc.call("simulateTransaction", json!({"transaction": xdr(&TransactionEnvelope::Tx(TransactionV1Envelope { tx:tx.clone(),signatures:VecM::default() }))?}))?;
+        let raw = xdr(&TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: tx.clone(),
+            signatures: VecM::default(),
+        }))?;
+        let response = self.simulate(&source, &raw, false)?;
         if response.get("error").is_some_and(|v| !v.is_null()) {
             return Err("Wallet lifetime simulation failed".into());
         }
@@ -245,6 +260,7 @@ impl Deployer<'_> {
         tx.fee = fee;
         tx.ext = TransactionExt::V1(data);
         self.owner_packet(
+            &config.network,
             &source,
             tx,
             OwnerAction::Extend {
