@@ -348,6 +348,61 @@ fn automated_roles(c: &WalletConfig) -> Vec<&str> {
     roles
 }
 impl AccountState {
+    /// Check the exact classic-custody setup against independently selected public roles.
+    /// This is current admission, not validation of a retained transaction after key rotation.
+    pub fn validate_roles(&self, owner: &str, agent: &str, trusted_server: &str) -> Result<()> {
+        self.validate_structure()?;
+        for role in [owner, agent, trusted_server] {
+            signing::canonical_account_key(role)?;
+        }
+        if owner != self.address
+            || owner == agent
+            || owner == trusted_server
+            || agent == trusted_server
+            || self.master_weight != 3
+            || self.low_threshold != 2
+            || self.medium_threshold != 2
+            || self.high_threshold != 3
+            || self.signers.len() != 2
+            || self
+                .signers
+                .iter()
+                .any(|s| s.weight != 1 || (s.key != agent && s.key != trusted_server))
+        {
+            return Err(
+                "Current native account differs from the independently selected roles".into(),
+            );
+        }
+        Ok(())
+    }
+    /// Verify every administrator signature and the current high-threshold quorum.
+    /// Zero-weight and nonmember signatures are errors even beside a sufficient quorum.
+    pub fn validate_authority_signatures(
+        &self,
+        digest: &[u8; 32],
+        signatures: &[DetachedSignature],
+    ) -> Result<()> {
+        self.validate_structure()?;
+        if signatures.is_empty()
+            || signatures.len() > 20
+            || self.signers.iter().any(|s| s.weight > 255)
+        {
+            return Err("Invalid current administrator signatures or weights".into());
+        }
+        let mut signers = std::collections::BTreeSet::new();
+        for signature in signatures {
+            if !signers.insert(signature.signer.as_str())
+                || self.signer_weight(&signature.signer)? == 0
+            {
+                return Err("Repeated or inactive administrator signer".into());
+            }
+            signing::verify_digest(&signature.signer, digest, &signature.signature)?;
+        }
+        self.validate_signer_quorum(
+            &signers.into_iter().collect::<Vec<_>>(),
+            self.high_threshold,
+        )
+    }
     pub fn validate_structure(&self) -> Result<()> {
         account_key(&self.address)?;
         if self.sequence < 0

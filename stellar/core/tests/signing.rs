@@ -2,6 +2,109 @@ use allowit_stellar_wallet::{self as native, signing};
 use ed25519_dalek::{Signer as _, SigningKey};
 
 #[test]
+fn classic_roles_and_admin_quorum_bind_current_independent_identities() {
+    let owner = native::account_for_seed(&[1; 32]);
+    let agent = native::account_for_seed(&[2; 32]);
+    let server = native::account_for_seed(&[3; 32]);
+    let stranger = native::account_for_seed(&[4; 32]);
+    let state = native::AccountState {
+        address: owner.clone(),
+        sequence: 42,
+        master_weight: 3,
+        low_threshold: 2,
+        medium_threshold: 2,
+        high_threshold: 3,
+        signers: vec![
+            native::AccountSigner {
+                key: agent.clone(),
+                weight: 1,
+            },
+            native::AccountSigner {
+                key: server.clone(),
+                weight: 1,
+            },
+        ],
+    };
+    state.validate_roles(&owner, &agent, &server).unwrap();
+    let mut reordered = state.clone();
+    reordered.signers.reverse();
+    reordered.validate_roles(&owner, &agent, &server).unwrap();
+    for (o, a, s) in [
+        (&stranger, &agent, &server),
+        (&owner, &owner, &server),
+        (&owner, &agent, &agent),
+        (&owner, &agent, &stranger),
+    ] {
+        assert!(state.validate_roles(o, a, s).is_err());
+    }
+    for field in 0..7 {
+        let mut changed = state.clone();
+        match field {
+            0 => changed.master_weight = 2,
+            1 => changed.low_threshold = 1,
+            2 => changed.medium_threshold = 1,
+            3 => changed.high_threshold = 2,
+            4 => changed.signers[0].weight = 0,
+            5 => changed.signers[0].key = stranger.clone(),
+            _ => changed.signers.push(native::AccountSigner {
+                key: stranger.clone(),
+                weight: 0,
+            }),
+        }
+        assert!(changed.validate_roles(&owner, &agent, &server).is_err());
+    }
+    let digest = signing::signed_message_digest("unchanged source approval v1 bytes");
+    let signature = |n| native::DetachedSignature {
+        signer: native::account_for_seed(&[n; 32]),
+        signature: SigningKey::from_bytes(&[n; 32])
+            .sign(&digest)
+            .to_bytes()
+            .to_vec(),
+    };
+    state
+        .validate_authority_signatures(&digest, &[signature(1)])
+        .unwrap();
+    assert!(
+        state
+            .validate_authority_signatures(&digest, &[signature(2), signature(3)])
+            .is_err()
+    );
+    assert!(
+        state
+            .validate_authority_signatures(&digest, &[signature(1), signature(4)])
+            .is_err()
+    );
+    assert!(
+        state
+            .validate_authority_signatures(&digest, &[signature(1), signature(1)])
+            .is_err()
+    );
+    assert!(
+        state
+            .validate_authority_signatures(&native::hash(b"other"), &[signature(1)])
+            .is_err()
+    );
+    let mut inactive = state.clone();
+    inactive.signers[0].weight = 0;
+    assert!(
+        inactive
+            .validate_authority_signatures(&digest, &[signature(1), signature(2)])
+            .is_err()
+    );
+    let mut rotated = state;
+    rotated.master_weight = 0;
+    rotated.signers[0].weight = 3;
+    assert!(
+        rotated
+            .validate_authority_signatures(&digest, &[signature(1)])
+            .is_err()
+    );
+    rotated
+        .validate_authority_signatures(&digest, &[signature(2)])
+        .unwrap();
+}
+
+#[test]
 fn native_key_codec_preserves_existing_files_and_signatures() {
     assert_eq!(
         signing::canonical_account_key("GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF")
