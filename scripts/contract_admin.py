@@ -197,7 +197,8 @@ LIMITS = {"payment_limit", "lifetime_spending_limit", "daily_spending_limit", "d
 LISTS = {"destinations", "tokens"}
 # This is the native fixed-tier ABI: the fields validated by the type groups below.
 # Its parity with the portable policy keys is checked by the administration test suite.
-PARAM_KEYS = tuple(sorted(LIMITS | LISTS | {"call_limit", "expires_at", "operations"}))
+PARAM_KEYS = ("payment_limit", "lifetime_spending_limit", "daily_spending_limit",
+    "daily_volume_limit", "call_limit", "destinations", "tokens", "expires_at", "operations")
 # One `operations` entry: a plain op name, `custom.<function>` or `custom:<contract>.<function>`. `allowit`
 # accepts any ASCII letters or digits as the contract; this Stellar tool also requires a `C` StrKey,
 # so that the entry can match a Stellar contract.

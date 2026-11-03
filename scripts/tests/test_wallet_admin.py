@@ -59,7 +59,7 @@ def state():
 class NativeAdmin(unittest.TestCase):
     def test_native_param_keys_match_portable_policy(self):
         from policy_source import PARAM_KEYS
-        self.assertEqual(set(ca.PARAM_KEYS), set(PARAM_KEYS))
+        self.assertEqual(tuple(ca.PARAM_KEYS), tuple(PARAM_KEYS))
 
     def test_owner_only_admission(self):
         wa.owner_only(state())

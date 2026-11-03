@@ -74,6 +74,7 @@ def network_identity(rpc, recorded=None):
     try:
         anchor = public_json_url("/ledgers/" + str(first))
     except HTTPError as error:
+        error.close()
         raise ValueError("Recorded Testnet generation anchor is unavailable; stop before mutation") from error
     recent_sequence = min(latest, rpc.get_latest_ledger().sequence)
     recent = public_json_url("/ledgers/" + str(recent_sequence))

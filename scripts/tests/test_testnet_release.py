@@ -254,11 +254,30 @@ class ReleaseSafety(unittest.TestCase):
         prior["status"] = "IN_PROGRESS"
         prior["transactions"] = [{"transaction_hash": "ab" * 32, "expires_at": 4_102_444_800}]
         driver.previous = [prior]
+        driver.ensure_account = Mock()
+        driver.submit = Mock()
         with self.assertRaisesRegex(ValueError, "remains uncertain"):
-            driver.reconcile_previous()
+            driver.run()
+        driver.ensure_account.assert_not_called()
+        driver.submit.assert_not_called()
         driver.rpc.get_transaction.assert_called_once_with("ab" * 32)
         prior["transactions"][0]["expires_at"] = 1
         driver.reconcile_previous()
+
+    def test_checkpoint_from_another_workflow_is_not_trusted_or_downloaded(self):
+        item = {"name": "stellar-testnet-checkpoint-" + self.manifest["tag"] + "-1-1",
+            "id": 12, "expired": False, "workflow_run": {"id": 1, "head_sha": "a" * 40}}
+        def api(path, missing=False):
+            if "/releases/tags/" in path:
+                return None
+            if "/actions/artifacts?" in path:
+                return {"artifacts": [item]}
+            return {"path": ".github/workflows/unrelated.yml", "event": "workflow_run",
+                "head_repository": {"full_name": "allowit-hq/allowit-contracts-stellar"}}
+        with patch.object(release, "gh_json", side_effect=api), patch.object(release.subprocess, "run") as command:
+            with self.assertRaisesRegex(ValueError, "another workflow"):
+                release.fetch_previous(self.manifest, self.root / "previous")
+            command.assert_not_called()
 
     def test_core_identity_and_native_release_version_are_part_of_bundle(self):
         changed = copy.deepcopy(self.manifest)
