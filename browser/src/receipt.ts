@@ -13,6 +13,6 @@ export function stellarTransfer(receipt: {action: unknown}): {units: string; rec
   return action.type === 'stellar-transfer' ? {units: action.amountUnits, recipient: action.recipient} : null;
 }
 export const stellarReceiptSucceeded = (receipt: {action: unknown; result?: unknown}) => !!stellarTransfer(receipt) && receipt.result === 'success';
-export const stellarReceiptFailed = (receipt: {chain?: unknown; result?: unknown}) => isStellarReceipt(receipt) && receipt.result === 'failed';
+export const stellarReceiptFailed = (receipt: {chain?: unknown; result?: unknown; action?: unknown}) => isStellarReceipt(receipt) && receipt.result === 'failed';
 export const stellarReceiptIdentityMismatch = (receipt: {chain?: unknown; requestHash: string; signature: string}, request: {requestHash?: string; signature?: string}) => isStellarReceipt(receipt) && (receipt.requestHash !== request.requestHash || receipt.signature !== request.signature);
-export const stellarReceiptHeight = (receipt: {chain?: unknown; finalizedLedger?: string}) => isStellarReceipt(receipt) ? {label: 'ledger', value: receipt.finalizedLedger} : null;
+export const stellarReceiptHeight = (receipt: {chain?: unknown; finalizedLedger?: string; finalizedSlot?: string}) => isStellarReceipt(receipt) ? {label: 'ledger', value: receipt.finalizedLedger} : null;
