@@ -1,0 +1,19 @@
+{
+  "name": "@allowit/stellar-browser",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "files": [
+    "browser/src"
+  ],
+  "exports": {
+    ".": "./browser/src/index.ts",
+    "./*": "./browser/src/*.ts"
+  },
+  "dependencies": {
+    "@stellar/freighter-api": "6.0.1",
+    "@stellar/stellar-sdk": "17.4.0",
+    "@noble/curves": "1.9.7",
+    "@noble/hashes": "1.8.0"
+  }
+}
