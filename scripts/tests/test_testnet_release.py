@@ -73,8 +73,17 @@ def constructor(config, module, salt):
         [scval.to_struct(fields)])
 
 
+def history(root, manifest, owner, agent, server, first=False):
+    paths = {str(path.relative_to(root)): release.digest(path.read_bytes()) for path in root.rglob('*.json')
+        if path.name != 'attempt-history.json'}
+    release.write(root / 'attempt-history.json', {'source': manifest, 'current_attempt': release.workflow_attempt(),
+        'covered_attempts': [], 'checkpoints': paths, 'bootstrap_attempt': '10:1',
+        'published_anchor': not first, 'anchor_roles': {'owner': owner, 'agent': agent, 'server': server}, 'first_use': first})
+
+
 class ReleaseSafety(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.dict(os.environ, {'GITHUB_RUN_ID':'100', 'GITHUB_RUN_ATTEMPT':'1', 'STELLAR_TESTNET_BOOTSTRAP_ATTEMPT':'10:1'}))
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -83,6 +92,8 @@ class ReleaseSafety(unittest.TestCase):
         self.config = release.config_for(self.manifest, "common", self.owner.public_key, self.agent.public_key, self.server.public_key)
         self.module = self.manifest["artifacts"]["common"]["sha256"]
         self.salt = bytes.fromhex("42" * 32)
+        self.previous = self.root / 'previous'
+        history(self.previous, self.manifest, self.owner.public_key, self.agent.public_key, self.server.public_key)
 
     def test_exact_bundle_and_native_constructor(self):
         self.assertEqual(release.check_bundle(self.root), self.manifest)
@@ -100,7 +111,7 @@ class ReleaseSafety(unittest.TestCase):
         with patch.object(release, "SorobanServer") as network:
             with self.assertRaisesRegex(ValueError, "differs"):
                 release.Deployment(self.root, self.root / "public.json", self.root / "private", self.owner,
-                    self.agent.public_key, self.server.public_key)
+                    self.agent.public_key, self.server.public_key, self.previous)
             network.assert_not_called()
 
     def test_bundle_paths_and_source_are_bound(self):
@@ -153,7 +164,7 @@ class ReleaseSafety(unittest.TestCase):
         with patch.object(release, "SorobanServer", return_value=network):
             with self.assertRaisesRegex(ValueError, "not Stellar Testnet"):
                 release.Deployment(self.root, self.root / "public.json", self.root / "private", self.owner,
-                    self.agent.public_key, self.server.public_key)
+                    self.agent.public_key, self.server.public_key, self.previous)
         with patch.object(release, "SorobanServer") as network:
             with self.assertRaisesRegex(ValueError, "must differ"):
                 release.Deployment(self.root, self.root / "public.json", self.root / "private", self.owner,
@@ -180,8 +191,9 @@ class ReleaseSafety(unittest.TestCase):
         self.owner.sign = Mock(wraps=self.owner.sign)
         deployment.cli = Mock(side_effect=subprocess.CalledProcessError(1, ["stellar", "tx", "send"]))
         with patch.object(release.ca, "prepare_xdr", return_value=envelope.to_xdr()):
+            action = release.Action('code','common',release.digest(wasm()),True)
             with self.assertRaisesRegex(ValueError, "Submission uncertain"):
-                deployment.submit("upload-common", envelope.to_xdr())
+                deployment.submit("upload-common", envelope.to_xdr(), plan=(action,), action=action)
         self.owner.sign.assert_called_once()
         deployment.cli.assert_called_once()
         deployment.rpc.get_transaction.assert_not_called()
@@ -206,11 +218,14 @@ class ReleaseSafety(unittest.TestCase):
 
     def test_healthy_driver_rerun_preserves_addresses_roles_and_funding(self):
         identity = self.identity()
+        release.write(self.previous/'checkpoint.json',self.prior())
+        history(self.previous,self.manifest,self.owner.public_key,self.agent.public_key,self.server.public_key)
         private = tempfile.TemporaryDirectory()
         self.addCleanup(private.cleanup)
         with patch.object(release, "network_identity", return_value=identity), patch.object(release, "SorobanServer"):
             driver = release.Deployment(self.root, self.root / "result.json", Path(private.name) / "packets", self.owner,
-                self.agent.public_key, self.server.public_key)
+                self.agent.public_key, self.server.public_key, self.previous)
+        driver.account_state = Mock(return_value=True)
         driver.ensure_account = Mock()
         driver.submit = Mock(side_effect=AssertionError("Healthy reruns must not sign or submit"))
         driver.cli = Mock(side_effect=AssertionError("Healthy reruns must not fund or build replacements"))
@@ -234,7 +249,7 @@ class ReleaseSafety(unittest.TestCase):
 
     def test_prior_role_or_config_change_stops_before_network_and_mutation(self):
         previous = self.root / "previous"
-        previous.mkdir()
+        previous.mkdir(exist_ok=True)
         for change in ("role", "config"):
             prior = self.prior()
             if change == "role":
@@ -242,6 +257,7 @@ class ReleaseSafety(unittest.TestCase):
             else:
                 prior["wallets"] = {"common": {"config": {**self.config, "x402_enabled": True}}}
             release.write(previous / "checkpoint.json", prior)
+            history(previous, self.manifest, self.owner.public_key, self.agent.public_key, self.server.public_key)
             with patch.object(release, "SorobanServer") as network:
                 with self.assertRaisesRegex(ValueError, "differ"):
                     release.Deployment(self.root, self.root / "result.json", self.root / "private", self.owner,
@@ -255,6 +271,7 @@ class ReleaseSafety(unittest.TestCase):
         driver.rpc = Mock()
         driver.rpc.get_transaction.return_value.status = release.GetTransactionStatus.NOT_FOUND
         prior = self.prior()
+        prior.update(workflow_attempt='100:1', bootstrap_attempt='10:1', covered_attempts=['100:1'])
         prior["status"] = "IN_PROGRESS"
         prior["transactions"] = [{"transaction_hash": "ab" * 32, "expires_at": 4_102_444_800, "status": "unknown"}]
         driver.previous = [prior]
@@ -327,6 +344,7 @@ class ReleaseSafety(unittest.TestCase):
 
     def test_immutable_published_manifest_is_never_replaced_on_healthy_rerun(self):
         prior = self.prior()
+        prior.update(workflow_attempt='100:1', bootstrap_attempt='10:1', covered_attempts=['100:1'])
         prior["wallets"] = {kind: {"contract": release.contract_id(self.owner.public_key, bytes([index]) * 32),
             "wasm_sha256": self.manifest["artifacts"][kind]["sha256"],
             "config": release.config_for(self.manifest, kind, self.owner.public_key, self.agent.public_key, self.server.public_key)}
@@ -337,6 +355,7 @@ class ReleaseSafety(unittest.TestCase):
         previous.mkdir(parents=True)
         release.write(previous / "source-manifest.json", self.manifest)
         release.write(previous / name, prior)
+        release.write(previous / release.attempt_filename(self.manifest, '100:1'), prior)
         ref = "refs/tags/" + self.manifest["tag"]
         remote = self.manifest["tag_object"] + "\t" + ref + "\n" + self.manifest["revision"] + "\t" + ref + "^{}\n"
         with patch.object(release.subprocess, "check_output", return_value=remote), patch.object(release.subprocess, "run") as command:

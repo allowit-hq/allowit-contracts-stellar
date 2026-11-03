@@ -3,6 +3,7 @@
 import argparse
 import copy
 from datetime import datetime, timezone
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -41,6 +42,38 @@ IDENTITY_KEYS = {"tag", "revision", "tag_object", "workflow_revision"}
 MAX_LEDGER_AGE = 120  # Seconds, measured from the native header close time.
 MAX_FUTURE_SKEW = 30
 MAX_ENDPOINT_LAG = 12  # Ledgers between the two fixed public services.
+
+
+def public_env():
+    """Public tools never receive Stellar credentials or signing overrides."""
+    return {key: value for key, value in os.environ.items() if not key.startswith("STELLAR_")}
+
+
+def public_run(args, **kwargs):
+    return subprocess.run(args, env=public_env(), **kwargs)
+
+
+def public_output(args, **kwargs):
+    return subprocess.check_output(args, env=public_env(), **kwargs)
+
+
+def workflow_attempt():
+    values = [os.environ.get(key, "") for key in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT")]
+    if any(not re.fullmatch(r"[1-9][0-9]{0,19}", value) for value in values):
+        raise ValueError("An exact GitHub workflow run and attempt are required")
+    return ":".join(values)
+
+
+def attempt_filename(manifest, attempt):
+    return "testnet-attempt-" + manifest["tag"] + "-" + attempt.replace(":", "-") + ".json"
+
+
+@dataclass(frozen=True)
+class Action:
+    resource: str
+    kind: str
+    key: str
+    create: bool
 
 
 def digest(data):
@@ -152,7 +185,7 @@ def read_public(path):
 
 
 def gh_json(path, missing=False):
-    result = subprocess.run(["gh", "api", path], capture_output=True, text=True)
+    result = public_run(["gh", "api", path], capture_output=True, text=True)
     data = ca.public_json(result.stdout)
     if result.returncode:
         if missing and data.get("status") == "404":
@@ -161,41 +194,166 @@ def gh_json(path, missing=False):
     return data
 
 
+def canonical_run(run):
+    if run.get("path") != ".github/workflows/testnet-release.yml" or run.get("event") != "workflow_run" or run.get("head_repository", {}).get("full_name") != "allowit-hq/allowit-contracts-stellar":
+        raise ValueError("Prior checkpoint belongs to another workflow")
+    head = run.get("head_sha", "")
+    if not SHA.fullmatch(head) or public_run(["git", "merge-base", "--is-ancestor", head, "refs/release/main"], capture_output=True).returncode:
+        raise ValueError("Prior deployment checkpoint is not from canonical main")
+    return head
+
+
+def published_coverage(output):
+    """Use the last immutable public attempt checkpoint as the durable history anchor."""
+    candidates = []
+    for page in range(1, 11):
+        releases = gh_json("repos/allowit-hq/allowit-contracts-stellar/releases?per_page=100&page=" + str(page))
+        for release in releases:
+            if release.get("draft"):
+                continue
+            for asset in release.get("assets", []):
+                match = re.fullmatch(r"testnet-attempt-(v[0-9]+\.[0-9]+\.[0-9]+)-([1-9][0-9]*)-([1-9][0-9]*)\.json", asset["name"])
+                if match and match[1] == release["tag_name"]:
+                    candidates.append((int(match[2]), int(match[3]), release["tag_name"], asset["name"]))
+        if len(releases) < 100:
+            break
+    else:
+        raise ValueError("Published history discovery exceeds limit")
+    if not candidates:
+        return None
+    run_id, attempt, tag, name = max(candidates)
+    latest, reference, expected, seen = None, None, None, set()
+    for depth in range(100):
+        if name in seen:
+            raise ValueError("Published checkpoint history contains a cycle")
+        seen.add(name)
+        target = output / str(depth)
+        target.mkdir(parents=True)
+        public_run(["gh", "release", "download", tag, "--repo", "allowit-hq/allowit-contracts-stellar", "--pattern", name,
+            "--pattern", "source-manifest.json", "--dir", str(target)], check=True, capture_output=True)
+        path = target / name
+        checkpoint, source = read_public(path), read_public(target / "source-manifest.json")
+        if expected is not None and digest(path.read_bytes()) != expected:
+            raise ValueError("Published checkpoint history hash differs")
+        run = gh_json("repos/allowit-hq/allowit-contracts-stellar/actions/runs/" + str(run_id) + "/attempts/" + str(attempt))
+        head = canonical_run(run)
+        if checkpoint.get("status") != "VERIFIED" or checkpoint.get("workflow_attempt") != str(run_id) + ":" + str(attempt) or not source_equal(checkpoint.get("source", {}), source) or source.get("tag") != tag or source.get("repository") != REPOSITORY or checkpoint.get("deployment_automation_revision") != head:
+            raise ValueError("Published attempt provenance differs")
+        check_canonical_tag(source)
+        coverage = checkpoint.get("covered_attempts")
+        if not isinstance(coverage, list) or checkpoint["workflow_attempt"] not in coverage or any(not re.fullmatch(r"[1-9][0-9]*:[1-9][0-9]*", key) for key in coverage):
+            raise ValueError("Published attempt coverage is incomplete")
+        if latest is None:
+            latest = checkpoint
+            reference = {"tag": tag, "file": name, "sha256": digest(path.read_bytes())}
+        elif not set(coverage).issubset(latest["covered_attempts"]):
+            raise ValueError("Published checkpoint lost earlier attempt coverage")
+        link = checkpoint.get("history_anchor")
+        if link is None:
+            return latest, reference
+        tag, name, expected = link["tag"], link["file"], link["sha256"]
+        match = re.fullmatch(r"testnet-attempt-" + re.escape(tag) + r"-([1-9][0-9]*)-([1-9][0-9]*)\.json", name)
+        if not TAG.fullmatch(tag) or match is None or not HEX.fullmatch(expected):
+            raise ValueError("Published history anchor identity is invalid")
+        run_id, attempt = int(match[1]), int(match[2])
+    raise ValueError("Published checkpoint history exceeds limit")
+
+
 def fetch_previous(manifest, output):
-    """Read published identities and prior public checkpoints before exposing deployment secrets."""
+    """Prove history from canonical runs, then recover public receipts before signing."""
+    current = workflow_attempt()
+    current_run = gh_json("repos/allowit-hq/allowit-contracts-stellar/actions/runs/" + current.split(":")[0])
+    canonical_run(current_run)
+    if current_run.get("run_attempt") != int(current.split(":")[1]):
+        raise ValueError("Current workflow attempt identity differs")
     output.mkdir(parents=True, exist_ok=False)
+    publication = published_coverage(output / "history-anchor")
+    anchor = publication[0] if publication else None
+    covered = set(anchor["covered_attempts"]) if anchor else set()
+    checkpoints, available = {}, set()
     release = gh_json("repos/allowit-hq/allowit-contracts-stellar/releases/tags/" + manifest["tag"], missing=True)
     if release is not None:
         published = output / "published"
         published.mkdir()
         patterns = ["source-manifest.json", "sample-policy.rs", "testnet-deployment-" + manifest["tag"] + "-*.json", *CONTRACTS.values()]
-        arguments = [argument for pattern in patterns for argument in ("--pattern", pattern)]
-        subprocess.run(["gh", "release", "download", manifest["tag"], "--repo", "allowit-hq/allowit-contracts-stellar",
-            *arguments, "--dir", str(published)], check=True, capture_output=True)
-        if not source_equal(check_bundle(published), manifest):
-            raise ValueError("Published release artifacts differ")
-        if not list(published.glob("testnet-deployment-*.json")):
-            raise ValueError("Published release has no versioned deployment identity")
+        patterns += [asset["name"] for asset in release.get("assets", []) if asset["name"].startswith("testnet-attempt-" + manifest["tag"] + "-")]
+        public_run(["gh", "release", "download", manifest["tag"], "--repo", "allowit-hq/allowit-contracts-stellar",
+            *[arg for pattern in patterns for arg in ("--pattern", pattern)], "--dir", str(published)], check=True, capture_output=True)
+        if not source_equal(check_bundle(published), manifest) or not list(published.glob("testnet-deployment-*.json")):
+            raise ValueError("Published release artifacts or deployment identity differ")
+        for path in published.glob("testnet-*.json"):
+            checkpoints[str(path.relative_to(output))] = digest(path.read_bytes())
     prefix = "stellar-testnet-checkpoint-" + manifest["tag"] + "-"
     for page in range(1, 11):
         records = gh_json("repos/allowit-hq/allowit-contracts-stellar/actions/artifacts?per_page=100&page=" + str(page))["artifacts"]
         for item in records:
             if not item["name"].startswith(prefix):
                 continue
-            run = gh_json("repos/allowit-hq/allowit-contracts-stellar/actions/runs/" + str(item["workflow_run"]["id"]))
-            if run.get("path") != ".github/workflows/testnet-release.yml" or run.get("event") != "workflow_run" or run.get("head_repository", {}).get("full_name") != "allowit-hq/allowit-contracts-stellar":
-                raise ValueError("Prior checkpoint belongs to another workflow")
-            head = item["workflow_run"]["head_sha"]
-            if not SHA.fullmatch(head) or subprocess.run(["git", "merge-base", "--is-ancestor", head, "refs/release/main"], capture_output=True).returncode:
-                raise ValueError("Prior deployment checkpoint is not from canonical main")
+            match = re.fullmatch(re.escape(prefix) + r"([1-9][0-9]*)-([1-9][0-9]*)", item["name"])
+            if match is None or int(match[1]) != item["workflow_run"]["id"]:
+                raise ValueError("Prior checkpoint run/attempt identity differs")
+            key = match[1] + ":" + match[2]
+            run = gh_json("repos/allowit-hq/allowit-contracts-stellar/actions/runs/" + match[1])
+            if canonical_run(run) != item["workflow_run"]["head_sha"] or int(match[2]) > run.get("run_attempt", 0):
+                raise ValueError("Prior checkpoint source differs")
+            if key in covered:
+                continue
             if item["expired"]:
-                raise ValueError("Prior deployment checkpoint expired; operator reconciliation is required")
+                raise ValueError("Prior signing checkpoint expired; operator reconciliation is required")
             target = output / ("run-" + str(item["id"]))
-            subprocess.run(["gh", "run", "download", str(item["workflow_run"]["id"]), "--repo", "allowit-hq/allowit-contracts-stellar",
+            public_run(["gh", "run", "download", match[1], "--repo", "allowit-hq/allowit-contracts-stellar",
                 "--name", item["name"], "--dir", str(target)], check=True, capture_output=True)
+            path = target / "testnet-deployment.json"
+            if read_public(path).get("workflow_attempt") != key:
+                raise ValueError("Downloaded checkpoint does not identify its authenticated attempt")
+            checkpoints[str(path.relative_to(output))] = digest(path.read_bytes())
+            available.add(key)
         if len(records) < 100:
-            return
-    raise ValueError("Deployment checkpoint discovery exceeds limit; stop before mutation")
+            break
+    else:
+        raise ValueError("Checkpoint discovery exceeds limit")
+    # Artifact deletion removes the artifact object itself. Run/attempt history is independent.
+    for page in range(1, 11):
+        runs = gh_json("repos/allowit-hq/allowit-contracts-stellar/actions/workflows/testnet-release.yml/runs?per_page=100&page=" + str(page))["workflow_runs"]
+        for run in runs:
+            canonical_run(run)
+            count = run.get("run_attempt")
+            if type(count) is not int or not 1 <= count <= 100:
+                raise ValueError("Workflow attempt history is unavailable")
+            for attempt in range(1, count + 1):
+                key = str(run["id"]) + ":" + str(attempt)
+                if key == current or key in covered:
+                    continue
+                jobs = gh_json("repos/allowit-hq/allowit-contracts-stellar/actions/runs/" + str(run["id"]) + "/attempts/" + str(attempt) + "/jobs?per_page=100")["jobs"]
+                signers = [job for job in jobs if job["name"] == "testnet"]
+                if not signers and jobs and all(job["name"] in ("verify", "publish") and job.get("status") == "completed" for job in jobs):
+                    covered.add(key)  # A publisher-only retry never receives the signing environment.
+                    continue
+                if len(jobs) >= 100 or len(signers) != 1:
+                    raise ValueError("Potential signing history is unavailable; operator reconciliation is required")
+                job = signers[0]
+                if job.get("status") != "completed":
+                    raise ValueError("Prior signing attempt is still active")
+                deployment_steps = [step for step in job.get("steps", []) if step["name"] == "Deploy exact release to Testnet and verify native readback"]
+                never_signed = job.get("conclusion") == "skipped" or len(deployment_steps) == 1 and deployment_steps[0].get("conclusion") == "skipped"
+                if not never_signed and key not in available:
+                    raise ValueError("Potential signing attempt has no authenticated checkpoint; operator reconciliation is required")
+                covered.add(key)
+        if len(runs) < 100:
+            break
+    else:
+        raise ValueError("Workflow history discovery exceeds limit")
+    bootstrap = {read_public(output / path).get("bootstrap_attempt") for path in checkpoints}
+    if anchor:
+        bootstrap.add(anchor.get("bootstrap_attempt"))
+    if len(bootstrap) > 1 or bootstrap and (None in bootstrap):
+        raise ValueError("Authenticated bootstrap history is inconsistent")
+    write(output / "attempt-history.json", {"source": manifest, "current_attempt": current,
+        "covered_attempts": sorted(covered), "checkpoints": checkpoints,
+        "bootstrap_attempt": next(iter(bootstrap)) if bootstrap else current,
+        "published_anchor": anchor is not None, "history_anchor": publication[1] if publication else None,
+        "anchor_roles": {key: anchor[key] for key in ("owner", "agent", "server")} if anchor else None,
+        "first_use": not anchor and not checkpoints})
 
 
 def write(path, value, private=False):
@@ -220,7 +378,7 @@ def write(path, value, private=False):
 
 
 def git(root, *args):
-    return subprocess.check_output(["git", "-C", str(root), *args], text=True).strip()
+    return public_output(["git", "-C", str(root), *args], text=True).strip()
 
 
 def release_identity(root, tag, workflow_sha):
@@ -233,7 +391,7 @@ def release_identity(root, tag, workflow_sha):
     tag_object = git(root, "rev-parse", reference)
     main = git(root, "rev-parse", "refs/release/main")
     for commit in (revision, workflow_sha):
-        if subprocess.run(["git", "-C", str(root), "merge-base", "--is-ancestor", commit, main], capture_output=True).returncode:
+        if public_run(["git", "-C", str(root), "merge-base", "--is-ancestor", commit, main], capture_output=True).returncode:
             raise ValueError("Release and workflow commits must belong to canonical main")
     remote = git(root, "ls-remote", REPOSITORY, reference, reference + "^{}")
     expected = {reference: tag_object, reference + "^{}": revision}
@@ -245,7 +403,7 @@ def release_identity(root, tag, workflow_sha):
 def check_canonical_tag(manifest):
     """Recheck the remote tag after protected-environment approval and before mutation."""
     reference = "refs/tags/" + manifest["tag"]
-    remote = subprocess.check_output(["git", "ls-remote", REPOSITORY, reference, reference + "^{}"], text=True, timeout=30)
+    remote = public_output(["git", "ls-remote", REPOSITORY, reference, reference + "^{}"], text=True, timeout=30)
     if {line.split()[1]: line.split()[0] for line in remote.splitlines()} != {reference: manifest["tag_object"], reference + "^{}": manifest["revision"]}:
         raise ValueError("Canonical release tag changed or is unavailable")
 
@@ -268,11 +426,11 @@ def bundle(source, identity, output):
     sample = source / "crates/custom-policy/policy/policy.rs"
     # Resolve this with the release's own checked policy gate, before the signing job.
     helper = "import sys;sys.path.insert(0,sys.argv[1]);from policy_source import standard_prefix;import json;print(json.dumps(standard_prefix(open(sys.argv[2]).read())))"
-    rules = json.loads(subprocess.check_output([sys.executable, "-c", helper, str(source / "scripts"), str(sample)], text=True))
+    rules = json.loads(public_output([sys.executable, "-c", helper, str(source / "scripts"), str(sample)], text=True))
     output.mkdir(parents=True, exist_ok=True)
     result = {"schema": 1, "repository": REPOSITORY, **identity, "core_source": CORE_SOURCE,
         "toolchain": {"rust": "1.98.0", "stellar": "28.1.0"}, "artifacts": {}}
-    target = Path(json.loads(subprocess.check_output(["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"], cwd=source, text=True))["target_directory"])
+    target = Path(json.loads(public_output(["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"], cwd=source, text=True))["target_directory"])
     for kind, filename in CONTRACTS.items():
         data = (target / "wasm32v1-none/release" / filename).read_bytes()
         if not 8 < len(data) <= 2 * 1024 * 1024 or data[:8] != b"\0asm\x01\0\0\0":
@@ -367,6 +525,39 @@ def check_constructor(create, config, module, salt):
         raise ValueError("Constructor native XDR differs from the release intent")
 
 
+def authorize_history(manifest, previous, owner, agent, server):
+    attempt = workflow_attempt()
+    if previous is None:
+        raise ValueError("Authenticated attempt history is required before deployment")
+    history = read_public(previous / "attempt-history.json")
+    if history.get("current_attempt") != attempt or not source_equal(history.get("source", {}), manifest):
+        raise ValueError("Authenticated attempt history differs from this release/run")
+    if type(history.get("first_use")) is not bool or type(history.get("published_anchor")) is not bool:
+        raise ValueError("Authenticated history classification is invalid")
+    if history["published_anchor"]:
+        if history.get("anchor_roles") != {"owner": owner, "agent": agent, "server": server}:
+            raise ValueError("Published release roles differ; operator reconciliation is required")
+    elif history.get("bootstrap_attempt") != os.environ.get("STELLAR_TESTNET_BOOTSTRAP_ATTEMPT", "") or (
+        history["first_use"] and history["bootstrap_attempt"] != attempt):
+        raise ValueError("First deployment requires its one-time protected bootstrap attempt")
+    checkpoints = []
+    for relative, expected in history["checkpoints"].items():
+        path = previous / relative
+        if not path.resolve().is_relative_to(previous.resolve()):
+            raise ValueError("Checkpoint path escapes authenticated history")
+        data = read_public(path)
+        if digest(path.read_bytes()) != expected:
+            raise ValueError("Checkpoint bytes differ from authenticated history")
+        if not source_equal(data.get("source", {}), manifest) or any(data.get(k) != v for k, v in
+            (("owner", owner), ("agent", agent), ("server", server), ("network", "stellar:testnet"))):
+            raise ValueError("Prior deployment source, roles or network differ; stop before mutation")
+        for kind, item in data.get("wallets", {}).items():
+            if kind not in KINDS or item.get("config") != config_for(manifest, kind, owner, agent, server):
+                raise ValueError("Prior wallet configuration differs; stop before mutation")
+        checkpoints.append(data)
+    return history, checkpoints
+
+
 class Deployment:
     def __init__(self, directory, output, private, key, agent, server, previous=None):
         self.directory, self.output, self.private, self.key = directory, output, private, key
@@ -376,19 +567,8 @@ class Deployment:
         if len({key.public_key, agent, server}) != 3:
             raise ValueError("Release owner, agent and server must differ")
         self.agent, self.server = agent, server
-        self.previous = []
-        if previous is not None:
-            for path in sorted(previous.rglob("*.json")):
-                if path.name == "source-manifest.json":
-                    continue
-                data = read_public(path)
-                if not source_equal(data.get("source", {}), self.manifest) or any(data.get(k) != v for k, v in
-                    (("owner", key.public_key), ("agent", agent), ("server", server), ("network", "stellar:testnet"))):
-                    raise ValueError("Prior deployment source, roles or network differ; stop before mutation")
-                for kind, item in data.get("wallets", {}).items():
-                    if kind not in KINDS or item.get("config") != config_for(self.manifest, kind, key.public_key, agent, server):
-                        raise ValueError("Prior wallet configuration differs; stop before mutation")
-                self.previous.append(data)
+        self.attempt = workflow_attempt()
+        self.history, self.previous = authorize_history(self.manifest, previous, key.public_key, agent, server)
         self.rpc = SorobanServer(RPC)
         self.current_previous = []
         identity = None
@@ -410,6 +590,9 @@ class Deployment:
         self.public = {"schema": 1, "network": "stellar:testnet", "rpc": RPC,
             "source": self.manifest, "owner": key.public_key, "agent": agent, "server": server,
             "deployment_automation_revision": git(Path(__file__).resolve().parents[1], "rev-parse", "HEAD"),
+            "workflow_attempt": self.attempt, "bootstrap_attempt": self.history["bootstrap_attempt"],
+            "covered_attempts": sorted(set(self.history["covered_attempts"]) | {self.attempt}),
+            "history_anchor": self.history.get("history_anchor"),
             "code": {}, "wallets": {}, "transactions": [],
             "network_identity": identity, "status": "IN_PROGRESS",
             "scope": "Release-controlled initialized smoke wallets; no user wallet, user funds, or Mainnet deployment. Shared engine/parent code is uploaded only."}
@@ -464,14 +647,35 @@ class Deployment:
                 record["expiry_confirmed_by_ledger"] = self.public["network_identity"]["observed"]["ledger"]
         self.public["transactions"] = list(records.values())
 
-    def guard_mutation(self):
+    def guard_mutation(self, plan, pending=None):
+        for action in plan:
+            if not action.create:
+                observed = self.observe(action)
+                if observed is None:
+                    raise ValueError("Observed release state disappeared after preflight")
+                if action.resource == "wallet":
+                    self.wallet_readback(action.kind, self.wallet_intent(action.kind)[0], action.key, observed)
         identity = network_identity(self.rpc, self.public["network_identity"]["generation"])
         if not same_generation(identity, self.public["network_identity"]):
             raise ValueError("Testnet generation changed before mutation")
-        # The remote tag check is the last I/O before signing/funding, after RPC readback.
+        if pending is not None and (pending not in plan or not pending.create or self.observe(pending) is not None):
+            raise ValueError("Planned creation is no longer eligible")
         check_canonical_tag(self.manifest)
         check_ledger_age(identity["observed"]["close_time"])
         self.public["network_identity"] = identity
+
+    def observe(self, action):
+        if action.resource == "account":
+            return self.account_state()
+        if action.resource == "code":
+            return self.code(action.key)
+        return self.instance(action.key, self.manifest["artifacts"][action.kind]["sha256"])
+
+    def planned_observation(self, action):
+        observed = self.observe(action)
+        if (observed is None) != action.create:
+            raise ValueError("Release resource presence changed after its immutable preflight plan")
+        return observed
 
     def wallet_intent(self, kind):
         config = config_for(self.manifest, kind, self.key.public_key, self.agent, self.server)
@@ -489,9 +693,13 @@ class Deployment:
             "funding": "No release funds are transferred to smoke wallets."}
 
     def preflight(self):
-        """Read every existing code and wallet before funding, signing or submission."""
+        """Freeze CREATE/REUSE decisions. Later reads cannot create new actions."""
         verified = any(item.get("status") == "VERIFIED" for item in self.current_previous)
         settled = {r["stage"] for r in self.public["transactions"] if r["status"] == "SUCCESS"}
+        account = self.account_state()
+        if account is None and (self.previous or self.history["published_anchor"]):
+            raise ValueError("Previously used release account is missing")
+        plan = [Action("account", "owner", self.key.public_key, account is None)]
         for kind, descriptor in self.manifest["artifacts"].items():
             observed = self.code(descriptor["sha256"])
             required = verified or "upload-" + kind in settled or any(kind in item.get("code", {}) for item in self.current_previous)
@@ -502,6 +710,8 @@ class Deployment:
                 raise ValueError("Code readback differs from the release artifact")
             else:
                 self.public["code"][kind] = observed
+            if not any(action.key == descriptor["sha256"] for action in plan):
+                plan.append(Action("code", kind, descriptor["sha256"], observed is None))
         for kind in KINDS:
             config, _, wallet = self.wallet_intent(kind)
             observed = self.instance(wallet, self.manifest["artifacts"][kind]["sha256"])
@@ -510,21 +720,29 @@ class Deployment:
                 if required:
                     raise ValueError("Previously verified release wallet is missing or archived")
             else:
+                if not required:
+                    raise ValueError("Cannot adopt an existing wallet without authenticated deployment history")
                 self.public["wallets"][kind] = self.wallet_readback(kind, config, wallet, observed)
+            plan.append(Action("wallet", kind, wallet, observed is None))
+        return tuple(plan)
 
-    def ensure_account(self):
+    def account_state(self):
         key = xdr.LedgerKey(xdr.LedgerEntryType.ACCOUNT, account=xdr.LedgerKeyAccount(self.key.xdr_account_id()))
         found = self.entry(key)
         if found is None:
-            self.guard_mutation()
-            ca.cli_run(["--config-dir", str(self.private / "cli"), "keys", "add", "release-owner", "--public-key", self.key.public_key])
-            self.cli(["keys", "fund", "release-owner"])
-            found = self.entry(key)
-        if found is None:
-            raise ValueError("Testnet release account is not funded")
+            return None
         account = found[2].account
         if account is None or account.account_id != self.key.xdr_account_id() or account.signers or account.thresholds.thresholds != b"\x01\x00\x00\x00":
             raise ValueError("Use a dedicated master-key-only Testnet release account")
+        return found
+
+    def ensure_account(self, action, plan):
+        if self.planned_observation(action) is None:
+            self.guard_mutation(plan, pending=action)
+            ca.cli_run(["--config-dir", str(self.private / "cli"), "keys", "add", "release-owner", "--public-key", self.key.public_key])
+            self.cli(["keys", "fund", "release-owner"])
+        if self.account_state() is None:
+            raise ValueError("Testnet release account is not funded")
 
     def entry(self, key):
         response = self.rpc.get_ledger_entries([key])
@@ -573,7 +791,9 @@ class Deployment:
         args[at:at] = ["--rpc-url", RPC, "--network-passphrase", PASSPHRASE]
         return ca.cli_run(["--config-dir", str(self.private / "cli"), *args], input_data=packet)
 
-    def submit(self, stage, raw, candidate=None, expected_wasm=None):
+    def submit(self, stage, raw, *, plan, action, candidate=None, expected_wasm=None):
+        if action not in plan or not action.create or stage != ("upload-" if action.resource == "code" else "deploy-") + action.kind:
+            raise ValueError("Transaction is not an authorized preflight creation")
         # The native preparation helper permits simulation to add only auth/resources/fees.
         original = ca.cli_run
         def configured(args, input_data=None):
@@ -589,7 +809,7 @@ class Deployment:
         finally:
             ca.cli_run = original
         envelope = TransactionEnvelope.from_xdr(unsigned, PASSPHRASE)
-        self.guard_mutation()
+        self.guard_mutation(plan, pending=action)
         envelope.sign(self.key)
         signed = envelope.to_xdr()
         tx_hash = envelope.hash_hex()
@@ -600,6 +820,7 @@ class Deployment:
             "expires_at": envelope.transaction.preconditions.time_bounds.max_time}
         self.public["transactions"].append(record)
         self.save()
+        self.guard_mutation(plan, pending=action)
         try:
             self.cli(["tx", "send"], signed)
         except subprocess.CalledProcessError:
@@ -619,44 +840,46 @@ class Deployment:
 
     def run(self):
         self.reconcile_previous()
-        self.preflight()
+        plan = self.preflight()
         self.save()
-        self.guard_mutation()
-        self.ensure_account()
-        for kind, descriptor in self.manifest["artifacts"].items():
+        self.guard_mutation(plan)
+        self.ensure_account(plan[0], plan)
+        for action in plan[1:]:
+            observed = self.planned_observation(action)
+            kind = action.kind
+            descriptor = self.manifest["artifacts"][kind]
             expected = descriptor["sha256"]
-            if self.code(expected) is None:
-                raw = self.cli(["contract", "upload", "--wasm", str(self.directory / descriptor["file"]),
-                    "--optimize=false", "--source-account", self.key.public_key, "--build-only"])
-                envelope = TransactionEnvelope.from_xdr(raw, PASSPHRASE)
-                host = envelope.transaction.operations[0].host_function
-                if host.type != xdr.HostFunctionType.HOST_FUNCTION_TYPE_UPLOAD_CONTRACT_WASM or digest(host.wasm) != expected:
-                    raise ValueError("Upload bytes differ from the release artifact")
-                self.submit("upload-" + kind, raw)
-            observed = self.code(expected)
-            if observed is None or observed["bytes"] != descriptor["bytes"]:
-                raise ValueError("Code upload has no exact onchain readback")
-            self.public["code"][kind] = observed
-            self.save()
-        for kind in KINDS:
-            config, salt, wallet = self.wallet_intent(kind)
-            expected = self.manifest["artifacts"][kind]["sha256"]
-            if self.instance(wallet, expected) is None:
-                args = ["contract", "deploy", "--wasm", str(self.directory / CONTRACTS[kind]), "--optimize=false",
-                    "--salt", salt.hex(), "--source-account", self.key.public_key, "--build-only", "--", *ca.serialize({"config": config})]
-                # Network flags precede the constructor's '--' separator.
-                at = args.index("--")
-                args[at:at] = ["--rpc-url", RPC, "--network-passphrase", PASSPHRASE]
-                raw = ca.cli_run(["--config-dir", str(self.private / "cli"), *args])
-                create = TransactionEnvelope.from_xdr(raw, PASSPHRASE).transaction.operations[0].host_function.create_contract_v2
-                check_constructor(create, config, expected, salt)
-                if create is None or Address.from_xdr_sc_address(ca.deployment_address(create, "testnet")).address != wallet:
-                    raise ValueError("Native constructor target differs from the release")
-                self.submit("deploy-" + kind, raw, expected_wasm=expected)
-            observed = self.instance(wallet, expected)
-            if observed is None:
-                raise ValueError("Wallet has no onchain readback")
-            self.public["wallets"][kind] = self.wallet_readback(kind, config, wallet, observed)
+            if action.resource == "code":
+                if action.create:
+                    raw = self.cli(["contract", "upload", "--wasm", str(self.directory / descriptor["file"]),
+                        "--optimize=false", "--source-account", self.key.public_key, "--build-only"])
+                    host = TransactionEnvelope.from_xdr(raw, PASSPHRASE).transaction.operations[0].host_function
+                    if host.type != xdr.HostFunctionType.HOST_FUNCTION_TYPE_UPLOAD_CONTRACT_WASM or digest(host.wasm) != expected:
+                        raise ValueError("Upload bytes differ from the release artifact")
+                    self.submit("upload-" + kind, raw, plan=plan, action=action)
+                observed = self.code(expected)
+                if observed is None or observed["bytes"] != descriptor["bytes"]:
+                    raise ValueError("Code upload has no exact onchain readback")
+                for name, item in self.manifest["artifacts"].items():
+                    if item["sha256"] == expected:
+                        self.public["code"][name] = observed
+            else:
+                config, salt, wallet = self.wallet_intent(kind)
+                if action.create:
+                    args = ["contract", "deploy", "--wasm", str(self.directory / CONTRACTS[kind]), "--optimize=false",
+                        "--salt", salt.hex(), "--source-account", self.key.public_key, "--build-only", "--", *ca.serialize({"config": config})]
+                    at = args.index("--")
+                    args[at:at] = ["--rpc-url", RPC, "--network-passphrase", PASSPHRASE]
+                    raw = ca.cli_run(["--config-dir", str(self.private / "cli"), *args])
+                    create = TransactionEnvelope.from_xdr(raw, PASSPHRASE).transaction.operations[0].host_function.create_contract_v2
+                    check_constructor(create, config, expected, salt)
+                    if Address.from_xdr_sc_address(ca.deployment_address(create, "testnet")).address != wallet:
+                        raise ValueError("Native constructor target differs from the release")
+                    self.submit("deploy-" + kind, raw, expected_wasm=expected, plan=plan, action=action)
+                observed = self.instance(wallet, expected)
+                if observed is None:
+                    raise ValueError("Wallet has no onchain readback")
+                self.public["wallets"][kind] = self.wallet_readback(kind, config, wallet, observed)
             self.save()
         final_identity = network_identity(self.rpc, self.public["network_identity"]["generation"])
         if not same_generation(final_identity, self.public["network_identity"]):
@@ -678,6 +901,11 @@ def publish(directory, previous):
         raise ValueError("Deployment is not the verified release")
     if files[0].name != deployment_filename(manifest, deployment["network_identity"]):
         raise ValueError("Deployment manifest filename differs from its generation")
+    attempt = deployment.get("workflow_attempt", "")
+    if not re.fullmatch(r"[1-9][0-9]*:[1-9][0-9]*", attempt) or attempt not in deployment.get("covered_attempts", []):
+        raise ValueError("Deployment has no authenticated workflow attempt coverage")
+    attempt_file = directory / attempt_filename(manifest, attempt)
+    write(attempt_file, deployment)
     check_canonical_tag(manifest)
     published = previous / "published"
     if published.exists():
@@ -689,18 +917,26 @@ def publish(directory, previous):
             if not same_generation(old["network_identity"], deployment["network_identity"]) or any(old.get(k) != deployment.get(k) for k in ("owner", "agent", "server")) or any(
                 any(old["wallets"][kind][k] != deployment["wallets"][kind][k] for k in ("contract", "wasm_sha256", "config")) for kind in KINDS):
                 raise ValueError("Published deployment identity differs")
-            return  # Preserve the first immutable manifest and all release assets.
-        subprocess.run(["gh", "release", "upload", manifest["tag"], str(files[0]), "--repo", "allowit-hq/allowit-contracts-stellar"], check=True, capture_output=True)
+        else:
+            public_run(["gh", "release", "upload", manifest["tag"], str(files[0]), "--repo", "allowit-hq/allowit-contracts-stellar"], check=True, capture_output=True)
+        old_attempt = published / attempt_file.name
+        if old_attempt.exists():
+            if old_attempt.read_bytes() != attempt_file.read_bytes():
+                raise ValueError("Immutable published attempt checkpoint differs")
+        else:
+            public_run(["gh", "release", "upload", manifest["tag"], str(attempt_file), "--repo", "allowit-hq/allowit-contracts-stellar"], check=True, capture_output=True)
     else:
         notes = directory.parent / "release-notes.md"
         notes.write_text("Exact release artifacts and dedicated operator smoke wallets are verified on Stellar Testnet.\n\n"
             "These wallets do not establish the human owner's app acceptance.\n\nSee source-manifest.json and " + files[0].name + " for code, configuration, generation and receipts.\n")
-        assets = [directory / filename for filename in CONTRACTS.values()] + [directory / "sample-policy.rs", directory / "source-manifest.json", files[0]]
-        subprocess.run(["gh", "release", "create", manifest["tag"], "--repo", "allowit-hq/allowit-contracts-stellar", "--verify-tag", "--title", manifest["tag"],
+        assets = [directory / filename for filename in CONTRACTS.values()] + [directory / "sample-policy.rs", directory / "source-manifest.json", files[0], attempt_file]
+        public_run(["gh", "release", "create", manifest["tag"], "--repo", "allowit-hq/allowit-contracts-stellar", "--verify-tag", "--title", manifest["tag"],
             "--notes-file", str(notes), *map(str, assets)], check=True, capture_output=True)
 
 
 def main():
+    # Remove the owner credential before any public verification or child process.
+    secret = os.environ.pop("STELLAR_TESTNET_OWNER_SECRET", "")
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
     metadata = commands.add_parser("metadata")
@@ -718,6 +954,11 @@ def main():
     publication = commands.add_parser("publish")
     publication.add_argument("--bundle", type=Path, required=True)
     publication.add_argument("--previous", type=Path, required=True)
+    authorization = commands.add_parser("authorize")
+    authorization.add_argument("--bundle", type=Path, required=True)
+    authorization.add_argument("--previous", type=Path, required=True)
+    for role in ("owner", "agent", "server"):
+        authorization.add_argument("--" + role, required=True)
     deploy = commands.add_parser("deploy")
     deploy.add_argument("--bundle", type=Path, required=True)
     deploy.add_argument("--identity", type=Path, required=True)
@@ -728,6 +969,8 @@ def main():
     deploy.add_argument("--server", required=True)
     deploy.add_argument("--previous", type=Path, required=True)
     args = parser.parse_args()
+    if args.action != "deploy":
+        secret = ""
     if args.action == "metadata":
         result = release_identity(args.repository, args.tag, args.workflow_sha)
         write(args.output, result)
@@ -739,17 +982,21 @@ def main():
         fetch_previous(check_bundle(args.bundle), args.output)
     elif args.action == "publish":
         publish(args.bundle, args.previous)
+    elif args.action == "authorize":
+        authorize_history(check_bundle(args.bundle), args.previous, ca.account(args.owner), ca.account(args.agent), ca.account(args.server))
+        print("Public workflow history and one-time setup authorization checked.")
     else:
         manifest = check_bundle(args.bundle)
         identity = json.loads(args.identity.read_text())
         if any(manifest.get(key) != value for key, value in identity.items()):
             raise ValueError("Deployment bundle is not the verified release")
         check_canonical_tag(manifest)
-        secret = os.environ.pop("STELLAR_TESTNET_OWNER_SECRET", "")
         try:
             key = Keypair.from_secret(secret)
         except Exception:
             raise ValueError("A dedicated Testnet release owner secret is required") from None
+        finally:
+            secret = ""
         if key.public_key != ca.account(args.owner):
             raise ValueError("Release secret does not match its configured public owner")
         result = Deployment(args.bundle, args.output, args.private, key, args.agent, args.server, args.previous).run()

@@ -3,6 +3,7 @@ import copy
 from datetime import datetime, timezone
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -14,12 +15,13 @@ from unittest.mock import Mock, patch
 # This switch also runs these regressions against the frozen pre-fix implementation.
 sys.path.insert(0, os.environ.get("ALLOWIT_RELEASE_SCRIPTS", str(Path(__file__).resolve().parents[1])))
 import testnet_release as r
-from test_testnet_release import constructor, ledger, make_bundle, wasm
+from test_testnet_release import constructor, ledger, make_bundle, wasm, history
 from stellar_sdk import Account, Address, Keypair, TransactionBuilder, TransactionEnvelope, scval, xdr
 
 
 class ReleaseRecovery(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.dict(os.environ, {'GITHUB_RUN_ID':'100', 'GITHUB_RUN_ATTEMPT':'1', 'STELLAR_TESTNET_BOOTSTRAP_ATTEMPT':'10:1'}))
         self.temp = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(self.temp)
         self.bundle = self.root / "bundle"
@@ -50,6 +52,7 @@ class ReleaseRecovery(unittest.TestCase):
         # git(root, rev-parse HEAD) remains a real local call, distinct from the tag query.
         self.enterContext(patch.object(r, 'git', return_value='d' * 40))
         self.sign = self.enterContext(patch.object(self.owner, 'sign', wraps=self.owner.sign))
+        self.fixture_histories = set()
 
     def remote_tag(self):
         ref = 'refs/tags/' + self.manifest['tag']
@@ -123,14 +126,34 @@ class ReleaseRecovery(unittest.TestCase):
         raise AssertionError('Unexpected native command: ' + repr(args))
 
     def driver(self, previous=None, name='run'):
+        if previous is None:
+            previous = self.root / name / 'history'
+            self.fixture_histories.add(previous)
+            # Existing native fixture worlds have an explicit authenticated deployment.
+            # Fresh worlds have no wallet entries; production never infers their history.
+            if self.wallets:
+                wallets={}
+                for kind in r.KINDS:
+                    config=r.config_for(self.manifest,kind,self.owner.public_key,self.agent.public_key,self.server.public_key)
+                    salt=bytes.fromhex(r.digest(r.canonical(['allowit_testnet_release_salt_v1',self.manifest['tag'],config])))
+                    wallets[kind]={'contract':r.contract_id(self.owner.public_key,salt),'config':config}
+                r.write(previous/'testnet-deployment.json',{'source':self.manifest,'owner':self.owner.public_key,
+                    'agent':self.agent.public_key,'server':self.server.public_key,'network':'stellar:testnet',
+                    'network_identity':r.network_identity(self.rpc),'status':'VERIFIED','wallets':wallets,
+                    'transactions':[],'bootstrap_attempt':'10:1','workflow_attempt':'10:1'})
+        if previous in self.fixture_histories:
+            history(previous, self.manifest, self.owner.public_key, self.agent.public_key, self.server.public_key)
         return r.Deployment(self.bundle, self.root / name / 'testnet-deployment.json', self.root / name / 'private', self.owner,
             self.agent.public_key, self.server.public_key, previous)
 
     def checkpoint(self, driver, records=None, status='VERIFIED'):
+        driver.preflight()  # Public checkpoints are saved after preflight in the real driver.
         prior = copy.deepcopy(driver.public)
+        prior['workflow_attempt'] = '10:1'
         prior.update(status=status, transactions=records or [])
         path = self.root / 'previous'
         r.write(path / 'run-1/testnet-deployment.json', prior)
+        self.fixture_histories.add(path)
         return path
 
     def test_wrong_native_variant_stops_whole_driver_before_signing(self):
@@ -222,22 +245,28 @@ class ReleaseRecovery(unittest.TestCase):
         r.write(previous / 'run-2/testnet-deployment.json', result)
         # A fresh workflow downloads authenticated public Actions artifacts. It does not
         # inherit a runner filesystem or private packets from the failed publication.
-        artifacts = [{'name': 'stellar-testnet-checkpoint-' + self.manifest['tag'] + '-1-' + str(n),
-            'id': n, 'expired': False, 'workflow_run': {'id': n, 'head_sha': 'd' * 40}} for n in (1, 2)]
+        artifacts = [{'name': 'stellar-testnet-checkpoint-' + self.manifest['tag'] + '-' + str(n) + '-1',
+            'id': n, 'expired': False, 'workflow_run': {'id': n, 'head_sha': 'd' * 40}} for n in (10, 100)]
+        run = lambda n: {'id':n, 'run_attempt':1, 'head_sha':'d'*40, 'path':'.github/workflows/testnet-release.yml',
+            'event':'workflow_run', 'head_repository':{'full_name':'allowit-hq/allowit-contracts-stellar'}}
         def api(path, missing=False):
+            if '/releases?' in path: return []
             if '/releases/tags/' in path: return None
             if '/actions/artifacts?' in path: return {'artifacts': artifacts}
-            return {'path': '.github/workflows/testnet-release.yml', 'event': 'workflow_run',
-                'head_repository': {'full_name': 'allowit-hq/allowit-contracts-stellar'}}
+            if '/actions/workflows/' in path: return {'workflow_runs':[run(n) for n in (10,100,200)]}
+            if '/jobs?' in path: return {'jobs':[{'name':'testnet','status':'completed','conclusion':'success'}]}
+            return run(int(path.rsplit('/',1)[-1]))
         def download(args, **kwargs):
             if args[:3] == ['git', 'merge-base', '--is-ancestor']:
                 self.assertEqual(args[3:], ['d' * 40, 'refs/release/main'])
                 return NS(returncode=0)
             self.assertEqual(args[:3], ['gh', 'run', 'download'])
             target = Path(args[args.index('--dir') + 1])
-            r.write(target / 'testnet-deployment.json', json.loads((previous / ('run-' + args[3]) / 'testnet-deployment.json').read_text()))
+            origin = 'run-1' if args[3]=='10' else 'run-2'
+            r.write(target / 'testnet-deployment.json', json.loads((previous / origin / 'testnet-deployment.json').read_text()))
             return NS(returncode=0)
         fetched = self.root / 'fresh-workflow-checkpoints'
+        os.environ['GITHUB_RUN_ID'] = '200'
         with patch.object(r, 'gh_json', side_effect=api), patch.object(r.subprocess, 'run', side_effect=download):
             r.fetch_previous(self.manifest, fetched)
         result = self.driver(fetched, 'second-recovery').run()
@@ -288,11 +317,11 @@ class ReleaseRecovery(unittest.TestCase):
         prior = json.loads(path.read_text())
         prior['network_identity']['generation']['hash'] = 'ff' * 32
         r.write(path, prior)
+        self.wallets.clear(); self.send_error=False
         result = self.driver(previous, 'new-generation').run()
         self.assertEqual(result['network_identity']['generation']['hash'], self.anchor['hash'])
-        self.assertEqual(result['transactions'], [])
-        self.rpc.get_transaction.assert_not_called()
-        self.assertEqual(self.mutations, [])
+        self.assertEqual(len(result['transactions']),3)
+        self.assertTrue(all(item.args != ('ab'*32,) for item in self.rpc.get_transaction.call_args_list))
 
     def test_tag_is_rechecked_immediately_before_signing(self):
         self.wallets.clear()
@@ -312,7 +341,150 @@ class ReleaseRecovery(unittest.TestCase):
             driver.return_value.run.side_effect = ValueError('Deployment reached after moved tag')
             with self.assertRaises(ValueError): r.main()
             driver.assert_not_called()
-            self.assertTrue('STELLAR_TESTNET_OWNER_SECRET' in os.environ)
+            self.assertTrue('STELLAR_TESTNET_OWNER_SECRET' not in os.environ)
+
+    def test_deleted_or_never_uploaded_checkpoint_is_detected_from_signing_runs(self):
+        self.codes.clear(); self.wallets.clear(); self.send_error = False
+        first = self.driver().run()
+        self.assertEqual(len(first['transactions']), 4)
+        self.mutations.clear(); self.sign.reset_mock()
+        os.environ['GITHUB_RUN_ID'] = '200'
+        run = lambda n: {'id':n, 'run_attempt':1, 'head_sha':'d'*40, 'path':'.github/workflows/testnet-release.yml',
+            'event':'workflow_run', 'head_repository':{'full_name':'allowit-hq/allowit-contracts-stellar'}}
+        def api(path, missing=False):
+            if '/releases?' in path: return []
+            if '/releases/tags/' in path: return None
+            if '/actions/artifacts?' in path: return {'artifacts':[]}  # No expired object survives deletion.
+            if '/actions/workflows/' in path: return {'workflow_runs':[run(100),run(200)]}
+            if '/jobs?' in path: return {'jobs':[{'name':'testnet','status':'completed','conclusion':'failure'}]}
+            return run(int(path.rsplit('/',1)[-1]))
+        with patch.object(r, 'gh_json', side_effect=api), patch.object(r.subprocess, 'run', return_value=NS(returncode=0)):
+            with self.assertRaisesRegex(ValueError, 'no authenticated checkpoint'):
+                r.fetch_previous(self.manifest, self.root/'missing-history')
+        self.assertEqual(self.mutations, []); self.sign.assert_not_called()
+
+    def test_bootstrap_cannot_adopt_existing_wallets_or_authorize_a_different_attempt(self):
+        previous=self.root/'bootstrap'
+        history(previous,self.manifest,self.owner.public_key,self.agent.public_key,self.server.public_key,first=True)
+        with self.assertRaisesRegex(ValueError,'one-time protected bootstrap'):
+            self.driver(previous).run()
+        proof=json.loads((previous/'attempt-history.json').read_text()); proof['bootstrap_attempt']='100:1'
+        r.write(previous/'attempt-history.json',proof)
+        os.environ['STELLAR_TESTNET_BOOTSTRAP_ATTEMPT']='100:1'
+        with self.assertRaisesRegex(ValueError,'adopt an existing wallet'):
+            self.driver(previous).run()
+        self.assertEqual(self.mutations,[]); self.sign.assert_not_called()
+
+    def test_immutable_plan_cannot_recreate_code_or_wallet_that_disappears(self):
+        previous = self.checkpoint(self.driver())
+        for resource in ('code','wallet'):
+            with self.subTest(resource=resource):
+                codes, wallets = self.codes.copy(), self.wallets.copy()
+                d = self.driver(previous, resource)
+                original = d.ensure_account
+                def advance(*args):
+                    original(*args)
+                    if resource == 'code': self.codes.clear()
+                    else: self.wallets.pop(next(iter(self.wallets)))
+                d.ensure_account = advance
+                with self.assertRaisesRegex(ValueError, 'immutable preflight plan'):
+                    d.run()
+                self.assertEqual(self.mutations, []); self.sign.assert_not_called()
+                self.codes, self.wallets = codes, wallets
+
+    def test_creation_eligibility_is_rechecked_after_native_preparation(self):
+        self.wallets.clear()
+        def concurrent_creation(raw,*args,**kwargs):
+            create=TransactionEnvelope.from_xdr(raw,r.PASSPHRASE).transaction.operations[0].host_function.create_contract_v2
+            wallet=Address.from_xdr_sc_address(r.ca.deployment_address(create,'testnet')).address
+            self.wallets[wallet]=create.executable.wasm_hash.hash.hex()
+            return raw
+        with patch.object(r.ca,'prepare_xdr',side_effect=concurrent_creation):
+            with self.assertRaisesRegex(ValueError,'no longer eligible'): self.driver().run()
+        self.assertEqual(self.mutations,[]); self.sign.assert_not_called()
+
+    def test_real_public_children_never_inherit_owner_marker_on_success_or_failure(self):
+        popen = subprocess.Popen
+        for failure in (False, True):
+            def check_env(kwargs):
+                child = popen([sys.executable,'-c','import os,sys;sys.exit(47 if "STELLAR_TESTNET_OWNER_SECRET" in os.environ else 0)'], env=kwargs.get('env'))
+                self.assertEqual(child.wait(), 0)
+            def git_child(args, **kwargs):
+                check_env(kwargs)
+                if failure: raise subprocess.CalledProcessError(1, args)
+                return self.remote_tag()
+            def gh_child(args, **kwargs):
+                check_env(kwargs)
+                return NS(returncode=int(failure),stdout='{}')
+            with patch.dict(os.environ, {'STELLAR_TESTNET_OWNER_SECRET':'synthetic-presence-marker'}):
+                with patch.object(r.subprocess,'check_output',side_effect=git_child):
+                    if failure:
+                        with self.assertRaises(subprocess.CalledProcessError): r.check_canonical_tag(self.manifest)
+                    else: r.check_canonical_tag(self.manifest)
+                with patch.object(r.subprocess,'run',side_effect=gh_child):
+                    if failure:
+                        with self.assertRaises(ValueError): r.gh_json('public-fixture')
+                    else: self.assertEqual(r.gh_json('public-fixture'),{})
+                self.assertTrue('STELLAR_TESTNET_OWNER_SECRET' in os.environ)
+
+    def test_published_anchor_covers_deleted_artifacts_and_next_release_without_new_bootstrap(self):
+        self.codes.clear(); self.wallets.clear(); self.send_error = False
+        first_history = self.root/'first-history'
+        history(first_history, self.manifest, self.owner.public_key, self.agent.public_key, self.server.public_key, first=True)
+        proof = json.loads((first_history/'attempt-history.json').read_text()); proof['bootstrap_attempt']='100:1'
+        r.write(first_history/'attempt-history.json',proof)
+        os.environ['STELLAR_TESTNET_BOOTSTRAP_ATTEMPT']='100:1'
+        first = self.driver(first_history).run()
+        r.write(self.bundle/r.deployment_filename(self.manifest,first['network_identity']),first)
+        published = self.root/'immutable-release'; published.mkdir()
+        def publish(args, **kwargs):
+            self.assertEqual(args[:3],['gh','release','create'])
+            for arg in args:
+                path=Path(arg)
+                if path.is_file() and path.suffix in ('.json','.rs','.wasm'): shutil.copyfile(path,published/path.name)
+            return NS(returncode=0)
+        with patch.object(r.subprocess,'run',side_effect=publish): r.publish(self.bundle,self.root/'no-prior-release')
+        old_manifest=copy.deepcopy(self.manifest)
+        name=r.attempt_filename(old_manifest,'100:1')
+        self.assertEqual(json.loads((published/name).read_text())['transactions'],first['transactions'])
+        self.manifest.update(tag='v0.3.0',revision='f'*40)
+        r.write(self.bundle/'source-manifest.json',self.manifest)
+        for kind in r.KINDS:
+            config=r.config_for(self.manifest,kind,self.owner.public_key,self.agent.public_key,self.server.public_key)
+            salt=bytes.fromhex(r.digest(r.canonical(['allowit_testnet_release_salt_v1',self.manifest['tag'],config])))
+            self.states[r.contract_id(self.owner.public_key,salt)]={**config,'params':r.ca.params(config['params'],kind),'contract_version':4}
+        os.environ['GITHUB_RUN_ID']='200'
+        run=lambda n:{'id':n,'run_attempt':1,'head_sha':'d'*40,'path':'.github/workflows/testnet-release.yml',
+            'event':'workflow_run','head_repository':{'full_name':'allowit-hq/allowit-contracts-stellar'}}
+        def api(path,missing=False):
+            if '/releases?' in path: return [{'tag_name':old_manifest['tag'],'assets':[{'name':name}]}]
+            if '/releases/tags/' in path: return None
+            if '/actions/artifacts?' in path: return {'artifacts':[]}
+            if '/actions/workflows/' in path: return {'workflow_runs':[run(100),run(200)]}
+            self.assertNotIn('/jobs?',path)  # Published coverage replaces expired transient artifacts.
+            return run(int(path.split('/actions/runs/')[1].split('/')[0]))
+        def download(args,**kwargs):
+            if args[:3]==['git','merge-base','--is-ancestor']: return NS(returncode=0)
+            self.assertEqual(args[:3],['gh','release','download'])
+            target=Path(args[args.index('--dir')+1])
+            for at,arg in enumerate(args):
+                if arg=='--pattern':
+                    for file in published.glob(args[at+1]): shutil.copyfile(file,target/file.name)
+            return NS(returncode=0)
+        def remote(args,**kwargs):
+            manifest=old_manifest if args[-2]=='refs/tags/'+old_manifest['tag'] else self.manifest
+            ref='refs/tags/'+manifest['tag']
+            return manifest['tag_object']+'\t'+ref+'\n'+manifest['revision']+'\t'+ref+'^{}\n'
+        fetched=self.root/'new-release-history'
+        with patch.object(r,'gh_json',side_effect=api),patch.object(r.subprocess,'run',side_effect=download),patch.object(r.subprocess,'check_output',side_effect=remote):
+            r.fetch_previous(self.manifest,fetched)
+        self.mutations.clear(); self.sign.reset_mock()
+        with patch.object(r.subprocess,'check_output',side_effect=remote):
+            second=self.driver(fetched,'next-release').run()
+        self.assertEqual(second['covered_attempts'],['100:1','200:1'])
+        self.assertEqual(second['history_anchor']['sha256'],r.digest((published/name).read_bytes()))
+        self.assertEqual(len(second['transactions']),3)
+        self.assertEqual(os.environ['STELLAR_TESTNET_BOOTSTRAP_ATTEMPT'],'100:1')
 
 
 if __name__ == '__main__': unittest.main()
