@@ -953,3 +953,141 @@ fn simulation_resources_are_bounded_without_becoming_business_intent() {
         "validity overflow",
     );
 }
+
+fn extend() -> (OwnerTransaction, ExpectedOwnerIntent) {
+    let (mut packet, _) = fund();
+    packet.action = "extend".into();
+    let wallet = Contract([9; 32]).to_string();
+    let code = hash(wasm());
+    modify_tx(&mut packet, |tx| {
+        tx.operations = vec![x::Operation {
+            source_account: None,
+            body: x::OperationBody::ExtendFootprintTtl(x::ExtendFootprintTtlOp {
+                ext: x::ExtensionPoint::V0,
+                extend_to: 999,
+            }),
+        }]
+        .try_into()
+        .unwrap();
+        let x::TransactionExt::V1(data) = &mut tx.ext else {
+            panic!()
+        };
+        data.resources.footprint = x::LedgerFootprint {
+            read_only: vec![
+                x::LedgerKey::ContractData(x::LedgerKeyContractData {
+                    contract: address(&wallet).unwrap(),
+                    key: x::ScVal::LedgerKeyContractInstance,
+                    durability: x::ContractDataDurability::Persistent,
+                }),
+                x::LedgerKey::ContractCode(x::LedgerKeyContractCode {
+                    hash: x::Hash(code),
+                }),
+            ]
+            .try_into()
+            .unwrap(),
+            read_write: Default::default(),
+        };
+    });
+    (
+        packet,
+        ExpectedOwnerIntent {
+            limits: limits(),
+            action: OwnerAction::Extend {
+                wallet,
+                wasm_hash: code,
+                extend_to: 999,
+            },
+        },
+    )
+}
+#[test]
+fn exact_relative_wallet_lifetime_extension_signs_only_the_selected_two_entries() {
+    let (packet, expected) = extend();
+    let calls = Cell::new(0);
+    let proof = validate_owner_transaction(&packet, &expected, NOW).unwrap();
+    let signed = proof
+        .sign_with(NOW, |digest| {
+            calls.set(calls.get() + 1);
+            Ok(SigningKey::from_bytes(&OWNER).sign(digest).to_bytes())
+        })
+        .unwrap();
+    assert_eq!(calls.get(), 1);
+    assert_eq!(
+        rpc::signed_transaction_hash("stellar:testnet", &signed).unwrap(),
+        packet.transaction_hash
+    );
+}
+#[test]
+fn lifetime_target_and_footprint_mutations_fail_before_signing() {
+    for variant in 0..8 {
+        let (mut packet, expected) = extend();
+        modify_tx(&mut packet, |tx| {
+            match variant {
+                0 => {
+                    let mut operations = tx.operations.to_vec();
+                    let x::OperationBody::ExtendFootprintTtl(op) = &mut operations[0].body else {
+                        panic!()
+                    };
+                    op.extend_to = 1119;
+                    tx.operations = operations.try_into().unwrap();
+                } // absolute ledger mistaken for relative target
+                1 => {
+                    let x::TransactionExt::V1(data) = &mut tx.ext else {
+                        panic!()
+                    };
+                    let mut keys = data.resources.footprint.read_only.to_vec();
+                    keys[0] = x::LedgerKey::ContractData(x::LedgerKeyContractData {
+                        contract: address(&Contract([8; 32]).to_string()).unwrap(),
+                        key: x::ScVal::LedgerKeyContractInstance,
+                        durability: x::ContractDataDurability::Persistent,
+                    });
+                    data.resources.footprint.read_only = keys.try_into().unwrap();
+                }
+                2 => {
+                    let x::TransactionExt::V1(data) = &mut tx.ext else {
+                        panic!()
+                    };
+                    let mut keys = data.resources.footprint.read_only.to_vec();
+                    keys[1] = x::LedgerKey::ContractCode(x::LedgerKeyContractCode {
+                        hash: x::Hash([8; 32]),
+                    });
+                    data.resources.footprint.read_only = keys.try_into().unwrap();
+                }
+                3 => {
+                    let x::TransactionExt::V1(data) = &mut tx.ext else {
+                        panic!()
+                    };
+                    data.resources.footprint.read_write =
+                        vec![data.resources.footprint.read_only[0].clone()]
+                            .try_into()
+                            .unwrap();
+                }
+                4 => {
+                    let x::TransactionExt::V1(data) = &mut tx.ext else {
+                        panic!()
+                    };
+                    let mut keys = data.resources.footprint.read_only.to_vec();
+                    keys.push(x::LedgerKey::Account(x::LedgerKeyAccount {
+                        account_id: x::AccountId(x::PublicKey::PublicKeyTypeEd25519(x::Uint256(
+                            account_key(&owner()).unwrap(),
+                        ))),
+                    }));
+                    data.resources.footprint.read_only = keys.try_into().unwrap();
+                }
+                5 => {
+                    let mut operations = tx.operations.to_vec();
+                    operations[0].source_account = Some(muxed(&owner()));
+                    tx.operations = operations.try_into().unwrap();
+                }
+                6 => tx.memo = x::Memo::Id(1),
+                _ => {
+                    let x::TransactionExt::V1(data) = &mut tx.ext else {
+                        panic!()
+                    };
+                    data.resource_fee += 1;
+                }
+            }
+        });
+        assert_refused(&packet, &expected, &format!("lifetime mutation {variant}"));
+    }
+}

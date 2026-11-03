@@ -33,7 +33,7 @@ pub struct OwnerLimits {
     pub valid_until: u64,
 }
 
-/// The four owner actions needed to establish and fund native and policy-wallet custody.
+/// The owner actions needed to establish, fund and renew native and policy-wallet custody.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OwnerAction {
     /// The hash of the independently reviewed wallet executable. The packet must contain its
@@ -53,6 +53,13 @@ pub enum OwnerAction {
         to: String,
         amount: i128,
     },
+    /// Extend exactly the selected policy wallet instance and executable to the caller-observed
+    /// network lifetime target. The caller obtains `extend_to` from `rpc::wallet_lifetime`.
+    Extend {
+        wallet: String,
+        wasm_hash: [u8; 32],
+        extend_to: u32,
+    },
     /// The exact existing three-operation native setup, reconstructed from a caller-observed
     /// fresh account. No server-provided signer or threshold is accepted as expected intent.
     NativeSetup {
@@ -70,6 +77,7 @@ impl OwnerAction {
             Self::UploadWasm { .. } => "upload_wasm",
             Self::CreateWallet { .. } => "create_wallet",
             Self::Fund { .. } => "fund",
+            Self::Extend { .. } => "extend",
             Self::NativeSetup { .. } => "native_setup",
         }
     }
@@ -197,6 +205,40 @@ pub fn validate_owner_transaction(
                 || packet.expires_at != exact.expires_at
             {
                 return Err("Native setup differs from the exact caller-selected template".into());
+            }
+        }
+        OwnerAction::Extend {
+            wallet,
+            wasm_hash,
+            extend_to,
+        } => {
+            if *extend_to == 0 || *wasm_hash == [0; 32] || tx.memo != Memo::None {
+                return Err("Invalid caller-selected wallet lifetime extension".into());
+            }
+            Contract::from_string(wallet).map_err(err)?;
+            let [operation] = tx.operations.as_slice() else {
+                return Err("Expected exactly one wallet lifetime operation".into());
+            };
+            if operation.source_account.is_some()
+                || operation.body
+                    != OperationBody::ExtendFootprintTtl(ExtendFootprintTtlOp {
+                        ext: ExtensionPoint::V0,
+                        extend_to: *extend_to,
+                    })
+            {
+                return Err("Wallet lifetime operation differs from caller intent".into());
+            }
+            validate_resources(tx)?;
+            let TransactionExt::V1(data) = &tx.ext else {
+                unreachable!("validated resources");
+            };
+            let keys = rpc::owner_observation::lifetime_keys(wallet, wasm_hash)?;
+            if data.resources.footprint.read_only.as_slice() != keys.as_slice()
+                || !data.resources.footprint.read_write.is_empty()
+            {
+                return Err(
+                    "Wallet lifetime footprint differs from the selected instance and code".into(),
+                );
             }
         }
         action => {
@@ -346,7 +388,7 @@ fn validate_host(
             }
             admin::validate_auth(&limits.network, &exact, &invoke.auth, None)?;
         }
-        OwnerAction::NativeSetup { .. } => unreachable!(),
+        OwnerAction::NativeSetup { .. } | OwnerAction::Extend { .. } => unreachable!(),
     }
     Ok(())
 }

@@ -2,7 +2,9 @@
 //! Common transport owns HTTP bounds; SDK engine owns persistence, polling and retry workflows.
 use crate::contract::{CustodyState, PolicyBinding};
 use crate::*;
+pub(crate) mod owner_observation;
 use allowit_policy_sdk::transport::rpc::{EnvelopeValidation, ErrorKind, RpcClient};
+pub use owner_observation::{AssetBalance, WalletLifetime, asset_balance, wallet_lifetime};
 use serde_json::{Value, json};
 use std::{
     sync::atomic::{AtomicU64, Ordering},
