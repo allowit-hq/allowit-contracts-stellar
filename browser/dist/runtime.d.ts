@@ -1,4 +1,5 @@
 export declare const isStellarNetwork: (network: unknown) => network is "stellar:testnet" | "stellar:mainnet" | "stellar:pubnet";
+export declare const isStellarPublicNetwork: (network: unknown) => boolean;
 export declare const isStellarPolicy: (policy: {
     runtime?: {
         wallet?: {
