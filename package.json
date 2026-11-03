@@ -4,16 +4,28 @@
   "private": true,
   "type": "module",
   "files": [
-    "browser/src"
+    "browser/dist"
   ],
   "exports": {
-    ".": "./browser/src/index.ts",
-    "./*": "./browser/src/*.ts"
+    ".": {
+      "types": "./browser/dist/index.d.ts",
+      "import": "./browser/dist/index.js"
+    },
+    "./*": {
+      "types": "./browser/dist/*.d.ts",
+      "import": "./browser/dist/*.js"
+    }
   },
   "dependencies": {
     "@stellar/freighter-api": "6.0.1",
     "@stellar/stellar-sdk": "17.4.0",
     "@noble/curves": "1.9.7",
     "@noble/hashes": "1.8.0"
+  },
+  "scripts": {
+    "build:browser": "tsc -p browser/tsconfig.json"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.2"
   }
 }

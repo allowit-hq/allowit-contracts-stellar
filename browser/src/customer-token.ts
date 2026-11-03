@@ -1,4 +1,4 @@
-import {stellarAccountKey} from './stellar-wallet';
+import {stellarAccountKey} from './stellar-wallet.js';
 import {ed25519} from '@noble/curves/ed25519';
 
 const alphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';

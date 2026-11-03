@@ -1,0 +1,36 @@
+export declare function customerPublicKey(seedText: string): string;
+export declare function newCustomerKey(): {
+    seed: string;
+    publicKey: string;
+};
+export type PublicStellarBundle = {
+    version: number;
+    profile: string;
+    network: string;
+    policyId: string;
+    sourceHash: string;
+    irHash: string;
+    moduleDigest: string;
+    wallet: string;
+    route: 'native' | 'policyWallet';
+    config: Record<string, unknown>;
+    endpoints: {
+        execute: string;
+        status: string;
+    };
+};
+export type TokenPolicy = {
+    id: string;
+    network: string;
+    sourceHash: string;
+    irHash: string;
+    code: string;
+    mint: string;
+    token: string;
+    runtime?: {
+        instanceBinding?: Record<string, unknown>;
+        authorization?: unknown;
+    };
+};
+/** Local-only encoding. Never pass its return value to an API, storage, URL, or analytics. */
+export declare function customerToken(bundle: PublicStellarBundle, seedText: string, policy: TokenPolicy, owner: string, service: unknown): string;

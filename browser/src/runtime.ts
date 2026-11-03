@@ -1,4 +1,4 @@
-import {STELLAR_PROFILES, stellarProfile} from './stellar-profiles';
+import {STELLAR_PROFILES, stellarProfile} from './stellar-profiles.js';
 export const isStellarNetwork = (network: unknown): network is 'stellar:testnet'|'stellar:mainnet' => network === 'stellar:testnet' || network === 'stellar:mainnet';
 export const isStellarPolicy = (policy: {runtime?: {wallet?: {profile?: unknown}}; network: string}) => stellarProfile(policy.runtime?.wallet?.profile) && isStellarNetwork(policy.network);
 export const STELLAR_FUNDING_MODE = 'stellar-installed';

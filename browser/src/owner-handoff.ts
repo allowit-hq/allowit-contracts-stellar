@@ -1,8 +1,8 @@
 import {Account, FeeBumpTransaction, Keypair, Memo, Operation, Transaction, TransactionBuilder, Networks, xdr} from '@stellar/stellar-sdk/base';
 import {sha256} from '@noble/hashes/sha256';
 
-import {STELLAR_OWNER_FRAGMENT} from './stellar-fragments';
-export {STELLAR_OWNER_FRAGMENT} from './stellar-fragments';
+import {STELLAR_OWNER_FRAGMENT} from './stellar-fragments.js';
+export {STELLAR_OWNER_FRAGMENT} from './stellar-fragments.js';
 export const STELLAR_OWNER_PROFILE = 'allowit-stellar-owner-v1';
 export interface StellarOwnerIntent {
   version: 1; profile: typeof STELLAR_OWNER_PROFILE; requestId: string; network: 'stellar:testnet';

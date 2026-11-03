@@ -3,7 +3,7 @@ import {ed25519} from '@noble/curves/ed25519';
 import {sha256} from '@noble/hashes/sha256';
 export interface Session {address: string; network: string; expiresAt: string}
 export type BrowserRequest = <T = unknown>(path: string, body?: unknown, options?: {expectedOwner?: string}) => Promise<T>;
-import {stellarAssetContract} from './stellar-asset';
+import {stellarAssetContract} from './stellar-asset.js';
 
 export type StellarNetwork = 'stellar:testnet' | 'stellar:mainnet';
 export const STELLAR_NETWORKS = {

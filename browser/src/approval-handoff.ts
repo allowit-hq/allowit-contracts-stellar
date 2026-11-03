@@ -1,10 +1,10 @@
 import {sha256} from '@noble/hashes/sha256';
 import {StrKey} from '@stellar/stellar-sdk/base';
 export interface ApprovalPolicy {id: string; revision: number; network: string; code: string; sourceHash: string; irHash: string; mint: string; token: string; runtime?: {wallet: {profile: string}; instanceBinding?: Record<string, unknown>}}
-import {stellarAccountKey, stellarAssetContractId} from './stellar-wallet';
-import {decodePublicFragment} from './owner-handoff';
-import {STELLAR_APPROVAL_FRAGMENT} from './stellar-fragments';
-export {STELLAR_APPROVAL_FRAGMENT} from './stellar-fragments';
+import {stellarAccountKey, stellarAssetContractId} from './stellar-wallet.js';
+import {decodePublicFragment} from './owner-handoff.js';
+import {STELLAR_APPROVAL_FRAGMENT} from './stellar-fragments.js';
+export {STELLAR_APPROVAL_FRAGMENT} from './stellar-fragments.js';
 export interface ApprovalBinding {wallet:string;route:'native';policyInstance:string;moduleDigest:string;asset:string;assetSymbol:string;assetIssuer:string|null;maxFeeStroops:number;deploymentId:string|null}
 export interface StellarApprovalIntent {version:1;profile:'allowit-stellar-approval-v1';requestId:string;network:'stellar:testnet';owner:string;policyId:string;revision:number;source:string;sourceHash:string;irHash:string;binding:ApprovalBinding;intentDigest:string}
 const hash=(v:string)=>Array.from(sha256(new TextEncoder().encode(v)),b=>b.toString(16).padStart(2,'0')).join('');
