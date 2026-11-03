@@ -6,6 +6,8 @@ use crate::contract::{CustodyState, KeptState, PolicyBinding};
 use crate::*;
 use allowit_policy_sdk::admin::{DeployPolicy, DeploymentVersion, RecoverFunds, SetPause};
 use serde_json::json;
+mod host;
+pub use host::{PolicyInstallation, wallet_salt};
 
 /// Complete owner-approved configuration. The version is supplied to deploy_policy.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

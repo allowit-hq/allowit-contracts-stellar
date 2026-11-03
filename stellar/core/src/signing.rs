@@ -107,6 +107,37 @@ pub fn request_proof(account: &str, issued_at: u64, signature: &[u8]) -> Result<
     ))
 }
 
+/// Verify the native request proof after HTTP admission removed the Bearer prefix.
+/// The caller supplies the exact path and canonical body, then decides whether this signer
+/// is authorized for that request. Verification alone grants no owner or server authority.
+pub fn verify_request_proof(
+    proof: &str,
+    now: u64,
+    path: &str,
+    canonical_body: &[u8],
+) -> Result<String> {
+    if proof.len() > 512 {
+        return Err("Native request proof exceeds limit".into());
+    }
+    let parts: Vec<_> = proof.split('.').collect();
+    if parts.len() != 4 || parts[0] != "stellar-proof" {
+        return Err("Invalid native request proof".into());
+    }
+    let issued_at = parts[2]
+        .parse::<u64>()
+        .map_err(|_| "Invalid request time")?;
+    if now.abs_diff(issued_at) > 120 {
+        return Err("Native request proof is not current".into());
+    }
+    let signature = crate::unhex::<64>(parts[3])?;
+    verify_digest(
+        parts[1],
+        &request_digest(issued_at, path, canonical_body),
+        &signature,
+    )?;
+    Ok(parts[1].into())
+}
+
 /// Parse the exact native sign-in message selected by the caller.
 /// The caller checks the returned timestamps, expiry field and challenge freshness.
 pub fn sign_in_message_times<'a>(

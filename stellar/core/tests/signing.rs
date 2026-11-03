@@ -273,3 +273,29 @@ fn canonical_networks_preserve_existing_native_passphrase_and_identity_bytes() {
     );
     assert!(native::passphrase("stellar:futurenet").is_err());
 }
+
+#[test]
+fn request_proof_verification_preserves_server_domain_and_exact_input() {
+    let signer = signing::LocalSigner::from_entropy(&[7; 32]).unwrap();
+    let now = 1_800_000_000;
+    let path = "/api/native/prepare";
+    let body = br#"{"requestId":"original","amount":"5"}"#;
+    let digest = signing::request_digest(now, path, body);
+    let proof =
+        signing::request_proof(signer.account(), now, &signer.sign_digest(&digest).unwrap())
+            .unwrap();
+    let token = proof.strip_prefix("Bearer ").unwrap();
+    assert_eq!(
+        signing::verify_request_proof(token, now, path, body).unwrap(),
+        signer.account()
+    );
+    for (time, route, data) in [
+        (now + 121, path, body.as_slice()),
+        (now - 121, path, body.as_slice()),
+        (now, "/api/native/submit", body.as_slice()),
+        (now, path, b"{}".as_slice()),
+    ] {
+        assert!(signing::verify_request_proof(token, time, route, data).is_err());
+    }
+    assert!(signing::verify_request_proof(&proof, now, path, body).is_err());
+}

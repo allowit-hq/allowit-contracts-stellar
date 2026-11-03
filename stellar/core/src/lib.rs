@@ -1164,7 +1164,8 @@ fn verify_wallet_portable(
 fn muxed(value: &str) -> Result<MuxedAccount> {
     Ok(MuxedAccount::Ed25519(Uint256(account_key(value)?)))
 }
-fn transaction_hash(network: &str, tx: &Transaction) -> Result<[u8; 32]> {
+/// Native signature-payload digest, without admitting or signing the transaction.
+pub fn transaction_hash(network: &str, tx: &Transaction) -> Result<[u8; 32]> {
     Ok(hash(
         TransactionSignaturePayload {
             network_id: Hash(network_id(network)?),

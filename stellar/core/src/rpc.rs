@@ -2,8 +2,14 @@
 //! Common transport owns HTTP bounds; SDK engine owns persistence, polling and retry workflows.
 use crate::contract::{CustodyState, PolicyBinding};
 use crate::*;
+mod diagnostics;
+mod owner_actions;
+pub use diagnostics::{ContractFault, simulation_fault};
 pub(crate) mod owner_observation;
 use allowit_policy_sdk::transport::rpc::{EnvelopeValidation, ErrorKind, RpcClient};
+pub use owner_actions::{
+    OwnerSettlement, code_uploaded, contract_exists, owner_settlement, vault_redeemable,
+};
 pub use owner_observation::{AssetBalance, WalletLifetime, asset_balance, wallet_lifetime};
 use serde_json::{Value, json};
 use std::{
@@ -515,7 +521,14 @@ pub fn receipt_by_hash(
     transaction_hash: &[u8; 32],
 ) -> Result<Option<VerifiedReceipt>> {
     let v = rpc.call("getTransaction", json!({"hash":hex(transaction_hash)}))?;
-    let status = verify_settlement(&v, network, transaction_hash)?;
+    receipt_from_response(&v, network, transaction_hash)
+}
+fn receipt_from_response(
+    v: &Value,
+    network: &str,
+    transaction_hash: &[u8; 32],
+) -> Result<Option<VerifiedReceipt>> {
+    let status = verify_settlement(v, network, transaction_hash)?;
     if !matches!(status, OperationStatus::Confirmed | OperationStatus::Failed) {
         return Ok(None);
     }

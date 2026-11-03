@@ -32,23 +32,23 @@ impl WalletLifetime {
         )
     }
 }
-fn ledger(value: &Value) -> Result<u32> {
+pub(super) fn ledger(value: &Value) -> Result<u32> {
     value
         .as_u64()
         .and_then(|v| u32::try_from(v).ok())
         .filter(|v| *v > 0)
         .ok_or_else(|| "Missing or invalid current ledger".into())
 }
-fn network(rpc: &dyn Rpc, selected: &str) -> Result<()> {
+pub(super) fn network(rpc: &dyn Rpc, selected: &str) -> Result<()> {
     if rpc.call("getNetwork", json!({}))?["passphrase"].as_str() != Some(passphrase(selected)?) {
         return Err("Owner observation RPC network differs".into());
     }
     Ok(())
 }
-fn head(rpc: &dyn Rpc) -> Result<u32> {
+pub(super) fn head(rpc: &dyn Rpc) -> Result<u32> {
     ledger(&rpc.call("getLatestLedger", json!({}))?["sequence"])
 }
-fn current(rpc: &dyn Rpc, before: u32, observed: u32) -> Result<()> {
+pub(super) fn current(rpc: &dyn Rpc, before: u32, observed: u32) -> Result<()> {
     let after = head(rpc)?;
     if after < before || observed < before || observed > after || after.saturating_sub(observed) > 1
     {

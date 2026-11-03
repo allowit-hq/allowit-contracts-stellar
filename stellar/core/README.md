@@ -75,6 +75,16 @@ Policy wallet custody calls the layout 4 `execute` entrypoint (`CONTRACT_VERSION
 
 - `upload_wasm` prepares `UploadContractWasm` of wallet code that declares custody layout 4 (`check_wallet_code`).
 - `create_wallet` prepares `CreateContractV2` with the constructor packet. The owner is the transaction source and must be owner-only. `wallet_address` derives the wallet address from the owner and salt.
+- `fund` prepares one exact SEP-41 owner-to-wallet transfer, within the installed fee ceiling.
+- `extend_wallet` prepares instance/code renewal to the independently observed network lifetime limit.
+
+`admin::PolicyInstallation::wallet_config` derives the native asset contract, source binding, rules and wallet address from admitted public installation inputs. `admin::wallet_salt` preserves the policy-instance address domain. `PolicyValue::from_core` and `to_core` preserve the common value variant and check native address encoding. SDK adapters convert common inputs here. They retain source admission, orchestration and storage.
+
+Funding and renewal return `owner_intent::OwnerTransaction` after native simulation and complete intent validation. They neither sign nor submit. `PreparedOwnerOperation::owner_transaction` refuses a pending owner handoff. Its metadata conversion grants no signing authority.
+
+`rpc::code_uploaded` and `contract_exists` check exact live entries at a current ledger. A missing live entry does not prove it never existed. `rpc::owner_settlement` observes the original transaction hash. It reports `NeverApplied` only when native history covers preparation through a ledger closed after expiry. Missing coverage remains `Unknown`.
+
+SDK callers retain the original packet and own retries. `rpc::vault_redeemable` reads SEP-56 valuation without authorizing a transfer. `rpc::simulation_fault` decodes native contract diagnostics for caller-owned error presentation.
 
 `admin::validate_auth` admits only the exact authorization scope of the host function. `admin::check_assembled` applies the `contract_admin.py` `prepare_xdr` intent checks to an assembled transaction: an unsigned v1 transaction from the source with one host function, where simulation added only authorization, resources and their fee within the ceiling.
 
@@ -89,6 +99,8 @@ Validation returns a sealed in-memory proof. Its consuming `sign_with` method se
 `rpc::send_transaction` sends existing signed bytes once and reports the native broadcast result. SDK engine persists intent and controls polling and exact-byte retries. Native validation and signing neither publish nor submit a packet.
 
 ## Service and agent authorization
+
+`AccountState::validate_roles` checks the fixed classic setup against independently selected owner, agent and server identities. `validate_authority_signatures` checks every distinct current positive-weight Ed25519 signer and the current high threshold. These checks serve fresh admission and signing. Historical packet validation remains separate. `signing::verify_request_proof` checks the existing native proof domain against the exact path, canonical body and time. The caller still decides whether that signer can perform the requested action.
 
 For a policy wallet, call `rpc::prepare`, then the service authorization, then `rpc::simulate` again. Initial simulation records authorization on a copy of the intent without auth entries, because Stellar RPC rejects recording mode when entries are present, and checks the recorded scope against the intent's entries. The second simulation enforces the signed service authorization and computes the final resource needs, including the service entry's nonce key. Only then deliver the prepared packet for agent revalidation and signing. Agent and service authority are both required. Direct execution requires an existing Stellar server account whose configured key meets its current medium threshold. Preparation reads that account and checks its quorum; enforce-mode simulation checks actual native authorization. The service authorization changes the transaction hash; the agent signs the final transaction. The service entry's nonce derives from the network, the policy wallet address, the operation nonce, the deployment version and the service key. Soroban tracks authorization nonces per signer, so one service key can serve several policy wallets.
 

@@ -271,6 +271,16 @@ impl PolicyParams {
     }
 }
 impl PolicyValue {
+    /// Convert a common value without erasing its variant. Validate native address encoding.
+    pub fn from_core(value: &allowit_policy_sdk::policy::PolicyValue) -> Result<Self> {
+        let native = Self::from_allowit(&value.0);
+        native.scval()?;
+        Ok(native)
+    }
+    pub fn to_core(&self) -> Result<allowit_policy_sdk::policy::PolicyValue> {
+        self.scval()?;
+        Ok(allowit_policy_sdk::policy::PolicyValue(self.allowit()))
+    }
     /// Contract encoding of `AllowitValue`: a vector of its variant symbol and payload.
     pub fn scval(&self) -> Result<ScVal> {
         let (variant, payload) = match self {
