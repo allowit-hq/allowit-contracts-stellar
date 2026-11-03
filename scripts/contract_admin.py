@@ -11,10 +11,28 @@ import struct
 import subprocess
 import sys
 from pathlib import Path
-from stellar_sdk import Address, Network, xdr, StrKey, TransactionEnvelope, InvokeHostFunction, Preconditions, TimeBounds
+from stellar_sdk import Address, Network, xdr, StrKey, TransactionEnvelope, InvokeHostFunction, Preconditions, TimeBounds, scval
 from wallet_admin import admin as verify_admin, fetch, owner_only, PASSPHRASE
-# Canonical param keys are the canonical rule names. An absent key is unset.
-from policy_source import PARAM_KEYS, checked_code, host_compile, standard_prefix, writes_state
+# Source admission is loaded only when authoring is requested. Native XDR/readback and
+# Testnet release signing must not resolve or execute authoring tooling with a signing key.
+def checked_code(*args, **kwargs):
+    from policy_source import checked_code as run
+    return run(*args, **kwargs)
+
+
+def host_compile(*args, **kwargs):
+    from policy_source import host_compile as run
+    return run(*args, **kwargs)
+
+
+def standard_prefix(*args, **kwargs):
+    from policy_source import standard_prefix as run
+    return run(*args, **kwargs)
+
+
+def writes_state(*args, **kwargs):
+    from policy_source import writes_state as run
+    return run(*args, **kwargs)
 
 # No transfers, token approvals, general calls or arbitrary method dispatch.
 WALLET = {
@@ -67,6 +85,29 @@ def code_hash(value):
     if not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", value):
         raise ValueError("Expected 32-byte hexadecimal Wasm hash")
     return value
+
+
+def prefix_digest(kind, module, asset, rules):
+    """Canonical standard-prefix binding of executable, asset and ordered native rules."""
+    checks = scval.to_vec([scval.to_vec([scval.to_symbol(rule)]) for rule in rules])
+    value = scval.to_vec([scval.to_symbol("allowit_std_prefix"), scval.to_symbol(kind),
+        scval.to_bytes(bytes.fromhex(module)), scval.to_address(asset), checks])
+    return hashlib.sha256(value.to_xdr_bytes()).hexdigest()
+
+
+def plain_params(native):
+    """Plain owner parameter values from decoded native AllowitValue enums."""
+    def plain(value):
+        kind, inner = value
+        return [plain(item) for item in inner] if kind == "List" else inner
+    return {key: plain(value) for key, value in native.items()}
+
+
+def rule_names(rules):
+    """Decoded Vec<AllowitRule>; each unit variant is a one-symbol list."""
+    if not isinstance(rules, list) or any(not isinstance(rule, list) or len(rule) != 1 or not isinstance(rule[0], str) for rule in rules):
+        raise ValueError("Wallet rules are not a Vec<AllowitRule>")
+    return [rule[0] for rule in rules]
 
 
 def pinned_wasm(path, expected_hash):
@@ -154,6 +195,9 @@ def wallet_layout(state):
 
 LIMITS = {"payment_limit", "lifetime_spending_limit", "daily_spending_limit", "daily_volume_limit"}
 LISTS = {"destinations", "tokens"}
+# This is the native fixed-tier ABI: the fields validated by the type groups below.
+# Its parity with the portable policy keys is checked by the administration test suite.
+PARAM_KEYS = tuple(sorted(LIMITS | LISTS | {"call_limit", "expires_at", "operations"}))
 # One `operations` entry: a plain op name, `custom.<function>` or `custom:<contract>.<function>`. `allowit`
 # accepts any ASCII letters or digits as the contract; this Stellar tool also requires a `C` StrKey,
 # so that the entry can match a Stellar contract.
