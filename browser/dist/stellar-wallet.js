@@ -1,4 +1,4 @@
-import * as freighter from '@stellar/freighter-api';
+import freighter from '@stellar/freighter-api';
 import { ed25519 } from '@noble/curves/ed25519';
 import { sha256 } from '@noble/hashes/sha256';
 import { stellarAssetContract } from './stellar-asset.js';
