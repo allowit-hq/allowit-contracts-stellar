@@ -6,13 +6,17 @@ export interface Session {
 export type BrowserRequest = <T = unknown>(path: string, body?: unknown, options?: {
     expectedOwner?: string;
 }) => Promise<T>;
-export type StellarNetwork = 'stellar:testnet' | 'stellar:mainnet';
+export type StellarNetwork = 'stellar:testnet' | 'stellar:mainnet' | 'stellar:pubnet';
 export declare const STELLAR_NETWORKS: {
     readonly 'stellar:testnet': {
         readonly label: "Testnet";
         readonly passphrase: "Test SDF Network ; September 2015";
     };
     readonly 'stellar:mainnet': {
+        readonly label: "Mainnet";
+        readonly passphrase: "Public Global Stellar Network ; September 2015";
+    };
+    readonly 'stellar:pubnet': {
         readonly label: "Mainnet";
         readonly passphrase: "Public Global Stellar Network ; September 2015";
     };

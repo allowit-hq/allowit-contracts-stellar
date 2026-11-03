@@ -5,10 +5,11 @@ export interface Session {address: string; network: string; expiresAt: string}
 export type BrowserRequest = <T = unknown>(path: string, body?: unknown, options?: {expectedOwner?: string}) => Promise<T>;
 import {stellarAssetContract} from './stellar-asset.js';
 
-export type StellarNetwork = 'stellar:testnet' | 'stellar:mainnet';
+export type StellarNetwork = 'stellar:testnet' | 'stellar:mainnet' | 'stellar:pubnet';
 export const STELLAR_NETWORKS = {
   'stellar:testnet': {label: 'Testnet', passphrase: 'Test SDF Network ; September 2015'},
   'stellar:mainnet': {label: 'Mainnet', passphrase: 'Public Global Stellar Network ; September 2015'},
+  'stellar:pubnet': {label: 'Mainnet', passphrase: 'Public Global Stellar Network ; September 2015'},
 } as const;
 
 /** A checksummed G address proves a key identity. Account thresholds are checked by the SDK/RPC adapter. */
@@ -127,7 +128,7 @@ export async function verifyStellarInstallation(request: BrowserRequest, policy:
   let signatures:undefined|{signer:string;signature:number[]}[];
   if(approval.required){
     const payload=approval.payload,binding=policy.runtime?.instanceBinding;
-    if(!exactPayload(payload)||payload.version!==1||!binding||(binding.assetIssuer??null)!==payload.assetIssuer||(payload.assetIssuer!==null&&typeof payload.assetIssuer!=='string')||typeof payload.assetSymbol!=='string'||payload.wallet!==binding.wallet||payload.route!=='native'||payload.route!==binding.route||payload.moduleDigest!==binding.moduleDigest||payload.policyInstance!==binding.policyInstance||payload.asset!==policy.mint||payload.assetSymbol!==policy.token||payload.maxFeeStroops!==binding.maxFeeStroops||approval.method!=='sep53'||payload.policyId!==policy.id||payload.revision!==policy.revision||payload.network!==policy.network||payload.sourceHash!==policy.sourceHash||payload.irHash!==policy.irHash||payload.source!==policy.code||approval.message!==`AllowIt Native policy approval v1\n${canonicalObject(payload)}`||!['stellar:testnet','stellar:mainnet'].includes(String(payload.network)))throw new Error('The source approval does not match this exact policy. Nothing was signed.');
+    if(!exactPayload(payload)||payload.version!==1||!binding||(binding.assetIssuer??null)!==payload.assetIssuer||(payload.assetIssuer!==null&&typeof payload.assetIssuer!=='string')||typeof payload.assetSymbol!=='string'||payload.wallet!==binding.wallet||payload.route!=='native'||payload.route!==binding.route||payload.moduleDigest!==binding.moduleDigest||payload.policyInstance!==binding.policyInstance||payload.asset!==policy.mint||payload.assetSymbol!==policy.token||payload.maxFeeStroops!==binding.maxFeeStroops||approval.method!=='sep53'||payload.policyId!==policy.id||payload.revision!==policy.revision||payload.network!==policy.network||payload.sourceHash!==policy.sourceHash||payload.irHash!==policy.irHash||payload.source!==policy.code||approval.message!==`AllowIt Native policy approval v1\n${canonicalObject(payload)}`||!['stellar:testnet','stellar:mainnet','stellar:pubnet'].includes(String(payload.network)))throw new Error('The source approval does not match this exact policy. Nothing was signed.');
     const network=payload.network as StellarNetwork;stellarAccountKey(String(payload.wallet));
     // The signed asset contract must derive from the exact code, issuer and network.
     let contract='';

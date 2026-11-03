@@ -1,6 +1,6 @@
 export interface StellarOperationReceipt {
     chain: 'stellar';
-    network: 'stellar:testnet' | 'stellar:mainnet';
+    network: 'stellar:testnet' | 'stellar:mainnet' | 'stellar:pubnet';
     signature: string;
     requestHash: string;
     invocationIndex: 0;

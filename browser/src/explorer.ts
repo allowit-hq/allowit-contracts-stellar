@@ -1,5 +1,5 @@
 export type ExplorerKind = 'address'|'tx'|'contract';
-const NETWORKS = new Map<string, string>([['stellar:testnet', 'testnet'], ['stellar:mainnet', 'public']]);
+const NETWORKS = new Map<string, string>([['stellar:testnet', 'testnet'], ['stellar:mainnet', 'public'], ['stellar:pubnet', 'public']]);
 const ACCOUNT = /^G[A-Z2-7]{55}$/, CONTRACT = /^C[A-Z2-7]{55}$/, TRANSACTION = /^[\da-fA-F]{64}$/;
 export function stellarExplorerUrl(kind: ExplorerKind, value: string, network: string): string|null {
   if (typeof value !== 'string' || typeof network !== 'string' || value.length > 128) return null;

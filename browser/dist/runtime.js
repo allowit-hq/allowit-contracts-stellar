@@ -1,5 +1,5 @@
 import { STELLAR_PROFILES, stellarProfile } from './stellar-profiles.js';
-export const isStellarNetwork = (network) => network === 'stellar:testnet' || network === 'stellar:mainnet';
+export const isStellarNetwork = (network) => network === 'stellar:testnet' || network === 'stellar:mainnet' || network === 'stellar:pubnet';
 export const isStellarPolicy = (policy) => stellarProfile(policy.runtime?.wallet?.profile) && isStellarNetwork(policy.network);
 export const STELLAR_FUNDING_MODE = 'stellar-installed';
 export const STELLAR_SOURCE_PROFILE = 'allowit-stellar-transfer-v1';
