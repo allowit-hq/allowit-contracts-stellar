@@ -13,6 +13,7 @@ use stellar_xdr::*;
 pub mod admin;
 mod authorization;
 pub mod contract;
+pub mod networks;
 pub mod owner;
 pub mod owner_intent;
 pub mod policy;
@@ -67,7 +68,9 @@ pub fn read<T: ReadXdr>(value: &str) -> Result<T> {
 }
 pub fn passphrase(network: &str) -> Result<&'static str> {
     match network {
-        "stellar:mainnet" => Ok("Public Global Stellar Network ; September 2015"),
+        "stellar:pubnet" | "stellar:mainnet" => {
+            Ok("Public Global Stellar Network ; September 2015")
+        }
         "stellar:testnet" => Ok("Test SDF Network ; September 2015"),
         _ => Err("Unsupported Stellar network".into()),
     }

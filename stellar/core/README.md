@@ -24,6 +24,9 @@ The rest of this page is the reference for how the crate behaves.
 
 The `workflow` module owns Stellar native request DTOs and their JSON encoding. `PolicyEngine` selects the Stellar wallet implementation. Generic owner capability traits remain in Allowit core. Fresh preparation and signing require portable source; historical compiler-language packets are decoded only to verify their original hashes, signatures and settlement. Read-only recovery does not rerun current source admission. The caller must bind the packet to its durable original owner-approved record.
 
+`networks::NETWORKS` lists canonical `stellar:testnet` and `stellar:pubnet` identifiers for compiled vendor registration.
+`stellar:mainnet` remains a pubnet alias with the same native passphrase and network ID.
+
 ## Native key and message signing
 
 `signing::LocalSigner` owns native key decoding, encoding and digest signing.

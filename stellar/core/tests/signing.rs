@@ -121,3 +121,52 @@ fn service_proofs_bind_request_path_time_and_exact_body() {
     assert!(signing::request_proof(&owner, 42, &[1; 63]).is_err());
     assert!(signing::request_proof("untrusted\nheader", 42, &[1; 64]).is_err());
 }
+
+#[test]
+fn network_inventory_owns_unique_canonical_and_alias_names() {
+    let mut names = std::collections::BTreeSet::new();
+    let descriptors = native::networks::NETWORKS;
+    assert_eq!(descriptors.len(), 2);
+    for network in descriptors {
+        assert!(names.insert(network.id));
+        assert_eq!(network.testnet, network.id == "stellar:testnet");
+        for alias in network.aliases {
+            assert!(names.insert(alias));
+            assert_eq!(native::passphrase(alias), native::passphrase(network.id));
+            assert_eq!(native::network_id(alias), native::network_id(network.id));
+        }
+    }
+    assert_eq!(
+        names,
+        std::collections::BTreeSet::from(["stellar:testnet", "stellar:pubnet", "stellar:mainnet",])
+    );
+}
+
+#[test]
+fn canonical_networks_preserve_existing_native_passphrase_and_identity_bytes() {
+    for (id, passphrase, network_id) in [
+        (
+            "stellar:testnet",
+            "Test SDF Network ; September 2015",
+            "cee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472",
+        ),
+        (
+            "stellar:pubnet",
+            "Public Global Stellar Network ; September 2015",
+            "7ac33997544e3175d266bd022439b22cdb16508c01163f26e5cb2a3e1045a979",
+        ),
+        (
+            "stellar:mainnet",
+            "Public Global Stellar Network ; September 2015",
+            "7ac33997544e3175d266bd022439b22cdb16508c01163f26e5cb2a3e1045a979",
+        ),
+    ] {
+        assert_eq!(native::passphrase(id).unwrap(), passphrase);
+        assert_eq!(native::hex(&native::network_id(id).unwrap()), network_id);
+    }
+    assert_ne!(
+        native::network_id("stellar:testnet"),
+        native::network_id("stellar:pubnet")
+    );
+    assert!(native::passphrase("stellar:futurenet").is_err());
+}
