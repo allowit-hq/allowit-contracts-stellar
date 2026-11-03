@@ -87,6 +87,10 @@ pub fn decode_seed(value: &str) -> Result<[u8; 32]> {
         .map(|v| v.0)
         .map_err(|_| "Expected a canonical Stellar S seed".into())
 }
+/// Encode an already derived public key using the native account address format.
+pub fn account_for_public_key(key: &[u8; 32]) -> String {
+    ed25519::PublicKey(*key).to_string()
+}
 pub fn account_for_seed(seed: &[u8; 32]) -> String {
     ed25519::PublicKey(SigningKey::from_bytes(seed).verifying_key().to_bytes()).to_string()
 }
@@ -669,6 +673,10 @@ pub fn validate_config(c: &WalletConfig) -> Result<()> {
 }
 // Retained packets prove transport/effect identity. Their original owner-approved source
 // binding belongs to the caller's durable record; current source admission cannot replace it.
+/// Validate a retained configuration's immutable structure without admitting source for new actions.
+pub fn validate_retained_configuration(c: &WalletConfig) -> Result<()> {
+    validate_config_for(c, false)
+}
 fn validate_config_for(c: &WalletConfig, admit_source: bool) -> Result<()> {
     passphrase(&c.network)?;
     if c.policy_instance == [0; 32]
