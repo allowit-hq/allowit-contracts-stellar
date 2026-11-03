@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Build public release inputs and deploy their exact contracts to Stellar Testnet."""
 import argparse
+import copy
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -37,6 +38,9 @@ SHA = re.compile(r"[0-9a-f]{40}")
 TAG = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 CORE_SOURCE = "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.3.1#96b558633d4e01a077d3fd1e75d2b9fe927f2036"
 IDENTITY_KEYS = {"tag", "revision", "tag_object", "workflow_revision"}
+MAX_LEDGER_AGE = 120  # Seconds, measured from the native header close time.
+MAX_FUTURE_SKEW = 30
+MAX_ENDPOINT_LAG = 12  # Ledgers between the two fixed public services.
 
 
 def digest(data):
@@ -59,6 +63,12 @@ def public_json_url(path):
     return ca.public_json(data.decode())
 
 
+def check_ledger_age(close_time):
+    age = datetime.now(timezone.utc).timestamp() - close_time
+    if not -MAX_FUTURE_SKEW <= age <= MAX_LEDGER_AGE:
+        raise ValueError("Public Testnet ledger header is stale or in the future")
+
+
 def network_identity(rpc, recorded=None):
     """Bind the fixed RPC to public Testnet history and its earliest retained generation anchor."""
     if rpc.get_network().passphrase != PASSPHRASE:
@@ -76,29 +86,47 @@ def network_identity(rpc, recorded=None):
     except HTTPError as error:
         error.close()
         raise ValueError("Recorded Testnet generation anchor is unavailable; stop before mutation") from error
-    recent_sequence = min(latest, rpc.get_latest_ledger().sequence)
+    rpc_latest = rpc.get_latest_ledger().sequence
+    if type(rpc_latest) is not int or abs(latest - rpc_latest) > MAX_ENDPOINT_LAG:
+        raise ValueError("Public Testnet endpoints exceed the ledger lag limit")
+    recent_sequence = min(latest, rpc_latest)
     recent = public_json_url("/ledgers/" + str(recent_sequence))
     for sequence, item in ((first, anchor), (recent_sequence, recent)):
         header = xdr.LedgerHeader.from_xdr(item["header_xdr"])
         if item.get("sequence") != sequence or header.ledger_seq.uint32 != sequence or digest(header.to_xdr_bytes()) != item.get("hash"):
             raise ValueError("Public Testnet ledger header differs from its identity")
+        closed = datetime.fromtimestamp(header.scp_value.close_time.time_point.uint64, timezone.utc)
+        if datetime.fromisoformat(item["closed_at"].replace("Z", "+00:00")) != closed:
+            raise ValueError("Public Testnet ledger close time differs from its native header")
+    close_time = xdr.LedgerHeader.from_xdr(recent["header_xdr"]).scp_value.close_time.time_point.uint64
     matches = rpc.get_ledgers(start_ledger=recent_sequence, limit=1).ledgers
     if len(matches) != 1 or matches[0].sequence != recent_sequence or matches[0].hash != recent["hash"]:
         raise ValueError("Public Testnet RPC and history disagree")
     rpc_header = xdr.LedgerHeaderHistoryEntry.from_xdr(matches[0].header_xdr)
     if rpc_header.hash.hash.hex() != recent["hash"] or rpc_header.header.to_xdr() != recent["header_xdr"]:
         raise ValueError("Public Testnet RPC and history ledger headers disagree")
+    check_ledger_age(close_time)
     now = datetime.now(timezone.utc).isoformat()
     generation = {"ledger": first, "hash": anchor["hash"], "closed_at": anchor["closed_at"],
         "source": HORIZON + "/ledgers/" + str(first), "observed_at": now}
     if recorded is not None and recorded["hash"] == generation["hash"]:
+        if recorded.get("closed_at") != generation["closed_at"]:
+            raise ValueError("Recorded Testnet anchor metadata differs from its native header")
         generation = recorded
     return {"network": "stellar:testnet", "network_id": Network(PASSPHRASE).network_id().hex(),
         "rpc": RPC, "horizon": HORIZON, "passphrase": PASSPHRASE,
         "generation": generation,
         "genesis_available": first == 1,
         "observed": {"ledger": recent_sequence, "hash": recent["hash"], "observed_at": now,
+            "close_time": close_time,
             "horizon_header_xdr": recent["header_xdr"], "rpc_header_xdr": matches[0].header_xdr}}
+
+
+def check_network_metadata(identity):
+    expected = {"network": "stellar:testnet", "network_id": Network(PASSPHRASE).network_id().hex(),
+        "rpc": RPC, "horizon": HORIZON, "passphrase": PASSPHRASE}
+    if any(identity.get(key) != value for key, value in expected.items()) or identity.get("genesis_available") is not (identity.get("generation", {}).get("ledger") == 1):
+        raise ValueError("Recorded Testnet network metadata is inconsistent")
 
 
 def same_generation(left, right):
@@ -214,6 +242,14 @@ def release_identity(root, tag, workflow_sha):
     return {"tag": tag, "revision": revision, "tag_object": tag_object, "workflow_revision": workflow_sha}
 
 
+def check_canonical_tag(manifest):
+    """Recheck the remote tag after protected-environment approval and before mutation."""
+    reference = "refs/tags/" + manifest["tag"]
+    remote = subprocess.check_output(["git", "ls-remote", REPOSITORY, reference, reference + "^{}"], text=True, timeout=30)
+    if {line.split()[1]: line.split()[0] for line in remote.splitlines()} != {reference: manifest["tag_object"], reference + "^{}": manifest["revision"]}:
+        raise ValueError("Canonical release tag changed or is unavailable")
+
+
 def bundle(source, identity, output):
     if set(identity) != IDENTITY_KEYS:
         raise ValueError("Unexpected release identity fields")
@@ -313,23 +349,22 @@ def check_constructor(create, config, module, salt):
     preimage = create.contract_id_preimage
     if preimage.type != xdr.ContractIDPreimageType.CONTRACT_ID_PREIMAGE_FROM_ADDRESS or preimage.from_address.address != Address(config["owner"]).to_xdr_sc_address() or preimage.from_address.salt.uint256 != salt:
         raise ValueError("Constructor owner or deterministic salt differs")
-    def plain(value):
-        if isinstance(value, Address):
-            return value.address
-        if isinstance(value, bytes):
-            return value.hex()
-        if isinstance(value, list):
-            return [plain(item) for item in value]
-        if isinstance(value, dict):
-            return {key: plain(item) for key, item in value.items()}
-        return value
-    decoded = plain(scval.to_native(create.constructor_args[0]))
-    if not isinstance(decoded, dict) or set(decoded) != set(config):
-        raise ValueError("Constructor fields differ from the release intent")
-    decoded["params"] = ca.plain_params(decoded["params"])
-    decoded["rules"] = ca.rule_names(decoded["rules"])
-    if decoded != config:
-        raise ValueError("Constructor values differ from the release intent")
+    # Encode caller-owned intent independently of the CLI/spec decoder. Preserve every
+    # AllowitValue tag, including nested Addr versus Str with identical printable bytes.
+    params = {}
+    for name, value in config["params"].items():
+        if name in ("destinations", "tokens", "operations"):
+            tag, encode = ("Str", scval.to_string) if name == "operations" else ("Addr", scval.to_address)
+            params[name] = scval.to_enum("List", scval.to_vec([scval.to_enum(tag, encode(item)) for item in value]))
+        else:
+            params[name] = scval.to_enum("Int", scval.to_int128(value))
+    fields = {key: scval.to_address(config[key]) for key in ("owner", "agent", "server", "asset")}
+    fields.update(policy_instance=scval.to_bytes(bytes.fromhex(config["policy_instance"])),
+        source_digest=scval.to_bytes(bytes.fromhex(config["source_digest"])),
+        rules=scval.to_vec([scval.to_enum(rule, None) for rule in config["rules"]]),
+        params=scval.to_struct(params), x402_enabled=scval.to_bool(config["x402_enabled"]))
+    if create.constructor_args[0].to_xdr_bytes() != scval.to_struct(fields).to_xdr_bytes():
+        raise ValueError("Constructor native XDR differs from the release intent")
 
 
 class Deployment:
@@ -354,9 +389,24 @@ class Deployment:
                     if kind not in KINDS or item.get("config") != config_for(self.manifest, kind, key.public_key, agent, server):
                         raise ValueError("Prior wallet configuration differs; stop before mutation")
                 self.previous.append(data)
-        recorded = self.previous[-1]["network_identity"]["generation"] if self.previous else None
         self.rpc = SorobanServer(RPC)
-        identity = network_identity(self.rpc, recorded)
+        self.current_previous = []
+        identity = None
+        for checkpoint in self.previous:
+            prior_identity = checkpoint["network_identity"]
+            check_network_metadata(prior_identity)
+            observed = network_identity(self.rpc, prior_identity["generation"])
+            if observed["generation"]["hash"] == prior_identity["generation"]["hash"]:
+                if not same_generation(observed, prior_identity):
+                    raise ValueError("Recorded Testnet generation metadata is inconsistent")
+                if identity is not None and not same_generation(identity, observed):
+                    raise ValueError("Recorded Testnet generation anchors are inconsistent")
+                identity = observed
+                self.current_previous.append(checkpoint)
+            # Only a different native hash at THIS checkpoint's retained sequence proves reset.
+            # network_identity refuses an unavailable or invalid retained anchor.
+        if identity is None:
+            identity = network_identity(self.rpc)
         self.public = {"schema": 1, "network": "stellar:testnet", "rpc": RPC,
             "source": self.manifest, "owner": key.public_key, "agent": agent, "server": server,
             "deployment_automation_revision": git(Path(__file__).resolve().parents[1], "rev-parse", "HEAD"),
@@ -374,28 +424,99 @@ class Deployment:
 
     def reconcile_previous(self):
         """Resolve original hashes before any rerun can fund, sign or submit another transaction."""
-        now = int(datetime.now(timezone.utc).timestamp())
-        for checkpoint in self.previous:
-            if not same_generation(checkpoint["network_identity"], self.public["network_identity"]):
-                continue  # The recorded anchor was read and its different hash proved a reset.
-            if checkpoint.get("status") == "VERIFIED":
-                continue
+        records = {}
+        for checkpoint in self.current_previous:
             for record in checkpoint.get("transactions", []):
                 tx_hash, expires = record.get("transaction_hash"), record.get("expires_at")
-                if not HEX.fullmatch(tx_hash or "") or type(expires) is not int or expires <= 0:
+                if not HEX.fullmatch(tx_hash or "") or type(expires) is not int or expires <= 0 or record.get("status") not in {
+                    "prepared", "unknown", "SUCCESS", "FAILED", "EXPIRED_UNCONFIRMED"} or record.get("stage") not in {
+                    *("upload-" + kind for kind in CONTRACTS), *("deploy-" + kind for kind in KINDS)}:
                     raise ValueError("Prior transaction identity is incomplete; operator reconciliation is required")
-                receipt = self.rpc.get_transaction(tx_hash)
-                if receipt.status == GetTransactionStatus.SUCCESS:
-                    envelope = TransactionEnvelope.from_xdr(receipt.envelope_xdr, PASSPHRASE)
-                    if envelope.hash_hex() != tx_hash or envelope.transaction.source.account_id != self.key.public_key or not receipt.ledger:
-                        raise ValueError("Prior transaction receipt differs from the original identity")
-                elif receipt.status != GetTransactionStatus.FAILED and now <= expires:
-                    raise ValueError("Prior submission remains uncertain; preserve its original hash " + tx_hash)
+                old = records.get(tx_hash)
+                if old is not None:
+                    if any(old.get(k) != record.get(k) for k in ("stage", "expires_at", "fee_cap_stroops")) or (
+                        old.get("status") in ("SUCCESS", "FAILED") and record.get("status") in ("SUCCESS", "FAILED") and
+                        any(old.get(k) != record.get(k) for k in ("status", "ledger"))):
+                        raise ValueError("Prior transaction records conflict")
+                    if old.get("status") == "SUCCESS" or old.get("status") == "FAILED" and record.get("status") != "SUCCESS":
+                        continue
+                records[tx_hash] = copy.deepcopy(record)
+        close_time = self.public["network_identity"]["observed"]["close_time"]
+        for tx_hash, record in records.items():
+            receipt = self.rpc.get_transaction(tx_hash)
+            if receipt.status in (GetTransactionStatus.SUCCESS, GetTransactionStatus.FAILED):
+                envelope = TransactionEnvelope.from_xdr(receipt.envelope_xdr, PASSPHRASE)
+                if envelope.hash_hex() != tx_hash or envelope.transaction.source.account_id != self.key.public_key or not receipt.ledger or envelope.transaction.preconditions.time_bounds.max_time != record["expires_at"]:
+                    raise ValueError("Prior transaction receipt differs from the original identity")
+                status = "SUCCESS" if receipt.status == GetTransactionStatus.SUCCESS else "FAILED"
+                if record.get("status") in ("SUCCESS", "FAILED") and (record["status"] != status or record.get("ledger") != receipt.ledger):
+                    raise ValueError("Prior settled transaction receipt changed")
+                record.update(status=status, ledger=receipt.ledger)
+            elif record.get("status") in ("SUCCESS", "FAILED"):
+                # Canonical-main checkpoints authenticate retained receipts beyond RPC retention.
+                # Preflight must still prove the corresponding successful live state exists.
+                if type(record.get("ledger")) is not int or not 0 < record["ledger"] <= self.public["network_identity"]["observed"]["ledger"]:
+                    raise ValueError("Prior settled transaction ledger is invalid")
+            elif close_time <= record["expires_at"]:
+                raise ValueError("Prior submission remains uncertain; preserve its original hash " + tx_hash)
+            else:
+                record["status"] = "EXPIRED_UNCONFIRMED"
+                record["expiry_confirmed_by_ledger"] = self.public["network_identity"]["observed"]["ledger"]
+        self.public["transactions"] = list(records.values())
+
+    def guard_mutation(self):
+        identity = network_identity(self.rpc, self.public["network_identity"]["generation"])
+        if not same_generation(identity, self.public["network_identity"]):
+            raise ValueError("Testnet generation changed before mutation")
+        # The remote tag check is the last I/O before signing/funding, after RPC readback.
+        check_canonical_tag(self.manifest)
+        check_ledger_age(identity["observed"]["close_time"])
+        self.public["network_identity"] = identity
+
+    def wallet_intent(self, kind):
+        config = config_for(self.manifest, kind, self.key.public_key, self.agent, self.server)
+        salt = bytes.fromhex(digest(canonical(["allowit_testnet_release_salt_v1", self.manifest["tag"], config])))
+        return config, salt, contract_id(self.key.public_key, salt)
+
+    def wallet_readback(self, kind, config, wallet, observed):
+        state = self.read_state(wallet)
+        for field in ("owner", "agent", "server", "asset", "policy_instance", "source_digest", "rules", "x402_enabled"):
+            if state.get(field) != config[field]:
+                raise ValueError("Wallet state differs from release configuration: " + field)
+        if state.get("params") != ca.params(config["params"], kind) or state.get("contract_version") != ca.WALLET_CONTRACT_VERSION:
+            raise ValueError("Wallet parameters or custody layout differ")
+        return {**observed, "config": config, "state": state,
+            "funding": "No release funds are transferred to smoke wallets."}
+
+    def preflight(self):
+        """Read every existing code and wallet before funding, signing or submission."""
+        verified = any(item.get("status") == "VERIFIED" for item in self.current_previous)
+        settled = {r["stage"] for r in self.public["transactions"] if r["status"] == "SUCCESS"}
+        for kind, descriptor in self.manifest["artifacts"].items():
+            observed = self.code(descriptor["sha256"])
+            required = verified or "upload-" + kind in settled or any(kind in item.get("code", {}) for item in self.current_previous)
+            if observed is None:
+                if required:
+                    raise ValueError("Previously verified release code is missing or archived")
+            elif observed["bytes"] != descriptor["bytes"]:
+                raise ValueError("Code readback differs from the release artifact")
+            else:
+                self.public["code"][kind] = observed
+        for kind in KINDS:
+            config, _, wallet = self.wallet_intent(kind)
+            observed = self.instance(wallet, self.manifest["artifacts"][kind]["sha256"])
+            required = verified or "deploy-" + kind in settled or any(kind in item.get("wallets", {}) for item in self.current_previous)
+            if observed is None:
+                if required:
+                    raise ValueError("Previously verified release wallet is missing or archived")
+            else:
+                self.public["wallets"][kind] = self.wallet_readback(kind, config, wallet, observed)
 
     def ensure_account(self):
         key = xdr.LedgerKey(xdr.LedgerEntryType.ACCOUNT, account=xdr.LedgerKeyAccount(self.key.xdr_account_id()))
         found = self.entry(key)
         if found is None:
+            self.guard_mutation()
             ca.cli_run(["--config-dir", str(self.private / "cli"), "keys", "add", "release-owner", "--public-key", self.key.public_key])
             self.cli(["keys", "fund", "release-owner"])
             found = self.entry(key)
@@ -431,7 +552,7 @@ class Deployment:
 
     def instance(self, wallet, expected):
         key = xdr.LedgerKey(xdr.LedgerEntryType.CONTRACT_DATA,
-            contract_data=xdr.LedgerKeyContractData(Address(wallet).to_xdr_sc_address(), scval.to_ledger_key_contract_instance(), xdr.ContractDataDurability.PERSISTENT))
+            contract_data=xdr.LedgerKeyContractData(Address(wallet).to_xdr_sc_address(), xdr.SCVal(xdr.SCValType.SCV_LEDGER_KEY_CONTRACT_INSTANCE), xdr.ContractDataDurability.PERSISTENT))
         found = self.entry(key)
         if found is None:
             return None
@@ -468,6 +589,7 @@ class Deployment:
         finally:
             ca.cli_run = original
         envelope = TransactionEnvelope.from_xdr(unsigned, PASSPHRASE)
+        self.guard_mutation()
         envelope.sign(self.key)
         signed = envelope.to_xdr()
         tx_hash = envelope.hash_hex()
@@ -497,7 +619,9 @@ class Deployment:
 
     def run(self):
         self.reconcile_previous()
+        self.preflight()
         self.save()
+        self.guard_mutation()
         self.ensure_account()
         for kind, descriptor in self.manifest["artifacts"].items():
             expected = descriptor["sha256"]
@@ -515,9 +639,7 @@ class Deployment:
             self.public["code"][kind] = observed
             self.save()
         for kind in KINDS:
-            config = config_for(self.manifest, kind, self.key.public_key, self.agent, self.server)
-            salt = bytes.fromhex(digest(canonical(["allowit_testnet_release_salt_v1", self.manifest["tag"], config])))
-            wallet = contract_id(self.key.public_key, salt)
+            config, salt, wallet = self.wallet_intent(kind)
             expected = self.manifest["artifacts"][kind]["sha256"]
             if self.instance(wallet, expected) is None:
                 args = ["contract", "deploy", "--wasm", str(self.directory / CONTRACTS[kind]), "--optimize=false",
@@ -532,16 +654,9 @@ class Deployment:
                     raise ValueError("Native constructor target differs from the release")
                 self.submit("deploy-" + kind, raw, expected_wasm=expected)
             observed = self.instance(wallet, expected)
-            state = self.read_state(wallet)
-            for field in ("owner", "agent", "server", "asset", "policy_instance", "source_digest", "rules", "x402_enabled"):
-                if state.get(field) != config[field]:
-                    raise ValueError("Wallet state differs from release configuration: " + field)
-            if state.get("params") != ca.params(config["params"], kind) or state.get("contract_version") != ca.WALLET_CONTRACT_VERSION:
-                raise ValueError("Wallet parameters or custody layout differ")
             if observed is None:
                 raise ValueError("Wallet has no onchain readback")
-            self.public["wallets"][kind] = {**observed, "config": config, "state": state,
-                "funding": "No release funds are transferred to smoke wallets."}
+            self.public["wallets"][kind] = self.wallet_readback(kind, config, wallet, observed)
             self.save()
         final_identity = network_identity(self.rpc, self.public["network_identity"]["generation"])
         if not same_generation(final_identity, self.public["network_identity"]):
@@ -563,10 +678,7 @@ def publish(directory, previous):
         raise ValueError("Deployment is not the verified release")
     if files[0].name != deployment_filename(manifest, deployment["network_identity"]):
         raise ValueError("Deployment manifest filename differs from its generation")
-    reference = "refs/tags/" + manifest["tag"]
-    remote = subprocess.check_output(["git", "ls-remote", REPOSITORY, reference, reference + "^{}"], text=True)
-    if {line.split()[1]: line.split()[0] for line in remote.splitlines()} != {reference: manifest["tag_object"], reference + "^{}": manifest["revision"]}:
-        raise ValueError("Canonical release tag changed")
+    check_canonical_tag(manifest)
     published = previous / "published"
     if published.exists():
         if not source_equal(read_public(published / "source-manifest.json"), manifest):
@@ -632,6 +744,7 @@ def main():
         identity = json.loads(args.identity.read_text())
         if any(manifest.get(key) != value for key, value in identity.items()):
             raise ValueError("Deployment bundle is not the verified release")
+        check_canonical_tag(manifest)
         secret = os.environ.pop("STELLAR_TESTNET_OWNER_SECRET", "")
         try:
             key = Keypair.from_secret(secret)

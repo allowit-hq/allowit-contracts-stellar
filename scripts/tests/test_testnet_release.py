@@ -1,5 +1,6 @@
 """Release failures must stop before signing or publication; no live network is used."""
 import copy
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -30,8 +31,9 @@ HEADER = 'AAAAHcZUtF0kU/EUPP5rVPxlxXrXJkZACUX7owA2H+03VA2SBYTDT40HB+AoPdOAmvZahm
 def ledger(sequence):
     header = xdr.LedgerHeader.from_xdr(HEADER)
     header.ledger_seq = xdr.Uint32(sequence)
+    header.scp_value.close_time = xdr.TimePoint(xdr.Uint64(int(datetime.now(timezone.utc).timestamp()) - 5))
     return {"sequence": sequence, "hash": hashlib.sha256(header.to_xdr_bytes()).hexdigest(),
-        "header_xdr": header.to_xdr(), "closed_at": "2026-11-03T03:00:00Z"}
+        "header_xdr": header.to_xdr(), "closed_at": datetime.fromtimestamp(header.scp_value.close_time.time_point.uint64, timezone.utc).isoformat()}
 
 
 def make_bundle(root):
@@ -173,6 +175,7 @@ class ReleaseSafety(unittest.TestCase):
         deployment.output = self.root / "public.json"
         deployment.public = {"transactions": []}
         deployment.rpc = Mock()
+        deployment.guard_mutation = Mock()
         envelope = TransactionBuilder(Account(self.owner.public_key, 1), release.PASSPHRASE, base_fee=100).set_timeout(300).append_upload_contract_wasm_op(wasm()).build()
         self.owner.sign = Mock(wraps=self.owner.sign)
         deployment.cli = Mock(side_effect=subprocess.CalledProcessError(1, ["stellar", "tx", "send"]))
@@ -193,7 +196,8 @@ class ReleaseSafety(unittest.TestCase):
             "rpc": release.RPC, "horizon": release.HORIZON, "passphrase": release.PASSPHRASE,
             "generation": {"ledger": 128, "hash": "42" * 32, "source": release.HORIZON + "/ledgers/128",
                 "closed_at": "2025-12-17T17:30:12Z", "observed_at": "2026-11-03T00:00:00Z"},
-            "genesis_available": False, "observed": {"ledger": 1000, "hash": "43" * 32}}
+            "genesis_available": False, "observed": {"ledger": 1000, "hash": "43" * 32,
+                "close_time": int(datetime.now(timezone.utc).timestamp()) - 5}}
 
     def prior(self):
         return {"schema": 1, "network": "stellar:testnet", "source": self.manifest,
@@ -220,7 +224,7 @@ class ReleaseSafety(unittest.TestCase):
                     return {**config, "params": release.ca.params(config["params"], kind), "contract_version": 4}
             raise AssertionError("Unexpected wallet")
         driver.read_state = state
-        with patch.object(release, "network_identity", return_value=identity):
+        with patch.object(release, "network_identity", return_value=identity), patch.object(release, "check_canonical_tag"):
             result = driver.run()
         self.assertEqual(result["status"], "VERIFIED")
         self.assertEqual(set(result["wallets"]), set(release.KINDS))
@@ -252,8 +256,10 @@ class ReleaseSafety(unittest.TestCase):
         driver.rpc.get_transaction.return_value.status = release.GetTransactionStatus.NOT_FOUND
         prior = self.prior()
         prior["status"] = "IN_PROGRESS"
-        prior["transactions"] = [{"transaction_hash": "ab" * 32, "expires_at": 4_102_444_800}]
+        prior["transactions"] = [{"transaction_hash": "ab" * 32, "expires_at": 4_102_444_800, "status": "unknown"}]
         driver.previous = [prior]
+        driver.current_previous = [prior]
+        prior["transactions"][0]["stage"] = "upload-common"
         driver.ensure_account = Mock()
         driver.submit = Mock()
         with self.assertRaisesRegex(ValueError, "remains uncertain"):
@@ -297,7 +303,7 @@ class ReleaseSafety(unittest.TestCase):
         def public(path):
             return {"/": {"network_passphrase": release.PASSPHRASE, "history_elder_ledger": 256,
                 "history_latest_ledger": 1000}, "/ledgers/128": anchor, "/ledgers/1000": recent}[path]
-        recorded = {**self.identity()["generation"], "hash": anchor["hash"]}
+        recorded = {**self.identity()["generation"], "hash": anchor["hash"], "closed_at": anchor["closed_at"]}
         with patch.object(release, "public_json_url", side_effect=public):
             result = release.network_identity(rpc, recorded)
         self.assertEqual(result["generation"], recorded)
