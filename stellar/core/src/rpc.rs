@@ -4,7 +4,7 @@ use crate::contract::{CustodyState, PolicyBinding};
 use crate::*;
 mod diagnostics;
 mod owner_actions;
-pub use diagnostics::{ContractFault, simulation_fault};
+pub use diagnostics::{ContractFault, simulation_fault, simulation_resource_fee};
 pub(crate) mod owner_observation;
 use allowit_policy_sdk::transport::rpc::{EnvelopeValidation, ErrorKind, RpcClient};
 pub use owner_actions::{

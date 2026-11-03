@@ -515,3 +515,23 @@ pub fn validate_native_setup(
         now,
     )
 }
+
+/// Read the immutable digest of a bounded v1 owner envelope. This is identity, not authority.
+/// When `require_signature` is true, an absent signature is rejected; callers must still match
+/// the exact retained packet with `validate_signed_owner_transaction` before broadcasting.
+pub fn owner_envelope_hash(
+    network: &str,
+    payload: &str,
+    require_signature: bool,
+) -> Result<[u8; 32]> {
+    if payload.len() > MAX_OWNER_XDR {
+        return Err("Owner transaction exceeds limit".into());
+    }
+    let TransactionEnvelope::Tx(envelope) = read(payload)? else {
+        return Err("Expected v1 owner transaction".into());
+    };
+    if require_signature && envelope.signatures.is_empty() {
+        return Err("Owner transaction has no signature".into());
+    }
+    transaction_hash(network, &envelope.tx)
+}

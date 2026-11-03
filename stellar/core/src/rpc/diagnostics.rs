@@ -23,3 +23,10 @@ pub fn simulation_fault(error: &str, _events: &[String]) -> Option<ContractFault
         contract: None,
     })
 }
+
+/// Decode the fee encoded in native simulation resources, without granting settlement authority.
+pub fn simulation_resource_fee(data: &str) -> Option<u64> {
+    use stellar_xdr::{Limits, ReadXdr, SorobanTransactionData};
+    let resources = SorobanTransactionData::from_xdr_base64(data, Limits::none()).ok()?;
+    u64::try_from(resources.resource_fee).ok()
+}
