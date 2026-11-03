@@ -4,13 +4,13 @@ version = 4
 
 [[package]]
 name = "allowit"
-version = "0.3.0"
-source = "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.3.0#56e8a0755a20bf2cc786c4ad0d5822c1a9ac63cb"
+version = "0.3.1"
+source = "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.3.1#96b558633d4e01a077d3fd1e75d2b9fe927f2036"
 
 [[package]]
 name = "allowit-sdk"
-version = "0.3.0"
-source = "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.3.0#56e8a0755a20bf2cc786c4ad0d5822c1a9ac63cb"
+version = "0.3.1"
+source = "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.3.1#96b558633d4e01a077d3fd1e75d2b9fe927f2036"
 dependencies = [
  "allowit",
  "libc",

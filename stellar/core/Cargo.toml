@@ -10,8 +10,8 @@ description = "Canonical Stellar wallet preparation, native authorization and se
 [workspace]
 
 [dependencies]
-allowit = { git = "https://github.com/allowit-hq/allowit-core.git", tag = "v0.3.0", version = "0.3", default-features = false, features = ["std"] }
-allowit-policy-sdk = { package = "allowit-sdk", git = "https://github.com/allowit-hq/allowit-core.git", tag = "v0.3.0", version = "0.3", default-features = false, features = ["std", "transport", "client", "policy-source"] }
+allowit = { git = "https://github.com/allowit-hq/allowit-core.git", tag = "v0.3.1", version = "0.3", default-features = false, features = ["std"] }
+allowit-policy-sdk = { package = "allowit-sdk", git = "https://github.com/allowit-hq/allowit-core.git", tag = "v0.3.1", version = "0.3", default-features = false, features = ["std", "transport", "client", "policy-source"] }
 base64 = "0.22"
 ed25519-dalek = "2.2"
 serde = { version = "1", features = ["derive"] }
