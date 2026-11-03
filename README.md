@@ -15,6 +15,26 @@
 
 **Go on. On your terms.** Allowit lets your AI agents spend and invest, within a policy you set. This repository holds the Soroban smart contracts that enforce that policy on Stellar: owner-controlled wallets that move funds only when the agent and an independent server both sign, and only when the owner's policy says yes. It also holds `stellar/core`, the off-chain Rust rail crate (`allowit-stellar-wallet`) that the SDK engine composes to prepare, authorize and settle transfers through those wallets.
 
+## Architecture
+
+This repository provides native contracts and rail capabilities within the vendor package family.
+Vendors own native signing and chain semantics, plus SVG graphics and vendor web components.
+SDK engine composes the shared workflows. Core owns common policy rules, types and interfaces.
+
+```mermaid
+flowchart TB
+    UI["[allowit-engine]<br/>npm @allowit/ui<br/>Shared policy web components"]
+    Engine["[allowit-sdk]<br/>crate @allowit/sdk/engine<br/>All other shared logic"]
+    Vendor["[allowit-contracts-stellar]<br/>crate + npm @allowit/vendor/stellar<br/>Native contracts · signing · chain semantics<br/>SVG graphics · web components"]
+    Core["[allowit-core]<br/>crate + npm @allowit/sdk/core<br/>Common types · policy rules · primitives<br/>TypeScript interfaces"]
+
+    UI -->|npm| Vendor
+    Engine -->|crate| Vendor
+    Vendor -->|crate + npm| Core
+```
+
+[Full architecture][responsibility-model].
+
 ## Overview
 
 A policy wallet is a Soroban contract that holds one native Stellar asset. The owner decides who may ask it to pay, deposit, swap or redeem, how much, to whom and until when. Every delegated SEP-41 transfer, SEP-56 vault deposit and redeem, and router swap needs two signatures, the agent's and the server's, and passes the wallet's own checks before a single stroop moves. The owner keeps the keys to everything else: pause, reconfigure, recover funds, upgrade the code and make exact passthrough calls.
@@ -233,3 +253,5 @@ Keep contract code, the `stellar/core` rail crate, build and API documentation a
 ## License
 
 The source is public, but every contract crate declares `license = "UNLICENSED"` and the repository has no license file, so no open-source license is granted for the contracts. `stellar/core` keeps the `license = "MIT"` declaration it had in the Allowit SDK.
+
+[responsibility-model]: https://github.com/allowit-hq/allowit-project/blob/main/wiki/allowit/architecture.md#dependency-direction

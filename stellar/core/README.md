@@ -33,6 +33,25 @@ Its private seed is zeroizing, non-serializable and non-printable. The caller ow
 SDK engine checks timestamp freshness, HTTP sessions and workflow authority.
 `signing::request_digest` and `request_proof` encode the exact execution-service proof without performing transport.
 
+## Architecture
+
+The rail crate owns native encoding, signing and chain semantics. SDK engine depends on vendor
+capabilities and core primitives. Shared workflow coordination remains in SDK engine.
+
+```mermaid
+flowchart TB
+    UI["[allowit-engine]<br/>npm @allowit/ui<br/>Shared policy web components"]
+    Engine["[allowit-sdk]<br/>crate @allowit/sdk/engine<br/>All other shared logic"]
+    Vendor["[allowit-contracts-stellar]<br/>crate + npm @allowit/vendor/stellar<br/>Native contracts · signing · chain semantics<br/>SVG graphics · web components"]
+    Core["[allowit-core]<br/>crate + npm @allowit/sdk/core<br/>Common types · policy rules · primitives<br/>TypeScript interfaces"]
+
+    UI -->|npm| Vendor
+    Engine -->|crate| Vendor
+    Vendor -->|crate + npm| Core
+```
+
+[Architecture](../../README.md#architecture).
+
 ## Request profile and custody
 
 This crate maps the canonical `ExecutionRequest` to one admitted native operation: a SEP-41 transfer, or a SEP-56 deposit into or redeem from a vault for a policy wallet. A Stellar call is identified by its contract, its function (`transfer`, `deposit` or `redeem`) and its typed arguments; the request's `schema_digest` names no contract schema and is not read. The wallet is the receiver, holder and operator of each SEP-56 call. The one effect bound is the debit: the wallet asset to the recipient or vault, or for a redeem the vault's own shares. `request::transfer`, `request::deposit` and `request::redeem` build these requests from the wallet configuration, the trusted state, an operation ID and typed amounts, and return only a request that decodes. A policy wallet's fee payer is its current agent account from the trusted state, which can differ from the configured customer signer. Native classic custody checks the current account weights and applicable transaction and payment thresholds. The 3/1/1 weights and 2/2/3 thresholds are deployment templates, not admission requirements. Classic custody admits only a transfer.
@@ -43,7 +62,7 @@ Policy wallet custody calls the layout 4 `execute` entrypoint (`CONTRACT_VERSION
 
 `config.tier` selects `simple`, `common` or `custom`. `config.language` is `portable` for every policy wallet. `config.rules` holds the ordered canonical rules: the standard prefix for Common, none otherwise. `config.params` holds the owner params at installation: the canonical keys of `policy::param_keys` plus Custom keys. `config.sourceDigest` is the standard prefix digest for Simple and Common, and the SHA-256 of the source for Custom. `config.server` is the independent G-address service signer.
 
-`policy::source_shape` re-exports the Core portable gate: one self-contained file, `allowit` as the only path root, the macro, attribute and identifier allowlists, and one `pub fn execute(ctx: &AllowitContext) -> allowit::Result`. It returns the standard prefix, whether the source is canonical-only and whether it writes state. `policy::params_from_json` matches `scripts/contract_admin.py` `params`, and `policy::policy_rules` matches its `policy_rules`. `tests/policy_vectors.rs` replays native param vectors and checks native owner binding to the shared gate. Generic Rust/Python source-gate vectors live in Core. The std-only host compile stays in the server build gate.
+`policy::source_shape` re-exports the Core portable gate: one self-contained file, `allowit` as the only path root, the macro, attribute and identifier allowlists, and one `pub fn execute(ctx: &AllowitContext) -> allowit::Result`. It returns the standard prefix, whether the source is canonical-only and whether it writes state. `policy::params_from_json` matches `scripts/contract_admin.py` `params`, and `policy::policy_rules` matches its `policy_rules`. `tests/policy_vectors.rs` replays native param vectors and checks native owner binding to the shared gate. Generic Rust/Python source-gate vectors live in Core. SDK engine supplies shared host compilation from Core resources. The server retains trusted admission and publication authority.
 
 `policy::evaluate` runs a policy on the host as the wallet does. A Common wallet runs its standard prefix first. A canonical-only source, or any source with a compiled evaluator, then runs in full. Otherwise the result is `Evaluation::Prefix`: only the onchain part ran. Fresh classic installs admit only canonical portable source and canonical params.
 
