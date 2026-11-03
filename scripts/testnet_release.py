@@ -140,9 +140,11 @@ def fetch_previous(manifest, output):
     if release is not None:
         published = output / "published"
         published.mkdir()
+        patterns = ["source-manifest.json", "sample-policy.rs", "testnet-deployment-" + manifest["tag"] + "-*.json", *CONTRACTS.values()]
+        arguments = [argument for pattern in patterns for argument in ("--pattern", pattern)]
         subprocess.run(["gh", "release", "download", manifest["tag"], "--repo", "allowit-hq/allowit-contracts-stellar",
-            "--pattern", "source-manifest.json", "--pattern", "testnet-deployment-" + manifest["tag"] + "-*.json", "--dir", str(published)], check=True, capture_output=True)
-        if not source_equal(read_public(published / "source-manifest.json"), manifest):
+            *arguments, "--dir", str(published)], check=True, capture_output=True)
+        if not source_equal(check_bundle(published), manifest):
             raise ValueError("Published release artifacts differ")
         if not list(published.glob("testnet-deployment-*.json")):
             raise ValueError("Published release has no versioned deployment identity")
