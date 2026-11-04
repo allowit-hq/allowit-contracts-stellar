@@ -198,34 +198,6 @@ fn sign_in_message_binds_canonical_account_origin_and_nonce() {
 }
 
 #[test]
-fn service_proofs_bind_request_path_time_and_exact_body() {
-    let owner = native::account_for_seed(&[7; 32]);
-    let body = br#"{"network":"stellar:testnet","requestId":"one"}"#;
-    let digest = signing::request_digest(42, "/api/native/execute", body);
-    let mut old = b"allowit-stellar-request-v1\n42\n/api/native/execute\n".to_vec();
-    old.extend_from_slice(body);
-    assert_eq!(digest, native::hash(old));
-    assert_ne!(
-        digest,
-        signing::request_digest(43, "/api/native/execute", body)
-    );
-    assert_ne!(
-        digest,
-        signing::request_digest(42, "/api/native/status", body)
-    );
-    assert_ne!(
-        digest,
-        signing::request_digest(42, "/api/native/execute", b"changed")
-    );
-    assert_eq!(
-        signing::request_proof(&owner, 42, &[1; 64]).unwrap(),
-        format!("Bearer stellar-proof.{owner}.42.{}", native::hex(&[1; 64]))
-    );
-    assert!(signing::request_proof(&owner, 42, &[1; 63]).is_err());
-    assert!(signing::request_proof("untrusted\nheader", 42, &[1; 64]).is_err());
-}
-
-#[test]
 fn network_inventory_owns_unique_canonical_and_alias_names() {
     let mut names = std::collections::BTreeSet::new();
     let descriptors = native::networks::NETWORKS;
@@ -275,27 +247,8 @@ fn canonical_networks_preserve_existing_native_passphrase_and_identity_bytes() {
 }
 
 #[test]
-fn request_proof_verification_preserves_server_domain_and_exact_input() {
-    let signer = signing::LocalSigner::from_entropy(&[7; 32]).unwrap();
-    let now = 1_800_000_000;
-    let path = "/api/native/prepare";
-    let body = br#"{"requestId":"original","amount":"5"}"#;
-    let digest = signing::request_digest(now, path, body);
-    let proof =
-        signing::request_proof(signer.account(), now, &signer.sign_digest(&digest).unwrap())
-            .unwrap();
-    let token = proof.strip_prefix("Bearer ").unwrap();
-    assert_eq!(
-        signing::verify_request_proof(token, now, path, body).unwrap(),
-        signer.account()
-    );
-    for (time, route, data) in [
-        (now + 121, path, body.as_slice()),
-        (now - 121, path, body.as_slice()),
-        (now, "/api/native/submit", body.as_slice()),
-        (now, path, b"{}".as_slice()),
-    ] {
-        assert!(signing::verify_request_proof(token, time, route, data).is_err());
-    }
-    assert!(signing::verify_request_proof(&proof, now, path, body).is_err());
+fn service_signing_domain_is_stable() {
+    assert_eq!(signing::REQUEST_PROOF_DOMAIN, "allowit-stellar-request-v1");
+    assert_eq!(signing::REQUEST_PROOF_SCHEME, "stellar-proof");
+    assert_eq!(signing::REQUEST_PROOF_SIGNATURE_BYTES, 64);
 }

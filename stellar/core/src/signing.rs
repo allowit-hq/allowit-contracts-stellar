@@ -88,55 +88,10 @@ pub fn signed_message_digest(message: &str) -> [u8; 32] {
     hash(bytes)
 }
 
-/// Bind a native execution-service proof to its exact path, time and canonical body.
-pub fn request_digest(issued_at: u64, path: &str, canonical_body: &[u8]) -> [u8; 32] {
-    let mut message = format!("allowit-stellar-request-v1\n{issued_at}\n{path}\n").into_bytes();
-    message.extend_from_slice(canonical_body);
-    hash(message)
-}
-
-/// Encode a verified native service signature. This does not perform an HTTP request.
-pub fn request_proof(account: &str, issued_at: u64, signature: &[u8]) -> Result<String> {
-    canonical_account_key(account)?;
-    if signature.len() != 64 {
-        return Err("Invalid native signature size".into());
-    }
-    Ok(format!(
-        "Bearer stellar-proof.{account}.{issued_at}.{}",
-        crate::hex(signature)
-    ))
-}
-
-/// Verify the native request proof after HTTP admission removed the Bearer prefix.
-/// The caller supplies the exact path and canonical body, then decides whether this signer
-/// is authorized for that request. Verification alone grants no owner or server authority.
-pub fn verify_request_proof(
-    proof: &str,
-    now: u64,
-    path: &str,
-    canonical_body: &[u8],
-) -> Result<String> {
-    if proof.len() > 512 {
-        return Err("Native request proof exceeds limit".into());
-    }
-    let parts: Vec<_> = proof.split('.').collect();
-    if parts.len() != 4 || parts[0] != "stellar-proof" {
-        return Err("Invalid native request proof".into());
-    }
-    let issued_at = parts[2]
-        .parse::<u64>()
-        .map_err(|_| "Invalid request time")?;
-    if now.abs_diff(issued_at) > 120 {
-        return Err("Native request proof is not current".into());
-    }
-    let signature = crate::unhex::<64>(parts[3])?;
-    verify_digest(
-        parts[1],
-        &request_digest(issued_at, path, canonical_body),
-        &signature,
-    )?;
-    Ok(parts[1].into())
-}
+/// Native signing domain and wire identifier selected by common request-proof coordination.
+pub const REQUEST_PROOF_DOMAIN: &str = "allowit-stellar-request-v1";
+pub const REQUEST_PROOF_SCHEME: &str = "stellar-proof";
+pub const REQUEST_PROOF_SIGNATURE_BYTES: usize = 64;
 
 /// Parse the exact native sign-in message selected by the caller.
 /// The caller checks the returned timestamps, expiry field and challenge freshness.
