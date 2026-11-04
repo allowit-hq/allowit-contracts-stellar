@@ -2,7 +2,6 @@ import freighter from '@stellar/freighter-api';
 import {ed25519} from '@noble/curves/ed25519';
 import {sha256} from '@noble/hashes/sha256';
 export interface Session {address: string; network: string; expiresAt: string}
-export type BrowserRequest = <T = unknown>(path: string, body?: unknown, options?: {expectedOwner?: string}) => Promise<T>;
 import {stellarAssetContract} from './stellar-asset.js';
 
 export type StellarNetwork = 'stellar:testnet' | 'stellar:mainnet' | 'stellar:pubnet';
@@ -120,14 +119,14 @@ export function stellarAssetContractId(code: string, issuer: string | null, netw
   return stellarAssetContract(code, issuer === null ? null : stellarAccountKey(issuer), STELLAR_NETWORKS[network].passphrase);
 }
 /** The owner approves an exact Native source against current account administration authority. */
-export async function signStellarSourceApproval(approval: {payload:Record<string,unknown>;message:string;method:string}, policy: {id: string; revision: number; network?:string; sourceHash?:string; irHash?:string; code?:string;mint?:string;token?:string;runtime?:{instanceBinding?:Record<string,unknown>}}, session: Session, stillCurrent:()=>boolean=()=>true): Promise<{signer:string;signature:number[]}[]> {
+export async function signStellarSourceApproval(approval: {payload:Record<string,unknown>;message:string;method:string}, policy: {id: string; revision: number; language?:string; network?:string; sourceHash?:string; irHash?:string; code?:string;mint?:string;token?:string;runtime?:{instanceBinding?:Record<string,unknown>}}, session: Session, stillCurrent:()=>boolean=()=>true): Promise<{signer:string;signature:number[]}[]> {
   const current=()=>{if(!stillCurrent())throw new Error('The owner, network or policy changed. Nothing was activated.');};
   current();
   if (session?.network !== 'stellar') throw new Error('Sign in with the Stellar owner before verifying the wallet.');
   {
     const payload=approval.payload,binding=policy.runtime?.instanceBinding;
     const portable = binding?.portable as Record<string, unknown> | undefined;
-    const portableExpected = portable !== undefined || binding?.language === 'allowit-portable-v1';
+    const portableExpected = portable !== undefined || binding?.language === 'allowit-portable-v1' || policy.language === 'allowit-portable-v1';
     const keys = portableExpected ? PORTABLE_APPROVAL_KEYS : APPROVAL_PAYLOAD_KEYS;
     const hash = (value: string) => Array.from(sha256(new TextEncoder().encode(value)), byte => byte.toString(16).padStart(2, '0')).join('');
     const portableMatches = !portableExpected || !!portable && portable.language === 'allowit-portable-v1'

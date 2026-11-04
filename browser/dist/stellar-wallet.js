@@ -150,7 +150,7 @@ export async function signStellarSourceApproval(approval, policy, session, still
     {
         const payload = approval.payload, binding = policy.runtime?.instanceBinding;
         const portable = binding?.portable;
-        const portableExpected = portable !== undefined || binding?.language === 'allowit-portable-v1';
+        const portableExpected = portable !== undefined || binding?.language === 'allowit-portable-v1' || policy.language === 'allowit-portable-v1';
         const keys = portableExpected ? PORTABLE_APPROVAL_KEYS : APPROVAL_PAYLOAD_KEYS;
         const hash = (value) => Array.from(sha256(new TextEncoder().encode(value)), byte => byte.toString(16).padStart(2, '0')).join('');
         const portableMatches = !portableExpected || !!portable && portable.language === 'allowit-portable-v1'

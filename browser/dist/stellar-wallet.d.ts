@@ -3,9 +3,6 @@ export interface Session {
     network: string;
     expiresAt: string;
 }
-export type BrowserRequest = <T = unknown>(path: string, body?: unknown, options?: {
-    expectedOwner?: string;
-}) => Promise<T>;
 export type StellarNetwork = 'stellar:testnet' | 'stellar:mainnet' | 'stellar:pubnet';
 export declare const STELLAR_NETWORKS: {
     readonly 'stellar:testnet': {
@@ -50,6 +47,7 @@ export declare function signStellarSourceApproval(approval: {
 }, policy: {
     id: string;
     revision: number;
+    language?: string;
     network?: string;
     sourceHash?: string;
     irHash?: string;
