@@ -25,10 +25,15 @@ export interface ApprovalBinding {
     assetIssuer: string | null;
     maxFeeStroops: number;
     deploymentId: string | null;
+    language?: string;
+    tier?: string;
+    rules?: string[];
+    params?: Record<string, unknown>;
+    paramsHash?: string;
 }
 export interface StellarApprovalIntent {
-    version: 1;
-    profile: 'allowit-stellar-approval-v1';
+    version: 1 | 2;
+    profile: 'allowit-stellar-approval-v1' | 'allowit-stellar-approval-v2';
     requestId: string;
     network: 'stellar:testnet';
     owner: string;
@@ -56,13 +61,6 @@ export declare function publicStellarBundle(value: unknown, policy: ApprovalPoli
     wallet: unknown;
     route: string;
     config: {
-        network: string;
-        policyInstance: number[];
-        wallet: unknown;
-        owner: string;
-        agent: string;
-        server: string;
-        route: string;
         asset: string;
         assetSymbol: string;
         assetIssuer: {} | null;
@@ -70,6 +68,13 @@ export declare function publicStellarBundle(value: unknown, policy: ApprovalPoli
         sourceHash: number[];
         moduleDigest: number[];
         maxFeeStroops: unknown;
+        network: string;
+        policyInstance: number[];
+        wallet: unknown;
+        owner: string;
+        agent: string;
+        server: string;
+        route: string;
     };
     endpoints: {
         execute: string;

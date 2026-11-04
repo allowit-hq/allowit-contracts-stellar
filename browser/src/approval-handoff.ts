@@ -1,3 +1,4 @@
+import {portableExport,canonicalJson,digest,object,hexHash} from './portable-export.js';
 import {sha256} from '@noble/hashes/sha256';
 import {StrKey} from '@stellar/stellar-sdk/base';
 export interface ApprovalPolicy {id: string; revision: number; network: string; code: string; sourceHash: string; irHash: string; mint: string; token: string; runtime?: {wallet: {profile: string}; instanceBinding?: Record<string, unknown>}}
@@ -5,26 +6,27 @@ import {stellarAccountKey, stellarAssetContractId} from './stellar-wallet.js';
 import {decodePublicFragment} from './owner-handoff.js';
 import {STELLAR_APPROVAL_FRAGMENT} from './stellar-fragments.js';
 export {STELLAR_APPROVAL_FRAGMENT} from './stellar-fragments.js';
-export interface ApprovalBinding {wallet:string;route:'native';policyInstance:string;moduleDigest:string;asset:string;assetSymbol:string;assetIssuer:string|null;maxFeeStroops:number;deploymentId:string|null}
-export interface StellarApprovalIntent {version:1;profile:'allowit-stellar-approval-v1';requestId:string;network:'stellar:testnet';owner:string;policyId:string;revision:number;source:string;sourceHash:string;irHash:string;binding:ApprovalBinding;intentDigest:string}
+export interface ApprovalBinding {wallet:string;route:'native';policyInstance:string;moduleDigest:string;asset:string;assetSymbol:string;assetIssuer:string|null;maxFeeStroops:number;deploymentId:string|null;language?:string;tier?:string;rules?:string[];params?:Record<string,unknown>;paramsHash?:string}
+export interface StellarApprovalIntent {version:1|2;profile:'allowit-stellar-approval-v1'|'allowit-stellar-approval-v2';requestId:string;network:'stellar:testnet';owner:string;policyId:string;revision:number;source:string;sourceHash:string;irHash:string;binding:ApprovalBinding;intentDigest:string}
 const hash=(v:string)=>Array.from(sha256(new TextEncoder().encode(v)),b=>b.toString(16).padStart(2,'0')).join('');
-const canonical=(v:object)=>JSON.stringify(Object.fromEntries(Object.entries(v).sort(([a],[b])=>a<b?-1:a>b?1:0)));
-export const stellarApprovalDigest=(v:StellarApprovalIntent)=>hash(JSON.stringify(['allowit-stellar-approval-v1',v.requestId,v.network,v.owner,v.policyId,v.revision,v.sourceHash,v.irHash,hash(canonical(v.binding))]));
+const canonical=canonicalJson;
+export const stellarApprovalDigest=(v:StellarApprovalIntent)=>hash(JSON.stringify([v.profile,v.requestId,v.network,v.owner,v.policyId,v.revision,v.sourceHash,v.irHash,hash(canonical(v.binding))]));
 function exact(v:unknown,keys:string[]):v is Record<string,unknown>{return !!v&&typeof v==='object'&&!Array.isArray(v)&&Object.keys(v).length===keys.length&&Object.keys(v).every(k=>keys.includes(k));}
 export function parseStellarApprovalIntent(fragment:string):StellarApprovalIntent {
  const value=decodePublicFragment(fragment,STELLAR_APPROVAL_FRAGMENT);
- if(!exact(value,['version','profile','requestId','network','owner','policyId','revision','source','sourceHash','irHash','binding','intentDigest'])||value.version!==1||value.profile!=='allowit-stellar-approval-v1'||value.network!=='stellar:testnet'
+ if(!exact(value,['version','profile','requestId','network','owner','policyId','revision','source','sourceHash','irHash','binding','intentDigest'])||!((value.version===1&&value.profile==='allowit-stellar-approval-v1')||(value.version===2&&value.profile==='allowit-stellar-approval-v2'))||value.network!=='stellar:testnet'
   ||typeof value.requestId!=='string'||!/^[A-Za-z0-9._:-]{8,100}$/.test(value.requestId)||typeof value.owner!=='string'
   ||typeof value.policyId!=='string'||!/^[A-Za-z0-9._:-]{1,128}$/.test(value.policyId)
   ||!Number.isInteger(value.revision)||Number(value.revision)<=0||Number(value.revision)>0xffffffff
   ||typeof value.source!=='string'||new TextEncoder().encode(value.source).length>32_768
-  ||typeof value.sourceHash!=='string'||value.sourceHash!==hash(value.source)||typeof value.irHash!=='string'||!/^[0-9a-f]{64}$/.test(value.irHash)
-  ||!exact(value.binding,['wallet','route','policyInstance','moduleDigest','asset','assetSymbol','assetIssuer','maxFeeStroops','deploymentId'])||typeof value.intentDigest!=='string')throw new Error('This link does not contain a supported Native Stellar policy approval.');
+  ||typeof value.sourceHash!=='string'||value.sourceHash!==hash(value.source)||typeof value.irHash!=='string'||(value.version===1?!hexHash(value.irHash):value.irHash!=='')
+  ||!exact(value.binding,['wallet','route','policyInstance','moduleDigest','asset','assetSymbol','assetIssuer','maxFeeStroops','deploymentId',...(value.version===2?['language','tier','rules','params','paramsHash']:[])])||typeof value.intentDigest!=='string')throw new Error('This link does not contain a supported Native Stellar policy approval.');
  const v=value as unknown as StellarApprovalIntent,b=v.binding;
  if(b.route!=='native'||typeof b.wallet!=='string'||typeof b.policyInstance!=='string'||!/^[0-9a-f]{64}$/.test(b.policyInstance)||typeof b.moduleDigest!=='string'||!/^[0-9a-f]{64}$/.test(b.moduleDigest)
   ||typeof b.asset!=='string'||!StrKey.isValidContract(b.asset)||typeof b.assetSymbol!=='string'||!/^[A-Za-z0-9]{1,12}$/.test(b.assetSymbol)
   ||(b.assetIssuer!==null&&typeof b.assetIssuer!=='string')||!Number.isInteger(b.maxFeeStroops)||b.maxFeeStroops<100||b.maxFeeStroops>1_000_000
   ||(b.deploymentId!==null&&(typeof b.deploymentId!=='string'||!/^[0-9a-f]{64}$/.test(b.deploymentId))))throw new Error('The installed Stellar policy binding is invalid.');
+ if(v.version===2){const p=object(b.params);if(b.language!=='allowit-portable-v1'||!['standard','custom'].includes(String(b.tier))||!Array.isArray(b.rules)||!b.rules.every(r=>typeof r==='string')||(b.tier==='custom'&&b.rules.length!==0)||!p||!hexHash(b.paramsHash)||digest(canonical(p))!==b.paramsHash||digest(canonical({language:b.language,tier:b.tier,rules:b.rules,sourceHash:v.sourceHash,paramsHash:b.paramsHash}))!==b.moduleDigest)throw new Error('The portable Stellar policy binding is invalid.');}
  stellarAccountKey(v.owner);stellarAccountKey(b.wallet);if(b.assetIssuer!==null)stellarAccountKey(b.assetIssuer);
  if(b.assetIssuer===null&&b.assetSymbol!=='XLM')throw new Error('The Stellar asset needs its exact issuer.');
  if(stellarAssetContractId(b.assetSymbol,b.assetIssuer,'stellar:testnet')!==b.asset)throw new Error('The Stellar asset contract differs from its code, issuer or network.');
@@ -40,6 +42,7 @@ export function matchStellarApproval<P extends ApprovalPolicy>(v:StellarApproval
   ||b.wallet!==v.binding.wallet||b.route!=='native'||b.policyInstance!==v.binding.policyInstance||b.moduleDigest!==v.binding.moduleDigest
   ||b.asset!==v.binding.asset||b.assetSymbol!==v.binding.assetSymbol||(b.assetIssuer??null)!==v.binding.assetIssuer||b.maxFeeStroops!==v.binding.maxFeeStroops
   ||(b.deploymentId??null)!==v.binding.deploymentId)throw new Error('This link differs from the owner’s stored policy or installed wallet. Nothing was signed.');
+ if(v.version===2){const p=object(b?.portable);if(!p||p.language!==v.binding.language||p.tier!==v.binding.tier||!((p.rules??[]) instanceof Array)||canonical(p.rules??[])!==canonical(v.binding.rules)||canonical(p.params)!==canonical(v.binding.params)||p.paramsHash!==v.binding.paramsHash)throw new Error('The portable approval differs from the stored policy. Nothing was signed.');}
  return policy;
 }
 
@@ -61,11 +64,12 @@ export function publicStellarBundle(value: unknown, policy: ApprovalPolicy, owne
     || (c.assetIssuer ?? null) !== (binding.assetIssuer ?? null) || c.policySource !== policy.code || c.maxFeeStroops !== binding.maxFeeStroops
     || bytesHex(c.policyInstance) !== binding.policyInstance || bytesHex(c.sourceHash) !== policy.sourceHash || bytesHex(c.moduleDigest) !== binding.moduleDigest
     || e.execute !== '/api/native/execute' || e.status !== '/api/native/execute/status') throw new Error('The public agent bundle does not match this policy. Nothing was saved.');
+  const portable=portableExport(b,c,policy);
   const bytes = (v: unknown) => [...(v as number[])];
   return {
-    version: 1, profile: 'allowit-stellar-wallet-v1', network: policy.network, policyId: policy.id, sourceHash: policy.sourceHash, irHash: policy.irHash,
+    ...portable.top, version: 1, profile: 'allowit-stellar-wallet-v1', network: policy.network, policyId: policy.id, sourceHash: policy.sourceHash, irHash: policy.irHash,
     moduleDigest: binding.moduleDigest, wallet: binding.wallet, route: 'native',
-    config: {network: policy.network, policyInstance: bytes(c.policyInstance), wallet: binding.wallet, owner, agent, server, route: 'native', asset: policy.mint, assetSymbol: policy.token,
+    config: {network: policy.network, policyInstance: bytes(c.policyInstance), wallet: binding.wallet, owner, agent, server, route: 'native', ...portable.config, asset: policy.mint, assetSymbol: policy.token,
       assetIssuer: binding.assetIssuer ?? null, policySource: policy.code, sourceHash: bytes(c.sourceHash), moduleDigest: bytes(c.moduleDigest), maxFeeStroops: binding.maxFeeStroops},
     endpoints: {execute: '/api/native/execute', status: '/api/native/execute/status'},
   };
