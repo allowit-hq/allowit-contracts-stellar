@@ -63,26 +63,27 @@ async function checkNetwork(network: StellarNetwork): Promise<void> {
   const value = await freighter.getNetworkDetails(); failed(value.error);
   if (value.networkPassphrase !== STELLAR_NETWORKS[network].passphrase) throw new Error(`Select ${STELLAR_NETWORKS[network].label} in Freighter, then try again.`);
 }
-export async function signInStellar<S extends Session>(request: BrowserRequest, network: StellarNetwork, signal?: AbortSignal): Promise<S> {
+/** A native wallet capability. HTTP sessions and their admission stay with the app. */
+export async function connectStellarWallet(network: StellarNetwork, signal?: AbortSignal): Promise<{
+  address: string;
+  network: 'stellar';
+  signMessage(message: string): Promise<string>;
+}> {
   const access = await freighter.requestAccess(); failed(access.error); stellarAccountKey(access.address);
   signal?.throwIfAborted(); await checkNetwork(network); signal?.throwIfAborted();
-  const challenge = await request<{id: string; message: string; address: string; origin: string}>('auth/challenge', {address: access.address});
-  if (challenge.address !== access.address || challenge.origin !== location.origin || typeof challenge.message !== 'string') throw new Error('The sign-in challenge belongs to another account or site. Nothing was signed.');
-  signal?.throwIfAborted();
-  const signed = await freighter.signMessage(challenge.message, {address: access.address, networkPassphrase: STELLAR_NETWORKS[network].passphrase}); failed(signed.error);
-  if (!signed.signedMessage || signed.signerAddress !== access.address) throw new Error('Freighter signed with another account. Sign in again.');
-  const signature = base64Bytes(signed.signedMessage);
-  if (signature.length !== 64 || !ed25519.verify(signature, stellarMessageDigest(challenge.message), stellarAccountKey(access.address), {zip215: false})) throw new Error('The Stellar wallet signature could not be verified.');
-  await currentAddress(access.address); signal?.throwIfAborted();
-  let result: {session: S};
-  try {result = await request<{session: S}>('auth/verify', {id: challenge.id, address: challenge.address, message: challenge.message, signature: base64(signature)});}
-  catch (error) {if (signal?.aborted) await request('auth/logout', {}).catch(() => {}); throw error;}
-  if (signal?.aborted || result.session?.address !== access.address || result.session?.network !== 'stellar') {
-    await request('auth/logout', {}).catch(() => {});
-    signal?.throwIfAborted();
-    throw new Error('The server returned a session for another account. Sign in again.');
-  }
-  return result.session;
+  return {
+    address: access.address,
+    network: 'stellar',
+    async signMessage(message: string): Promise<string> {
+      signal?.throwIfAborted();
+      const signed = await freighter.signMessage(message, {address: access.address, networkPassphrase: STELLAR_NETWORKS[network].passphrase}); failed(signed.error);
+      if (!signed.signedMessage || signed.signerAddress !== access.address) throw new Error('Freighter signed with another account. Sign in again.');
+      const signature = base64Bytes(signed.signedMessage);
+      if (signature.length !== 64 || !ed25519.verify(signature, stellarMessageDigest(message), stellarAccountKey(access.address), {zip215: false})) throw new Error('The Stellar wallet signature could not be verified.');
+      await currentAddress(access.address); signal?.throwIfAborted();
+      return base64(signature);
+    },
+  };
 }
 
 /**
@@ -108,27 +109,34 @@ export function watchStellarAccount(owner: string, changed: () => void): () => v
   return () => watcher.stop();
 }
 
-function canonicalObject(value:Record<string,unknown>):string{return JSON.stringify(Object.fromEntries(Object.keys(value).sort().map(key=>[key,value[key]])));}
+export function canonicalApprovalJson(value: unknown): string {return JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item) ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item);}
 const APPROVAL_PAYLOAD_KEYS = ['version','policyId','revision','network','wallet','route','policyInstance','source','sourceHash','irHash','moduleDigest','asset','assetSymbol','assetIssuer','maxFeeStroops'];
 /** The owner signs only reviewed fields. Any added or missing payload field rejects before the wallet prompt. */
-const exactPayload = (value: unknown) => !!value && typeof value === 'object' && !Array.isArray(value)
-  && Object.keys(value).length === APPROVAL_PAYLOAD_KEYS.length && Object.keys(value).every(key => APPROVAL_PAYLOAD_KEYS.includes(key));
+const PORTABLE_APPROVAL_KEYS = [...APPROVAL_PAYLOAD_KEYS, 'language', 'tier', 'rules', 'params', 'paramsHash'];
+const exactPayload = (value: unknown, keys: readonly string[]) => !!value && typeof value === 'object' && !Array.isArray(value)
+  && Object.keys(value).length === keys.length && Object.keys(value).every(key => keys.includes(key));
 /** Stellar Asset Contract for an exact asset code, issuer and network. A null issuer means native XLM; issued XLM keeps its issuer. */
 export function stellarAssetContractId(code: string, issuer: string | null, network: StellarNetwork): string {
   return stellarAssetContract(code, issuer === null ? null : stellarAccountKey(issuer), STELLAR_NETWORKS[network].passphrase);
 }
 /** The owner approves an exact Native source against current account administration authority. */
-export async function verifyStellarInstallation(request: BrowserRequest, policy: {id: string; revision: number; network?:string; sourceHash?:string; irHash?:string; code?:string;mint?:string;token?:string;runtime?:{instanceBinding?:Record<string,unknown>}}, session: Session | null | undefined, stillCurrent:()=>boolean=()=>true): Promise<void> {
+export async function signStellarSourceApproval(approval: {payload:Record<string,unknown>;message:string;method:string}, policy: {id: string; revision: number; network?:string; sourceHash?:string; irHash?:string; code?:string;mint?:string;token?:string;runtime?:{instanceBinding?:Record<string,unknown>}}, session: Session, stillCurrent:()=>boolean=()=>true): Promise<{signer:string;signature:number[]}[]> {
   const current=()=>{if(!stillCurrent())throw new Error('The owner, network or policy changed. Nothing was activated.');};
   current();
   if (session?.network !== 'stellar') throw new Error('Sign in with the Stellar owner before verifying the wallet.');
-  const expectedOwner=`stellar:${session.address}`;
-  const approval=await request<{required:boolean;payload:Record<string,unknown>;message:string;method:string}>('native/approval',{policyId:policy.id},{expectedOwner});
-  current();
-  let signatures:undefined|{signer:string;signature:number[]}[];
-  if(approval.required){
+  {
     const payload=approval.payload,binding=policy.runtime?.instanceBinding;
-    if(!exactPayload(payload)||payload.version!==1||!binding||(binding.assetIssuer??null)!==payload.assetIssuer||(payload.assetIssuer!==null&&typeof payload.assetIssuer!=='string')||typeof payload.assetSymbol!=='string'||payload.wallet!==binding.wallet||payload.route!=='native'||payload.route!==binding.route||payload.moduleDigest!==binding.moduleDigest||payload.policyInstance!==binding.policyInstance||payload.asset!==policy.mint||payload.assetSymbol!==policy.token||payload.maxFeeStroops!==binding.maxFeeStroops||approval.method!=='sep53'||payload.policyId!==policy.id||payload.revision!==policy.revision||payload.network!==policy.network||payload.sourceHash!==policy.sourceHash||payload.irHash!==policy.irHash||payload.source!==policy.code||approval.message!==`AllowIt Native policy approval v1\n${canonicalObject(payload)}`||!['stellar:testnet','stellar:mainnet','stellar:pubnet'].includes(String(payload.network)))throw new Error('The source approval does not match this exact policy. Nothing was signed.');
+    const portable = binding?.portable as Record<string, unknown> | undefined;
+    const portableExpected = portable !== undefined || binding?.language === 'allowit-portable-v1';
+    const keys = portableExpected ? PORTABLE_APPROVAL_KEYS : APPROVAL_PAYLOAD_KEYS;
+    const portableMatches = !portableExpected || !!portable && portable.language === 'allowit-portable-v1'
+      && portable.sourceHash === policy.sourceHash && payload.language === portable.language
+      && payload.tier === portable.tier && canonicalApprovalJson(payload.rules) === canonicalApprovalJson(portable.rules)
+      && canonicalApprovalJson(payload.params) === canonicalApprovalJson(portable.params)
+      && typeof portable.paramsHash === 'string' && /^[0-9a-f]{64}$/.test(portable.paramsHash)
+      && payload.paramsHash === portable.paramsHash
+      && Array.from(sha256(new TextEncoder().encode(canonicalApprovalJson(portable.params))), byte => byte.toString(16).padStart(2, '0')).join('') === portable.paramsHash;
+    if(!exactPayload(payload,keys)||!portableMatches||payload.version!==1||!binding||(binding.assetIssuer??null)!==payload.assetIssuer||(payload.assetIssuer!==null&&typeof payload.assetIssuer!=='string')||typeof payload.assetSymbol!=='string'||payload.wallet!==binding.wallet||payload.route!=='native'||payload.route!==binding.route||payload.moduleDigest!==binding.moduleDigest||payload.policyInstance!==binding.policyInstance||payload.asset!==policy.mint||payload.assetSymbol!==policy.token||payload.maxFeeStroops!==binding.maxFeeStroops||approval.method!=='sep53'||payload.policyId!==policy.id||payload.revision!==policy.revision||payload.network!==policy.network||payload.sourceHash!==policy.sourceHash||payload.irHash!==policy.irHash||payload.source!==policy.code||approval.message!==`AllowIt Native policy approval v1\n${canonicalApprovalJson(payload)}`||!['stellar:testnet','stellar:mainnet','stellar:pubnet'].includes(String(payload.network)))throw new Error('The source approval does not match this exact policy. Nothing was signed.');
     const network=payload.network as StellarNetwork;stellarAccountKey(String(payload.wallet));
     // The signed asset contract must derive from the exact code, issuer and network.
     let contract='';
@@ -139,8 +147,6 @@ export async function verifyStellarInstallation(request: BrowserRequest, policy:
     if(signed.signerAddress!==session.address||!signed.signedMessage)throw new Error('Freighter signed with another administrator. Nothing was activated.');
     const signature=base64Bytes(signed.signedMessage);
     if(signature.length!==64||!ed25519.verify(signature,stellarMessageDigest(approval.message),stellarAccountKey(session.address),{zip215:false}))throw new Error('The policy approval signature could not be verified.');
-    await currentAddress(session.address);current();await checkNetwork(network);current();signatures=[{signer:session.address,signature:Array.from(signature)}];
+    await currentAddress(session.address);current();await checkNetwork(network);current();return [{signer:session.address,signature:Array.from(signature)}];
   }
-  current();
-  await request('micro/allocation/confirm', {id: policy.id, revision: policy.revision,...(signatures?{stellarSourceApproval:signatures}:{})}, {expectedOwner});
 }
