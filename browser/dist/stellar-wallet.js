@@ -152,13 +152,18 @@ export async function signStellarSourceApproval(approval, policy, session, still
         const portable = binding?.portable;
         const portableExpected = portable !== undefined || binding?.language === 'allowit-portable-v1';
         const keys = portableExpected ? PORTABLE_APPROVAL_KEYS : APPROVAL_PAYLOAD_KEYS;
+        const hash = (value) => Array.from(sha256(new TextEncoder().encode(value)), byte => byte.toString(16).padStart(2, '0')).join('');
         const portableMatches = !portableExpected || !!portable && portable.language === 'allowit-portable-v1'
+            && ['standard', 'custom'].includes(String(portable.tier)) && Array.isArray(portable.rules) && portable.rules.every(rule => typeof rule === 'string')
+            && !!portable.params && typeof portable.params === 'object' && !Array.isArray(portable.params)
+            && typeof policy.code === 'string' && hash(policy.code) === policy.sourceHash
             && portable.sourceHash === policy.sourceHash && payload.language === portable.language
             && payload.tier === portable.tier && canonicalApprovalJson(payload.rules) === canonicalApprovalJson(portable.rules)
             && canonicalApprovalJson(payload.params) === canonicalApprovalJson(portable.params)
             && typeof portable.paramsHash === 'string' && /^[0-9a-f]{64}$/.test(portable.paramsHash)
             && payload.paramsHash === portable.paramsHash
-            && Array.from(sha256(new TextEncoder().encode(canonicalApprovalJson(portable.params))), byte => byte.toString(16).padStart(2, '0')).join('') === portable.paramsHash;
+            && hash(canonicalApprovalJson(portable.params)) === portable.paramsHash
+            && hash(canonicalApprovalJson({ language: portable.language, tier: portable.tier, rules: portable.rules, sourceHash: portable.sourceHash, paramsHash: portable.paramsHash })) === binding?.moduleDigest;
         if (!exactPayload(payload, keys) || !portableMatches || payload.version !== 1 || !binding || (binding.assetIssuer ?? null) !== payload.assetIssuer || (payload.assetIssuer !== null && typeof payload.assetIssuer !== 'string') || typeof payload.assetSymbol !== 'string' || payload.wallet !== binding.wallet || payload.route !== 'native' || payload.route !== binding.route || payload.moduleDigest !== binding.moduleDigest || payload.policyInstance !== binding.policyInstance || payload.asset !== policy.mint || payload.assetSymbol !== policy.token || payload.maxFeeStroops !== binding.maxFeeStroops || approval.method !== 'sep53' || payload.policyId !== policy.id || payload.revision !== policy.revision || payload.network !== policy.network || payload.sourceHash !== policy.sourceHash || payload.irHash !== policy.irHash || payload.source !== policy.code || approval.message !== `AllowIt Native policy approval v1\n${canonicalApprovalJson(payload)}` || !['stellar:testnet', 'stellar:mainnet', 'stellar:pubnet'].includes(String(payload.network)))
             throw new Error('The source approval does not match this exact policy. Nothing was signed.');
         const network = payload.network;
