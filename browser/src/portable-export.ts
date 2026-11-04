@@ -1,8 +1,7 @@
-import {sha256} from '@noble/hashes/sha256';
+import {canonicalJson,digest} from './consent-codec.js';
+export {canonicalJson,digest} from './consent-codec.js';
 import {ed25519} from '@noble/curves/ed25519';
 import {stellarAccountKey, stellarAssetContractId, stellarMessageDigest, type StellarNetwork} from './stellar-wallet.js';
-export const canonicalJson = (value: unknown): string => JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item) ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item);
-export const digest = (value: string): string => Array.from(sha256(new TextEncoder().encode(value)), b => b.toString(16).padStart(2, '0')).join('');
 export const object = (value: unknown): Record<string, unknown> | null => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
 export const hexHash = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
 function reject(): never {throw new Error('The portable Stellar source or consent differs from the selected policy. Nothing was saved.');}

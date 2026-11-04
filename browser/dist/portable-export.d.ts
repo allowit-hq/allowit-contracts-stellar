@@ -1,5 +1,4 @@
-export declare const canonicalJson: (value: unknown) => string;
-export declare const digest: (value: string) => string;
+export { canonicalJson, digest } from './consent-codec.js';
 export declare const object: (value: unknown) => Record<string, unknown> | null;
 export declare const hexHash: (value: unknown) => value is string;
 export type PortablePolicy = {

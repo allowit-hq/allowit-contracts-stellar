@@ -1,3 +1,4 @@
+import {canonicalJson,digest} from './consent-codec.js';
 import freighter from '@stellar/freighter-api';
 import {ed25519} from '@noble/curves/ed25519';
 import {sha256} from '@noble/hashes/sha256';
@@ -132,7 +133,7 @@ export function watchStellarAccount(owner: string, changed: () => void): () => v
   return () => watcher.stop();
 }
 
-export function canonicalApprovalJson(value: unknown): string {return JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item) ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item);}
+export const canonicalApprovalJson=canonicalJson;
 const APPROVAL_PAYLOAD_KEYS = ['version','policyId','revision','network','wallet','route','policyInstance','source','sourceHash','irHash','moduleDigest','asset','assetSymbol','assetIssuer','maxFeeStroops'];
 /** The owner signs only reviewed fields. Any added or missing payload field rejects before the wallet prompt. */
 const PORTABLE_APPROVAL_KEYS = [...APPROVAL_PAYLOAD_KEYS, 'language', 'tier', 'rules', 'params', 'paramsHash'];
@@ -152,7 +153,7 @@ export async function signStellarSourceApproval(approval: {payload:Record<string
     const portable = binding?.portable as Record<string, unknown> | undefined;
     const portableExpected = portable !== undefined || binding?.language === 'allowit-portable-v1' || policy.language === 'allowit-portable-v1';
     const keys = portableExpected ? PORTABLE_APPROVAL_KEYS : APPROVAL_PAYLOAD_KEYS;
-    const hash = (value: string) => Array.from(sha256(new TextEncoder().encode(value)), byte => byte.toString(16).padStart(2, '0')).join('');
+    const hash=digest;
     const portableMatches = !portableExpected || !!portable && portable.language === 'allowit-portable-v1'
       && ['standard','custom'].includes(String(portable.tier)) && Array.isArray(portable.rules) && portable.rules.every(rule => typeof rule === 'string')
       && !!portable.params && typeof portable.params === 'object' && !Array.isArray(portable.params)

@@ -10,8 +10,7 @@ export interface StellarOwnerIntent {
   expiresAt: number; transactionXdr: string; transactionHash: string; intentDigest: string;
 }
 const keys = ['version','profile','requestId','network','owner','agent','engine','sequence','feeStroops','expiresAt','transactionXdr','transactionHash','intentDigest'];
-const hex = (v: Uint8Array) => Array.from(v, b=>b.toString(16).padStart(2,'0')).join('');
-const digest = (v: string) => hex(sha256(new TextEncoder().encode(v)));
+import {hex,digest} from './consent-codec.js';
 export const stellarOwnerDigest = (v: StellarOwnerIntent) => digest(JSON.stringify([STELLAR_OWNER_PROFILE,v.requestId,v.network,v.owner,v.agent,v.engine,v.sequence,v.feeStroops,v.expiresAt,v.transactionHash]));
 export function decodePublicFragment(fragment: string, prefix: string): unknown {
   if (!fragment.startsWith(prefix)||fragment.length>65_536) throw new Error('The owner signing link is invalid or too large.');
@@ -140,18 +139,13 @@ export async function stellarOwnerStatus(record:OwnerRecord,transport:OwnerTrans
   if(record.signedXdr&&settled.signedXdr!==record.signedXdr)throw new Error('The settled envelope differs from the saved signed proof.');
   return {intent:record.intent,signedXdr:settled.signedXdr,status:settled.successful?'confirmed':'failed',ledger:Number(receipt.ledger)};
 }
-export async function submitSavedStellarOwner(record:OwnerRecord,transport:OwnerTransport=stellarOwnerTransport):Promise<OwnerRecord> {
+/** Broadcast only the exact retained native envelope. Callers own retention and recovery sequencing. */
+export async function broadcastStellarOwner(record:OwnerRecord,transport:OwnerTransport=stellarOwnerTransport):Promise<void> {
   if(!record.signedXdr)throw new Error('There is no saved signed transaction.');
   verifyStellarOwnerSignature(record.intent,record.signedXdr);
-  const checked=await stellarOwnerStatus(record,transport);
-  if(checked.status==='confirmed'||checked.status==='failed')return checked;
-  // A rejection can follow an earlier accepted broadcast. Only lookup establishes a final result.
   await transport('/transactions',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({tx:record.signedXdr}).toString()});
-  return stellarOwnerStatus({...record,status:'unknown'},transport);
 }
-export function ownerRecordKey(v:StellarOwnerIntent):string{return `allowit.stellar.owner.v1:${v.network}:${v.owner}:${v.requestId}`;}
-export function readOwnerRecord(v:StellarOwnerIntent,storage:Storage=localStorage):OwnerRecord|null {
-  const raw=storage.getItem(ownerRecordKey(v));if(raw===null)return null;
+export function decodeStellarOwnerRecord(raw:string,v:StellarOwnerIntent):OwnerRecord {
   if(raw.length>16_384)throw new Error('The saved native setup proof exceeds its bounds.');
   const record=JSON.parse(raw) as OwnerRecord;
   checkStellarOwnerIntent(record.intent);
@@ -160,149 +154,19 @@ export function readOwnerRecord(v:StellarOwnerIntent,storage:Storage=localStorag
   else if(record.status!=='unsigned')throw new Error('The saved signed proof is missing. Keep this journal.');
   return record;
 }
-const sameIntent=(a:StellarOwnerIntent,b:StellarOwnerIntent)=>JSON.stringify(a)===JSON.stringify(b);
-/**
- * Verified signed proofs this page could not yet save, by journal key. A copy outlives a closed dialog or remount until
- * its exact bytes are saved and read back. Public signed transaction bytes only: no key material, no status authority.
- */
-const unsavedProofs=new Map<string,OwnerRecord>();
-function holdUnsavedProof(proof:OwnerRecord):void {
-  const key=ownerRecordKey(proof.intent),prior=unsavedProofs.get(key);
-  if(prior){
-    if(!sameIntent(prior.intent,proof.intent)||prior.signedXdr!==proof.signedXdr)throw new Error('The saved native setup signature cannot be replaced.');
-    return;
-  }
-  const copy:OwnerRecord={intent:Object.freeze({...proof.intent}),signedXdr:proof.signedXdr,status:'unknown'};
-  unsavedProofs.set(key,Object.freeze(copy));
-}
-/** This request's proof from the caller, or the page copy once the caller has let it go. */
-function memoryProof(v:StellarOwnerIntent,held:OwnerRecord|null):OwnerRecord|null {
-  if(held?.signedXdr&&sameIntent(held.intent,v))return held;
-  const kept=unsavedProofs.get(ownerRecordKey(v));
-  return kept&&sameIntent(kept.intent,v)?kept:null;
-}
-export function saveOwnerRecord(record:OwnerRecord,storage:Storage=localStorage):void {
-  checkStellarOwnerIntent(record.intent);
-  const prior=readOwnerRecord(record.intent,storage);
-  if(prior?.signedXdr&&prior.signedXdr!==record.signedXdr)throw new Error('The saved native setup signature cannot be replaced.');
-  if(record.signedXdr)verifyStellarOwnerSignature(record.intent,record.signedXdr);
-  const key=ownerRecordKey(record.intent),raw=JSON.stringify(record);
-  const failed=record.signedXdr?'The signed transaction could not be saved in this browser. It was not sent.':'This browser could not save the setup journal. Nothing was signed.';
-  try{storage.setItem(key,raw);}catch{throw new Error(failed);}
-  if(storage.getItem(key)!==raw)throw new Error(failed);
-  // Only the exact proof, saved and read back, releases its page copy.
-  const kept=unsavedProofs.get(key);
-  if(kept&&kept.signedXdr===record.signedXdr&&sameIntent(kept.intent,record.intent))unsavedProofs.delete(key);
-}
-const signedNotSaved='Your wallet signed the setup, but this browser could not save it. It was not sent. Keep this page open, then retry the signed transaction.';
-/**
- * Keeps a wallet-returned signature before any further wallet or network step. The verified proof reaches page memory,
- * then the caller, then the durable journal. A failed save keeps it in memory, sends nothing and still blocks another signature.
- */
-export function retainStellarOwnerProof(v:StellarOwnerIntent,signedXdr:string,keep:(proof:OwnerRecord)=>void,storage:Storage=localStorage):OwnerRecord {
-  verifyStellarOwnerSignature(v,signedXdr);
-  const proof:OwnerRecord={intent:v,signedXdr,status:'unknown'};
-  holdUnsavedProof(proof);
-  keep(proof);
-  try{saveOwnerRecord(proof,storage);}catch{throw new Error(signedNotSaved);}
-  return proof;
-}
-const recoverEarlier=(requestId:string)=>`Recover the earlier native setup ${requestId} before authorizing another request.`;
-/**
- * Signed proof for this exact request: the durable journal first, then one kept in memory after a failed save, by the
- * caller or by this page. A proof kept only in memory for another request blocks this one regardless of expiry or owner,
- * since replacing it would lose its only copy. Once that exact proof is durable, the per-owner admission scan reconciles
- * it before any new signature.
- */
-export function heldStellarOwnerProof(v:StellarOwnerIntent,held:OwnerRecord|null,storage:Storage=localStorage):OwnerRecord|null {
-  for(const kept of [...unsavedProofs.values(),...(held?.signedXdr?[held]:[])]){
-    if(sameIntent(kept.intent,v))continue;
-    let durable=false;
-    try{durable=readOwnerRecord(kept.intent,storage)?.signedXdr===kept.signedXdr;}catch{/* an unreadable original journal leaves the proof in memory only */}
-    if(!durable)throw new Error(recoverEarlier(kept.intent.requestId));
-  }
-  const saved=readOwnerRecord(v,storage);
-  if(saved?.signedXdr)return saved;
-  return memoryProof(v,held);
-}
-/** Display recovery never lets an unsigned or unreadable journal entry hide a known signed proof. */
-export function keptStellarOwnerRecord(v:StellarOwnerIntent,held:OwnerRecord|null,storage:Storage=localStorage):OwnerRecord|null {
-  let saved:OwnerRecord|null=null;
-  try{saved=readOwnerRecord(v,storage);}catch{/* an unreadable journal still blocks signing in heldStellarOwnerProof */}
-  if(saved?.signedXdr)return saved;
-  return memoryProof(v,held)??saved;
-}
-/** Retry durably saves the same kept proof before any send. It never asks the wallet again. */
-export function durableStellarOwnerProof(v:StellarOwnerIntent,held:OwnerRecord|null,storage:Storage=localStorage):OwnerRecord {
-  const proof=heldStellarOwnerProof(v,held,storage);
-  if(!proof?.signedXdr)throw new Error('There is no saved signed transaction.');
-  if(readOwnerRecord(v,storage)?.signedXdr!==proof.signedXdr){
-    try{saveOwnerRecord(proof,storage);}catch{throw new Error(signedNotSaved);}
-  }
-  return proof;
-}
-const ownerLock=(v:StellarOwnerIntent)=>`allowit.stellar.owner:${v.network}:${v.owner}`;
-/** The raw per-owner Web Lock, without the admission scan. Callers that already hold it use the direct status functions. */
-export async function withRawStellarOwnerLock<T>(v:StellarOwnerIntent,run:()=>Promise<T>):Promise<T> {
-  if(!navigator.locks)throw new Error('This browser cannot safely lock native setup. Use a browser with Web Locks support.');
-  return navigator.locks.request(ownerLock(v),async()=>run());
-}
-/** Opening or checking a link reads, looks up and saves inside the owner lock, so an older lookup never overwrites a newer one. */
-export async function observeStellarOwnerRecord(v:StellarOwnerIntent,held:OwnerRecord|null,transport:OwnerTransport=stellarOwnerTransport,storage:Storage=localStorage):Promise<OwnerRecord|null> {
-  return withRawStellarOwnerLock(v,async()=>{
-    const proof=heldStellarOwnerProof(v,held,storage);
-    if(!proof)return readOwnerRecord(v,storage);
-    const checked=await stellarOwnerStatus(proof,transport);
-    saveOwnerRecord(checked,storage);
-    return checked;
-  });
-}
-/**
- * An expired proof can have a pruned receipt. Fresh owner-only authority resolves the current authority risk, not the
- * historical transaction outcome. Keep both the original journal and an immutable archive; never label this failed.
- */
-async function archiveSupersededOwnerAuthority(prior:OwnerRecord,next:StellarOwnerIntent,transport:OwnerTransport,storage:Storage):Promise<boolean> {
-  if(!prior.signedXdr||prior.intent.expiresAt>=Math.floor(Date.now()/1000))return false;
+
+export async function stellarOwnerSupersessionProof(prior:OwnerRecord,next:StellarOwnerIntent,transport:OwnerTransport=stellarOwnerTransport):Promise<unknown|null> {
+  if(!prior.signedXdr||prior.intent.expiresAt>=Math.floor(Date.now()/1000))return null;
   try {
     const response=await transport('/ledgers?order=desc&limit=1',{cache:'no-store'});
-    if(!response.ok)return false;
+    if(!response.ok)return null;
     const embedded=plain((await json(response))._embedded),records=embedded?.records;
-    if(!Array.isArray(records)||records.length!==1)return false;
+    if(!Array.isArray(records)||records.length!==1)return null;
     const ledger=plain(records[0]),closedAt=ledger?.closed_at,sequence=ledger?.sequence;
     if(typeof closedAt!=='string'||!Number.isSafeInteger(sequence)||Number(sequence)<=0
-      ||!Number.isFinite(Date.parse(closedAt))||Date.parse(closedAt)<=prior.intent.expiresAt*1000)return false;
+      ||!Number.isFinite(Date.parse(closedAt))||Date.parse(closedAt)<=prior.intent.expiresAt*1000)return null;
     // Read account authority after the finalized expiry boundary, and bind it to this new request's sequence.
     await verifyFreshStellarOwner(next,async(path,init)=>transport(path,{...init,cache:'no-store'}));
-    const key=`allowit.stellar.owner.archive.v1:${prior.intent.network}:${prior.intent.owner}:${prior.intent.transactionHash}`;
-    const existing=storage.getItem(key);
-    if(existing!==null){
-      const archived=plain(JSON.parse(existing)),proof=archived?.record as OwnerRecord|undefined;
-      if(!proof||!sameIntent(proof.intent,prior.intent)||proof.signedXdr!==prior.signedXdr)return false;
-    }else{
-      const raw=JSON.stringify({record:prior,authority:{ledger:sequence,closedAt,owner:next.owner,sequence:(BigInt(next.sequence)-1n).toString(),requestId:next.requestId}});
-      storage.setItem(key,raw);
-      if(storage.getItem(key)!==raw)return false;
-    }
-    return true;
-  }catch{return false;}
-}
-/** Serialize signing across all tabs that share the same owner account sequence. Every earlier signed proof is looked up again; a saved terminal label is not chain evidence. */
-export async function withStellarOwnerLock<T>(v:StellarOwnerIntent,run:()=>Promise<T>,transport:OwnerTransport=stellarOwnerTransport,storage:Storage=localStorage):Promise<T> {
-  return withRawStellarOwnerLock(v,async()=>{
-    const prefix=`allowit.stellar.owner.v1:${v.network}:${v.owner}:`,now=Math.floor(Date.now()/1000),current=ownerRecordKey(v);
-    // Snapshot before the first lookup: another tab can remove any key during an await and shift live indices.
-    const earlier=Array.from({length:storage.length},(_,i)=>storage.key(i)).filter((key):key is string=>!!key?.startsWith(prefix)&&key!==current);
-    for(const key of earlier){
-      const raw=storage.getItem(key);if(raw===null)throw new Error('The native setup journal changed.');
-      const candidate=JSON.parse(raw) as OwnerRecord;checkStellarOwnerIntent(candidate.intent);
-      const prior=readOwnerRecord(candidate.intent,storage);
-      if(!prior||ownerRecordKey(candidate.intent)!==key)throw new Error('The saved native setup binding is invalid.');
-      const blocked=recoverEarlier(prior.intent.requestId);
-      if(prior.signedXdr){
-        const checked=await stellarOwnerStatus(prior,transport);saveOwnerRecord(checked,storage);
-        if(checked.status==='unknown'&&!await archiveSupersededOwnerAuthority(checked,v,transport,storage))throw new Error(blocked);
-      }else if(unsignedStellarOwnerOpen(prior.intent,now))throw new Error(blocked);
-    }
-    return run();
-  });
+    return {ledger:sequence,closedAt,owner:next.owner,sequence:(BigInt(next.sequence)-1n).toString(),requestId:next.requestId};
+  }catch{return null;}
 }

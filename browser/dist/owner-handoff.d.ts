@@ -41,29 +41,7 @@ export declare function checkUnsignedStellarOwnerWindow(v: StellarOwnerIntent, n
 export declare function verifyFreshStellarOwner(v: StellarOwnerIntent, transport?: OwnerTransport, now?: number): Promise<void>;
 /** A receipt must name the exact original hash, owner bytes and result. Unknown status retains its signed proof. */
 export declare function stellarOwnerStatus(record: OwnerRecord, transport?: OwnerTransport): Promise<OwnerRecord>;
-export declare function submitSavedStellarOwner(record: OwnerRecord, transport?: OwnerTransport): Promise<OwnerRecord>;
-export declare function ownerRecordKey(v: StellarOwnerIntent): string;
-export declare function readOwnerRecord(v: StellarOwnerIntent, storage?: Storage): OwnerRecord | null;
-export declare function saveOwnerRecord(record: OwnerRecord, storage?: Storage): void;
-/**
- * Keeps a wallet-returned signature before any further wallet or network step. The verified proof reaches page memory,
- * then the caller, then the durable journal. A failed save keeps it in memory, sends nothing and still blocks another signature.
- */
-export declare function retainStellarOwnerProof(v: StellarOwnerIntent, signedXdr: string, keep: (proof: OwnerRecord) => void, storage?: Storage): OwnerRecord;
-/**
- * Signed proof for this exact request: the durable journal first, then one kept in memory after a failed save, by the
- * caller or by this page. A proof kept only in memory for another request blocks this one regardless of expiry or owner,
- * since replacing it would lose its only copy. Once that exact proof is durable, the per-owner admission scan reconciles
- * it before any new signature.
- */
-export declare function heldStellarOwnerProof(v: StellarOwnerIntent, held: OwnerRecord | null, storage?: Storage): OwnerRecord | null;
-/** Display recovery never lets an unsigned or unreadable journal entry hide a known signed proof. */
-export declare function keptStellarOwnerRecord(v: StellarOwnerIntent, held: OwnerRecord | null, storage?: Storage): OwnerRecord | null;
-/** Retry durably saves the same kept proof before any send. It never asks the wallet again. */
-export declare function durableStellarOwnerProof(v: StellarOwnerIntent, held: OwnerRecord | null, storage?: Storage): OwnerRecord;
-/** The raw per-owner Web Lock, without the admission scan. Callers that already hold it use the direct status functions. */
-export declare function withRawStellarOwnerLock<T>(v: StellarOwnerIntent, run: () => Promise<T>): Promise<T>;
-/** Opening or checking a link reads, looks up and saves inside the owner lock, so an older lookup never overwrites a newer one. */
-export declare function observeStellarOwnerRecord(v: StellarOwnerIntent, held: OwnerRecord | null, transport?: OwnerTransport, storage?: Storage): Promise<OwnerRecord | null>;
-/** Serialize signing across all tabs that share the same owner account sequence. Every earlier signed proof is looked up again; a saved terminal label is not chain evidence. */
-export declare function withStellarOwnerLock<T>(v: StellarOwnerIntent, run: () => Promise<T>, transport?: OwnerTransport, storage?: Storage): Promise<T>;
+/** Broadcast only the exact retained native envelope. Callers own retention and recovery sequencing. */
+export declare function broadcastStellarOwner(record: OwnerRecord, transport?: OwnerTransport): Promise<void>;
+export declare function decodeStellarOwnerRecord(raw: string, v: StellarOwnerIntent): OwnerRecord;
+export declare function stellarOwnerSupersessionProof(prior: OwnerRecord, next: StellarOwnerIntent, transport?: OwnerTransport): Promise<unknown | null>;

@@ -1,11 +1,10 @@
 import { portableExport, canonicalJson, digest, object, hexHash } from './portable-export.js';
-import { sha256 } from '@noble/hashes/sha256';
 import { StrKey } from '@stellar/stellar-sdk/base';
 import { stellarAccountKey, stellarAssetContractId } from './stellar-wallet.js';
 import { decodePublicFragment } from './owner-handoff.js';
 import { STELLAR_APPROVAL_FRAGMENT } from './stellar-fragments.js';
 export { STELLAR_APPROVAL_FRAGMENT } from './stellar-fragments.js';
-const hash = (v) => Array.from(sha256(new TextEncoder().encode(v)), b => b.toString(16).padStart(2, '0')).join('');
+const hash = digest;
 const canonical = canonicalJson;
 export const stellarApprovalDigest = (v) => hash(JSON.stringify([v.profile, v.requestId, v.network, v.owner, v.policyId, v.revision, v.sourceHash, v.irHash, hash(canonical(v.binding))]));
 function exact(v, keys) { return !!v && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length === keys.length && Object.keys(v).every(k => keys.includes(k)); }

@@ -1,5 +1,4 @@
 import {portableExport,canonicalJson,digest,object,hexHash} from './portable-export.js';
-import {sha256} from '@noble/hashes/sha256';
 import {StrKey} from '@stellar/stellar-sdk/base';
 export interface ApprovalPolicy {id: string; revision: number; network: string; code: string; sourceHash: string; irHash: string; mint: string; token: string; runtime?: {wallet: {profile: string}; instanceBinding?: Record<string, unknown>}}
 import {stellarAccountKey, stellarAssetContractId} from './stellar-wallet.js';
@@ -8,7 +7,7 @@ import {STELLAR_APPROVAL_FRAGMENT} from './stellar-fragments.js';
 export {STELLAR_APPROVAL_FRAGMENT} from './stellar-fragments.js';
 export interface ApprovalBinding {wallet:string;route:'native';policyInstance:string;moduleDigest:string;asset:string;assetSymbol:string;assetIssuer:string|null;maxFeeStroops:number;deploymentId:string|null;language?:string;tier?:string;rules?:string[];params?:Record<string,unknown>;paramsHash?:string}
 export interface StellarApprovalIntent {version:1|2;profile:'allowit-stellar-approval-v1'|'allowit-stellar-approval-v2';requestId:string;network:'stellar:testnet';owner:string;policyId:string;revision:number;source:string;sourceHash:string;irHash:string;binding:ApprovalBinding;intentDigest:string}
-const hash=(v:string)=>Array.from(sha256(new TextEncoder().encode(v)),b=>b.toString(16).padStart(2,'0')).join('');
+const hash=digest;
 const canonical=canonicalJson;
 export const stellarApprovalDigest=(v:StellarApprovalIntent)=>hash(JSON.stringify([v.profile,v.requestId,v.network,v.owner,v.policyId,v.revision,v.sourceHash,v.irHash,hash(canonical(v.binding))]));
 function exact(v:unknown,keys:string[]):v is Record<string,unknown>{return !!v&&typeof v==='object'&&!Array.isArray(v)&&Object.keys(v).length===keys.length&&Object.keys(v).every(k=>keys.includes(k));}

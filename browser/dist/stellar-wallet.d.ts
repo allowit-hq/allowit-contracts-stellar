@@ -46,7 +46,7 @@ export declare function connectStellarWallet(network: StellarNetwork, signal?: A
  */
 export declare function signStellarTransaction(transactionXdr: string, owner: string, network: StellarNetwork, retain?: (signedXdr: string) => void | Promise<void>): Promise<string>;
 export declare function watchStellarAccount(owner: string, changed: () => void): () => void;
-export declare function canonicalApprovalJson(value: unknown): string;
+export declare const canonicalApprovalJson: (value: unknown) => string;
 /** Stellar Asset Contract for an exact asset code, issuer and network. A null issuer means native XLM; issued XLM keeps its issuer. */
 export declare function stellarAssetContractId(code: string, issuer: string | null, network: StellarNetwork): string;
 /** The owner approves an exact Native source against current account administration authority. */
