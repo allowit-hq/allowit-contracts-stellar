@@ -25,7 +25,7 @@ export function portableExport(bundle: Record<string, unknown>, config: Record<s
       || !same(p, expected) || !same(config.params ?? {}, params)
       || asset.address !== config.asset || asset.symbol !== config.assetSymbol || asset.decimals !== 7
       || !Array.isArray(p.unresolved) || p.unresolved.length !== 0 || !Array.isArray(build.prefix) || !build.prefix.every(v => typeof v === 'string')
-      || typeof build.writesState !== 'boolean' || !hexHash(build.libraryRevision) || !Number.isInteger(build.attempts) || Number(build.attempts) < 1 || Number(build.attempts) > 3) reject();
+      || typeof build.writesState !== 'boolean' || !(typeof build.libraryRevision === 'string' && /^[0-9a-f]{40}$/.test(build.libraryRevision)) || !Number.isInteger(build.attempts) || Number(build.attempts) < 1 || Number(build.attempts) > 3) reject();
   if (stellarAssetContractId(String(config.assetSymbol), config.assetIssuer == null ? null : String(config.assetIssuer), policy.network as StellarNetwork) !== config.asset) reject();
   const kinds = p.kinds === undefined ? undefined : object(p.kinds);
   if (p.kinds !== undefined && (!kinds || Object.values(kinds).some(v => typeof v !== 'string'))) reject();
