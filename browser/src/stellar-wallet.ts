@@ -62,10 +62,33 @@ async function checkNetwork(network: StellarNetwork): Promise<void> {
   const value = await freighter.getNetworkDetails(); failed(value.error);
   if (value.networkPassphrase !== STELLAR_NETWORKS[network].passphrase) throw new Error(`Select ${STELLAR_NETWORKS[network].label} in Freighter, then try again.`);
 }
+export interface StellarSignInChallenge {id: string; message: string; address: string; origin: string; expiresAt: string}
+/** Exact current server sign-in domain; it cannot be substituted with a spending approval. */
+export function validateStellarSignInChallenge(challenge: StellarSignInChallenge, owner: string, origin: string, now = Date.now()): void {
+  const invalid = () => new Error('The sign-in challenge is invalid or expired. Nothing was signed.');
+  let site: URL;
+  try {site = new URL(origin); stellarAccountKey(owner);} catch {throw invalid();}
+  if (site.origin !== origin || !['http:', 'https:'].includes(site.protocol) || !/^[0-9a-f]{64}$/.test(challenge.id)
+    || challenge.address !== owner || challenge.origin !== origin || typeof challenge.message !== 'string') throw invalid();
+  const prefix = `${site.host} wants you to sign in with your Stellar account:\n${owner}\n\nSign in to AllowIt. This does not authorize spending or move funds.\n\nURI: ${origin}\nVersion: 1\nNonce: ${challenge.id}\nIssued At: `;
+  if (!challenge.message.startsWith(prefix)) throw invalid();
+  const times = challenge.message.slice(prefix.length).split('\nExpiration Time: ');
+  const timestamp = (value: string) => {
+    if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(value)) throw invalid();
+    const time = Date.parse(value);
+    if (!Number.isFinite(time) || new Date(time).toISOString().replace('.000Z', 'Z') !== value) throw invalid();
+    return time;
+  };
+  if (times.length !== 2 || times[1] !== challenge.expiresAt) throw invalid();
+  const issued = timestamp(times[0]), expiry = timestamp(times[1]);
+  if (expiry - issued !== 300_000 || issued > now + 30_000 || now - issued > 300_000 || expiry <= now) throw invalid();
+}
+
 /** A native wallet capability. HTTP sessions and their admission stay with the app. */
 export async function connectStellarWallet(network: StellarNetwork, signal?: AbortSignal): Promise<{
   address: string;
   network: 'stellar';
+  validateChallenge(challenge: StellarSignInChallenge): void;
   signMessage(message: string): Promise<string>;
 }> {
   const access = await freighter.requestAccess(); failed(access.error); stellarAccountKey(access.address);
@@ -73,6 +96,7 @@ export async function connectStellarWallet(network: StellarNetwork, signal?: Abo
   return {
     address: access.address,
     network: 'stellar',
+    validateChallenge(challenge: StellarSignInChallenge): void {validateStellarSignInChallenge(challenge, access.address, location.origin);},
     async signMessage(message: string): Promise<string> {
       signal?.throwIfAborted();
       const signed = await freighter.signMessage(message, {address: access.address, networkPassphrase: STELLAR_NETWORKS[network].passphrase}); failed(signed.error);

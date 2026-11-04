@@ -23,10 +23,20 @@ export declare function stellarAccountKey(address: string): Uint8Array;
 /** SEP-53 signs the prefixed digest. It never signs a transaction or authorizes spending. */
 export declare function stellarMessageDigest(message: string): Uint8Array;
 export declare function freighterAvailable(): Promise<boolean>;
+export interface StellarSignInChallenge {
+    id: string;
+    message: string;
+    address: string;
+    origin: string;
+    expiresAt: string;
+}
+/** Exact current server sign-in domain; it cannot be substituted with a spending approval. */
+export declare function validateStellarSignInChallenge(challenge: StellarSignInChallenge, owner: string, origin: string, now?: number): void;
 /** A native wallet capability. HTTP sessions and their admission stay with the app. */
 export declare function connectStellarWallet(network: StellarNetwork, signal?: AbortSignal): Promise<{
     address: string;
     network: 'stellar';
+    validateChallenge(challenge: StellarSignInChallenge): void;
     signMessage(message: string): Promise<string>;
 }>;
 /**
