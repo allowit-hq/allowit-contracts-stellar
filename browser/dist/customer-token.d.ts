@@ -10,6 +10,9 @@ export type PublicStellarBundle = {
     policyId: string;
     sourceHash: string;
     irHash: string;
+    language?: string;
+    portable?: Record<string, unknown>;
+    sourceApproval?: unknown;
     moduleDigest: string;
     wallet: string;
     route: 'native' | 'policyWallet';
@@ -21,6 +24,7 @@ export type PublicStellarBundle = {
 };
 export type TokenPolicy = {
     id: string;
+    revision?: number;
     network: string;
     sourceHash: string;
     irHash: string;

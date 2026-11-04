@@ -1,3 +1,4 @@
+import { portableExport } from './portable-export.js';
 import { stellarAccountKey } from './stellar-wallet.js';
 import { ed25519 } from '@noble/curves/ed25519';
 const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
@@ -59,9 +60,10 @@ function bytesHex(value) { return Array.isArray(value) && value.length === 32 &&
 export function customerToken(bundle, seedText, policy, owner, service) {
     const binding = policy.runtime?.instanceBinding;
     const c = bundle.config;
-    if (!binding || !['native', 'policyWallet'].includes(bundle.route) || bundle.version !== 1 || bundle.profile !== 'allowit-stellar-wallet-v1' || bundle.policyId !== policy.id || bundle.network !== policy.network || bundle.sourceHash !== policy.sourceHash || bundle.irHash !== policy.irHash || c.policySource !== policy.code || bundle.wallet !== binding.wallet || bundle.route !== binding.route || bundle.moduleDigest !== binding.moduleDigest || bytesHex(c.policyInstance) !== binding.policyInstance || bytesHex(c.sourceHash) !== policy.sourceHash || bytesHex(c.moduleDigest) !== binding.moduleDigest || c.owner !== owner || c.network !== policy.network || c.wallet !== bundle.wallet || c.route !== bundle.route || c.asset !== policy.mint || c.assetSymbol !== policy.token || (binding.maxFeeStroops !== undefined && c.maxFeeStroops !== binding.maxFeeStroops) || (binding.assetIssuer !== undefined && c.assetIssuer !== binding.assetIssuer) || bundle.endpoints.execute !== '/api/native/execute' || bundle.endpoints.status !== '/api/native/execute/status' || !['sourceHash', 'irHash', 'moduleDigest'].every(k => /^[a-f0-9]{64}$/.test(bundle[k])))
+    if (!binding || !['native', 'policyWallet'].includes(bundle.route) || bundle.version !== 1 || bundle.profile !== 'allowit-stellar-wallet-v1' || bundle.policyId !== policy.id || bundle.network !== policy.network || bundle.sourceHash !== policy.sourceHash || bundle.irHash !== policy.irHash || c.policySource !== policy.code || bundle.wallet !== binding.wallet || bundle.route !== binding.route || bundle.moduleDigest !== binding.moduleDigest || bytesHex(c.policyInstance) !== binding.policyInstance || bytesHex(c.sourceHash) !== policy.sourceHash || bytesHex(c.moduleDigest) !== binding.moduleDigest || c.owner !== owner || c.network !== policy.network || c.wallet !== bundle.wallet || c.route !== bundle.route || c.asset !== policy.mint || c.assetSymbol !== policy.token || (binding.maxFeeStroops !== undefined && c.maxFeeStroops !== binding.maxFeeStroops) || (binding.assetIssuer !== undefined && c.assetIssuer !== binding.assetIssuer) || bundle.endpoints.execute !== '/api/native/execute' || bundle.endpoints.status !== '/api/native/execute/status' || !['sourceHash', 'moduleDigest'].every(k => /^[a-f0-9]{64}$/.test(bundle[k])))
         throw new Error('The public deployment metadata does not match the selected Stellar policy.');
-    if (bundle.route === 'policyWallet' && (!['simple_policy_engine', 'common_policy_engine', 'custom_policy'].includes(String(c.policyEngine)) || c.policyEngine !== binding.policyEngine))
+    const portable = portableExport(bundle, c, policy);
+    if (bundle.route === 'policyWallet' && portable.top.language === undefined && (!['simple_policy_engine', 'common_policy_engine', 'custom_policy'].includes(String(c.policyEngine)) || c.policyEngine !== binding.policyEngine))
         throw new Error('The policy engine differs from the selected wallet.');
     const agent = customerPublicKey(seedText);
     const server = typeof c.server === 'string' ? c.server : '';
@@ -83,8 +85,8 @@ export function customerToken(bundle, seedText, policy, owner, service) {
     if (bundle.route === 'policyWallet' && agent !== c.agent)
         throw new Error('The customer key differs from the agent installed in this policy wallet.');
     // Copy only the public wallet contract. Unexpected response fields never enter the token.
-    const config = { network: c.network, policyInstance: c.policyInstance, wallet: c.wallet, owner: c.owner, agent, server: c.server, route: c.route, ...(c.policyEngine === undefined ? {} : { policyEngine: c.policyEngine }), asset: c.asset, assetSymbol: c.assetSymbol, assetIssuer: c.assetIssuer ?? null, policySource: c.policySource, sourceHash: c.sourceHash, moduleDigest: c.moduleDigest, maxFeeStroops: c.maxFeeStroops };
-    const token = { version: bundle.version, profile: bundle.profile, network: bundle.network, policyId: bundle.policyId, sourceHash: bundle.sourceHash, irHash: bundle.irHash, moduleDigest: bundle.moduleDigest, wallet: bundle.wallet, route: bundle.route, config, endpoints: bundle.endpoints, signingSeed: seedText };
+    const config = { network: c.network, policyInstance: c.policyInstance, wallet: c.wallet, owner: c.owner, agent, server: c.server, route: c.route, ...(c.policyEngine === undefined ? {} : { policyEngine: c.policyEngine }), ...portable.config, asset: c.asset, assetSymbol: c.assetSymbol, assetIssuer: c.assetIssuer ?? null, policySource: c.policySource, sourceHash: c.sourceHash, moduleDigest: c.moduleDigest, maxFeeStroops: c.maxFeeStroops };
+    const token = { ...portable.top, version: bundle.version, profile: bundle.profile, network: bundle.network, policyId: bundle.policyId, sourceHash: bundle.sourceHash, irHash: bundle.irHash, moduleDigest: bundle.moduleDigest, wallet: bundle.wallet, route: bundle.route, config, endpoints: bundle.endpoints, signingSeed: seedText };
     const bytes = new TextEncoder().encode(JSON.stringify(token));
     try {
         return 'allowit-stellar-v1.' + Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
