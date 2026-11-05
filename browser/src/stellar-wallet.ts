@@ -86,7 +86,7 @@ export function stellarSignInChallengeTimes(challenge: StellarSignInChallenge, o
 }
 
 /** A native wallet capability. HTTP sessions and their admission stay with the app. */
-export async function connectStellarWallet(network: StellarNetwork, admitTimes:(times:{issuedAt:number;expiresAt:number})=>void, signal?: AbortSignal): Promise<{
+export async function connectStellarWallet(network: StellarNetwork, admitTimes:(times:{issuedAt:number;expiresAt:number})=>boolean, signal?: AbortSignal): Promise<{
   address: string;
   network: 'stellar';
   validateChallenge(challenge: StellarSignInChallenge): void;
@@ -98,7 +98,7 @@ export async function connectStellarWallet(network: StellarNetwork, admitTimes:(
   return {
     address: access.address,
     network: 'stellar',
-    validateChallenge(challenge: StellarSignInChallenge): void {admitTimes(stellarSignInChallengeTimes(challenge, access.address, location.origin));},
+    validateChallenge(challenge: StellarSignInChallenge): void {if(admitTimes(stellarSignInChallengeTimes(challenge, access.address, location.origin))!==true)throw new Error('The sign-in challenge is invalid or expired. Nothing was signed.');},
     async signMessage(message: string): Promise<string> {
       signal?.throwIfAborted();
       const signed = await freighter.signMessage(message, {address: access.address, networkPassphrase: STELLAR_NETWORKS[network].passphrase}); failed(signed.error);

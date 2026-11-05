@@ -121,7 +121,8 @@ export async function connectStellarWallet(network, admitTimes, signal) {
     return {
         address: access.address,
         network: 'stellar',
-        validateChallenge(challenge) { admitTimes(stellarSignInChallengeTimes(challenge, access.address, location.origin)); },
+        validateChallenge(challenge) { if (admitTimes(stellarSignInChallengeTimes(challenge, access.address, location.origin)) !== true)
+            throw new Error('The sign-in challenge is invalid or expired. Nothing was signed.'); },
         async signMessage(message) {
             signal?.throwIfAborted();
             const signed = await freighter.signMessage(message, { address: access.address, networkPassphrase: STELLAR_NETWORKS[network].passphrase });
