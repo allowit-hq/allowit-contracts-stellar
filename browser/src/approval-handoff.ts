@@ -1,4 +1,4 @@
-import {portableExport,canonicalJson,digest,object,hexHash} from './portable-export.js';
+import {portableExport,canonicalJson,digest,object,hexHash,type PortableAdmission} from './portable-export.js';
 import {StrKey} from '@stellar/stellar-sdk/base';
 export interface ApprovalPolicy {id: string; revision: number; network: string; code: string; sourceHash: string; irHash: string; mint: string; token: string; runtime?: {wallet: {profile: string}; instanceBinding?: Record<string, unknown>}}
 import {stellarAccountKey, stellarAssetContractId} from './stellar-wallet.js';
@@ -48,7 +48,7 @@ export function matchStellarApproval<P extends ApprovalPolicy>(v:StellarApproval
 const bytesHex = (value: unknown) => Array.isArray(value) && value.length === 32 && value.every(b => Number.isInteger(b) && b >= 0 && b <= 255) ? value.map((b: number) => b.toString(16).padStart(2, '0')).join('') : '';
 const plainObject = (value: unknown) => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
 /** Rebuilds the export from checked public fields only. Unexpected response fields never reach the file. */
-export function publicStellarBundle(value: unknown, policy: ApprovalPolicy, owner: string, service: unknown) {
+export function publicStellarBundle(value: unknown, policy: ApprovalPolicy, owner: string, service: unknown, admit:PortableAdmission) {
   const b = plainObject(value), c = plainObject(b?.config), e = plainObject(b?.endpoints), binding = policy.runtime?.instanceBinding;
   const server = typeof c?.server === 'string' ? c.server : '';
   const agent = typeof c?.agent === 'string' ? c.agent : '';
@@ -63,7 +63,7 @@ export function publicStellarBundle(value: unknown, policy: ApprovalPolicy, owne
     || (c.assetIssuer ?? null) !== (binding.assetIssuer ?? null) || c.policySource !== policy.code || c.maxFeeStroops !== binding.maxFeeStroops
     || bytesHex(c.policyInstance) !== binding.policyInstance || bytesHex(c.sourceHash) !== policy.sourceHash || bytesHex(c.moduleDigest) !== binding.moduleDigest
     || e.execute !== '/api/native/execute' || e.status !== '/api/native/execute/status') throw new Error('The public agent bundle does not match this policy. Nothing was saved.');
-  const portable=portableExport(b,c,policy);
+  const portable=portableExport(b,c,policy,admit);
   const bytes = (v: unknown) => [...(v as number[])];
   return {
     ...portable.top, version: 1, profile: 'allowit-stellar-wallet-v1', network: policy.network, policyId: policy.id, sourceHash: policy.sourceHash, irHash: policy.irHash,

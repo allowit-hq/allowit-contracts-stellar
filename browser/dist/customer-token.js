@@ -49,7 +49,9 @@ export function customerPublicKey(seedText) { const seed = decodeSeed(seedText);
 finally {
     seed.fill(0);
 } }
-export function newCustomerKey() { const seed = crypto.getRandomValues(new Uint8Array(32)); try {
+/** Encode native keys from caller-owned entropy. The caller owns generation and secret retention. */
+export function customerKeyFromEntropy(entropy) { if (!(entropy instanceof Uint8Array) || entropy.length !== 32)
+    throw new Error('Provide exactly 32 bytes of customer key entropy.'); const seed = new Uint8Array(entropy); try {
     return { seed: encodeKey(144, seed), publicKey: encodeKey(48, ed25519.getPublicKey(seed)) };
 }
 finally {
@@ -57,12 +59,12 @@ finally {
 } }
 function bytesHex(value) { return Array.isArray(value) && value.length === 32 && value.every(b => Number.isInteger(b) && b >= 0 && b <= 255) ? value.map(b => b.toString(16).padStart(2, '0')).join('') : ''; }
 /** Local-only encoding. Never pass its return value to an API, storage, URL, or analytics. */
-export function customerToken(bundle, seedText, policy, owner, service) {
+export function customerToken(bundle, seedText, policy, owner, service, admit) {
     const binding = policy.runtime?.instanceBinding;
     const c = bundle.config;
     if (!binding || !['native', 'policyWallet'].includes(bundle.route) || bundle.version !== 1 || bundle.profile !== 'allowit-stellar-wallet-v1' || bundle.policyId !== policy.id || bundle.network !== policy.network || bundle.sourceHash !== policy.sourceHash || bundle.irHash !== policy.irHash || c.policySource !== policy.code || bundle.wallet !== binding.wallet || bundle.route !== binding.route || bundle.moduleDigest !== binding.moduleDigest || bytesHex(c.policyInstance) !== binding.policyInstance || bytesHex(c.sourceHash) !== policy.sourceHash || bytesHex(c.moduleDigest) !== binding.moduleDigest || c.owner !== owner || c.network !== policy.network || c.wallet !== bundle.wallet || c.route !== bundle.route || c.asset !== policy.mint || c.assetSymbol !== policy.token || (binding.maxFeeStroops !== undefined && c.maxFeeStroops !== binding.maxFeeStroops) || (binding.assetIssuer !== undefined && c.assetIssuer !== binding.assetIssuer) || bundle.endpoints.execute !== '/api/native/execute' || bundle.endpoints.status !== '/api/native/execute/status' || !['sourceHash', 'moduleDigest'].every(k => /^[a-f0-9]{64}$/.test(bundle[k])))
         throw new Error('The public deployment metadata does not match the selected Stellar policy.');
-    const portable = portableExport(bundle, c, policy);
+    const portable = portableExport(bundle, c, policy, admit);
     if (bundle.route === 'policyWallet' && portable.top.language === undefined && (!['simple_policy_engine', 'common_policy_engine', 'custom_policy'].includes(String(c.policyEngine)) || c.policyEngine !== binding.policyEngine))
         throw new Error('The policy engine differs from the selected wallet.');
     const agent = customerPublicKey(seedText);

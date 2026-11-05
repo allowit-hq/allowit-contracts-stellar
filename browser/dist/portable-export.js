@@ -7,7 +7,9 @@ export const hexHash = (value) => typeof value === 'string' && /^[0-9a-f]{64}$/.
 function reject() { throw new Error('The portable Stellar source or consent differs from the selected policy. Nothing was saved.'); }
 const same = (a, b) => canonicalJson(a) === canonicalJson(b);
 /** Validate portable identity without rewriting its signed values or claiming current RPC authority. */
-export function portableExport(bundle, config, policy) {
+export function portableExport(bundle, config, policy, admit) {
+    if (typeof admit !== 'function')
+        reject();
     const binding = policy.runtime?.instanceBinding;
     const expected = object(binding?.portable);
     const claimsPortable = bundle.language !== undefined || bundle.portable !== undefined || config.language === 'portable' || binding?.language === 'allowit-portable-v1' || expected !== null;
@@ -17,14 +19,16 @@ export function portableExport(bundle, config, policy) {
         return { top: {}, config: {} };
     }
     const p = object(bundle.portable), rules = p?.rules ?? [], asset = object(p?.asset), build = object(p?.build), params = object(p?.params);
+    if (!p || admit(p) !== true)
+        reject();
     if (!expected || !p || !params || !asset || !build || bundle.language !== 'allowit-portable-v1' || p.language !== bundle.language || config.language !== 'portable'
         || policy.irHash !== '' || bundle.irHash !== '' || p.sourceHash !== policy.sourceHash || digest(policy.code) !== policy.sourceHash
         || !['standard', 'custom'].includes(String(p.tier)) || !Array.isArray(rules) || !rules.every(v => typeof v === 'string')
         || (p.tier === 'custom' && rules.length !== 0) || !hexHash(p.paramsHash) || digest(canonicalJson(params)) !== p.paramsHash
         || !same(p, expected) || !same(config.params ?? {}, params)
         || asset.address !== config.asset || asset.symbol !== config.assetSymbol || asset.decimals !== 7
-        || !Array.isArray(p.unresolved) || p.unresolved.length !== 0 || !Array.isArray(build.prefix) || !build.prefix.every(v => typeof v === 'string')
-        || typeof build.writesState !== 'boolean' || !(typeof build.libraryRevision === 'string' && /^[0-9a-f]{40}$/.test(build.libraryRevision)) || !Number.isInteger(build.attempts) || Number(build.attempts) < 1 || Number(build.attempts) > 3)
+        || !Array.isArray(p.unresolved) || !p.unresolved.every(v => typeof v === 'string') || !Array.isArray(build.prefix) || !build.prefix.every(v => typeof v === 'string')
+        || typeof build.writesState !== 'boolean' || !(typeof build.libraryRevision === 'string') || !Number.isInteger(build.attempts))
         reject();
     if (stellarAssetContractId(String(config.assetSymbol), config.assetIssuer == null ? null : String(config.assetIssuer), policy.network) !== config.asset)
         reject();
@@ -40,7 +44,7 @@ export function portableExport(bundle, config, policy) {
         reject();
     // Whitelist metadata shapes. Params are owner-signed data, not arbitrary server response metadata.
     const portable = { language: p.language, sourceHash: p.sourceHash, tier: p.tier, ...(rules.length ? { rules } : {}), params, paramsHash: p.paramsHash,
-        asset: { symbol: asset.symbol, address: asset.address, decimals: asset.decimals }, unresolved: [], build: { prefix: build.prefix, writesState: build.writesState, libraryRevision: build.libraryRevision, attempts: build.attempts }, ...(kinds ? { kinds } : {}) };
+        asset: { symbol: asset.symbol, address: asset.address, decimals: asset.decimals }, unresolved: [...p.unresolved], build: { prefix: build.prefix, writesState: build.writesState, libraryRevision: build.libraryRevision, attempts: build.attempts }, ...(kinds ? { kinds } : {}) };
     // Omitted empty rules have their native serde default; preserve a supplied empty array literally.
     if (Object.hasOwn(p, 'rules'))
         Object.assign(portable, { rules });

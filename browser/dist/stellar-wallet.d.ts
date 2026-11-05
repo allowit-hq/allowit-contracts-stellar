@@ -30,10 +30,16 @@ export interface StellarSignInChallenge {
     origin: string;
     expiresAt: string;
 }
-/** Exact current server sign-in domain; it cannot be substituted with a spending approval. */
-export declare function validateStellarSignInChallenge(challenge: StellarSignInChallenge, owner: string, origin: string, now?: number): void;
+/** Bind the exact sign-in purpose, account, Origin and nonce. The caller admits timestamp freshness. */
+export declare function stellarSignInChallengeTimes(challenge: StellarSignInChallenge, owner: string, origin: string): {
+    issuedAt: number;
+    expiresAt: number;
+};
 /** A native wallet capability. HTTP sessions and their admission stay with the app. */
-export declare function connectStellarWallet(network: StellarNetwork, signal?: AbortSignal): Promise<{
+export declare function connectStellarWallet(network: StellarNetwork, admitTimes: (times: {
+    issuedAt: number;
+    expiresAt: number;
+}) => void, signal?: AbortSignal): Promise<{
     address: string;
     network: 'stellar';
     validateChallenge(challenge: StellarSignInChallenge): void;

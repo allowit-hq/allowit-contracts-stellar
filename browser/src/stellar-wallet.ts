@@ -64,8 +64,8 @@ async function checkNetwork(network: StellarNetwork): Promise<void> {
   if (value.networkPassphrase !== STELLAR_NETWORKS[network].passphrase) throw new Error(`Select ${STELLAR_NETWORKS[network].label} in Freighter, then try again.`);
 }
 export interface StellarSignInChallenge {id: string; message: string; address: string; origin: string; expiresAt: string}
-/** Exact current server sign-in domain; it cannot be substituted with a spending approval. */
-export function validateStellarSignInChallenge(challenge: StellarSignInChallenge, owner: string, origin: string, now = Date.now()): void {
+/** Bind the exact sign-in purpose, account, Origin and nonce. The caller admits timestamp freshness. */
+export function stellarSignInChallengeTimes(challenge: StellarSignInChallenge, owner: string, origin: string): {issuedAt:number;expiresAt:number} {
   const invalid = () => new Error('The sign-in challenge is invalid or expired. Nothing was signed.');
   let site: URL;
   try {site = new URL(origin); stellarAccountKey(owner);} catch {throw invalid();}
@@ -82,22 +82,23 @@ export function validateStellarSignInChallenge(challenge: StellarSignInChallenge
   };
   if (times.length !== 2 || times[1] !== challenge.expiresAt) throw invalid();
   const issued = timestamp(times[0]), expiry = timestamp(times[1]);
-  if (expiry - issued !== 300_000 || issued > now + 30_000 || now - issued > 300_000 || expiry <= now) throw invalid();
+  return {issuedAt:issued,expiresAt:expiry};
 }
 
 /** A native wallet capability. HTTP sessions and their admission stay with the app. */
-export async function connectStellarWallet(network: StellarNetwork, signal?: AbortSignal): Promise<{
+export async function connectStellarWallet(network: StellarNetwork, admitTimes:(times:{issuedAt:number;expiresAt:number})=>void, signal?: AbortSignal): Promise<{
   address: string;
   network: 'stellar';
   validateChallenge(challenge: StellarSignInChallenge): void;
   signMessage(message: string): Promise<string>;
 }> {
+  if(typeof admitTimes!=='function')throw new Error('Provide the app sign-in admission capability.');
   const access = await freighter.requestAccess(); failed(access.error); stellarAccountKey(access.address);
   signal?.throwIfAborted(); await checkNetwork(network); signal?.throwIfAborted();
   return {
     address: access.address,
     network: 'stellar',
-    validateChallenge(challenge: StellarSignInChallenge): void {validateStellarSignInChallenge(challenge, access.address, location.origin);},
+    validateChallenge(challenge: StellarSignInChallenge): void {admitTimes(stellarSignInChallengeTimes(challenge, access.address, location.origin));},
     async signMessage(message: string): Promise<string> {
       signal?.throwIfAborted();
       const signed = await freighter.signMessage(message, {address: access.address, networkPassphrase: STELLAR_NETWORKS[network].passphrase}); failed(signed.error);

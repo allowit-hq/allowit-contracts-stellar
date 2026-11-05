@@ -1,6 +1,7 @@
 export { canonicalJson, digest } from './consent-codec.js';
 export declare const object: (value: unknown) => Record<string, unknown> | null;
 export declare const hexHash: (value: unknown) => value is string;
+export type PortableAdmission = (portable: Readonly<Record<string, unknown>>) => boolean;
 export type PortablePolicy = {
     id: string;
     revision?: number;
@@ -15,7 +16,7 @@ export type PortablePolicy = {
     };
 };
 /** Validate portable identity without rewriting its signed values or claiming current RPC authority. */
-export declare function portableExport(bundle: Record<string, unknown>, config: Record<string, unknown>, policy: PortablePolicy): {
+export declare function portableExport(bundle: Record<string, unknown>, config: Record<string, unknown>, policy: PortablePolicy, admit: PortableAdmission): {
     top: Record<string, unknown>;
     config: Record<string, unknown>;
 };

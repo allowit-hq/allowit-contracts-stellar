@@ -77,8 +77,8 @@ async function checkNetwork(network) {
     if (value.networkPassphrase !== STELLAR_NETWORKS[network].passphrase)
         throw new Error(`Select ${STELLAR_NETWORKS[network].label} in Freighter, then try again.`);
 }
-/** Exact current server sign-in domain; it cannot be substituted with a spending approval. */
-export function validateStellarSignInChallenge(challenge, owner, origin, now = Date.now()) {
+/** Bind the exact sign-in purpose, account, Origin and nonce. The caller admits timestamp freshness. */
+export function stellarSignInChallengeTimes(challenge, owner, origin) {
     const invalid = () => new Error('The sign-in challenge is invalid or expired. Nothing was signed.');
     let site;
     try {
@@ -106,11 +106,12 @@ export function validateStellarSignInChallenge(challenge, owner, origin, now = D
     if (times.length !== 2 || times[1] !== challenge.expiresAt)
         throw invalid();
     const issued = timestamp(times[0]), expiry = timestamp(times[1]);
-    if (expiry - issued !== 300_000 || issued > now + 30_000 || now - issued > 300_000 || expiry <= now)
-        throw invalid();
+    return { issuedAt: issued, expiresAt: expiry };
 }
 /** A native wallet capability. HTTP sessions and their admission stay with the app. */
-export async function connectStellarWallet(network, signal) {
+export async function connectStellarWallet(network, admitTimes, signal) {
+    if (typeof admitTimes !== 'function')
+        throw new Error('Provide the app sign-in admission capability.');
     const access = await freighter.requestAccess();
     failed(access.error);
     stellarAccountKey(access.address);
@@ -120,7 +121,7 @@ export async function connectStellarWallet(network, signal) {
     return {
         address: access.address,
         network: 'stellar',
-        validateChallenge(challenge) { validateStellarSignInChallenge(challenge, access.address, location.origin); },
+        validateChallenge(challenge) { admitTimes(stellarSignInChallengeTimes(challenge, access.address, location.origin)); },
         async signMessage(message) {
             signal?.throwIfAborted();
             const signed = await freighter.signMessage(message, { address: access.address, networkPassphrase: STELLAR_NETWORKS[network].passphrase });

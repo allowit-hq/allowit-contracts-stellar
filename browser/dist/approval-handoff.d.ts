@@ -1,3 +1,4 @@
+import { type PortableAdmission } from './portable-export.js';
 export interface ApprovalPolicy {
     id: string;
     revision: number;
@@ -50,7 +51,7 @@ export declare function parseStellarApprovalIntent(fragment: string): StellarApp
 /** Only the original owner-stored policy can continue. Handoff source never creates or replaces policy. */
 export declare function matchStellarApproval<P extends ApprovalPolicy>(v: StellarApprovalIntent, policy: P | undefined, owner: string, network: string): P;
 /** Rebuilds the export from checked public fields only. Unexpected response fields never reach the file. */
-export declare function publicStellarBundle(value: unknown, policy: ApprovalPolicy, owner: string, service: unknown): {
+export declare function publicStellarBundle(value: unknown, policy: ApprovalPolicy, owner: string, service: unknown, admit: PortableAdmission): {
     version: number;
     profile: string;
     network: string;

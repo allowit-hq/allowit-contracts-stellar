@@ -1,4 +1,4 @@
-import {portableExport} from './portable-export.js';
+import {portableExport,type PortableAdmission} from './portable-export.js';
 import {stellarAccountKey} from './stellar-wallet.js';
 import {ed25519} from '@noble/curves/ed25519';
 
@@ -14,16 +14,17 @@ function decodeSeed(text:string):Uint8Array{
  const seed=new Uint8Array(bytes.slice(1,33));if(bytes[0]!==144||encodeKey(144,seed)!==text)throw new Error('The customer signing key checksum is invalid.');return seed;
 }
 export function customerPublicKey(seedText:string):string{const seed=decodeSeed(seedText);try{return encodeKey(48,ed25519.getPublicKey(seed));}finally{seed.fill(0);}}
-export function newCustomerKey():{seed:string;publicKey:string}{const seed=crypto.getRandomValues(new Uint8Array(32));try{return{seed:encodeKey(144,seed),publicKey:encodeKey(48,ed25519.getPublicKey(seed))};}finally{seed.fill(0);}}
+/** Encode native keys from caller-owned entropy. The caller owns generation and secret retention. */
+export function customerKeyFromEntropy(entropy:Uint8Array):{seed:string;publicKey:string}{if(!(entropy instanceof Uint8Array)||entropy.length!==32)throw new Error('Provide exactly 32 bytes of customer key entropy.');const seed=new Uint8Array(entropy);try{return{seed:encodeKey(144,seed),publicKey:encodeKey(48,ed25519.getPublicKey(seed))};}finally{seed.fill(0);}}
 export type PublicStellarBundle={version:number;profile:string;network:string;policyId:string;sourceHash:string;irHash:string;language?:string;portable?:Record<string,unknown>;sourceApproval?:unknown;moduleDigest:string;wallet:string;route:'native'|'policyWallet';config:Record<string,unknown>;endpoints:{execute:string;status:string}};
 export type TokenPolicy={id:string;revision?:number;network:string;sourceHash:string;irHash:string;code:string;mint:string;token:string;runtime?:{instanceBinding?:Record<string,unknown>;authorization?:unknown}};
 function bytesHex(value:unknown):string{return Array.isArray(value)&&value.length===32&&value.every(b=>Number.isInteger(b)&&b>=0&&b<=255)?value.map(b=>b.toString(16).padStart(2,'0')).join(''):'';}
 /** Local-only encoding. Never pass its return value to an API, storage, URL, or analytics. */
-export function customerToken(bundle:PublicStellarBundle,seedText:string,policy:TokenPolicy,owner:string,service:unknown):string{
+export function customerToken(bundle:PublicStellarBundle,seedText:string,policy:TokenPolicy,owner:string,service:unknown,admit:PortableAdmission):string{
  const binding=policy.runtime?.instanceBinding;
  const c=bundle.config;
  if(!binding||!['native','policyWallet'].includes(bundle.route)||bundle.version!==1||bundle.profile!=='allowit-stellar-wallet-v1'||bundle.policyId!==policy.id||bundle.network!==policy.network||bundle.sourceHash!==policy.sourceHash||bundle.irHash!==policy.irHash||c.policySource!==policy.code||bundle.wallet!==binding.wallet||bundle.route!==binding.route||bundle.moduleDigest!==binding.moduleDigest||bytesHex(c.policyInstance)!==binding.policyInstance||bytesHex(c.sourceHash)!==policy.sourceHash||bytesHex(c.moduleDigest)!==binding.moduleDigest||c.owner!==owner||c.network!==policy.network||c.wallet!==bundle.wallet||c.route!==bundle.route||c.asset!==policy.mint||c.assetSymbol!==policy.token||(binding.maxFeeStroops!==undefined&&c.maxFeeStroops!==binding.maxFeeStroops)||(binding.assetIssuer!==undefined&&c.assetIssuer!==binding.assetIssuer)||bundle.endpoints.execute!=='/api/native/execute'||bundle.endpoints.status!=='/api/native/execute/status'||!['sourceHash','moduleDigest'].every(k=>/^[a-f0-9]{64}$/.test(bundle[k as 'sourceHash'])))throw new Error('The public deployment metadata does not match the selected Stellar policy.');
- const portable=portableExport(bundle as unknown as Record<string,unknown>,c,policy);
+ const portable=portableExport(bundle as unknown as Record<string,unknown>,c,policy,admit);
  if(bundle.route==='policyWallet'&&portable.top.language===undefined&&(!['simple_policy_engine','common_policy_engine','custom_policy'].includes(String(c.policyEngine))||c.policyEngine!==binding.policyEngine))throw new Error('The policy engine differs from the selected wallet.');
  const agent=customerPublicKey(seedText);
  const server=typeof c.server==='string'?c.server:'';

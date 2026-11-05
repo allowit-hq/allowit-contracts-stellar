@@ -61,7 +61,7 @@ export function matchStellarApproval(v, policy, owner, network) {
 const bytesHex = (value) => Array.isArray(value) && value.length === 32 && value.every(b => Number.isInteger(b) && b >= 0 && b <= 255) ? value.map((b) => b.toString(16).padStart(2, '0')).join('') : '';
 const plainObject = (value) => value && typeof value === 'object' && !Array.isArray(value) ? value : null;
 /** Rebuilds the export from checked public fields only. Unexpected response fields never reach the file. */
-export function publicStellarBundle(value, policy, owner, service) {
+export function publicStellarBundle(value, policy, owner, service, admit) {
     const b = plainObject(value), c = plainObject(b?.config), e = plainObject(b?.endpoints), binding = policy.runtime?.instanceBinding;
     const server = typeof c?.server === 'string' ? c.server : '';
     const agent = typeof c?.agent === 'string' ? c.agent : '';
@@ -86,7 +86,7 @@ export function publicStellarBundle(value, policy, owner, service) {
         || bytesHex(c.policyInstance) !== binding.policyInstance || bytesHex(c.sourceHash) !== policy.sourceHash || bytesHex(c.moduleDigest) !== binding.moduleDigest
         || e.execute !== '/api/native/execute' || e.status !== '/api/native/execute/status')
         throw new Error('The public agent bundle does not match this policy. Nothing was saved.');
-    const portable = portableExport(b, c, policy);
+    const portable = portableExport(b, c, policy, admit);
     const bytes = (v) => [...v];
     return {
         ...portable.top, version: 1, profile: 'allowit-stellar-wallet-v1', network: policy.network, policyId: policy.id, sourceHash: policy.sourceHash, irHash: policy.irHash,

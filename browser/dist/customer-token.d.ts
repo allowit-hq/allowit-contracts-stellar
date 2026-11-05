@@ -1,5 +1,7 @@
+import { type PortableAdmission } from './portable-export.js';
 export declare function customerPublicKey(seedText: string): string;
-export declare function newCustomerKey(): {
+/** Encode native keys from caller-owned entropy. The caller owns generation and secret retention. */
+export declare function customerKeyFromEntropy(entropy: Uint8Array): {
     seed: string;
     publicKey: string;
 };
@@ -37,4 +39,4 @@ export type TokenPolicy = {
     };
 };
 /** Local-only encoding. Never pass its return value to an API, storage, URL, or analytics. */
-export declare function customerToken(bundle: PublicStellarBundle, seedText: string, policy: TokenPolicy, owner: string, service: unknown): string;
+export declare function customerToken(bundle: PublicStellarBundle, seedText: string, policy: TokenPolicy, owner: string, service: unknown, admit: PortableAdmission): string;
