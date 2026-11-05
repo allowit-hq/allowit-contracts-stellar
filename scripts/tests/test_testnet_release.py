@@ -1,0 +1,157 @@
+"""Release failures must stop before signing or publication; no live network is used."""
+import copy
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+from types import SimpleNamespace
+import unittest
+from unittest.mock import Mock, patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import testnet_release as release
+from stellar_sdk import Account, Address, Keypair, Network, TransactionBuilder, scval, xdr
+
+
+def wasm():
+    key, value = b"allowit_custody_layout", b"4"
+    string = lambda data: len(data).to_bytes(4, "big") + data + b"\0" * (-len(data) % 4)
+    meta = (0).to_bytes(4, "big") + string(key) + string(value)
+    section = bytes([len(b"contractmetav0")]) + b"contractmetav0" + meta
+    assert len(section) < 128
+    return b"\0asm\x01\0\0\0\0" + bytes([len(section)]) + section
+
+
+HEADER = 'AAAAHcZUtF0kU/EUPP5rVPxlxXrXJkZACUX7owA2H+03VA2SBYTDT40HB+AoPdOAmvZahm8nLETwKm772EfLg3gA0aoAAAAAaulRZAAAAAAAAAABAAAAALVdELK7fShO1cA6R6XhtZDJD1eDVUccxFB7voIE0jyLAAAAQIwULdseRt+SGg3UVPP2Uxrc17N4FmHi7pn8BpK+Ti8A8T837IwAWSW7dvmXYJB+ygIPmwXf0y2fpW8vcMducA5OL+zh2o752a5vI7tUrIakdaCY1POwPOGDU2/mvc9l5K4nAAZtG3JCSZZ1eeCxVKeLFgh7tnqMpZohzRF5U7keAFRjHA3gtrOnZAAAAAAssvgWS94AAAAAAAAAAAAOUFMAAABkAExLQAAAAMhxyYyFUWF57GaIY/xBq6LJb98hxNe4yeDPavXUhJXd7HkUDjOFVGqdFFv2dUYsj7l9wPt801UBN1Uzuf6cnEUMRMBoDPQBwpeD7Ri4S3ftkKh9f06Ejj/Mx09WJZoMPWi2cm6r8ecN/675yBcoOos0c4aKRh6aDbiou7DptxnL1QAAAAA='
+
+def ledger(sequence):
+    header = xdr.LedgerHeader.from_xdr(HEADER)
+    header.ledger_seq = xdr.Uint32(sequence)
+    header.scp_value.close_time = xdr.TimePoint(xdr.Uint64(int(datetime.now(timezone.utc).timestamp()) - 5))
+    return {"sequence": sequence, "hash": hashlib.sha256(header.to_xdr_bytes()).hexdigest(),
+        "header_xdr": header.to_xdr(), "closed_at": datetime.fromtimestamp(header.scp_value.close_time.time_point.uint64, timezone.utc).isoformat()}
+
+
+def make_bundle(root):
+    source = b"reviewed policy bytes\n"
+    result = {"schema": 1, "repository": release.REPOSITORY, "tag": "v0.2.0", "revision": "a" * 40,
+        "tag_object": "b" * 40, "workflow_revision": "c" * 40, "core_source": release.CORE_SOURCE,
+        "toolchain": {"rust": "1.98.0", "stellar": "28.1.0"}, "artifacts": {},
+        "sample_policy": {"file": "sample-policy.rs", "sha256": release.digest(source), "rules": ["payment_limit"]}}
+    for kind, name in release.CONTRACTS.items():
+        data = wasm()
+        (root / name).write_bytes(data)
+        result["artifacts"][kind] = {"file": name, "bytes": len(data), "sha256": release.digest(data)}
+    (root / "sample-policy.rs").write_bytes(source)
+    release.write(root / "source-manifest.json", result)
+    release.write(root / "release-build.json", release.build_record(result, "90:1"))
+    return result
+
+
+def constructor(config, module, salt):
+    def value(item):
+        if type(item) is int:
+            return scval.to_enum("Int", scval.to_int128(item))
+        if isinstance(item, list):
+            return scval.to_enum("List", scval.to_vec([value(v) for v in item]))
+        if release.ca.is_address(item):
+            return scval.to_enum("Addr", scval.to_address(item))
+        return scval.to_enum("Str", scval.to_string(item))
+    fields = {key: scval.to_address(config[key]) for key in ("owner", "agent", "server", "asset")}
+    fields.update(policy_instance=scval.to_bytes(bytes.fromhex(config["policy_instance"])),
+        source_digest=scval.to_bytes(bytes.fromhex(config["source_digest"])),
+        rules=scval.to_vec([scval.to_enum(rule, None) for rule in config["rules"]]),
+        params=scval.to_struct({key: value(item) for key, item in config["params"].items()}),
+        x402_enabled=scval.to_bool(config["x402_enabled"]))
+    return xdr.CreateContractArgsV2(
+        xdr.ContractIDPreimage(xdr.ContractIDPreimageType.CONTRACT_ID_PREIMAGE_FROM_ADDRESS,
+            from_address=xdr.ContractIDPreimageFromAddress(Address(config["owner"]).to_xdr_sc_address(), xdr.Uint256(salt))),
+        xdr.ContractExecutable(xdr.ContractExecutableType.CONTRACT_EXECUTABLE_WASM, wasm_hash=xdr.Hash(bytes.fromhex(module))),
+        [scval.to_struct(fields)])
+
+
+class ReleaseSafety(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.manifest = make_bundle(self.root)
+        self.owner, self.agent, self.server = (Keypair.random() for _ in range(3))
+        self.config, self.salt, self.wallet = release.wallet_intent(self.manifest, 'common', self.owner.public_key, self.agent.public_key, self.server.public_key)
+        self.module = self.manifest['artifacts']['common']['sha256']
+
+    def test_bundle_native_constructor_and_stable_identity(self):
+        self.assertEqual(release.check_bundle(self.root), self.manifest)
+        packet = constructor(self.config, self.module, self.salt)
+        release.check_constructor(packet, self.config, self.module, self.salt)
+        changed, salt, wallet = release.wallet_intent(self.manifest, 'common', self.owner.public_key, self.server.public_key, self.agent.public_key)
+        self.assertEqual((salt, wallet, changed['policy_instance']), (self.salt, self.wallet, self.config['policy_instance']))
+        self.assertNotEqual(changed['server'], self.config['server'])
+        other = {**self.manifest, 'tag':'v0.3.0'}
+        self.assertNotEqual(release.wallet_intent(other, 'common', self.owner.public_key, self.agent.public_key, self.server.public_key)[2], self.wallet)
+
+    def test_strict_constructor_variants_and_intent(self):
+        for field, value in [('server',self.agent.public_key),('policy_instance','11'*32),('rules',[]),('x402_enabled',True)]:
+            changed=copy.deepcopy(self.config);changed[field]=value
+            with self.subTest(field=field),self.assertRaises(ValueError):
+                release.check_constructor(constructor(changed,self.module,self.salt),self.config,self.module,self.salt)
+        packet=constructor(self.config,self.module,self.salt)
+        fields=scval.from_struct(packet.constructor_args[0]);params=scval.from_struct(fields['params'])
+        params['destinations']=scval.to_enum('List',scval.to_vec([scval.to_enum('Str',scval.to_string(self.agent.public_key))]))
+        fields['params']=scval.to_struct(params);packet.constructor_args[0]=scval.to_struct(fields)
+        with self.assertRaises(ValueError):release.check_constructor(packet,self.config,self.module,self.salt)
+
+    def test_bundle_provenance_and_paths_fail_before_network(self):
+        for mutation in ('wasm','source','core','path'):
+            make_bundle(self.root)
+            if mutation=='wasm':(self.root/release.CONTRACTS['common']).write_bytes(wasm()+b'wrong')
+            elif mutation=='source':(self.root/'sample-policy.rs').write_text('wrong')
+            else:
+                changed=copy.deepcopy(self.manifest)
+                if mutation=='core':changed['core_source']='wrong'
+                else:changed['artifacts']['common']['file']='../outside.wasm'
+                release.write(self.root/'source-manifest.json',changed)
+            with self.subTest(mutation=mutation),patch.object(release,'SorobanServer') as rpc,self.assertRaises(ValueError):
+                release.Deployment(self.root,self.root/'out',self.root/'private',self.owner,self.agent.public_key,self.server.public_key)
+            rpc.assert_not_called()
+
+    def test_hostile_tags_and_wrong_run_provenance(self):
+        for tag in ('main','--option','v01.2.0','v0.3.0; bad'):
+            with patch.object(release,'git') as git,self.assertRaises(ValueError):release.release_identity(self.root,tag,'a'*40)
+            git.assert_not_called()
+        with patch.dict(os.environ,{'GITHUB_RUN_ID':'100','GITHUB_RUN_ATTEMPT':'1','GITHUB_WORKFLOW_SHA':'c'*40}),patch.object(release,'check_canonical_tag'),patch.object(release,'git',return_value='c'*40),patch.object(release,'public_run',return_value=SimpleNamespace(returncode=0)),patch.object(release,'gh_json',return_value={'path':'.github/workflows/untrusted.yml'}),self.assertRaisesRegex(ValueError,'canonical main'):
+            release.current_authority(self.manifest)
+
+    def test_public_children_use_explicit_environment(self):
+        with patch.dict(os.environ,{'STELLAR_TESTNET_OWNER_SECRET':'synthetic','GEMINI_API_KEY':'synthetic','GH_TOKEN':'scoped','ALLOWIT_AGENT_TOKEN':'synthetic'}):
+            env=release.public_env()
+            self.assertFalse({'STELLAR_TESTNET_OWNER_SECRET','GEMINI_API_KEY','GH_TOKEN','ALLOWIT_AGENT_TOKEN'}&env.keys())
+            self.assertEqual(release.public_env(True)['GH_TOKEN'],'scoped')
+            for code in (0,17):
+                result=release.public_run([sys.executable,'-c','import os,sys; assert all(k not in os.environ for k in ("STELLAR_TESTNET_OWNER_SECRET","GEMINI_API_KEY","GH_TOKEN","ALLOWIT_AGENT_TOKEN"));sys.exit('+str(code)+')'])
+                self.assertEqual(result.returncode,code)
+
+    def test_exact_current_trigger_and_successful_build_attempt_are_rechecked(self):
+        event=self.root/'event.json';release.write(event,{'workflow_run':{'id':90,'run_attempt':1}})
+        current={'path':'.github/workflows/testnet-release.yml','event':'workflow_run','head_repository':{'full_name':'allowit-hq/allowit-contracts-stellar'},'head_branch':'main','head_sha':'c'*40,'run_attempt':1}
+        built={'path':'.github/workflows/release.yml','event':'workflow_dispatch','head_repository':{'full_name':'allowit-hq/allowit-contracts-stellar'},'head_branch':'main','head_sha':'c'*40,'run_attempt':1,'conclusion':'success'}
+        env={'GITHUB_RUN_ID':'100','GITHUB_RUN_ATTEMPT':'1','GITHUB_WORKFLOW_SHA':'c'*40,'RELEASE_BUILD_RUN_ID':'90','RELEASE_BUILD_RUN_ATTEMPT':'1','GITHUB_EVENT_PATH':str(event)}
+        with patch.dict(os.environ,env),patch.object(release,'check_canonical_tag'),patch.object(release,'git',return_value='c'*40),patch.object(release,'public_run',return_value=SimpleNamespace(returncode=0)):
+            for mutation in (None,'head_sha','path','conclusion','run_attempt'):
+                selected=copy.deepcopy(built)
+                if mutation:selected[mutation]='wrong'
+                with patch.object(release,'gh_json',side_effect=[current,selected]):
+                    if mutation:
+                        with self.assertRaises(ValueError):release.current_authority(self.manifest)
+                    else:self.assertEqual(release.current_authority(self.manifest)['build_run'],'90:1')
+            release.write(event,{'workflow_run':{'id':89,'run_attempt':1}})
+            with patch.object(release,'gh_json',return_value=current),self.assertRaisesRegex(ValueError,'trigger'):release.current_authority(self.manifest)
+
+    def test_immutable_run_snapshots_never_clobber(self):
+        path=self.root/'snapshot.json';release.immutable(path,b'first');release.immutable(path,b'first')
+        with self.assertRaises(ValueError):release.immutable(path,b'second')
+        self.assertEqual(path.read_bytes(),b'first')
+
+if __name__=='__main__':unittest.main()

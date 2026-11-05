@@ -57,6 +57,10 @@ def state():
 
 
 class NativeAdmin(unittest.TestCase):
+    def test_native_param_keys_match_portable_policy(self):
+        from policy_source import PARAM_KEYS
+        self.assertEqual(tuple(ca.PARAM_KEYS), tuple(PARAM_KEYS))
+
     def test_owner_only_admission(self):
         wa.owner_only(state())
         value = state()
@@ -799,7 +803,9 @@ class ContractAdmin(unittest.TestCase):
         call = CALL
         head = HEAD + call("destinations")
         diverging = (
-            # Native code that runs inside the offchain evaluator process before `main`.
+            # The std-only compiler accepts native assembly. Source admission must reject it.
+            'core::arch::global_asm!("nop");\n',
+            # Retain the hostile pre-main constructor in the rejection corpus on every host.
             'core::arch::global_asm!(".section __DATA,__mod_init_func", ".quad _p", "_p:", "mov x0, #42", "bl _exit");\n',
             'fn g() { core::arch::asm!("nop"); }\n',
             "use core::arch::global_asm as assert;\n",

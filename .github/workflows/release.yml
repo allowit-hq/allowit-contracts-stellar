@@ -1,0 +1,92 @@
+name: Build Stellar release
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing approved annotated vX.Y.Z tag
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: stellar-release-build-${{ inputs.tag || github.ref_name }}
+  queue: max
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      tag: ${{ steps.identity.outputs.tag }}
+      revision: ${{ steps.identity.outputs.revision }}
+      tag_object: ${{ steps.identity.outputs.tag_object }}
+      workflow_revision: ${{ steps.identity.outputs.workflow_revision }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: automation
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r automation/scripts/requirements-admin.txt
+      - name: Verify annotated release tag and trusted workflow
+        id: identity
+        working-directory: automation
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags https://github.com/allowit-hq/allowit-contracts-stellar.git refs/heads/main:refs/release/main
+          python scripts/testnet_release.py metadata --repository . --tag "$RELEASE_TAG" --workflow-sha "$WORKFLOW_SHA" --output "$RUNNER_TEMP/release-identity.json" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.identity.outputs.revision }}
+          persist-credentials: false
+          path: source
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt
+          targets: wasm32v1-none
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: source -> target
+          key: stellar-release
+      - name: Install pinned Stellar CLI
+        run: |
+          set -euo pipefail
+          curl -fsSL https://github.com/stellar/stellar-cli/releases/download/v28.1.0/stellar-cli-28.1.0-x86_64-unknown-linux-gnu.tar.gz -o "$RUNNER_TEMP/stellar.tar.gz"
+          echo "c1680deee94301d33ada7a17f98411e642a4248c727afbd2e43050d345746462  $RUNNER_TEMP/stellar.tar.gz" | sha256sum -c -
+          mkdir "$RUNNER_TEMP/stellar-cli"
+          tar -xzf "$RUNNER_TEMP/stellar.tar.gz" -C "$RUNNER_TEMP/stellar-cli"
+          echo "$RUNNER_TEMP/stellar-cli" >> "$GITHUB_PATH"
+      - name: Validate and build exact release source without deployment secrets
+        working-directory: source
+        run: |
+          set -euo pipefail
+          python scripts/check-policy-bindings.py
+          cargo fmt --all --check
+          scripts/build-contracts.sh
+          cargo test --workspace --locked
+          cargo test --locked --manifest-path stellar/core/Cargo.toml
+          cargo clippy --workspace --locked --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path stellar/core/Cargo.toml --all-targets -- -D warnings
+          python -m unittest discover -s scripts/tests -v
+      - name: Verify release automation
+        working-directory: automation
+        run: python -m unittest discover -s scripts/tests -p test_testnet_release.py -v
+      - name: Bundle exact artifacts and source identity
+        run: |
+          python automation/scripts/testnet_release.py bundle --source source --identity "$RUNNER_TEMP/release-identity.json" --output bundle
+          cp "$RUNNER_TEMP/release-identity.json" bundle/release-identity.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stellar-release-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: bundle/
+          if-no-files-found: error
+          retention-days: 30

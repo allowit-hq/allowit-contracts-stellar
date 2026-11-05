@@ -65,3 +65,8 @@ jobs:
         run: scripts/build-contracts.sh
       - name: Local authorization and custody regressions
         run: cargo test --workspace --locked
+      - name: Native administration and release automation regressions
+        run: |
+          python3 -m venv "$RUNNER_TEMP/wallet-admin"
+          "$RUNNER_TEMP/wallet-admin/bin/pip" install -r scripts/requirements-admin.txt
+          "$RUNNER_TEMP/wallet-admin/bin/python" -m unittest discover -s scripts/tests -v

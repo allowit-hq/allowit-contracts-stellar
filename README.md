@@ -156,6 +156,10 @@ allowit_engine_parent.wasm
 
 Write a public manifest of source hashes and artifact hashes with `python3 scripts/artifacts.py --output PATH`.
 
+Approved release tags also build, deploy and verify the release on Testnet before publishing its
+GitHub Release. See [Testnet releases](docs/testnet-releases.md) for environment configuration,
+deployment scope and reruns.
+
 > [!TIP]
 > The `AllowitCustomPolicy` sample source is `crates/custom-policy/policy/policy.rs`. Its contract compiles that file verbatim as a module, and `build.rs` binds `SOURCE_HASH` to its bytes. No SDK code generation is involved. `scripts/policy-smoke.rs` compiles the sample against the host backend with plain `rustc`. `cargo test` builds and runs it, then compares its outcomes on the shared vectors in `scripts/policy-vectors.rs` with the Soroban backend and the custom, standard and simple Wasm. `STELLAR_BIN` selects the Stellar CLI executable.
 
