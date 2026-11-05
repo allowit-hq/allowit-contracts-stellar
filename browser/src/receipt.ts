@@ -1,0 +1,18 @@
+export interface StellarOperationReceipt {chain:'stellar';network:'stellar:testnet'|'stellar:mainnet'|'stellar:pubnet';signature:string;requestHash:string;invocationIndex:0;finalizedLedger:string;result:'success'|'failed';action:{type:'stellar-transfer';amountUnits:string;asset:string;recipient:string}}
+export const isStellarReceipt = (value: {chain?: unknown}) => value.chain === 'stellar';
+export function parseStellarReceipt(q: Record<string, unknown>, field: string, u64: (value: unknown, field: string) => string, fail: (field: string, what?: string) => Error): StellarOperationReceipt {
+  const record = (value: unknown, field: string): Record<string, unknown> => {if (!value || typeof value !== 'object' || Array.isArray(value)) throw fail(field); return value as Record<string, unknown>;};
+
+    const action=record(q.action,`${field}.action`);
+    if(!['stellar:testnet','stellar:mainnet','stellar:pubnet'].includes(q.network as string)||!['success','failed'].includes(q.result as string)||q.invocationIndex!==0||!/^([a-f0-9]{64})$/.test(q.signature as string)||!/^([a-f0-9]{64})$/.test(q.requestHash as string)||action.type!=='stellar-transfer'||!/^C[A-Z2-7]{55}$/.test(action.asset as string)||!/^([GC])[A-Z2-7]{55}$/.test(action.recipient as string)||typeof action.amountUnits!=='string'||!/^[1-9][0-9]*$/.test(action.amountUnits)||BigInt(action.amountUnits)>((1n<<127n)-1n))throw fail(field,'is not an admitted Stellar transaction receipt');
+    return {chain:'stellar',network:q.network as StellarOperationReceipt['network'],signature:q.signature as string,requestHash:q.requestHash as string,invocationIndex:0,finalizedLedger:u64(q.finalizedLedger,`${field}.finalizedLedger`),result:q.result as StellarOperationReceipt['result'],action:{type:'stellar-transfer',amountUnits:action.amountUnits,asset:action.asset as string,recipient:action.recipient as string}};
+}
+/** Native receipt projection. It grants no settlement authority beyond the admitted receipt. */
+export function stellarTransfer(receipt: {action: unknown}): {units: string; recipient: string}|null {
+  const action = receipt.action as StellarOperationReceipt['action'];
+  return action.type === 'stellar-transfer' ? {units: action.amountUnits, recipient: action.recipient} : null;
+}
+export const stellarReceiptSucceeded = (receipt: {action: unknown; result?: unknown}) => !!stellarTransfer(receipt) && receipt.result === 'success';
+export const stellarReceiptFailed = (receipt: {chain?: unknown; result?: unknown; action?: unknown}) => isStellarReceipt(receipt) && receipt.result === 'failed';
+export const stellarReceiptIdentityMismatch = (receipt: {chain?: unknown; requestHash: string; signature: string}, request: {requestHash?: string; signature?: string}) => isStellarReceipt(receipt) && (receipt.requestHash !== request.requestHash || receipt.signature !== request.signature);
+export const stellarReceiptHeight = (receipt: {chain?: unknown; finalizedLedger?: string; finalizedSlot?: string}) => isStellarReceipt(receipt) ? {label: 'ledger', value: receipt.finalizedLedger} : null;

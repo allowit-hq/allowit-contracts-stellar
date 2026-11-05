@@ -4,13 +4,13 @@ version = 4
 
 [[package]]
 name = "allowit"
-version = "0.2.0"
-source = "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.2.0#6aa4235e6229e18d1f9780a6a9fdf80aceb0f348"
+version = "0.3.1"
+source = "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.3.1#96b558633d4e01a077d3fd1e75d2b9fe927f2036"
 
 [[package]]
 name = "allowit-sdk"
-version = "0.2.0"
-source = "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.2.0#6aa4235e6229e18d1f9780a6a9fdf80aceb0f348"
+version = "0.3.1"
+source = "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.3.1#96b558633d4e01a077d3fd1e75d2b9fe927f2036"
 dependencies = [
  "allowit",
  "libc",
@@ -23,7 +23,7 @@ dependencies = [
 
 [[package]]
 name = "allowit-stellar-wallet"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "allowit",
  "allowit-sdk",
@@ -31,9 +31,11 @@ dependencies = [
  "ed25519-dalek",
  "serde",
  "serde_json",
+ "serde_json_canonicalizer",
  "sha2",
  "stellar-strkey",
  "stellar-xdr",
+ "zeroize",
 ]
 
 [[package]]
@@ -924,6 +926,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "ryu-js"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04d056b875a9d2e6cb9a61d127afee9ac5999b9f87bcb32079d1318e505be714"
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -970,6 +978,17 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "serde_json_canonicalizer"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe52319a927259afbfa5180c5157cd8167edfd3e8c254f9558c7fef44c5649f2"
+dependencies = [
+ "ryu-js",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

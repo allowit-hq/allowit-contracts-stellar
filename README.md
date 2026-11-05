@@ -25,7 +25,7 @@ SDK engine composes the shared workflows. Core owns common policy rules, types a
 flowchart TB
     UI["[allowit-engine]<br/>npm @allowit/ui<br/>Shared policy web components"]
     Engine["[allowit-sdk]<br/>crate @allowit/sdk/engine<br/>All other shared logic"]
-    Vendor["[allowit-contracts-stellar]<br/>crate + npm @allowit/vendor/stellar<br/>Native contracts · signing · chain semantics<br/>SVG graphics · web components"]
+    Vendor["[allowit-contracts-stellar]<br/>crate allowit-stellar-wallet · allowit-stellar-policy<br/>npm @allowit/stellar-browser<br/>Native contracts · signing · chain semantics<br/>SVG graphics · web components"]
     Core["[allowit-core]<br/>crate + npm @allowit/sdk/core<br/>Common types · policy rules · primitives<br/>TypeScript interfaces"]
 
     UI -->|npm| Vendor
@@ -246,7 +246,7 @@ cargo test --locked --manifest-path stellar/core/Cargo.toml
 cargo clippy --locked --manifest-path stellar/core/Cargo.toml --all-targets -- -D warnings
 ```
 
-All packages consume the same `allowit-core` release tag `v0.2.0`. Releases of this repository are annotated git tags `vX.Y.Z`: set `version` in `Cargo.toml` and `stellar/core/Cargo.toml`, merge, then tag the merge commit with `git tag -a vX.Y.Z -m vX.Y.Z <commit> && git push origin vX.Y.Z`.
+All packages consume the same `allowit-core` release tag `v0.3.1`. Releases of this repository are annotated git tags `vX.Y.Z`: set `version` in `Cargo.toml` and `stellar/core/Cargo.toml`, merge, then tag the merge commit with `git tag -a vX.Y.Z -m vX.Y.Z <commit> && git push origin vX.Y.Z`.
 
 Keep contract code, the `stellar/core` rail crate, build and API documentation and release inputs here. [AGENTS.md](AGENTS.md) describes the repository scope.
 

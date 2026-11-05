@@ -401,6 +401,7 @@ impl rpc::Rpc for ModelChain {
                 };
                 let fee = if record { 1_000i64 } else { 1_500 };
                 Ok(json!({
+                    "latestLedger": m.ledger,
                     "minResourceFee": fee.to_string(),
                     "transactionData": b64(&x::SorobanTransactionData { resource_fee: fee, ..Default::default() }),
                     "results": [{"xdr": b64(&result), "auth": auth.iter().map(b64).collect::<Vec<_>>()}],

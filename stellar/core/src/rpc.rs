@@ -2,7 +2,17 @@
 //! Common transport owns HTTP bounds; SDK engine owns persistence, polling and retry workflows.
 use crate::contract::{CustodyState, PolicyBinding};
 use crate::*;
+mod diagnostics;
+mod owner_actions;
+pub use diagnostics::{
+    ContractFault, WalletError, host_policy_denial, simulation_fault, simulation_resource_fee,
+};
+pub(crate) mod owner_observation;
 use allowit_policy_sdk::transport::rpc::{EnvelopeValidation, ErrorKind, RpcClient};
+pub use owner_actions::{
+    OwnerSettlement, code_uploaded, contract_exists, owner_settlement, vault_redeemable,
+};
+pub use owner_observation::{AssetBalance, WalletLifetime, asset_balance, wallet_lifetime};
 use serde_json::{Value, json};
 use std::{
     sync::atomic::{AtomicU64, Ordering},
@@ -61,6 +71,36 @@ pub fn get_account(rpc: &dyn Rpc, address: &str) -> Result<AccountState> {
         )?))),
     });
     let value = rpc.call("getLedgerEntries", json!({"keys":[xdr(&key)?]}))?;
+    account_from_response(&value, address)
+}
+/// A native source account dated by the entry response and fresh bracketing heads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountObservation {
+    pub account: AccountState,
+    pub ledger: u32,
+}
+pub fn observe_account(rpc: &dyn Rpc, network: &str, address: &str) -> Result<AccountObservation> {
+    owner_observation::network(rpc, network)?;
+    let before = owner_observation::head(rpc)?;
+    let key = LedgerKey::Account(LedgerKeyAccount {
+        account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(account_key(
+            address,
+        )?))),
+    });
+    let value = rpc.call("getLedgerEntries", json!({"keys":[xdr(&key)?]}))?;
+    let ledger = owner_observation::ledger(&value["latestLedger"])?;
+    let account = account_from_response(&value, address)?;
+    account.validate_structure()?;
+    if value["entries"][0]
+        .get("key")
+        .is_some_and(|v| v.as_str() != xdr(&key).ok().as_deref())
+    {
+        return Err("Native account response key differs".into());
+    }
+    owner_observation::current(rpc, before, ledger)?;
+    Ok(AccountObservation { account, ledger })
+}
+fn account_from_response(value: &Value, address: &str) -> Result<AccountState> {
     let entries = value["entries"]
         .as_array()
         .ok_or("Missing account entries")?;
@@ -391,11 +431,79 @@ pub fn status_by_hash(
     let v = rpc.call("getTransaction", json!({"hash":hex(transaction_hash)}))?;
     verify_settlement(&v, network, transaction_hash)
 }
+/// Verify a terminal CAP-15 wrapper before retaining the original inner transaction.
+/// This accepts settlement evidence only; owner intent signing still rejects fee-bump envelopes.
+fn settlement_reply<'a>(
+    v: &'a Value,
+    network: &str,
+    expected: &[u8; 32],
+) -> Result<std::borrow::Cow<'a, Value>> {
+    if !matches!(v["status"].as_str(), Some("SUCCESS" | "FAILED")) {
+        return Ok(std::borrow::Cow::Borrowed(v));
+    }
+    let envelope: TransactionEnvelope = read(
+        v["envelopeXdr"]
+            .as_str()
+            .ok_or("Settlement envelope is required")?,
+    )?;
+    let TransactionEnvelope::TxFeeBump(outer) = envelope else {
+        return Ok(std::borrow::Cow::Borrowed(v));
+    };
+    let FeeBumpTransactionInnerTx::Tx(inner) = &outer.tx.inner_tx;
+    if transaction_hash_for(network, &inner.tx)? != *expected {
+        return Err("Fee-bump inner transaction identity differs".into());
+    }
+    let payload = TransactionSignaturePayload {
+        network_id: Hash(network_id(network)?),
+        tagged_transaction: TransactionSignaturePayloadTaggedTransaction::TxFeeBump(
+            outer.tx.clone(),
+        ),
+    };
+    let outer_hash = hash(payload.to_xdr(limits()).map_err(err)?);
+    // RPC versions may echo the requested inner hash or identify the outer wrapper.
+    // Neither spelling may identify an unrelated transaction.
+    let asserted_hash = if v["txHash"].as_str() == Some(hex(expected).as_str()) {
+        expected
+    } else {
+        &outer_hash
+    };
+    validate_response_identity(v, asserted_hash)?;
+    let result: TransactionResult = read(
+        v["resultXdr"]
+            .as_str()
+            .ok_or("Settlement result is required")?,
+    )?;
+    let (pair, success) = match result.result {
+        TransactionResultResult::TxFeeBumpInnerSuccess(pair) => (pair, true),
+        TransactionResultResult::TxFeeBumpInnerFailed(pair) => (pair, false),
+        _ => return Err("Fee-bump settlement requires its inner result".into()),
+    };
+    if pair.transaction_hash.0 != *expected
+        || matches!(
+            pair.result.result,
+            InnerTransactionResultResult::TxSuccess(_)
+        ) != success
+        || (v["status"] == "SUCCESS") != success
+        || pair.result.fee_charged != 0
+    {
+        return Err("Fee-bump result identity or status differs".into());
+    }
+    // InnerTransactionResult has the same wire shape as a non-fee-bump TransactionResult.
+    let inner_result: TransactionResult = read(&xdr(&pair.result)?)?;
+    let mut normalized = v.clone();
+    normalized["txHash"] = json!(hex(expected));
+    normalized["envelopeXdr"] = json!(xdr(&TransactionEnvelope::Tx(inner.clone()))?);
+    normalized["resultXdr"] = json!(xdr(&inner_result)?);
+    Ok(std::borrow::Cow::Owned(normalized))
+}
 fn verify_settlement(
     v: &Value,
     network: &str,
     transaction_hash: &[u8; 32],
 ) -> Result<OperationStatus> {
+    let normalized = settlement_reply(v, network, transaction_hash)?;
+    let v = normalized.as_ref();
+    validate_response_identity(v, transaction_hash)?;
     if matches!(v["status"].as_str(), Some("SUCCESS" | "FAILED")) {
         let envelope: TransactionEnvelope = read(
             v["envelopeXdr"]
@@ -429,6 +537,40 @@ fn verify_settlement(
         Some("NOT_FOUND") => OperationStatus::SubmissionUnknown,
         _ => return Err("Unknown Stellar settlement state".into()),
     })
+}
+// Retained receipts can lack RPC range metadata. Every supplied native field must still agree.
+fn validate_response_identity(v: &Value, expected_hash: &[u8; 32]) -> Result<()> {
+    if let Some(value) = v.get("txHash")
+        && unhex::<32>(value.as_str().ok_or("Invalid response transaction hash")?)?
+            != *expected_hash
+    {
+        return Err("Response transaction hash differs from the original".into());
+    }
+    let ledger = |name: &str| -> Result<Option<u32>> {
+        v.get(name)
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| "Invalid native response ledger".into())
+            })
+            .transpose()
+    };
+    let (oldest, latest, settled) = (
+        ledger("oldestLedger")?,
+        ledger("latestLedger")?,
+        ledger("ledger")?,
+    );
+    if let (Some(oldest), Some(latest)) = (oldest, latest)
+        && (oldest > latest || settled.is_some_and(|n| n < oldest || n > latest))
+    {
+        return Err("Settlement ledger is outside the native response history".into());
+    }
+    if oldest.is_some() != latest.is_some() {
+        return Err("Incomplete native response history interval".into());
+    }
+    Ok(())
 }
 /// A chain result bound to the requested network and exact transaction bytes.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -513,7 +655,16 @@ pub fn receipt_by_hash(
     transaction_hash: &[u8; 32],
 ) -> Result<Option<VerifiedReceipt>> {
     let v = rpc.call("getTransaction", json!({"hash":hex(transaction_hash)}))?;
-    let status = verify_settlement(&v, network, transaction_hash)?;
+    receipt_from_response(&v, network, transaction_hash)
+}
+fn receipt_from_response(
+    v: &Value,
+    network: &str,
+    transaction_hash: &[u8; 32],
+) -> Result<Option<VerifiedReceipt>> {
+    let normalized = settlement_reply(v, network, transaction_hash)?;
+    let v = normalized.as_ref();
+    let status = verify_settlement(v, network, transaction_hash)?;
     if !matches!(status, OperationStatus::Confirmed | OperationStatus::Failed) {
         return Ok(None);
     }

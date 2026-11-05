@@ -24,6 +24,18 @@ The rest of this page is the reference for how the crate behaves.
 
 The `workflow` module owns Stellar native request DTOs and their JSON encoding. `PolicyEngine` selects the Stellar wallet implementation. Generic owner capability traits remain in Allowit core. Fresh preparation and signing require portable source; historical compiler-language packets are decoded only to verify their original hashes, signatures and settlement. Read-only recovery does not rerun current source admission. The caller must bind the packet to its durable original owner-approved record.
 
+`networks::NETWORKS` lists canonical `stellar:testnet` and `stellar:pubnet` identifiers for compiled vendor registration.
+`stellar:mainnet` remains a pubnet alias with the same native passphrase and network ID.
+
+## Native key and message signing
+
+`signing::LocalSigner` owns native key decoding, encoding and digest signing.
+Its private seed is zeroizing, non-serializable and non-printable. The caller owns private-file storage and signing authority.
+`signing::validate_key_identity` checks native public metadata. `verify_digest` verifies the exact native signature.
+`signing::signed_message_digest` owns SEP-53 domain separation. `sign_in_message_times` binds the exact owner, Origin and nonce.
+SDK engine checks timestamp freshness, HTTP sessions and workflow authority.
+`signing` supplies the native request-proof domain, scheme and signature-size constants. SDK engine owns request framing and freshness checks.
+
 ## Architecture
 
 The rail crate owns native encoding, signing and chain semantics. SDK engine depends on vendor
@@ -33,7 +45,7 @@ capabilities and core primitives. Shared workflow coordination remains in SDK en
 flowchart TB
     UI["[allowit-engine]<br/>npm @allowit/ui<br/>Shared policy web components"]
     Engine["[allowit-sdk]<br/>crate @allowit/sdk/engine<br/>All other shared logic"]
-    Vendor["[allowit-contracts-stellar]<br/>crate + npm @allowit/vendor/stellar<br/>Native contracts · signing · chain semantics<br/>SVG graphics · web components"]
+    Vendor["[allowit-contracts-stellar]<br/>crate allowit-stellar-wallet · allowit-stellar-policy<br/>npm @allowit/stellar-browser<br/>Native contracts · signing · chain semantics<br/>SVG graphics · web components"]
     Core["[allowit-core]<br/>crate + npm @allowit/sdk/core<br/>Common types · policy rules · primitives<br/>TypeScript interfaces"]
 
     UI -->|npm| Vendor
@@ -63,10 +75,40 @@ Policy wallet custody calls the layout 4 `execute` entrypoint (`CONTRACT_VERSION
 
 - `upload_wasm` prepares `UploadContractWasm` of wallet code that declares custody layout 4 (`check_wallet_code`).
 - `create_wallet` prepares `CreateContractV2` with the constructor packet. The owner is the transaction source and must be owner-only. `wallet_address` derives the wallet address from the owner and salt.
+- `fund` prepares one exact SEP-41 owner-to-wallet transfer, within the installed fee ceiling.
+- `extend_wallet` prepares instance/code renewal to the independently observed network lifetime limit.
 
-`admin::validate_auth` admits only the exact authorization scope of the host function. `admin::check_assembled` applies the `contract_admin.py` `prepare_xdr` intent checks to an assembled transaction: an unsigned v1 transaction from the source with one host function, where simulation added only authorization, resources and their fee within the ceiling. `admin::sign_owner_transaction` signs an unsigned prepared transaction as its G-account source. `rpc::send_transaction` sends existing signed bytes once and reports the native broadcast result. SDK engine persists intent and controls polling and exact-byte retries.
+`admin::PolicyInstallation::wallet_config` derives the native asset contract, source binding, rules and wallet address from admitted public installation inputs. `admin::wallet_salt` preserves the policy-instance address domain. `PolicyValue::from_core` and `to_core` preserve the common value variant and check native address encoding. SDK adapters convert common inputs here. They retain source admission, orchestration and storage.
+
+Funding and renewal return `owner_intent::OwnerTransaction` after native simulation and complete intent validation. They neither sign nor submit. Fresh builders date source and simulation observations with bracketing native heads. They reread the source before returning and reject changed accounts or stale resources.
+
+`rpc::observe_account` exposes the dated account separately. Native network identity admits the pubnet/mainnet alias while packet fields retain the selected config spelling. `PreparedOwnerOperation::owner_transaction` refuses a pending owner handoff. Its metadata conversion grants no signing authority.
+
+Before presenting funding or renewal and again before signing, SDK callers independently match current destination custody, source, code, parameters, roles, asset and pause state. A successful asset transfer simulation does not attest its recipient. The native unsigned builder can construct funding for an absent destination. Callers decide automatic renewal eligibility with `WalletLifetime::needs_renewal`. These preparations neither authorize a signature nor release a reservation.
+
+`rpc::code_uploaded` and `contract_exists` check exact live entries at a current ledger. A missing live entry does not prove it never existed. `rpc::owner_settlement` observes the original transaction hash. A missing hash remains `Unknown`, including after expiry. Only a verified native success or failed receipt is terminal. Supplied response hashes and native ledger ranges must agree with that receipt.
+
+SDK callers retain the original packet and own retries. `rpc::vault_redeemable` reads SEP-56 valuation without authorizing a transfer. `rpc::simulation_fault` reads only the terminal contract error code. Events and log hints cannot establish the originating contract. Budget and transport failures remain separate from contract errors.
+
+`admin::validate_auth` admits only the exact authorization scope of the host function. `admin::check_assembled` applies the `contract_admin.py` `prepare_xdr` intent checks to an assembled transaction: an unsigned v1 transaction from the source with one host function, where simulation added only authorization, resources and their fee within the ceiling.
+
+Before signing an untrusted owner step, construct `owner_intent::ExpectedOwnerIntent` from the owner's selected policy, reviewed executable, destination and amount. Its limits name the network, owner, independently observed next sequence, fee ceiling and latest expiry. `validate_owner_transaction` compares the complete unsigned XDR and step metadata with that intent. It supports exact Wasm uploads, policy-wallet creation, funding transfers, instance/code lifetime renewal and the existing three-operation native setup. Creation checks the selected tier, source binding, params, roles, asset, executable and salt-derived wallet. `validate_deployment` also checks the deployment metadata; `validate_native_setup` also checks the native setup identity digest and complete reconstruction. Server-supplied business fields must not become the caller's expected values.
+
+`OwnerAction::Extend` binds one `ExtendFootprintTtl` operation to exactly the selected wallet instance and executable in the read-only footprint. `extend_to` is a relative lifetime in ledgers, capped at `max_entry_ttl - 1`, as specified by [Stellar state archival](https://github.com/stellar/stellar-protocol/blob/master/core/cap-0046-12.md). `rpc::wallet_lifetime` reads the matching current entries and archival limit. The renewal threshold includes the same 17,280-ledger headroom as the owner deployment flow, capped at the maximum target.
+
+`rpc::asset_balance` observes the selected asset's `balance(holder)` through an explicit G-account simulation source. It requires one nonnegative native i128 result and an explicit empty authorization list. Missing data, restoration, contract errors and stale or inconsistent ledgers fail. The result includes its observation ledger. Before reporting post-transaction funding, SDK callers require that ledger to be at or after the independently verified transaction receipt. A sign-in session and a source-consent response do not establish deployment or funding.
+
+Validation returns a sealed in-memory proof. Its consuming `sign_with` method sends only the approved transaction hash to a caller-owned signing capability, then strictly verifies the returned owner Ed25519 signature before attaching it. Expired proofs cannot call the signer. Reloaded JSON requires validation again. `admin::sign_owner_transaction` remains a low-level seed helper: it checks unsigned source ownership and does not validate business intent, fees or expiry.
+
+`rpc::send_transaction` sends existing signed bytes once and reports the native broadcast result. SDK engine persists intent and controls polling and exact-byte retries. Native validation and signing neither publish nor submit a packet.
+
+`owner_intent::validate_signed_owner_transaction` matches an external signed v1 envelope to the retained original transaction and network digest. It requires one valid source-owner signature. It establishes no settlement or new business approval. Historical observation imposes no current expiry, role or source-admission gate. Fresh broadcast separately requires current authority and validity checks.
 
 ## Service and agent authorization
+
+`authorize_server_using` accepts a declared server public identity and a caller-owned sign-hash capability. It applies the same native preflight and full-policy evaluator gates as the seed helpers before invoking the capability. It strictly verifies the returned signature. The seed helpers delegate to this path and preserve their transaction bytes. SDK adapters can keep private server keys outside the common facade.
+
+`AccountState::validate_roles` checks the fixed classic setup against independently selected owner, agent and server identities. `validate_authority_signatures` checks every distinct current positive-weight Ed25519 signer and the current high threshold. These checks serve fresh admission and signing. Historical packet validation remains separate. the SDK request-proof verifier checks the existing native proof domain against the exact path, canonical body and time. The caller still decides whether that signer can perform the requested action.
 
 For a policy wallet, call `rpc::prepare`, then the service authorization, then `rpc::simulate` again. Initial simulation records authorization on a copy of the intent without auth entries, because Stellar RPC rejects recording mode when entries are present, and checks the recorded scope against the intent's entries. The second simulation enforces the signed service authorization and computes the final resource needs, including the service entry's nonce key. Only then deliver the prepared packet for agent revalidation and signing. Agent and service authority are both required. Direct execution requires an existing Stellar server account whose configured key meets its current medium threshold. Preparation reads that account and checks its quorum; enforce-mode simulation checks actual native authorization. The service authorization changes the transaction hash; the agent signs the final transaction. The service entry's nonce derives from the network, the policy wallet address, the operation nonce, the deployment version and the service key. Soroban tracks authorization nonces per signer, so one service key can serve several policy wallets.
 

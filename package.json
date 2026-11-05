@@ -1,0 +1,32 @@
+{
+  "name": "@allowit/stellar-browser",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "files": [
+    "browser/dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./browser/dist/index.d.ts",
+      "import": "./browser/dist/index.js"
+    },
+    "./*": {
+      "types": "./browser/dist/*.d.ts",
+      "import": "./browser/dist/*.js"
+    }
+  },
+  "dependencies": {
+    "@stellar/freighter-api": "6.0.1",
+    "@stellar/stellar-sdk": "17.3.0",
+    "@noble/curves": "1.9.7",
+    "@noble/hashes": "1.8.0"
+  },
+  "scripts": {
+    "build:browser": "tsc -p browser/tsconfig.json",
+    "test:browser": "node --test browser/tests/*.test.mjs"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.2"
+  }
+}

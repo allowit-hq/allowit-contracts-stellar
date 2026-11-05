@@ -118,6 +118,12 @@ pub fn sign_account_entry(
     Ok(signed)
 }
 
+/// Validate the retained service authorization without signing or changing the packet.
+/// This does not establish current source authority, execution validity or settlement.
+pub fn validate_server_authorization(p: &PreparedOperation) -> Result<()> {
+    server_signature(p, true).map(|_| ())
+}
+
 pub(crate) fn server_signature(p: &PreparedOperation, require_signed: bool) -> Result<ScVal> {
     let TransactionEnvelope::Tx(envelope) = read(&p.transaction_xdr)? else {
         return Err("Expected a policy transaction".into());
@@ -247,7 +253,20 @@ fn authorize_service(
     now: u64,
     evaluator: Option<policy::PortableEvaluator>,
 ) -> Result<PreparedOperation> {
-    if p.config.route != WalletRoute::PolicyWallet || account_for_seed(seed) != p.config.server {
+    authorize_server_using(p, &account_for_seed(seed), now, evaluator, |digest| {
+        Ok(SigningKey::from_bytes(seed).sign(digest).to_bytes())
+    })
+}
+/// Authorize through a caller-owned signing capability after the same complete policy gates.
+/// The callback receives only the native digest. Its signature must match the declared server.
+pub fn authorize_server_using(
+    p: &PreparedOperation,
+    signer_account: &str,
+    now: u64,
+    evaluator: Option<policy::PortableEvaluator>,
+    sign_hash: impl FnOnce(&[u8; 32]) -> Result<[u8; 64]>,
+) -> Result<PreparedOperation> {
+    if p.config.route != WalletRoute::PolicyWallet || signer_account != p.config.server {
         return Err("Configured policy service signer required".into());
     }
     validate_prepared(p, now)?;
@@ -273,9 +292,9 @@ fn authorize_service(
     let OperationBody::InvokeHostFunction(op) = &envelope.tx.operations[0].body else {
         unreachable!()
     };
-    let signature = SigningKey::from_bytes(seed)
-        .sign(&payload(&p.config.network, &op.auth[1])?)
-        .to_bytes();
+    let digest = payload(&p.config.network, &op.auth[1])?;
+    let signature = sign_hash(&digest)?;
+    signing::verify_digest(signer_account, &digest, &signature)?;
     let value = ScVal::Vec(Some(
         vec![value_map(vec![
             ("public_key", value_bytes(&account_key(&p.config.server)?)?),

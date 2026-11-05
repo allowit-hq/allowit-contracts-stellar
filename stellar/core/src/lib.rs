@@ -13,14 +13,20 @@ use stellar_xdr::*;
 pub mod admin;
 mod authorization;
 pub mod contract;
+pub mod networks;
 pub mod owner;
+pub mod owner_intent;
 pub mod policy;
 pub mod request;
 pub mod workflow;
-pub use authorization::{authorize_server, authorize_server_with, sign_account_entry};
+pub use authorization::{
+    authorize_server, authorize_server_using, authorize_server_with, sign_account_entry,
+    validate_server_authorization,
+};
 pub use contract::{CONTRACT_VERSION, DepositReceipt, RedeemReceipt, TransferReceipt};
 pub use policy::{PolicyEngine, PolicyLanguage, PolicyParams, PolicyTier, PolicyValue};
 pub mod rpc;
+pub mod signing;
 pub mod x402;
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -65,7 +71,9 @@ pub fn read<T: ReadXdr>(value: &str) -> Result<T> {
 }
 pub fn passphrase(network: &str) -> Result<&'static str> {
     match network {
-        "stellar:mainnet" => Ok("Public Global Stellar Network ; September 2015"),
+        "stellar:pubnet" | "stellar:mainnet" => {
+            Ok("Public Global Stellar Network ; September 2015")
+        }
         "stellar:testnet" => Ok("Test SDF Network ; September 2015"),
         _ => Err("Unsupported Stellar network".into()),
     }
@@ -78,6 +86,10 @@ pub fn decode_seed(value: &str) -> Result<[u8; 32]> {
     ed25519::PrivateKey::from_string(value)
         .map(|v| v.0)
         .map_err(|_| "Expected a canonical Stellar S seed".into())
+}
+/// Encode an already derived public key using the native account address format.
+pub fn account_for_public_key(key: &[u8; 32]) -> String {
+    ed25519::PublicKey(*key).to_string()
 }
 pub fn account_for_seed(seed: &[u8; 32]) -> String {
     ed25519::PublicKey(SigningKey::from_bytes(seed).verifying_key().to_bytes()).to_string()
@@ -153,6 +165,16 @@ pub enum WalletRoute {
     /// Historical signed packets only. New preparation rejects this route.
     #[doc(hidden)]
     Odc,
+}
+impl WalletRoute {
+    /// Existing native route spelling in owner approval and retained packet codecs.
+    pub fn encoding(&self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::PolicyWallet => "policyWallet",
+            Self::Odc => "odc",
+        }
+    }
 }
 fn is_zero(v: &[u8; 32]) -> bool {
     *v == [0; 32]
@@ -343,6 +365,61 @@ fn automated_roles(c: &WalletConfig) -> Vec<&str> {
     roles
 }
 impl AccountState {
+    /// Check the exact classic-custody setup against independently selected public roles.
+    /// This is current admission, not validation of a retained transaction after key rotation.
+    pub fn validate_roles(&self, owner: &str, agent: &str, trusted_server: &str) -> Result<()> {
+        self.validate_structure()?;
+        for role in [owner, agent, trusted_server] {
+            signing::canonical_account_key(role)?;
+        }
+        if owner != self.address
+            || owner == agent
+            || owner == trusted_server
+            || agent == trusted_server
+            || self.master_weight != 3
+            || self.low_threshold != 2
+            || self.medium_threshold != 2
+            || self.high_threshold != 3
+            || self.signers.len() != 2
+            || self
+                .signers
+                .iter()
+                .any(|s| s.weight != 1 || (s.key != agent && s.key != trusted_server))
+        {
+            return Err(
+                "Current native account differs from the independently selected roles".into(),
+            );
+        }
+        Ok(())
+    }
+    /// Verify every administrator signature and the current high-threshold quorum.
+    /// Zero-weight and nonmember signatures are errors even beside a sufficient quorum.
+    pub fn validate_authority_signatures(
+        &self,
+        digest: &[u8; 32],
+        signatures: &[DetachedSignature],
+    ) -> Result<()> {
+        self.validate_structure()?;
+        if signatures.is_empty()
+            || signatures.len() > 20
+            || self.signers.iter().any(|s| s.weight > 255)
+        {
+            return Err("Invalid current administrator signatures or weights".into());
+        }
+        let mut signers = std::collections::BTreeSet::new();
+        for signature in signatures {
+            if !signers.insert(signature.signer.as_str())
+                || self.signer_weight(&signature.signer)? == 0
+            {
+                return Err("Repeated or inactive administrator signer".into());
+            }
+            signing::verify_digest(&signature.signer, digest, &signature.signature)?;
+        }
+        self.validate_signer_quorum(
+            &signers.into_iter().collect::<Vec<_>>(),
+            self.high_threshold,
+        )
+    }
     pub fn validate_structure(&self) -> Result<()> {
         account_key(&self.address)?;
         if self.sequence < 0
@@ -606,6 +683,10 @@ pub fn validate_config(c: &WalletConfig) -> Result<()> {
 }
 // Retained packets prove transport/effect identity. Their original owner-approved source
 // binding belongs to the caller's durable record; current source admission cannot replace it.
+/// Validate a retained configuration's immutable structure without admitting source for new actions.
+pub fn validate_retained_configuration(c: &WalletConfig) -> Result<()> {
+    validate_config_for(c, false)
+}
 fn validate_config_for(c: &WalletConfig, admit_source: bool) -> Result<()> {
     passphrase(&c.network)?;
     if c.policy_instance == [0; 32]
@@ -706,6 +787,14 @@ pub fn transfer_from_request(c: &WalletConfig, r: &ExecutionRequest) -> Result<T
 pub fn operation_from_request(c: &WalletConfig, r: &ExecutionRequest) -> Result<StellarOperation> {
     decode_operation(c, r, false)
 }
+/// Read the effect of an original retained request. This grants no fresh execution authority.
+pub fn retained_operation_from_request(
+    c: &WalletConfig,
+    r: &ExecutionRequest,
+) -> Result<StellarOperation> {
+    decode_operation(c, r, true)
+}
+
 fn decode_operation(
     c: &WalletConfig,
     r: &ExecutionRequest,
@@ -1104,7 +1193,8 @@ fn verify_wallet_portable(
 fn muxed(value: &str) -> Result<MuxedAccount> {
     Ok(MuxedAccount::Ed25519(Uint256(account_key(value)?)))
 }
-fn transaction_hash(network: &str, tx: &Transaction) -> Result<[u8; 32]> {
+/// Native signature-payload digest, without admitting or signing the transaction.
+pub fn transaction_hash(network: &str, tx: &Transaction) -> Result<[u8; 32]> {
     Ok(hash(
         TransactionSignaturePayload {
             network_id: Hash(network_id(network)?),

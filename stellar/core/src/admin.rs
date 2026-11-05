@@ -1,10 +1,13 @@
 //! Owner preparation for the layout 4 policy wallet interface: Wasm upload, wallet creation and
 //! owner calls. Preparation simulates and checks every authorization; it never signs. The owner
-//! signs with `sign_owner_transaction`, then SDK engine submits and observes its exact native hash.
+//! validates its business intent with `owner_intent` before signing through a caller capability.
+//! SDK engine submits and observes the exact native hash.
 use crate::contract::{CustodyState, KeptState, PolicyBinding};
 use crate::*;
 use allowit_policy_sdk::admin::{DeployPolicy, DeploymentVersion, RecoverFunds, SetPause};
 use serde_json::json;
+mod host;
+pub use host::{PolicyInstallation, wallet_salt};
 
 /// Complete owner-approved configuration. The version is supplied to deploy_policy.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1138,19 +1141,36 @@ pub struct PreparedDeployment {
 pub struct Deployer<'a> {
     pub rpc: &'a dyn rpc::Rpc,
     pub network: &'a str,
+    /// Current trusted preparation time, supplied by the caller rather than a prepared packet.
     pub now: u64,
     /// Total fee ceiling in stroops, simulation resources included.
     pub max_fee_stroops: u32,
 }
 impl Deployer<'_> {
     fn account(&self, source: &str) -> Result<AccountState> {
-        passphrase(self.network)?;
-        if self.rpc.call("getNetwork", json!({}))?["passphrase"] != passphrase(self.network)? {
-            return Err("Stellar RPC network differs from the selected network".into());
+        Ok(rpc::observe_account(self.rpc, self.network, source)?.account)
+    }
+    // Date simulation resources and re-read the source. Neither this observation nor the
+    // unsigned result replaces the caller's independent check immediately before signing.
+    fn simulate(
+        &self,
+        source: &AccountState,
+        transaction: &str,
+        record: bool,
+    ) -> Result<serde_json::Value> {
+        let before = rpc::owner_observation::head(self.rpc)?;
+        let mut params = json!({"transaction":transaction});
+        if record {
+            params["authMode"] = json!("record");
         }
-        let account = rpc::get_account(self.rpc, source)?;
-        account.validate_structure()?;
-        Ok(account)
+        let response = self.rpc.call("simulateTransaction", params)?;
+        let observed = rpc::owner_observation::ledger(&response["latestLedger"])?;
+        rpc::owner_observation::current(self.rpc, before, observed)?;
+        let after = rpc::observe_account(self.rpc, self.network, &source.address)?;
+        if after.account != *source || after.ledger < observed || after.ledger - observed > 1 {
+            return Err("Owner account or simulation changed during native preparation".into());
+        }
+        Ok(response)
     }
     /// Simulate `host` from `source` in record mode, check the recorded authorization and the
     /// assembled intent, and return the assembled unsigned transaction and the simulated result.
@@ -1185,10 +1205,7 @@ impl Deployer<'_> {
             tx: raw.clone(),
             signatures: VecM::default(),
         }))?;
-        let response = self.rpc.call(
-            "simulateTransaction",
-            json!({"transaction":raw_xdr,"authMode":"record"}),
-        )?;
+        let response = self.simulate(source, &raw_xdr, true)?;
         if response.get("error").is_some_and(|v| !v.is_null()) {
             return Err("Deployment simulation rejected the transaction".into());
         }
@@ -1332,8 +1349,9 @@ impl Deployer<'_> {
         self.prepared(&account, "create_wallet", wasm_hash, Some(wallet), tx)
     }
 }
-/// Sign an unsigned prepared transaction as its G-account source. The seed must own the
-/// transaction source; nothing else is signed.
+/// Low-level source-account signing. This checks unsigned v1 envelope ownership only; it does
+/// not validate the business intent, fees or expiry. Use [`crate::owner_intent`] to validate an
+/// untrusted prepared packet against independently approved intent before requesting a signature.
 pub fn sign_owner_transaction(
     network: &str,
     transaction_xdr: &str,
