@@ -1,0 +1,174 @@
+name: Deploy and publish Stellar release
+on:
+  workflow_run:
+    workflows: ["Build Stellar release"]
+    types: [completed]
+permissions:
+  actions: read
+  contents: read
+concurrency:
+  group: stellar-testnet-release
+  queue: max
+  cancel-in-progress: false
+jobs:
+  verify:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.identity.outputs.tag }}
+      revision: ${{ steps.identity.outputs.revision }}
+      automation: ${{ github.workflow_sha }}
+    steps:
+      # workflow_run executes the deployment workflow from default main, not from a tag.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check canonical upstream run before reading its artifacts
+        env:
+          UPSTREAM_SHA: ${{ github.event.workflow_run.head_sha }}
+          UPSTREAM_PATH: ${{ github.event.workflow_run.path }}
+          UPSTREAM_EVENT: ${{ github.event.workflow_run.event }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags https://github.com/allowit-hq/allowit-contracts-stellar.git refs/heads/main:refs/release/main
+          python - <<'PY'
+          import os, re, subprocess
+          assert os.environ['UPSTREAM_PATH']=='.github/workflows/release.yml'
+          assert os.environ['UPSTREAM_EVENT'] in ('push','workflow_dispatch')
+          for key in ('UPSTREAM_SHA','WORKFLOW_SHA'):
+              value=os.environ[key]
+              assert re.fullmatch('[0-9a-f]{40}', value)
+              subprocess.run(['git','merge-base','--is-ancestor',value,'refs/release/main'],check=True)
+          PY
+      - uses: actions/download-artifact@v4
+        with:
+          name: stellar-release-build-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+          path: bundle
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r scripts/requirements-admin.txt
+      - name: Recheck exact annotated tag and bundle identity
+        id: identity
+        env:
+          UPSTREAM_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          sys.path.insert(0,'scripts')
+          import testnet_release as release
+          data=release.check_bundle(Path('bundle'))
+          identity=release.release_identity(Path('.'), data['tag'], os.environ['UPSTREAM_SHA'])
+          assert all(data.get(k)==v for k,v in identity.items())
+          assert json.loads(Path('bundle/release-identity.json').read_text())==identity
+          with open(os.environ['GITHUB_OUTPUT'],'a') as output:
+              output.write('tag='+identity['tag']+'\nrevision='+identity['revision']+'\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verified-stellar-release-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: bundle/
+          if-no-files-found: error
+          retention-days: 30
+  testnet:
+    needs: verify
+    # Environment deployment policy permits main only. A tag cannot request this secret.
+    environment: stellar-testnet
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.automation }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r scripts/requirements-admin.txt
+      - uses: actions/download-artifact@v4
+        with:
+          name: verified-stellar-release-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: bundle
+      - name: Recheck current build, controller and annotated tag after environment approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_BUILD_RUN_ID: ${{ github.event.workflow_run.id }}
+          RELEASE_BUILD_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          git fetch --no-tags https://github.com/allowit-hq/allowit-contracts-stellar.git refs/heads/main:refs/release/main
+          python - <<'PYTHON'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, 'scripts')
+          import testnet_release as release
+          release.current_bundle(Path('bundle'))
+          PYTHON
+      - name: Deploy exact release to Testnet and verify native readback
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_BUILD_RUN_ID: ${{ github.event.workflow_run.id }}
+          RELEASE_BUILD_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          STELLAR_TESTNET_OWNER_SECRET: ${{ secrets.STELLAR_TESTNET_OWNER_SECRET }}
+          RELEASE_OWNER: ${{ vars.STELLAR_TESTNET_OWNER }}
+          RELEASE_AGENT: ${{ vars.STELLAR_TESTNET_AGENT }}
+          RELEASE_SERVER: ${{ vars.STELLAR_TESTNET_SERVER }}
+        run: |
+          set -euo pipefail
+          python scripts/testnet_release.py deploy --bundle bundle --identity bundle/release-identity.json --output public/testnet-deployment.json --private "$RUNNER_TEMP/stellar-private" --owner "$RELEASE_OWNER" --agent "$RELEASE_AGENT" --server "$RELEASE_SERVER"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stellar-testnet-checkpoint-${{ needs.verify.outputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            public/testnet-deployment.json
+            public/*-snapshot-*.json
+          if-no-files-found: warn
+          retention-days: 90
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stellar-testnet-deployment-${{ github.run_id }}-${{ github.run_attempt }}
+          path: public/testnet-deployment-v*.json
+          if-no-files-found: error
+          retention-days: 90
+  publish:
+    needs: [verify, testnet]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.automation }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r scripts/requirements-admin.txt
+      - uses: actions/download-artifact@v4
+        with:
+          name: verified-stellar-release-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release
+      - uses: actions/download-artifact@v4
+        with:
+          name: stellar-testnet-deployment-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release
+      - name: Publish immutable verified release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_BUILD_RUN_ID: ${{ github.event.workflow_run.id }}
+          RELEASE_BUILD_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          git fetch --no-tags https://github.com/allowit-hq/allowit-contracts-stellar.git refs/heads/main:refs/release/main
+          python scripts/testnet_release.py publish --bundle release

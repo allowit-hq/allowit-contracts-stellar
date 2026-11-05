@@ -14,6 +14,7 @@ from urllib.request import Request, urlopen
 
 from stellar_sdk import Account, Address, Asset, Network, TransactionBuilder, TransactionEnvelope, Keypair, scval, xdr
 import contract_admin as ca
+from contract_admin import plain_params, prefix_digest, rule_names
 import wallet_admin as wa
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -125,25 +126,6 @@ def smoke_params(plan):
         raise ValueError("Smoke payment and gas exceed daily capacity")
     ca.params(params, "common")
     return params
-
-
-def plain_params(native):
-    """The plain JSON params of a decoded state map: each AllowitValue as its inner value."""
-    def plain(value):
-        kind, inner = value
-        return [plain(item) for item in inner] if kind == "List" else inner
-    return {key: plain(value) for key, value in native.items()}
-
-
-def prefix_digest(kind, module, asset, rules):
-    """The contract's standard_prefix_digest: SHA-256 of canonical XDR of its binding tuple
-    (domain, kind, module hash, asset, rules).
-
-    The ordered rules are a Vec<AllowitRule>; each unit enum variant encodes as a one-symbol vector."""
-    checks = scval.to_vec([scval.to_vec([scval.to_symbol(rule)]) for rule in rules])
-    value = scval.to_vec([scval.to_symbol("allowit_std_prefix"), scval.to_symbol(kind), scval.to_bytes(bytes.fromhex(module)), scval.to_address(asset),
-                          checks])
-    return digest(value.to_xdr_bytes())
 
 
 def wallet_config(plan):
@@ -369,13 +351,6 @@ def read_contract(plan, contract, method):
         if isinstance(value,dict): return {plain(k):plain(v) for k,v in value.items()}
         return value
     return plain(value)
-
-
-def rule_names(rules):
-    """Decoded Vec<AllowitRule>. Each unit enum variant decodes as a one-symbol list."""
-    if not isinstance(rules, list) or any(not isinstance(rule, list) or len(rule) != 1 or not isinstance(rule[0], str) for rule in rules):
-        raise ValueError("Wallet rules are not a Vec<AllowitRule>")
-    return [rule[0] for rule in rules]
 
 
 def wallet_state(plan, wallet, parent):
