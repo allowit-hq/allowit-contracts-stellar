@@ -863,3 +863,216 @@ fn external_owner_bytes_match_retained_identity_without_fresh_admission() {
     changed.transaction_xdr = signed.clone();
     assert!(validate_signed_owner_transaction(&changed, &signed).is_err());
 }
+
+#[test]
+fn renewal_rejects_invalid_config_and_excessive_installed_fee_before_rpc() {
+    let mut c = config();
+    let chain = Chain::new(&c);
+    c.max_fee_stroops = 999;
+    assert!(
+        deployer(&chain)
+            .extend_wallet(&c, 999)
+            .unwrap_err()
+            .contains("fee ceiling")
+    );
+    c.max_fee_stroops = 10000;
+    c.asset = "invalid".into();
+    assert!(deployer(&chain).extend_wallet(&c, 999).is_err());
+}
+
+#[test]
+fn native_error_codes_follow_the_contract_and_host_envelope() {
+    let source = include_str!("../../../crates/policy-wallet/src/lib.rs");
+    let body = source
+        .split("pub enum AllowitWalletError {")
+        .nth(1)
+        .unwrap()
+        .split('}')
+        .next()
+        .unwrap();
+    let mut count = 0;
+    for line in body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with("//"))
+    {
+        let Some((name, code)) = line.trim_end_matches(',').split_once(" = ") else {
+            continue;
+        };
+        let code: u32 = code.parse().unwrap();
+        let error = rpc::WalletError::from_code(code).unwrap();
+        assert_eq!(error.name(), name);
+        assert_eq!(error as u32, code);
+        count += 1;
+    }
+    assert_eq!(count, 16);
+    for code in [0, 10, 12, 13, 20, 101, u32::MAX] {
+        assert!(rpc::WalletError::from_code(code).is_none());
+    }
+    assert_eq!(
+        rpc::host_policy_denial("Policy prefix denied: PaymentLimitExceeded (101)"),
+        Some("PaymentLimitExceeded")
+    );
+    assert_eq!(
+        rpc::host_policy_denial("Authored policy denied this exact operation: Expired"),
+        Some("Expired")
+    );
+    assert!(rpc::host_policy_denial("Policy prefix denied: ").is_none());
+    assert!(rpc::host_policy_denial("contract error 18").is_none());
+}
+
+#[test]
+fn simulation_resources_reject_deep_recursive_xdr() {
+    use x::WriteXdr;
+    let mut resource = resources(vec![]);
+    resource.resource_fee = 123;
+    assert_eq!(
+        rpc::simulation_resource_fee(&xdr(&resource).unwrap()),
+        Some(123)
+    );
+    let mut key = x::ScVal::Void;
+    for _ in 0..100 {
+        key = x::ScVal::Vec(Some(x::ScVec(vec![key].try_into().unwrap())));
+    }
+    resource.resources.footprint.read_only =
+        vec![x::LedgerKey::ContractData(x::LedgerKeyContractData {
+            contract: address(&config().wallet).unwrap(),
+            key,
+            durability: x::ContractDataDurability::Persistent,
+        })]
+        .try_into()
+        .unwrap();
+    let encoded = resource.to_xdr_base64(x::Limits::none()).unwrap();
+    assert!(rpc::simulation_resource_fee(&encoded).is_none());
+}
+
+fn fee_bump_reply(inner: &x::TransactionV1Envelope, success: bool) -> Value {
+    let outer = x::FeeBumpTransactionEnvelope {
+        tx: x::FeeBumpTransaction {
+            fee_source: x::MuxedAccount::Ed25519(x::Uint256(account_key(&account(99)).unwrap())),
+            fee: 20000,
+            inner_tx: x::FeeBumpTransactionInnerTx::Tx(inner.clone()),
+            ext: x::FeeBumpTransactionExt::V0,
+        },
+        signatures: Default::default(),
+    };
+    let tagged = x::TransactionSignaturePayload {
+        network_id: x::Hash(network_id(NETWORK).unwrap()),
+        tagged_transaction: x::TransactionSignaturePayloadTaggedTransaction::TxFeeBump(
+            outer.tx.clone(),
+        ),
+    };
+    use x::WriteXdr;
+    let outer_hash = hash(tagged.to_xdr(x::Limits::none()).unwrap());
+    let pair = x::InnerTransactionResultPair {
+        transaction_hash: x::Hash(transaction_hash(NETWORK, &inner.tx).unwrap()),
+        result: x::InnerTransactionResult {
+            fee_charged: 0,
+            result: if success {
+                x::InnerTransactionResultResult::TxSuccess(Default::default())
+            } else {
+                x::InnerTransactionResultResult::TxFailed(Default::default())
+            },
+            ext: x::InnerTransactionResultExt::V0,
+        },
+    };
+    let result = x::TransactionResult {
+        fee_charged: 5000,
+        result: if success {
+            x::TransactionResultResult::TxFeeBumpInnerSuccess(pair)
+        } else {
+            x::TransactionResultResult::TxFeeBumpInnerFailed(pair)
+        },
+        ext: x::TransactionResultExt::V0,
+    };
+    json!({"status":if success {"SUCCESS"} else {"FAILED"},"txHash":hex(&outer_hash),
+        "ledger":121,"oldestLedger":100,"latestLedger":122,"feeBump":true,
+        "envelopeXdr":xdr(&x::TransactionEnvelope::TxFeeBump(outer)).unwrap(),"resultXdr":xdr(&result).unwrap()})
+}
+#[test]
+fn fee_bumped_owner_receipt_binds_outer_inner_result_and_status() {
+    let c = config();
+    let mut chain = Chain::new(&c);
+    let packet = deployer(&chain).fund(&c, 500).unwrap();
+    let signed = sign_owner_transaction(NETWORK, &packet.transaction_xdr, &[11; 32]).unwrap();
+    let x::TransactionEnvelope::Tx(inner) = read(&signed).unwrap() else {
+        panic!()
+    };
+    for success in [true, false] {
+        chain.receipt = fee_bump_reply(&inner, success);
+        let rpc::OwnerSettlement::Settled(receipt) =
+            rpc::owner_settlement(&chain, NETWORK, &signed).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(receipt.envelope_xdr, signed);
+        assert_eq!(
+            receipt.status,
+            if success {
+                OperationStatus::Confirmed
+            } else {
+                OperationStatus::Failed
+            }
+        );
+        rpc::validate_receipt(&receipt, NETWORK, &packet.transaction_hash).unwrap();
+        let valid = chain.receipt.clone();
+        // Current stellar-rpc getTransaction echoes the requested inner hash.
+        chain.receipt["txHash"] = json!(hex(&packet.transaction_hash));
+        assert!(matches!(
+            rpc::owner_settlement(&chain, NETWORK, &signed).unwrap(),
+            rpc::OwnerSettlement::Settled(_)
+        ));
+        for mode in 0..6 {
+            chain.receipt = valid.clone();
+            match mode {
+                0 => chain.receipt["txHash"] = json!(hex(&[13; 32])),
+                1 => chain.receipt["status"] = json!(if success { "FAILED" } else { "SUCCESS" }),
+                2 => {
+                    let mut result: x::TransactionResult =
+                        read(chain.receipt["resultXdr"].as_str().unwrap()).unwrap();
+                    let pair = match &mut result.result {
+                        x::TransactionResultResult::TxFeeBumpInnerSuccess(p)
+                        | x::TransactionResultResult::TxFeeBumpInnerFailed(p) => p,
+                        _ => panic!(),
+                    };
+                    pair.transaction_hash = x::Hash([15; 32]);
+                    chain.receipt["resultXdr"] = json!(xdr(&result).unwrap());
+                }
+                3 => {
+                    let mut result: x::TransactionResult =
+                        read(chain.receipt["resultXdr"].as_str().unwrap()).unwrap();
+                    let pair = match &mut result.result {
+                        x::TransactionResultResult::TxFeeBumpInnerSuccess(p)
+                        | x::TransactionResultResult::TxFeeBumpInnerFailed(p) => p,
+                        _ => panic!(),
+                    };
+                    pair.result.result = if success {
+                        x::InnerTransactionResultResult::TxFailed(Default::default())
+                    } else {
+                        x::InnerTransactionResultResult::TxSuccess(Default::default())
+                    };
+                    chain.receipt["resultXdr"] = json!(xdr(&result).unwrap());
+                }
+                4 => {
+                    let mut changed = inner.clone();
+                    changed.tx.fee += 1;
+                    chain.receipt = fee_bump_reply(&changed, success);
+                }
+                _ => {
+                    chain.receipt["resultXdr"] = json!(
+                        xdr(&x::TransactionResult {
+                            fee_charged: 0,
+                            result: x::TransactionResultResult::TxSuccess(Default::default()),
+                            ext: x::TransactionResultExt::V0
+                        })
+                        .unwrap()
+                    )
+                }
+            }
+            assert!(
+                rpc::owner_settlement(&chain, NETWORK, &signed).is_err(),
+                "success={success} mode={mode}"
+            );
+        }
+    }
+}

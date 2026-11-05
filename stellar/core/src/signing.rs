@@ -121,3 +121,49 @@ pub fn sign_in_message_times<'a>(
         .and_then(|s| s.split_once("\nExpiration Time: "))
         .ok_or_else(|| "Owner sign-in message differs from its exact account and Origin".into())
 }
+
+/// Borrowed inputs of the existing native v1 owner source-consent protocol.
+/// Encoding binds bytes only. The caller independently checks authority and approved identity.
+pub struct SourceApproval<'a, P: serde::Serialize> {
+    pub policy_id: &'a str,
+    pub revision: u32,
+    pub network: &'a str,
+    pub wallet: &'a str,
+    pub route: &'a str,
+    pub policy_instance: &'a [u8; 32],
+    pub source: &'a str,
+    pub source_hash: &'a str,
+    pub ir_hash: &'a str,
+    pub module_digest: &'a str,
+    pub asset: &'a str,
+    pub asset_symbol: &'a str,
+    pub asset_issuer: &'a Option<String>,
+    pub max_fee_stroops: u32,
+    pub language: &'a str,
+    pub tier: &'a str,
+    pub rules: &'a [String],
+    pub params: &'a P,
+    pub params_hash: &'a str,
+}
+/// Encode all fields of the existing native v1 source-consent payload.
+pub fn source_approval_payload<P: serde::Serialize>(
+    a: &SourceApproval<'_, P>,
+) -> Result<serde_json::Value> {
+    let params =
+        serde_json::to_value(a.params).map_err(|_| "Cannot encode exact source consent")?;
+    Ok(
+        serde_json::json!({"version":1,"policyId":a.policy_id,"revision":a.revision,
+        "network":a.network,"wallet":a.wallet,"route":a.route,
+        "policyInstance":crate::hex(a.policy_instance),"source":a.source,
+        "sourceHash":a.source_hash,"irHash":a.ir_hash,"moduleDigest":a.module_digest,
+        "asset":a.asset,"assetSymbol":a.asset_symbol,"assetIssuer":a.asset_issuer,
+        "maxFeeStroops":a.max_fee_stroops,"language":a.language,"tier":a.tier,
+        "rules":a.rules,"params":params,"paramsHash":a.params_hash}),
+    )
+}
+/// Canonical native consent text. Signing or decoding this text does not establish authority.
+pub fn source_approval_message(payload: &serde_json::Value) -> Result<String> {
+    serde_json_canonicalizer::to_string(payload)
+        .map(|json| format!("AllowIt Native policy approval v1\n{json}"))
+        .map_err(|_| "Cannot encode exact source consent".into())
+}

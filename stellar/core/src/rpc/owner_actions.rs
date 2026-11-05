@@ -92,14 +92,16 @@ pub fn owner_settlement(
     };
     let digest = transaction_hash_for(network, &envelope.tx)?;
     let reply = rpc.call("getTransaction", json!({"hash":hex(&digest)}))?;
-    validate_response_identity(&reply, &digest)?;
     match reply["status"].as_str() {
         Some("SUCCESS" | "FAILED") => {
             let receipt = receipt_from_response(&reply, network, &digest)?
                 .ok_or("Missing terminal owner receipt")?;
             Ok(OwnerSettlement::Settled(receipt))
         }
-        Some("NOT_FOUND") => Ok(OwnerSettlement::Unknown),
+        Some("NOT_FOUND") => {
+            validate_response_identity(&reply, &digest)?;
+            Ok(OwnerSettlement::Unknown)
+        }
         _ => Err("Unknown native owner settlement state".into()),
     }
 }

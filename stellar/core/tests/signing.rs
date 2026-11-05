@@ -252,3 +252,63 @@ fn service_signing_domain_is_stable() {
     assert_eq!(signing::REQUEST_PROOF_SCHEME, "stellar-proof");
     assert_eq!(signing::REQUEST_PROOF_SIGNATURE_BYTES, 64);
 }
+
+#[test]
+fn source_consent_preserves_existing_signed_payload_bytes() {
+    let params =
+        serde_json::json!({"payment_limit":{"Int":"170141183460469231731687303715884105727"}});
+    let approval = signing::SourceApproval {
+        policy_id: "policy-1",
+        revision: 7,
+        network: "stellar:testnet",
+        wallet: "wallet-1",
+        route: "native",
+        policy_instance: &[7; 32],
+        source: "source\n£5",
+        source_hash: "source-hash",
+        ir_hash: "",
+        module_digest: "module-hash",
+        asset: "asset-1",
+        asset_symbol: "XLM",
+        asset_issuer: &None,
+        max_fee_stroops: 1000,
+        language: "allowit-portable-v1",
+        tier: "standard",
+        rules: &["payment_limit".into()],
+        params: &params,
+        params_hash: "params-hash",
+    };
+    let payload = signing::source_approval_payload(&approval).unwrap();
+    // Frozen before migrating the SDK/server codecs: their existing field list and JCS encoding.
+    let old_payload = serde_json::json!({"version":1,"policyId":"policy-1","revision":7,
+        "network":"stellar:testnet","wallet":"wallet-1","route":"native",
+        "policyInstance":"07".repeat(32),"source":"source\n£5","sourceHash":"source-hash",
+        "irHash":"","moduleDigest":"module-hash","asset":"asset-1","assetSymbol":"XLM",
+        "assetIssuer":null,"maxFeeStroops":1000,"language":"allowit-portable-v1","tier":"standard",
+        "rules":["payment_limit"],"params":params,"paramsHash":"params-hash"});
+    assert_eq!(payload, old_payload);
+    let expected = concat!(
+        "AllowIt Native policy approval v1\n",
+        r#"{"asset":"asset-1","assetIssuer":null,"assetSymbol":"XLM","irHash":"","language":"allowit-portable-v1","maxFeeStroops":1000,"moduleDigest":"module-hash","network":"stellar:testnet","params":{"payment_limit":{"Int":"170141183460469231731687303715884105727"}},"paramsHash":"params-hash","policyId":"policy-1","policyInstance":"0707070707070707070707070707070707070707070707070707070707070707","revision":7,"route":"native","rules":["payment_limit"],"source":"source\n£5","sourceHash":"source-hash","tier":"standard","version":1,"wallet":"wallet-1"}"#
+    );
+    let message = signing::source_approval_message(&payload).unwrap();
+    assert_eq!(message, expected);
+    let digest = signing::signed_message_digest(expected);
+    let signature = SigningKey::from_bytes(&[7; 32]).sign(&digest).to_bytes();
+    signing::verify_digest(
+        &native::account_for_seed(&[7; 32]),
+        &signing::signed_message_digest(&message),
+        &signature,
+    )
+    .unwrap();
+    let mut changed = payload;
+    changed["revision"] = serde_json::json!(8);
+    assert!(
+        signing::verify_digest(
+            &native::account_for_seed(&[7; 32]),
+            &signing::signed_message_digest(&signing::source_approval_message(&changed).unwrap()),
+            &signature
+        )
+        .is_err()
+    );
+}

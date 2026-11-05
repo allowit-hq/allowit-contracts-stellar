@@ -4,7 +4,9 @@ use crate::contract::{CustodyState, PolicyBinding};
 use crate::*;
 mod diagnostics;
 mod owner_actions;
-pub use diagnostics::{ContractFault, simulation_fault, simulation_resource_fee};
+pub use diagnostics::{
+    ContractFault, WalletError, host_policy_denial, simulation_fault, simulation_resource_fee,
+};
 pub(crate) mod owner_observation;
 use allowit_policy_sdk::transport::rpc::{EnvelopeValidation, ErrorKind, RpcClient};
 pub use owner_actions::{
@@ -429,11 +431,78 @@ pub fn status_by_hash(
     let v = rpc.call("getTransaction", json!({"hash":hex(transaction_hash)}))?;
     verify_settlement(&v, network, transaction_hash)
 }
+/// Verify a terminal CAP-15 wrapper before retaining the original inner transaction.
+/// This accepts settlement evidence only; owner intent signing still rejects fee-bump envelopes.
+fn settlement_reply<'a>(
+    v: &'a Value,
+    network: &str,
+    expected: &[u8; 32],
+) -> Result<std::borrow::Cow<'a, Value>> {
+    if !matches!(v["status"].as_str(), Some("SUCCESS" | "FAILED")) {
+        return Ok(std::borrow::Cow::Borrowed(v));
+    }
+    let envelope: TransactionEnvelope = read(
+        v["envelopeXdr"]
+            .as_str()
+            .ok_or("Settlement envelope is required")?,
+    )?;
+    let TransactionEnvelope::TxFeeBump(outer) = envelope else {
+        return Ok(std::borrow::Cow::Borrowed(v));
+    };
+    let FeeBumpTransactionInnerTx::Tx(inner) = &outer.tx.inner_tx;
+    if transaction_hash_for(network, &inner.tx)? != *expected {
+        return Err("Fee-bump inner transaction identity differs".into());
+    }
+    let payload = TransactionSignaturePayload {
+        network_id: Hash(network_id(network)?),
+        tagged_transaction: TransactionSignaturePayloadTaggedTransaction::TxFeeBump(
+            outer.tx.clone(),
+        ),
+    };
+    let outer_hash = hash(payload.to_xdr(limits()).map_err(err)?);
+    // RPC versions may echo the requested inner hash or identify the outer wrapper.
+    // Neither spelling may identify an unrelated transaction.
+    let asserted_hash = if v["txHash"].as_str() == Some(hex(expected).as_str()) {
+        expected
+    } else {
+        &outer_hash
+    };
+    validate_response_identity(v, asserted_hash)?;
+    let result: TransactionResult = read(
+        v["resultXdr"]
+            .as_str()
+            .ok_or("Settlement result is required")?,
+    )?;
+    let (pair, success) = match result.result {
+        TransactionResultResult::TxFeeBumpInnerSuccess(pair) => (pair, true),
+        TransactionResultResult::TxFeeBumpInnerFailed(pair) => (pair, false),
+        _ => return Err("Fee-bump settlement requires its inner result".into()),
+    };
+    if pair.transaction_hash.0 != *expected
+        || matches!(
+            pair.result.result,
+            InnerTransactionResultResult::TxSuccess(_)
+        ) != success
+        || (v["status"] == "SUCCESS") != success
+        || pair.result.fee_charged != 0
+    {
+        return Err("Fee-bump result identity or status differs".into());
+    }
+    // InnerTransactionResult has the same wire shape as a non-fee-bump TransactionResult.
+    let inner_result: TransactionResult = read(&xdr(&pair.result)?)?;
+    let mut normalized = v.clone();
+    normalized["txHash"] = json!(hex(expected));
+    normalized["envelopeXdr"] = json!(xdr(&TransactionEnvelope::Tx(inner.clone()))?);
+    normalized["resultXdr"] = json!(xdr(&inner_result)?);
+    Ok(std::borrow::Cow::Owned(normalized))
+}
 fn verify_settlement(
     v: &Value,
     network: &str,
     transaction_hash: &[u8; 32],
 ) -> Result<OperationStatus> {
+    let normalized = settlement_reply(v, network, transaction_hash)?;
+    let v = normalized.as_ref();
     validate_response_identity(v, transaction_hash)?;
     if matches!(v["status"].as_str(), Some("SUCCESS" | "FAILED")) {
         let envelope: TransactionEnvelope = read(
@@ -593,6 +662,8 @@ fn receipt_from_response(
     network: &str,
     transaction_hash: &[u8; 32],
 ) -> Result<Option<VerifiedReceipt>> {
+    let normalized = settlement_reply(v, network, transaction_hash)?;
+    let v = normalized.as_ref();
     let status = verify_settlement(v, network, transaction_hash)?;
     if !matches!(status, OperationStatus::Confirmed | OperationStatus::Failed) {
         return Ok(None);

@@ -23,7 +23,8 @@
     "@noble/hashes": "1.8.0"
   },
   "scripts": {
-    "build:browser": "tsc -p browser/tsconfig.json"
+    "build:browser": "tsc -p browser/tsconfig.json",
+    "test:browser": "node --test browser/tests/*.test.mjs"
   },
   "devDependencies": {
     "typescript": "~5.9.2"

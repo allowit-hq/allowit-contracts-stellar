@@ -181,6 +181,10 @@ impl Deployer<'_> {
         {
             return Err("Lifetime renewal requires the selected policy-wallet network".into());
         }
+        validate_config(config)?;
+        if self.max_fee_stroops > config.max_fee_stroops {
+            return Err("Renewal fee ceiling exceeds the installed ceiling".into());
+        }
         let lifetime = rpc::wallet_lifetime(
             self.rpc,
             self.network,

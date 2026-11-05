@@ -166,6 +166,16 @@ pub enum WalletRoute {
     #[doc(hidden)]
     Odc,
 }
+impl WalletRoute {
+    /// Existing native route spelling in owner approval and retained packet codecs.
+    pub fn encoding(&self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::PolicyWallet => "policyWallet",
+            Self::Odc => "odc",
+        }
+    }
+}
 fn is_zero(v: &[u8; 32]) -> bool {
     *v == [0; 32]
 }

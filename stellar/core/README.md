@@ -34,7 +34,7 @@ Its private seed is zeroizing, non-serializable and non-printable. The caller ow
 `signing::validate_key_identity` checks native public metadata. `verify_digest` verifies the exact native signature.
 `signing::signed_message_digest` owns SEP-53 domain separation. `sign_in_message_times` binds the exact owner, Origin and nonce.
 SDK engine checks timestamp freshness, HTTP sessions and workflow authority.
-`signing::request_digest` and `request_proof` encode the exact execution-service proof without performing transport.
+`signing` supplies the native request-proof domain, scheme and signature-size constants. SDK engine owns request framing and freshness checks.
 
 ## Architecture
 
@@ -108,7 +108,7 @@ Validation returns a sealed in-memory proof. Its consuming `sign_with` method se
 
 `authorize_server_using` accepts a declared server public identity and a caller-owned sign-hash capability. It applies the same native preflight and full-policy evaluator gates as the seed helpers before invoking the capability. It strictly verifies the returned signature. The seed helpers delegate to this path and preserve their transaction bytes. SDK adapters can keep private server keys outside the common facade.
 
-`AccountState::validate_roles` checks the fixed classic setup against independently selected owner, agent and server identities. `validate_authority_signatures` checks every distinct current positive-weight Ed25519 signer and the current high threshold. These checks serve fresh admission and signing. Historical packet validation remains separate. `signing::verify_request_proof` checks the existing native proof domain against the exact path, canonical body and time. The caller still decides whether that signer can perform the requested action.
+`AccountState::validate_roles` checks the fixed classic setup against independently selected owner, agent and server identities. `validate_authority_signatures` checks every distinct current positive-weight Ed25519 signer and the current high threshold. These checks serve fresh admission and signing. Historical packet validation remains separate. the SDK request-proof verifier checks the existing native proof domain against the exact path, canonical body and time. The caller still decides whether that signer can perform the requested action.
 
 For a policy wallet, call `rpc::prepare`, then the service authorization, then `rpc::simulate` again. Initial simulation records authorization on a copy of the intent without auth entries, because Stellar RPC rejects recording mode when entries are present, and checks the recorded scope against the intent's entries. The second simulation enforces the signed service authorization and computes the final resource needs, including the service entry's nonce key. Only then deliver the prepared packet for agent revalidation and signing. Agent and service authority are both required. Direct execution requires an existing Stellar server account whose configured key meets its current medium threshold. Preparation reads that account and checks its quorum; enforce-mode simulation checks actual native authorization. The service authorization changes the transaction hash; the agent signs the final transaction. The service entry's nonce derives from the network, the policy wallet address, the operation nonce, the deployment version and the service key. Soroban tracks authorization nonces per signer, so one service key can serve several policy wallets.
 
