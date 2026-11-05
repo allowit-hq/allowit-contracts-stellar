@@ -23,6 +23,64 @@ pub struct OwnerTransaction {
     pub expires_at: u64,
 }
 
+/// Validate retained unsigned bytes and their descriptive identity without granting fresh authority.
+/// Expired packets remain readable for history and restart recovery.
+pub fn validate_retained_owner_transaction(original: &OwnerTransaction) -> Result<()> {
+    if original.transaction_xdr.len() > MAX_OWNER_XDR {
+        return Err("Owner transaction exceeds limit".into());
+    }
+    let TransactionEnvelope::Tx(envelope) = read(&original.transaction_xdr)? else {
+        return Err("Expected an unsigned v1 owner transaction".into());
+    };
+    let tx = &envelope.tx;
+    let Preconditions::Time(bounds) = &tx.cond else {
+        return Err("Owner transaction requires time bounds".into());
+    };
+    if !envelope.signatures.is_empty()
+        || !matches!(tx.source_account, MuxedAccount::Ed25519(_))
+        || bounds.max_time.0 == 0
+        || bounds.min_time.0 >= bounds.max_time.0
+        || bounds.max_time.0 != original.expires_at
+        || transaction_hash(&original.network, tx)? != original.transaction_hash
+        || xdr(&TransactionEnvelope::Tx(envelope.clone()))? != original.transaction_xdr
+    {
+        return Err("Retained owner identity differs from its transaction".into());
+    }
+    let action_matches = match tx.operations.as_slice() {
+        [
+            Operation {
+                body: OperationBody::InvokeHostFunction(invoke),
+                ..
+            },
+        ] => match &invoke.host_function {
+            HostFunction::UploadContractWasm(_) => original.action == "upload_wasm",
+            HostFunction::CreateContractV2(_) => original.action == "create_wallet",
+            HostFunction::InvokeContract(call) => {
+                call.function_name.0.as_slice() == original.action.as_bytes()
+                    || (original.action == "fund" && call.function_name.0.as_slice() == b"transfer")
+            }
+            _ => false,
+        },
+        [
+            Operation {
+                body: OperationBody::ExtendFootprintTtl(_),
+                ..
+            },
+        ] => original.action == "extend",
+        [a, b, c] => {
+            original.action == "native_setup"
+                && [a, b, c]
+                    .iter()
+                    .all(|op| matches!(op.body, OperationBody::SetOptions(_)))
+        }
+        _ => false,
+    };
+    if !action_matches {
+        return Err("Retained owner action differs from its transaction".into());
+    }
+    Ok(())
+}
+
 /// Match external owner-signed bytes to the exact retained unsigned v1 transaction and digest.
 /// This checks one real source-owner signature, not current roles, expiry, source admission or
 /// settlement. Fresh broadcast requires independent current authority and validity checks.
@@ -30,6 +88,7 @@ pub fn validate_signed_owner_transaction(
     original: &OwnerTransaction,
     signed_xdr: &str,
 ) -> Result<[u8; 32]> {
+    validate_retained_owner_transaction(original)?;
     if original.transaction_xdr.len() > MAX_OWNER_XDR || signed_xdr.len() > MAX_OWNER_XDR {
         return Err("Owner transaction exceeds limit".into());
     }

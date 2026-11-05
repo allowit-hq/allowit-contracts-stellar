@@ -1,4 +1,4 @@
-//! Selected native owner binding. Custody, HTTP sessions and journals stay in the SDK engine.
+//! Native owner workflows use caller-owned custody, Core HTTP sessions and SDK-opened stores.
 use super::runtime::{
     Runtime,
     owner::SetupRequest,
@@ -13,7 +13,6 @@ use crate::host::{
     vendors::OwnerProvider,
 };
 use allowit_policy_sdk::client::store::Store;
-use std::path::Path;
 pub struct Owner;
 pub static OWNER: Owner = Owner;
 fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
@@ -55,9 +54,6 @@ fn fee(text: &str) -> Result<u32> {
 fn runtime(url: &str) -> Result<Runtime> {
     Runtime::new(url).map_err(|_| Error::config("Invalid owner RPC endpoint"))
 }
-fn store(root: &Path) -> Result<Store> {
-    Store::open(&root.join("stellar-owner-workflows"))
-}
 fn client(cx: &Context<'_>) -> Result<OwnerClient> {
     let mut c = OwnerClient::with_authority(cx.authority, cx.origin, cx.signer.address())?;
     c.authenticate(&super::OwnerSignerRef(cx.signer), (cx.clock)()?)?;
@@ -83,7 +79,7 @@ impl OwnerProvider for Owner {
         )?;
         check(cx, &p)?;
         let runtime = runtime(cx.rpc_url)?;
-        let store = store(cx.root)?;
+        let store = (cx.store)()?;
         emit(client(cx)?.deploy(
             OwnerCapabilities {
                 store: &store,
@@ -108,7 +104,7 @@ impl OwnerProvider for Owner {
         check(cx, &p)?;
         workflow::amount_units(amount)?;
         let runtime = runtime(cx.rpc_url)?;
-        let store = store(cx.root)?;
+        let store = (cx.store)()?;
         emit(client(cx)?.fund(
             OwnerCapabilities {
                 store: &store,
@@ -139,7 +135,7 @@ impl OwnerProvider for Owner {
         };
         check(cx, &p)?;
         let runtime = runtime(cx.rpc_url)?;
-        let store = store(cx.root)?;
+        let store = (cx.store)()?;
         emit(client(cx)?.activate(
             OwnerCapabilities {
                 store: &store,
@@ -160,7 +156,7 @@ impl OwnerProvider for Owner {
         let p = selected(document)?;
         check(cx, &p)?;
         let runtime = runtime(cx.rpc_url)?;
-        let store = store(cx.root)?;
+        let store = (cx.store)()?;
         let raw = client(cx)?.export_raw(&store, &p, runtime.rpc(), id, (cx.clock)()?)?;
         Ok(raw)
     }
@@ -186,13 +182,72 @@ impl OwnerProvider for Owner {
         request.validate()?;
         workflow::configure_native(
             &runtime(cx.rpc_url)?,
-            &store(cx.root)?,
+            &(cx.store)()?,
             &request,
             &super::OwnerSignerRef(cx.signer),
             cx.clock,
         )
     }
-    fn status(&self, root: &Path, network: &str, url: &str, id: &str) -> Result<serde_json::Value> {
-        workflow::status(&store(root)?, &runtime(url)?, id, network)
+    fn status(
+        &self,
+        store: &Store,
+        network: &str,
+        url: &str,
+        id: &str,
+    ) -> Result<serde_json::Value> {
+        workflow::status(store, &runtime(url)?, id, network)
+    }
+}
+
+#[cfg(test)]
+mod storage_boundary_tests {
+    use super::*;
+    struct Signer;
+    impl crate::host::Signer for Signer {
+        fn network(&self) -> &str {
+            "stellar:testnet"
+        }
+        fn address(&self) -> &str {
+            "unused-before-validation"
+        }
+        fn sign_hash(&self, _: &[u8]) -> Result<Vec<u8>> {
+            panic!("invalid draft requested a signature")
+        }
+    }
+    #[test]
+    fn invalid_owner_input_fails_before_requesting_a_caller_store() {
+        let authority = crate::host::config::ServerAuthority::validated(
+            "stellar:testnet",
+            "http://localhost:3000",
+            &crate::account_for_seed(&[13; 32]),
+        )
+        .unwrap();
+        let context = Context {
+            network: "stellar:testnet",
+            backend: authority.origin(),
+            authority: &authority,
+            origin: "http://localhost:5173",
+            rpc_url: "invalid",
+            store: &|| panic!("invalid draft requested a journal"),
+            signer: &Signer,
+            clock: &|| Ok(1),
+        };
+        let error = OWNER
+            .deploy(
+                &context,
+                owner::Deploy {
+                    draft: b"invalid",
+                    agent: "unused",
+                    server: "unused",
+                    executable: &[],
+                    request_id: "invalid-001",
+                    fee_limit: "100",
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.message,
+            "The request file must contain a JSON object."
+        );
     }
 }

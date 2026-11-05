@@ -16,6 +16,10 @@ use crate::host::{
 use allowit_stellar_wallet as native;
 use zeroize::Zeroizing;
 
+/// Stable SDK storage registrations. The caller opens these namespaces.
+pub const EXECUTION_STORE_NAMESPACE: &str = "stellar-journal";
+pub const OWNER_STORE_NAMESPACE: &str = "stellar-owner-workflows";
+
 pub static KEYS: Keys = Keys;
 pub struct Keys;
 struct Key(native::signing::LocalSigner);

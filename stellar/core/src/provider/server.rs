@@ -143,11 +143,13 @@ fn prepared(p: &Prepared) -> Result<PreparedOperation> {
         decode(p.0.document())?
     };
     checked(native::validate_retained_prepared(&v))?;
+    packet_network(&p.0, &v.config.network)?;
     Ok(v)
 }
 fn signed(p: &Signed) -> Result<SignedOperation> {
     let v = decode(p.0.document())?;
     checked(native::validate_retained_signed(&v))?;
+    packet_network(&p.0, &v.prepared.config.network)?;
     Ok(v)
 }
 fn info_of(p: &PreparedOperation, hash: [u8; 32]) -> PacketInfo {
@@ -161,11 +163,15 @@ fn info_of(p: &PreparedOperation, hash: [u8; 32]) -> PacketInfo {
 pub fn info(p: &Packet, k: Kind) -> Result<PacketInfo> {
     match k {
         Kind::Prepared => {
-            let p: PreparedOperation = decode(p.document())?;
-            Ok(info_of(&p, p.transaction_hash))
+            let value: PreparedOperation = decode(p.document())?;
+            checked(native::validate_retained_prepared(&value))?;
+            packet_network(p, &value.config.network)?;
+            Ok(info_of(&value, value.transaction_hash))
         }
         Kind::Signed => {
             let s: SignedOperation = decode(p.document())?;
+            retained_signed_shape(&s)?;
+            packet_network(p, &s.prepared.config.network)?;
             Ok(info_of(&s.prepared, s.transaction_hash))
         }
         _ => Err(Error::usage("This packet has no execution identity")),
@@ -195,6 +201,9 @@ pub fn restore(k: Kind, document: Box<RawValue>) -> Result<Packet> {
         }
         Kind::Owner => {
             let p: native::owner_intent::OwnerTransaction = decode(&document)?;
+            checked(native::owner_intent::validate_retained_owner_transaction(
+                &p,
+            ))?;
             p.network
         }
         Kind::OwnerSigned => {
@@ -228,6 +237,9 @@ pub fn restore(k: Kind, document: Box<RawValue>) -> Result<Packet> {
 }
 pub fn owner_info(p: &Packet) -> Result<OwnerInfo> {
     let original: native::owner_intent::OwnerTransaction = decode(p.document())?;
+    checked(native::owner_intent::validate_retained_owner_transaction(
+        &original,
+    ))?;
     if crate::host::routing::normalize(&original.network)? != p.network() {
         return Err(Error::config("Owner packet and network differ"));
     }
@@ -1004,6 +1016,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
 pub fn prepared_metadata(p: &Packet) -> Result<PreparedMetadata> {
     let value: PreparedOperation = decode(p.document())?;
     checked(native::validate_retained_prepared(&value))?;
+    packet_network(p, &value.config.network)?;
     let effect = value
         .request
         .effect_bounds
@@ -1058,6 +1071,7 @@ pub fn prepared_metadata(p: &Packet) -> Result<PreparedMetadata> {
 pub fn signed_preparation(p: &Packet) -> Result<Prepared> {
     let value: SignedOperation = decode(p.document())?;
     retained_signed_shape(&value)?;
+    packet_network(p, &value.prepared.config.network)?;
     Ok(Prepared(packet(
         &value.prepared.config.network,
         &value.prepared,
@@ -1139,13 +1153,15 @@ fn retained_signed_shape(s: &SignedOperation) -> Result<()> {
     Ok(())
 }
 pub fn validate_signed(p: &Packet) -> Result<()> {
-    checked(native::validate_retained_signed(
-        &decode::<SignedOperation>(p.document())?,
-    ))
+    let signed: SignedOperation = decode(p.document())?;
+    packet_network(p, &signed.prepared.config.network)?;
+    checked(native::validate_retained_signed(&signed))
 }
 pub fn verify_receipt(r: &Packet, p: &Packet) -> Result<()> {
     let signed: SignedOperation = decode(p.document())?;
     let receipt: rpc::VerifiedReceipt = decode(r.document())?;
+    packet_network(p, &signed.prepared.config.network)?;
+    packet_network(r, &signed.prepared.config.network)?;
     verify_native_receipt(&signed, &receipt)
 }
 fn verify_native_receipt(signed: &SignedOperation, receipt: &rpc::VerifiedReceipt) -> Result<()> {
@@ -1419,5 +1435,99 @@ mod diagnostic_regressions {
             "local decode inherited prior RPC evidence"
         );
         assert!(problem.message.contains("Invalid retained native packet"));
+    }
+}
+
+fn packet_network(packet: &Packet, network: &str) -> Result<()> {
+    if crate::host::routing::normalize(network)? != packet.network() {
+        return Err(Error::config("Retained packet and network differ"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod retained_projection_tests {
+    use super::*;
+    fn owner() -> native::owner_intent::OwnerTransaction {
+        let state = native::AccountState {
+            address: native::account_for_seed(&[11; 32]),
+            sequence: 7,
+            master_weight: 1,
+            low_threshold: 0,
+            medium_threshold: 0,
+            high_threshold: 0,
+            signers: vec![],
+        };
+        let setup = native::owner::prepare_native_setup(
+            &state,
+            &native::account_for_seed(&[12; 32]),
+            &native::account_for_seed(&[13; 32]),
+            "setup-history-001",
+            "stellar:testnet",
+            100,
+            1,
+        )
+        .unwrap();
+        native::owner_intent::OwnerTransaction {
+            network: setup.network,
+            action: "native_setup".into(),
+            transaction_xdr: setup.transaction_xdr,
+            transaction_hash: native::unhex(&setup.transaction_hash).unwrap(),
+            expires_at: setup.expires_at,
+        }
+    }
+    fn raw(value: &impl Serialize, network: &str) -> Packet {
+        Packet::new(network, value, &PACKETS).unwrap()
+    }
+    #[test]
+    fn retained_owner_projections_reject_corrupted_hash_expiry_action_and_network() {
+        let original = owner();
+        // Expired history remains readable. No current signing authority is inferred.
+        assert_eq!(
+            owner_info(&raw(&original, &original.network))
+                .unwrap()
+                .expires_at,
+            301
+        );
+        for field in ["hash", "expiry", "action", "xdr", "network"] {
+            let mut changed = original.clone();
+            match field {
+                "hash" => changed.transaction_hash[0] ^= 1,
+                "expiry" => changed.expires_at += 1,
+                "action" => changed.action = "fund".into(),
+                "xdr" => changed.transaction_xdr = "invalid".into(),
+                "network" => changed.network = "stellar:pubnet".into(),
+                _ => unreachable!(),
+            }
+            let packet = raw(&changed, &changed.network);
+            assert!(owner_info(&packet).is_err(), "{field}");
+            assert!(
+                restore(Kind::Owner, packet.document().to_owned()).is_err(),
+                "{field}"
+            );
+        }
+        assert!(owner_info(&raw(&original, "stellar:pubnet")).is_err());
+    }
+    #[test]
+    fn execution_projections_validate_raw_packet_identity_before_exposing_metadata() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/provider/stellar-policy-wallet-revalidation-rpc.json"
+        ))
+        .unwrap();
+        let prepared: PreparedOperation =
+            serde_json::from_value(fixture["prepared"].clone()).unwrap();
+        let signed: SignedOperation = serde_json::from_value(fixture["signed"].clone()).unwrap();
+        assert!(info(&raw(&prepared, &prepared.config.network), Kind::Prepared).is_ok());
+        assert!(info(&raw(&signed, &prepared.config.network), Kind::Signed).is_ok());
+        let mut changed = prepared.clone();
+        changed.transaction_hash[0] ^= 1;
+        assert!(info(&raw(&changed, &prepared.config.network), Kind::Prepared).is_err());
+        assert!(prepared_metadata(&raw(&changed, &prepared.config.network)).is_err());
+        let mut changed = signed.clone();
+        changed.transaction_hash[0] ^= 1;
+        assert!(info(&raw(&changed, &prepared.config.network), Kind::Signed).is_err());
+        assert!(signed_preparation(&raw(&changed, &prepared.config.network)).is_err());
+        assert!(info(&raw(&prepared, "stellar:pubnet"), Kind::Prepared).is_err());
+        assert!(info(&raw(&signed, "stellar:pubnet"), Kind::Signed).is_err());
     }
 }

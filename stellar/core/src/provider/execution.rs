@@ -8,13 +8,10 @@ use crate::host::{
 };
 use allowit_policy_sdk::client::store::Store;
 use allowit_stellar_wallet::OperationStatus;
-use std::{path::Path, sync::Arc, time::Duration};
-fn journal(root: &Path) -> Result<Store> {
-    Store::open(&root.join("stellar-journal"))
-}
+use std::{sync::Arc, time::Duration};
 fn typed(
     profile: &Profile,
-    root: &Path,
+    store: &dyn Fn() -> Result<Store>,
     rpc: Option<&str>,
     r: &Request,
 ) -> Result<super::typed::TypedRequest> {
@@ -22,7 +19,7 @@ fn typed(
     let retained = if r.build_only {
         None
     } else {
-        client::retained_request(&journal(root)?, &bundle.policy_id, &r.request_id)?
+        client::retained_request(&store()?, &bundle.policy_id, &r.request_id)?
     };
     if let Some(old) = retained {
         super::request::rebuild(&bundle.policy_id, &bundle.config, r, &old)
@@ -34,11 +31,11 @@ fn typed(
 }
 pub fn build(
     profile: &Profile,
-    root: &Path,
+    store: &dyn Fn() -> Result<Store>,
     rpc: Option<&str>,
     r: &Request,
 ) -> Result<serde_json::Value> {
-    typed(profile, root, rpc, r)?.wire()
+    typed(profile, store, rpc, r)?.wire()
 }
 fn client(
     profile: Profile,
@@ -62,14 +59,14 @@ fn client(
 pub fn execute(
     profile: Profile,
     signer: Arc<dyn Signer>,
-    root: &Path,
+    store: &dyn Fn() -> Result<Store>,
     rpc: Option<String>,
     r: &Request,
 ) -> Result<Outcome> {
-    let typed = typed(&profile, root, rpc.as_deref(), r)?;
+    let typed = typed(&profile, store, rpc.as_deref(), r)?;
     client::exec(
         &client(profile, signer, rpc)?,
-        &journal(root)?,
+        &store()?,
         &r.request_id,
         typed.request,
         r.wait,
@@ -77,12 +74,12 @@ pub fn execute(
     .map(render)
 }
 pub fn retained(
-    root: &Path,
+    store: &dyn Fn() -> Result<Store>,
     network: &str,
     wallet: Option<&str>,
     id: &str,
 ) -> Result<Option<crate::host::execution::Recovery>> {
-    client::retained(&journal(root)?, network, wallet, id).map(|r| {
+    client::retained(&store()?, network, wallet, id).map(|r| {
         r.map(|r| crate::host::execution::Recovery {
             binding: Box::new(r),
         })
@@ -92,7 +89,7 @@ pub fn recover(
     original: crate::host::execution::Recovery,
     signer: Arc<dyn Signer>,
     backend: &str,
-    root: &Path,
+    store: &dyn Fn() -> Result<Store>,
     id: &str,
     wait: Duration,
     request: Option<&Request>,
@@ -122,7 +119,7 @@ pub fn recover(
     }
     client::recover(
         original,
-        &journal(root)?,
+        &store()?,
         Arc::new(super::AgentSignerArc(signer)),
         backend,
         id,
@@ -133,12 +130,12 @@ pub fn recover(
 pub fn status(
     profile: Profile,
     signer: Arc<dyn Signer>,
-    root: &Path,
+    store: &dyn Fn() -> Result<Store>,
     rpc: Option<String>,
     id: &str,
     wait: Duration,
 ) -> Result<Outcome> {
-    client::status(&client(profile, signer, rpc)?, &journal(root)?, id, wait).map(render)
+    client::status(&client(profile, signer, rpc)?, &store()?, id, wait).map(render)
 }
 
 fn render(out: ExecutionOutcome) -> Outcome {
@@ -178,5 +175,55 @@ impl crate::host::execution::RecoveryBinding for client::Retained {
     }
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send + Sync> {
         self
+    }
+}
+
+#[cfg(test)]
+mod storage_boundary_tests {
+    use super::*;
+    #[test]
+    fn build_only_does_not_request_a_caller_store() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/provider/stellar-portable-descriptors.json"
+        ))
+        .unwrap();
+        let descriptor = serde_json::to_vec(&fixture[0]["bundle"]).unwrap();
+        let (description, binding) =
+            crate::provider::profiles::decode("stellar:testnet", &descriptor).unwrap();
+        let profile = Profile {
+            description,
+            binding,
+            version: "fixture".into(),
+            backend: "http://localhost:3000".into(),
+            descriptor: serde_json::value::RawValue::from_string(
+                String::from_utf8(descriptor).unwrap(),
+            )
+            .unwrap(),
+            authority: None,
+        };
+        let request = Request {
+            op: "transfer".into(),
+            to: crate::account_for_seed(&[9; 32]),
+            amount: crate::host::input::asset::Amount {
+                asset: crate::host::input::asset::Asset::Installed,
+                quantity: 1,
+                decimals: None,
+                text: "1".into(),
+            },
+            token_out: None,
+            args: None,
+            request_id: "build-only-001".into(),
+            wait: Duration::ZERO,
+            build_only: true,
+            wallet: None,
+        };
+        let output = build(
+            &profile,
+            &|| panic!("build-only requested a journal"),
+            None,
+            &request,
+        )
+        .unwrap();
+        assert_eq!(output["requestId"], "build-only-001");
     }
 }
