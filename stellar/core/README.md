@@ -22,6 +22,9 @@ cargo test --locked --manifest-path stellar/core/Cargo.toml
 cargo clippy --locked --manifest-path stellar/core/Cargo.toml --all-targets -- -D warnings
 ```
 
+The optional `test-support` feature supplies native protocol fixtures for consumer integration tests.
+Consumer tests provide mock transport, temporary storage and assertions.
+
 The rest of this page is the reference for how the crate behaves.
 
 The `workflow` module owns Stellar native request DTOs and their JSON encoding. `PolicyEngine` selects the Stellar wallet implementation. Generic owner capability traits remain in Allowit core. Fresh preparation and signing require portable source; historical compiler-language packets are decoded only to verify their original hashes, signatures and settlement. Read-only recovery does not rerun current source admission. The caller must bind the packet to its durable original owner-approved record.

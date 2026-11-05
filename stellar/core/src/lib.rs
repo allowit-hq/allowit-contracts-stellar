@@ -4,6 +4,8 @@ extern crate self as allowit_stellar_wallet;
 
 mod host;
 pub mod provider;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 use crate::workflow::{
     AbiValue, AccountId as WorkflowAccount, AccountKind, Amount256, Chain, ExecutionInput,
