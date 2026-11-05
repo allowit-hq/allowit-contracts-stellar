@@ -557,11 +557,13 @@ fn validate_response_identity(v: &Value, expected_hash: &[u8; 32]) -> Result<()>
             })
             .transpose()
     };
-    let (oldest, latest, settled) = (
-        ledger("oldestLedger")?,
-        ledger("latestLedger")?,
-        ledger("ledger")?,
-    );
+    let (oldest, latest) = (ledger("oldestLedger")?, ledger("latestLedger")?);
+    // A current RPC reports zero as the unset settlement ledger for NOT_FOUND.
+    let settled = if v["status"] == "NOT_FOUND" && v["ledger"].as_u64() == Some(0) {
+        None
+    } else {
+        ledger("ledger")?
+    };
     if let (Some(oldest), Some(latest)) = (oldest, latest)
         && (oldest > latest || settled.is_some_and(|n| n < oldest || n > latest))
     {
