@@ -1,5 +1,10 @@
 //! Stellar adapters for the existing typed execution request and operation lifecycle.
 //! Native and policy wallet custody use the same authored policy and exact operation identity.
+extern crate self as allowit_stellar_wallet;
+
+mod host;
+pub mod provider;
+
 use crate::workflow::{
     AbiValue, AccountId as WorkflowAccount, AccountKind, Amount256, Chain, ExecutionInput,
     ExecutionRequest, NativeInstruction, WorkflowAsset,

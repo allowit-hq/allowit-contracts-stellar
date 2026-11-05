@@ -7,8 +7,10 @@ Custody uses the owner's classic G-address account or policy wallet contract. Th
 The rail's recovery rules preserve the original signed bytes and transaction identity after an uncertain broadcast.
 
 The [SDK engine](https://github.com/allowit-hq/allowit-sdk/tree/main/engine) composes this crate for both CLI and server callers.
-It owns reusable offchain preparation, execution, status and recovery workflows.
-This rail core owns Stellar encoding, signatures, simulation, receipts and transaction validity and finality rules.
+The SDK owns generic orchestration, routing and caller-owned storage.
+This crate owns Stellar execution, owner workflows, runtime clients, request validation, formatting,
+profiles, diagnostics, signing, simulation, receipts and native recovery rules.
+The `provider` module implements Core’s optional `vendor` contracts. SDK Stellar paths reexport it.
 Common HTTP/JSON-RPC transport and journal primitives belong to [Allowit core](https://github.com/allowit-hq/allowit-core).
 Callers provide RPC, signing and storage bindings. Each actor retains its private keys and policy authority.
 
@@ -33,8 +35,9 @@ The `workflow` module owns Stellar native request DTOs and their JSON encoding. 
 Its private seed is zeroizing, non-serializable and non-printable. The caller owns private-file storage and signing authority.
 `signing::validate_key_identity` checks native public metadata. `verify_digest` verifies the exact native signature.
 `signing::signed_message_digest` owns SEP-53 domain separation. `sign_in_message_times` binds the exact owner, Origin and nonce.
-SDK engine checks timestamp freshness, HTTP sessions and workflow authority.
-`signing` supplies the native request-proof domain, scheme and signature-size constants. SDK engine owns request framing and freshness checks.
+The Stellar client checks the native authentication challenge. Core supplies bounded HTTP sessions.
+The SDK retains caller-owned authority and generic orchestration.
+`signing` supplies the native request-proof domain, scheme and signature-size constants. Core supplies protocol-neutral request framing and freshness checks.
 
 ## Architecture
 

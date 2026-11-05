@@ -1,0 +1,114 @@
+{
+  "policy": {
+    "code": "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::payment_limit(ctx, &ctx.params[allowit::PAYMENT_LIMIT])?;\n    Ok(())\n}\n",
+    "id": "portable-native-policy",
+    "irHash": "",
+    "language": "allowit-portable-v1",
+    "mint": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+    "network": "stellar:testnet",
+    "revision": 3,
+    "runtime": {
+      "instanceBinding": {
+        "asset": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+        "assetIssuer": null,
+        "assetSymbol": "XLM",
+        "deploymentId": "0909090909090909090909090909090909090909090909090909090909090909",
+        "language": "allowit-portable-v1",
+        "maxFeeStroops": 100,
+        "moduleDigest": "b9b1ac33f11574d4bf6b7f60773f0fe0758fe216b469e9b57e60648bdf20f100",
+        "policyInstance": "0707070707070707070707070707070707070707070707070707070707070707",
+        "portable": {
+          "language": "allowit-portable-v1",
+          "params": {
+            "payment_limit": {
+              "Int": "1000"
+            }
+          },
+          "paramsHash": "c22553fee3fba9e455c810f72953f58d605632411a2d4996185e9bd5aad05589",
+          "rules": [
+            "payment_limit"
+          ],
+          "sourceHash": "58aaea8d178d3d1ec38bfb5f7124d1f86e33aaf9618e3e2c5eafa555837ef526",
+          "tier": "standard",
+          "unresolved": []
+        },
+        "profile": "allowit-stellar-wallet-v1",
+        "route": "native",
+        "wallet": "GDVEU3DD4KOFECV66VIHWEZOYX4ZKR3WV27L464SIIPOU2IUI3JCZA57"
+      },
+      "wallet": {
+        "profile": "allowit-stellar-native-v1"
+      }
+    },
+    "sourceHash": "58aaea8d178d3d1ec38bfb5f7124d1f86e33aaf9618e3e2c5eafa555837ef526",
+    "token": "XLM"
+  },
+  "intent": {
+    "binding": {
+      "asset": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+      "assetIssuer": null,
+      "assetSymbol": "XLM",
+      "deploymentId": "0909090909090909090909090909090909090909090909090909090909090909",
+      "language": "allowit-portable-v1",
+      "maxFeeStroops": 100,
+      "moduleDigest": "b9b1ac33f11574d4bf6b7f60773f0fe0758fe216b469e9b57e60648bdf20f100",
+      "params": {
+        "payment_limit": {
+          "Int": "1000"
+        }
+      },
+      "paramsHash": "c22553fee3fba9e455c810f72953f58d605632411a2d4996185e9bd5aad05589",
+      "policyInstance": "0707070707070707070707070707070707070707070707070707070707070707",
+      "route": "native",
+      "rules": [
+        "payment_limit"
+      ],
+      "tier": "standard",
+      "wallet": "GDVEU3DD4KOFECV66VIHWEZOYX4ZKR3WV27L464SIIPOU2IUI3JCZA57"
+    },
+    "intentDigest": "ceff34d14c0b0edb995ae850af54ed3a78a71f36f61a463a7348f47c09aa64c8",
+    "irHash": "",
+    "network": "stellar:testnet",
+    "owner": "GDVEU3DD4KOFECV66VIHWEZOYX4ZKR3WV27L464SIIPOU2IUI3JCZA57",
+    "policyId": "portable-native-policy",
+    "profile": "allowit-stellar-approval-v2",
+    "requestId": "portable-approval-001",
+    "revision": 3,
+    "source": "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::payment_limit(ctx, &ctx.params[allowit::PAYMENT_LIMIT])?;\n    Ok(())\n}\n",
+    "sourceHash": "58aaea8d178d3d1ec38bfb5f7124d1f86e33aaf9618e3e2c5eafa555837ef526",
+    "version": 2
+  },
+  "canonicalParams": {
+    "canonical": "{\"10\":{\"Int\":\"10\"},\"2\":{\"Int\":\"2\"}}",
+    "hash": "d646efabb4a3653b5a225af96076a19786afa437142b9b0f0d8b8ca8322ed214",
+    "params": {
+      "10": {
+        "Int": "10"
+      },
+      "2": {
+        "Int": "2"
+      }
+    }
+  },
+  "canonicalValues": {
+    "canonical": "{\"exact\":{\"Int\":\"9007199254740993\"},\"maximum\":{\"Int\":\"170141183460469231731687303715884105727\"},\"minimum\":{\"Int\":\"-170141183460469231731687303715884105728\"},\"text\":{\"Str\":\"é 😀     \\\"quoted\\\"\\n\"},\"zero\":{\"Int\":\"0\"}}",
+    "hash": "2aae4502a255f24e9f612a04d8c983ed2c02836d2f943c7ea3f599435e336697",
+    "params": {
+      "exact": {
+        "Int": "9007199254740993"
+      },
+      "maximum": {
+        "Int": "170141183460469231731687303715884105727"
+      },
+      "minimum": {
+        "Int": "-170141183460469231731687303715884105728"
+      },
+      "text": {
+        "Str": "é 😀     \"quoted\"\n"
+      },
+      "zero": {
+        "Int": "0"
+      }
+    }
+  }
+}
