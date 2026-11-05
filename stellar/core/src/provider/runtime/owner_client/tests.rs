@@ -387,3 +387,51 @@ fn stale_funding_destination_never_receives_an_owner_signature_or_submission() {
     assert_eq!(signer.calls.load(Ordering::SeqCst), before);
     assert!(server.state.lock().unwrap().owner_submissions.is_empty());
 }
+
+#[test]
+fn generation_validates_prompt_network_and_profile_before_authenticated_http() {
+    use super::{GenerateRequest, Target};
+    let server = wire::Server::new(wire::Plan::new(&account(11)));
+    let now = wire::now();
+    let mut client = OwnerClient::with_authority(
+        &authority(&server.url),
+        "http://localhost:5173",
+        &account(11),
+    )
+    .unwrap();
+    client.authenticate(&key(), now).unwrap();
+    let mut request = GenerateRequest {
+        prompt: "Allow a small payment".into(),
+        network: "stellar:unsupported".into(),
+        profile: "allowit-stellar-policy-wallet-v1".into(),
+        target: Target::NewWallet,
+    };
+    let error = client.generate(&request, now).unwrap_err();
+    assert!(error.message.starts_with("unknown rail"));
+    assert_eq!(
+        server.calls("/api/micro/runtime"),
+        0,
+        "invalid network reached authenticated discovery"
+    );
+    request.prompt = "x".into();
+    request.profile.clear();
+    assert_eq!(
+        client.generate(&request, now).unwrap_err().message,
+        "Describe the policy in 5–3000 UTF-8 bytes"
+    );
+    request.prompt = "Allow a small payment".into();
+    assert!(
+        client
+            .generate(&request, now)
+            .unwrap_err()
+            .message
+            .starts_with("unknown rail"),
+        "network must precede profile validation"
+    );
+    request.network = "stellar:testnet".into();
+    assert_eq!(
+        client.generate(&request, now).unwrap_err().message,
+        "Select an advertised wallet profile"
+    );
+    assert_eq!(server.calls("/api/micro/runtime"), 0);
+}

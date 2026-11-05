@@ -227,8 +227,13 @@ impl OwnerClient {
             Ok(STANDARD.encode(signature))
         })
     }
-    pub fn generate(&self, request: &GenerateRequest, now: u64) -> Result<GeneratedPolicy> {
-        request.validate()?;
+    pub fn generate<'a>(
+        &self,
+        request: impl Into<std::borrow::Cow<'a, GenerateRequest>>,
+        now: u64,
+    ) -> Result<GeneratedPolicy> {
+        let request = request.into();
+        request.validate_with_network(|network| crate::host::routing::info(network).map(|_| ()))?;
         let discovery: Discovery =
             self.session
                 .owner_request(Method::Get, "/api/micro/runtime", None, now, false)?;
@@ -377,7 +382,7 @@ impl OwnerClient {
         }
         let policy =
             selected.ok_or_else(|| Error::uncertain("Generation omitted the selected policy"))?;
-        validate_generated(&policy, request, network, &wallet.kind).map_err(|_|Error::uncertain("Generated policy failed portable identity validation; inspect the owner workspace before retrying"))?;
+        validate_generated(&policy, &request, network, &wallet.kind).map_err(|_|Error::uncertain("Generated policy failed portable identity validation; inspect the owner workspace before retrying"))?;
         let binding = &policy.runtime.instance_binding;
         if let Some(template) = selected_template
             && (binding.asset != template.asset
