@@ -18,6 +18,78 @@ fn checked<T>(r: native::Result<T>) -> Result<T> {
 fn decode<T: DeserializeOwned>(v: &RawValue) -> Result<T> {
     serde_json::from_str(v.get()).map_err(|_| Error::config("Invalid retained native packet"))
 }
+/// Every self-identifying native packet crosses the same network and retained-shape boundary.
+trait RetainedPacket: DeserializeOwned {
+    fn validate_packet(&self, packet: &Packet) -> Result<()>;
+}
+fn decode_packet<T: RetainedPacket>(packet: &Packet) -> Result<T> {
+    let value: T = decode(packet.document())?;
+    value.validate_packet(packet)?;
+    Ok(value)
+}
+impl RetainedPacket for PreparedOperation {
+    fn validate_packet(&self, packet: &Packet) -> Result<()> {
+        packet_network(packet, &self.config.network)?;
+        checked(native::validate_retained_prepared(self))
+    }
+}
+impl RetainedPacket for SignedOperation {
+    fn validate_packet(&self, packet: &Packet) -> Result<()> {
+        packet_network(packet, &self.prepared.config.network)?;
+        retained_signed_shape(self)
+    }
+}
+impl RetainedPacket for native::owner_intent::OwnerTransaction {
+    fn validate_packet(&self, packet: &Packet) -> Result<()> {
+        packet_network(packet, &self.network)?;
+        checked(native::owner_intent::validate_retained_owner_transaction(
+            self,
+        ))
+    }
+}
+impl RetainedPacket for OwnerSignedData {
+    fn validate_packet(&self, packet: &Packet) -> Result<()> {
+        packet_network(packet, &self.original.network)?;
+        checked(native::owner_intent::validate_signed_owner_transaction(
+            &self.original,
+            owner_payload(self)?,
+        ))
+        .map(drop)
+    }
+}
+impl RetainedPacket for rpc::VerifiedReceipt {
+    fn validate_packet(&self, packet: &Packet) -> Result<()> {
+        checked(rpc::validate_receipt(
+            self,
+            packet.network(),
+            &self.transaction_hash,
+        ))
+    }
+}
+
+impl RetainedPacket for native::workflow::ExecutionRequest {
+    fn validate_packet(&self, packet: &Packet) -> Result<()> {
+        let network = checked(native::network_id(packet.network()))?;
+        let matches = |asset: &native::workflow::WorkflowAsset| match asset {
+            native::workflow::WorkflowAsset::Native { network: value, .. } => *value == network,
+            native::workflow::WorkflowAsset::Token(value) => value.network == network,
+        };
+        if self
+            .effect_bounds
+            .iter()
+            .any(|bound| !matches(&bound.asset))
+            || self
+                .fee_bounds
+                .iter()
+                .flatten()
+                .any(|bound| !matches(&bound.asset))
+        {
+            return Err(Error::config("Request asset and carrier networks differ"));
+        }
+        Ok(())
+    }
+}
+
 fn params(
     v: &BTreeMap<String, allowit_policy_sdk::policy::PolicyValue>,
 ) -> Result<native::PolicyParams> {
@@ -140,16 +212,14 @@ fn prepared(p: &Prepared) -> Result<PreparedOperation> {
         }
         original.clone()
     } else {
-        decode(p.0.document())?
+        decode_packet(&p.0)?
     };
-    checked(native::validate_retained_prepared(&v))?;
-    packet_network(&p.0, &v.config.network)?;
+    v.validate_packet(&p.0)?;
     Ok(v)
 }
 fn signed(p: &Signed) -> Result<SignedOperation> {
-    let v = decode(p.0.document())?;
+    let v: SignedOperation = decode_packet(&p.0)?;
     checked(native::validate_retained_signed(&v))?;
-    packet_network(&p.0, &v.prepared.config.network)?;
     Ok(v)
 }
 fn info_of(p: &PreparedOperation, hash: [u8; 32]) -> PacketInfo {
@@ -163,15 +233,11 @@ fn info_of(p: &PreparedOperation, hash: [u8; 32]) -> PacketInfo {
 pub fn info(p: &Packet, k: Kind) -> Result<PacketInfo> {
     match k {
         Kind::Prepared => {
-            let value: PreparedOperation = decode(p.document())?;
-            checked(native::validate_retained_prepared(&value))?;
-            packet_network(p, &value.config.network)?;
+            let value: PreparedOperation = decode_packet(p)?;
             Ok(info_of(&value, value.transaction_hash))
         }
         Kind::Signed => {
-            let s: SignedOperation = decode(p.document())?;
-            retained_signed_shape(&s)?;
-            packet_network(p, &s.prepared.config.network)?;
+            let s: SignedOperation = decode_packet(p)?;
             Ok(info_of(&s.prepared, s.transaction_hash))
         }
         _ => Err(Error::usage("This packet has no execution identity")),
@@ -189,36 +255,20 @@ fn owner_payload(p: &OwnerSignedData) -> Result<&str> {
 }
 pub fn restore(k: Kind, document: Box<RawValue>) -> Result<Packet> {
     let network = match k {
-        Kind::Prepared => {
-            let p: PreparedOperation = decode(&document)?;
-            checked(native::validate_retained_prepared(&p))?;
-            p.config.network
-        }
+        Kind::Prepared => decode::<PreparedOperation>(&document)?.config.network,
         Kind::Signed => {
-            let p: SignedOperation = decode(&document)?;
-            retained_signed_shape(&p)?;
-            p.prepared.config.network
+            decode::<SignedOperation>(&document)?
+                .prepared
+                .config
+                .network
         }
-        Kind::Owner => {
-            let p: native::owner_intent::OwnerTransaction = decode(&document)?;
-            checked(native::owner_intent::validate_retained_owner_transaction(
-                &p,
-            ))?;
-            p.network
-        }
-        Kind::OwnerSigned => {
-            let p: OwnerSignedData = decode(&document)?;
-            checked(native::owner_intent::validate_signed_owner_transaction(
-                &p.original,
-                owner_payload(&p)?,
-            ))?;
-            p.original.network
-        }
+        Kind::Owner => decode::<native::owner_intent::OwnerTransaction>(&document)?.network,
+        Kind::OwnerSigned => decode::<OwnerSignedData>(&document)?.original.network,
         Kind::Receipt => {
-            let p: rpc::VerifiedReceipt = decode(&document)?;
+            let receipt: rpc::VerifiedReceipt = decode(&document)?;
             native::networks::NETWORKS
                 .iter()
-                .find(|n| rpc::validate_receipt(&p, n.id, &p.transaction_hash).is_ok())
+                .find(|n| rpc::validate_receipt(&receipt, n.id, &receipt.transaction_hash).is_ok())
                 .ok_or_else(|| Error::config("Receipt has no valid supported network identity"))?
                 .id
                 .into()
@@ -229,20 +279,33 @@ pub fn restore(k: Kind, document: Box<RawValue>) -> Result<Packet> {
             ));
         }
     };
-    Ok(Packet::from_raw(
+    let packet = Packet::from_raw(
         crate::host::routing::normalize(&network)?,
         document,
         &PACKETS,
-    ))
+    );
+    match k {
+        Kind::Prepared => {
+            decode_packet::<PreparedOperation>(&packet)?;
+        }
+        Kind::Signed => {
+            decode_packet::<SignedOperation>(&packet)?;
+        }
+        Kind::Owner => {
+            decode_packet::<native::owner_intent::OwnerTransaction>(&packet)?;
+        }
+        Kind::OwnerSigned => {
+            decode_packet::<OwnerSignedData>(&packet)?;
+        }
+        Kind::Receipt => {
+            decode_packet::<rpc::VerifiedReceipt>(&packet)?;
+        }
+        Kind::Request => unreachable!(),
+    }
+    Ok(packet)
 }
 pub fn owner_info(p: &Packet) -> Result<OwnerInfo> {
-    let original: native::owner_intent::OwnerTransaction = decode(p.document())?;
-    checked(native::owner_intent::validate_retained_owner_transaction(
-        &original,
-    ))?;
-    if crate::host::routing::normalize(&original.network)? != p.network() {
-        return Err(Error::config("Owner packet and network differ"));
-    }
+    let original: native::owner_intent::OwnerTransaction = decode_packet(p)?;
     Ok(OwnerInfo {
         action: original.action,
         signing_payload: original.transaction_xdr.into_bytes(),
@@ -250,17 +313,27 @@ pub fn owner_info(p: &Packet) -> Result<OwnerInfo> {
         expires_at: original.expires_at,
     })
 }
+// An account observation has no intrinsic network field. It describes caller-supplied
+// observed state and never authorizes a transaction or selects an RPC network.
+fn decode_observation(packet: &Packet) -> Result<rpc::DiscoveredState> {
+    crate::host::routing::normalize(packet.network())?;
+    let value: rpc::DiscoveredState = decode(packet.document())?;
+    checked(value.state.source.validate_structure())?;
+    Ok(value)
+}
 pub fn same_snapshot(a: &Snapshot, b: &Snapshot) -> Result<bool> {
-    let mut a: rpc::DiscoveredState = decode(a.evidence.document())?;
-    let mut b: rpc::DiscoveredState = decode(b.evidence.document())?;
+    if a.evidence.network() != b.evidence.network() {
+        return Ok(false);
+    }
+    let mut a: rpc::DiscoveredState = decode_observation(&a.evidence)?;
+    let mut b: rpc::DiscoveredState = decode_observation(&b.evidence)?;
     // Match the native revalidation rule: only the observation ledger can advance.
     a.state.ledger = 0;
     b.state.ledger = 0;
     Ok(a == b)
 }
 pub fn receipt_info(p: &Packet) -> Result<ReceiptInfo> {
-    let r: rpc::VerifiedReceipt = decode(p.document())?;
-    checked(rpc::validate_receipt(&r, p.network(), &r.transaction_hash))?;
+    let r: rpc::VerifiedReceipt = decode_packet(p)?;
     Ok(ReceiptInfo {
         transaction_hash: r.transaction_hash,
         status: status(r.status),
@@ -324,6 +397,7 @@ impl Provider {
     fn config(&self, i: &Installation) -> Result<WalletConfig> {
         self.network(&i.description.network)?;
         let c: WalletConfig = decode(&i.config)?;
+        self.network(&c.network)?;
         checked(native::validate_config(&c))?;
         Ok(c)
     }
@@ -543,7 +617,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
     fn action(&self, i: &Installation, r: &RequestPacket) -> Result<Action> {
         let c = self.config(i)?;
         self.network(r.network())?;
-        let r = decode(r.0.document())?;
+        let r = decode_packet(&r.0)?;
         Ok(match checked(native::operation_from_request(&c, &r))? {
             native::StellarOperation::Transfer(t) => Action::Transfer {
                 recipient: t.recipient,
@@ -652,7 +726,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         let accounting = accounting(a);
         self.packet(&checked(self.runtime.prepare(
             &c,
-            &decode(r.0.document())?,
+            &decode_packet(&r.0)?,
             &terms,
             accounting,
             v.now,
@@ -946,7 +1020,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
     }
     fn read_owner_signed(&self, p: &OwnerPacket, signed_payload: &[u8]) -> Result<OwnerSigned> {
         self.network(p.network())?;
-        let original = decode(p.0.document())?;
+        let original = decode_packet(&p.0)?;
         checked(native::owner_intent::validate_signed_owner_transaction(
             &original,
             std::str::from_utf8(signed_payload)
@@ -968,11 +1042,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         now: u64,
     ) -> Result<Receipt> {
         self.network(p.network())?;
-        let data: OwnerSignedData = decode(p.0.document())?;
-        checked(native::owner_intent::validate_signed_owner_transaction(
-            &data.original,
-            owner_payload(&data)?,
-        ))?;
+        let data: OwnerSignedData = decode_packet(&p.0)?;
         if now >= data.original.expires_at {
             return self.observe_owner(p)?.ok_or_else(|| {
                 Error::uncertain(
@@ -998,11 +1068,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
     }
     fn observe_owner(&self, p: &OwnerSigned) -> Result<Option<Receipt>> {
         self.network(p.network())?;
-        let data: OwnerSignedData = decode(p.0.document())?;
-        checked(native::owner_intent::validate_signed_owner_transaction(
-            &data.original,
-            owner_payload(&data)?,
-        ))?;
+        let data: OwnerSignedData = decode_packet(&p.0)?;
         checked(rpc::receipt_by_hash(
             self.rpc(),
             &data.original.network,
@@ -1014,9 +1080,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
 }
 
 pub fn prepared_metadata(p: &Packet) -> Result<PreparedMetadata> {
-    let value: PreparedOperation = decode(p.document())?;
-    checked(native::validate_retained_prepared(&value))?;
-    packet_network(p, &value.config.network)?;
+    let value: PreparedOperation = decode_packet(p)?;
     let effect = value
         .request
         .effect_bounds
@@ -1069,9 +1133,7 @@ pub fn prepared_metadata(p: &Packet) -> Result<PreparedMetadata> {
     })
 }
 pub fn signed_preparation(p: &Packet) -> Result<Prepared> {
-    let value: SignedOperation = decode(p.document())?;
-    retained_signed_shape(&value)?;
-    packet_network(p, &value.prepared.config.network)?;
+    let value: SignedOperation = decode_packet(p)?;
     Ok(Prepared(packet(
         &value.prepared.config.network,
         &value.prepared,
@@ -1112,7 +1174,7 @@ fn snapshot_from(network: &str, live: rpc::DiscoveredState) -> Result<Snapshot> 
     })
 }
 pub fn verify_consent(s: &Snapshot, message: &str, signatures: &[Signature]) -> Result<()> {
-    let live: rpc::DiscoveredState = decode(s.evidence.document())?;
+    let live: rpc::DiscoveredState = decode_observation(&s.evidence)?;
     let signatures = signatures
         .iter()
         .map(|s| native::DetachedSignature {
@@ -1126,11 +1188,11 @@ pub fn verify_consent(s: &Snapshot, message: &str, signatures: &[Signature]) -> 
     ))
 }
 pub fn signer_weight(s: &Snapshot, identity: &str) -> Result<u32> {
-    let live: rpc::DiscoveredState = decode(s.evidence.document())?;
+    let live: rpc::DiscoveredState = decode_observation(&s.evidence)?;
     checked(live.state.source.signer_weight(identity))
 }
 pub fn authority_document(s: &Snapshot) -> Result<serde_json::Value> {
-    let live: rpc::DiscoveredState = decode(s.evidence.document())?;
+    let live: rpc::DiscoveredState = decode_observation(&s.evidence)?;
     serde_json::to_value(live.state.source)
         .map_err(|_| Error::config("Cannot describe authority observation"))
 }
@@ -1153,15 +1215,15 @@ fn retained_signed_shape(s: &SignedOperation) -> Result<()> {
     Ok(())
 }
 pub fn validate_signed(p: &Packet) -> Result<()> {
-    let signed: SignedOperation = decode(p.document())?;
-    packet_network(p, &signed.prepared.config.network)?;
+    let signed: SignedOperation = decode_packet(p)?;
     checked(native::validate_retained_signed(&signed))
 }
 pub fn verify_receipt(r: &Packet, p: &Packet) -> Result<()> {
-    let signed: SignedOperation = decode(p.document())?;
-    let receipt: rpc::VerifiedReceipt = decode(r.document())?;
-    packet_network(p, &signed.prepared.config.network)?;
-    packet_network(r, &signed.prepared.config.network)?;
+    let signed: SignedOperation = decode_packet(p)?;
+    let receipt: rpc::VerifiedReceipt = decode_packet(r)?;
+    if r.network() != p.network() {
+        return Err(Error::config("Receipt network differs from operation"));
+    }
     verify_native_receipt(&signed, &receipt)
 }
 fn verify_native_receipt(signed: &SignedOperation, receipt: &rpc::VerifiedReceipt) -> Result<()> {
@@ -1201,7 +1263,7 @@ pub fn signer_identity(key: &[u8; 32]) -> Result<String> {
 }
 
 pub fn request_id(p: &Packet) -> Result<[u8; 32]> {
-    let request: native::workflow::ExecutionRequest = decode(p.document())?;
+    let request: native::workflow::ExecutionRequest = decode_packet(p)?;
     Ok(request.operation.nonce)
 }
 
@@ -1529,5 +1591,138 @@ mod retained_projection_tests {
         assert!(signed_preparation(&raw(&changed, &prepared.config.network)).is_err());
         assert!(info(&raw(&prepared, "stellar:pubnet"), Kind::Prepared).is_err());
         assert!(info(&raw(&signed, "stellar:pubnet"), Kind::Signed).is_err());
+        assert!(request_id(&raw(&prepared.request, "stellar:pubnet")).is_err());
+        assert_eq!(
+            request_id(&raw(&prepared.request, &prepared.config.network)).unwrap(),
+            prepared.request.operation.nonce
+        );
+    }
+}
+
+#[cfg(test)]
+mod owner_carrier_tests {
+    use super::*;
+    use crate::host::vendors::RuntimeProvider;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    struct CountRpc(Arc<AtomicUsize>);
+    impl rpc::Rpc for CountRpc {
+        fn call(&self, _: &str, _: serde_json::Value) -> native::Result<serde_json::Value> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err("unexpected RPC".into())
+        }
+    }
+    #[test]
+    fn installation_description_cannot_relabel_embedded_network_before_rpc() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/provider/stellar-policy-wallet-revalidation-rpc.json"
+        ))
+        .unwrap();
+        let prepared: PreparedOperation =
+            serde_json::from_value(fixture["prepared"].clone()).unwrap();
+        let config = super::super::server_owner::configuration(
+            "stellar:testnet",
+            &serde_json::to_vec(&prepared.config).unwrap(),
+        )
+        .unwrap();
+        let mut installation = installation(&config);
+        installation.description.network = "stellar:pubnet".into();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Provider::from_rpc("stellar:pubnet", Arc::new(CountRpc(calls.clone())));
+        assert!(provider.snapshot(&installation, None).is_err());
+        assert!(provider.resources(&installation).is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "foreign configuration reached RPC"
+        );
+    }
+    #[test]
+    fn raw_owner_carriers_cannot_relabel_network_before_signing_retention_or_rpc() {
+        let state = native::AccountState {
+            address: native::account_for_seed(&[11; 32]),
+            sequence: 7,
+            master_weight: 1,
+            low_threshold: 0,
+            medium_threshold: 0,
+            high_threshold: 0,
+            signers: vec![],
+        };
+        let setup = native::owner::prepare_native_setup(
+            &state,
+            &native::account_for_seed(&[12; 32]),
+            &native::account_for_seed(&[13; 32]),
+            "network-test-001",
+            "stellar:testnet",
+            100,
+            1,
+        )
+        .unwrap();
+        let original = native::owner_intent::OwnerTransaction {
+            network: setup.network,
+            action: "native_setup".into(),
+            transaction_xdr: setup.transaction_xdr,
+            transaction_hash: native::unhex(&setup.transaction_hash).unwrap(),
+            expires_at: setup.expires_at,
+        };
+        let stellar_xdr::TransactionEnvelope::Tx(mut env) =
+            native::read(&original.transaction_xdr).unwrap()
+        else {
+            unreachable!()
+        };
+        let signature = native::signing::LocalSigner::from_entropy(&[11; 32])
+            .unwrap()
+            .sign_digest(&original.transaction_hash)
+            .unwrap();
+        let key = native::account_key(&state.address).unwrap();
+        env.signatures = vec![stellar_xdr::DecoratedSignature {
+            hint: stellar_xdr::SignatureHint(key[28..].try_into().unwrap()),
+            signature: stellar_xdr::Signature(signature.try_into().unwrap()),
+        }]
+        .try_into()
+        .unwrap();
+        let signed = native::xdr(&stellar_xdr::TransactionEnvelope::Tx(env)).unwrap();
+        native::owner_intent::validate_signed_owner_transaction(&original, &signed).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Provider::from_rpc("stellar:pubnet", Arc::new(CountRpc(calls.clone())));
+        let owner = OwnerPacket(Packet::new("stellar:pubnet", &original, &PACKETS).unwrap());
+        let read = provider.read_owner_signed(&owner, signed.as_bytes());
+        let data = OwnerSignedData {
+            original,
+            signed_payload: signed.into_bytes(),
+        };
+        let owner_signed = OwnerSigned(Packet::new("stellar:pubnet", &data, &PACKETS).unwrap());
+        let retained = AtomicUsize::new(0);
+        let submitted = provider.submit_owner(
+            &owner_signed,
+            Box::new(|_| {
+                retained.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+            Poll {
+                attempts: 1,
+                interval: std::time::Duration::ZERO,
+            },
+            1,
+        );
+        let observed = provider.observe_owner(&owner_signed);
+        assert!(
+            read.is_err(),
+            "read_owner_signed accepted another native network"
+        );
+        assert!(submitted.is_err());
+        assert!(observed.is_err());
+        assert_eq!(
+            retained.load(Ordering::SeqCst),
+            0,
+            "foreign network reached durable retention"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "foreign network reached RPC"
+        );
     }
 }

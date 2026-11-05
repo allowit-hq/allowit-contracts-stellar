@@ -193,7 +193,6 @@ mod storage_boundary_tests {
         let profile = Profile {
             description,
             binding,
-            version: "fixture".into(),
             backend: "http://localhost:3000".into(),
             descriptor: serde_json::value::RawValue::from_string(
                 String::from_utf8(descriptor).unwrap(),
