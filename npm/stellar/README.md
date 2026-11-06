@@ -5,11 +5,11 @@
 The package exports JavaScript modules and TypeScript declarations. Run these commands from `npm/stellar/`:
 
 ```sh
-npm install --ignore-scripts --package-lock=false
-npm run build:browser
-npm run test:browser
-npm pack --dry-run --ignore-scripts --json
-npm pack --ignore-scripts
+pnpm install --frozen-lockfile --ignore-scripts
+pnpm run build:browser
+pnpm run test:browser
+pnpm --config.ignore-scripts=true pack --dry-run --json
+pnpm --config.ignore-scripts=true pack
 ```
 
 The build regenerates `dist/` from `src/`. Keep the distribution with its source so consumers can install the package with lifecycle scripts disabled. Before a registry release, build a tarball from an immutable repository revision and install that tarball. A repository-root Git dependency cannot select this nested package. Signing retains original signed bytes before broadcast, and recovery observes the original transaction.
