@@ -35,6 +35,77 @@ flowchart TB
 
 [Full architecture][responsibility-model].
 
+### On-chain relationships
+
+The three wallets run their own custody and policy checks. The engine parent manages the separate
+stateless checker. See [wallet architecture](docs/architecture.md) and
+[engine parent](docs/engine-parent.md).
+
+```mermaid
+flowchart LR
+    W["Simple / Common / Custom<br/>Three separate custody contracts"]
+    S["Stellar Asset Contract"]
+    R["Swap router"]
+    V["SEP-56 vault"]
+    P["Engine Parent"]
+    E["Wallet Engine<br/>Stateless checker"]
+
+    W -. "Token operations" .-> S
+    W -. "Swap" .-> R
+    W -. "Redeem, plus deposits for Simple and Common" .-> V
+    P -. "Deploys checker and manages its Wasm reference" .-> E
+```
+
+### Proposed wallet upgrade model
+
+EngineParent manages separate executable references for Simple and Common wallets. Owners choose
+whether to pin a Wasm hash or follow a managed reference. Each wallet keeps its own address,
+configuration and state. Changing a reference changes the code used by its subscribed wallets.
+Updates must preserve their contract interface and storage layout. See
+[Stellar CAP-85](https://github.com/stellar/stellar-protocol/blob/master/core/cap-0085.md).
+
+```mermaid
+flowchart LR
+    P["EngineParent"] -. "Updates" .-> S["Simple Wasm reference"]
+    P -. "Updates" .-> C["Common Wasm reference"]
+    SW["Opted-in Simple wallets"] -. "Load code from" .-> S
+    CW["Opted-in Common wallets"] -. "Load code from" .-> C
+```
+
+### Proposed Cargo dependencies
+
+Simple, Common and Custom each build a separate Wasm artifact. They share one library for custody,
+wire types and Soroban policy bindings. EngineParent manages the references directly through
+Soroban. Arrows show dependencies. Labels mark dependencies between modules in the shared crate.
+The diagram uses proposed package names and omits direct Soroban SDK dependencies from the three
+wallet entry points and test dependencies.
+
+```mermaid
+flowchart TD
+    S["allowit-stellar-simple<br/>Simple contract"]
+    C["allowit-stellar-common<br/>Common contract"]
+    X["allowit-stellar-custom<br/>Custom contract"]
+    P["allowit-stellar-engine-parent<br/>EngineParent contract"]
+    SDK["soroban-sdk"]
+
+    subgraph Shared["allowit-stellar-contracts · shared library"]
+        XM["Custom · authored policy hook"]
+        CM["Common · standard rule helpers"]
+        SM["Simple · request validation and custody"]
+        XM -->|Module dependency| CM
+        CM -->|Module dependency| SM
+    end
+
+    CORE["allowit-core · one crate<br/>Portable rules, types and interfaces"]
+
+    S --> Shared
+    C --> Shared
+    X --> Shared
+    Shared --> CORE
+    Shared --> SDK
+    P --> SDK
+```
+
 ## Overview
 
 A policy wallet is a Soroban contract that holds one native Stellar asset. The owner decides who may ask it to pay, deposit, swap or redeem, how much, to whom and until when. Every delegated SEP-41 transfer, SEP-56 vault deposit and redeem, and router swap needs two signatures, the agent's and the server's, and passes the wallet's own checks before a single stroop moves. The owner keeps the keys to everything else: pause, reconfigure, recover funds, upgrade the code and make exact passthrough calls.
