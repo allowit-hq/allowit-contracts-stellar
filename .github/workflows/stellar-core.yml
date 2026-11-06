@@ -14,6 +14,8 @@ on:
       - "Cargo.lock"
       - "scripts/contract_admin.py"
       - "scripts/build-contracts.sh"
+      - "scripts/build-browser-owner-verifier.sh"
+      - "npm/stellar/**"
       - ".github/workflows/stellar-core.yml"
   pull_request:
     paths:
@@ -28,6 +30,8 @@ on:
       - "Cargo.lock"
       - "scripts/contract_admin.py"
       - "scripts/build-contracts.sh"
+      - "scripts/build-browser-owner-verifier.sh"
+      - "npm/stellar/**"
       - ".github/workflows/stellar-core.yml"
   schedule:
     - cron: "17 4 * * *"
@@ -54,6 +58,24 @@ jobs:
       - run: cargo fmt --manifest-path crates/allowit-stellar/Cargo.toml --check
       - run: cargo test --locked --manifest-path crates/allowit-stellar/Cargo.toml
       - run: cargo clippy --locked --manifest-path crates/allowit-stellar/Cargo.toml --all-targets -- -D warnings
+  browser-verifier:
+    # Match the arm64 macOS toolchain that produced the committed verifier bytes.
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Rebuild and compare the committed browser verifier
+        run: sh scripts/build-browser-owner-verifier.sh
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Verify browser owner transaction admission
+        run: node --test npm/stellar/tests/owner-verifier.test.mjs
   vectors:
     # The crates/allowit-stellar suite compares only the step shape of the recorded policy wallet
     # vectors. Regenerate them from the release Wasm, require the committed file to match,
