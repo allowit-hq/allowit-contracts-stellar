@@ -1,5 +1,7 @@
 //! Policy-callable metadata for the installed Stellar rail.
 
+#[cfg(feature = "horizon-price")]
+pub mod horizon;
 pub mod networks;
 
 use serde::Deserialize;
@@ -21,10 +23,7 @@ struct Network<'a> {
 
 fn network(args: &Value, _: &Value) -> Result<Value, String> {
     let args = Network::deserialize(args).map_err(|_| "Supply one Stellar network.")?;
-    let network = crate::networks::NETWORKS
-        .iter()
-        .find(|network| network.id == args.network || network.aliases.contains(&args.network))
-        .ok_or("Unsupported Stellar network.")?;
+    let network = networks::resolve(args.network).ok_or("Unsupported Stellar network.")?;
     Ok(json!({"network": network.id, "testnet": network.testnet}))
 }
 
