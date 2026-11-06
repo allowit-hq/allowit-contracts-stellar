@@ -132,7 +132,7 @@ You need:
 
 - [Rust](https://rustup.rs) with `rustup`. `rust-toolchain.toml` pins Rust 1.98.0 and the `wasm32v1-none` target.
 - [Stellar CLI](https://developers.stellar.org/docs/tools/cli/stellar-cli) 28.1.0.
-- Python 3.10 or later.
+- Python 3.12 or later.
 - Git and Bash.
 
 ```sh
