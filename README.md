@@ -50,10 +50,10 @@ flowchart LR
     P["Engine Parent"]
     E["Wallet Engine<br/>Stateless checker"]
 
-    W -->|"Token operations"| S
-    W -->|"Swap"| R
-    W -->|"Redeem; Simple and Common also deposit"| V
-    P -->|"Deploys checker and manages its Wasm reference"| E
+    W -. "Token operations" .-> S
+    W -. "Swap" .-> R
+    W -. "Redeem, plus deposits for Simple and Common" .-> V
+    P -. "Deploys checker and manages its Wasm reference" .-> E
 ```
 
 ### Proposed wallet upgrade model
@@ -66,17 +66,17 @@ Updates must preserve their contract interface and storage layout. See
 
 ```mermaid
 flowchart LR
-    P["EngineParent"] -->|"Updates"| S["Simple Wasm reference"]
-    P -->|"Updates"| C["Common Wasm reference"]
-    SW["Opted-in Simple wallets"] -->|"Load code from"| S
-    CW["Opted-in Common wallets"] -->|"Load code from"| C
+    P["EngineParent"] -. "Updates" .-> S["Simple Wasm reference"]
+    P -. "Updates" .-> C["Common Wasm reference"]
+    SW["Opted-in Simple wallets"] -. "Load code from" .-> S
+    CW["Opted-in Common wallets"] -. "Load code from" .-> C
 ```
 
 ### Proposed Cargo dependencies
 
 Simple, Common and Custom each build a separate Wasm artifact. They share one library for custody,
 wire types and Soroban policy bindings. EngineParent manages the references directly through
-Soroban. Solid arrows show crate dependencies. Dashed arrows show reuse between Rust modules.
+Soroban. Arrows show dependencies. Labels mark dependencies between modules in the shared crate.
 The diagram uses proposed package names and omits direct Soroban SDK dependencies from the three
 wallet entry points and test dependencies.
 
@@ -92,8 +92,8 @@ flowchart TD
         XM["Custom · authored policy hook"]
         CM["Common · standard rule helpers"]
         SM["Simple · request validation and custody"]
-        XM -.-> CM
-        CM -.-> SM
+        XM -->|Module dependency| CM
+        CM -->|Module dependency| SM
     end
 
     CORE["allowit-core · one crate<br/>Portable rules, types and interfaces"]
