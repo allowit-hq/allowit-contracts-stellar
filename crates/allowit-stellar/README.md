@@ -2,8 +2,8 @@
 
 *Prepare, authorize and settle a policy-bound Stellar transfer, deposit or redeem, with the agent and the service each holding their own key.*
 
-`allowit-stellar-wallet` is the Stellar rail core. It maps a canonical execution request to an exact Stellar transaction and requires agent and server authorization.
-Custody uses the owner's classic G-address account or policy wallet contract. The custody contracts live in [`crates/`](../../crates).
+`allowit-stellar` is the Stellar rail core. It maps a canonical execution request to an exact Stellar transaction and requires agent and server authorization.
+Custody uses the owner's classic G-address account or policy wallet contract. The custody contracts live in [`contracts/`](../../contracts).
 The rail's recovery rules preserve the original signed bytes and transaction identity after an uncertain broadcast.
 
 The [SDK engine](https://github.com/allowit-hq/allowit-sdk/tree/main/engine) composes this crate for both CLI and server callers.
@@ -17,9 +17,9 @@ Callers provide RPC, signing and storage bindings. Each actor retains its privat
 Run its checks with:
 
 ```sh
-cargo fmt --manifest-path stellar/core/Cargo.toml --check
-cargo test --locked --manifest-path stellar/core/Cargo.toml
-cargo clippy --locked --manifest-path stellar/core/Cargo.toml --all-targets -- -D warnings
+cargo fmt --manifest-path crates/allowit-stellar/Cargo.toml --check
+cargo test --locked --manifest-path crates/allowit-stellar/Cargo.toml
+cargo clippy --locked --manifest-path crates/allowit-stellar/Cargo.toml --all-targets -- -D warnings
 ```
 
 The optional `test-support` feature supplies native protocol fixtures for consumer integration tests.
@@ -51,7 +51,7 @@ capabilities and core primitives. Shared workflow coordination remains in SDK en
 flowchart TB
     UI["[allowit-engine]<br/>npm @allowit/ui<br/>Shared policy web components"]
     Engine["[allowit-sdk]<br/>crate @allowit/sdk/engine<br/>All other shared logic"]
-    Vendor["[allowit-contracts-stellar]<br/>crate allowit-stellar-wallet · allowit-stellar-policy<br/>npm @allowit/stellar<br/>Native contracts · signing · chain semantics<br/>SVG graphics · web components"]
+    Vendor["[allowit-contracts-stellar]<br/>crate allowit-stellar · allowit-stellar-policy<br/>npm @allowit/stellar<br/>Native contracts · signing · chain semantics<br/>SVG graphics · web components"]
     Core["[allowit-core]<br/>crate + npm @allowit/core<br/>Common types · policy rules · primitives<br/>TypeScript interfaces"]
 
     UI -->|npm| Vendor

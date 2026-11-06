@@ -5,7 +5,7 @@
 //! wallet Wasm.
 //!
 //! Regenerate after a contract or encoding change: run `scripts/build-contracts.sh`, then
-//! `ALLOWIT_UPDATE_VECTORS=1 cargo test --test policy_wallet` in `stellar/core`.
+//! `ALLOWIT_UPDATE_VECTORS=1 cargo test --test policy_wallet` in `crates/allowit-stellar`.
 use allowit::AllowitTier;
 use allowit_policy_sdk::admin::{Admin, DeploymentVersion};
 use allowit_stellar_wallet::admin::*;
@@ -28,7 +28,7 @@ const AGENT: [u8; 32] = [2; 32];
 const SERVER: [u8; 32] = [3; 32];
 const RECIPIENT: [u8; 32] = [6; 32];
 const MAX_FEE: u32 = 1_000_000;
-const SOURCE: &str = include_str!("../../../crates/custom-policy/policy/policy.rs");
+const SOURCE: &str = include_str!("../../../contracts/allowit-custom-policy/policy/policy.rs");
 const VECTORS: &str = "tests/fixtures/policy-wallet-vectors.txt";
 
 fn vault() -> String {

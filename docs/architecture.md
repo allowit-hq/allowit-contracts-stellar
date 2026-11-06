@@ -540,7 +540,7 @@ param it reads is always its canonical key. It excludes param values and full so
 hash fixes the operations that the code runs. The constructor and binding getter check the digest
 against the actual runtime module.
 
-Custom `source_digest` is the plain SHA-256 of the exact bytes of `crates/custom-policy/policy/policy.rs`.
+Custom `source_digest` is the plain SHA-256 of the exact bytes of `contracts/allowit-custom-policy/policy/policy.rs`.
 `build.rs` computes `SOURCE_HASH` from the file that the contract compiles verbatim, so they
 cannot drift. `AllowitCustom::OPERATIONS` lists transfer, swap and redeem; Custom runs no deposit.
 The compiled policy's `operations` rule selects among them. The contract does not depend on
@@ -834,4 +834,4 @@ control native transactions. Its policy source and economic checks run offchain 
 The portable `allowit` package in [Allowit core](https://github.com/allowit-hq/allowit-core/tree/main/crates/allowit) holds the shared rule core (`core.rs`) and both backends. The core with the host
 backend becomes `sdk/core` in the SDK repository, for the offchain server and SDK evaluator. The
 Soroban backend with the policy wallet, protocol, custom policy and engine crates becomes
-`stellar/core`. Authored policy names only `allowit::`, so the split does not change policy source.
+`crates/allowit-stellar`. Authored policy names only `allowit::`, so the split does not change policy source.

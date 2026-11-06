@@ -1,5 +1,5 @@
 [package]
-name = "allowit-common-policy-engine"
+name = "allowit-simple-engine"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
@@ -7,12 +7,13 @@ license = "UNLICENSED"
 publish = false
 
 [lib]
+name = "allowit_simple_policy_engine"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
-allowit-wallet-protocol = { path = "../protocol" }
-allowit-policy-wallet = { path = "../policy-wallet" }
+allowit-wallet-protocol = { path = "../../crates/protocol" }
+allowit-policy-wallet = { path = "../../crates/policy-wallet" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }

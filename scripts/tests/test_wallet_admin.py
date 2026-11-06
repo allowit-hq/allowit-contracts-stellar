@@ -460,7 +460,7 @@ class ContractAdmin(unittest.TestCase):
                     ca.command(args)
 
     def test_standard_prefix_is_derived_from_policy_source_statements(self):
-        sample = (ROOT / "crates/custom-policy/policy/policy.rs").read_text()
+        sample = (ROOT / "contracts/allowit-custom-policy/policy/policy.rs").read_text()
         self.assertEqual(ca.standard_prefix(sample), list(ca.PARAM_KEYS))
         call = CALL
         vectors = [
@@ -733,8 +733,8 @@ class ContractAdmin(unittest.TestCase):
                    "fn seven<'a>(x: &'static str, y: &'a str) -> bool { x != y && 0u32 != 1 && LIMIT > 1 }\n")
         self.assertEqual(ca.standard_prefix(allowed + source(body)), ["expires_at"])
         # The `AllowitCustomPolicy` sources pass the same check.
-        for path in ("crates/custom-policy/policy/policy.rs", "crates/custom-policy/src/branch_policy.rs",
-                     "crates/custom-policy/src/catching_policy.rs"):
+        for path in ("contracts/allowit-custom-policy/policy/policy.rs", "contracts/allowit-custom-policy/src/branch_policy.rs",
+                     "contracts/allowit-custom-policy/src/catching_policy.rs"):
             ca.checked_code((ROOT / path).read_text())
         result = subprocess.run([sys.executable, str(ROOT / "scripts/check-policy-bindings.py")], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)

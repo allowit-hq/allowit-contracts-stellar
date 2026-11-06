@@ -25,7 +25,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "allowit-stellar-wallet"
+name = "allowit-stellar"
 version = "0.3.0"
 dependencies = [
  "allowit",

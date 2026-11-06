@@ -1,5 +1,5 @@
 //! Builds the typed request of one `exec` operation with the request builders
-//! of `allowit-stellar-wallet`. A transfer moves the wallet's asset to a G or C
+//! of `allowit-stellar`. A transfer moves the wallet's asset to a G or C
 //! address. A policy wallet also deposits its asset into a SEP-56 vault for a
 //! minimum of shares, and redeems vault shares for a minimum of its asset.
 use super::typed::TypedRequest;

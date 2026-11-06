@@ -7,6 +7,7 @@ license = "UNLICENSED"
 publish = false
 
 [lib]
+name = "allowit_custom_policy"
 crate-type = ["cdylib", "rlib"]
 
 [features]
@@ -16,9 +17,9 @@ test-catching = []
 
 [dependencies]
 soroban-sdk = { workspace = true }
-allowit-wallet-protocol = { path = "../protocol" }
+allowit-wallet-protocol = { path = "../../crates/protocol" }
 allowit = { workspace = true }
-allowit-policy-wallet = { path = "../policy-wallet" }
+allowit-policy-wallet = { path = "../../crates/policy-wallet" }
 
 [build-dependencies]
 sha2 = "=0.10.9"
