@@ -1,0 +1,107 @@
+{
+  "fixtureScope": "Synthetic current03b wire envelope with recorded real one-call03b portable source/params. No new provider/chain call or deployment/publication proof. Build report preserves actual old released library revision.",
+  "prompt": "Let my research agent pay the data vendor GCWQPKTAISVM4PXZ3Z2NY4CKKILSN7I4O5AQ2NB5IW3BSFUHBNAJDCYO in USDC: at most 1 USDC per call and 5 USDC per day, only to that vendor, for the next 7 days.",
+  "policy": {
+    "id": "generated-policy-001",
+    "revision": 1,
+    "network": "stellar:testnet",
+    "language": "allowit-portable-v1",
+    "originalIntent": "Let my research agent pay the data vendor GCWQPKTAISVM4PXZ3Z2NY4CKKILSN7I4O5AQ2NB5IW3BSFUHBNAJDCYO in USDC: at most 1 USDC per call and 5 USDC per day, only to that vendor, for the next 7 days.",
+    "title": "Recorded bounded vendor payments",
+    "explanation": "Recorded portable source and terms, replayed as a protocol test fixture.",
+    "code": "use allowit::prelude::*;\n/// Let my research agent pay the data vendor GCWQPKTAISVM4PXZ3Z2NY4CKKILSN7I4O5AQ2NB5IW3BSFUHBNAJDCYO in USDC: at most 1 USDC per call and 5 USDC per day, only to that vendor, for the next 7 days.\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    // \"pay\"\n    allowit::operations(ctx, &ctx.params[allowit::OPERATIONS])?;\n    // \"in USDC\"\n    allowit::tokens(ctx, &ctx.params[allowit::TOKENS])?;\n    // \"per call\"\n    allowit::payment_limit(ctx, &ctx.params[allowit::PAYMENT_LIMIT])?;\n    // \"per day\"\n    allowit::daily_volume_limit(ctx, &ctx.params[allowit::DAILY_VOLUME_LIMIT])?;\n    // \"only to that vendor\"\n    allowit::destinations(ctx, &ctx.params[allowit::DESTINATIONS])?;\n    // \"for the next\"\n    allowit::expires_at(ctx, &ctx.params[allowit::EXPIRES_AT])?;\n    Ok(())\n}\n",
+    "sourceHash": "a8f7e636fdf9b4937544014f704607eaa605b677ccf152fab99a34230fba6e96",
+    "irHash": "",
+    "status": "draft",
+    "token": "USDC",
+    "mint": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
+    "runtime": {
+      "sourceProfile": "allowit-stellar-transfer-v1",
+      "wallet": {
+        "kind": "contract-wallet",
+        "profile": "allowit-stellar-policy-wallet-v1"
+      },
+      "operation": "stellar::sep41_transfer",
+      "instanceBinding": {
+        "profile": "allowit-stellar-wallet-v1",
+        "language": "allowit-portable-v1",
+        "deploymentId": "0707070707070707070707070707070707070707070707070707070707070707",
+        "policyInstance": "0707070707070707070707070707070707070707070707070707070707070707",
+        "moduleDigest": "",
+        "wallet": "",
+        "route": "policyWallet",
+        "tier": "common",
+        "template": true,
+        "asset": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
+        "assetSymbol": "USDC",
+        "assetIssuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "maxFeeStroops": 5000000,
+        "portable": {
+          "language": "allowit-portable-v1",
+          "sourceHash": "a8f7e636fdf9b4937544014f704607eaa605b677ccf152fab99a34230fba6e96",
+          "tier": "standard",
+          "rules": [
+            "operations",
+            "tokens",
+            "payment_limit",
+            "daily_volume_limit",
+            "destinations",
+            "expires_at"
+          ],
+          "params": {
+            "daily_volume_limit": {
+              "Int": "50000000"
+            },
+            "destinations": {
+              "List": [
+                {
+                  "Addr": "GCWQPKTAISVM4PXZ3Z2NY4CKKILSN7I4O5AQ2NB5IW3BSFUHBNAJDCYO"
+                }
+              ]
+            },
+            "expires_at": {
+              "Int": "1794226459"
+            },
+            "operations": {
+              "List": [
+                {
+                  "Str": "transfer"
+                }
+              ]
+            },
+            "payment_limit": {
+              "Int": "10000000"
+            },
+            "tokens": {
+              "List": [
+                {
+                  "Addr": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA"
+                }
+              ]
+            }
+          },
+          "paramsHash": "e455365e70ffb945dc912e7356a6757c3dc6471be620e55a21e92d04bf028aea",
+          "asset": {
+            "address": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
+            "symbol": "USDC",
+            "decimals": 7
+          },
+          "unresolved": [],
+          "build": {
+            "attempts": 1,
+            "libraryRevision": "d0ae9be9e3d7a51e9ac4a1008ba207937aef36a2",
+            "prefix": [
+              "operations",
+              "tokens",
+              "payment_limit",
+              "daily_volume_limit",
+              "destinations",
+              "expires_at"
+            ],
+            "writesState": false
+          }
+        }
+      }
+    }
+  }
+}

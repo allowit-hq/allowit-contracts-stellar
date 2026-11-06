@@ -1,0 +1,52 @@
+{
+  "policy": {
+    "id": "existing-native-policy",
+    "revision": 1,
+    "network": "stellar:testnet",
+    "code": "use allowit::v1::prelude::*; async fn _execute(ctx: &Context) -> PolicyResult { Ok(()) }",
+    "sourceHash": "270422c48fdccb678a758ca78c8e2e3c35c0f40d939bee937cdd9bb7c14db241",
+    "irHash": "0505050505050505050505050505050505050505050505050505050505050505",
+    "mint": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+    "token": "XLM",
+    "runtime": {
+      "wallet": {
+        "profile": "allowit-stellar-native-v1"
+      },
+      "instanceBinding": {
+        "wallet": "GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR",
+        "route": "native",
+        "policyInstance": "0707070707070707070707070707070707070707070707070707070707070707",
+        "moduleDigest": "0505050505050505050505050505050505050505050505050505050505050505",
+        "asset": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+        "assetSymbol": "XLM",
+        "assetIssuer": null,
+        "maxFeeStroops": 100,
+        "deploymentId": "0909090909090909090909090909090909090909090909090909090909090909"
+      }
+    }
+  },
+  "intent": {
+    "version": 1,
+    "profile": "allowit-stellar-approval-v1",
+    "requestId": "stellar-approval-001",
+    "network": "stellar:testnet",
+    "owner": "GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR",
+    "policyId": "existing-native-policy",
+    "revision": 1,
+    "source": "use allowit::v1::prelude::*; async fn _execute(ctx: &Context) -> PolicyResult { Ok(()) }",
+    "sourceHash": "270422c48fdccb678a758ca78c8e2e3c35c0f40d939bee937cdd9bb7c14db241",
+    "irHash": "0505050505050505050505050505050505050505050505050505050505050505",
+    "binding": {
+      "wallet": "GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR",
+      "route": "native",
+      "policyInstance": "0707070707070707070707070707070707070707070707070707070707070707",
+      "moduleDigest": "0505050505050505050505050505050505050505050505050505050505050505",
+      "asset": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+      "assetSymbol": "XLM",
+      "assetIssuer": null,
+      "maxFeeStroops": 100,
+      "deploymentId": "0909090909090909090909090909090909090909090909090909090909090909"
+    },
+    "intentDigest": "f20ea9a31ad23c3531471c4f2330daf6af011d0cde41d2a1d77b8ba3d886e9fb"
+  }
+}
