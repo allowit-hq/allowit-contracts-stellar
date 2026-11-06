@@ -208,7 +208,7 @@ def current_authority(manifest):
     automation = git(root, "rev-parse", "HEAD")
     if automation != os.environ.get("GITHUB_WORKFLOW_SHA"):
         raise ValueError("Controller source differs from the executing workflow")
-    if version("stellar-sdk") != "16.1.0" or public_run(["git", "-C", str(root), "diff", "--quiet", "HEAD", "--", "scripts",
+    if version("stellar-sdk") != "17.0.0" or public_run(["git", "-C", str(root), "diff", "--quiet", "HEAD", "--", "scripts",
         ".github/workflows/testnet-release.yml"], capture_output=True).returncode:
         raise ValueError("Controller files or native SDK differ from the approved source")
     for commit in (automation, manifest["revision"], manifest["workflow_revision"]):
