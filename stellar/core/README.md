@@ -51,8 +51,8 @@ capabilities and core primitives. Shared workflow coordination remains in SDK en
 flowchart TB
     UI["[allowit-engine]<br/>npm @allowit/ui<br/>Shared policy web components"]
     Engine["[allowit-sdk]<br/>crate @allowit/sdk/engine<br/>All other shared logic"]
-    Vendor["[allowit-contracts-stellar]<br/>crate allowit-stellar-wallet · allowit-stellar-policy<br/>npm @allowit/stellar-browser<br/>Native contracts · signing · chain semantics<br/>SVG graphics · web components"]
-    Core["[allowit-core]<br/>crate + npm @allowit/sdk/core<br/>Common types · policy rules · primitives<br/>TypeScript interfaces"]
+    Vendor["[allowit-contracts-stellar]<br/>crate allowit-stellar-wallet · allowit-stellar-policy<br/>npm @allowit/stellar<br/>Native contracts · signing · chain semantics<br/>SVG graphics · web components"]
+    Core["[allowit-core]<br/>crate + npm @allowit/core<br/>Common types · policy rules · primitives<br/>TypeScript interfaces"]
 
     UI -->|npm| Vendor
     Engine -->|crate| Vendor
