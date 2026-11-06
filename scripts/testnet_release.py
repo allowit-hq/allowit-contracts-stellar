@@ -47,6 +47,30 @@ MAX_FUTURE_SKEW = 30
 MAX_ENDPOINT_LAG = 12  # Ledgers between the two fixed public services.
 
 
+PUBLIC_STAGES = frozenset({"COMMAND", "RELEASE_AUTHORITY", "NETWORK_IDENTITY",
+    "RESOURCE_SNAPSHOT", "NATIVE_ASSET", "OPERATOR_ACCOUNT", "RELEASE_RESOURCE",
+    "DEPLOYMENT_INITIALIZATION", "DEPLOYMENT_EXECUTION"})
+
+
+def public_stage(stage, operation, *args):
+    """Attach a fixed public phase without exposing exception text or changing its behavior."""
+    if not isinstance(stage, str) or stage not in PUBLIC_STAGES:
+        raise ValueError("Unknown public release stage")
+    try:
+        return operation(*args)
+    except Exception as error:
+        if not isinstance(getattr(error, "release_stage", None), str) or error.release_stage not in PUBLIC_STAGES:
+            error.release_stage = stage
+        raise
+
+
+def release_stop_message(error):
+    stage = getattr(error, "release_stage", "COMMAND")
+    if not isinstance(stage, str) or stage not in PUBLIC_STAGES:
+        stage = "COMMAND"
+    return f"Release stopped [stage={stage}]. Inspect the immutable public checkpoints; preserve original signed packets."
+
+
 def public_env(github=False):
     """Public tools receive only explicit tool paths and, for gh, its scoped token."""
     names = {"PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "TMPDIR", "TMP", "TEMP", "SYSTEMROOT", "LANG", "LC_ALL"}
@@ -487,7 +511,7 @@ def nonrestoring(simulation):
 class Deployment:
     def __init__(self, directory, output, private, key, agent, server):
         self.directory, self.output, self.private, self.key = directory, output, private, key
-        self.manifest, self.authority = current_bundle(directory)
+        self.manifest, self.authority = public_stage("RELEASE_AUTHORITY", current_bundle, directory)
         for address in (key.public_key, agent, server):
             ca.account(address)
         if len({key.public_key, agent, server}) != 3:
@@ -496,7 +520,7 @@ class Deployment:
         self.rpc = SorobanServer(RPC)
         # This starts after the workflow's global signer slot and environment admission.
         self.slot_entered = utc_seconds()
-        self.identity = network_identity(self.rpc)
+        self.identity = public_stage("NETWORK_IDENTITY", network_identity, self.rpc)
         self.intents = {kind: wallet_intent(self.manifest, kind, key.public_key, agent, server) for kind in KINDS}
         self.account_key = xdr.LedgerKey(xdr.LedgerEntryType.ACCOUNT,
             account=xdr.LedgerKeyAccount(key.xdr_account_id()))
@@ -529,7 +553,7 @@ class Deployment:
     def current(self):
         if current_bundle(self.directory) != (self.manifest, self.authority):
             raise ValueError("Current release source or automation changed")
-        observed = network_identity(self.rpc, self.identity["generation"])
+        observed = public_stage("NETWORK_IDENTITY", network_identity, self.rpc, self.identity["generation"])
         if not same_generation(observed, self.identity):
             raise ValueError("Testnet generation changed; a fresh run and barrier are required")
         self.identity = observed
@@ -563,12 +587,12 @@ class Deployment:
         if found is None:
             return None  # Ambiguous until exact native simulation proves eligible absence.
         item, data = found
-        if type(item.live_until_ledger_seq) is not int or item.live_until_ledger_seq <= snapshot[0]:
+        if type(item.live_until_ledger) is not int or item.live_until_ledger <= snapshot[0]:
             raise ValueError("Release resource is expired or its lifetime is unknown")
         if action.resource == "code":
             if data.type != xdr.LedgerEntryType.CONTRACT_CODE or data.contract_code.hash.hash.hex() != action.key or digest(data.contract_code.code) != action.key:
                 raise ValueError("Native code readback differs from the release")
-            return {"sha256": action.key, "bytes": len(data.contract_code.code), "ledger": snapshot[0], "live_until_ledger": item.live_until_ledger_seq}
+            return {"sha256": action.key, "bytes": len(data.contract_code.code), "ledger": snapshot[0], "live_until_ledger": item.live_until_ledger}
         if data.type != xdr.LedgerEntryType.CONTRACT_DATA or data.contract_data.contract != Address(action.key).to_xdr_sc_address() or data.contract_data.key != instance_key(action.key).contract_data.key or data.contract_data.durability != xdr.ContractDataDurability.PERSISTENT or data.contract_data.val.type != xdr.SCValType.SCV_CONTRACT_INSTANCE:
             raise ValueError("Wallet is not the exact persistent contract instance")
         instance = data.contract_data.val.instance
@@ -584,7 +608,7 @@ class Deployment:
             token=scval.to_string("XLM"), deployment_version=scval.to_uint64(0), nonce=scval.to_uint64(0), paused=scval.to_bool(False))
         if storage[0].val.to_xdr_bytes() != scval.to_struct(fields).to_xdr_bytes():
             raise ValueError("Wallet native configuration or pristine state differs")
-        return {"contract": action.key, "wasm_sha256": module, "ledger": snapshot[0], "live_until_ledger": item.live_until_ledger_seq,
+        return {"contract": action.key, "wasm_sha256": module, "ledger": snapshot[0], "live_until_ledger": item.live_until_ledger,
             "config": config, "state": {**config, "params": ca.params(config["params"], action.kind), "policy_state": {},
                 "contract_version": ca.WALLET_CONTRACT_VERSION, "token": "XLM", "deployment_version": 0, "nonce": 0, "paused": False},
             "state_xdr": storage[0].val.to_xdr(), "funding": "No release funds are transferred to smoke wallets."}
@@ -596,22 +620,22 @@ class Deployment:
         item, data = found
         if data.contract_data.contract != self.asset_key.contract_data.contract or data.contract_data.key != self.asset_key.contract_data.key or data.contract_data.durability != xdr.ContractDataDurability.PERSISTENT or data.contract_data.val.type != xdr.SCValType.SCV_CONTRACT_INSTANCE or data.contract_data.val.instance.executable.type != xdr.ContractExecutableType.CONTRACT_EXECUTABLE_STELLAR_ASSET:
             raise ValueError("The required asset is not the exact native SAC")
-        if type(item.live_until_ledger_seq) is not int or item.live_until_ledger_seq <= snapshot[0]:
+        if type(item.live_until_ledger) is not int or item.live_until_ledger <= snapshot[0]:
             raise ValueError("Native asset lifetime is unavailable")
 
     def preflight(self):
-        self.current()
-        snapshot = self.snapshot()
-        self.asset_present(snapshot)
-        account = self.account_state(snapshot)
+        public_stage("RELEASE_AUTHORITY", self.current)
+        snapshot = public_stage("RESOURCE_SNAPSHOT", self.snapshot)
+        public_stage("NATIVE_ASSET", self.asset_present, snapshot)
+        account = public_stage("OPERATOR_ACCOUNT", self.account_state, snapshot)
         plan = [Action("account", "owner", self.key.public_key, account is None)]
         for kind, item in self.manifest["artifacts"].items():
             if not any(a.key == item["sha256"] for a in plan):
                 action = Action("code", kind, item["sha256"], False)
-                plan.append(Action("code", kind, action.key, self.resource(action, snapshot) is None))
+                plan.append(Action("code", kind, action.key, public_stage("RELEASE_RESOURCE", self.resource, action, snapshot) is None))
         for kind, intent in self.intents.items():
             action = Action("wallet", kind, intent[2], False)
-            plan.append(Action("wallet", kind, action.key, self.resource(action, snapshot) is None))
+            plan.append(Action("wallet", kind, action.key, public_stage("RELEASE_RESOURCE", self.resource, action, snapshot) is None))
         self.expected_sequence = account
         self.public["plan"] = [{"resource": a.resource, "kind": a.kind, "key": a.key, "mode": "CONDITIONAL" if a.create else "REUSE"} for a in plan]
         return tuple(plan)
@@ -912,7 +936,8 @@ def main():
             secret = ""
         if key.public_key != ca.account(args.owner):
             raise ValueError("Secret differs from the independently configured operator")
-        result = Deployment(args.bundle, args.output, args.private, key, args.agent, args.server).run()
+        driver = public_stage("DEPLOYMENT_INITIALIZATION", Deployment, args.bundle, args.output, args.private, key, args.agent, args.server)
+        result = public_stage("DEPLOYMENT_EXECUTION", driver.run)
         immutable(args.output.parent / deployment_filename(manifest, result["network_identity"], workflow_attempt()), canonical(result) + b"\n")
         print("Current release resource state verified on Stellar Testnet.")
 
@@ -920,6 +945,6 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
-        print("Release stopped. Inspect the immutable public checkpoints; preserve original signed packets.", file=sys.stderr)
+    except Exception as error:
+        print(release_stop_message(error), file=sys.stderr)
         sys.exit(1)

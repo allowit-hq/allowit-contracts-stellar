@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import testnet_release as r
 from test_testnet_release import constructor, ledger, make_bundle, wasm
 from stellar_sdk import Address, Keypair, SorobanServer, TransactionEnvelope, scval, xdr
-from stellar_sdk.soroban_rpc import SimulateTransactionResponse, GetTransactionResponse
+from stellar_sdk.soroban_rpc import SimulateTransactionResponse, GetTransactionResponse, LedgerEntryResult, GetLedgerEntriesResponse
 
 class ReleaseReconciliation(unittest.TestCase):
     def setUp(self):
@@ -85,9 +85,9 @@ class ReleaseReconciliation(unittest.TestCase):
                     executable=xdr.ContractExecutable(xdr.ContractExecutableType.CONTRACT_EXECUTABLE_WASM,wasm_hash=xdr.Hash(bytes.fromhex(self.wallets[address])));storage=[xdr.SCMapEntry(scval.to_uint32(0),self.state(address))]
                 else:continue
                 data=xdr.LedgerEntryData(key.type,contract_data=xdr.ContractDataEntry(xdr.ExtensionPoint(0),key.contract_data.contract,key.contract_data.key,key.contract_data.durability,xdr.SCVal(xdr.SCValType.SCV_CONTRACT_INSTANCE,instance=xdr.SCContractInstance(executable,xdr.SCMap(storage)))))
-            if data is not None:items.append(NS(key=key.to_xdr(),xdr=data.to_xdr(),live_until_ledger_seq=tip+5000))
+            if data is not None:items.append(LedgerEntryResult(key=key.to_xdr(),xdr=data.to_xdr(),lastModifiedLedgerSeq=tip,liveUntilLedgerSeq=tip+5000))
         if self.after_snapshot:self.after_snapshot(self.snapshots)
-        return NS(latest_ledger=tip,entries=items)
+        return GetLedgerEntriesResponse(latestLedger=tip,entries=items)
 
     def simulate(self,envelope,**kwargs):
         self.simulated.append(envelope.to_xdr());host=envelope.transaction.operations[0].host_function;auth=[]
@@ -135,6 +135,22 @@ class ReleaseReconciliation(unittest.TestCase):
             'ledger':result['resource_observation']['ledger'],'observation':'observed-present','friendbot_requested':False})
         self.assertEqual({v['ledger'] for v in result['wallets'].values()},{result['resource_observation']['ledger']})
         self.assertTrue(all(v['observation']=='observed-existing' for v in result['wallets'].values()))
+
+    def test_native_sdk_resource_ttl_must_be_known_and_after_snapshot(self):
+        driver=self.driver();snapshot=driver.snapshot()
+        asset_item=snapshot[1][driver.asset_key.to_xdr()][0]
+        self.assertIsInstance(asset_item,LedgerEntryResult)
+        driver.asset_present(snapshot)
+        for expiry in (None,snapshot[0]-1,snapshot[0]):
+            with self.subTest(expiry=expiry):
+                asset_item.live_until_ledger=expiry
+                with self.assertRaisesRegex(ValueError,'lifetime is unavailable'):driver.asset_present(snapshot)
+                for key in driver.keys[2:]:
+                    item=snapshot[1].get(key.to_xdr())
+                    if item is not None:item[0].live_until_ledger=expiry
+                action=r.Action('code','common',self.manifest['artifacts']['common']['sha256'],False)
+                with self.assertRaisesRegex(ValueError,'lifetime is unknown'):driver.resource(action,snapshot)
+        self.sign.assert_not_called();self.assertFalse(self.sent)
 
     def test_pristine_deployment_and_fresh_run_do_not_fabricate_historical_receipts(self):
         self.codes.clear();self.wallets.clear();driver=self.driver();result=driver.run()

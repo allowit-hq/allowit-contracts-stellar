@@ -277,6 +277,18 @@ class ReleaseSafety(unittest.TestCase):
                 release.current_authority(self.manifest)
             command.assert_not_called()
 
+    def test_public_stop_message_exposes_only_a_fixed_stage(self):
+        error = ValueError("synthetic private exception detail")
+        with self.assertRaisesRegex(ValueError, "synthetic private exception detail"):
+            release.public_stage("DEPLOYMENT_EXECUTION", release.public_stage,
+                "NATIVE_ASSET", Mock(side_effect=error))
+        message = release.release_stop_message(error)
+        self.assertIn("stage=NATIVE_ASSET", message)
+        self.assertNotIn("synthetic private", message)
+        error.release_stage = "untrusted exception detail"
+        self.assertIn("stage=COMMAND", release.release_stop_message(error))
+        self.assertNotIn("untrusted exception", release.release_stop_message(error))
+
     def test_immutable_run_snapshots_never_clobber(self):
         path=self.root/'snapshot.json';release.immutable(path,b'first');release.immutable(path,b'first')
         with self.assertRaises(ValueError):release.immutable(path,b'second')
