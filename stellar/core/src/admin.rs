@@ -1165,11 +1165,14 @@ impl Deployer<'_> {
         }
         let response = self.rpc.call("simulateTransaction", params)?;
         let observed = rpc::owner_observation::ledger(&response["latestLedger"])?;
-        rpc::owner_observation::current(self.rpc, before, observed)?;
-        let after = rpc::observe_account(self.rpc, self.network, &source.address)?;
-        if after.account != *source || after.ledger < observed || after.ledger - observed > 1 {
+        // Bracket the simulation and its owner observation with the same heads.
+        // Read the owner entry first so intervening RPC calls cannot age the simulation.
+        let owner = rpc::read_account_observation(self.rpc, &source.address)?;
+        let after = rpc::owner_observation::current(self.rpc, before, observed)?;
+        if owner.account != *source || !(observed..=after).contains(&owner.ledger) {
             return Err("Owner account or simulation changed during native preparation".into());
         }
+        rpc::owner_observation::network(self.rpc, self.network)?;
         Ok(response)
     }
     /// Simulate `host` from `source` in record mode, check the recorded authorization and the

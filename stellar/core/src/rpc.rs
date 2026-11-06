@@ -82,6 +82,13 @@ pub struct AccountObservation {
 pub fn observe_account(rpc: &dyn Rpc, network: &str, address: &str) -> Result<AccountObservation> {
     owner_observation::network(rpc, network)?;
     let before = owner_observation::head(rpc)?;
+    let observation = read_account_observation(rpc, address)?;
+    owner_observation::current(rpc, before, observation.ledger)?;
+    Ok(observation)
+}
+
+/// Read the exact account entry and its ledger. The caller verifies the network and freshness.
+pub(crate) fn read_account_observation(rpc: &dyn Rpc, address: &str) -> Result<AccountObservation> {
     let key = LedgerKey::Account(LedgerKeyAccount {
         account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(account_key(
             address,
@@ -97,7 +104,6 @@ pub fn observe_account(rpc: &dyn Rpc, network: &str, address: &str) -> Result<Ac
     {
         return Err("Native account response key differs".into());
     }
-    owner_observation::current(rpc, before, ledger)?;
     Ok(AccountObservation { account, ledger })
 }
 fn account_from_response(value: &Value, address: &str) -> Result<AccountState> {
