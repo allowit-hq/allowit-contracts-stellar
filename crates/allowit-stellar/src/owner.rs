@@ -177,6 +177,7 @@ pub fn validate_native_setup(v: &NativeSetup) -> Result<()> {
 
 /// Read the native setup profile from Horizon without granting any authority.
 /// Only a fresh funded Testnet account without additional entries is admitted.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn fresh_testnet_owner_account(owner: &str, endpoint: Option<&str>) -> Result<AccountState> {
     account_key(owner)?;
     let origin = service_origin(endpoint, "https://horizon-testnet.stellar.org")?;
@@ -220,6 +221,7 @@ pub fn fresh_testnet_owner_account(owner: &str, endpoint: Option<&str>) -> Resul
 }
 
 /// Ask the Testnet faucet once. An uncertain response is not permission to repeat funding blindly.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn fund_testnet_account(account: &str, endpoint: Option<&str>) -> Result<String> {
     account_key(account)?;
     let origin = service_origin(endpoint, "https://friendbot.stellar.org")?;
@@ -230,12 +232,14 @@ pub fn fund_testnet_account(account: &str, endpoint: Option<&str>) -> Result<Str
     unhex::<32>(hash)?;
     Ok(hash.into())
 }
+#[cfg(not(target_arch = "wasm32"))]
 fn service_origin(endpoint: Option<&str>, default: &str) -> Result<String> {
     allowit_policy_sdk::client::config::parse_origin(
         endpoint.filter(|v| !v.is_empty()).unwrap_or(default),
     )
     .map_err(|_| "Stellar service endpoint must be an HTTPS or local HTTP origin".into())
 }
+#[cfg(not(target_arch = "wasm32"))]
 fn service_json(url: &str) -> Result<serde_json::Value> {
     use allowit_policy_sdk::transport::{
         http::{HttpClient, Method, Request},

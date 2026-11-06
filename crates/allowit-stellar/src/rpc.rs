@@ -8,12 +8,14 @@ pub use diagnostics::{
     ContractFault, WalletError, host_policy_denial, simulation_fault, simulation_resource_fee,
 };
 pub(crate) mod owner_observation;
+#[cfg(not(target_arch = "wasm32"))]
 use allowit_policy_sdk::transport::rpc::{EnvelopeValidation, ErrorKind, RpcClient};
 pub use owner_actions::{
     OwnerSettlement, code_uploaded, contract_exists, owner_settlement, vault_redeemable,
 };
 pub use owner_observation::{AssetBalance, WalletLifetime, asset_balance, wallet_lifetime};
 use serde_json::{Value, json};
+#[cfg(not(target_arch = "wasm32"))]
 use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
@@ -26,10 +28,12 @@ pub trait Rpc: Send + Sync {
     fn call(&self, method: &str, params: Value) -> Result<Value>;
 }
 /// Stellar JSON-RPC protocol adapter over the bounded common host transport.
+#[cfg(not(target_arch = "wasm32"))]
 pub struct HttpRpc {
     client: RpcClient,
     id: AtomicU64,
 }
+#[cfg(not(target_arch = "wasm32"))]
 impl HttpRpc {
     pub fn new(url: &str) -> Result<Self> {
         Ok(Self {
@@ -40,6 +44,7 @@ impl HttpRpc {
         })
     }
 }
+#[cfg(not(target_arch = "wasm32"))]
 impl Rpc for HttpRpc {
     fn call(&self, method: &str, params: Value) -> Result<Value> {
         self.client
@@ -82,6 +87,13 @@ pub struct AccountObservation {
 pub fn observe_account(rpc: &dyn Rpc, network: &str, address: &str) -> Result<AccountObservation> {
     owner_observation::network(rpc, network)?;
     let before = owner_observation::head(rpc)?;
+    let observation = read_account_observation(rpc, address)?;
+    owner_observation::current(rpc, before, observation.ledger)?;
+    Ok(observation)
+}
+
+/// Read the exact account entry and its ledger. The caller verifies the network and freshness.
+pub(crate) fn read_account_observation(rpc: &dyn Rpc, address: &str) -> Result<AccountObservation> {
     let key = LedgerKey::Account(LedgerKeyAccount {
         account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(account_key(
             address,
@@ -97,7 +109,6 @@ pub fn observe_account(rpc: &dyn Rpc, network: &str, address: &str) -> Result<Ac
     {
         return Err("Native account response key differs".into());
     }
-    owner_observation::current(rpc, before, ledger)?;
     Ok(AccountObservation { account, ledger })
 }
 fn account_from_response(value: &Value, address: &str) -> Result<AccountState> {
@@ -557,11 +568,13 @@ fn validate_response_identity(v: &Value, expected_hash: &[u8; 32]) -> Result<()>
             })
             .transpose()
     };
-    let (oldest, latest, settled) = (
-        ledger("oldestLedger")?,
-        ledger("latestLedger")?,
-        ledger("ledger")?,
-    );
+    let (oldest, latest) = (ledger("oldestLedger")?, ledger("latestLedger")?);
+    // A current RPC reports zero as the unset settlement ledger for NOT_FOUND.
+    let settled = if v["status"] == "NOT_FOUND" && v["ledger"].as_u64() == Some(0) {
+        None
+    } else {
+        ledger("ledger")?
+    };
     if let (Some(oldest), Some(latest)) = (oldest, latest)
         && (oldest > latest || settled.is_some_and(|n| n < oldest || n > latest))
     {
