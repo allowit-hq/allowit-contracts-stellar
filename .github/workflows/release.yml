@@ -77,7 +77,9 @@ jobs:
           cargo test --locked --manifest-path "$native_manifest"
           cargo clippy --workspace --locked --all-targets -- -D warnings
           cargo clippy --locked --manifest-path "$native_manifest" --all-targets -- -D warnings
-          python -m unittest discover -s scripts/tests -v
+          python -m venv "$RUNNER_TEMP/stellar-source-python"
+          "$RUNNER_TEMP/stellar-source-python/bin/python" -m pip install -r scripts/requirements-admin.txt
+          "$RUNNER_TEMP/stellar-source-python/bin/python" -m unittest discover -s scripts/tests -v
       - name: Verify release automation
         working-directory: automation
         run: python -m unittest discover -s scripts/tests -p test_testnet_release.py -v
