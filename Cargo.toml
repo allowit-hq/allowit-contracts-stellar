@@ -1,8 +1,8 @@
 [workspace]
-members = ["crates/policy", "crates/protocol", "crates/engine", "crates/engine-parent", "crates/policy-wallet", "crates/simple-policy-engine", "crates/common-policy-engine", "crates/custom-policy", "crates/test-vault"]
+members = ["crates/policy", "crates/protocol", "crates/engine", "contracts/allowit-engine-deployer", "crates/policy-wallet", "contracts/allowit-simple-engine", "contracts/allowit-common-engine", "contracts/allowit-custom-policy", "crates/test-vault"]
 resolver = "2"
 
-# Every package in this repository, including stellar/core, releases at this version.
+# Every package in this repository, including crates/allowit-stellar, releases at this version.
 [workspace.package]
 version = "0.3.0"
 edition = "2024"

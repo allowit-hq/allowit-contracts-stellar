@@ -882,7 +882,7 @@ fn renewal_rejects_invalid_config_and_excessive_installed_fee_before_rpc() {
 
 #[test]
 fn native_error_codes_follow_the_contract_and_host_envelope() {
-    let source = include_str!("../../../crates/policy-wallet/src/lib.rs");
+    let source = include_str!("../../policy-wallet/src/lib.rs");
     let body = source
         .split("pub enum AllowitWalletError {")
         .nth(1)

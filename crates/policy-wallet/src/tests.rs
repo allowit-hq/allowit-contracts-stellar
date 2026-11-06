@@ -193,9 +193,9 @@ impl Fixture {
         }
         let source_digest = if wasm == CUSTOM || wasm == CATCHING {
             let source: &[u8] = if wasm == CUSTOM {
-                include_bytes!("../../custom-policy/policy/policy.rs")
+                include_bytes!("../../../contracts/allowit-custom-policy/policy/policy.rs")
             } else {
-                include_bytes!("../../custom-policy/src/catching_policy.rs")
+                include_bytes!("../../../contracts/allowit-custom-policy/src/catching_policy.rs")
             };
             env.crypto()
                 .sha256(&Bytes::from_slice(&env, source))
@@ -1668,7 +1668,7 @@ fn upgraded_tiers_validate_retained_rules_and_owner_can_correct_configuration() 
                 .crypto()
                 .sha256(&Bytes::from_slice(
                     &f.env,
-                    include_bytes!("../../custom-policy/policy/policy.rs"),
+                    include_bytes!("../../../contracts/allowit-custom-policy/policy/policy.rs"),
                 ))
                 .to_bytes();
         }

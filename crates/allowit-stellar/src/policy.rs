@@ -837,7 +837,7 @@ pub fn evaluate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    const SOURCE: &str = include_str!("../../../crates/custom-policy/policy/policy.rs");
+    const SOURCE: &str = include_str!("../../../contracts/allowit-custom-policy/policy/policy.rs");
 
     #[test]
     fn canonical_source_has_the_full_prefix_and_is_canonical_only() {

@@ -1,11 +1,14 @@
 [package]
-name = "allowit-stellar-wallet"
+name = "allowit-stellar"
 version = "0.3.0"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
 repository = "https://github.com/allowit-hq/allowit-contracts-stellar"
 description = "Canonical Stellar wallet preparation, native authorization and settlement"
+
+[lib]
+name = "allowit_stellar_wallet"
 
 [workspace]
 

@@ -305,6 +305,22 @@ def check_canonical_tag(manifest):
         raise ValueError("Canonical release tag changed or is unavailable")
 
 
+def source_layout(source):
+    """Resolve one complete release layout, including historical annotated tags."""
+    layouts = (
+        ("stellar/core", "crates/custom-policy/policy/policy.rs"),
+        ("crates/allowit-stellar", "contracts/allowit-custom-policy/policy/policy.rs"),
+    )
+    present = [(source / native, source / policy) for native, policy in layouts
+        if (source / native).exists() or (source / policy).exists()]
+    if len(present) != 1:
+        raise ValueError("Expected exactly one supported release source layout")
+    native, policy = present[0]
+    if not all(path.is_file() for path in (native / "Cargo.toml", native / "Cargo.lock", policy)):
+        raise ValueError("Incomplete release source layout")
+    return native, policy
+
+
 def bundle(source, identity, output):
     if set(identity) != IDENTITY_KEYS:
         raise ValueError("Unexpected release identity fields")
@@ -313,14 +329,14 @@ def bundle(source, identity, output):
     version = tomllib.loads((source / "Cargo.toml").read_text())["workspace"]["package"]["version"]
     if "v" + version != identity["tag"]:
         raise ValueError("Tag and workspace version differ")
-    if tomllib.loads((source / "stellar/core/Cargo.toml").read_text())["package"]["version"] != version:
+    native, sample = source_layout(source)
+    if tomllib.loads((native / "Cargo.toml").read_text())["package"]["version"] != version:
         raise ValueError("Native host and workspace release versions differ")
-    for relative in ("Cargo.lock", "stellar/core/Cargo.lock"):
-        packages = tomllib.loads((source / relative).read_text())["package"]
+    for lock in (source / "Cargo.lock", native / "Cargo.lock"):
+        packages = tomllib.loads(lock.read_text())["package"]
         identities = {item["source"] for item in packages if "allowit-core" in item.get("source", "")}
         if identities != {CORE_SOURCE}:
             raise ValueError("Release must use the single published Core v0.3.2 source")
-    sample = source / "crates/custom-policy/policy/policy.rs"
     # Resolve this with the release's own checked policy gate, before the signing job.
     helper = "import sys;sys.path.insert(0,sys.argv[1]);from policy_source import standard_prefix;import json;print(json.dumps(standard_prefix(open(sys.argv[2]).read())))"
     rules = json.loads(public_output([sys.executable, "-c", helper, str(source / "scripts"), str(sample)], text=True))
@@ -856,6 +872,8 @@ def main():
     build.add_argument("--source", type=Path, required=True)
     build.add_argument("--identity", type=Path, required=True)
     build.add_argument("--output", type=Path, required=True)
+    layout = commands.add_parser("source-layout")
+    layout.add_argument("--source", type=Path, required=True)
     publication = commands.add_parser("publish")
     publication.add_argument("--bundle", type=Path, required=True)
     deploy = commands.add_parser("deploy")
@@ -871,6 +889,9 @@ def main():
         write(args.output, result)
         for key, value in result.items():
             print(key + "=" + value)
+    elif args.action == "source-layout":
+        native, _ = source_layout(args.source)
+        print(native / "Cargo.toml")
     elif args.action == "bundle":
         bundle(args.source, read_public(args.identity), args.output)
     elif args.action == "publish":

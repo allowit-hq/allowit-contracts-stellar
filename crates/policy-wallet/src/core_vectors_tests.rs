@@ -1,7 +1,7 @@
-//! Execute the transactions that `stellar/core` builds on the Soroban host with the released
+//! Execute the transactions that `crates/allowit-stellar` builds on the Soroban host with the released
 //! Simple, Common and Custom wallet Wasm.
 //!
-//! `stellar/core/tests/policy_wallet.rs` runs each tier's complete workflow (create, transfer,
+//! `crates/allowit-stellar/tests/policy_wallet.rs` runs each tier's complete workflow (create, transfer,
 //! SEP-56 deposit and redeem, pause, resume, params update, transfer and recovery) and records
 //! every transaction, the host result it expects and the wallet State it computes after it. Here each
 //! recorded host function runs with its exact recorded authorization entries and transaction
@@ -21,7 +21,7 @@ use soroban_sdk::{
 use std::{string::String, vec::Vec};
 
 const VECTORS: &str =
-    include_str!("../../../stellar/core/tests/fixtures/policy-wallet-vectors.txt");
+    include_str!("../../allowit-stellar/tests/fixtures/policy-wallet-vectors.txt");
 const VAULT: &[u8] =
     include_bytes!("../../../target/wasm32v1-none/release/allowit_sep56_test_vault.wasm");
 

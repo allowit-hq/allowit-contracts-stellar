@@ -9,6 +9,7 @@ import re
 import subprocess
 import tempfile
 import time
+import tomllib
 from types import SimpleNamespace
 from urllib.request import Request, urlopen
 
@@ -27,7 +28,7 @@ DEFAULT_REVISION = None
 DEFAULT_HASHES = {}
 WALLET_KIND = "common_policy_engine"
 POLICY_DENIED = 18
-BUILD_SCRIPTS = ("build-contracts.sh", "check-policy-bindings.py", "policy_source.py", "core_sources.py")
+BUILD_SCRIPTS = ("build-contracts.sh", "stellar-cargo.py", "check-policy-bindings.py", "policy_source.py", "core_sources.py")
 
 # The smoke policy is entirely one standard prefix of canonical calls. Its rules derive from the source.
 SMOKE_SOURCE = b"""use allowit::prelude::*;
@@ -245,6 +246,16 @@ def complete_execute(plan, prepared, signed_xdr):
     return result
 
 
+def contract_build_sources(root):
+    """List contract workspace inputs; the separate off-chain SDK is not a contract input."""
+    files = [root / name for name in ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml")]
+    members = tomllib.loads((root / "Cargo.toml").read_text())["workspace"]["members"]
+    for member in members:
+        files += sorted((root / member).rglob("*.rs"))
+        files += sorted((root / member).rglob("Cargo.toml"))
+    return files + [root / "scripts" / name for name in BUILD_SCRIPTS]
+
+
 def load_plan(path):
     path = Path(path).resolve()
     plan = json.loads(path.read_text())
@@ -327,7 +338,7 @@ def load_plan(path):
             raise ValueError("Test-feature artifacts cannot be deployed")
         if digest(artifact_path.read_bytes()) != artifact["sha256"].lower():
             raise ValueError("Artifact hash differs from plan: " + name)
-    if set(entry["path"] for entry in manifest["sources"]) != set(str(f.relative_to(ROOT)) for f in [ROOT / n for n in ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml")] + list((ROOT / "crates").rglob("*.rs")) + list((ROOT / "crates").rglob("Cargo.toml")) + [ROOT / "scripts" / n for n in BUILD_SCRIPTS]):
+    if set(entry["path"] for entry in manifest["sources"]) != set(str(f.relative_to(ROOT)) for f in contract_build_sources(ROOT)):
         raise ValueError("Manifest must include every contract build source")
     return plan, digest(canonical(plan)), path.parent
 

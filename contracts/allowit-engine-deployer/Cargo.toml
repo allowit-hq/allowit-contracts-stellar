@@ -1,5 +1,5 @@
 [package]
-name = "allowit-engine-parent"
+name = "allowit-engine-deployer"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
@@ -7,6 +7,7 @@ license = "UNLICENSED"
 publish = false
 
 [lib]
+name = "allowit_engine_parent"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
@@ -14,5 +15,5 @@ soroban-sdk.workspace = true
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
-allowit-wallet-engine = { path = "../engine" }
+allowit-wallet-engine = { path = "../../crates/engine" }
 allowit = { workspace = true }

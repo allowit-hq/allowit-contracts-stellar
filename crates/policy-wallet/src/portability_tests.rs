@@ -37,11 +37,11 @@ use std::{
     vec::Vec as List,
 };
 
-#[path = "../../custom-policy/src/branch_policy.rs"]
+#[path = "../../../contracts/allowit-custom-policy/src/branch_policy.rs"]
 mod branch;
-#[path = "../../custom-policy/src/catching_policy.rs"]
+#[path = "../../../contracts/allowit-custom-policy/src/catching_policy.rs"]
 mod catching;
-#[path = "../../custom-policy/policy/policy.rs"]
+#[path = "../../../contracts/allowit-custom-policy/policy/policy.rs"]
 mod sample;
 mod vectors {
     use super::std::{self, format, string::String, vec, vec::Vec};
@@ -368,7 +368,7 @@ fn soroban_outcome(env: &Env, contract: &Address, universe: &[Address], v: &Vect
 /// The leading canonical calls of the sample policy, as `scripts/policy_source.py` derives them
 /// for the standard contract.
 fn sample_prefix() -> List<AllowitRule> {
-    let source = include_str!("../../custom-policy/policy/policy.rs");
+    let source = include_str!("../../../contracts/allowit-custom-policy/policy/policy.rs");
     let (_, body) = source
         .split_once("pub fn execute(ctx: &AllowitContext) -> allowit::Result {")
         .unwrap();

@@ -16,7 +16,16 @@ if ! mkdir "$lock" 2>/dev/null; then
   echo "Another build-contracts.sh holds $lock; remove it if no build runs." >&2
   exit 1
 fi
-trap 'rmdir "$lock"' EXIT
+# CLI 28.1 looks up Wasm by package name even when Cargo declares a different
+# library target. Keep its metadata injection, spec filtering and optimization.
+# The scoped Cargo bridge supplies that lookup file after each real compilation.
+bridge=""
+trap 'rmdir "$lock"; rm -rf "$bridge"' EXIT
+bridge=$(mktemp -d)
+export ALLOWIT_REAL_CARGO
+ALLOWIT_REAL_CARGO=$(command -v cargo)
+ln -s "$PWD/scripts/stellar-cargo.py" "$bridge/cargo"
+export PATH="$bridge:$PATH"
 python3 scripts/check-policy-bindings.py
 stellar_bin="${STELLAR_BIN:-stellar}"
 fixtures="$cargo_target/test-fixture-build"
@@ -30,3 +39,10 @@ if [ "$cargo_target" -ef target ]; then
 else
   "$stellar_bin" contract build --locked --out-dir target/wasm32v1-none/release
 fi
+
+# Publish the historical library basenames after CLI processing, including builds
+# using an external Cargo target directory. Package-named files are intermediate.
+for names in "allowit_simple_engine allowit_simple_policy_engine" "allowit_common_engine allowit_common_policy_engine" "allowit_engine_deployer allowit_engine_parent"; do
+  read -r package library <<< "$names"
+  mv "target/wasm32v1-none/release/$package.wasm" "target/wasm32v1-none/release/$library.wasm"
+done

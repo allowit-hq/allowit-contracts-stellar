@@ -2,7 +2,17 @@
 
 `@allowit/stellar` supplies native profiles, asset derivation, wallet signing, owner handoffs, receipt validation and explorer links. Consumers supply their authenticated REST transport. The adapter does not own application sessions or presentation layout.
 
-The package exports JavaScript modules and TypeScript declarations. Run `npm install --ignore-scripts` and `npm run build:browser` to regenerate `browser/dist` from `browser/src`. Keep the distribution with its source so Git consumers work when install scripts are disabled. Pin the repository to an immutable commit when consuming it before a registry release. Signing retains original signed bytes before broadcast, and recovery observes the original transaction.
+The package exports JavaScript modules and TypeScript declarations. Run these commands from `npm/stellar/`:
+
+```sh
+npm install --ignore-scripts --package-lock=false
+npm run build:browser
+npm run test:browser
+npm pack --dry-run --ignore-scripts --json
+npm pack --ignore-scripts
+```
+
+The build regenerates `dist/` from `src/`. Keep the distribution with its source so consumers can install the package with lifecycle scripts disabled. Before a registry release, build a tarball from an immutable repository revision and install that tarball. A repository-root Git dependency cannot select this nested package. Signing retains original signed bytes before broadcast, and recovery observes the original transaction.
 
 `customerKeyFromEntropy` encodes caller-supplied entropy. The caller generates entropy and retains the secret. `stellarSignInChallengeTimes` binds the native message and returns its dates. `connectStellarWallet` requires the caller's timestamp-admission capability. The capability must return `true` for admitted dates. HTTP-session freshness rules remain with the consumer.
 

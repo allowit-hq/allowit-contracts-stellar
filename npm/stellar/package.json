@@ -4,16 +4,16 @@
   "private": true,
   "type": "module",
   "files": [
-    "browser/dist"
+    "dist"
   ],
   "exports": {
     ".": {
-      "types": "./browser/dist/index.d.ts",
-      "import": "./browser/dist/index.js"
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
     },
     "./*": {
-      "types": "./browser/dist/*.d.ts",
-      "import": "./browser/dist/*.js"
+      "types": "./dist/*.d.ts",
+      "import": "./dist/*.js"
     }
   },
   "dependencies": {
@@ -23,8 +23,8 @@
     "@noble/hashes": "1.8.0"
   },
   "scripts": {
-    "build:browser": "tsc -p browser/tsconfig.json",
-    "test:browser": "node --test browser/tests/*.test.mjs"
+    "build:browser": "tsc -p tsconfig.json",
+    "test:browser": "node --test tests/*.test.mjs"
   },
   "devDependencies": {
     "typescript": "~5.9.2"

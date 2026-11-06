@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/"scripts"))
-PARAMS_FILE=ROOT/"stellar/core/tests/fixtures/params-vectors.json"
+PARAMS_FILE=ROOT/"crates/allowit-stellar/tests/fixtures/params-vectors.json"
 
 G = "GAKDNXUGEIRGESAXOPUHU4GOWLVYGQFJVHQOGFXKBXDGZ7AKMPPSDDPV"
 C = "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ"

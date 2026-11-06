@@ -74,6 +74,62 @@ def constructor(config, module, salt):
         [scval.to_struct(fields)])
 
 
+class ReleaseSourceLayouts(unittest.TestCase):
+    layouts = (
+        ("stellar/core", "crates/custom-policy/policy/policy.rs"),
+        ("crates/allowit-stellar", "contracts/allowit-custom-policy/policy/policy.rs"),
+    )
+
+    def create_source(self, root, native_name, policy_name):
+        native, policy = root / native_name, root / policy_name
+        native.mkdir(parents=True)
+        policy.parent.mkdir(parents=True)
+        (root / "Cargo.toml").write_text('[workspace.package]\nversion = "0.3.0"\n')
+        (native / "Cargo.toml").write_text('[package]\nversion = "0.3.0"\n')
+        lock = '[[package]]\nname = "allowit"\nversion = "0.3.1"\nsource = "' + release.CORE_SOURCE + '"\n'
+        for path in (root / "Cargo.lock", native / "Cargo.lock"):
+            path.write_text(lock)
+        policy.write_bytes(b"exact policy bytes\n")
+        return native, policy
+
+    def test_bundle_old_and_new_sources_preserve_exact_artifacts(self):
+        for native_name, policy_name in self.layouts:
+            with self.subTest(layout=native_name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                native, policy = self.create_source(root, native_name, policy_name)
+                target = root / "target"
+                artifacts = target / "wasm32v1-none/release"
+                artifacts.mkdir(parents=True)
+                for filename in release.CONTRACTS.values():
+                    (artifacts / filename).write_bytes(wasm())
+                identity = {"tag": "v0.3.0", "revision": "a" * 40,
+                    "tag_object": "b" * 40, "workflow_revision": "c" * 40}
+                output = root / "bundle"
+                with patch.object(release, "git", side_effect=[identity["revision"], ""]), \
+                        patch.object(release, "public_output", side_effect=[json.dumps(["payment_limit"]), json.dumps({"target_directory": str(target)})]), \
+                        patch.object(release, "workflow_attempt", return_value="90:1"):
+                    result = release.bundle(root, identity, output)
+                self.assertEqual(release.source_layout(root), (native, policy))
+                self.assertEqual(release.check_bundle(output), result)
+                self.assertEqual((output / "sample-policy.rs").read_bytes(), policy.read_bytes())
+                for filename in release.CONTRACTS.values():
+                    self.assertEqual((output / filename).read_bytes(), (artifacts / filename).read_bytes())
+
+    def test_missing_partial_and_ambiguous_sources_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(ValueError, "exactly one"):
+                release.source_layout(root)
+            native, policy = self.create_source(root, *self.layouts[0])
+            (native / "Cargo.lock").unlink()
+            with self.assertRaisesRegex(ValueError, "Incomplete"):
+                release.source_layout(root)
+            (native / "Cargo.lock").write_text("")
+            self.create_source(root, *self.layouts[1])
+            with self.assertRaisesRegex(ValueError, "exactly one"):
+                release.source_layout(root)
+
+
 class ReleaseSafety(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))

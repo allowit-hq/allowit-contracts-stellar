@@ -16,6 +16,43 @@ import mainnet_release as release
 from stellar_sdk import Keypair, Asset, scval, Account, TransactionBuilder, Network, Address, TransactionEnvelope, StrKey, xdr
 
 
+class ContractSourceManifestTests(unittest.TestCase):
+    def test_old_and_new_manifests_bind_contract_sources_and_exclude_offchain_sdk(self):
+        for contract, native in (("crates/custom-policy", "stellar/core"),
+                ("contracts/allowit-custom-policy", "crates/allowit-stellar")):
+            with self.subTest(contract=contract), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                scripts = root / "scripts"
+                scripts.mkdir()
+                (scripts / "artifacts.py").write_bytes((release.ROOT / "scripts/artifacts.py").read_bytes())
+                (root / "Cargo.toml").write_text('[workspace]\nmembers = ["crates/policy", "' + contract + '"]\n')
+                (root / "Cargo.lock").write_text("lock bytes")
+                (root / "rust-toolchain.toml").write_text("toolchain bytes")
+                for member in ("crates/policy", contract, native):
+                    (root / member / "src").mkdir(parents=True)
+                    (root / member / "src/lib.rs").write_text(member + " source")
+                    (root / member / "Cargo.toml").write_text(member + " manifest")
+                for script in release.BUILD_SCRIPTS:
+                    (scripts / script).write_text(script)
+                target = root / "target/wasm32v1-none/release"
+                target.mkdir(parents=True)
+                names = ("allowit_simple_policy_engine", "allowit_common_policy_engine", "allowit_custom_policy", "allowit_wallet_engine", "allowit_engine_parent")
+                for name in names:
+                    (target / (name + ".wasm")).write_bytes(b"fixture Wasm")
+                subprocess.run(["git", "init", "-q", str(root)], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(root), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", "fixture"], check=True, capture_output=True)
+                manifest = json.loads(subprocess.check_output([sys.executable, str(scripts / "artifacts.py")], text=True))
+                entries = {item["path"]: item["sha256"] for item in manifest["sources"]}
+                self.assertEqual(set(entries), {str(path.relative_to(root)) for path in release.contract_build_sources(root)})
+                for relative in (contract + "/Cargo.toml", contract + "/src/lib.rs", "crates/policy/Cargo.toml", "crates/policy/src/lib.rs"):
+                    self.assertEqual(entries[relative], release.digest((root / relative).read_bytes()))
+                self.assertFalse(any(path.startswith(native + "/") for path in entries))
+                (root / contract / "src/lib.rs").write_text("changed contract")
+                changed = json.loads(subprocess.check_output([sys.executable, str(scripts / "artifacts.py")], text=True))
+                changed_entries = {item["path"]: item["sha256"] for item in changed["sources"]}
+                self.assertNotEqual(entries[contract + "/src/lib.rs"], changed_entries[contract + "/src/lib.rs"])
+
+
 class ReleaseTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -33,9 +70,7 @@ class ReleaseTests(unittest.TestCase):
             owner=keys[0], admin=keys[1], agent=keys[2], recipient=keys[3], forbidden_recipient=keys[4], admin_members=keys[5:8], server=keys[8], asset=Asset.native().contract_id(Network.PUBLIC_NETWORK_PASSPHRASE), policy_instance='01'*32,
             params=dict(destinations=[keys[3]], payment_limit=10000, daily_volume_limit=20020000, lifetime_spending_limit=20020000, call_limit=2, expires_at=2000000000),
             fund_stroops=20000, payment_stroops=10000, fee_caps_stroops=dict.fromkeys(release.STAGES, 10000000), total_fee_cap_stroops=70000000, artifacts={})
-        files = [release.ROOT/n for n in ('Cargo.toml','Cargo.lock','rust-toolchain.toml')]
-        files += list((release.ROOT/'crates').rglob('*.rs')) + list((release.ROOT/'crates').rglob('Cargo.toml'))
-        files += [release.ROOT/'scripts'/n for n in release.BUILD_SCRIPTS]
+        files = release.contract_build_sources(release.ROOT)
         manifest = dict(git_revision=release.DEFAULT_REVISION, sources=[dict(path=str(f.relative_to(release.ROOT)),sha256=release.digest(f.read_bytes())) for f in files], artifacts=[])
         hashes = {}
         for name, filename in release.NAMES.items():

@@ -13,7 +13,7 @@
 
 </div>
 
-**Go on. On your terms.** Allowit lets your AI agents spend and invest, within a policy you set. This repository holds the Soroban smart contracts that enforce that policy on Stellar: owner-controlled wallets that move funds only when the agent and an independent server both sign, and only when the owner's policy says yes. It also holds `stellar/core`, the off-chain Rust rail crate (`allowit-stellar-wallet`) that the SDK engine composes to prepare, authorize and settle transfers through those wallets.
+**Go on. On your terms.** Allowit lets your AI agents spend and invest, within a policy you set. This repository holds the Soroban smart contracts that enforce that policy on Stellar: owner-controlled wallets that move funds only when the agent and an independent server both sign, and only when the owner's policy says yes. It also holds `crates/allowit-stellar`, the off-chain Rust rail crate (`allowit-stellar`) that the SDK engine composes to prepare, authorize and settle transfers through those wallets.
 
 ## Architecture
 
@@ -25,7 +25,7 @@ SDK engine composes the shared workflows. Core owns common policy rules, types a
 flowchart TB
     UI["[allowit-engine]<br/>npm @allowit/ui<br/>Shared policy web components"]
     Engine["[allowit-sdk]<br/>crate @allowit/sdk/engine<br/>All other shared logic"]
-    Vendor["[allowit-contracts-stellar]<br/>crate allowit-stellar-wallet · allowit-stellar-policy<br/>npm @allowit/stellar<br/>Native contracts · signing · chain semantics<br/>SVG graphics · web components"]
+    Vendor["[allowit-contracts-stellar]<br/>crate allowit-stellar · allowit-stellar-policy<br/>npm @allowit/stellar<br/>Native contracts · signing · chain semantics<br/>SVG graphics · web components"]
     Core["[allowit-core]<br/>crate + npm @allowit/core<br/>Common types · policy rules · primitives<br/>TypeScript interfaces"]
 
     UI -->|npm| Vendor
@@ -34,6 +34,88 @@ flowchart TB
 ```
 
 [Full architecture][responsibility-model].
+
+### On-chain relationships
+
+The three wallets run their own custody and policy checks. The engine parent manages the separate
+stateless checker. See [wallet architecture](docs/architecture.md) and
+[engine parent](docs/engine-parent.md).
+
+```mermaid
+flowchart LR
+    W["Simple / Common / Custom<br/>Three separate custody contracts"]
+    S["Stellar Asset Contract"]
+    R["Swap router"]
+    V["SEP-56 vault"]
+    P["Engine Parent"]
+    E["Wallet Engine<br/>Stateless checker"]
+
+    W -. "Token operations" .-> S
+    W -. "Swap" .-> R
+    W -. "Redeem, plus deposits for Simple and Common" .-> V
+    P -. "Deploys checker and manages its Wasm reference" .-> E
+```
+
+### Proposed wallet upgrade model
+
+EngineParent manages separate executable references for Simple and Common wallets. Owners choose
+whether to pin a Wasm hash or follow a managed reference. Each wallet keeps its own address,
+configuration and state. Changing a reference changes the code used by its subscribed wallets.
+Updates must preserve their contract interface and storage layout. See
+[Stellar CAP-85](https://github.com/stellar/stellar-protocol/blob/master/core/cap-0085.md).
+
+```mermaid
+flowchart LR
+    P["EngineParent"] -. "Updates" .-> S["Simple Wasm reference"]
+    P -. "Updates" .-> C["Common Wasm reference"]
+    SW["Opted-in Simple wallets"] -. "Load code from" .-> S
+    CW["Opted-in Common wallets"] -. "Load code from" .-> C
+```
+
+### Cargo dependencies
+
+Each contract produces a separate Wasm artifact. Arrows show Cargo dependencies. The off-chain
+Stellar crate uses a separate workspace. Support crates retain their existing boundaries.
+
+```mermaid
+flowchart TD
+    S["contracts/allowit-simple-engine<br/>allowit-simple-engine"]
+    C["contracts/allowit-common-engine<br/>allowit-common-engine"]
+    X["contracts/allowit-custom-policy<br/>allowit-custom-policy"]
+    P["contracts/allowit-engine-deployer<br/>allowit-engine-deployer"]
+    W["crates/policy-wallet<br/>allowit-policy-wallet"]
+    T["crates/protocol<br/>allowit-wallet-protocol"]
+    B["crates/policy<br/>allowit-stellar-policy"]
+    CORE["allowit-core<br/>portable allowit"]
+    SDK["soroban-sdk"]
+    OFF["crates/allowit-stellar<br/>allowit-stellar · off-chain"]
+    HOST["allowit-core<br/>allowit-sdk · host primitives"]
+    E["crates/engine<br/>allowit-wallet-engine · standalone checker"]
+    S --> W
+    S --> T
+    C --> W
+    C --> T
+    X --> W
+    X --> T
+    X --> B
+    W --> T
+    W --> B
+    B --> CORE
+    B --> SDK
+    S --> SDK
+    C --> SDK
+    X --> SDK
+    P --> SDK
+    W --> SDK
+    T --> SDK
+    E --> B
+    E --> SDK
+    OFF --> CORE
+    OFF --> HOST
+```
+
+The deployer package retains the EngineParent contract and its stateless-checker behavior.
+The proposed managed Simple and Common references above are a separate design.
 
 ## Overview
 
@@ -161,7 +243,7 @@ GitHub Release. See [Testnet releases](docs/testnet-releases.md) for environment
 deployment scope and reruns.
 
 > [!TIP]
-> The `AllowitCustomPolicy` sample source is `crates/custom-policy/policy/policy.rs`. Its contract compiles that file verbatim as a module, and `build.rs` binds `SOURCE_HASH` to its bytes. No SDK code generation is involved. `scripts/policy-smoke.rs` compiles the sample against the host backend with plain `rustc`. `cargo test` builds and runs it, then compares its outcomes on the shared vectors in `scripts/policy-vectors.rs` with the Soroban backend and the custom, standard and simple Wasm. `STELLAR_BIN` selects the Stellar CLI executable.
+> The `AllowitCustomPolicy` sample source is `contracts/allowit-custom-policy/policy/policy.rs`. Its contract compiles that file verbatim as a module, and `build.rs` binds `SOURCE_HASH` to its bytes. No SDK code generation is involved. `scripts/policy-smoke.rs` compiles the sample against the host backend with plain `rustc`. `cargo test` builds and runs it, then compares its outcomes on the shared vectors in `scripts/policy-vectors.rs` with the Soroban backend and the custom, standard and simple Wasm. `STELLAR_BIN` selects the Stellar CLI executable.
 
 The administration tools need the pinned Python Stellar SDK. Keep it in a virtual environment:
 
@@ -203,16 +285,19 @@ The step-by-step guide, including params encoding and owner handoffs, is in [doc
 ## Project structure
 
 ```
+contracts/
+  allowit-simple-engine/    AllowitSimplePolicyEngine contract
+  allowit-common-engine/    AllowitCommonPolicyEngine contract
+  allowit-custom-policy/    AllowitCustomPolicy contract and sample policy source
+  allowit-engine-deployer/  EngineParent contract for the standalone checker
 crates/
-  protocol/               Shared request, receipt and binding types
-  policy-wallet/          Custody core, owner operations and the policy_wallet! macro
-  simple-policy-engine/   AllowitSimplePolicyEngine contract
-  common-policy-engine/   AllowitCommonPolicyEngine contract
-  custom-policy/          AllowitCustomPolicy contract and its sample policy source
-  engine/                 Standalone shared rule engine contract
-  engine-parent/          Upgrade parent for the shared engine
-  test-vault/             SEP-56 vault for deposit and redeem tests
-stellar/core/             Stellar rail core (allowit-stellar-wallet) that the SDK engine composes; its own Cargo workspace
+  allowit-stellar/          Off-chain Stellar SDK; separate Cargo workspace
+  protocol/                Shared request, receipt and binding types
+  policy/                  Soroban policy bindings
+  policy-wallet/           Custody core, owner operations and policy_wallet! macro
+  engine/                  Standalone shared rule engine contract
+  test-vault/              SEP-56 vault for tests
+npm/stellar/               @allowit/stellar browser package; source, tests and distribution
 scripts/                  Build, policy checks, smoke vectors, administration and release tooling
 docs/                     Architecture, engine parent, administration, mainnet
 ```
@@ -231,9 +316,25 @@ docs/                     Architecture, engine parent, administration, mainnet
 - [Setup and administration](docs/admin.md): preparing, reviewing and signing wallet transactions.
 - [Mainnet preparation](docs/mainnet.md): bounded, unsigned release packets.
 
+## Browser package
+
+Build and test the single npm package from its package directory:
+
+```sh
+cd npm/stellar
+npm install --ignore-scripts --package-lock=false
+npm run build:browser
+npm run test:browser
+npm pack --dry-run --ignore-scripts --json
+```
+
+[Browser package](npm/stellar/README.md) documents its exports. Git installs from the repository
+root cannot select the nested package. Consumers use a tarball built from the selected revision
+or an approved registry release.
+
 ## Contributing
 
-Pull requests run the portable policy checks and the chain-free policy smoke tests. A pull request that changes `stellar/core` also runs its format, test and clippy checks. The full Wasm build and `cargo test --workspace --locked` run for pull requests, pushes, scheduled checks and manual runs. Before you open a pull request:
+Pull requests run the portable policy checks and the chain-free policy smoke tests. A pull request that changes `crates/allowit-stellar` also runs its format, test and clippy checks. The full Wasm build and `cargo test --workspace --locked` run for pull requests, pushes, scheduled checks and manual runs. Before you open a pull request:
 
 ```sh
 python3 scripts/check-policy-bindings.py
@@ -242,20 +343,20 @@ scripts/build-contracts.sh
 cargo test --workspace --locked
 ```
 
-`stellar/core` is a separate Cargo workspace. Check it with `--manifest-path`:
+`crates/allowit-stellar` is a separate Cargo workspace. Check it with `--manifest-path`:
 
 ```sh
-cargo fmt --manifest-path stellar/core/Cargo.toml --check
-cargo test --locked --manifest-path stellar/core/Cargo.toml
-cargo clippy --locked --manifest-path stellar/core/Cargo.toml --all-targets -- -D warnings
+cargo fmt --manifest-path crates/allowit-stellar/Cargo.toml --check
+cargo test --locked --manifest-path crates/allowit-stellar/Cargo.toml
+cargo clippy --locked --manifest-path crates/allowit-stellar/Cargo.toml --all-targets -- -D warnings
 ```
 
-All packages consume the same `allowit-core` release tag `v0.3.2`. Releases of this repository are annotated git tags `vX.Y.Z`: set `version` in `Cargo.toml` and `stellar/core/Cargo.toml`, merge, then tag the merge commit with `git tag -a vX.Y.Z -m vX.Y.Z <commit> && git push origin vX.Y.Z`.
+All packages consume the same `allowit-core` release tag `v0.3.2`. Releases of this repository are annotated git tags `vX.Y.Z`: set `version` in `Cargo.toml` and `crates/allowit-stellar/Cargo.toml`, merge, then tag the merge commit with `git tag -a vX.Y.Z -m vX.Y.Z <commit> && git push origin vX.Y.Z`.
 
-Keep contract code, the `stellar/core` rail crate, build and API documentation and release inputs here. [AGENTS.md](AGENTS.md) describes the repository scope.
+Keep contract code, the `crates/allowit-stellar` rail crate, build and API documentation and release inputs here. [AGENTS.md](AGENTS.md) describes the repository scope.
 
 ## License
 
-The source is public, but every contract crate declares `license = "UNLICENSED"` and the repository has no license file, so no open-source license is granted for the contracts. `stellar/core` keeps the `license = "MIT"` declaration it had in the Allowit SDK.
+The source is public, but every contract crate declares `license = "UNLICENSED"` and the repository has no license file, so no open-source license is granted for the contracts. `crates/allowit-stellar` keeps the `license = "MIT"` declaration it had in the Allowit SDK.
 
 [responsibility-model]: https://github.com/allowit-hq/allowit-project/blob/main/wiki/allowit/architecture.md#dependency-direction

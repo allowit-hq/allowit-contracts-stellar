@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import subprocess
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,9 +17,11 @@ missing = [str(path.relative_to(ROOT)) for path in files if not path.is_file()]
 if missing:
     parser.error("Build the policy wallet contracts first. Missing: " + ", ".join(missing))
 source_files = [ROOT / name for name in ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml")]
-source_files += sorted((ROOT / "crates").rglob("*.rs"))
-source_files += sorted((ROOT / "crates").rglob("Cargo.toml"))
-source_files += [ROOT / "scripts" / name for name in ("build-contracts.sh", "check-policy-bindings.py", "policy_source.py", "core_sources.py")]
+members = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["members"]
+for member in members:
+    source_files += sorted((ROOT / member).rglob("*.rs"))
+    source_files += sorted((ROOT / member).rglob("Cargo.toml"))
+source_files += [ROOT / "scripts" / name for name in ("build-contracts.sh", "stellar-cargo.py", "check-policy-bindings.py", "policy_source.py", "core_sources.py")]
 manifest = {
     "schema": 2,
     "git_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),

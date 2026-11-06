@@ -3,7 +3,7 @@ use allowit_stellar_wallet::PolicyTier;
 use allowit_stellar_wallet::policy::params_from_json;
 use serde_json::Value;
 
-const CANONICAL: &str = include_str!("../../../crates/custom-policy/policy/policy.rs");
+const CANONICAL: &str = include_str!("../../../contracts/allowit-custom-policy/policy/policy.rs");
 
 fn vectors(text: &str) -> Vec<Value> {
     serde_json::from_str(text).expect("vector file is JSON")

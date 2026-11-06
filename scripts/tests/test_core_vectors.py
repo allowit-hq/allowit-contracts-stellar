@@ -1,4 +1,4 @@
-"""The vectors that `stellar/core` replays must equal what the Python admin tools decide now."""
+"""The vectors that `crates/allowit-stellar` replays must equal what the Python admin tools decide now."""
 import importlib.util
 import unittest
 from pathlib import Path
