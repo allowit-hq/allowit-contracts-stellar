@@ -8,12 +8,14 @@ pub use diagnostics::{
     ContractFault, WalletError, host_policy_denial, simulation_fault, simulation_resource_fee,
 };
 pub(crate) mod owner_observation;
+#[cfg(not(target_arch = "wasm32"))]
 use allowit_policy_sdk::transport::rpc::{EnvelopeValidation, ErrorKind, RpcClient};
 pub use owner_actions::{
     OwnerSettlement, code_uploaded, contract_exists, owner_settlement, vault_redeemable,
 };
 pub use owner_observation::{AssetBalance, WalletLifetime, asset_balance, wallet_lifetime};
 use serde_json::{Value, json};
+#[cfg(not(target_arch = "wasm32"))]
 use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
@@ -26,10 +28,12 @@ pub trait Rpc: Send + Sync {
     fn call(&self, method: &str, params: Value) -> Result<Value>;
 }
 /// Stellar JSON-RPC protocol adapter over the bounded common host transport.
+#[cfg(not(target_arch = "wasm32"))]
 pub struct HttpRpc {
     client: RpcClient,
     id: AtomicU64,
 }
+#[cfg(not(target_arch = "wasm32"))]
 impl HttpRpc {
     pub fn new(url: &str) -> Result<Self> {
         Ok(Self {
@@ -40,6 +44,7 @@ impl HttpRpc {
         })
     }
 }
+#[cfg(not(target_arch = "wasm32"))]
 impl Rpc for HttpRpc {
     fn call(&self, method: &str, params: Value) -> Result<Value> {
         self.client
