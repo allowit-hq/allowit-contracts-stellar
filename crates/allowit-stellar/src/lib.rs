@@ -20,7 +20,7 @@ use stellar_xdr::*;
 pub mod admin;
 mod authorization;
 pub mod contract;
-pub mod networks;
+pub use allowit_stellar_policy_bindings::networks;
 pub mod owner;
 pub mod owner_intent;
 pub mod policy;

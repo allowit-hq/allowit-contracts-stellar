@@ -30,6 +30,7 @@ version = "0.3.0"
 dependencies = [
  "allowit",
  "allowit-sdk",
+ "allowit-stellar-policy-bindings",
  "base64 0.22.1",
  "ed25519-dalek",
  "serde",
@@ -41,6 +42,14 @@ dependencies = [
  "tempfile",
  "time",
  "zeroize",
+]
+
+[[package]]
+name = "allowit-stellar-policy-bindings"
+version = "0.3.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

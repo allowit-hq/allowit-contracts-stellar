@@ -16,6 +16,7 @@ name = "allowit_stellar_wallet"
 test-support = []
 
 [dependencies]
+allowit-stellar-policy-bindings = { path = "../policy-bindings", version = "0.3" }
 allowit = { git = "https://github.com/allowit-hq/allowit-core.git", tag = "v0.3.2", version = "0.3", default-features = false, features = ["std"] }
 allowit-policy-sdk = { package = "allowit-sdk", git = "https://github.com/allowit-hq/allowit-core.git", tag = "v0.3.2", version = "0.3", default-features = false, features = ["std", "transport", "client", "policy-source", "vendor"] }
 base64 = "0.22"

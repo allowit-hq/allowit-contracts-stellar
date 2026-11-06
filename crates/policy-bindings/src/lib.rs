@@ -1,5 +1,7 @@
 //! Policy-callable metadata for the installed Stellar rail.
 
+pub mod networks;
+
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -8,7 +10,7 @@ type Test = fn() -> Result<(), String>;
 
 /// Register this trusted rail pack with the host's policy engine.
 pub fn bindings() -> (&'static str, [(&'static str, Invoke); 1], Test) {
-    (super::FAMILY.0, [("network", network as Invoke)], self_test)
+    ("stellar", [("network", network as Invoke)], self_test)
 }
 
 #[derive(Deserialize)]
