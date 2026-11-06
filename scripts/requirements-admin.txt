@@ -1,2 +1,2 @@
 # Native Stellar XDR construction. Installed only for administration tooling.
-stellar-sdk==16.1.0
+stellar-sdk==17.0.0

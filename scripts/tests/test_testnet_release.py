@@ -135,6 +135,61 @@ class ReleaseSourceLayouts(unittest.TestCase):
                 release.source_layout(root)
 
 
+class PublicTestnetHeaders(unittest.TestCase):
+    """Exact public Horizon/RPC records, including protocol 30 signed millisecond values."""
+    def setUp(self):
+        path = Path(__file__).with_name("fixtures") / "testnet-protocol-30-ledgers.json"
+        self.fixture = json.loads(path.read_text())
+        self.recent = self.fixture["horizon_recent"]
+        self.rpc = Mock()
+        self.rpc.get_network.return_value = SimpleNamespace(passphrase=release.PASSPHRASE)
+        self.rpc.get_latest_ledger.return_value = SimpleNamespace(sequence=self.recent["sequence"])
+        self.rpc.get_ledgers.return_value = SimpleNamespace(ledgers=[SimpleNamespace(**self.fixture["rpc_recent"])])
+        self.clock = datetime.fromisoformat(self.recent["closed_at"].replace("Z", "+00:00")).timestamp() + 5
+        self.enterContext(patch.object(release, "utc_seconds", return_value=self.clock))
+        self.enterContext(patch.object(release, "public_json_url", side_effect=self.public))
+
+    def public(self, path):
+        if path == "/":
+            return {"network_passphrase": release.PASSPHRASE, "history_latest_ledger": self.recent["sequence"]}
+        if path == "/ledgers/128":
+            return self.fixture["horizon_anchor"]
+        self.assertEqual(path, "/ledgers/" + str(self.recent["sequence"]))
+        return self.recent
+
+    def test_public_protocol_30_headers_preserve_native_identity(self):
+        identity = release.network_identity(self.rpc)
+        self.assertEqual(identity["generation"]["hash"], self.fixture["horizon_anchor"]["hash"])
+        self.assertEqual(identity["observed"]["hash"], self.recent["hash"])
+        self.assertEqual(identity["observed"]["horizon_header_xdr"], self.recent["header_xdr"])
+        self.assertEqual(identity["observed"]["rpc_header_xdr"], self.fixture["rpc_recent"]["header_xdr"])
+        header = xdr.LedgerHeader.from_xdr(self.recent["header_xdr"])
+        self.assertEqual(header.ledger_version.uint32, 30)
+        self.assertEqual(int(header.scp_value.ext.v), 3)
+        self.assertEqual(release.digest(header.to_xdr_bytes()), self.recent["hash"])
+        self.assertEqual(release.native_header(self.rpc, self.recent["sequence"]), {
+            "ledger": self.recent["sequence"], "hash": self.recent["hash"],
+            "header_xdr": self.fixture["rpc_recent"]["header_xdr"]})
+
+    def test_public_protocol_30_hash_time_and_native_wrapper_still_fail_closed(self):
+        for field, value in (("hash", "00" * 32), ("closed_at", "2026-01-01T00:00:00Z")):
+            with self.subTest(field=field):
+                old = self.recent[field]
+                self.recent[field] = value
+                try:
+                    with self.assertRaisesRegex(ValueError, "differs"):
+                        release.network_identity(self.rpc)
+                finally:
+                    self.recent[field] = old
+        entry = xdr.LedgerHeaderHistoryEntry.from_xdr(self.fixture["rpc_recent"]["header_xdr"])
+        entry.hash = xdr.Hash(bytes(32))
+        self.rpc.get_ledgers.return_value.ledgers[0].header_xdr = entry.to_xdr()
+        with self.assertRaisesRegex(ValueError, "headers disagree"):
+            release.network_identity(self.rpc)
+        with self.assertRaisesRegex(ValueError, "differs from its identity"):
+            release.native_header(self.rpc, self.recent["sequence"])
+
+
 class ReleaseSafety(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -209,6 +264,18 @@ class ReleaseSafety(unittest.TestCase):
                     else:self.assertEqual(release.current_authority(self.manifest)['build_run'],'90:1')
             release.write(event,{'workflow_run':{'id':89,'run_attempt':1}})
             with patch.object(release,'gh_json',return_value=current),self.assertRaisesRegex(ValueError,'trigger'):release.current_authority(self.manifest)
+
+    def test_controller_rejects_a_native_sdk_that_differs_from_the_pin(self):
+        env = {"GITHUB_WORKFLOW_SHA": "c" * 40}
+        for sdk_version in ("16.1.0", "17.0.1"):
+            with self.subTest(version=sdk_version), patch.dict(os.environ, env), \
+                    patch.object(release, "check_canonical_tag"), \
+                    patch.object(release, "git", return_value="c" * 40), \
+                    patch.object(release, "version", return_value=sdk_version), \
+                    patch.object(release, "public_run") as command, \
+                    self.assertRaisesRegex(ValueError, "native SDK differ"):
+                release.current_authority(self.manifest)
+            command.assert_not_called()
 
     def test_immutable_run_snapshots_never_clobber(self):
         path=self.root/'snapshot.json';release.immutable(path,b'first');release.immutable(path,b'first')
