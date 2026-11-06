@@ -424,3 +424,62 @@ pub fn approval_public_profile(fixture: &Value) -> Value {
         "route":"native","config":config,
         "endpoints":{"execute":"/api/native/execute","status":"/api/native/execute/status"}})
 }
+
+pub mod server;
+
+/// Owner source-consent signature fixture. The consumer chooses the signing identity.
+pub fn source_consent_signature(
+    selection: &crate::provider::runtime::owner_client::workflow::OwnerPolicy,
+    seed: [u8; 32],
+) -> [u8; 64] {
+    let message = owner::consent(selection)["message"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    sign_digest(seed, &crate::signing::signed_message_digest(&message))
+}
+pub fn active_owner_outcome(
+    selection: &crate::provider::runtime::owner_client::workflow::OwnerPolicy,
+    request_id: &str,
+) -> Value {
+    serde_json::to_value(crate::provider::runtime::owner_client::workflow::Outcome {
+        request_id: request_id.into(),
+        state: "active".into(),
+        selection: selection.clone(),
+        transactions: vec![],
+    })
+    .unwrap()
+}
+pub fn request_expiry(now: u64) -> u64 {
+    (now + 120).min((now / 86400 + 1) * 86400 - 1)
+}
+pub fn execution_record_filename(request: &ExecutionRequest) -> String {
+    format!(
+        "request-{}.json",
+        crate::hex(&crate::hash(crate::hex(&request.operation.nonce)))
+    )
+}
+pub fn unsigned_execution_record(
+    policy_id: &str,
+    request_id: &str,
+    config: &WalletConfig,
+    request: &ExecutionRequest,
+    state: &TrustedState,
+    now: u64,
+) -> Value {
+    let prepared = crate::prepare(config, request, state, now, request_expiry(now)).unwrap();
+    json!({"policyId":policy_id,"requestId":request_id,"config":config,"request":request,"prepared":prepared,"agentSignature":null,"status":"prepared"})
+}
+pub fn execution_response(
+    prepared: &crate::PreparedOperation,
+    signed: Option<&SignedOperation>,
+    status: &str,
+    request_id: &str,
+) -> Value {
+    let receipt = if status == "confirmed" {
+        signed.map(|signed| confirmed_payment_receipt(signed, 777, 100))
+    } else {
+        None
+    };
+    json!({"prepared":prepared,"operation":{"id":request_id,"status":status,"transactionHash":crate::hex(&prepared.transaction_hash)},"signedOperation":signed,"receipt":receipt})
+}
