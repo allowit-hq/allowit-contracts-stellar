@@ -99,6 +99,7 @@ flowchart TD
     X --> T
     X --> B
     W --> T
+    T --> B
     W --> B
     B --> CORE
     B --> SDK
