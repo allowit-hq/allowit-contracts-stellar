@@ -343,7 +343,9 @@ def bundle(source, identity, output):
     output.mkdir(parents=True, exist_ok=True)
     result = {"schema": 1, "repository": REPOSITORY, **identity, "core_source": CORE_SOURCE,
         "toolchain": {"rust": "1.98.0", "stellar": "28.1.0"}, "artifacts": {}}
-    target = Path(json.loads(public_output(["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"], cwd=source, text=True))["target_directory"])
+    # build-contracts.sh publishes CLI-processed artifacts here even when Cargo
+    # uses an external cache. Cache outputs can contain unprocessed Cargo bytes.
+    target = source / "target"
     for kind, filename in CONTRACTS.items():
         data = (target / "wasm32v1-none/release" / filename).read_bytes()
         if not 8 < len(data) <= 2 * 1024 * 1024 or data[:8] != b"\0asm\x01\0\0\0":

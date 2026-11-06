@@ -100,15 +100,20 @@ class ReleaseSourceLayouts(unittest.TestCase):
                 target = root / "target"
                 artifacts = target / "wasm32v1-none/release"
                 artifacts.mkdir(parents=True)
+                external_target = root / "external-cache"
+                external_artifacts = external_target / "wasm32v1-none/release"
+                external_artifacts.mkdir(parents=True)
                 for filename in release.CONTRACTS.values():
                     (artifacts / filename).write_bytes(wasm())
+                    (external_artifacts / filename).write_bytes(b"raw Cargo output, before CLI processing")
                 identity = {"tag": "v0.3.0", "revision": "a" * 40,
                     "tag_object": "b" * 40, "workflow_revision": "c" * 40}
                 output = root / "bundle"
                 with patch.object(release, "git", side_effect=[identity["revision"], ""]), \
-                        patch.object(release, "public_output", side_effect=[json.dumps(["payment_limit"]), json.dumps({"target_directory": str(target)})]), \
+                        patch.object(release, "public_output", return_value=json.dumps(["payment_limit"])) as helper, \
                         patch.object(release, "workflow_attempt", return_value="90:1"):
                     result = release.bundle(root, identity, output)
+                self.assertEqual(helper.call_count, 1)
                 self.assertEqual(release.source_layout(root), (native, policy))
                 self.assertEqual(release.check_bundle(output), result)
                 self.assertEqual((output / "sample-policy.rs").read_bytes(), policy.read_bytes())
