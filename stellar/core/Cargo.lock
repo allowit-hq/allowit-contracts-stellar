@@ -4,21 +4,24 @@ version = 4
 
 [[package]]
 name = "allowit"
-version = "0.3.1"
-source = "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.3.1#96b558633d4e01a077d3fd1e75d2b9fe927f2036"
+version = "0.3.2"
+source = "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.3.2#c6c9f382761a0c5b88afc5524be7220c5c56c244"
 
 [[package]]
 name = "allowit-sdk"
-version = "0.3.1"
-source = "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.3.1#96b558633d4e01a077d3fd1e75d2b9fe927f2036"
+version = "0.3.2"
+source = "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.3.2#c6c9f382761a0c5b88afc5524be7220c5c56c244"
 dependencies = [
  "allowit",
  "libc",
  "reqwest",
  "serde",
  "serde_json",
+ "serde_json_canonicalizer",
  "sha2",
+ "time",
  "url",
+ "zeroize",
 ]
 
 [[package]]
