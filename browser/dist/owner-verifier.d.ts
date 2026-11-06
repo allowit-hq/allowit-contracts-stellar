@@ -24,3 +24,4 @@ export interface AdkOwnerSelection {
 }
 export declare function verifyAdkOwnerStep(step: AdkOwnerStep, expected: AdkOwnerSelection): Promise<void>;
 export declare function verifyAdkOwnerSignature(step: AdkOwnerStep, expected: AdkOwnerSelection, signedXdr: string): Promise<void>;
+export declare function deriveAdkOwnerWallet(owner: string, policyInstance: string): Promise<string>;

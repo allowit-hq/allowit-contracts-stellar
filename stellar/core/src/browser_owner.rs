@@ -50,6 +50,13 @@ struct Input {
     signed_xdr: Option<String>,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WalletSelection {
+    owner: String,
+    policy_instance: String,
+}
+
 fn stroops(amount: &str) -> Result<i128> {
     let (whole, fraction) = amount.split_once('.').unwrap_or((amount, ""));
     if whole.is_empty()
@@ -178,5 +185,31 @@ pub extern "C" fn owner_verify(len: usize) -> u32 {
             .and_then(|bytes| serde_json::from_slice(bytes).map_err(crate::err))
             .and_then(verify);
         u32::from(result.is_ok())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn owner_wallet(len: usize) -> usize {
+    INPUT.with(|input| {
+        let mut bytes = input.borrow_mut();
+        let result = bytes
+            .get(..len)
+            .ok_or_else(|| "Owner selection exceeds the browser limit".to_owned())
+            .and_then(|value| serde_json::from_slice::<WalletSelection>(value).map_err(crate::err))
+            .and_then(|selection| {
+                crate::account_key(&selection.owner)?;
+                let instance = crate::unhex(&selection.policy_instance)?;
+                crate::admin::wallet_address(
+                    NETWORK,
+                    &selection.owner,
+                    &crate::admin::wallet_salt(&instance),
+                )
+            });
+        if let Ok(wallet) = result {
+            bytes[..wallet.len()].copy_from_slice(wallet.as_bytes());
+            wallet.len()
+        } else {
+            0
+        }
     })
 }
