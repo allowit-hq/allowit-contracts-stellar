@@ -1,18 +1,22 @@
 //! Bounded, read-only price observations from the public Stellar Horizon API.
 
-use reqwest::{Url, blocking::Client};
+use allowit_core::transport::{
+    http::{HttpClient, Method, Request},
+    rpc::Options,
+};
 use serde_json::Value;
 use std::{
-    io::Read,
     sync::OnceLock,
     time::{Duration, Instant},
 };
 use stellar_strkey::ed25519::PublicKey;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use url::Url;
 
 const SCALE: i128 = 10_000_000;
 const HOUR_MS: i64 = 3_600_000;
-const MAX_REPLY: u64 = 65_536;
+const MAX_REPLY: usize = 65_536;
+const OBSERVATION_BUDGET: Duration = Duration::from_millis(1800);
 const UNAVAILABLE: &str = "Stellar Horizon price is missing, stale, or thin.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,40 +105,39 @@ fn decimal(value: &str) -> Option<i128> {
     (units > 0 && units <= i128::from(i64::MAX)).then_some(units)
 }
 
-fn client() -> Option<&'static Client> {
-    static CLIENT: OnceLock<Result<Client, reqwest::Error>> = OnceLock::new();
+fn client() -> Option<&'static HttpClient> {
+    static CLIENT: OnceLock<Option<HttpClient>> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
-            Client::builder()
-                .https_only(true)
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(Duration::from_millis(500))
-                .build()
+            HttpClient::new(Options {
+                timeout: OBSERVATION_BUDGET,
+                max_response_bytes: MAX_REPLY,
+                no_proxy: true,
+                connect_timeout: Some(Duration::from_millis(500)),
+            })
+            .ok()
         })
         .as_ref()
-        .ok()
 }
 
 fn get(url: Url, deadline: Instant) -> Option<(Option<u32>, Value)> {
-    let remaining = deadline.checked_duration_since(Instant::now())?;
-    if remaining.is_zero() {
+    if url.scheme() != "https" {
         return None;
     }
-    let reply = client()?.get(url).timeout(remaining).send().ok()?;
-    if !reply.status().is_success() {
+    let request = Request {
+        method: Method::Get,
+        url: url.as_str(),
+        headers: &[],
+        body: None,
+    };
+    let reply = client()?.send_success_body(request, Some(deadline)).ok()?;
+    if !(200..300).contains(&reply.status) {
         return None;
     }
     let ledger = reply
-        .headers()
-        .get("latest-ledger")
-        .and_then(|header| header.to_str().ok()?.parse::<u32>().ok());
-    let mut body = Vec::new();
-    reply.take(MAX_REPLY + 1).read_to_end(&mut body).ok()?;
-    if body.len() as u64 > MAX_REPLY {
-        return None;
-    }
-    Some((ledger, serde_json::from_slice(&body).ok()?))
+        .header("latest-ledger")
+        .and_then(|value| value.parse().ok());
+    Some((ledger, serde_json::from_slice(&reply.body).ok()?))
 }
 
 fn path_rate(paths: &Value, from: &Asset<'_>, to: &Asset<'_>, amount: i128) -> Option<i128> {
@@ -227,7 +230,7 @@ fn observe(network: &str, from: &str, to: &str, amount: i128) -> Option<PriceObs
         "stellar:pubnet" => "https://horizon.stellar.org/",
         _ => return None,
     };
-    let deadline = Instant::now() + Duration::from_millis(1800);
+    let deadline = Instant::now() + OBSERVATION_BUDGET;
     let destination = to;
     let from = Asset::parse(from)?;
     let to = Asset::parse(to)?;

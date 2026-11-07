@@ -10,12 +10,13 @@ description = "Server policy bindings and canonical Stellar network inventory"
 [workspace]
 
 [features]
-horizon-price = ["dep:reqwest", "dep:time"]
+horizon-price = ["dep:allowit-core", "dep:time", "dep:url"]
 
 [dependencies]
-reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "rustls-tls"], optional = true }
+allowit-core = { git = "https://github.com/allowit-hq/allowit-core.git", rev = "943670a8d2d291a805ddceebe2a23dde1391c252", default-features = false, features = ["transport"], optional = true }
 stellar-strkey = "0.0.13"
 time = { version = "0.3.55", features = ["parsing"], optional = true }
+url = { version = "2", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_json_canonicalizer = "0.3"

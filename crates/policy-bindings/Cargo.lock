@@ -3,17 +3,29 @@
 version = 4
 
 [[package]]
+name = "allowit-core"
+version = "0.4.0"
+source = "git+https://github.com/allowit-hq/allowit-core.git?rev=943670a8d2d291a805ddceebe2a23dde1391c252#943670a8d2d291a805ddceebe2a23dde1391c252"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "allowit-stellar-policy-bindings"
 version = "0.3.0"
 dependencies = [
+ "allowit-core",
  "ed25519-dalek",
- "reqwest",
  "serde",
  "serde_json",
  "serde_json_canonicalizer",
  "sha2",
  "stellar-strkey",
  "time",
+ "url",
 ]
 
 [[package]]
