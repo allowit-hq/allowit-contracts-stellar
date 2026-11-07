@@ -804,6 +804,92 @@ fn wasm_for(tier: PolicyTier) -> Vec<u8> {
     }
 }
 
+struct DeploymentLedgerClock {
+    chain: ModelChain,
+    after_simulation: Mutex<Option<u32>>,
+    slow_account: bool,
+    changed_owner: bool,
+    wrong_network: bool,
+}
+
+impl rpc::Rpc for DeploymentLedgerClock {
+    fn call(&self, method: &str, params: Value) -> Result<Value> {
+        let mut response = self.chain.call(method, params)?;
+        let mut elapsed = self.after_simulation.lock().unwrap();
+        if method == "simulateTransaction" {
+            *elapsed = Some(0);
+        } else if let Some(calls) = elapsed.as_mut() {
+            // The next ledger closes after two RPC round trips. The original builder
+            // spends those on redundant checks before requesting the owner's entry.
+            let ledger = LEDGER
+                + if *calls < 2 && !self.slow_account {
+                    1
+                } else {
+                    2
+                };
+            *calls += 1;
+            match method {
+                "getLatestLedger" => response["sequence"] = json!(ledger),
+                "getNetwork" if self.wrong_network => {
+                    response["passphrase"] = json!(passphrase("stellar:mainnet")?);
+                }
+                "getLedgerEntries" => {
+                    response["latestLedger"] = json!(ledger);
+                    if self.changed_owner {
+                        let mut entry: x::LedgerEntryData =
+                            de(response["entries"][0]["xdr"].as_str().unwrap());
+                        let x::LedgerEntryData::Account(account) = &mut entry else {
+                            panic!("expected the owner account entry");
+                        };
+                        account.seq_num.0 += 1;
+                        response["entries"][0]["xdr"] = json!(b64(&entry));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(response)
+    }
+}
+
+#[test]
+fn custom_upload_checks_owner_before_the_next_ledger() {
+    let wasm = stand_in_wasm(PolicyTier::Custom);
+    let module = hash(&wasm);
+    let owner = account_for_seed(&OWNER);
+    for (slow_account, changed_owner, wrong_network) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        let chain = DeploymentLedgerClock {
+            chain: ModelChain::new(BTreeMap::from([(module, PolicyTier::Custom)])),
+            after_simulation: Mutex::new(None),
+            slow_account,
+            changed_owner,
+            wrong_network,
+        };
+        let deployer = Deployer {
+            rpc: &chain,
+            network: NETWORK,
+            now: NOW,
+            max_fee_stroops: MAX_FEE,
+        };
+        let prepared = deployer.upload_wasm(&owner, &wasm);
+        if slow_account || changed_owner || wrong_network {
+            assert!(
+                prepared.is_err(),
+                "stale, changed or wrong-network owner observation"
+            );
+        } else {
+            let packet = prepared.unwrap();
+            assert_eq!(packet.wasm_hash, module);
+            assert_eq!(packet.source, owner);
+        }
+    }
+}
+
 /// The complete workflow of one tier; returns the recorded steps.
 fn workflow(tier: PolicyTier) -> Vec<Step> {
     let wasm = wasm_for(tier);
