@@ -97,6 +97,7 @@ pub struct State {
     pub calls: BTreeMap<String, usize>,
     pub generated: Vec<Value>,
     pub owner_submissions: Vec<Value>,
+    pub owner_activations: Vec<Value>,
 }
 pub struct Server {
     pub url: String,
@@ -243,12 +244,15 @@ impl Server {
                         plan.approval.clone().expect("approval fixture"),
                         "",
                     ),
-                    "/api/micro/allocation/confirm" => reply(
-                        &mut stream,
-                        200,
-                        plan.activation.clone().expect("activation fixture"),
-                        "",
-                    ),
+                    "/api/micro/allocation/confirm" => {
+                        captured.lock().unwrap().owner_activations.push(body);
+                        reply(
+                            &mut stream,
+                            200,
+                            plan.activation.clone().expect("activation fixture"),
+                            "",
+                        );
+                    }
                     "/api/native/export" => reply(
                         &mut stream,
                         200,

@@ -128,6 +128,10 @@ pub struct PolicyBinding {
     pub tier: Option<PolicyTier>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_source_hash: Option<String>,
     pub portable: PortableDraft,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -160,6 +164,8 @@ pub struct BuildReport {
     pub writes_state: bool,
     pub library_revision: String,
     pub attempts: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_bindings: Option<String>,
 }
 
 fn lower_hash(value: &str) -> Result<()> {
@@ -172,6 +178,46 @@ fn lower_hash(value: &str) -> Result<()> {
     } else {
         Err(Error::config("Invalid lowercase Stellar identity"))
     }
+}
+
+struct ServerSource<'a> {
+    installed: &'a str,
+    installed_hash: &'a str,
+    bindings: &'a str,
+}
+
+fn server_source(binding: &PolicyBinding) -> Result<Option<ServerSource<'_>>> {
+    let installed = binding.installed_source.as_deref();
+    let installed_hash = binding.installed_source_hash.as_deref();
+    let bindings = binding.portable.build.server_bindings.as_deref();
+    if binding.portable.tier != "server"
+        && (installed, installed_hash, bindings) == (None, None, None)
+    {
+        return Ok(None);
+    }
+    let (Some(installed), Some(installed_hash), Some(bindings)) =
+        (installed, installed_hash, bindings)
+    else {
+        return Err(Error::config(
+            "The Server policy needs its exact installed source and binding identity",
+        ));
+    };
+    if binding.portable.tier != "server"
+        || binding.route != "policyWallet"
+        || !binding.tier.is_some_and(|tier| tier.standard())
+        || !(1..=32_768).contains(&installed.len())
+        || installed_hash != allowit::digest(installed.as_bytes())
+    {
+        return Err(Error::config(
+            "The Server policy differs from its canonical wallet source",
+        ));
+    }
+    lower_hash(bindings)?;
+    Ok(Some(ServerSource {
+        installed,
+        installed_hash,
+        bindings,
+    }))
 }
 impl OwnerClient {
     pub fn new(backend: &str, origin: &str, owner: &str) -> Result<Self> {
@@ -384,6 +430,8 @@ impl OwnerClient {
             selected.ok_or_else(|| Error::uncertain("Generation omitted the selected policy"))?;
         validate_generated(&policy, &request, network, &wallet.kind).map_err(|_|Error::uncertain("Generated policy failed portable identity validation; inspect the owner workspace before retrying"))?;
         let binding = &policy.runtime.instance_binding;
+        let installed_source =
+            server_source(binding)?.map_or(policy.code.as_str(), |s| s.installed);
         if let Some(template) = selected_template
             && (binding.asset != template.asset
                 || binding.asset_symbol != template.asset_symbol
@@ -408,7 +456,7 @@ impl OwnerClient {
                 || (config.route == native::WalletRoute::PolicyWallet
                     && (binding.module_digest != native::hex(&config.module_digest)
                         || binding.tier != config.tier
-                        || policy.code != config.policy_source
+                        || installed_source != config.policy_source
                         || binding.portable.params != config.params)))
         {
             return Err(Error::uncertain(
@@ -426,7 +474,11 @@ fn validate_generated(
 ) -> Result<()> {
     let b = &policy.runtime.instance_binding;
     let d = &b.portable;
-    let shape = crate::host::authoring::check(&policy.code).map_err(|_| {
+    let server = server_source(b)?;
+    let installed_source = server
+        .as_ref()
+        .map_or(policy.code.as_str(), |s| s.installed);
+    let shape = crate::host::authoring::check(installed_source).map_err(|_| {
         Error::uncertain("Returned policy source is outside the portable vocabulary")
     })?;
     if !crate::host::request::request_id_valid(&policy.id)
@@ -436,6 +488,7 @@ fn validate_generated(
         || policy.original_intent != request.prompt
         || !policy.ir_hash.is_empty()
         || policy.status != "draft"
+        || (server.is_some() && !(1..=32_768).contains(&policy.code.len()))
         || policy.source_hash != allowit::digest(policy.code.as_bytes())
         || policy.runtime.source_profile != SOURCE_PROFILE
         || policy.runtime.wallet.kind != kind
@@ -474,9 +527,13 @@ fn validate_generated(
     let tier = match d.tier.as_str() {
         "standard" => PolicyTier::Common,
         "custom" => PolicyTier::Custom,
+        "server" => b
+            .tier
+            .ok_or_else(|| Error::uncertain("Missing installed Server wallet tier"))?,
         _ => return Err(Error::uncertain("Invalid returned portable tier")),
     };
-    if (d.tier == "standard" && (!shape.canonical_only || d.rules != shape.prefix))
+    if (matches!(d.tier.as_str(), "standard" | "server")
+        && (!shape.canonical_only || d.rules != shape.prefix))
         || (d.tier == "custom" && !d.rules.is_empty())
     {
         return Err(Error::uncertain(
@@ -524,7 +581,10 @@ fn validate_generated(
             .ok_or_else(|| Error::uncertain("Missing returned contract policy tier"))?;
         let profile_fits = match tier {
             PolicyTier::Custom => request.profile == "allowit-stellar-custom-wallet-v1",
-            _ => request.profile == "allowit-stellar-policy-wallet-v1" && d.tier == "standard",
+            _ => {
+                request.profile == "allowit-stellar-policy-wallet-v1"
+                    && matches!(d.tier.as_str(), "standard" | "server")
+            }
         };
         if b.route != "policyWallet"
             || !profile_fits

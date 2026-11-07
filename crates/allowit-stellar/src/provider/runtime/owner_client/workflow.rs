@@ -1,6 +1,9 @@
 //! Retained owner workflows. A session identifies the owner; only checked native intent can request a signature.
 use super::*;
 use allowit::client::store::Store;
+use allowit_stellar_policy_bindings::approval::{
+    SERVER_POLICY_APPROVAL_PROFILE, ServerPolicyApproval,
+};
 use native::owner_intent::{self, ExpectedOwnerIntent, OwnerAction, OwnerLimits, OwnerTransaction};
 use native::{OperationStatus, WalletConfig, WalletRoute, rpc};
 
@@ -92,6 +95,11 @@ impl OwnerPolicy {
         let c = &self.config;
         let p = &self.policy;
         let b = &p.runtime.instance_binding;
+        let server = server_source(b)?;
+        let installed_source = server.as_ref().map_or(p.code.as_str(), |s| s.installed);
+        let installed_hash = server
+            .as_ref()
+            .map_or(p.source_hash.as_str(), |s| s.installed_hash);
         roles(&c.owner, &c.agent, &c.server)?;
         checked(native::validate_config(c))?;
         let target = if b.template == Some(true) {
@@ -108,14 +116,19 @@ impl OwnerPolicy {
         validate_generated(p, &request, &p.network, &p.runtime.wallet.kind)?;
         if c.network != p.network
             || c.policy_instance != checked(native::unhex(&b.policy_instance))?
-            || c.policy_source != p.code
-            || native::hex(&c.source_hash) != p.source_hash
+            || c.policy_source != installed_source
+            || native::hex(&c.source_hash) != installed_hash
             || c.asset != b.asset
             || c.asset_symbol != b.asset_symbol
             || c.asset_issuer != b.asset_issuer
             || c.max_fee_stroops != b.max_fee_stroops
             || c.params != b.portable.params
             || c.tier != b.tier
+            || (server.is_some()
+                && (c.route != WalletRoute::PolicyWallet
+                    || (b.template != Some(true)
+                        && (c.wallet != b.wallet
+                            || native::hex(&c.module_digest) != b.module_digest))))
             || (c.route == WalletRoute::Native
                 && (c.wallet != b.wallet || native::hex(&c.module_digest) != b.module_digest))
             || (c.route == WalletRoute::Native
@@ -159,6 +172,7 @@ pub fn deployment_policy(
     };
     validate_generated(&policy, &request, &policy.network, "contract-wallet")?;
     let b = &policy.runtime.instance_binding;
+    let installed_source = server_source(b)?.map_or(policy.code.as_str(), |s| s.installed);
     if !b.portable.unresolved.is_empty() {
         return Err(Error::usage(
             "Supply unresolved owner params before deployment",
@@ -169,7 +183,7 @@ pub fn deployment_policy(
         .tier
         .ok_or_else(|| Error::usage("Select the wallet tier"))?;
     let module = checked(native::admin::check_wallet_code(wasm))?;
-    let rules = checked(native::policy::tier_rules(tier, &policy.code))?;
+    let rules = checked(native::policy::tier_rules(tier, installed_source))?;
     let config = WalletConfig {
         network: policy.network.clone(),
         policy_instance: instance,
@@ -191,13 +205,13 @@ pub fn deployment_policy(
             &module,
             &b.asset,
             &rules,
-            &policy.code,
+            installed_source,
         ))?,
         asset: b.asset.clone(),
         asset_symbol: b.asset_symbol.clone(),
         asset_issuer: b.asset_issuer.clone(),
-        policy_source: policy.code.clone(),
-        source_hash: native::hash(policy.code.as_bytes()),
+        policy_source: installed_source.to_owned(),
+        source_hash: native::hash(installed_source.as_bytes()),
         module_digest: module,
         max_fee_stroops: b.max_fee_stroops,
     };
@@ -793,11 +807,58 @@ struct Activation {
     signature: Option<native::DetachedSignature>,
     completed: bool,
 }
-fn approval_payload(selection: &OwnerPolicy) -> Result<Value> {
+struct Approval {
+    payload: Value,
+    message: String,
+    server: Option<ServerPolicyApproval>,
+}
+
+impl Approval {
+    fn verify(&self, owner: &str, signature: &native::DetachedSignature) -> Result<()> {
+        if signature.signer != owner {
+            return Err(Error::config("Retained source-consent signer differs"));
+        }
+        if let Some(server) = &self.server {
+            return server
+                .verify(owner, &signature.signature)
+                .map_err(Error::config);
+        }
+        checked(native::signing::verify_digest(
+            owner,
+            &native::signing::signed_message_digest(&self.message),
+            &signature.signature,
+        ))
+    }
+}
+
+fn source_approval(selection: &OwnerPolicy) -> Result<Approval> {
     let c = &selection.config;
     let p = &selection.policy;
     let d = &p.runtime.instance_binding.portable;
-    super::super::consent::payload(
+    if let Some(server) = server_source(&p.runtime.instance_binding)? {
+        let approval = ServerPolicyApproval {
+            profile: SERVER_POLICY_APPROVAL_PROFILE.into(),
+            network: c.network.clone(),
+            wallet: c.wallet.clone(),
+            owner: c.owner.clone(),
+            policy_id: p.id.clone(),
+            revision: p.revision,
+            policy_instance: native::hex(&c.policy_instance),
+            module_digest: native::hex(&c.module_digest),
+            installed_source_hash: server.installed_hash.into(),
+            source: p.code.clone(),
+            source_hash: p.source_hash.clone(),
+            params_hash: d.params_hash.clone(),
+            server_bindings: server.bindings.into(),
+        };
+        return Ok(Approval {
+            payload: serde_json::to_value(&approval)
+                .map_err(|_| Error::config("Cannot encode Server policy approval"))?,
+            message: approval.message().map_err(Error::config)?,
+            server: Some(approval),
+        });
+    }
+    let payload = super::super::consent::payload(
         &p.id,
         p.revision,
         c,
@@ -811,11 +872,17 @@ fn approval_payload(selection: &OwnerPolicy) -> Result<Value> {
             params: &d.params,
             params_hash: &d.params_hash,
         },
-    )
+    )?;
+    let message = super::super::consent::message(&payload)?;
+    Ok(Approval {
+        payload,
+        message,
+        server: None,
+    })
 }
 impl OwnerClient {
     /// Check the exact source consent and current native authority before requesting a source signature.
-    /// Policy-wallet confirmation requests no source signature; deployment and funding remain separate gates.
+    /// A Server overlay needs its own source signature. Deployment and funding remain separate gates.
     pub fn activate(
         &self,
         caps: OwnerCapabilities<'_>,
@@ -844,9 +911,8 @@ impl OwnerClient {
             ));
         }
         self.verify_binding(selection, rpc)?;
-        let payload = approval_payload(selection)?;
-        let message = super::super::consent::message(&payload)?;
-        let identity = intent_hash(&json!({"selection":selection,"message":message}))?;
+        let approval = source_approval(selection)?;
+        let identity = intent_hash(&json!({"selection":selection,"message":approval.message}))?;
         let mut record = match store.load::<Activation>(id)? {
             Some(saved)
                 if saved.backend == self.session.backend()
@@ -884,46 +950,43 @@ impl OwnerClient {
             clock()?,
             false,
         )?;
-        if consent.payload != payload
-            || consent.message != message
+        if consent.payload != approval.payload
+            || consent.message != approval.message
             || consent.method != "sep53"
-            || (selection.config.route == WalletRoute::PolicyWallet && consent.required)
+            || (selection.config.route == WalletRoute::PolicyWallet
+                && approval.server.is_none()
+                && consent.required)
         {
             return Err(Error::config(
                 "Source consent differs from the exact locally selected policy",
             ));
         }
-        if selection.config.route == WalletRoute::Native && record.signature.is_none() {
-            let account = checked(rpc::get_account(rpc, &selection.config.wallet))?;
-            crate::provider::runtime::client::verify_native_members(&account, &selection.config)?;
-            checked(
-                account.validate_signer_quorum(&[self.session.owner()], account.high_threshold),
-            )?;
-            let digest = native::signing::signed_message_digest(&message);
+        let native = selection.config.route == WalletRoute::Native;
+        if (native || approval.server.is_some()) && record.signature.is_none() {
+            if native {
+                let account = checked(rpc::get_account(rpc, &selection.config.wallet))?;
+                crate::provider::runtime::client::verify_native_members(
+                    &account,
+                    &selection.config,
+                )?;
+                checked(
+                    account.validate_signer_quorum(&[self.session.owner()], account.high_threshold),
+                )?;
+            }
+            let digest = native::signing::signed_message_digest(&approval.message);
             let signature = signer
                 .sign_hash(&digest)
                 .map_err(|_| Error::config("Owner source signer failed"))?;
-            checked(native::signing::verify_digest(
-                self.session.owner(),
-                &digest,
-                &signature,
-            ))?;
-            record.signature = Some(native::DetachedSignature {
+            let signature = native::DetachedSignature {
                 signer: self.session.owner().to_owned(),
                 signature: signature.to_vec(),
-            });
+            };
+            approval.verify(self.session.owner(), &signature)?;
+            record.signature = Some(signature);
             store.save(id, &record)?;
         }
         if let Some(signature) = &record.signature {
-            let digest = native::signing::signed_message_digest(&message);
-            if signature.signer != self.session.owner() {
-                return Err(Error::config("Retained source-consent signer differs"));
-            }
-            checked(native::signing::verify_digest(
-                self.session.owner(),
-                &digest,
-                &signature.signature,
-            ))?;
+            approval.verify(self.session.owner(), signature)?;
         }
         let response:Value=self.session.owner_request(Method::Post,"/api/micro/allocation/confirm",Some(&json!({"id":selection.policy.id,"revision":selection.policy.revision,"requestId":id,"stellarSourceApproval":record.signature.iter().collect::<Vec<_>>()})),clock()?,true).map_err(|_|Error::uncertain("Owner activation is uncertain; retain this activation ID and source consent"))?;
         if response["active"] != true {
@@ -965,18 +1028,24 @@ impl OwnerClient {
         let activation: Activation = store
             .load(activation_id)?
             .ok_or_else(|| Error::config("Complete the retained owner activation before export"))?;
-        let message = super::super::consent::message(&approval_payload(selection)?)?;
+        let approval = source_approval(selection)?;
         if !activation.completed
             || activation.backend != self.session.backend()
             || activation.origin != self.session.origin()
             || activation.identity
-                != intent_hash(&json!({"selection":selection,"message":message}))?
+                != intent_hash(&json!({"selection":selection,"message":approval.message}))?
         {
             return Err(Error::config(
                 "Export activation does not bind this exact policy",
             ));
         }
         self.verify_binding(selection, rpc)?;
+        if approval.server.is_some() {
+            let signature = activation.signature.as_ref().ok_or_else(|| {
+                Error::config("Server export requires retained owner source consent")
+            })?;
+            approval.verify(self.session.owner(), signature)?;
+        }
         if selection.config.route == WalletRoute::Native {
             let signature=activation.signature.as_ref().ok_or_else(||Error::config("Native export requires proven owner source consent. Complete source activation on this device."))?;
             if signature.signer != self.session.owner() {
@@ -986,12 +1055,12 @@ impl OwnerClient {
             }
             checked(native::signing::verify_digest(
                 &signature.signer,
-                &native::signing::signed_message_digest(&message),
+                &native::signing::signed_message_digest(&approval.message),
                 &signature.signature,
             ))?;
             let current = checked(rpc::get_account(rpc, &selection.config.wallet))?;
             checked(current.validate_authority_signatures(
-                &native::signing::signed_message_digest(&message),
+                &native::signing::signed_message_digest(&approval.message),
                 std::slice::from_ref(signature),
             ))?;
         }
