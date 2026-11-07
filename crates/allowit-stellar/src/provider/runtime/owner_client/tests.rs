@@ -26,6 +26,155 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
 };
+
+#[test]
+fn server_policy_uses_installed_prefix_and_retains_exact_overlay_consent() {
+    use allowit_stellar_wallet as native;
+
+    let base = selection();
+    let mut draft = base.policy.clone();
+    let prefix = draft.code.clone();
+    let prefix_hash = draft.source_hash.clone();
+    draft.code = prefix.replace(
+        "    Ok(())",
+        "    let _network = stellar::network(ctx)?;\n    Ok(())",
+    );
+    assert_ne!(draft.code, prefix);
+    draft.source_hash = allowit::digest(draft.code.as_bytes());
+    let binding = &mut draft.runtime.instance_binding;
+    binding.installed_source = Some(prefix.clone());
+    binding.installed_source_hash = Some(prefix_hash.clone());
+    binding.portable.tier = "server".into();
+    binding.portable.source_hash = draft.source_hash.clone();
+    binding.portable.build.server_bindings = Some("44".repeat(32));
+
+    let selected = workflow::deployment_policy(
+        draft.clone(),
+        &account(11),
+        &account(12),
+        &account(13),
+        &wasm(),
+    )
+    .unwrap();
+    assert_eq!(selected.config, base.config);
+    assert_eq!(selected.config.policy_source, prefix);
+    assert_ne!(selected.policy.code, selected.config.policy_source);
+    selected.validate().unwrap();
+    let mut mismatched = selected.clone();
+    mismatched
+        .policy
+        .runtime
+        .instance_binding
+        .installed_source_hash = Some("55".repeat(32));
+    assert!(mismatched.validate().is_err());
+    let mut mismatched = selected.clone();
+    mismatched.policy.runtime.instance_binding.portable.tier = "standard".into();
+    assert!(mismatched.validate().is_err());
+
+    let c = &selected.config;
+    let p = &selected.policy;
+    let payload = json!({
+        "profile":"allowit-stellar-server-policy-approval-v1", "network":c.network,
+        "wallet":c.wallet, "owner":c.owner, "policyId":p.id, "revision":p.revision,
+        "policyInstance":native::hex(&c.policy_instance), "moduleDigest":native::hex(&c.module_digest),
+        "installedSourceHash":prefix_hash, "source":p.code, "sourceHash":p.source_hash,
+        "paramsHash":p.runtime.instance_binding.portable.params_hash, "serverBindings":"44".repeat(32),
+    });
+    let message = format!(
+        "AllowIt Stellar server policy approval v1\n{}",
+        serde_json_canonicalizer::to_string(&payload).unwrap()
+    );
+    let digest = native::signing::signed_message_digest(&message);
+    let expected_signature = native::test_support::sign_digest([11; 32], &digest);
+    let descriptor = native::test_support::public_profile(c, &p.id);
+    let now = wire::now();
+
+    for substitute in [true, false] {
+        let mut returned = payload.clone();
+        if substitute {
+            returned["serverBindings"] = json!("55".repeat(32));
+        }
+        let returned_message = format!(
+            "AllowIt Stellar server policy approval v1\n{}",
+            serde_json_canonicalizer::to_string(&returned).unwrap()
+        );
+        let mut plan = wire::Plan::new(&account(11));
+        plan.policy = serde_json::to_value(&draft).unwrap();
+        plan.approval = Some(
+            json!({"required":true,"payload":returned,"message":returned_message,"method":"sep53"}),
+        );
+        plan.activation = Some(json!({"active":true}));
+        plan.export = Some(descriptor.clone());
+        let server = wire::Server::new(plan);
+        let mut client = OwnerClient::with_authority(
+            &authority(&server.url),
+            "http://localhost:5173",
+            &account(11),
+        )
+        .unwrap();
+        let signer = key();
+        client.authenticate(&signer, now).unwrap();
+        let prior = signer.calls.load(Ordering::SeqCst);
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().canonicalize().unwrap().join("proof")).unwrap();
+        let chain = Chain::new(c.clone());
+        let caps = OwnerCapabilities {
+            store: &store,
+            rpc: &chain,
+            signer: &signer,
+            clock: &|| Ok(now),
+        };
+        let id = "server-activate-001";
+        if substitute {
+            assert!(client.activate(caps, &selected, id).is_err());
+            assert_eq!(signer.calls.load(Ordering::SeqCst), prior);
+            assert_eq!(server.calls("/api/micro/allocation/confirm"), 0);
+        } else {
+            let request = super::GenerateRequest {
+                prompt: p.original_intent.clone(),
+                network: p.network.clone(),
+                profile: p.runtime.wallet.profile.clone(),
+                target: super::Target::NewWallet,
+            };
+            let generated = client.generate(&request, now).unwrap();
+            assert_eq!(generated.code, p.code);
+            assert_eq!(
+                generated
+                    .runtime
+                    .instance_binding
+                    .installed_source
+                    .as_deref(),
+                Some(prefix.as_str())
+            );
+            let out = client.activate(caps, &selected, id).unwrap();
+            assert_eq!(out.state, "active");
+            assert_eq!(out.selection.policy.code, p.code);
+            assert_eq!(
+                client.activate(caps, &selected, id).unwrap().state,
+                "active"
+            );
+            assert_eq!(signer.calls.load(Ordering::SeqCst), prior + 1);
+            let submitted = server.state.lock().unwrap().owner_activations.clone();
+            assert_eq!(submitted.len(), 2);
+            for request in submitted {
+                assert_eq!(
+                    request["stellarSourceApproval"],
+                    json!([{"signer":c.owner,"signature":expected_signature.to_vec()}])
+                );
+            }
+            assert_eq!(
+                client.export(&store, &selected, &chain, id, now).unwrap(),
+                descriptor
+            );
+            let mut saved: Value = store.load(id).unwrap().unwrap();
+            saved["signature"]["signature"][0] = json!(expected_signature[0] ^ 1);
+            store.save(id, &saved).unwrap();
+            assert!(client.export(&store, &selected, &chain, id, now).is_err());
+            assert_eq!(server.calls("/api/native/export"), 1);
+        }
+    }
+}
+
 #[test]
 fn native_setup_retains_before_sign_and_recovers_lost_reply_without_another_signature() {
     let dir = tempfile::tempdir().unwrap();
