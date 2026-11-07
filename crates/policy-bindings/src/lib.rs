@@ -1,5 +1,6 @@
 //! Policy-callable metadata for the installed Stellar rail.
 
+pub mod approval;
 #[cfg(feature = "horizon-price")]
 pub mod horizon;
 pub mod networks;
