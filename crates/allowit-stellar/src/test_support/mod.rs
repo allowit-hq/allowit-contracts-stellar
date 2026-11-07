@@ -159,11 +159,10 @@ pub fn portable_descriptor(config: &mut crate::WalletConfig) -> Value {
     } else {
         vec![]
     };
-    let params_hash =
-        allowit_policy_sdk::digest(&serde_json_canonicalizer::to_vec(&config.params).unwrap());
+    let params_hash = allowit::digest(&serde_json_canonicalizer::to_vec(&config.params).unwrap());
     let identity = serde_json::json!({"language":"allowit-portable-v1","tier":tier,"rules":rules,"sourceHash":sdk::hex(&config.source_hash),"paramsHash":params_hash});
     if config.route == WalletRoute::Native {
-        config.module_digest = sdk::unhex(&allowit_policy_sdk::digest(
+        config.module_digest = sdk::unhex(&allowit::digest(
             &serde_json_canonicalizer::to_vec(&identity).unwrap(),
         ))
         .unwrap();

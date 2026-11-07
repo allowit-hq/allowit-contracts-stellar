@@ -6,7 +6,7 @@ use crate::host::{
     execution::{Outcome, Request},
     profiles::Profile,
 };
-use allowit_policy_sdk::client::store::Store;
+use allowit::client::store::Store;
 use allowit_stellar_wallet::OperationStatus;
 use std::{sync::Arc, time::Duration};
 fn typed(

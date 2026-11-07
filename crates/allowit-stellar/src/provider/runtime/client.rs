@@ -7,7 +7,7 @@ use crate::host::{
     error::{Error, Result},
     typed_request::operation_nonce,
 };
-use allowit_policy_sdk::{
+use allowit::{
     client::store::Store,
     transport::{
         http::{HttpClient, Method, Request},
@@ -1204,10 +1204,10 @@ mod native_revalidation_tests {
             let journal = Store::open(&root.join("journal")).unwrap();
             let key = sdk::hex(&record.request.operation.nonce);
             journal.save(&key, &record).unwrap();
-            let before = std::fs::read(root.join("journal").join(format!(
-                "request-{}.json",
-                allowit_policy_sdk::digest(key.as_bytes())
-            )))
+            let before = std::fs::read(
+                root.join("journal")
+                    .join(format!("request-{}.json", allowit::digest(key.as_bytes()))),
+            )
             .unwrap();
             let roundtrip: Record =
                 serde_json::from_slice(&serde_json::to_vec(&record).unwrap()).unwrap();
@@ -1227,10 +1227,10 @@ mod native_revalidation_tests {
             );
             assert_eq!(server.join().unwrap(), "original");
             assert_eq!(
-                std::fs::read(root.join("journal").join(format!(
-                    "request-{}.json",
-                    allowit_policy_sdk::digest(key.as_bytes())
-                )))
+                std::fs::read(
+                    root.join("journal")
+                        .join(format!("request-{}.json", allowit::digest(key.as_bytes())))
+                )
                 .unwrap(),
                 before
             );

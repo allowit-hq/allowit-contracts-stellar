@@ -11,7 +11,7 @@ use crate::provider::runtime::{
         workflow::{self, OwnerCapabilities},
     },
 };
-use allowit_policy_sdk::client::store::Store;
+use allowit::client::store::Store;
 use chain::*;
 fn authority(origin: &str) -> crate::host::config::ServerAuthority {
     crate::host::config::ServerAuthority::validated("stellar:testnet", origin, &account(13))

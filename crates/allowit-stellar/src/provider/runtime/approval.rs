@@ -2,7 +2,7 @@
 //! Backs the hidden `allowit wallet approve`: prints a source approval link
 //! and moves no funds.
 use crate::host::error::{Error, Result};
-use allowit_policy_sdk::client::store::Store;
+use allowit::client::store::Store;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 /// Admit the Native approval-link network before reading caller input.
@@ -55,7 +55,7 @@ pub struct ApprovalIntent {
     pub intent_digest: String,
 }
 fn hash(value: impl AsRef<[u8]>) -> String {
-    allowit_policy_sdk::digest(value.as_ref())
+    allowit::digest(value.as_ref())
 }
 pub fn intent_digest(v: &ApprovalIntent) -> Result<String> {
     let binding = serde_json_canonicalizer::to_vec(&v.binding)

@@ -1,6 +1,6 @@
 //! Shared classic-account owner setup continuation. Keys remain with the owner.
 use crate::host::error::{Error, Result};
-use allowit_policy_sdk::client::store::Store;
+use allowit::client::store::Store;
 use allowit_stellar_wallet::{
     self as native,
     owner::{NativeSetup, prepare_native_setup, validate_native_setup},

@@ -3,16 +3,10 @@
 version = 4
 
 [[package]]
-name = "allowit"
-version = "0.3.2"
-source = "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.3.2#c6c9f382761a0c5b88afc5524be7220c5c56c244"
-
-[[package]]
-name = "allowit-sdk"
-version = "0.3.2"
-source = "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.3.2#c6c9f382761a0c5b88afc5524be7220c5c56c244"
+name = "allowit-core"
+version = "0.4.0"
+source = "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.4.0#7c53bf637c70f3fe685274a285d4cf5c64ea779f"
 dependencies = [
- "allowit",
  "libc",
  "reqwest",
  "serde",
@@ -26,10 +20,9 @@ dependencies = [
 
 [[package]]
 name = "allowit-stellar"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
- "allowit",
- "allowit-sdk",
+ "allowit-core",
  "allowit-stellar-policy-bindings",
  "base64 0.22.1",
  "ed25519-dalek",
@@ -46,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "allowit-stellar-policy-bindings"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "ed25519-dalek",
  "serde",

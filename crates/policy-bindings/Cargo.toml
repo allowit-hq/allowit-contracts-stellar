@@ -1,6 +1,6 @@
 [package]
 name = "allowit-stellar-policy-bindings"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
@@ -13,7 +13,7 @@ description = "Server policy bindings and canonical Stellar network inventory"
 horizon-price = ["dep:allowit-core", "dep:time", "dep:url"]
 
 [dependencies]
-allowit-core = { git = "https://github.com/allowit-hq/allowit-core.git", rev = "943670a8d2d291a805ddceebe2a23dde1391c252", default-features = false, features = ["transport"], optional = true }
+allowit-core = { git = "https://github.com/allowit-hq/allowit-core.git", tag = "v0.4.0", version = "0.4", default-features = false, features = ["transport"], optional = true }
 stellar-strkey = "0.0.13"
 time = { version = "0.3.55", features = ["parsing"], optional = true }
 url = { version = "2", optional = true }

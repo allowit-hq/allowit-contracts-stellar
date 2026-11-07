@@ -4,7 +4,7 @@ use crate::host::{
     profiles::Description,
     vendors::ProfileBinding,
 };
-use allowit_policy_sdk::policy::PolicyValue;
+use allowit::policy::PolicyValue;
 pub fn decode(network: &str, bytes: &[u8]) -> Result<(Description, Box<dyn ProfileBinding>)> {
     let bundle = crate::provider::runtime::client::decode_public_bundle(bytes)?;
     if crate::host::routing::normalize(&bundle.network)? != network {

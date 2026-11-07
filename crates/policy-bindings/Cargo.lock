@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "allowit-core"
 version = "0.4.0"
-source = "git+https://github.com/allowit-hq/allowit-core.git?rev=943670a8d2d291a805ddceebe2a23dde1391c252#943670a8d2d291a805ddceebe2a23dde1391c252"
+source = "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.4.0#7c53bf637c70f3fe685274a285d4cf5c64ea779f"
 dependencies = [
  "reqwest",
  "serde",
@@ -15,7 +15,7 @@ dependencies = [
 
 [[package]]
 name = "allowit-stellar-policy-bindings"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "allowit-core",
  "ed25519-dalek",

@@ -86,10 +86,10 @@ flowchart TD
     W["crates/policy-wallet<br/>allowit-policy-wallet"]
     T["crates/protocol<br/>allowit-wallet-protocol"]
     B["crates/policy<br/>allowit-stellar-policy"]
-    CORE["allowit-core<br/>portable allowit"]
+    CORE["allowit-core<br/>portable rules"]
     SDK["soroban-sdk"]
     OFF["crates/allowit-stellar<br/>allowit-stellar · off-chain"]
-    HOST["allowit-core<br/>allowit-sdk · host primitives"]
+    HOST["allowit-core<br/>host primitives"]
     E["crates/engine<br/>allowit-wallet-engine · standalone checker"]
     S --> W
     S --> T
@@ -139,7 +139,7 @@ Pick **Simple** when your server already runs the whole policy and you want the 
 
 ### The canonical rules
 
-The canonical rules live in the portable `allowit` package in [Allowit core](https://github.com/allowit-hq/allowit-core/tree/main/crates/allowit). Each rule takes one value that the policy reads by key from the owner's `params`, such as `&ctx.params[allowit::DESTINATIONS]`, and returns its passing constraint or an error. The standard contract admits only these nine keys, runs only the rules the owner lists, in that order, and skips a rule whose param is absent. An empty list means no onchain business checks, like Simple.
+The canonical rules live in the portable module in [Allowit Core](https://github.com/allowit-hq/allowit-core/tree/v0.4.0/crates/allowit-core/src/portable). Each rule takes one value that the policy reads by key from the owner's `params`, such as `&ctx.params[allowit::DESTINATIONS]`, and returns its passing constraint or an error. The standard contract admits only these nine keys, runs only the rules the owner lists, in that order, and skips a rule whose param is absent. An empty list means no onchain business checks, like Simple.
 
 | Rule and param key | What it does |
 | --- | --- |
@@ -352,7 +352,7 @@ cargo test --locked --manifest-path crates/allowit-stellar/Cargo.toml
 cargo clippy --locked --manifest-path crates/allowit-stellar/Cargo.toml --all-targets -- -D warnings
 ```
 
-All packages consume the same `allowit-core` release tag `v0.3.2`. Releases of this repository are annotated git tags `vX.Y.Z`: set `version` in `Cargo.toml` and `crates/allowit-stellar/Cargo.toml`, merge, then tag the merge commit with `git tag -a vX.Y.Z -m vX.Y.Z <commit> && git push origin vX.Y.Z`.
+All packages consume the same `allowit-core` release tag `v0.4.0`. Releases of this repository are annotated git tags `vX.Y.Z`: set `version` in `Cargo.toml`, `crates/allowit-stellar/Cargo.toml` and `crates/policy-bindings/Cargo.toml`, merge, then tag the merge commit with `git tag -a vX.Y.Z -m vX.Y.Z <commit> && git push origin vX.Y.Z`.
 
 Keep contract code, the `crates/allowit-stellar` rail crate, build and API documentation and release inputs here. [AGENTS.md](AGENTS.md) describes the repository scope.
 

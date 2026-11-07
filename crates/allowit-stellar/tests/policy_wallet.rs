@@ -7,7 +7,7 @@
 //! Regenerate after a contract or encoding change: run `scripts/build-contracts.sh`, then
 //! `ALLOWIT_UPDATE_VECTORS=1 cargo test --test policy_wallet` in `crates/allowit-stellar`.
 use allowit::AllowitTier;
-use allowit_policy_sdk::admin::{Admin, DeploymentVersion};
+use allowit::admin::{Admin, DeploymentVersion};
 use allowit_stellar_wallet::admin::*;
 use allowit_stellar_wallet::contract::{CustodyState, PolicyBinding};
 use allowit_stellar_wallet::workflow::*;

@@ -90,9 +90,7 @@ impl RetainedPacket for native::workflow::ExecutionRequest {
     }
 }
 
-fn params(
-    v: &BTreeMap<String, allowit_policy_sdk::policy::PolicyValue>,
-) -> Result<native::PolicyParams> {
+fn params(v: &BTreeMap<String, allowit::policy::PolicyValue>) -> Result<native::PolicyParams> {
     Ok(native::PolicyParams(
         v.iter()
             .map(|(k, v)| checked(native::PolicyValue::from_core(v)).map(|v| (k.clone(), v)))
@@ -956,7 +954,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 }
             }
             OwnerAction::SetPause { paused } => {
-                use allowit_policy_sdk::admin::{DeploymentVersion, SetPause};
+                use allowit::admin::{DeploymentVersion, SetPause};
                 let mut admin = native::admin::OwnerAdmin {
                     rpc: self.rpc(),
                     config: &c,
@@ -972,7 +970,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 )?
             }
             OwnerAction::Recover { units, recipient } => {
-                use allowit_policy_sdk::admin::RecoverFunds;
+                use allowit::admin::RecoverFunds;
                 let mut admin = native::admin::OwnerAdmin {
                     rpc: self.rpc(),
                     config: &c,

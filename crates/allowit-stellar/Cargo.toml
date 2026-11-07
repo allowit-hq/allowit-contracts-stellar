@@ -1,6 +1,6 @@
 [package]
 name = "allowit-stellar"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
@@ -17,9 +17,8 @@ test-support = []
 browser-owner-verifier = []
 
 [dependencies]
-allowit-stellar-policy-bindings = { path = "../policy-bindings", version = "0.3" }
-allowit = { git = "https://github.com/allowit-hq/allowit-core.git", tag = "v0.3.2", version = "0.3", default-features = false, features = ["std"] }
-allowit-policy-sdk = { package = "allowit-sdk", git = "https://github.com/allowit-hq/allowit-core.git", tag = "v0.3.2", version = "0.3", default-features = false, features = ["std", "client", "policy-source"] }
+allowit-stellar-policy-bindings = { path = "../policy-bindings", version = "0.4" }
+allowit = { package = "allowit-core", git = "https://github.com/allowit-hq/allowit-core.git", tag = "v0.4.0", version = "0.4", default-features = false, features = ["std", "client", "policy-source"] }
 base64 = "0.22"
 ed25519-dalek = "2.2"
 serde = { version = "1", features = ["derive"] }
@@ -32,7 +31,7 @@ zeroize = "1.9.1"
 time = { version = "0.3.55", features = ["parsing", "formatting"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-allowit-policy-sdk = { package = "allowit-sdk", git = "https://github.com/allowit-hq/allowit-core.git", tag = "v0.3.2", version = "0.3", default-features = false, features = ["vendor"] }
+allowit = { package = "allowit-core", git = "https://github.com/allowit-hq/allowit-core.git", tag = "v0.4.0", version = "0.4", default-features = false, features = ["vendor"] }
 
 [dev-dependencies]
 tempfile = "3.27"
