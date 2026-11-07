@@ -16,6 +16,8 @@ on:
       - "scripts/contract_admin.py"
       - "scripts/build-contracts.sh"
       - "scripts/build-browser-owner-verifier.sh"
+      - "scripts/browser_verifier_build.py"
+      - "scripts/tests/test_browser_verifier_build.py"
       - "npm/stellar/**"
       - ".github/workflows/stellar-core.yml"
   pull_request:
@@ -33,6 +35,8 @@ on:
       - "scripts/contract_admin.py"
       - "scripts/build-contracts.sh"
       - "scripts/build-browser-owner-verifier.sh"
+      - "scripts/browser_verifier_build.py"
+      - "scripts/tests/test_browser_verifier_build.py"
       - "npm/stellar/**"
       - ".github/workflows/stellar-core.yml"
   schedule:
@@ -75,6 +79,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: wasm32-unknown-unknown
+      - name: Verify isolated build staging
+        run: python3 -m unittest discover -s scripts/tests -p test_browser_verifier_build.py -v
       - name: Rebuild and compare the committed browser verifier
         run: sh scripts/build-browser-owner-verifier.sh
       - uses: actions/setup-node@v4
