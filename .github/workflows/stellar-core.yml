@@ -4,6 +4,7 @@ on:
     branches: [main]
     paths:
       - "crates/allowit-stellar/**"
+      - "crates/policy-bindings/**"
       - "crates/policy/**"
       - "crates/protocol/**"
       - "crates/policy-wallet/**"
@@ -15,11 +16,14 @@ on:
       - "scripts/contract_admin.py"
       - "scripts/build-contracts.sh"
       - "scripts/build-browser-owner-verifier.sh"
+      - "scripts/browser_verifier_build.py"
+      - "scripts/tests/test_browser_verifier_build.py"
       - "npm/stellar/**"
       - ".github/workflows/stellar-core.yml"
   pull_request:
     paths:
       - "crates/allowit-stellar/**"
+      - "crates/policy-bindings/**"
       - "crates/policy/**"
       - "crates/protocol/**"
       - "crates/policy-wallet/**"
@@ -31,6 +35,8 @@ on:
       - "scripts/contract_admin.py"
       - "scripts/build-contracts.sh"
       - "scripts/build-browser-owner-verifier.sh"
+      - "scripts/browser_verifier_build.py"
+      - "scripts/tests/test_browser_verifier_build.py"
       - "npm/stellar/**"
       - ".github/workflows/stellar-core.yml"
   schedule:
@@ -55,7 +61,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates/allowit-stellar -> target
-      - run: cargo fmt --manifest-path crates/allowit-stellar/Cargo.toml --check
+      - run: cargo fmt --manifest-path crates/allowit-stellar/Cargo.toml --all --check
+      - run: cargo fmt --manifest-path crates/policy-bindings/Cargo.toml --all --check
+      - run: cargo test --locked --manifest-path crates/policy-bindings/Cargo.toml
+      - run: cargo test --locked --manifest-path crates/policy-bindings/Cargo.toml --features horizon-price
+      - run: cargo clippy --locked --manifest-path crates/policy-bindings/Cargo.toml --all-targets --features horizon-price -- -D warnings
       - run: cargo test --locked --manifest-path crates/allowit-stellar/Cargo.toml
       - run: cargo clippy --locked --manifest-path crates/allowit-stellar/Cargo.toml --all-targets -- -D warnings
   browser-verifier:
@@ -69,6 +79,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: wasm32-unknown-unknown
+      - name: Verify isolated build staging
+        run: python3 -m unittest discover -s scripts/tests -p test_browser_verifier_build.py -v
       - name: Rebuild and compare the committed browser verifier
         run: sh scripts/build-browser-owner-verifier.sh
       - uses: actions/setup-node@v4

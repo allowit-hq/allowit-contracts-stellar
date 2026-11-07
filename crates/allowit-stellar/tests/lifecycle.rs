@@ -1759,7 +1759,7 @@ fn admin_fixture(
 }
 #[test]
 fn owner_admin_delegates_full_balance_and_versions_without_agent_or_engine_calls() {
-    use allowit_policy_sdk::admin::{Admin, DeploymentVersion};
+    use allowit::admin::{Admin, DeploymentVersion};
     use allowit_stellar_wallet::admin::OwnerAdmin;
     let rpc = admin_fixture(4, Some(stellar_xdr::ScVal::U32(4)));
     let c = &rpc.base.config;
@@ -1800,7 +1800,7 @@ fn owner_admin_delegates_full_balance_and_versions_without_agent_or_engine_calls
 }
 #[test]
 fn owner_admin_fails_closed_on_release_owner_mismatch_auth_and_empty_balance() {
-    use allowit_policy_sdk::admin::{Admin, DeploymentVersion};
+    use allowit::admin::{Admin, DeploymentVersion};
     use allowit_stellar_wallet::admin::OwnerAdmin;
     for case in ["release", "owner", "auth", "balance"] {
         let mut rpc = admin_fixture(4, Some(stellar_xdr::ScVal::U32(4)));
@@ -1880,7 +1880,7 @@ fn contract_release_and_persisted_counter_names_are_exact() {
 
 #[test]
 fn full_policy_deployment_uses_one_versioned_owner_flow_and_owner_handoff_authorization() {
-    use allowit_policy_sdk::admin::{Admin, DeploymentVersion};
+    use allowit::admin::{Admin, DeploymentVersion};
     use allowit_stellar_wallet::admin::{OwnerAdmin, PolicyDeployment};
     for enabled in [false, true] {
         let rpc = admin_fixture(4, Some(stellar_xdr::ScVal::U32(4)));
@@ -2004,7 +2004,7 @@ fn owner_handoff_completes_with_the_new_owner_signature(
     prepared: &allowit_stellar_wallet::admin::PreparedOwnerOperation,
     recorded: &stellar_xdr::SorobanAuthorizationEntry,
 ) {
-    use allowit_policy_sdk::admin::{Admin, DeploymentVersion};
+    use allowit::admin::{Admin, DeploymentVersion};
     use allowit_stellar_wallet::admin::{OwnerAdmin, PreparedOwnerOperation};
     use stellar_xdr::*;
     let c = &rpc.base.config;
@@ -2139,7 +2139,7 @@ fn canonical_main_revision_packet_is_status_only_and_preserves_signed_bytes() {
 
 #[test]
 fn enabled_x402_rejects_contract_agents() {
-    use allowit_policy_sdk::admin::{Admin, DeploymentVersion};
+    use allowit::admin::{Admin, DeploymentVersion};
     use allowit_stellar_wallet::admin::{OwnerAdmin, PolicyDeployment};
     let rpc = admin_fixture(4, Some(stellar_xdr::ScVal::U32(4)));
     let c = &rpc.base.config;
@@ -3376,7 +3376,7 @@ fn service_auth_nonce_is_scoped_to_the_policy_wallet() {
 
 #[test]
 fn owner_recovery_reads_only_kept_fields_and_pause_only_the_current_layout() {
-    use allowit_policy_sdk::admin::{DeployPolicy, DeploymentVersion, RecoverFunds, SetPause};
+    use allowit::admin::{DeployPolicy, DeploymentVersion, RecoverFunds, SetPause};
     use allowit_stellar_wallet::admin::{OwnerAdmin, PolicyDeployment};
     let recipient = account_for_seed(&[6; 32]);
     // A policy binding that does not verify, as after an upgrade whose source digest differs:
@@ -3451,7 +3451,7 @@ fn owner_recovery_reads_only_kept_fields_and_pause_only_the_current_layout() {
 
 #[test]
 fn owner_deployment_binds_common_rules_to_the_installed_source_prefix() {
-    use allowit_policy_sdk::admin::{DeployPolicy, DeploymentVersion};
+    use allowit::admin::{DeployPolicy, DeploymentVersion};
     use allowit_stellar_wallet::admin::{OwnerAdmin, PolicyDeployment};
     let rpc = admin_fixture(4, Some(stellar_xdr::ScVal::U32(4)));
     let mut c = rpc.base.config.clone();
@@ -3489,7 +3489,7 @@ fn owner_deployment_binds_common_rules_to_the_installed_source_prefix() {
 
 #[test]
 fn owner_deployment_binds_common_rules_to_a_target_source() {
-    use allowit_policy_sdk::admin::{DeployPolicy, DeploymentVersion};
+    use allowit::admin::{DeployPolicy, DeploymentVersion};
     use allowit_stellar_wallet::admin::{OwnerAdmin, PolicyDeployment};
     // The installed Common wallet binds the prefix `destinations` of its source.
     let mut rpc = admin_fixture(4, Some(stellar_xdr::ScVal::U32(4)));
@@ -3568,7 +3568,7 @@ fn portable_classic_custody_accepts_only_canonical_only_sources() {
 
 #[test]
 fn owner_preparation_refuses_address_v2_entries_that_the_handoff_cannot_sign() {
-    use allowit_policy_sdk::admin::{DeployPolicy, DeploymentVersion};
+    use allowit::admin::{DeployPolicy, DeploymentVersion};
     use allowit_stellar_wallet::admin::{OwnerAdmin, PolicyDeployment};
     let mut rpc = admin_fixture(4, Some(stellar_xdr::ScVal::U32(4)));
     rpc.address_v2 = true;

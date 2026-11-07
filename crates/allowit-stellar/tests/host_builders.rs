@@ -403,7 +403,7 @@ fn installation_preserves_policy_instance_salt_and_constructor_binding() {
 
 #[test]
 fn common_values_keep_variant_and_native_address_validation() {
-    use allowit_policy_sdk::policy::PolicyValue as Common;
+    use allowit::policy::PolicyValue as Common;
     let address = account(11);
     for value in [
         allowit::AllowitValue::Addr(allowit::Address::new(address.clone())),

@@ -20,3 +20,9 @@ pub const NETWORKS: &[Network] = &[
         testnet: false,
     },
 ];
+
+pub(crate) fn resolve(value: &str) -> Option<&'static Network> {
+    NETWORKS
+        .iter()
+        .find(|network| network.id == value || network.aliases.contains(&value))
+}

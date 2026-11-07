@@ -24,7 +24,7 @@ mod authorization;
 #[cfg(all(target_arch = "wasm32", feature = "browser-owner-verifier"))]
 mod browser_owner;
 pub mod contract;
-pub mod networks;
+pub use allowit_stellar_policy_bindings::networks;
 pub mod owner;
 pub mod owner_intent;
 pub mod policy;

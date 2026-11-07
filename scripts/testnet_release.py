@@ -40,7 +40,10 @@ MAX_FEE = 1_250_000_000  # First constructor can renew shared code; Testnet only
 HEX = re.compile(r"[0-9a-f]{64}")
 SHA = re.compile(r"[0-9a-f]{40}")
 TAG = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
-CORE_SOURCE = "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.3.2#c6c9f382761a0c5b88afc5524be7220c5c56c244"
+CORE_SOURCES = {
+    "v0.3.0": "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.3.2#c6c9f382761a0c5b88afc5524be7220c5c56c244",
+    "v0.4.0": "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.4.0#7c53bf637c70f3fe685274a285d4cf5c64ea779f",
+}
 IDENTITY_KEYS = {"tag", "revision", "tag_object", "workflow_revision"}
 MAX_LEDGER_AGE = 120  # Seconds, measured from the native header close time.
 MAX_FUTURE_SKEW = 30
@@ -356,16 +359,25 @@ def bundle(source, identity, output):
     native, sample = source_layout(source)
     if tomllib.loads((native / "Cargo.toml").read_text())["package"]["version"] != version:
         raise ValueError("Native host and workspace release versions differ")
-    for lock in (source / "Cargo.lock", native / "Cargo.lock"):
+    core_source = CORE_SOURCES.get(identity["tag"])
+    if core_source is None:
+        raise ValueError("Release tag has no approved Core source")
+    locks = [source / "Cargo.lock", native / "Cargo.lock"]
+    if identity["tag"] == "v0.4.0":
+        bindings = source / "crates/policy-bindings"
+        if tomllib.loads((bindings / "Cargo.toml").read_text())["package"]["version"] != version:
+            raise ValueError("Policy bindings and workspace release versions differ")
+        locks.append(bindings / "Cargo.lock")
+    for lock in locks:
         packages = tomllib.loads(lock.read_text())["package"]
         identities = {item["source"] for item in packages if "allowit-core" in item.get("source", "")}
-        if identities != {CORE_SOURCE}:
-            raise ValueError("Release must use the single published Core v0.3.2 source")
+        if identities != {core_source}:
+            raise ValueError("Release must use its single approved published Core source")
     # Resolve this with the release's own checked policy gate, before the signing job.
     helper = "import sys;sys.path.insert(0,sys.argv[1]);from policy_source import standard_prefix;import json;print(json.dumps(standard_prefix(open(sys.argv[2]).read())))"
     rules = json.loads(public_output([sys.executable, "-c", helper, str(source / "scripts"), str(sample)], text=True))
     output.mkdir(parents=True, exist_ok=True)
-    result = {"schema": 1, "repository": REPOSITORY, **identity, "core_source": CORE_SOURCE,
+    result = {"schema": 1, "repository": REPOSITORY, **identity, "core_source": core_source,
         "toolchain": {"rust": "1.98.0", "stellar": "28.1.0"}, "artifacts": {}}
     # build-contracts.sh publishes CLI-processed artifacts here even when Cargo
     # uses an external cache. Cache outputs can contain unprocessed Cargo bytes.
@@ -395,7 +407,8 @@ def check_bundle(directory):
         raise ValueError("Invalid release manifest identity")
     if not SHA.fullmatch(manifest.get("revision", "")) or not SHA.fullmatch(manifest.get("workflow_revision", "")) or not SHA.fullmatch(manifest.get("tag_object", "")):
         raise ValueError("Invalid release revisions")
-    if manifest.get("core_source") != CORE_SOURCE:
+    core_source = CORE_SOURCES.get(manifest["tag"])
+    if core_source is None or manifest.get("core_source") != core_source:
         raise ValueError("Release Core source differs from the approved published version")
     if set(manifest.get("artifacts", {})) != set(CONTRACTS) or manifest.get("toolchain") != {"rust": "1.98.0", "stellar": "28.1.0"}:
         raise ValueError("Unexpected release artifacts or toolchain")

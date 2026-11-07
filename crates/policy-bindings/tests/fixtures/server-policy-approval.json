@@ -1,0 +1,24 @@
+{
+  "payload": {
+    "profile": "allowit-stellar-server-policy-approval-v1",
+    "network": "stellar:testnet",
+    "wallet": "CAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQTD2L",
+    "owner": "GDVEU3DD4KOFECV66VIHWEZOYX4ZKR3WV27L464SIIPOU2IUI3JCZA57",
+    "policyId": "server-policy-001",
+    "revision": 2,
+    "policyInstance": "1111111111111111111111111111111111111111111111111111111111111111",
+    "moduleDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+    "installedSourceHash": "3333333333333333333333333333333333333333333333333333333333333333",
+    "source": "pub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::allow() // Café\n}\n",
+    "sourceHash": "c0097eb99fa190ef39880c7e2a11c1f5856a73de918172fb7483de5893674a84",
+    "paramsHash": "c22553fee3fba9e455c810f72953f58d605632411a2d4996185e9bd5aad05589",
+    "serverBindings": "4444444444444444444444444444444444444444444444444444444444444444"
+  },
+  "params": {
+    "payment_limit": {
+      "Int": "1000"
+    }
+  },
+  "message": "AllowIt Stellar server policy approval v1\n{\"installedSourceHash\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"moduleDigest\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"network\":\"stellar:testnet\",\"owner\":\"GDVEU3DD4KOFECV66VIHWEZOYX4ZKR3WV27L464SIIPOU2IUI3JCZA57\",\"paramsHash\":\"c22553fee3fba9e455c810f72953f58d605632411a2d4996185e9bd5aad05589\",\"policyId\":\"server-policy-001\",\"policyInstance\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"profile\":\"allowit-stellar-server-policy-approval-v1\",\"revision\":2,\"serverBindings\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"source\":\"pub fn execute(ctx: &AllowitContext) -> allowit::Result {\\n    allowit::allow() // Café\\n}\\n\",\"sourceHash\":\"c0097eb99fa190ef39880c7e2a11c1f5856a73de918172fb7483de5893674a84\",\"wallet\":\"CAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQTD2L\"}",
+  "digest": "305688e977fc815e3c7d81d4c2e87a789cd764ef5adfdbeb4ab92ecbef31b933"
+}

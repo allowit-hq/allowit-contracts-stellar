@@ -2,6 +2,7 @@ import {canonicalJson,digest} from './consent-codec.js';
 import freighter from '@stellar/freighter-api';
 import {ed25519} from '@noble/curves/ed25519';
 import {sha256} from '@noble/hashes/sha256';
+import {StrKey} from '@stellar/stellar-sdk/base';
 export interface Session {address: string; network: string; expiresAt: string}
 import {stellarAssetContract} from './stellar-asset.js';
 
@@ -140,15 +141,67 @@ const APPROVAL_PAYLOAD_KEYS = ['version','policyId','revision','network','wallet
 const PORTABLE_APPROVAL_KEYS = [...APPROVAL_PAYLOAD_KEYS, 'language', 'tier', 'rules', 'params', 'paramsHash'];
 const exactPayload = (value: unknown, keys: readonly string[]) => !!value && typeof value === 'object' && !Array.isArray(value)
   && Object.keys(value).length === keys.length && Object.keys(value).every(key => keys.includes(key));
+const SERVER_POLICY_APPROVAL_PROFILE = 'allowit-stellar-server-policy-approval-v1';
+const SERVER_POLICY_APPROVAL_KEYS = [
+  'profile', 'network', 'wallet', 'owner', 'policyId', 'revision', 'policyInstance',
+  'moduleDigest', 'installedSourceHash', 'source', 'sourceHash', 'paramsHash', 'serverBindings',
+];
+const hashIdentity = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
+type SourceApproval = {payload: Record<string, unknown>; message: string; method: string};
+type ApprovalPolicy = {id: string; revision: number; language?: string; network?: string; sourceHash?: string; irHash?: string; code?: string; mint?: string; token?: string; runtime?: {instanceBinding?: Record<string, unknown>}};
+
+function serverPolicyApprovalNetwork(approval: SourceApproval, policy: ApprovalPolicy, owner: string): StellarNetwork {
+  const {payload, message, method} = approval;
+  const binding = policy.runtime?.instanceBinding;
+  const portable = binding?.portable as Record<string, unknown> | undefined;
+  const build = portable?.build as Record<string, unknown> | undefined;
+  const invalid = () => new Error('The server policy approval does not match this exact policy and wallet. Nothing was signed.');
+  if (!exactPayload(payload, SERVER_POLICY_APPROVAL_KEYS) || payload.profile !== SERVER_POLICY_APPROVAL_PROFILE
+    || method !== 'sep53' || payload.owner !== owner || payload.policyId !== policy.id
+    || !/^[A-Za-z0-9._:-]{1,128}$/.test(policy.id) || payload.revision !== policy.revision
+    || !Number.isInteger(policy.revision) || policy.revision < 1 || policy.revision > 0xffffffff
+    || typeof payload.network !== 'string' || !Object.hasOwn(STELLAR_NETWORKS, payload.network)
+    || payload.network !== policy.network || binding?.route !== 'policyWallet'
+    || typeof payload.wallet !== 'string' || !StrKey.isValidContract(payload.wallet) || payload.wallet !== binding.wallet
+    || !hashIdentity(payload.policyInstance) || payload.policyInstance !== binding.policyInstance
+    || !hashIdentity(payload.moduleDigest) || payload.moduleDigest !== binding.moduleDigest
+    || !hashIdentity(payload.installedSourceHash) || payload.installedSourceHash !== binding.installedSourceHash
+    || typeof policy.code !== 'string' || policy.code.length === 0 || new TextEncoder().encode(policy.code).length > 32_768
+    || payload.source !== policy.code || payload.sourceHash !== policy.sourceHash || digest(policy.code) !== payload.sourceHash
+    || portable?.sourceHash !== payload.sourceHash || !hashIdentity(payload.paramsHash) || payload.paramsHash !== portable.paramsHash
+    || !portable.params || typeof portable.params !== 'object' || Array.isArray(portable.params)
+    || digest(canonicalApprovalJson(portable.params)) !== payload.paramsHash
+    || !hashIdentity(payload.serverBindings) || payload.serverBindings !== build?.serverBindings
+    || message !== `AllowIt Stellar server policy approval v1\n${canonicalApprovalJson(payload)}`) throw invalid();
+  stellarAccountKey(owner);
+  return payload.network as StellarNetwork;
+}
+
+async function signSourceApproval(message: string, owner: string, network: StellarNetwork, current: () => void): Promise<{signer: string; signature: number[]}[]> {
+  await currentAddress(owner); current();
+  await checkNetwork(network); current();
+  const signed = await freighter.signMessage(message, {address: owner, networkPassphrase: STELLAR_NETWORKS[network].passphrase});
+  failed(signed.error);
+  if (signed.signerAddress !== owner || !signed.signedMessage) throw new Error('Freighter signed with another administrator. Nothing was activated.');
+  const signature = base64Bytes(signed.signedMessage);
+  if (signature.length !== 64 || !ed25519.verify(signature, stellarMessageDigest(message), stellarAccountKey(owner), {zip215: false})) throw new Error('The policy approval signature could not be verified.');
+  await currentAddress(owner); current();
+  await checkNetwork(network); current();
+  return [{signer: owner, signature: Array.from(signature)}];
+}
 /** Stellar Asset Contract for an exact asset code, issuer and network. A null issuer means native XLM; issued XLM keeps its issuer. */
 export function stellarAssetContractId(code: string, issuer: string | null, network: StellarNetwork): string {
   return stellarAssetContract(code, issuer === null ? null : stellarAccountKey(issuer), STELLAR_NETWORKS[network].passphrase);
 }
-/** The owner approves an exact Native source against current account administration authority. */
-export async function signStellarSourceApproval(approval: {payload:Record<string,unknown>;message:string;method:string}, policy: {id: string; revision: number; language?:string; network?:string; sourceHash?:string; irHash?:string; code?:string;mint?:string;token?:string;runtime?:{instanceBinding?:Record<string,unknown>}}, session: Session, stillCurrent:()=>boolean=()=>true): Promise<{signer:string;signature:number[]}[]> {
+/** Bind the exact reviewed source and sign with the selected Stellar owner. */
+export async function signStellarSourceApproval(approval: SourceApproval, policy: ApprovalPolicy, session: Session, stillCurrent:()=>boolean=()=>true): Promise<{signer:string;signature:number[]}[]> {
   const current=()=>{if(!stillCurrent())throw new Error('The owner, network or policy changed. Nothing was activated.');};
   current();
   if (session?.network !== 'stellar') throw new Error('Sign in with the Stellar owner before verifying the wallet.');
+  if (approval.payload?.profile === SERVER_POLICY_APPROVAL_PROFILE) {
+    const network = serverPolicyApprovalNetwork(approval, policy, session.address);
+    return signSourceApproval(approval.message, session.address, network, current);
+  }
   {
     const payload=approval.payload,binding=policy.runtime?.instanceBinding;
     const portable = binding?.portable as Record<string, unknown> | undefined;
@@ -172,11 +225,6 @@ export async function signStellarSourceApproval(approval: {payload:Record<string
     let contract='';
     try{contract=stellarAssetContractId(payload.assetSymbol as string,payload.assetIssuer as string|null,network);}catch{/* rejected below */}
     if(contract!==payload.asset)throw new Error('The source approval does not match this exact policy. Nothing was signed.');
-    await currentAddress(session.address);current();await checkNetwork(network);current();
-    const signed=await freighter.signMessage(approval.message,{address:session.address,networkPassphrase:STELLAR_NETWORKS[network].passphrase});failed(signed.error);
-    if(signed.signerAddress!==session.address||!signed.signedMessage)throw new Error('Freighter signed with another administrator. Nothing was activated.');
-    const signature=base64Bytes(signed.signedMessage);
-    if(signature.length!==64||!ed25519.verify(signature,stellarMessageDigest(approval.message),stellarAccountKey(session.address),{zip215:false}))throw new Error('The policy approval signature could not be verified.');
-    await currentAddress(session.address);current();await checkNetwork(network);current();return [{signer:session.address,signature:Array.from(signature)}];
+    return signSourceApproval(approval.message, session.address, network, current);
   }
 }

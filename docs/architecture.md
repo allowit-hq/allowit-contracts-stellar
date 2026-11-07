@@ -831,7 +831,7 @@ control native transactions. Its policy source and economic checks run offchain 
 
 ## Crate boundaries
 
-The portable `allowit` package in [Allowit core](https://github.com/allowit-hq/allowit-core/tree/main/crates/allowit) holds the shared rule core (`core.rs`) and both backends. The core with the host
+The portable module in [Allowit Core](https://github.com/allowit-hq/allowit-core/tree/v0.4.0/crates/allowit-core/src/portable) holds the shared rule core (`core.rs`) and both backends. The core with the host
 backend becomes `sdk/core` in the SDK repository, for the offchain server and SDK evaluator. The
 Soroban backend with the policy wallet, protocol, custom policy and engine crates becomes
 `crates/allowit-stellar`. Authored policy names only `allowit::`, so the split does not change policy source.

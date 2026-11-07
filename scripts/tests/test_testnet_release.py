@@ -38,8 +38,8 @@ def ledger(sequence):
 
 def make_bundle(root):
     source = b"reviewed policy bytes\n"
-    result = {"schema": 1, "repository": release.REPOSITORY, "tag": "v0.2.0", "revision": "a" * 40,
-        "tag_object": "b" * 40, "workflow_revision": "c" * 40, "core_source": release.CORE_SOURCE,
+    result = {"schema": 1, "repository": release.REPOSITORY, "tag": "v0.3.0", "revision": "a" * 40,
+        "tag_object": "b" * 40, "workflow_revision": "c" * 40, "core_source": release.CORE_SOURCES["v0.3.0"],
         "toolchain": {"rust": "1.98.0", "stellar": "28.1.0"}, "artifacts": {},
         "sample_policy": {"file": "sample-policy.rs", "sha256": release.digest(source), "rules": ["payment_limit"]}}
     for kind, name in release.CONTRACTS.items():
@@ -80,23 +80,30 @@ class ReleaseSourceLayouts(unittest.TestCase):
         ("crates/allowit-stellar", "contracts/allowit-custom-policy/policy/policy.rs"),
     )
 
-    def create_source(self, root, native_name, policy_name):
+    def create_source(self, root, native_name, policy_name, tag):
         native, policy = root / native_name, root / policy_name
         native.mkdir(parents=True)
         policy.parent.mkdir(parents=True)
-        (root / "Cargo.toml").write_text('[workspace.package]\nversion = "0.3.0"\n')
-        (native / "Cargo.toml").write_text('[package]\nversion = "0.3.0"\n')
-        lock = '[[package]]\nname = "allowit"\nversion = "0.3.1"\nsource = "' + release.CORE_SOURCE + '"\n'
-        for path in (root / "Cargo.lock", native / "Cargo.lock"):
+        version = tag.removeprefix("v")
+        (root / "Cargo.toml").write_text(f'[workspace.package]\nversion = "{version}"\n')
+        (native / "Cargo.toml").write_text(f'[package]\nversion = "{version}"\n')
+        lock = f'[[package]]\nname = "allowit-core"\nversion = "{version}"\nsource = "{release.CORE_SOURCES[tag]}"\n'
+        locks = [root / "Cargo.lock", native / "Cargo.lock"]
+        if tag == "v0.4.0":
+            bindings = root / "crates/policy-bindings"
+            bindings.mkdir(parents=True)
+            (bindings / "Cargo.toml").write_text(f'[package]\nversion = "{version}"\n')
+            locks.append(bindings / "Cargo.lock")
+        for path in locks:
             path.write_text(lock)
         policy.write_bytes(b"exact policy bytes\n")
         return native, policy
 
     def test_bundle_old_and_new_sources_preserve_exact_artifacts(self):
-        for native_name, policy_name in self.layouts:
-            with self.subTest(layout=native_name), tempfile.TemporaryDirectory() as temporary:
+        for (native_name, policy_name), tag in zip(self.layouts, ("v0.3.0", "v0.4.0")):
+            with self.subTest(layout=native_name, tag=tag), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
-                native, policy = self.create_source(root, native_name, policy_name)
+                native, policy = self.create_source(root, native_name, policy_name, tag)
                 target = root / "target"
                 artifacts = target / "wasm32v1-none/release"
                 artifacts.mkdir(parents=True)
@@ -106,7 +113,7 @@ class ReleaseSourceLayouts(unittest.TestCase):
                 for filename in release.CONTRACTS.values():
                     (artifacts / filename).write_bytes(wasm())
                     (external_artifacts / filename).write_bytes(b"raw Cargo output, before CLI processing")
-                identity = {"tag": "v0.3.0", "revision": "a" * 40,
+                identity = {"tag": tag, "revision": "a" * 40,
                     "tag_object": "b" * 40, "workflow_revision": "c" * 40}
                 output = root / "bundle"
                 with patch.object(release, "git", side_effect=[identity["revision"], ""]), \
@@ -120,17 +127,35 @@ class ReleaseSourceLayouts(unittest.TestCase):
                 for filename in release.CONTRACTS.values():
                     self.assertEqual((output / filename).read_bytes(), (artifacts / filename).read_bytes())
 
+    def test_bundle_rejects_a_mixed_core_release_in_every_lock(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            native, _ = self.create_source(root, *self.layouts[1], "v0.4.0")
+            identity = {"tag": "v0.4.0", "revision": "a" * 40,
+                "tag_object": "b" * 40, "workflow_revision": "c" * 40}
+            locks = [root / "Cargo.lock", native / "Cargo.lock",
+                root / "crates/policy-bindings/Cargo.lock"]
+            for lock in locks:
+                original = lock.read_text()
+                lock.write_text(original.replace(release.CORE_SOURCES["v0.4.0"],
+                    release.CORE_SOURCES["v0.3.0"]))
+                with self.subTest(lock=lock.relative_to(root)), \
+                        patch.object(release, "git", side_effect=[identity["revision"], ""]), \
+                        self.assertRaisesRegex(ValueError, "single approved"):
+                    release.bundle(root, identity, root / "bundle")
+                lock.write_text(original)
+
     def test_missing_partial_and_ambiguous_sources_are_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             with self.assertRaisesRegex(ValueError, "exactly one"):
                 release.source_layout(root)
-            native, policy = self.create_source(root, *self.layouts[0])
+            native, policy = self.create_source(root, *self.layouts[0], "v0.3.0")
             (native / "Cargo.lock").unlink()
             with self.assertRaisesRegex(ValueError, "Incomplete"):
                 release.source_layout(root)
             (native / "Cargo.lock").write_text("")
-            self.create_source(root, *self.layouts[1])
+            self.create_source(root, *self.layouts[1], "v0.3.0")
             with self.assertRaisesRegex(ValueError, "exactly one"):
                 release.source_layout(root)
 
@@ -205,8 +230,14 @@ class ReleaseSafety(unittest.TestCase):
         changed, salt, wallet = release.wallet_intent(self.manifest, 'common', self.owner.public_key, self.server.public_key, self.agent.public_key)
         self.assertEqual((salt, wallet, changed['policy_instance']), (self.salt, self.wallet, self.config['policy_instance']))
         self.assertNotEqual(changed['server'], self.config['server'])
-        other = {**self.manifest, 'tag':'v0.3.0'}
+        other = {**self.manifest, 'tag':'v0.4.0'}
         self.assertNotEqual(release.wallet_intent(other, 'common', self.owner.public_key, self.agent.public_key, self.server.public_key)[2], self.wallet)
+
+    def test_bundle_rejects_core_source_from_another_release(self):
+        self.manifest["core_source"] = release.CORE_SOURCES["v0.4.0"]
+        release.write(self.root / "source-manifest.json", self.manifest)
+        with self.assertRaisesRegex(ValueError, "Core source differs"):
+            release.check_bundle(self.root)
 
     def test_strict_constructor_variants_and_intent(self):
         for field, value in [('server',self.agent.public_key),('policy_instance','11'*32),('rules',[]),('x402_enabled',True)]:

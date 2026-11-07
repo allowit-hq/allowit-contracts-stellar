@@ -1,4 +1,5 @@
 //! Stellar adapter registration and native workflow bindings.
+pub use allowit_stellar_policy_bindings::bindings;
 pub mod execution;
 pub mod formats;
 pub mod owner;

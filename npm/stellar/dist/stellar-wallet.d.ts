@@ -53,14 +53,12 @@ export declare function connectStellarWallet(network: StellarNetwork, admitTimes
 export declare function signStellarTransaction(transactionXdr: string, owner: string, network: StellarNetwork, retain?: (signedXdr: string) => void | Promise<void>): Promise<string>;
 export declare function watchStellarAccount(owner: string, changed: () => void): () => void;
 export declare const canonicalApprovalJson: (value: unknown) => string;
-/** Stellar Asset Contract for an exact asset code, issuer and network. A null issuer means native XLM; issued XLM keeps its issuer. */
-export declare function stellarAssetContractId(code: string, issuer: string | null, network: StellarNetwork): string;
-/** The owner approves an exact Native source against current account administration authority. */
-export declare function signStellarSourceApproval(approval: {
+type SourceApproval = {
     payload: Record<string, unknown>;
     message: string;
     method: string;
-}, policy: {
+};
+type ApprovalPolicy = {
     id: string;
     revision: number;
     language?: string;
@@ -73,7 +71,12 @@ export declare function signStellarSourceApproval(approval: {
     runtime?: {
         instanceBinding?: Record<string, unknown>;
     };
-}, session: Session, stillCurrent?: () => boolean): Promise<{
+};
+/** Stellar Asset Contract for an exact asset code, issuer and network. A null issuer means native XLM; issued XLM keeps its issuer. */
+export declare function stellarAssetContractId(code: string, issuer: string | null, network: StellarNetwork): string;
+/** Bind the exact reviewed source and sign with the selected Stellar owner. */
+export declare function signStellarSourceApproval(approval: SourceApproval, policy: ApprovalPolicy, session: Session, stillCurrent?: () => boolean): Promise<{
     signer: string;
     signature: number[];
 }[]>;
+export {};

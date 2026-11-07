@@ -12,7 +12,7 @@ use crate::host::{
     owner::{self, Context},
     vendors::OwnerProvider,
 };
-use allowit_policy_sdk::client::store::Store;
+use allowit::client::store::Store;
 pub struct Owner;
 pub static OWNER: Owner = Owner;
 fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {

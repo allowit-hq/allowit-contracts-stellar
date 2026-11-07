@@ -272,14 +272,14 @@ impl PolicyParams {
 }
 impl PolicyValue {
     /// Convert a common value without erasing its variant. Validate native address encoding.
-    pub fn from_core(value: &allowit_policy_sdk::policy::PolicyValue) -> Result<Self> {
+    pub fn from_core(value: &allowit::policy::PolicyValue) -> Result<Self> {
         let native = Self::from_allowit(&value.0);
         native.scval()?;
         Ok(native)
     }
-    pub fn to_core(&self) -> Result<allowit_policy_sdk::policy::PolicyValue> {
+    pub fn to_core(&self) -> Result<allowit::policy::PolicyValue> {
         self.scval()?;
-        Ok(allowit_policy_sdk::policy::PolicyValue(self.allowit()))
+        Ok(allowit::policy::PolicyValue(self.allowit()))
     }
     /// Contract encoding of `AllowitValue`: a vector of its variant symbol and payload.
     pub fn scval(&self) -> Result<ScVal> {
@@ -616,7 +616,7 @@ pub fn installed_source_digest(
 }
 
 /// Shared portable source gate from the same released Core dependency as the library.
-pub use allowit_policy_sdk::policy_source::{SourceShape, source_shape};
+pub use allowit::policy_source::{SourceShape, source_shape};
 /// The rules a tier installs for `source`: the standard prefix for Common, none otherwise.
 pub fn tier_rules(tier: PolicyTier, source: &str) -> Result<Vec<String>> {
     let shape = source_shape(source)?;
