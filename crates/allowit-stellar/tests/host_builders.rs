@@ -990,6 +990,32 @@ fn fee_bump_reply(inner: &x::TransactionV1Envelope, success: bool) -> Value {
         "envelopeXdr":xdr(&x::TransactionEnvelope::TxFeeBump(outer)).unwrap(),"resultXdr":xdr(&result).unwrap()})
 }
 #[test]
+fn current_rpc_not_found_zero_ledger_is_no_receipt() {
+    let mut chain = Chain::new(&config());
+    let hash = unhex("e3cda1ad89b47aeb58b23a0d524205a15a12113c632f5bf3ad1da6308006d92e").unwrap();
+    chain.receipt = json!({
+        "latestLedger": 5579142,
+        "latestLedgerCloseTime": "1793919351",
+        "oldestLedger": 5458183,
+        "oldestLedgerCloseTime": "1793314555",
+        "status": "NOT_FOUND",
+        "txHash": hex(&hash),
+        "applicationOrder": 0,
+        "feeBump": false,
+        "events": {},
+        "ledger": 0,
+        "createdAt": "0"
+    });
+    assert_eq!(rpc::receipt_by_hash(&chain, NETWORK, &hash).unwrap(), None);
+    assert!(rpc::receipt_by_hash(&chain, NETWORK, &[1; 32]).is_err());
+    chain.receipt["oldestLedger"] = json!(5579143);
+    assert!(rpc::receipt_by_hash(&chain, NETWORK, &hash).is_err());
+    chain.receipt["oldestLedger"] = json!(5458183);
+    chain.receipt["ledger"] = json!("0");
+    assert!(rpc::receipt_by_hash(&chain, NETWORK, &hash).is_err());
+}
+
+#[test]
 fn fee_bumped_owner_receipt_binds_outer_inner_result_and_status() {
     let c = config();
     let mut chain = Chain::new(&c);
@@ -1022,7 +1048,7 @@ fn fee_bumped_owner_receipt_binds_outer_inner_result_and_status() {
             rpc::owner_settlement(&chain, NETWORK, &signed).unwrap(),
             rpc::OwnerSettlement::Settled(_)
         ));
-        for mode in 0..6 {
+        for mode in 0..7 {
             chain.receipt = valid.clone();
             match mode {
                 0 => chain.receipt["txHash"] = json!(hex(&[13; 32])),
@@ -1058,7 +1084,7 @@ fn fee_bumped_owner_receipt_binds_outer_inner_result_and_status() {
                     changed.tx.fee += 1;
                     chain.receipt = fee_bump_reply(&changed, success);
                 }
-                _ => {
+                5 => {
                     chain.receipt["resultXdr"] = json!(
                         xdr(&x::TransactionResult {
                             fee_charged: 0,
@@ -1068,6 +1094,7 @@ fn fee_bumped_owner_receipt_binds_outer_inner_result_and_status() {
                         .unwrap()
                     )
                 }
+                _ => chain.receipt["ledger"] = json!(0),
             }
             assert!(
                 rpc::owner_settlement(&chain, NETWORK, &signed).is_err(),

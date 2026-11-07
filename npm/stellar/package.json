@@ -24,6 +24,7 @@
   },
   "scripts": {
     "build:browser": "tsc -p tsconfig.json",
+    "build:owner-verifier": "sh ../../scripts/build-browser-owner-verifier.sh",
     "test:browser": "node --test tests/*.test.mjs"
   },
   "devDependencies": {

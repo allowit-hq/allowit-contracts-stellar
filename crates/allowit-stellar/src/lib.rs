@@ -2,9 +2,11 @@
 //! Native and policy wallet custody use the same authored policy and exact operation identity.
 extern crate self as allowit_stellar_wallet;
 
+#[cfg(not(target_arch = "wasm32"))]
 mod host;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod provider;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(all(not(target_arch = "wasm32"), any(test, feature = "test-support")))]
 pub mod test_support;
 
 use crate::workflow::{
@@ -19,6 +21,8 @@ use stellar_xdr::*;
 
 pub mod admin;
 mod authorization;
+#[cfg(all(target_arch = "wasm32", feature = "browser-owner-verifier"))]
+mod browser_owner;
 pub mod contract;
 pub use allowit_stellar_policy_bindings::networks;
 pub mod owner;
