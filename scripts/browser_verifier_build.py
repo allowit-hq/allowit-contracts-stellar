@@ -8,12 +8,14 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 STAGING = Path("/tmp/allowit-stellar-owner-verifier-v1")
 FORMAT = b"allowit-stellar-owner-verifier-v1\n"
 CRATES = ("crates/allowit-stellar", "crates/policy-bindings")
 INPUTS = tuple(f"{crate}/{item}" for crate in CRATES for item in ("Cargo.toml", "Cargo.lock", "src"))
+TOOL_ENV = {"PATH", "HOME", "RUSTUP_HOME", "TMPDIR", "TMP", "TEMP", "SYSTEMROOT", "LANG", "LC_ALL"}
 
 
 def private_directory(path):
@@ -74,12 +76,13 @@ def locked_staging(path, wait_seconds=10):
 
 def stage_sources(root, destination):
     git = ["git", "--no-replace-objects", "-c", "core.hooksPath=/dev/null", "-C", str(root)]
-    revision = subprocess.check_output([*git, "rev-parse", "HEAD"], text=True).strip()
-    if subprocess.run([*git, "diff", "--quiet", revision, "--", *INPUTS]).returncode:
+    environment = {name: value for name, value in os.environ.items() if name in TOOL_ENV}
+    revision = subprocess.check_output([*git, "rev-parse", "HEAD"], text=True, env=environment).strip()
+    if subprocess.run([*git, "diff", "--quiet", "--no-ext-diff", "--no-textconv", revision, "--", *INPUTS], env=environment).returncode:
         raise ValueError("Commit the Rust verifier inputs before rebuilding")
-    if subprocess.check_output([*git, "ls-files", "--others", "--exclude-standard", "--", *INPUTS]):
+    if subprocess.check_output([*git, "ls-files", "--others", "--exclude-standard", "--", *INPUTS], env=environment):
         raise ValueError("Commit the new Rust verifier inputs before rebuilding")
-    entries = subprocess.check_output([*git, "ls-tree", "-rz", revision, "--", *INPUTS]).split(b"\0")
+    entries = subprocess.check_output([*git, "ls-tree", "-rz", revision, "--", *INPUTS], env=environment).split(b"\0")
     destination.mkdir(mode=0o700)
     for entry in filter(None, entries):
         metadata, raw_path = entry.split(b"\t", 1)
@@ -87,22 +90,64 @@ def stage_sources(root, destination):
         relative = Path(os.fsdecode(raw_path))
         if mode not in {"100644", "100755"} or kind != "blob" or relative.is_absolute() or ".." in relative.parts:
             raise ValueError("Verifier inputs must be committed regular files")
-        data = subprocess.check_output([*git, "cat-file", "blob", oid])
+        data = subprocess.check_output([*git, "cat-file", "blob", oid], env=environment)
         target = destination / relative
         target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         target.write_bytes(data)
-    if subprocess.check_output([*git, "rev-parse", "HEAD"], text=True).strip() != revision:
+    if subprocess.check_output([*git, "rev-parse", "HEAD"], text=True, env=environment).strip() != revision:
         raise ValueError("The verifier source revision changed during staging")
+
+
+def artifact_path(root, create=False):
+    directory = root
+    for part in (None, "npm", "stellar", "dist"):
+        if part is not None:
+            directory /= part
+        try:
+            info = directory.lstat()
+        except FileNotFoundError:
+            if not create or part is None:
+                raise
+            directory.mkdir(mode=0o755)
+            info = directory.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+            raise ValueError("The verifier artifact directory must have an owned regular directory path")
+    artifact = directory / "owner-verifier.wasm"
+    try:
+        info = artifact.lstat()
+    except FileNotFoundError:
+        if not create:
+            raise
+    else:
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+            raise ValueError("The verifier artifact must be an owned regular file")
+    return artifact
+
+
+def update_artifact(root, built):
+    artifact = artifact_path(root, create=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=artifact.parent, prefix=".owner-verifier-", delete=False) as output:
+            temporary = Path(output.name)
+            with built.open("rb") as source:
+                shutil.copyfileobj(source, output)
+            output.flush()
+            os.fsync(output.fileno())
+            os.fchmod(output.fileno(), 0o644)
+        os.replace(temporary, artifact)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def build(root, update=False):
     target = Path(os.environ.get("CARGO_TARGET_DIR", root / "target/browser-owner-verifier")).absolute()
-    artifact = root / "npm/stellar/dist/owner-verifier.wasm"
+    artifact = artifact_path(root, create=update)
     with locked_staging(STAGING) as (source, cargo_home):
         try:
             stage_sources(root, source)
-            names = {"PATH", "HOME", "RUSTUP_HOME", "TMPDIR", "TMP", "TEMP", "SYSTEMROOT", "LANG", "LC_ALL"}
-            environment = {name: value for name, value in os.environ.items() if name in names}
+            environment = {name: value for name, value in os.environ.items() if name in TOOL_ENV}
             environment["CARGO_HOME"] = str(cargo_home)
             environment["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join((
                 f"--remap-path-prefix={source}=/allowit-stellar",
@@ -113,9 +158,7 @@ def build(root, update=False):
                 "--target-dir", str(target), "--lib", "--crate-type", "cdylib"], env=environment, check=True)
             built = target / "wasm32-unknown-unknown/release/allowit_stellar_wallet.wasm"
             if update:
-                artifact.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(built, artifact)
-                artifact.chmod(0o644)
+                update_artifact(root, built)
             elif built.read_bytes() != artifact.read_bytes():
                 digest = hashlib.sha256(built.read_bytes()).hexdigest()
                 raise ValueError(f"The rebuilt owner verifier differs from the committed artifact (SHA-256 {digest})")

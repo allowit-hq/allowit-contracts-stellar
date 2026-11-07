@@ -56,6 +56,22 @@ class VerifierBuild(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Commit the new Rust"):
                 verifier.stage_sources(repository, root / "new")
 
+    def test_git_environment_cannot_redirect_the_source_repository(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            intended, foreign = root / "intended", root / "foreign"
+            self.repository(intended)
+            self.repository(foreign)
+            source = foreign / verifier.CRATES[0] / "src/lib.rs"
+            source.write_text("foreign Rust source\n")
+            subprocess.run(["git", "-C", foreign, "add", "."], check=True)
+            subprocess.run(["git", "-C", foreign, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                "commit", "-qm", "Foreign source"], check=True)
+            with patch.dict(os.environ, {"GIT_DIR": str(foreign / ".git"), "GIT_WORK_TREE": str(foreign),
+                    "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "diff.external", "GIT_CONFIG_VALUE_0": "false"}):
+                verifier.stage_sources(intended, root / "snapshot")
+            self.assertEqual((root / "snapshot" / verifier.CRATES[0] / "src/lib.rs").read_text(), "exact Rust source\n")
+
     def test_committed_symlink_inputs_are_refused(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -110,6 +126,42 @@ class VerifierBuild(unittest.TestCase):
                 with verifier.locked_staging(directory):
                     self.fail("Existing source accepted")
             self.assertEqual(retained.read_text(), "preserve prior source\n")
+
+    def test_artifact_links_are_refused_without_altering_other_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = root / "repository"
+            repository.mkdir()
+            artifact = verifier.artifact_path(repository, create=True)
+            unrelated = root / "unrelated"
+            unrelated.write_bytes(b"original unrelated bytes")
+            built = root / "built.wasm"
+            built.write_bytes(b"new artifact bytes")
+            artifact.symlink_to(unrelated)
+            with self.assertRaisesRegex(ValueError, "owned regular file"):
+                verifier.update_artifact(repository, built)
+            self.assertEqual(unrelated.read_bytes(), b"original unrelated bytes")
+            artifact.unlink()
+            artifact.parent.rmdir()
+            artifact.parent.symlink_to(root, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "directory path"):
+                verifier.update_artifact(repository, built)
+            self.assertEqual(unrelated.read_bytes(), b"original unrelated bytes")
+
+    def test_failed_artifact_copy_preserves_the_committed_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            artifact = verifier.artifact_path(root, create=True)
+            artifact.write_bytes(b"committed artifact bytes")
+            built = root / "built.wasm"
+            built.write_bytes(b"replacement artifact bytes")
+            with patch.object(verifier.shutil, "copyfileobj", side_effect=OSError("Interrupted copy")):
+                with self.assertRaisesRegex(OSError, "Interrupted copy"):
+                    verifier.update_artifact(root, built)
+            self.assertEqual(artifact.read_bytes(), b"committed artifact bytes")
+            self.assertEqual(list(artifact.parent.glob(".owner-verifier-*")), [])
+            verifier.update_artifact(root, built)
+            self.assertEqual(artifact.read_bytes(), built.read_bytes())
 
     def test_lock_symlink_and_cargo_credentials_are_refused(self):
         with tempfile.TemporaryDirectory() as temporary:
