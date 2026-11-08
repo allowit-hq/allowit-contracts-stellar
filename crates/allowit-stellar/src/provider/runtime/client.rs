@@ -176,6 +176,11 @@ struct Response {
     operation: Operation,
     signed_operation: Option<SignedOperation>,
     receipt: Option<sdk::rpc::VerifiedReceipt>,
+    /// The engine reported this policy wallet operation `failed` without a chain receipt: it
+    /// released the operation. The status stays `submissionUnknown` until the client proves
+    /// the release itself.
+    #[serde(skip)]
+    released: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -526,6 +531,9 @@ impl Client {
         let mut parsed: Response = serde_json::from_slice(&response.body).map_err(|_| {
             Error::uncertain("Invalid Stellar response; recover the original request ID")
         })?;
+        parsed.released = parsed.prepared.config.route == WalletRoute::PolicyWallet
+            && parsed.operation.status == OperationStatus::Failed
+            && parsed.receipt.is_none();
         parsed.operation.status =
             super::projected_status(&parsed.prepared.config.route, parsed.operation.status);
         Ok(parsed)
@@ -599,12 +607,26 @@ impl Client {
         Ok(())
     }
     fn status(&self, id: &str, record: Option<&Record>) -> Result<Response> {
-        let r = self.post(
+        let mut r = self.post(
             &self.bundle.endpoints.status,
             json!({"policyId":self.bundle.policy_id,"requestId":id}),
         )?;
         self.validate(&r, id, record, true)?;
+        if self.proven_release(&r, record) {
+            r.operation.status = OperationStatus::Failed;
+        }
         Ok(r)
+    }
+    /// Whether the engine released the retained policy wallet operation and this client's own
+    /// RPC proves that it lapsed without executing. Without independent RPC, a retained
+    /// preparation or the proof, the operation stays `submissionUnknown`.
+    fn proven_release(&self, r: &Response, record: Option<&Record>) -> bool {
+        r.released
+            && record.and_then(|v| v.prepared.as_ref()) == Some(&r.prepared)
+            && !self.rpc_url.is_empty()
+            && sdk::rpc::HttpRpc::new(&self.rpc_url)
+                .and_then(|rpc| sdk::rpc::operation_lapsed(&rpc, &r.prepared))
+                .unwrap_or(false)
     }
 }
 /// The request retained under this policy and request ID, if any. `exec`
@@ -1537,6 +1559,180 @@ mod native_revalidation_tests {
             };
             server.join().unwrap();
             assert_eq!((error.code, error.message.as_str()), (code, text), "{body}");
+        }
+    }
+    /// A loopback Stellar RPC that answers each JSON-RPC call with `answer(method, params)`
+    /// until `stop` is set, and returns the methods it served.
+    fn rpc_server(
+        answer: impl Fn(&str, &serde_json::Value) -> serde_json::Value + Send + 'static,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<Vec<String>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = stop.clone();
+        let server = std::thread::spawn(move || {
+            let mut methods = Vec::new();
+            while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    header.push(byte[0]);
+                }
+                let length: usize = String::from_utf8(header)
+                    .unwrap()
+                    .lines()
+                    .find_map(|v| {
+                        v.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|s| s.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).unwrap();
+                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let method = request["method"].as_str().unwrap().to_owned();
+                let result = answer(&method, &request["params"]);
+                methods.push(method);
+                let response = serde_json::to_vec(
+                    &json!({"jsonrpc":"2.0","id":request["id"],"result":result}),
+                )
+                .unwrap();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n", response.len()).unwrap();
+                stream.write_all(&response).unwrap();
+            }
+            methods
+        });
+        (url, stop, server)
+    }
+    /// RPC answers for a policy wallet whose fixture packet expires at 86700 with nonce 4: the
+    /// original hash, the closing ledger 130 and its close time, then the fixture's wallet
+    /// discovery replies dated `entries_ledger`.
+    fn lapse_rpc(
+        transaction: serde_json::Value,
+        entries_ledger: u64,
+    ) -> impl Fn(&str, &serde_json::Value) -> serde_json::Value + Send + 'static {
+        let calls = fixture()["calls"].as_array().unwrap().clone();
+        move |method, params| match method {
+            "getTransaction" => transaction.clone(),
+            "getLatestLedger" => json!({"sequence":130}),
+            _ => {
+                let mut result = calls
+                    .iter()
+                    .find(|c| c["method"] == method && c["params"] == *params)
+                    .unwrap_or_else(|| panic!("unexpected {method} {params}"))["result"]
+                    .clone();
+                if method == "getLedgerEntries" {
+                    result["latestLedger"] = json!(entries_ledger);
+                }
+                result
+            }
+        }
+    }
+    #[test]
+    fn released_operation_fails_only_with_an_independent_lapse_proof() {
+        // Common R4.1 on testnet: the engine released the expired operation as `failed`
+        // without a receipt, and the CLI reported `submissionUnknown`.
+        let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
+        assert_eq!((p.expires_at, p.state.nonce), (86700, 4));
+        let not_found =
+            json!({"status":"NOT_FOUND","latestLedger":130,"latestLedgerCloseTime":"86700"});
+        let (rpc, stop, server) = rpc_server(lapse_rpc(not_found.clone(), 130));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let engine = reply_once(
+            listener,
+            Duration::ZERO,
+            "200 OK",
+            serde_json::to_vec(&json!({"prepared":p,"operation":{"id":"released-001","status":OperationStatus::Failed,"transactionHash":sdk::hex(&p.transaction_hash)},"signedOperation":null,"receipt":null})).unwrap(),
+        );
+        let mut client = engine_client(p.config.clone(), &origin);
+        client.rpc_url = rpc.clone();
+        let r = client
+            .post(
+                "/api/native/execute/status",
+                json!({"requestId":"released-001"}),
+            )
+            .unwrap();
+        engine.join().unwrap();
+        assert!(r.released);
+        assert_eq!(r.operation.status, OperationStatus::SubmissionUnknown);
+        let mut record = Record {
+            backend_origin: Some(origin.clone()),
+            policy_id: "engine-policy".into(),
+            request_id: "released-001".into(),
+            config: p.config.clone(),
+            request: p.request.clone(),
+            prepared: Some(p.clone()),
+            agent_signature: None,
+            status: Some(OperationStatus::SubmissionUnknown),
+        };
+        assert!(client.proven_release(&r, Some(&record)));
+        record.prepared = None;
+        assert!(!client.proven_release(&r, Some(&record)));
+        assert!(!client.proven_release(&r, None));
+        record.prepared = Some(p.clone());
+        let mut unreleased = engine_client(p.config.clone(), &origin);
+        unreleased.rpc_url = rpc.clone();
+        let mut submitted: Response = serde_json::from_value(json!({"prepared":p,"operation":{"id":"released-001","status":OperationStatus::SubmissionUnknown,"transactionHash":sdk::hex(&p.transaction_hash)}})).unwrap();
+        assert!(!unreleased.proven_release(&submitted, Some(&record)));
+        submitted.released = true;
+        unreleased.rpc_url.clear();
+        assert!(!unreleased.proven_release(&submitted, Some(&record)));
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let methods = server.join().unwrap();
+        assert_eq!(methods[0], "getTransaction");
+        assert!(methods.iter().any(|m| m == "getLedgerEntries"));
+
+        let mut advanced = p.clone();
+        advanced.state.nonce = 3;
+        for (transaction, entries_ledger, packet, lapsed) in [
+            (not_found.clone(), 130, &p, true),
+            (
+                json!({"status":"FAILED","latestLedger":130,"latestLedgerCloseTime":86701}),
+                131,
+                &p,
+                true,
+            ),
+            // The closing ledger precedes the expiry: the wallet can still execute it.
+            (
+                json!({"status":"NOT_FOUND","latestLedger":130,"latestLedgerCloseTime":"86699"}),
+                130,
+                &p,
+                false,
+            ),
+            (
+                json!({"status":"SUCCESS","latestLedger":130,"latestLedgerCloseTime":"86700"}),
+                130,
+                &p,
+                false,
+            ),
+            (
+                json!({"status":"NOT_FOUND","latestLedger":130}),
+                130,
+                &p,
+                false,
+            ),
+            // The wallet entries predate the closing ledger.
+            (not_found.clone(), 129, &p, false),
+            // The wallet nonce moved past the packet: some operation executed.
+            (not_found.clone(), 130, &advanced, false),
+        ] {
+            let (rpc, stop, server) = rpc_server(lapse_rpc(transaction.clone(), entries_ledger));
+            let result = sdk::rpc::operation_lapsed(&sdk::rpc::HttpRpc::new(&rpc).unwrap(), packet);
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            server.join().unwrap();
+            assert_eq!(result, Ok(lapsed), "{transaction} at {entries_ledger}");
         }
     }
     #[test]
