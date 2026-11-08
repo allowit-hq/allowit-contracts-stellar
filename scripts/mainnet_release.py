@@ -32,16 +32,16 @@ BUILD_SCRIPTS = ("build-contracts.sh", "stellar-cargo.py", "check-policy-binding
 
 # The smoke policy is entirely one standard prefix of canonical calls. Its rules derive from the source.
 SMOKE_SOURCE = b"""use allowit::prelude::*;
-/// Smoke-test my mainnet wallet. Pay only the pinned recipient, cap each payment, cap the daily
-/// volume, cap total spending, allow only a few payments and stop when the params expire.
+/// Smoke-test my mainnet wallet. Pay only the pinned recipient, limit each payment, limit the daily
+/// volume, limit total spending, allow only a few payments and stop when the params expire.
 pub fn execute(ctx: &AllowitContext) -> allowit::Result {
     // "Pay only the pinned recipient"
     allowit::destinations(ctx, &ctx.params[allowit::DESTINATIONS])?;
-    // "cap each payment"
+    // "limit each payment"
     allowit::payment_limit(ctx, &ctx.params[allowit::PAYMENT_LIMIT])?;
-    // "cap the daily volume"
+    // "limit the daily volume"
     allowit::daily_volume_limit(ctx, &ctx.params[allowit::DAILY_VOLUME_LIMIT])?;
-    // "cap total spending"
+    // "limit total spending"
     allowit::lifetime_spending_limit(ctx, &ctx.params[allowit::LIFETIME_SPENDING_LIMIT])?;
     // "allow only a few payments"
     allowit::call_limit(ctx, &ctx.params[allowit::CALL_LIMIT])?;
@@ -312,12 +312,12 @@ def load_plan(path):
         raise ValueError("Payment, gas, funding and lifetime spending limit params are inconsistent")
     if plan["payment_stroops"] > params["payment_limit"]:
         raise ValueError("Smoke payment exceeds the payment limit")
-    caps = plan["fee_caps_stroops"]
-    if set(caps) != set(STAGES):
+    fee_caps = plan["fee_caps_stroops"]
+    if set(fee_caps) != set(STAGES):
         raise ValueError("Set one fee cap for every release stage")
-    for value in caps.values():
+    for value in fee_caps.values():
         integer(value, 100, 2**32 - 1)
-    if sum(caps.values()) > integer(plan["total_fee_cap_stroops"]):
+    if sum(fee_caps.values()) > integer(plan["total_fee_cap_stroops"]):
         raise ValueError("Stage fee caps exceed the aggregate release fee cap")
     if set(plan["artifacts"]) != set(NAMES):
         raise ValueError("Pin engine, parent and policy wallet artifacts")
@@ -465,7 +465,7 @@ def prepare(plan, base, stage, parent=None, wallet=None, operation_id=None):
     wa.owner_only(wa.fetch(network, plan["agent"]))
     wa.owner_only(wa.fetch(network, plan["server"]))
     wa.admin(wa.fetch(network, plan["admin"]), plan["admin_members"])
-    cap = plan["fee_caps_stroops"][stage]
+    fee_cap = plan["fee_caps_stroops"][stage]
     source = plan["admin"] if stage == "deploy-parent" else plan["agent"] if stage == "execute" else plan["owner"]
     expected = None
     effects = None
@@ -480,7 +480,7 @@ def prepare(plan, base, stage, parent=None, wallet=None, operation_id=None):
             policy.write_bytes(SMOKE_SOURCE)
             options = SimpleNamespace(action="upload" if stage.startswith("upload-") else stage, network=network, allow_mainnet=True, source=source, wasm=artifact_path(plan, base, name), wasm_hash=plan["artifacts"][name]["sha256"], owner=plan["admin"] if stage=="deploy-parent" else plan["owner"], engine_wasm=plan["artifacts"]["engine"]["sha256"], config=json.dumps(wallet_config(plan)), tier="common", policy_source=str(policy))
             raw = ca.cli_run(ca.command(options))
-        assembled = ca.prepare_xdr(raw, source, network, max_fee=cap, expected_wasm=options.wasm_hash if stage.startswith("deploy-") else None)
+        assembled = ca.prepare_xdr(raw, source, network, max_fee=fee_cap, expected_wasm=options.wasm_hash if stage.startswith("deploy-") else None)
     else:
         if not wallet or not parent:
             raise ValueError("Funding and execution require --wallet and --parent")
@@ -502,7 +502,7 @@ def prepare(plan, base, stage, parent=None, wallet=None, operation_id=None):
             expected = expected_receipt(plan, wallet, state, operation_id)
             calls, spent = usage(plan, wallet)
             effects = {"wallet": wallet, "wallet_balance": balance(plan, wallet), "recipient_balance": balance(plan, plan["recipient"]), "calls": calls, "spent_total": spent}
-        assembled = ca.prepare_xdr(raw, source, network, max_fee=cap, candidate=plan["server"] if stage == "execute" else None)
+        assembled = ca.prepare_xdr(raw, source, network, max_fee=fee_cap, candidate=plan["server"] if stage == "execute" else None)
     envelope = TransactionEnvelope.from_xdr(assembled, wa.PASSPHRASE[network])
     if stage == "execute":
         entry = server_entry(envelope, plan, signed=False)
@@ -621,7 +621,7 @@ def main():
         wa.owner_only(wa.fetch(plan["network"], plan["agent"]))
         wa.owner_only(wa.fetch(plan["network"], plan["server"]))
         wa.admin(wa.fetch(plan["network"], plan["admin"]), plan["admin_members"])
-        result = {"network": network, "owner_sequence": owner["sequence"], "funding_cap_stroops": plan["fund_stroops"], "aggregate_fee_cap_stroops": plan["total_fee_cap_stroops"], "scope": "Public inputs and exact current signer profiles checked; no deployment acceptance"}
+        result = {"network": network, "owner_sequence": owner["sequence"], "fund_stroops": plan["fund_stroops"], "aggregate_fee_cap_stroops": plan["total_fee_cap_stroops"], "scope": "Public inputs and exact current signer profiles checked; no deployment acceptance"}
     elif args.action == "prepare":
         if not args.stage:
             p.error("Preparation requires --stage")

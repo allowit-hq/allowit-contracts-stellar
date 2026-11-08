@@ -364,23 +364,29 @@ impl OwnerClient {
     /// Execute the next upload/create steps, retaining every packet and signature before submission.
     pub fn deploy(
         &self,
-        caps: OwnerCapabilities<'_>,
+        capabilities: OwnerCapabilities<'_>,
         selection: &OwnerPolicy,
         request_id: &str,
         max_fee_stroops: u32,
     ) -> Result<Outcome> {
-        self.run_owner(caps, selection, request_id, Work::Deploy, max_fee_stroops)
+        self.run_owner(
+            capabilities,
+            selection,
+            request_id,
+            Work::Deploy,
+            max_fee_stroops,
+        )
     }
     pub fn fund(
         &self,
-        caps: OwnerCapabilities<'_>,
+        capabilities: OwnerCapabilities<'_>,
         selection: &OwnerPolicy,
         request_id: &str,
         amount: &str,
         max_fee_stroops: u32,
     ) -> Result<Outcome> {
         self.run_owner(
-            caps,
+            capabilities,
             selection,
             request_id,
             Work::Fund {
@@ -392,7 +398,7 @@ impl OwnerClient {
     }
     fn run_owner(
         &self,
-        caps: OwnerCapabilities<'_>,
+        capabilities: OwnerCapabilities<'_>,
         selection: &OwnerPolicy,
         id: &str,
         work: Work,
@@ -403,7 +409,7 @@ impl OwnerClient {
             rpc,
             signer,
             clock,
-        } = caps;
+        } = capabilities;
         if !crate::host::request::request_id_valid(id)
             || max_fee < 100
             || selection.config.route != WalletRoute::PolicyWallet
@@ -818,7 +824,7 @@ impl OwnerClient {
     /// Policy-wallet confirmation requests no source signature; deployment and funding remain separate gates.
     pub fn activate(
         &self,
-        caps: OwnerCapabilities<'_>,
+        capabilities: OwnerCapabilities<'_>,
         selection: &OwnerPolicy,
         id: &str,
     ) -> Result<Outcome> {
@@ -827,7 +833,7 @@ impl OwnerClient {
             rpc,
             signer,
             clock,
-        } = caps;
+        } = capabilities;
         if !crate::host::request::request_id_valid(id)
             || signer.account() != self.session.owner()
             || selection.config.owner != self.session.owner()

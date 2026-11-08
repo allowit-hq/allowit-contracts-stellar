@@ -277,7 +277,7 @@ class ReleaseTests(unittest.TestCase):
                     cred.signature=scval.to_vec([scval.to_struct({k:scval.to_bytes(v) for k,v in value.items()})])
                 with self.assertRaises(ValueError):self.complete(packet,signed,state,binding)
 
-    def test_enforce_simulation_cannot_change_principal_authorization_or_exceed_cap(self):
+    def test_enforce_simulation_cannot_change_principal_authorization_or_exceed_fee_cap(self):
         for field in ['fee','auth','scope']:
             with self.subTest(field=field):
                 packet,signed,state,binding=self.execution_packet()

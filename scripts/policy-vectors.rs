@@ -16,11 +16,11 @@ pub const ADDRESSES: usize = 6;
 const SECONDS_PER_DAY: u64 = 86_400;
 /// Request time of the base vector.
 pub const NOW: u64 = 2 * SECONDS_PER_DAY + 100;
-/// State key that the catching policy counts its caught daily cap errors in.
-pub const OVER: &str = "over_day_cap";
+/// State key that the catching policy counts its caught daily spending limit errors in.
+pub const OVER: &str = "over_daily_spending_limit";
 /// Custom param key that the catching policy reads with `payment_limit`.
-pub const INVOICE_CAP: &str = "invoice_cap";
-/// Execution param key that makes the catching policy apply its invoice cap.
+pub const INVOICE_LIMIT: &str = "invoice_limit";
+/// Execution param key that makes the catching policy apply its invoice limit.
 pub const INVOICE: &str = "invoice";
 /// `allowit::MAX_ARGS`: most execution params of one request.
 pub const MAX_ARGS: usize = 16;
@@ -68,14 +68,14 @@ pub const POOL_CLAIM: &str = "custom:pool.claim";
 pub struct Vector {
     pub name: &'static str,
     /// `payment_limit`, `lifetime_spending_limit`, `daily_spending_limit` and `daily_volume_limit`.
-    pub caps: [Option<i128>; 4],
+    pub limits: [Option<i128>; 4],
     pub call_limit: Option<u64>,
     pub destinations: Option<Vec<usize>>,
     pub tokens: Option<Vec<usize>>,
     pub expires_at_param: Option<u64>,
     pub operations: Option<Ops>,
-    /// The custom `invoice_cap` param, which only Custom wallets admit.
-    pub invoice_cap: Option<i128>,
+    /// The custom `invoice_limit` param, which only Custom wallets admit.
+    pub invoice_limit: Option<i128>,
     pub calls: u64,
     pub spent: i128,
     pub unpriced: bool,
@@ -116,13 +116,13 @@ pub struct Vector {
 pub fn base() -> Vector {
     Vector {
         name: "base",
-        caps: [Some(100), Some(1000), Some(500), Some(600)],
+        limits: [Some(100), Some(1000), Some(500), Some(600)],
         call_limit: Some(3),
         destinations: Some(vec![RECIPIENT, VAULT]),
         tokens: Some(vec![ASSET]),
         expires_at_param: Some(NOW + 1000),
         operations: Some(Ops::List(vec!["transfer"])),
-        invoice_cap: None,
+        invoice_limit: None,
         calls: 0,
         spent: 5,
         unpriced: false,
@@ -199,42 +199,42 @@ pub fn vectors() -> Vec<Vector> {
     vec![
         base(),
         edit("boundary", |v| {
-            v.caps = [Some(40), Some(45), Some(45), Some(43)];
+            v.limits = [Some(40), Some(45), Some(45), Some(43)];
             v.call_limit = Some(1);
             v.expires_at_param = Some(v.expires_at);
         }),
         edit("with_gas", |v| {
             v.gas_units = 3;
             v.spent_units = 43;
-            v.caps = [Some(40), Some(48), Some(48), Some(46)];
+            v.limits = [Some(40), Some(48), Some(48), Some(46)];
         }),
         edit("with_gas_over_daily_volume_limit", |v| {
             v.gas_units = 3;
             v.spent_units = 43;
-            v.caps[3] = Some(45);
+            v.limits[3] = Some(45);
         }),
         edit("to_vault", |v| v.recipient = VAULT),
         edit("deposit", deposit),
         edit("deposit_over_lifetime_spending_limit", |v| {
             deposit(v);
-            v.caps[1] = Some(44);
+            v.limits[1] = Some(44);
         }),
         edit("deposit_unset_lifetime_spending_limit", |v| {
             deposit(v);
-            v.caps[1] = None;
+            v.limits[1] = None;
         }),
-        edit("over_payment_limit", |v| v.caps[0] = Some(39)),
-        edit("over_lifetime_spending_limit", |v| v.caps[1] = Some(44)),
-        edit("over_daily_spending_limit", |v| v.caps[2] = Some(44)),
+        edit("over_payment_limit", |v| v.limits[0] = Some(39)),
+        edit("over_lifetime_spending_limit", |v| v.limits[1] = Some(44)),
+        edit("over_daily_spending_limit", |v| v.limits[2] = Some(44)),
         edit("over_daily_spending_limit_counted_once", |v| {
-            v.caps[2] = Some(44);
+            v.limits[2] = Some(44);
             v.over = Some(1);
         }),
         edit("over_daily_spending_limit_counted_twice", |v| {
-            v.caps[2] = Some(44);
+            v.limits[2] = Some(44);
             v.over = Some(2);
         }),
-        edit("over_daily_volume_limit", |v| v.caps[3] = Some(42)),
+        edit("over_daily_volume_limit", |v| v.limits[3] = Some(42)),
         edit("zero_call_limit", |v| v.call_limit = Some(0)),
         edit("over_call_limit", |v| v.calls = 3),
         edit("unpriced_lifetime", |v| v.unpriced = true),
@@ -246,10 +246,10 @@ pub fn vectors() -> Vec<Vector> {
             v.priced = false;
             v.spent_units = 0;
         }),
-        edit("unpriced_request_without_cost_caps", |v| {
+        edit("unpriced_request_without_cost_limits", |v| {
             v.priced = false;
             v.spent_units = 0;
-            v.caps = [Some(100), None, None, None];
+            v.limits = [Some(100), None, None, None];
         }),
         edit("earlier_day_rolls_over", |v| {
             v.day -= 1;
@@ -271,21 +271,21 @@ pub fn vectors() -> Vec<Vector> {
         edit("request_outlives_params", |v| {
             v.expires_at_param = Some(v.expires_at - 1)
         }),
-        edit("negative_cap", |v| v.caps[0] = Some(-1)),
+        edit("negative_limit", |v| v.limits[0] = Some(-1)),
         edit("zero_amount", |v| v.amount = 0),
         edit("negative_spent", |v| v.spent = -1),
         edit("negative_request_units", |v| v.spent_units = -1),
-        edit("unset_payment_limit", |v| v.caps[0] = None),
-        edit("unset_lifetime_spending_limit", |v| v.caps[1] = None),
-        edit("unset_daily_spending_limit", |v| v.caps[2] = None),
-        edit("unset_daily_volume_limit", |v| v.caps[3] = None),
+        edit("unset_payment_limit", |v| v.limits[0] = None),
+        edit("unset_lifetime_spending_limit", |v| v.limits[1] = None),
+        edit("unset_daily_spending_limit", |v| v.limits[2] = None),
+        edit("unset_daily_volume_limit", |v| v.limits[3] = None),
         edit("unset_call_limit", |v| v.call_limit = None),
         edit("unset_destinations", |v| v.destinations = None),
         edit("unset_tokens", |v| v.tokens = None),
         edit("unset_expires_at", |v| v.expires_at_param = None),
         edit("unset_operations", |v| v.operations = None),
         edit("unset_everything", |v| {
-            v.caps = [None; 4];
+            v.limits = [None; 4];
             v.call_limit = None;
             v.destinations = None;
             v.tokens = None;
@@ -323,11 +323,11 @@ pub fn vectors() -> Vec<Vector> {
         }),
         edit("swap_over_payment_limit", |v| {
             swap(v, false);
-            v.caps[0] = Some(39);
+            v.limits[0] = Some(39);
         }),
         edit("reverse_swap_floor_over_payment_limit", |v| {
             swap(v, true);
-            v.caps[0] = Some(39);
+            v.limits[0] = Some(39);
         }),
         edit("redeem", redeem),
         edit("redeem_not_in_operations", |v| {
@@ -355,26 +355,28 @@ pub fn vectors() -> Vec<Vector> {
         edit("custom_contract_not_alphanumeric", |v| {
             v.operations = Some(Ops::List(vec!["transfer", "custom:po-ol.claim"]))
         }),
-        // A custom param alone changes nothing; an `invoice` arg applies the invoice cap.
-        edit("invoice_cap_without_invoice", |v| v.invoice_cap = Some(39)),
-        edit("invoice_within_cap", |v| {
-            v.invoice = true;
-            v.invoice_cap = Some(40);
+        // A custom param alone changes nothing; an `invoice` arg applies the invoice limit.
+        edit("invoice_limit_without_invoice", |v| {
+            v.invoice_limit = Some(39)
         }),
-        edit("invoice_over_cap", |v| {
+        edit("invoice_within_limit", |v| {
             v.invoice = true;
-            v.invoice_cap = Some(39);
+            v.invoice_limit = Some(40);
         }),
-        edit("invoice_without_cap", |v| v.invoice = true),
+        edit("invoice_over_limit", |v| {
+            v.invoice = true;
+            v.invoice_limit = Some(39);
+        }),
+        edit("invoice_without_limit", |v| v.invoice = true),
         // A custom param beside fewer than nine canonical params: the standard tiers reject it.
-        edit("invoice_cap_beside_few_params", |v| {
-            v.caps = [Some(100), None, None, None];
+        edit("invoice_limit_beside_few_params", |v| {
+            v.limits = [Some(100), None, None, None];
             v.call_limit = None;
             v.destinations = None;
             v.tokens = None;
             v.expires_at_param = None;
             v.operations = None;
-            v.invoice_cap = Some(39);
+            v.invoice_limit = Some(39);
         }),
         // Args at their bound pass; one more denies in `evaluate` as in the wallet kernel.
         edit("args_at_bound", |v| v.extra_args = MAX_ARGS),
@@ -382,22 +384,22 @@ pub fn vectors() -> Vec<Vector> {
         // The catching policy writes one new key: up to the state key bound it is stored, past
         // it every backend denies with `InvalidState`.
         edit("state_keys_at_bound", |v| {
-            v.caps[2] = Some(44);
+            v.limits[2] = Some(44);
             v.extra_state = MAX_POLICY_KEYS - 1;
         }),
         edit("state_keys_over_bound", |v| {
-            v.caps[2] = Some(44);
+            v.limits[2] = Some(44);
             v.extra_state = MAX_POLICY_KEYS;
         }),
         // The state's encoded size: the seven standard keys take 7 * 120 bytes, the catching
         // policy's key 120 and `blob` 40 + 80 + 45 * (80 + 256) + 80 + 104, exactly
         // `MAX_STATE_BYTES`. Four more bytes deny with `InvalidState` on every backend.
         edit("state_bytes_at_bound", |v| {
-            v.caps[2] = Some(44);
+            v.limits[2] = Some(44);
             v.blob = blob(104);
         }),
         edit("state_bytes_over_bound", |v| {
-            v.caps[2] = Some(44);
+            v.limits[2] = Some(44);
             v.blob = blob(105);
         }),
     ]

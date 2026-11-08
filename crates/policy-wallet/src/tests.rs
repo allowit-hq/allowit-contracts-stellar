@@ -543,14 +543,14 @@ fn common_skips_absent_params_and_rejects_unknown_names_keys_and_values() {
         assert_eq!(deploy(raw), Err(Ok(AllowitWalletError::InvalidParam)));
     }
     // A name outside the enum aborts in the host's symbol lookup.
-    let rule: Val = vec![&f.env, Symbol::new(&f.env, "daily_cap")].into_val(&f.env);
+    let rule: Val = vec![&f.env, Symbol::new(&f.env, "daily_limit")].into_val(&f.env);
     assert!(deploy(packet(rule, None)).is_err());
     // The standard contract admits only the canonical keys, each with its rule's type.
     let text = AllowitValue::Str(String::from_str(&f.env, "100"));
     let invalid = [
         (PAYMENT_LIMIT, AllowitValue::Int(-1)),
         (DAILY_VOLUME_LIMIT, text),
-        ("vendor_cap", AllowitValue::Int(5)),
+        ("vendor_limit", AllowitValue::Int(5)),
     ];
     for (key, value) in invalid {
         let mut p = f.deployment();
@@ -1459,7 +1459,7 @@ fn x402_enforces_compiled_business_rules_without_committing() {
 
 /// A Custom policy that panics in the Wasm wallet aborts the call with the failed read's
 /// `AllowitError` code, which no wallet error shares, on `execute` and on the x402 hook. Its
-/// caught-cap write, the nonce and the replay marker stay unwritten, so the same operation then
+/// caught-limit write, the nonce and the replay marker stay unwritten, so the same operation then
 /// succeeds once the read passes.
 #[test]
 fn a_panicking_wasm_policy_aborts_with_its_allowit_code_and_writes_nothing() {
@@ -1481,7 +1481,7 @@ fn a_panicking_wasm_policy_aborts_with_its_allowit_code_and_writes_nothing() {
             }
         };
         settle(&f.execution(100), 100, 1);
-        // 60 more exceeds the daily cap of 150; the policy catches that and writes its count
+        // 60 more exceeds the daily spending limit of 150; the policy catches that and writes its count
         // before it reads the refund's order number.
         let mut e = f.execution(60);
         set_param(&mut e.args, "refund", Some(AllowitValue::Bool(true)));
@@ -1518,7 +1518,7 @@ fn a_panicking_wasm_policy_aborts_with_its_allowit_code_and_writes_nothing() {
         let over = f
             .client()
             .policy_state()
-            .get(Symbol::new(&f.env, "over_day_cap"));
+            .get(Symbol::new(&f.env, "over_daily_spending_limit"));
         assert_eq!(over, Some(AllowitValue::Int(1)));
         assert_eq!(f.balance(), 840);
     }

@@ -213,12 +213,12 @@ class ContractAdmin(unittest.TestCase):
         self.assertEqual(tagged["lifetime_spending_limit"], {"Int": str(2**127 - 1)})
         self.assertNotIn("expires_at", tagged)
         # Custom params: inferred or explicitly typed values within the contract's bounds.
-        custom = {"vendor_cap": -5, "note": "pay invoices", "vendor": KEYS[2], "as_text": {"Str": KEYS[2]}, "urgent": True,
+        custom = {"vendor_limit": -5, "note": "pay invoices", "vendor": KEYS[2], "as_text": {"Str": KEYS[2]}, "urgent": True,
                   "pairs": [[1, KEYS[1]]]}
-        self.assertEqual(ca.params(custom, "custom"), {"vendor_cap": {"Int": "-5"}, "note": {"Str": "pay invoices"},
+        self.assertEqual(ca.params(custom, "custom"), {"vendor_limit": {"Int": "-5"}, "note": {"Str": "pay invoices"},
                                                         "vendor": {"Addr": KEYS[2]}, "as_text": {"Str": KEYS[2]},
                                                         "urgent": {"Bool": True}, "pairs": {"List": [{"List": [{"Int": "1"}, {"Addr": KEYS[1]}]}]}})
-        for invalid in ({"vendor_cap": 1}, {"lifetime_spending_limit": -1}, {"lifetime_spending_limit": 2**127},
+        for invalid in ({"vendor_limit": 1}, {"lifetime_spending_limit": -1}, {"lifetime_spending_limit": 2**127},
                         {"call_limit": 2**64}, {"expires_at": True}, {"payment_limit": "1"}, {"destinations": KEYS[1]},
                         {"tokens": ["not-an-address"]}, {"destinations": [[KEYS[1]]]}):
             with self.subTest(params=invalid), self.assertRaises(ValueError):
@@ -258,7 +258,7 @@ class ContractAdmin(unittest.TestCase):
                       "rules": ["lifetime_spending_limit", "destinations"], "params": values, "x402_enabled": False, "wasm_hash": None}
         ca.deployment(deployment)
         with self.assertRaises(ValueError):
-            ca.deployment(dict(deployment, rules=["daily_cap"]))
+            ca.deployment(dict(deployment, rules=["daily_limit"]))
         with self.assertRaises(ValueError):
             ca.public_json('{"custom":1,"custom":2}')
         # Owner packets encode the current layout only; earlier and later layouts are refused.
@@ -466,7 +466,7 @@ class ContractAdmin(unittest.TestCase):
         vectors = [
             # A rule that reads another key ends the prefix; later calls run offchain or in Custom.
             (call("destinations") + "    allowit::lifetime_spending_limit(ctx, &ctx.params[allowit::DAILY_SPENDING_LIMIT])?;\n" + call("expires_at"), ["destinations"]),
-            (call("destinations") + "    allowit::lifetime_spending_limit(ctx, &ctx.params[\"vendor_cap\"])?;\n" + call("expires_at"), ["destinations"]),
+            (call("destinations") + "    allowit::lifetime_spending_limit(ctx, &ctx.params[\"vendor_limit\"])?;\n" + call("expires_at"), ["destinations"]),
             # Statements, not lines: a split call, two calls on one line and comments.
             ("    allowit::lifetime_spending_limit(\n        ctx,\n        &ctx.params[allowit::LIFETIME_SPENDING_LIMIT],\n    )?;\n" + call("expires_at").rstrip() + call("tokens"), ["lifetime_spending_limit", "expires_at", "tokens"]),
             ("    allowit::lifetime_spending_limit(\n        ctx,\n        &ctx.params[\n            allowit::LIFETIME_SPENDING_LIMIT\n        ],\n    )?;\n", ["lifetime_spending_limit"]),
@@ -479,9 +479,9 @@ class ContractAdmin(unittest.TestCase):
         for body, expected in vectors:
             with self.subTest(body=body):
                 self.assertEqual(ca.standard_prefix(source(body)), expected)
-        # Removed rule names are not on the allowlist.
+        # Unknown rule names are not on the allowlist.
         with self.assertRaisesRegex(ValueError, "allowlist"):
-            ca.standard_prefix(source(call("set_cap_per_day") + call("expires_at")))
+            ca.standard_prefix(source(call("set_daily_limit") + call("expires_at")))
         explicit = HEAD.replace("allowit::Result {", "allowit::Result<()> {")
         self.assertEqual(ca.standard_prefix(source(call("tokens"), explicit)), ["tokens"])
         # Calls in other functions are not part of execute.
@@ -543,11 +543,11 @@ class ContractAdmin(unittest.TestCase):
             writer_digest = hashlib.sha256(writer.encode()).hexdigest()
             self.assertEqual(ca.policy_rules({"rules": [], "source_digest": writer_digest}, "custom", str(policy))["rules"], [])
             # Simple and Common admit only canonical params; Custom admits its own keys.
-            custom_key = {"rules": [], "source_digest": writer_digest, "params": {"vendor_cap": 5}}
+            custom_key = {"rules": [], "source_digest": writer_digest, "params": {"vendor_limit": 5}}
             self.assertEqual(ca.policy_rules(custom_key, "custom", str(policy)), custom_key)
             policy.write_text(text)
             with self.assertRaisesRegex(ValueError, "canonical keys"):
-                ca.policy_rules(dict(packet, params={"vendor_cap": 5}), "common", str(policy))
+                ca.policy_rules(dict(packet, params={"vendor_limit": 5}), "common", str(policy))
             # The admin packet path applies the same binding.
             deployment = {"deployment_version": 1, "owner": KEYS[0], "agent": KEYS[1], "server": KEYS[2], "source_digest": "22" * 32,
                           "rules": ["expires_at"], "params": {}, "x402_enabled": False, "wasm_hash": None}
@@ -869,9 +869,9 @@ class ContractAdmin(unittest.TestCase):
                    "fn d(c: &AllowitContext) -> &AllowitContext { c }\n"
                    "use allowit::AllowitRule;\nfn e(r: AllowitRule) -> bool { r == AllowitRule::tokens || r == allowit::AllowitRule::destinations }\n"
                    "fn f(ctx: &AllowitContext) -> allowit::Result { let c = ctx.clone(); allowit::tokens(&c, &c.params[allowit::TOKENS])?; Ok(()) }\n"
-                   "fn g(c: &AllowitContext) -> bool { match &c.params[\"vendor_cap\"] { AllowitValue::Int(cap) => *cap > 0i128, _ => false } }\n"
-                   "fn vendor_cap_of(c: &AllowitContext) -> allowit::Result<i128> { allowit::destinations(c, &c.params[allowit::TOKENS])?; match allowit::param(c, \"vendor_cap\") "
-                   "{ AllowitValue::Int(cap) => Ok(cap), AllowitValue::List(items) => { let mut n = 0i128; for _ in items { n += 1; } Ok(n) } _ => Err(AllowitError::InvalidParam) } }\n"
+                   "fn g(c: &AllowitContext) -> bool { match &c.params[\"vendor_limit\"] { AllowitValue::Int(limit) => *limit > 0i128, _ => false } }\n"
+                   "fn vendor_limit_of(c: &AllowitContext) -> allowit::Result<i128> { allowit::destinations(c, &c.params[allowit::TOKENS])?; match allowit::param(c, \"vendor_limit\") "
+                   "{ AllowitValue::Int(limit) => Ok(limit), AllowitValue::List(items) => { let mut n = 0i128; for _ in items { n += 1; } Ok(n) } _ => Err(AllowitError::InvalidParam) } }\n"
                    "fn typed(c: &AllowitContext) -> bool { let v: Vec<Address> = allowit::param(c, \"vendors\"); let memo: String = allowit::arg(c, \"memo\"); "
                    "let n: u32 = allowit::arg(c, \"n\"); for vendor in v { if vendor == c.request.recipient { return memo == memo.clone() && n > 0u32; } } false }\n"
                    "fn ask(c: &AllowitContext) -> allowit::Result<u32> { allowit::systemone(c, &allowit::AllowitSystemOne { id: \"a\", query: \"b\", deny_below: 1u32, allow_above: 2u32 }) }\n"
@@ -890,7 +890,7 @@ class ContractAdmin(unittest.TestCase):
     def test_policy_source_admits_literal_panic_messages_and_the_documented_per_op_policy(self):
         head = HEAD + CALL("destinations")
         # A message is optional; when present it is one string literal, followed by format arguments.
-        for body in ('    panic!();\n', '    panic!("swap above swap_cap");\n', '    unreachable!("op {}", ctx.request.amount);\n',
+        for body in ('    panic!();\n', '    panic!("swap above swap_limit");\n', '    unreachable!("op {}", ctx.request.amount);\n',
                      '    assert!(ctx.request.amount > 0i128);\n', '    assert!(ctx.request.amount > 0i128, "amount {:?}", ctx.request.amount,);\n',
                      '    assert_eq!(ctx.request.amount, 1i128, "one");\n', '    assert_ne!(ctx.request.now, 0u64);\n'):
             with self.subTest(body=body):
@@ -906,8 +906,8 @@ class ContractAdmin(unittest.TestCase):
                       + '        "' + pool + '.swap" => {\n'
                       + '            // "at most 50 XLM per swap"\n'
                       + '            let amount: i128 = allowit::arg(ctx, "amount");\n'
-                      + '            let cap: i128 = allowit::param(ctx, "swap_cap");\n'
-                      + '            if amount > cap { panic!("swap above swap_cap"); }\n'
+                      + '            let limit: i128 = allowit::param(ctx, "swap_limit");\n'
+                      + '            if amount > limit { panic!("swap above swap_limit"); }\n'
                       + "        }\n"
                       + '        "' + pool + '.claim" => {}\n'
                       + "        _ => {}\n    }\n    Ok(())\n}\n")
@@ -923,21 +923,21 @@ class ContractAdmin(unittest.TestCase):
     def test_policy_source_rejects_pointer_width_and_address_probes(self):
         call = CALL
         head = HEAD + call("destinations")
-        # The review probe: a 64-bit host skips the cap that a 32-bit contract enforces.
+        # The review probe: a 64-bit host skips the limit that a 32-bit contract enforces.
         probe = ("    let wide = core::num::NonZeroUsize::MAX.ilog2() == 63;\n    if !wide {\n"
                  "        allowit::lifetime_spending_limit(ctx, &ctx.params[allowit::LIFETIME_SPENDING_LIMIT])?;\n    }\n")
         # A format width or precision count is `usize`, so it infers `a: usize` without naming it.
-        cap = "    let wide = a.checked_mul(a).is_some();\n    if !wide {\n        allowit::lifetime_spending_limit(ctx, &ctx.params[allowit::LIFETIME_SPENDING_LIMIT])?;\n    }\n"
+        limit = "    let wide = a.checked_mul(a).is_some();\n    if !wide {\n        allowit::lifetime_spending_limit(ctx, &ctx.params[allowit::LIFETIME_SPENDING_LIMIT])?;\n    }\n"
         guard = "    let a = 65_536;\n    if ctx.request.amount < 0i128 {{ {} }}\n".format
         formats = (
-            guard('panic!("{:1$}", 0u8, a);') + cap,
-            guard('assert!(false, "{:.*}", a, 0u8);') + cap,
-            guard('assert!(false, "{:a$}", 0u8);') + cap,
-            guard('unreachable!("{:>a$}", 0u8);') + cap,
-            guard('panic!(r"{:.a$}", 0u8);') + cap,
+            guard('panic!("{:1$}", 0u8, a);') + limit,
+            guard('assert!(false, "{:.*}", a, 0u8);') + limit,
+            guard('assert!(false, "{:a$}", 0u8);') + limit,
+            guard('unreachable!("{:>a$}", 0u8);') + limit,
+            guard('panic!(r"{:.a$}", 0u8);') + limit,
             # Escapes spell the braces without writing them.
-            guard('panic!("\\x7b:1$\\x7d", 0u8, a);') + cap,
-            guard('panic!("\\u{7b}:1$\\u{7d}", 0u8, a);') + cap,
+            guard('panic!("\\x7b:1$\\x7d", 0u8, a);') + limit,
+            guard('panic!("\\u{7b}:1$\\u{7d}", 0u8, a);') + limit,
         )
         with tempfile.TemporaryDirectory() as directory:
             policy = Path(directory) / "policy.rs"
@@ -996,7 +996,7 @@ class ContractAdmin(unittest.TestCase):
 
     def test_policy_source_rejects_raw_function_values_and_lowered_pointer_lints(self):
         # Review probe: identical functions may merge in release Wasm only, so `a == b` is false on
-        # the host and true onchain, and the spending cap runs on one backend only.
+        # the host and true onchain, and the lifetime spending limit runs on one backend only.
         same = ("fn r#one() {}\nfn r#two() {}\n#[allow(unpredictable_function_pointer_comparisons)]\n"
                 "fn same() -> bool { let a = if true { r#one } else { r#two }; "
                 "let b = if true { r#two } else { r#one }; a == b }\n")
@@ -1085,14 +1085,14 @@ class ContractAdmin(unittest.TestCase):
     def test_policy_source_rejects_closure_pointer_and_layout_probes(self):
         call = CALL
         head = HEAD + call("destinations")
-        cap = "    if {} {{\n        allowit::lifetime_spending_limit(ctx, &ctx.params[allowit::LIFETIME_SPENDING_LIMIT])?;\n    }}\n".format
+        limit = "    if {} {{\n        allowit::lifetime_spending_limit(ctx, &ctx.params[allowit::LIFETIME_SPENDING_LIMIT])?;\n    }}\n".format
         # Closures after `break` coerce to function pointers whose equality depends on the build.
         pointers = ("    let a = loop { break |x: u64| x; };\n    let b = loop { break |x: u64| x; };\n"
                     "    let p = if ctx.request.now > 0u64 { a } else { b };\n"
-                    "    let q = if ctx.request.now > 0u64 { b } else { a };\n" + cap("p == q"))
+                    "    let q = if ctx.request.now > 0u64 { b } else { a };\n" + limit("p == q"))
         # Prelude layout functions differ: the host `Address` is a 24-byte string, onchain an 8-byte handle.
-        size = "    let wide = size_of_val(&ctx.request) > 100;\n" + cap("!wide")
-        align = cap("align_of_val(&ctx.request.asset) == 8")
+        size = "    let wide = size_of_val(&ctx.request) > 100;\n" + limit("!wide")
+        align = limit("align_of_val(&ctx.request.asset) == 8")
         with tempfile.TemporaryDirectory() as directory:
             policy = Path(directory) / "policy.rs"
             for probe in (size, align):

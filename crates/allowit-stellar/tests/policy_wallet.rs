@@ -960,7 +960,7 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
         standard.get("spent"),
         Some(&PolicyValue::Int(10_000_000 + i128::from(MAX_FEE)))
     );
-    // A transfer over the cap is denied on the host before any signature.
+    // A transfer over the payment limit is denied on the host before any signature.
     let ledger = chain.0.lock().unwrap().ledger;
     let over = request::transfer(&c, &found.state, [9; 32], &recipient, 60_000_000).unwrap();
     assert!(
@@ -1034,7 +1034,7 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
     );
     let resumed = owner_admin.set_pause(false, DeploymentVersion(2)).unwrap();
     owner_submit(&chain, "resume", &resumed.transaction_xdr);
-    // 7. Params update without new code: a lower transaction cap.
+    // 7. Params update without new code: a lower payment limit.
     let mut lower = params();
     lower
         .0

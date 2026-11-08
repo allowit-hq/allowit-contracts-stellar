@@ -3,7 +3,7 @@
 //! 1. the host backend: `scripts/policy-smoke.rs` compiled with plain `rustc` against `allowit`
 //!    with only the `std` feature, so a policy that names `soroban_sdk` or a wallet crate fails;
 //! 2. `AllowitCustomPolicy`: the Soroban backend of the same sources, then the real custom Wasm,
-//!    and the `test-catching` fixture Wasm, whose policy catches a daily cap error, continues and
+//!    and the `test-catching` fixture Wasm, whose policy catches a daily spending limit error, continues and
 //!    writes its own state key;
 //! 3. `AllowitCommonPolicyEngine`: the real standard Wasm with the policy's leading-rule prefix;
 //! 4. `AllowitSimplePolicyEngine`: the real simple Wasm, which has no rules.
@@ -193,16 +193,16 @@ fn map(env: &Env, entries: &[(&str, Option<AllowitValue>)]) -> Map<Symbol, Allow
     }
     out
 }
-/// The params of a vector: its canonical params and the custom `invoice_cap`.
+/// The params of a vector: its canonical params and the custom `invoice_limit`.
 fn params(env: &Env, universe: &[Address], v: &Vector) -> Map<Symbol, AllowitValue> {
     let int = |n: Option<i128>| n.map(AllowitValue::Int);
     map(
         env,
         &[
-            (allowit::PAYMENT_LIMIT, int(v.caps[0])),
-            (allowit::LIFETIME_SPENDING_LIMIT, int(v.caps[1])),
-            (allowit::DAILY_SPENDING_LIMIT, int(v.caps[2])),
-            (allowit::DAILY_VOLUME_LIMIT, int(v.caps[3])),
+            (allowit::PAYMENT_LIMIT, int(v.limits[0])),
+            (allowit::LIFETIME_SPENDING_LIMIT, int(v.limits[1])),
+            (allowit::DAILY_SPENDING_LIMIT, int(v.limits[2])),
+            (allowit::DAILY_VOLUME_LIMIT, int(v.limits[3])),
             (allowit::CALL_LIMIT, v.call_limit.map(AllowitValue::from)),
             (allowit::DESTINATIONS, list(env, universe, &v.destinations)),
             (allowit::TOKENS, list(env, universe, &v.tokens)),
@@ -214,7 +214,7 @@ fn params(env: &Env, universe: &[Address], v: &Vector) -> Map<Symbol, AllowitVal
                 allowit::OPERATIONS,
                 v.operations.as_ref().map(|ops| operations(env, ops)),
             ),
-            (vectors::INVOICE_CAP, int(v.invoice_cap)),
+            (vectors::INVOICE_LIMIT, int(v.invoice_limit)),
         ],
     )
 }
@@ -432,7 +432,7 @@ fn realizable(v: &Vector) -> bool {
         && v.amount > 0
         && v.expires_at > v.now
         && cost
-        && v.caps.iter().flatten().all(|cap| *cap >= 0)
+        && v.limits.iter().flatten().all(|limit| *limit >= 0)
         && v.operations.as_ref().is_none_or(operations_valid)
 }
 
@@ -614,7 +614,7 @@ fn one_vector_set_has_matching_outcomes_on_host_custom_standard_and_simple() {
         // A standard evaluation admits only canonical params, as the standard contract does
         // after a direct seed, then runs the prefix and the plain post-flight.
         let custom_param = v
-            .invoice_cap
+            .invoice_limit
             .map_or(Ok(()), |_| Err(AllowitError::InvalidParam as u32));
         let common = custom_param
             .and(first_prefix_error.unwrap_or(Ok(())))
@@ -640,13 +640,13 @@ fn one_vector_set_has_matching_outcomes_on_host_custom_standard_and_simple() {
             outcome.catching.and(outcome.next.clone())
         });
         assert_eq!(outcome.catching_standard, standard, "{}", v.name);
-        let unset = v.caps.contains(&None)
+        let unset = v.limits.contains(&None)
             || v.call_limit.is_none()
             || v.destinations.is_none()
             || v.tokens.is_none()
             || v.expires_at_param.is_none()
             || v.operations.is_none();
-        if !unset && v.invoice_cap.is_none() {
+        if !unset && v.invoice_limit.is_none() {
             assert_eq!(expected(Tier::Common), expected(Tier::Custom), "{}", v.name);
         }
         if outcome.catching.is_ok() && outcome.policy.is_err() {
@@ -740,7 +740,7 @@ fn kernel_violations_reject_identically_in_every_contract() {
 fn every_tier_stores_exactly_the_state_that_the_server_evaluates() {
     let base = vectors::base();
     let mut over = base.clone();
-    over.caps[2] = Some(44);
+    over.limits[2] = Some(44);
     let custom = Wallet::new(Tier::Catching);
     let common = Wallet::new(Tier::Common);
     // The catching policy's prefix is its leading `destinations` call.
@@ -760,7 +760,7 @@ fn every_tier_stores_exactly_the_state_that_the_server_evaluates() {
                 c.state = chain.clone();
                 allowit::evaluate(&c, catching::execute, tier)
             });
-            let written = v.caps[2] == Some(44);
+            let written = v.limits[2] == Some(44);
             if tier == AllowitTier::Standard && written {
                 assert_eq!(host, Err(AllowitError::Unsupported), "{:?}", wallet.tier);
                 // Danger: signed anyway, the chain stores a state without the counted write.
@@ -787,18 +787,18 @@ fn every_tier_stores_exactly_the_state_that_the_server_evaluates() {
 #[test]
 fn execution_params_reach_custom_policy_are_signed_and_standard_tiers_ignore_them() {
     let mut v = vectors::base();
-    v.invoice_cap = Some(39);
+    v.invoice_limit = Some(39);
     let custom = Wallet::new(Tier::Catching);
     custom.seed(&v, false);
     assert_eq!(custom.execute(&custom.request(&v)), Ok(()));
     v.invoice = true;
-    let capped = Err(wallet_error(AllowitError::PaymentLimitExceeded as u32));
-    assert_eq!(custom.execute(&custom.request(&v)), capped);
-    v.invoice_cap = Some(40);
+    let over_limit = Err(wallet_error(AllowitError::PaymentLimitExceeded as u32));
+    assert_eq!(custom.execute(&custom.request(&v)), over_limit);
+    v.invoice_limit = Some(40);
     custom.seed(&v, false);
     assert_eq!(custom.execute(&custom.request(&v)), Ok(()));
     // The standard tiers store no custom param and ignore the args.
-    v.invoice_cap = None;
+    v.invoice_limit = None;
     for tier in [Tier::Common, Tier::Simple] {
         let wallet = Wallet::new(tier);
         wallet.seed(&v, false);
