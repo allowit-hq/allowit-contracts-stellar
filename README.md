@@ -86,10 +86,9 @@ flowchart TD
     W["crates/policy-wallet<br/>allowit-policy-wallet"]
     T["crates/protocol<br/>allowit-wallet-protocol"]
     B["crates/policy<br/>allowit-stellar-policy"]
-    CORE["allowit-core<br/>portable allowit"]
+    CORE["allowit-core<br/>portable rules · host primitives"]
     SDK["soroban-sdk"]
     OFF["crates/allowit-stellar<br/>allowit-stellar · off-chain"]
-    HOST["allowit-core<br/>allowit-sdk · host primitives"]
     E["contracts/allowit-wallet-engine<br/>allowit-wallet-engine · standalone checker"]
     S --> W
     S --> T
@@ -112,7 +111,6 @@ flowchart TD
     E --> B
     E --> SDK
     OFF --> CORE
-    OFF --> HOST
 ```
 
 The deployer package retains the EngineParent contract and its stateless-checker behavior.
@@ -352,7 +350,7 @@ cargo test --locked --manifest-path crates/allowit-stellar/Cargo.toml
 cargo clippy --locked --manifest-path crates/allowit-stellar/Cargo.toml --all-targets -- -D warnings
 ```
 
-All packages consume the same `allowit-core` release tag `v0.3.2`. Releases of this repository are annotated git tags `vX.Y.Z`: set `version` in `Cargo.toml` and `crates/allowit-stellar/Cargo.toml`, merge, then tag the merge commit with `git tag -a vX.Y.Z -m vX.Y.Z <commit> && git push origin vX.Y.Z`.
+All packages consume the same `allowit-core` release tag `v0.5.0`. Releases of this repository are annotated git tags `vX.Y.Z`: set `version` in `Cargo.toml`, `crates/allowit-stellar/Cargo.toml` and `npm/stellar/package.json`, merge, then tag the merge commit with `git tag -a vX.Y.Z -m vX.Y.Z <commit> && git push origin vX.Y.Z`.
 
 Keep contract code, the `crates/allowit-stellar` rail crate, build and API documentation and release inputs here. [AGENTS.md](AGENTS.md) describes the repository scope.
 

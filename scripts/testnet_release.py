@@ -40,7 +40,7 @@ MAX_FEE = 1_250_000_000  # First constructor can renew shared code; Testnet only
 HEX = re.compile(r"[0-9a-f]{64}")
 SHA = re.compile(r"[0-9a-f]{40}")
 TAG = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
-CORE_SOURCE = "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.3.2#c6c9f382761a0c5b88afc5524be7220c5c56c244"
+CORE_SOURCE = "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.5.0#e3f860a243675f21784e8aedf92303e8004b34bf"
 IDENTITY_KEYS = {"tag", "revision", "tag_object", "workflow_revision"}
 MAX_LEDGER_AGE = 120  # Seconds, measured from the native header close time.
 MAX_FUTURE_SKEW = 30
@@ -360,7 +360,7 @@ def bundle(source, identity, output):
         packages = tomllib.loads(lock.read_text())["package"]
         identities = {item["source"] for item in packages if "allowit-core" in item.get("source", "")}
         if identities != {CORE_SOURCE}:
-            raise ValueError("Release must use the single published Core v0.3.2 source")
+            raise ValueError("Release must use the single published Core source")
     # Resolve this with the release's own checked policy gate, before the signing job.
     helper = "import sys;sys.path.insert(0,sys.argv[1]);from policy_source import standard_prefix;import json;print(json.dumps(standard_prefix(open(sys.argv[2]).read())))"
     rules = json.loads(public_output([sys.executable, "-c", helper, str(source / "scripts"), str(sample)], text=True))

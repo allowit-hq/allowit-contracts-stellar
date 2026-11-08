@@ -2,7 +2,7 @@ use crate::host::{
     error::Error,
     request_proof::{Protocol, authorize, verify},
 };
-use allowit_stellar_wallet::{self as native, signing};
+use crate::{self as native, signing};
 fn protocol() -> Protocol {
     super::server::request_proof_protocol()
 }

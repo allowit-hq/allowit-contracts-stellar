@@ -1,6 +1,6 @@
 //! Independently assembled owner XDR exercises the caller-intent signing boundary.
-use allowit_stellar_wallet::owner_intent::*;
-use allowit_stellar_wallet::*;
+use allowit_stellar::owner_intent::*;
+use allowit_stellar::*;
 use ed25519_dalek::{Signer, SigningKey};
 use std::cell::Cell;
 use stellar_strkey::Contract;

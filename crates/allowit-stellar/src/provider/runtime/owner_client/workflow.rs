@@ -1,6 +1,6 @@
 //! Retained owner workflows. A session identifies the owner; only checked native intent can request a signature.
 use super::*;
-use allowit_policy_sdk::client::store::Store;
+use allowit_core::client::store::Store;
 use native::owner_intent::{self, ExpectedOwnerIntent, OwnerAction, OwnerLimits, OwnerTransaction};
 use native::{OperationStatus, WalletConfig, WalletRoute, rpc};
 
@@ -80,7 +80,7 @@ fn checked<T>(value: native::Result<T>) -> Result<T> {
 }
 fn intent_hash(value: &impl Serialize) -> Result<String> {
     serde_json_canonicalizer::to_vec(value)
-        .map(|b| allowit_policy_sdk::digest(&b))
+        .map(|b| allowit_core::digest(&b))
         .map_err(|_| Error::config("Cannot encode owner workflow identity"))
 }
 pub fn wallet_salt(instance: &[u8; 32]) -> [u8; 32] {

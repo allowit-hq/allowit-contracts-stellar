@@ -1,6 +1,5 @@
 //! Stellar adapters for the existing typed execution request and operation lifecycle.
 //! Native and policy wallet custody use the same authored policy and exact operation identity.
-extern crate self as allowit_stellar_wallet;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod host;
@@ -269,12 +268,12 @@ impl OperationKind {
         }
     }
     /// The `AllowitOperation` of the policy core.
-    pub fn allowit(self) -> allowit::AllowitOperation {
+    pub fn allowit(self) -> allowit_core::AllowitOperation {
         match self {
-            Self::Transfer => allowit::AllowitOperation::transfer,
-            Self::Swap => allowit::AllowitOperation::swap,
-            Self::Deposit => allowit::AllowitOperation::deposit,
-            Self::Redeem => allowit::AllowitOperation::redeem,
+            Self::Transfer => allowit_core::AllowitOperation::transfer,
+            Self::Swap => allowit_core::AllowitOperation::swap,
+            Self::Deposit => allowit_core::AllowitOperation::deposit,
+            Self::Redeem => allowit_core::AllowitOperation::redeem,
         }
     }
     /// Contract encoding of the unit `AllowitOperation` variant: a one-symbol vector.
@@ -332,7 +331,7 @@ impl ExpenseBounds {
             spent_units: principal.checked_add(gas).ok_or("Expense overflow")?,
             max_fee_stroops,
             observed_ledger,
-            day: now / allowit::DAY,
+            day: now / allowit_core::DAY,
         })
     }
 }
@@ -1093,7 +1092,7 @@ fn verify_classic_portable(
             spent_units: t.amount,
             max_fee_stroops: 0,
             observed_ledger: state.ledger,
-            day: now / allowit::DAY,
+            day: now / allowit_core::DAY,
         }),
         terms.args.clone(),
     );
@@ -1126,7 +1125,7 @@ fn validate_expense(
         || expense.spent_units < 0
         || expense.observed_ledger == 0
         || expense.observed_ledger > state.ledger
-        || expense.day != now / allowit::DAY
+        || expense.day != now / allowit_core::DAY
     {
         return Err(
             "Expense bounds have negative units, a future observation or another day".into(),
@@ -1343,9 +1342,9 @@ fn build(
     if admit_policy {
         verify_operation(c, r, terms, state, now, expires, None)?;
     }
-    let day_end = (now / allowit::DAY)
+    let day_end = (now / allowit_core::DAY)
         .checked_add(1)
-        .and_then(|day| day.checked_mul(allowit::DAY))
+        .and_then(|day| day.checked_mul(allowit_core::DAY))
         .ok_or("UTC boundary overflow")?;
     if terms.expense.is_some() && expires > day_end {
         return Err("Priced execution cannot cross its UTC expense day".into());

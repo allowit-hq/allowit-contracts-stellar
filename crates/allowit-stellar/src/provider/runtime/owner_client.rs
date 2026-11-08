@@ -1,8 +1,8 @@
 //! Owner HTTP authentication and portable generation. This workflow grants no spending authority.
 pub mod workflow;
 use crate::host::error::{Error, Result};
-use allowit_policy_sdk::transport::http::Method;
-use allowit_stellar_wallet::{self as native, PolicyParams, PolicyTier};
+use crate::{self as native, PolicyParams, PolicyTier};
+use allowit_core::transport::http::Method;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -436,7 +436,7 @@ fn validate_generated(
         || policy.original_intent != request.prompt
         || !policy.ir_hash.is_empty()
         || policy.status != "draft"
-        || policy.source_hash != allowit_policy_sdk::digest(policy.code.as_bytes())
+        || policy.source_hash != allowit_core::digest(policy.code.as_bytes())
         || policy.runtime.source_profile != SOURCE_PROFILE
         || policy.runtime.wallet.kind != kind
         || policy.runtime.wallet.profile != request.profile

@@ -67,7 +67,7 @@ impl OwnerDocuments {
         b["assetIssuer"] = json!(issuer);
         b["portable"]["asset"]["address"] = json!(asset);
         b["portable"]["params"]["tokens"]["List"][0]["Addr"] = json!(asset);
-        b["portable"]["paramsHash"] = json!(allowit_policy_sdk::digest(
+        b["portable"]["paramsHash"] = json!(allowit_core::digest(
             &serde_json_canonicalizer::to_vec(&b["portable"]["params"]).unwrap()
         ));
     }
@@ -98,13 +98,13 @@ impl OwnerDocuments {
             json!(if tampered {
                 "44".repeat(32)
             } else {
-                allowit_policy_sdk::digest(&serde_json_canonicalizer::to_vec(&identity).unwrap())
+                allowit_core::digest(&serde_json_canonicalizer::to_vec(&identity).unwrap())
             }),
         );
     }
     pub fn use_empty_standard_prefix(&mut self, tier: &str) {
         let source = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result { Ok(()) }\n";
-        let digest = allowit_policy_sdk::digest(source.as_bytes());
+        let digest = allowit_core::digest(source.as_bytes());
         self.policy["code"] = json!(source);
         self.policy["sourceHash"] = json!(digest);
         let b = &mut self.policy["runtime"]["instanceBinding"];

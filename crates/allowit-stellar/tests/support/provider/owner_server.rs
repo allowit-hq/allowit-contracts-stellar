@@ -209,7 +209,7 @@ impl Server {
                     let mut bytes = b"Stellar Signed Message:\n".to_vec();
                     bytes.extend(body["message"].as_str().unwrap().as_bytes());
                     let digest = Sha256::digest(bytes);
-                    let key = allowit_stellar_wallet::account_key(&plan.owner).unwrap();
+                    let key = crate::account_key(&plan.owner).unwrap();
                     let sig = STANDARD
                         .decode(body["signature"].as_str().unwrap())
                         .unwrap();
@@ -282,15 +282,12 @@ impl Server {
                         {
                             continue;
                         }
-                        let hash = allowit_stellar_wallet::rpc::signed_transaction_hash(
-                            "stellar:testnet",
-                            signed,
-                        )
-                        .unwrap();
+                        let hash =
+                            crate::rpc::signed_transaction_hash("stellar:testnet", signed).unwrap();
                         reply(
                             &mut stream,
                             200,
-                            json!({"status":"confirmed","transactionHash":allowit_stellar_wallet::hex(&hash)}),
+                            json!({"status":"confirmed","transactionHash":crate::hex(&hash)}),
                             "",
                         );
                     }

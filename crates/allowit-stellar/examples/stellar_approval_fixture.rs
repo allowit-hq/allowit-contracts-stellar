@@ -1,5 +1,5 @@
 //! Deterministic portable approval fixture. No private key or signing seed is exported.
-use allowit_stellar_wallet::provider::runtime::approval::approval_for_policy;
+use allowit_stellar::provider::runtime::approval::approval_for_policy;
 fn main() {
     let fixture: serde_json::Value = serde_json::from_str(include_str!(
         "../tests/fixtures/provider/stellar-portable-approval.json"

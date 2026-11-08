@@ -1,6 +1,6 @@
 //! Native error classification. Event hints never establish contract authority.
 use crate::host::runtime::Problem;
-pub use allowit_stellar_wallet::rpc::{ContractFault, simulation_fault};
+pub use crate::rpc::{ContractFault, simulation_fault};
 use serde_json::json;
 fn fail(message: impl Into<String>) -> Problem {
     Problem {
@@ -28,7 +28,7 @@ impl Details for Problem {
     }
 }
 /// `AllowitError` names, their codes and the canonical rule each one reports.
-use allowit::{AllowitError as E, AllowitRule as R};
+use allowit_core::{AllowitError as E, AllowitRule as R};
 const RULE_ERRORS: &[(E, Option<R>)] = &[
     (E::MissingParam, None),
     (E::PaymentLimitExceeded, Some(R::payment_limit)),
@@ -92,7 +92,7 @@ pub fn rule_denial(code: u32) -> Problem {
 pub fn denial(message: &str, contract: Option<&ContractFault>, wallet: &str) -> Problem {
     let named = contract
         .is_none()
-        .then(|| allowit_stellar_wallet::rpc::host_policy_denial(message))
+        .then(|| crate::rpc::host_policy_denial(message))
         .flatten()
         .and_then(|name| {
             RULE_ERRORS
@@ -125,8 +125,8 @@ pub fn denial(message: &str, contract: Option<&ContractFault>, wallet: &str) -> 
     if let Some((name, rule)) = rule_error(code) {
         return policy_denied(&name, rule, Some(code));
     }
-    match allowit_stellar_wallet::rpc::WalletError::from_code(code) {
-        Some(allowit_stellar_wallet::rpc::WalletError::PolicyDenied) => policy_denied("PolicyDenied", None, Some(code)),
+    match crate::rpc::WalletError::from_code(code) {
+        Some(crate::rpc::WalletError::PolicyDenied) => policy_denied("PolicyDenied", None, Some(code)),
         Some(error) => coded(
             409,
             wallet_error_code(error.name()),

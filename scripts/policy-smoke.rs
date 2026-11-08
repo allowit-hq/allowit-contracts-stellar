@@ -69,7 +69,7 @@ fn int(n: impl Into<i128>) -> Option<AllowitValue> {
 }
 /// The `operations` value of `ops`.
 fn operations(ops: &Ops) -> AllowitValue {
-    let text = |name: &str| AllowitValue::Str(name.to_string());
+    let text = |name: &str| AllowitValue::Str(name.into());
     match ops {
         Ops::Text(name) => text(name),
         Ops::List(names) => AllowitValue::List(names.iter().map(|name| text(name)).collect()),
@@ -437,7 +437,10 @@ fn host_context(v: &Vector) -> AllowitContext {
         state.insert(vectors::state_key(i), AllowitValue::from(i as u64));
     }
     if !v.blob.is_empty() {
-        let texts = v.blob.iter().map(|n| AllowitValue::Str("x".repeat(*n)));
+        let texts = v
+            .blob
+            .iter()
+            .map(|n| AllowitValue::Str("x".repeat(*n).into()));
         state.insert(
             vectors::BLOB.to_string(),
             AllowitValue::List(texts.collect()),

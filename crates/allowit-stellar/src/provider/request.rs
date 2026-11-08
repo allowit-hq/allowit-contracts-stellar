@@ -9,8 +9,8 @@ use crate::host::{
     input::asset::{Amount, Asset},
     typed_request::operation_nonce,
 };
-use allowit_stellar_wallet::workflow::{AccountKind, ExecutionRequest};
-use allowit_stellar_wallet::{self as sdk, AccountState, TrustedState, WalletConfig, WalletRoute};
+use crate::workflow::{AccountKind, ExecutionRequest};
+use crate::{self as sdk, AccountState, TrustedState, WalletConfig, WalletRoute};
 
 /// Checks the operation flags alone, before any profile, journal or network
 /// access.

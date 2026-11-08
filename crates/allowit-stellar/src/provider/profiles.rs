@@ -4,7 +4,7 @@ use crate::host::{
     profiles::Description,
     vendors::ProfileBinding,
 };
-use allowit_policy_sdk::policy::PolicyValue;
+use allowit_core::policy::PolicyValue;
 pub fn decode(network: &str, bytes: &[u8]) -> Result<(Description, Box<dyn ProfileBinding>)> {
     let bundle = crate::provider::runtime::client::decode_public_bundle(bytes)?;
     if crate::host::routing::normalize(&bundle.network)? != network {
@@ -23,7 +23,7 @@ pub fn decode(network: &str, bytes: &[u8]) -> Result<(Description, Box<dyn Profi
         asset: c.asset.clone(),
         asset_symbol: c.asset_symbol.clone(),
         source: c.policy_source.clone(),
-        source_hash: allowit_stellar_wallet::hex(&c.source_hash),
+        source_hash: crate::hex(&c.source_hash),
         module_digest: bundle.module_digest.clone(),
         params: c
             .params

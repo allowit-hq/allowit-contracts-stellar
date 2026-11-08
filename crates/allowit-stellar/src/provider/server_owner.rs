@@ -6,7 +6,7 @@ use crate::host::{
         owner::{Configuration, ConfigurationInfo, Custody},
     },
 };
-use allowit_stellar_wallet::{self as native, WalletConfig, WalletRoute};
+use crate::{self as native, WalletConfig, WalletRoute};
 
 pub fn configuration(network: &str, document: &[u8]) -> Result<Configuration> {
     let c: WalletConfig = serde_json::from_slice(document)

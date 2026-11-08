@@ -1,5 +1,5 @@
 //! Native owner observations use independently built XDR and explicit malformed/stale RPC fixtures.
-use allowit_stellar_wallet::{
+use allowit_stellar::{
     self as native,
     rpc::{self, Rpc},
 };

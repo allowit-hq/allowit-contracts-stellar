@@ -1,6 +1,6 @@
 //! Native owner-param vectors and binding integration with the shared Core source gate.
-use allowit_stellar_wallet::PolicyTier;
-use allowit_stellar_wallet::policy::params_from_json;
+use allowit_stellar::PolicyTier;
+use allowit_stellar::policy::params_from_json;
 use serde_json::Value;
 
 const CANONICAL: &str = include_str!("../../../contracts/allowit-custom-policy/policy/policy.rs");
@@ -45,7 +45,7 @@ fn params_from_json_matches_contract_admin_params() {
 fn owner_builders_reject_sources_the_python_gate_rejects() {
     // Every owner builder binds its source through `policy_rules` and `tier_rules`, so a source
     // the server build gate can never compile cannot reach a create or deploy packet.
-    use allowit_stellar_wallet::policy::{PolicyParams, policy_rules, tier_rules};
+    use allowit_stellar::policy::{PolicyParams, policy_rules, tier_rules};
     for extra in [
         "use std::fs;",
         "fn helper(a: &[i128]) -> bool { a.len() > 0 }",

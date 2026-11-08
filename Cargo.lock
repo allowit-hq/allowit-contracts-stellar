@@ -21,13 +21,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
-name = "allowit"
-version = "0.3.2"
-source = "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.3.2#c6c9f382761a0c5b88afc5524be7220c5c56c244"
-
-[[package]]
 name = "allowit-common-policy-engine"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "allowit-policy-wallet",
  "allowit-wallet-protocol",
@@ -36,8 +31,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "allowit-core"
+version = "0.5.0"
+source = "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.5.0#e3f860a243675f21784e8aedf92303e8004b34bf"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "allowit-custom-policy"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "allowit-policy-wallet",
  "allowit-stellar-policy",
@@ -49,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "allowit-engine-parent"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "allowit-stellar-policy",
  "allowit-wallet-engine",
@@ -58,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "allowit-policy-wallet"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "allowit-sep56-test-vault",
  "allowit-stellar-policy",
@@ -69,14 +74,14 @@ dependencies = [
 
 [[package]]
 name = "allowit-sep56-test-vault"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "soroban-sdk",
 ]
 
 [[package]]
 name = "allowit-simple-policy-engine"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "allowit-policy-wallet",
  "allowit-wallet-protocol",
@@ -86,15 +91,15 @@ dependencies = [
 
 [[package]]
 name = "allowit-stellar-policy"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
- "allowit",
+ "allowit-core",
  "soroban-sdk",
 ]
 
 [[package]]
 name = "allowit-wallet-engine"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "allowit-stellar-policy",
  "soroban-sdk",
@@ -102,7 +107,7 @@ dependencies = [
 
 [[package]]
 name = "allowit-wallet-protocol"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "allowit-stellar-policy",
  "soroban-sdk",

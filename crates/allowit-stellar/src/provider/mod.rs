@@ -8,12 +8,12 @@ pub mod runtime;
 pub mod server;
 pub mod server_owner;
 mod typed;
+use crate as native;
 use crate::host::{KeyProvider, PrivateSigner};
 use crate::host::{
     Signer,
     error::{Error, Result},
 };
-use allowit_stellar_wallet as native;
 use zeroize::Zeroizing;
 
 /// Stable SDK storage registrations. The caller opens these namespaces.

@@ -6,12 +6,12 @@
 //!
 //! Regenerate after a contract or encoding change: run `scripts/build-contracts.sh`, then
 //! `ALLOWIT_UPDATE_VECTORS=1 cargo test --test policy_wallet` in `crates/allowit-stellar`.
-use allowit::AllowitTier;
-use allowit_policy_sdk::admin::{Admin, DeploymentVersion};
-use allowit_stellar_wallet::admin::*;
-use allowit_stellar_wallet::contract::{CustodyState, PolicyBinding};
-use allowit_stellar_wallet::workflow::*;
-use allowit_stellar_wallet::*;
+use allowit_core::AllowitTier;
+use allowit_core::admin::{Admin, DeploymentVersion};
+use allowit_stellar::admin::*;
+use allowit_stellar::contract::{CustodyState, PolicyBinding};
+use allowit_stellar::workflow::*;
+use allowit_stellar::*;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -607,37 +607,37 @@ fn execute(w: &mut Wallet, request: &x::ScVal, now: u64) -> x::ScVal {
     };
     let args = PolicyParams::from_scval(field(request, "args")).unwrap();
     let (name, operation_args) = operation(request);
-    let asset = allowit::Address::new(w.state.asset.clone());
+    let asset = allowit_core::Address::new(w.state.asset.clone());
     let debit = int(field(&receipt, "amount"));
     let minimum = |key| int(field(operation_args, key));
-    let vault = || allowit::Address::new(addr(field(operation_args, "vault")));
+    let vault = || allowit_core::Address::new(addr(field(operation_args, "vault")));
     // The wallet's facts: a redeem's gross amount is its minimum asset output.
     let (op, amount, token_out, min_out) = match name.as_str() {
-        "Transfer" => (allowit::AllowitOperation::transfer, debit, None, 0),
+        "Transfer" => (allowit_core::AllowitOperation::transfer, debit, None, 0),
         "Deposit" => (
-            allowit::AllowitOperation::deposit,
+            allowit_core::AllowitOperation::deposit,
             debit,
             Some(vault()),
             minimum("min_shares"),
         ),
         "Redeem" => (
-            allowit::AllowitOperation::redeem,
+            allowit_core::AllowitOperation::redeem,
             minimum("min_assets"),
             Some(asset.clone()),
             minimum("min_assets"),
         ),
         _ => panic!(),
     };
-    let ctx = allowit::AllowitContext {
-        env: allowit::AllowitEnv::new(),
+    let ctx = allowit_core::AllowitContext {
+        env: allowit_core::AllowitEnv::new(),
         params: w.state.params.allowit().into(),
         state: w.state.policy_state.allowit(),
-        request: allowit::AllowitRequest {
+        request: allowit_core::AllowitRequest {
             operation: op,
             asset,
-            recipient: allowit::Address::new(addr(field(&receipt, "to"))),
+            recipient: allowit_core::Address::new(addr(field(&receipt, "to"))),
             amount,
-            token_in: allowit::Address::new(addr(field(&receipt, "token"))),
+            token_in: allowit_core::Address::new(addr(field(&receipt, "token"))),
             amount_in: debit,
             token_out,
             min_out,
@@ -654,7 +654,8 @@ fn execute(w: &mut Wallet, request: &x::ScVal, now: u64) -> x::ScVal {
     } else {
         AllowitTier::Standard
     };
-    w.state.policy_state = PolicyParams::from_allowit(&allowit::post_flight(&ctx, tier).unwrap());
+    w.state.policy_state =
+        PolicyParams::from_allowit(&allowit_core::post_flight(&ctx, tier).unwrap());
     w.state.nonce += 1;
     let id = digest(field(request, "operation_id"));
     let vault = addr(field(&receipt, "to"));
