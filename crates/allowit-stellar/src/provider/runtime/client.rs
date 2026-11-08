@@ -25,15 +25,14 @@ use serde_json::json;
 use std::{
     path::Path,
     sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use zeroize::Zeroizing;
 
-/// Status and submit replies are short server calls.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-/// The prepare phase runs several ledger reads and simulations on the server
-/// before it returns the packet to sign, so it gets a longer wait.
-const PREPARATION_TIMEOUT: Duration = Duration::from_secs(180);
+/// Every engine call waits up to this long. Prepare, submit and status each run tens of
+/// sequential ledger reads and simulations on the server, and submit also broadcasts and
+/// polls for the receipt. At public RPC latency (about 5 s per call) these took up to 138 s.
+const ENGINE_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -409,7 +408,7 @@ impl Client {
         let account = signer.account().to_owned();
         Ok(Self {
             http: HttpClient::new(Options {
-                timeout: PREPARATION_TIMEOUT,
+                timeout: ENGINE_TIMEOUT,
                 max_response_bytes: 1_048_576,
                 no_proxy: false,
                 connect_timeout: None,
@@ -422,7 +421,7 @@ impl Client {
             rpc_url: rpc_url.unwrap_or_default(),
         })
     }
-    fn post(&self, path: &str, body: serde_json::Value, timeout: Duration) -> Result<Response> {
+    fn post(&self, path: &str, body: serde_json::Value) -> Result<Response> {
         let issued_at = clock()?;
         let canonical = serde_json_canonicalizer::to_vec(&body)
             .map_err(|_| Error::config("Cannot encode Stellar request"))?;
@@ -449,7 +448,7 @@ impl Client {
                     headers: &headers,
                     body: Some(&bytes),
                 },
-                Some(Instant::now() + timeout),
+                None,
             )
             .map_err(|_| {
                 Error::uncertain(
@@ -541,7 +540,6 @@ impl Client {
         let r = self.post(
             &self.bundle.endpoints.status,
             json!({"policyId":self.bundle.policy_id,"requestId":id}),
-            REQUEST_TIMEOUT,
         )?;
         self.validate(&r, id, record, true)?;
         Ok(r)
@@ -667,7 +665,6 @@ pub fn exec(
         c.post(
             &c.bundle.endpoints.execute,
             json!({"policyId":policy,"requestId":id,"phase":"prepare","request":request}),
-            PREPARATION_TIMEOUT,
         )?
     };
     c.validate(&prepared, &id, Some(&record), false)?;
@@ -696,7 +693,6 @@ pub fn exec(
     let response = c.post(
         &c.bundle.endpoints.execute,
         json!({"policyId":policy,"requestId":id,"phase":"submit","agentSignature":signature}),
-        REQUEST_TIMEOUT,
     )?;
     c.validate(&response, &id, Some(&record), false)?;
     record.status = Some(response.operation.status.clone());
@@ -1319,8 +1315,47 @@ mod native_revalidation_tests {
         assert!(revalidate_with_rpc_url(&old.prepared, 86402, "").is_err());
         sdk::validate_retained_prepared(&old.prepared).unwrap();
     }
-    #[test]
-    fn preparation_reply_may_arrive_after_the_status_timeout() {
+    /// Answer one engine request on `listener` with `status` and `body` after `delay`, and
+    /// return the request line and body.
+    fn reply_once(
+        listener: TcpListener,
+        delay: Duration,
+        status: &'static str,
+        body: Vec<u8>,
+    ) -> std::thread::JoinHandle<(String, serde_json::Value)> {
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                header.push(byte[0]);
+            }
+            let header = String::from_utf8(header).unwrap();
+            let length: usize = header
+                .lines()
+                .find_map(|v| {
+                    v.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|s| s.trim().parse().unwrap())
+                })
+                .unwrap();
+            let mut request = vec![0; length];
+            stream.read_exact(&mut request).unwrap();
+            std::thread::sleep(delay);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .and_then(|_| stream.write_all(&body));
+            (
+                header.lines().next().unwrap().to_owned(),
+                serde_json::from_slice(&request).unwrap(),
+            )
+        })
+    }
+    fn engine_client(config: WalletConfig, origin: &str) -> Client {
         struct TestKey(String);
         impl AgentSigner for TestKey {
             fn account(&self) -> &str {
@@ -1333,62 +1368,52 @@ mod native_revalidation_tests {
                     .to_bytes())
             }
         }
-        let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
-        let body = serde_json::to_vec(&json!({"prepared":p,"operation":{"id":"slow-prepare-001","status":OperationStatus::Prepared,"transactionHash":sdk::hex(&p.transaction_hash)}})).unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut header = Vec::new();
-            while !header.ends_with(b"\r\n\r\n") {
-                let mut byte = [0];
-                stream.read_exact(&mut byte).unwrap();
-                header.push(byte[0]);
-            }
-            let header = String::from_utf8(header).unwrap();
-            assert!(header.starts_with("POST /api/native/execute "));
-            let length: usize = header
-                .lines()
-                .find_map(|v| {
-                    v.to_ascii_lowercase()
-                        .strip_prefix("content-length:")
-                        .map(|s| s.trim().parse().unwrap())
-                })
-                .unwrap();
-            let mut request = vec![0; length];
-            stream.read_exact(&mut request).unwrap();
-            // A slow server preparation outlasts the short status and submit timeout.
-            std::thread::sleep(REQUEST_TIMEOUT + Duration::from_secs(2));
-            let _ = write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            )
-            .and_then(|_| stream.write_all(&body));
-        });
-        let client = Client::from_context(
+        Client::from_context(
             ExecutionProfile {
-                policy_id: "slow-prepare-policy".into(),
-                config: p.config.clone(),
+                policy_id: "engine-policy".into(),
+                config,
                 endpoints: Endpoints {
                     execute: "/api/native/execute".into(),
                     status: "/api/native/execute/status".into(),
                 },
             },
             Arc::new(TestKey(sdk::account_for_seed(&[43; 32]))),
-            &origin,
+            origin,
             None,
         )
-        .unwrap();
-        let response = client.post(
-            "/api/native/execute",
-            json!({"policyId":"slow-prepare-policy","requestId":"slow-prepare-001","phase":"prepare"}),
-            PREPARATION_TIMEOUT,
-        );
-        server.join().unwrap();
-        let response = response.expect("the prepare reply arrives within the preparation timeout");
-        assert_eq!(response.operation.status, OperationStatus::Prepared);
-        assert_eq!(response.prepared, p);
+        .unwrap()
+    }
+    #[test]
+    fn slow_engine_replies_arrive_for_prepare_submit_and_status() {
+        // Engine prepare took up to 138 s, submit up to 90 s and status up to 44 s on testnet.
+        // Each reply here outlasts the former 30 s submit and status bound.
+        let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
+        let body = serde_json::to_vec(&json!({"prepared":p,"operation":{"id":"slow-engine-001","status":OperationStatus::Prepared,"transactionHash":sdk::hex(&p.transaction_hash)}})).unwrap();
+        std::thread::scope(|scope| {
+            for (path, phase) in [
+                ("/api/native/execute", Some("prepare")),
+                ("/api/native/execute", Some("submit")),
+                ("/api/native/execute/status", None),
+            ] {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let origin = format!("http://{}", listener.local_addr().unwrap());
+                let server = reply_once(listener, Duration::from_secs(32), "200 OK", body.clone());
+                let client = engine_client(p.config.clone(), &origin);
+                let p = &p;
+                scope.spawn(move || {
+                    let response = client.post(
+                        path,
+                        json!({"policyId":"engine-policy","requestId":"slow-engine-001","phase":phase}),
+                    );
+                    let (line, request) = server.join().unwrap();
+                    assert!(line.starts_with(&format!("POST {path} ")));
+                    assert_eq!(request["phase"], json!(phase));
+                    let response = response
+                        .unwrap_or_else(|e| panic!("{path} {phase:?}: {}", e.message));
+                    assert_eq!(response.prepared, *p);
+                });
+            }
+        });
     }
     #[test]
     fn failed_policy_wallet_envelope_remains_unknown_on_the_server_client_wire() {
@@ -1478,7 +1503,6 @@ mod native_revalidation_tests {
             .post(
                 "/api/native/execute/status",
                 json!({"requestId":"wire-status-001"}),
-                REQUEST_TIMEOUT,
             )
             .unwrap();
         server.join().unwrap();
