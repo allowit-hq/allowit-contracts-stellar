@@ -201,7 +201,8 @@ export async function deployAdkOwnerDraft({
       const expected: AdkOwnerSelection = {
         owner, agent, server, policyInstance, code: proposal.code, sourceHash: proposal.sourceHash,
         params: proposal.params, wasmHash, wallet, asset, policyMaxFeeStroops: template.maxFeeStroops,
-        maxFeeStroops: step.action === 'fund' ? template.maxFeeStroops : deploymentFee,
+        // Upload and creation use the deployment ceiling. Funding and renewal keep the installed policy ceiling.
+        maxFeeStroops: step.action === 'upload_wasm' || step.action === 'create_wallet' ? deploymentFee : template.maxFeeStroops,
         amount, nextSequence: await sequence(owner), validUntil: now + 300,
       };
       ensureCurrent();
@@ -233,6 +234,11 @@ export async function deployAdkOwnerDraft({
       if (!reply.step || reply.wallet !== expectedWallet
         || !['upload_wasm', 'create_wallet', 'extend'].includes(reply.step.action))
         throw new Error('The Stellar service did not prepare this wallet for deployment.');
+      // A renewal can be due while a funding result is unknown. Settle the funding first, so the renewal can be signed.
+      if (reply.step.action === 'extend' && journal.pending?.step.action === 'fund') {
+        onStep('Checking the saved funding transaction…');
+        await confirm(journal.pending);
+      }
       await sign(reply.step, reply.wallet);
     }
     if (!installed) throw new Error('The Stellar wallet installation could not be confirmed.');

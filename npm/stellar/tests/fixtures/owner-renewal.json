@@ -18,7 +18,7 @@
     "wallet": "CBWIJSMM2H6QKSNBUGP34OKM4L63Y5KUSZPMWVJ7OETSL6LOPQEPOJFD",
     "asset": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
     "maxFeeStroops": 1000,
-    "policyMaxFeeStroops": 100,
+    "policyMaxFeeStroops": 1000,
     "amount": "1.25",
     "nextSequence": "11",
     "validUntil": 1800000060

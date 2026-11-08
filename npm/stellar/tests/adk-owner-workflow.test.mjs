@@ -7,6 +7,7 @@ const passphrase = 'Test SDF Network ; September 2015';
 const [owner, agent, server] = [1, 2, 3].map(seed => Keypair.fromRawEd25519Seed(Buffer.alloc(32, seed)).publicKey());
 const wallet = 'C' + 'A'.repeat(55);
 const signatures = [];
+const selections = [];
 const forged = new Set();
 mock.module('@stellar/freighter-api', {defaultExport: {
   getAddress: async () => ({address: owner}),
@@ -17,7 +18,8 @@ mock.module('@stellar/freighter-api', {defaultExport: {
   },
 }});
 mock.module(new URL('../dist/owner-verifier.js', import.meta.url).href, {namedExports: {
-  deriveAdkOwnerWallet: async () => wallet, verifyAdkOwnerStep: async () => {}, verifyAdkOwnerSignature: async (_step, _expected, signedXdr) => {
+  deriveAdkOwnerWallet: async () => wallet, verifyAdkOwnerStep: async (step, expected) => {selections.push([step.action, expected.maxFeeStroops]);},
+  verifyAdkOwnerSignature: async (_step, _expected, signedXdr) => {
     if (forged.has(signedXdr)) throw new Error('The owner signature is invalid.');
   },
 }});
@@ -160,4 +162,25 @@ test('an installed wallet that needs renewal signs the renewal, then the funding
   assert.equal(result.wallet, wallet);
   assert.deepEqual(signatures, ['AAAA8', 'AAAA1']);
   assert.equal(trace.filter(path => path === 'native/deploy/prepare').length, 2);
+  // A renewal keeps the installed policy fee ceiling, not the deployment ceiling.
+  assert.deepEqual(selections.slice(-2), [['extend', 1000], ['fund', 1000]]);
+});
+
+test('a funding result lost before a renewal is due is settled, and then the owner signs the renewal', async () => {
+  signatures.length = 0;
+  const {entries, state, input} = browser(body => {
+    const receipt = confirmed(body);
+    if (receipt.transactionHash !== '8'.repeat(64)) return receipt;
+    state.renewalDue = false;
+    return {...receipt, action: 'extend'};
+  });
+  await deployAdkOwnerDraft(input);
+  const key = adkOwnerKey(owner, proposal);
+  const saved = JSON.parse(entries.get(key));
+  entries.set(key, JSON.stringify({...saved, pending: {...saved.funded, sent: true}, funded: undefined}));
+  state.renewalDue = true;
+  const result = await deployAdkOwnerDraft(input);
+  assert.equal(result.wallet, wallet);
+  assert.deepEqual(signatures, ['AAAA1', 'AAAA8']);
+  assert.equal(JSON.parse(entries.get(key)).funded.step.transactionHash, '1'.repeat(64));
 });
