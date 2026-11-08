@@ -67,7 +67,7 @@ External or unbounded signed packets require separate operator reconciliation.
 Targets remain fixed during the barrier. Initially live resources must remain valid.
 Earlier bounded packets may settle before the barrier completes.
 The controller then freezes current CREATE or REUSE decisions and the expected operator sequence.
-A disappeared REUSE never becomes CREATE.
+A disappeared REUSE never turns into CREATE.
 Missing persistent data alone does not prove absence.
 A conditional target requires successful exact native simulation without restoration metadata before signing.
 A constructor simulation also requires exact Wasm and operator-account readback first.

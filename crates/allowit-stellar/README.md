@@ -6,7 +6,7 @@
 Custody uses the owner's classic G-address account or policy wallet contract. The custody contracts live in [`contracts/`](../../contracts).
 The rail's recovery rules preserve the original signed bytes and transaction identity after an uncertain broadcast.
 
-The [SDK engine](https://github.com/allowit-hq/allowit-sdk/tree/main/engine) composes this crate for both CLI and server callers.
+The [SDK engine](https://github.com/allowit-hq/allowit-sdk) composes this crate for both CLI and server callers.
 The SDK owns generic orchestration, routing and caller-owned storage.
 This crate owns Stellar execution, owner workflows, runtime clients, request validation, formatting,
 profiles, diagnostics, signing, simulation, receipts and native recovery rules.
@@ -50,7 +50,7 @@ capabilities and core primitives. Shared workflow coordination remains in SDK en
 ```mermaid
 flowchart TB
     UI["[allowit-engine]<br/>npm @allowit/ui<br/>Shared policy web components"]
-    Engine["[allowit-sdk]<br/>crate @allowit/sdk/engine<br/>All other shared logic"]
+    Engine["[allowit-sdk]<br/>crate allowit-sdk<br/>All other shared logic"]
     Vendor["[allowit-contracts-stellar]<br/>crate allowit-stellar · allowit-stellar-policy<br/>npm @allowit/stellar<br/>Native contracts · signing · chain semantics<br/>SVG graphics · web components"]
     Core["[allowit-core]<br/>crate + npm @allowit/core<br/>Common types · policy rules · primitives<br/>TypeScript interfaces"]
 
