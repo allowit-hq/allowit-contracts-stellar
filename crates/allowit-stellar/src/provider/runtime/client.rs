@@ -25,9 +25,15 @@ use serde_json::json;
 use std::{
     path::Path,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use zeroize::Zeroizing;
+
+/// Status and submit replies are short server calls.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// The prepare phase runs several ledger reads and simulations on the server
+/// before it returns the packet to sign, so it gets a longer wait.
+const PREPARATION_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -403,7 +409,7 @@ impl Client {
         let account = signer.account().to_owned();
         Ok(Self {
             http: HttpClient::new(Options {
-                timeout: Duration::from_secs(30),
+                timeout: PREPARATION_TIMEOUT,
                 max_response_bytes: 1_048_576,
                 no_proxy: false,
                 connect_timeout: None,
@@ -416,7 +422,7 @@ impl Client {
             rpc_url: rpc_url.unwrap_or_default(),
         })
     }
-    fn post(&self, path: &str, body: serde_json::Value) -> Result<Response> {
+    fn post(&self, path: &str, body: serde_json::Value, timeout: Duration) -> Result<Response> {
         let issued_at = clock()?;
         let canonical = serde_json_canonicalizer::to_vec(&body)
             .map_err(|_| Error::config("Cannot encode Stellar request"))?;
@@ -443,7 +449,7 @@ impl Client {
                     headers: &headers,
                     body: Some(&bytes),
                 },
-                None,
+                Some(Instant::now() + timeout),
             )
             .map_err(|_| {
                 Error::uncertain(
@@ -535,6 +541,7 @@ impl Client {
         let r = self.post(
             &self.bundle.endpoints.status,
             json!({"policyId":self.bundle.policy_id,"requestId":id}),
+            REQUEST_TIMEOUT,
         )?;
         self.validate(&r, id, record, true)?;
         Ok(r)
@@ -660,6 +667,7 @@ pub fn exec(
         c.post(
             &c.bundle.endpoints.execute,
             json!({"policyId":policy,"requestId":id,"phase":"prepare","request":request}),
+            PREPARATION_TIMEOUT,
         )?
     };
     c.validate(&prepared, &id, Some(&record), false)?;
@@ -688,6 +696,7 @@ pub fn exec(
     let response = c.post(
         &c.bundle.endpoints.execute,
         json!({"policyId":policy,"requestId":id,"phase":"submit","agentSignature":signature}),
+        REQUEST_TIMEOUT,
     )?;
     c.validate(&response, &id, Some(&record), false)?;
     record.status = Some(response.operation.status.clone());
@@ -1311,6 +1320,77 @@ mod native_revalidation_tests {
         sdk::validate_retained_prepared(&old.prepared).unwrap();
     }
     #[test]
+    fn preparation_reply_may_arrive_after_the_status_timeout() {
+        struct TestKey(String);
+        impl AgentSigner for TestKey {
+            fn account(&self) -> &str {
+                &self.0
+            }
+            fn sign_hash(&self, hash: &[u8; 32]) -> sdk::Result<[u8; 64]> {
+                use ed25519_dalek::Signer;
+                Ok(ed25519_dalek::SigningKey::from_bytes(&[43; 32])
+                    .sign(hash)
+                    .to_bytes())
+            }
+        }
+        let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
+        let body = serde_json::to_vec(&json!({"prepared":p,"operation":{"id":"slow-prepare-001","status":OperationStatus::Prepared,"transactionHash":sdk::hex(&p.transaction_hash)}})).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                header.push(byte[0]);
+            }
+            let header = String::from_utf8(header).unwrap();
+            assert!(header.starts_with("POST /api/native/execute "));
+            let length: usize = header
+                .lines()
+                .find_map(|v| {
+                    v.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|s| s.trim().parse().unwrap())
+                })
+                .unwrap();
+            let mut request = vec![0; length];
+            stream.read_exact(&mut request).unwrap();
+            // A slow server preparation outlasts the short status and submit timeout.
+            std::thread::sleep(REQUEST_TIMEOUT + Duration::from_secs(2));
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .and_then(|_| stream.write_all(&body));
+        });
+        let client = Client::from_context(
+            ExecutionProfile {
+                policy_id: "slow-prepare-policy".into(),
+                config: p.config.clone(),
+                endpoints: Endpoints {
+                    execute: "/api/native/execute".into(),
+                    status: "/api/native/execute/status".into(),
+                },
+            },
+            Arc::new(TestKey(sdk::account_for_seed(&[43; 32]))),
+            &origin,
+            None,
+        )
+        .unwrap();
+        let response = client.post(
+            "/api/native/execute",
+            json!({"policyId":"slow-prepare-policy","requestId":"slow-prepare-001","phase":"prepare"}),
+            PREPARATION_TIMEOUT,
+        );
+        server.join().unwrap();
+        let response = response.expect("the prepare reply arrives within the preparation timeout");
+        assert_eq!(response.operation.status, OperationStatus::Prepared);
+        assert_eq!(response.prepared, p);
+    }
+    #[test]
     fn failed_policy_wallet_envelope_remains_unknown_on_the_server_client_wire() {
         use ed25519_dalek::Signer;
         use stellar_xdr::{
@@ -1398,6 +1478,7 @@ mod native_revalidation_tests {
             .post(
                 "/api/native/execute/status",
                 json!({"requestId":"wire-status-001"}),
+                REQUEST_TIMEOUT,
             )
             .unwrap();
         server.join().unwrap();
