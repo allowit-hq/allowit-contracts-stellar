@@ -25,9 +25,13 @@ use serde_json::json;
 use std::{
     path::Path,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use zeroize::Zeroizing;
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+// Preparation can include multiple ledger reads and simulations. Leave time to sign its packet.
+const PREPARATION_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -403,7 +407,7 @@ impl Client {
         let account = signer.account().to_owned();
         Ok(Self {
             http: HttpClient::new(Options {
-                timeout: Duration::from_secs(30),
+                timeout: PREPARATION_TIMEOUT,
                 max_response_bytes: 1_048_576,
                 no_proxy: false,
                 connect_timeout: None,
@@ -416,7 +420,7 @@ impl Client {
             rpc_url: rpc_url.unwrap_or_default(),
         })
     }
-    fn post(&self, path: &str, body: serde_json::Value) -> Result<Response> {
+    fn post(&self, path: &str, body: serde_json::Value, timeout: Duration) -> Result<Response> {
         let issued_at = clock()?;
         let canonical = serde_json_canonicalizer::to_vec(&body)
             .map_err(|_| Error::config("Cannot encode Stellar request"))?;
@@ -443,7 +447,7 @@ impl Client {
                     headers: &headers,
                     body: Some(&bytes),
                 },
-                None,
+                Some(Instant::now() + timeout),
             )
             .map_err(|_| {
                 Error::uncertain(
@@ -535,6 +539,7 @@ impl Client {
         let r = self.post(
             &self.bundle.endpoints.status,
             json!({"policyId":self.bundle.policy_id,"requestId":id}),
+            REQUEST_TIMEOUT,
         )?;
         self.validate(&r, id, record, true)?;
         Ok(r)
@@ -660,6 +665,7 @@ pub fn exec(
         c.post(
             &c.bundle.endpoints.execute,
             json!({"policyId":policy,"requestId":id,"phase":"prepare","request":request}),
+            PREPARATION_TIMEOUT,
         )?
     };
     c.validate(&prepared, &id, Some(&record), false)?;
@@ -688,6 +694,7 @@ pub fn exec(
     let response = c.post(
         &c.bundle.endpoints.execute,
         json!({"policyId":policy,"requestId":id,"phase":"submit","agentSignature":signature}),
+        REQUEST_TIMEOUT,
     )?;
     c.validate(&response, &id, Some(&record), false)?;
     record.status = Some(response.operation.status.clone());
@@ -1398,6 +1405,7 @@ mod native_revalidation_tests {
             .post(
                 "/api/native/execute/status",
                 json!({"requestId":"wire-status-001"}),
+                REQUEST_TIMEOUT,
             )
             .unwrap();
         server.join().unwrap();
