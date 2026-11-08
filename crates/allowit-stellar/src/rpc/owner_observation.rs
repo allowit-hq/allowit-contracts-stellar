@@ -48,11 +48,15 @@ pub(crate) fn network(rpc: &dyn Rpc, selected: &str) -> Result<()> {
 pub(crate) fn head(rpc: &dyn Rpc) -> Result<u32> {
     ledger(&rpc.call("getLatestLedger", json!({}))?["sequence"])
 }
+/// The observation crossed more than one ledger, or the RPC ledgers disagree. A new
+/// observation can succeed.
+pub(crate) const STALE_OBSERVATION: &str =
+    "Owner observation ledger is stale, future or inconsistent";
 pub(crate) fn current(rpc: &dyn Rpc, before: u32, observed: u32) -> Result<u32> {
     let after = head(rpc)?;
     if after < before || observed < before || observed > after || after.saturating_sub(observed) > 1
     {
-        return Err("Owner observation ledger is stale, future or inconsistent".into());
+        return Err(STALE_OBSERVATION.into());
     }
     Ok(after)
 }

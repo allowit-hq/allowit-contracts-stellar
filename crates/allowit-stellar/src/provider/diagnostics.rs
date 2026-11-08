@@ -87,9 +87,13 @@ pub fn rule_denial(code: u32) -> Problem {
 /// core's host evaluation, or a rule error code or `PolicyDenied` that the installed `wallet`
 /// itself raised in simulation, becomes `policy_denied`. Other wallet contract errors keep their
 /// own codes. An error that another contract raised, such as the asset contract or a vault, or
-/// whose origin is unknown, is a plain wallet rejection with the raw code, and anything else
-/// stays a plain conflict.
+/// whose origin is unknown, is a plain wallet rejection with the raw code. A stale owner
+/// observation is `stale_owner_observation`, which a caller can retry once. Anything else stays
+/// a plain conflict.
 pub fn denial(message: &str, contract: Option<&ContractFault>, wallet: &str) -> Problem {
+    if contract.is_none() && message == crate::rpc::owner_observation::STALE_OBSERVATION {
+        return coded(409, "stale_owner_observation", message);
+    }
     let named = contract
         .is_none()
         .then(|| allowit_stellar_wallet::rpc::host_policy_denial(message))
@@ -156,6 +160,13 @@ mod tests {
         let local = denial("Policy prefix denied: PaymentLimitExceeded", None, "");
         assert_eq!(local.code, "policy_denied");
         assert!(local.details.unwrap()["contractError"].is_null());
+    }
+    #[test]
+    fn a_stale_owner_observation_has_its_own_code() {
+        use crate::{host::error::Error, rpc::owner_observation::STALE_OBSERVATION};
+        let problem = denial(&Error::config(STALE_OBSERVATION).to_string(), None, "");
+        assert_eq!(problem.code, "stale_owner_observation");
+        assert_eq!(problem.status, 409);
     }
     #[test]
     fn only_explicit_wallet_provenance_selects_native_contract_diagnostics() {
