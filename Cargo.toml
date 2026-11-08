@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/policy", "crates/protocol", "crates/engine", "contracts/allowit-engine-deployer", "crates/policy-wallet", "contracts/allowit-simple-engine", "contracts/allowit-common-engine", "contracts/allowit-custom-policy", "crates/test-vault"]
+members = ["crates/policy", "crates/protocol", "contracts/allowit-wallet-engine", "contracts/allowit-engine-parent", "crates/policy-wallet", "contracts/allowit-simple-policy-engine", "contracts/allowit-common-policy-engine", "contracts/allowit-custom-policy", "crates/test-vault"]
 resolver = "2"
 
 # Every package in this repository, including crates/allowit-stellar, releases at this version.

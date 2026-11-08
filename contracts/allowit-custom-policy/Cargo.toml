@@ -7,7 +7,6 @@ license = "UNLICENSED"
 publish = false
 
 [lib]
-name = "allowit_custom_policy"
 crate-type = ["cdylib", "rlib"]
 
 [features]

@@ -26,7 +26,7 @@ version = "0.3.2"
 source = "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.3.2#c6c9f382761a0c5b88afc5524be7220c5c56c244"
 
 [[package]]
-name = "allowit-common-engine"
+name = "allowit-common-policy-engine"
 version = "0.3.0"
 dependencies = [
  "allowit-policy-wallet",
@@ -48,7 +48,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "allowit-engine-deployer"
+name = "allowit-engine-parent"
 version = "0.3.0"
 dependencies = [
  "allowit-stellar-policy",
@@ -75,7 +75,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "allowit-simple-engine"
+name = "allowit-simple-policy-engine"
 version = "0.3.0"
 dependencies = [
  "allowit-policy-wallet",

@@ -1,5 +1,5 @@
 [package]
-name = "allowit-common-engine"
+name = "allowit-common-policy-engine"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
@@ -7,7 +7,6 @@ license = "UNLICENSED"
 publish = false
 
 [lib]
-name = "allowit_common_policy_engine"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
