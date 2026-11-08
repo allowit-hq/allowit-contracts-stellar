@@ -38,11 +38,40 @@ async function hash(source) {
     const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(source));
     return [...new Uint8Array(bytes)].map(byte => byte.toString(16).padStart(2, '0')).join('');
 }
+const horizonFetch = (path) => fetch(horizon + path, { credentials: 'omit', redirect: 'error', signal: AbortSignal.timeout(15_000) });
 async function horizonRead(path) {
-    const response = await fetch(horizon + path, { credentials: 'omit', redirect: 'error', signal: AbortSignal.timeout(15_000) });
+    const response = await horizonFetch(path);
     if (!response.ok)
         throw new Error('The Stellar transaction could not be checked. Retry with the original signed transaction.');
     return response.json();
+}
+/**
+ * The Horizon record of a sent owner transaction past its time bound, or null when it never applied.
+ * Expiry stops a later application, not an earlier one, so an expiry reply alone never drops a step.
+ */
+async function expiredRecord(signed) {
+    const unknown = () => new Error('The expired Stellar transaction could not be checked. Retry with the original signed transaction.');
+    const { transactionHash, expiresAt } = signed.step;
+    const root = await horizonRead('/');
+    const closedAt = typeof root.history_latest_ledger_closed_at === 'string' ? Date.parse(root.history_latest_ledger_closed_at) / 1000 : NaN;
+    // Every ledger that can include the transaction closes at or before its time bound. Horizon must have read past it.
+    if (!(closedAt > expiresAt))
+        throw unknown();
+    const response = await horizonFetch(`/transactions/${transactionHash}`);
+    if (response.ok) {
+        const chain = await response.json();
+        if (chain.hash !== transactionHash || typeof chain.successful !== 'boolean')
+            throw unknown();
+        return chain;
+    }
+    if (response.status !== 404)
+        throw unknown();
+    // A missing record alone proves nothing. An owner sequence below the transaction's sequence proves it never applied.
+    const account = await horizonRead(`/accounts/${signed.expected.owner}`);
+    if (account.account_id !== signed.expected.owner || !/^[0-9]{1,19}$/.test(account.sequence)
+        || BigInt(account.sequence) >= BigInt(signed.expected.nextSequence))
+        throw unknown();
+    return null;
 }
 async function sequence(owner) {
     const account = await horizonRead(`/accounts/${owner}`);
@@ -151,17 +180,27 @@ export async function deployAdkOwnerDraft({ host, proposal, session, agent, amou
                 const failed = object(details);
                 if (failed?.policyId === policyId && failed.action === signed.step.action && failed.transactionHash === signed.step.transactionHash) {
                     if (code === 'owner_transaction_expired' && expired()) {
-                        localStorage.setItem(adkOwnerArchiveKey(owner, signed.step.transactionHash), JSON.stringify(signed));
-                        save({ ...journal, pending: undefined });
-                        return false;
-                    }
-                    if (code === 'owner_transaction_failed') {
-                        const chain = await horizonRead(`/transactions/${signed.step.transactionHash}`);
-                        if (chain.hash === signed.step.transactionHash && chain.ledger === failed.ledger && chain.successful === false)
+                        const chain = await expiredRecord(signed);
+                        if (chain?.successful !== true) {
+                            localStorage.setItem(adkOwnerArchiveKey(owner, signed.step.transactionHash), JSON.stringify(signed));
                             save({ ...journal, pending: undefined });
+                            return false;
+                        }
+                        // The transaction applied before its time bound. Its Horizon record settles it below.
+                        receipt = { policyId, action: signed.step.action, status: 'confirmed', transactionHash: chain.hash, ledger: chain.ledger };
+                    }
+                    else {
+                        if (code === 'owner_transaction_failed') {
+                            const chain = await horizonRead(`/transactions/${signed.step.transactionHash}`);
+                            if (chain.hash === signed.step.transactionHash && chain.ledger === failed.ledger && chain.successful === false)
+                                save({ ...journal, pending: undefined });
+                        }
+                        throw error;
                     }
                 }
-                throw error;
+                else {
+                    throw error;
+                }
             }
             if (receipt.policyId !== policyId || receipt.action !== signed.step.action || receipt.status !== 'confirmed'
                 || receipt.transactionHash !== signed.step.transactionHash || !Number.isSafeInteger(receipt.ledger) || receipt.ledger <= 0)
@@ -220,10 +259,12 @@ export async function deployAdkOwnerDraft({ host, proposal, session, agent, amou
             if (!reply.step || reply.wallet !== expectedWallet
                 || !['upload_wasm', 'create_wallet', 'extend'].includes(reply.step.action))
                 throw new Error('The Stellar service did not prepare this wallet for deployment.');
-            // A renewal can be due while a funding result is unknown. Settle the funding first, so the renewal can be signed.
+            // A renewal can be due while a funding result is unknown. Settle the funding first. Its submission can use
+            // the sequence of this renewal, so prepare the renewal again.
             if (reply.step.action === 'extend' && journal.pending?.step.action === 'fund') {
                 onStep('Checking the saved funding transaction…');
                 await confirm(journal.pending);
+                continue;
             }
             await sign(reply.step, reply.wallet);
         }
