@@ -166,6 +166,9 @@ importers:
 
   .:
     dependencies:
+      '@allowit/core':
+        specifier: github:allowit-hq/allowit-core#v0.5.0
+        version: https://codeload.github.com/allowit-hq/allowit-core/tar.gz/e3f860a243675f21784e8aedf92303e8004b34bf
       '@noble/curves':
         specifier: 1.9.7
         version: 1.9.7
@@ -184,6 +187,10 @@ importers:
         version: 5.9.3
 
 packages:
+
+  '@allowit/core@https://codeload.github.com/allowit-hq/allowit-core/tar.gz/e3f860a243675f21784e8aedf92303e8004b34bf':
+    resolution: {gitHosted: true, integrity: sha512-4/VAN1MbJ92GP1wxMxThllUpeIKWAEqTmC02MMa2Al7DocaxmkTIkcoiGMJmeT11Afc4UgcGh1iceVvv9oQfqg==, tarball: https://codeload.github.com/allowit-hq/allowit-core/tar.gz/e3f860a243675f21784e8aedf92303e8004b34bf}
+    version: 0.5.0
 
   '@exodus/bytes@1.16.0':
     resolution: {integrity: sha512-IcpW84uEn3N7ETtNZMlxKhfl6Pec8rUNGOTBtWbK1FKhJxIFAptZyVrvVRVBimAJxJCgc3PxepxkdWWG4DVzfA==}
@@ -388,6 +395,8 @@ packages:
     engines: {node: '>=18'}
 
 snapshots:
+
+  '@allowit/core@https://codeload.github.com/allowit-hq/allowit-core/tar.gz/e3f860a243675f21784e8aedf92303e8004b34bf': {}
 
   '@exodus/bytes@1.16.0(@noble/hashes@2.4.0)':
     optionalDependencies:
