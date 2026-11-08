@@ -345,6 +345,71 @@ pub trait AgentSigner: Send + Sync {
     fn account(&self) -> &str;
     fn sign_hash(&self, digest: &[u8; 32]) -> sdk::Result<[u8; 64]>;
 }
+/// The exit code of a policy denial in the shared CLI exit table.
+const POLICY_DENIED: i32 = 20;
+/// A typed engine refusal. See `provider::diagnostics`.
+#[derive(Deserialize)]
+struct Refusal {
+    code: String,
+    #[serde(default)]
+    details: RefusalDetails,
+}
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RefusalDetails {
+    rule: Option<String>,
+    error: Option<String>,
+    contract_error: Option<u32>,
+}
+/// The client error for a non-2xx engine reply. A 409 `policy_denied` names the denying rule
+/// and error and uses the policy-denial exit code. A 409 `wallet_rejected` is a contract
+/// rejection: the wallet, its asset or a vault refused the operation, and it names the contract
+/// error. Every other reply leaves the operation unresolved.
+fn refusal(status: u16, body: &[u8]) -> Error {
+    let refusal = serde_json::from_slice::<Refusal>(body)
+        .ok()
+        .filter(|_| status == 409);
+    // Engine names reach the terminal only as plain identifiers.
+    let name = |v: &Option<String>| {
+        v.clone().filter(|v| {
+            (1..=64).contains(&v.len()) && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        })
+    };
+    match refusal {
+        Some(Refusal { code, details: d }) if code == "policy_denied" => {
+            let reason = match (name(&d.rule), name(&d.error), d.contract_error) {
+                (Some(rule), Some(error), _) => format!("`{rule}` ({error})"),
+                (Some(rule), None, _) => format!("`{rule}`"),
+                (None, Some(error), Some(code)) => format!("{error} (contract error {code})"),
+                (None, Some(error), None) => error,
+                (None, None, Some(code)) => format!("contract error {code}"),
+                (None, None, None) => "no rule named".into(),
+            };
+            let mut error = Error::api(
+                status,
+                format!("The policy denied this operation: {reason}"),
+            );
+            error.code = POLICY_DENIED;
+            error
+        }
+        Some(Refusal { code, details: d }) if code == "wallet_rejected" => Error::api(
+            status,
+            match (name(&d.error), d.contract_error) {
+                (Some(error), Some(code)) => format!(
+                    "The operation was rejected in simulation: {error} (contract error {code})"
+                ),
+                (None, Some(code)) => {
+                    format!("The operation was rejected in simulation: contract error {code}")
+                }
+                (_, None) => "The operation was rejected in simulation".into(),
+            },
+        ),
+        _ => Error::api(
+            status,
+            "Stellar operation was not resolved; retain the original request ID",
+        ),
+    }
+}
 fn validate_response_receipt(r: &Response) -> Result<()> {
     let p = &r.prepared;
     if let Some(receipt) = &r.receipt {
@@ -441,7 +506,7 @@ impl Client {
         ];
         let response = self
             .http
-            .send_success_body(
+            .send(
                 Request {
                     method: Method::Post,
                     url: &format!("{}{path}", self.origin),
@@ -456,10 +521,7 @@ impl Client {
                 )
             })?;
         if !(200..300).contains(&response.status) {
-            return Err(Error::api(
-                response.status,
-                "Stellar operation was not resolved; retain the original request ID",
-            ));
+            return Err(refusal(response.status, &response.body));
         }
         let mut parsed: Response = serde_json::from_slice(&response.body).map_err(|_| {
             Error::uncertain("Invalid Stellar response; recover the original request ID")
@@ -1414,6 +1476,68 @@ mod native_revalidation_tests {
                 });
             }
         });
+    }
+    #[test]
+    fn engine_refusals_keep_the_denying_rule_and_exit_code() {
+        // The engine replies of the testnet rerun: a portable rule denial and a Custom wallet
+        // simulation rejection whose contract the RPC did not identify.
+        let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
+        for (status, body, code, text) in [
+            (
+                "409 Conflict",
+                json!({"code":"policy_denied","details":{"contractError":null,"error":"PaymentLimitExceeded","rule":"payment_limit"},"error":"The policy denied this operation: `payment_limit` (PaymentLimitExceeded)."}),
+                20,
+                "Allowit returned HTTP 409: The policy denied this operation: `payment_limit` (PaymentLimitExceeded)",
+            ),
+            (
+                "409 Conflict",
+                json!({"code":"policy_denied","details":{"contractError":18,"error":"PolicyDenied","rule":null},"error":"denied"}),
+                20,
+                "Allowit returned HTTP 409: The policy denied this operation: PolicyDenied (contract error 18)",
+            ),
+            (
+                "409 Conflict",
+                json!({"code":"wallet_rejected","details":{"contract":null,"contractError":18},"error":"The operation failed in simulation: an unidentified contract raised contract error 18."}),
+                4,
+                "Allowit returned HTTP 409: The operation was rejected in simulation: contract error 18",
+            ),
+            (
+                "409 Conflict",
+                json!({"code":"policy_denied","details":{"rule":"payment_limit\u{1b}[2J","error":"Paid\nout"}}),
+                20,
+                "Allowit returned HTTP 409: The policy denied this operation: no rule named",
+            ),
+            (
+                "409 Conflict",
+                json!({"error":"Reconcile the original Stellar operation before preparing another."}),
+                4,
+                "Allowit returned HTTP 409: Stellar operation was not resolved; retain the original request ID",
+            ),
+            (
+                "503 Service Unavailable",
+                json!({"code":"policy_denied","details":{"rule":"payment_limit","error":"PaymentLimitExceeded"}}),
+                4,
+                "Allowit returned HTTP 503: Stellar operation was not resolved; retain the original request ID",
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let server = reply_once(
+                listener,
+                Duration::ZERO,
+                status,
+                serde_json::to_vec(&body).unwrap(),
+            );
+            let error = match engine_client(p.config.clone(), &origin).post(
+                "/api/native/execute",
+                json!({"policyId":"engine-policy","requestId":"denied-001","phase":"prepare"}),
+            ) {
+                Ok(_) => panic!("{body} must be refused"),
+                Err(error) => error,
+            };
+            server.join().unwrap();
+            assert_eq!((error.code, error.message.as_str()), (code, text), "{body}");
+        }
     }
     #[test]
     fn failed_policy_wallet_envelope_remains_unknown_on_the_server_client_wire() {
