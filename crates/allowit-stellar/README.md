@@ -86,7 +86,7 @@ Policy wallet custody calls the layout 4 `execute` entrypoint (`CONTRACT_VERSION
 
 `admin::PolicyInstallation::wallet_config` derives the native asset contract, source binding, rules and wallet address from admitted public installation inputs. `admin::wallet_salt` preserves the policy-instance address domain. `PolicyValue::from_core` and `to_core` preserve the common value variant and check native address encoding. SDK adapters convert common inputs here. They retain source admission, orchestration and storage.
 
-Funding and renewal return `owner_intent::OwnerTransaction` after native simulation and complete intent validation. They neither sign nor submit. Fresh builders date source and simulation observations with bracketing native heads. They reread the source before returning and reject changed accounts or stale resources.
+Funding and renewal return `owner_intent::OwnerTransaction` after native simulation and complete intent validation. They neither sign nor submit. Fresh builders date source and simulation observations with bracketing native heads. An observation may trail the closing head by at most five ledgers, because one public RPC call can take a full ledger close. They reread the source before returning and reject changed accounts or stale resources.
 
 `rpc::observe_account` exposes the dated account separately. Native network identity admits the pubnet/mainnet alias while packet fields retain the selected config spelling. `PreparedOwnerOperation::owner_transaction` refuses a pending owner handoff. Its metadata conversion grants no signing authority.
 

@@ -125,6 +125,22 @@ fn balance_observes_explicit_zero_and_positive_i128_and_exact_unsigned_native_ca
     }
 }
 #[test]
+fn observation_may_trail_the_closing_head_by_a_few_slow_rpc_calls() {
+    // At public RPC latency one call can take a full ledger close, so the closing head often
+    // lands two or more ledgers after the observation.
+    for closing in [121, 122, 125] {
+        let rpc = Balance::new(5);
+        *rpc.heads.lock().unwrap() = vec![120, closing];
+        let observed =
+            rpc::asset_balance(&rpc, "stellar:testnet", &asset(), &account(), &account())
+                .unwrap_or_else(|e| panic!("closing head {closing}: {e}"));
+        assert_eq!(observed.ledger, 120);
+    }
+    let rpc = Balance::new(5);
+    *rpc.heads.lock().unwrap() = vec![120, 126];
+    assert!(rpc::asset_balance(&rpc, "stellar:testnet", &asset(), &account(), &account()).is_err());
+}
+#[test]
 fn missing_malformed_authorized_restored_and_stale_balances_never_become_zero() {
     for variant in 0..13 {
         let mut rpc = Balance::new(0);
@@ -150,7 +166,7 @@ fn missing_malformed_authorized_restored_and_stale_balances_never_become_zero() 
             8 => rpc.response["latestLedger"] = json!(119),
             9 => rpc.response["latestLedger"] = json!(121),
             10 => *rpc.heads.lock().unwrap() = vec![120, 119],
-            11 => *rpc.heads.lock().unwrap() = vec![120, 122],
+            11 => *rpc.heads.lock().unwrap() = vec![120, 126],
             _ => rpc.response["results"][0]["xdr"] = json!("malformed"),
         }
         assert!(

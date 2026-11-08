@@ -48,9 +48,20 @@ pub(crate) fn network(rpc: &dyn Rpc, selected: &str) -> Result<()> {
 pub(crate) fn head(rpc: &dyn Rpc) -> Result<u32> {
     ledger(&rpc.call("getLatestLedger", json!({}))?["sequence"])
 }
+/// The most ledgers that an observation may trail the closing head. After the observed read,
+/// a bracket makes up to two more RPC calls. A public RPC call can take as long as a ledger
+/// close (about 5 s, slow calls near 8 s), so two calls can span 4 closes; one more ledger
+/// absorbs an RPC node that trails its peers. The window is about 25 s.
+pub(crate) const MAX_OBSERVATION_LAG: u32 = 5;
+/// The closing head after an observation dated `observed`. The observation is current: it is
+/// not older than the head read before it, not newer than the closing head and at most
+/// [`MAX_OBSERVATION_LAG`] ledgers behind it.
 pub(crate) fn current(rpc: &dyn Rpc, before: u32, observed: u32) -> Result<u32> {
     let after = head(rpc)?;
-    if after < before || observed < before || observed > after || after.saturating_sub(observed) > 1
+    if after < before
+        || observed < before
+        || observed > after
+        || after.saturating_sub(observed) > MAX_OBSERVATION_LAG
     {
         return Err("Owner observation ledger is stale, future or inconsistent".into());
     }
