@@ -7,6 +7,7 @@ const passphrase = 'Test SDF Network ; September 2015';
 const [owner, agent, server] = [1, 2, 3].map(seed => Keypair.fromRawEd25519Seed(Buffer.alloc(32, seed)).publicKey());
 const wallet = 'C' + 'A'.repeat(55);
 const signatures = [];
+const forged = new Set();
 mock.module('@stellar/freighter-api', {defaultExport: {
   getAddress: async () => ({address: owner}),
   getNetworkDetails: async () => ({networkPassphrase: passphrase}),
@@ -16,7 +17,9 @@ mock.module('@stellar/freighter-api', {defaultExport: {
   },
 }});
 mock.module(new URL('../dist/owner-verifier.js', import.meta.url).href, {namedExports: {
-  deriveAdkOwnerWallet: async () => wallet, verifyAdkOwnerStep: async () => {}, verifyAdkOwnerSignature: async () => {},
+  deriveAdkOwnerWallet: async () => wallet, verifyAdkOwnerStep: async () => {}, verifyAdkOwnerSignature: async (_step, _expected, signedXdr) => {
+    if (forged.has(signedXdr)) throw new Error('The owner signature is invalid.');
+  },
 }});
 mock.module(new URL('../dist/portable-export.js', import.meta.url).href, {namedExports: {
   object: value => value && typeof value === 'object' && !Array.isArray(value) ? value : null,
@@ -129,4 +132,16 @@ test('a lost send expires, and then the owner signs a new step', async t => {
   const journal = JSON.parse(entries.get(key));
   assert.equal(journal.pending, undefined);
   assert.equal(journal.funded.step.transactionHash, '2'.repeat(64));
+});
+
+test('a wrong wallet signature is never saved, so the owner can sign again', async () => {
+  signatures.length = 0;
+  forged.add('AAAA1signed');
+  const {entries, input} = browser(confirmed);
+  await assert.rejects(deployAdkOwnerDraft(input), /signature is invalid/);
+  assert.equal(entries.get(adkOwnerKey(owner, proposal)), undefined);
+  const result = await deployAdkOwnerDraft(input);
+  assert.equal(result.wallet, wallet);
+  assert.deepEqual(signatures, ['AAAA1', 'AAAA2']);
+  forged.clear();
 });

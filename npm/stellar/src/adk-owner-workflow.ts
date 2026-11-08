@@ -209,7 +209,9 @@ export async function deployAdkOwnerDraft({
       ensureCurrent();
       onStep(step.action === 'fund' ? 'Sign the XLM funding in your wallet…' : 'Sign the deployment in your wallet…');
       let signed: Signed | undefined;
-      await signStellarTransaction(step.transactionXdr, owner, network, signedXdr => {
+      // Only verified bytes enter the journal. Invalid bytes there would block every later Resume.
+      await signStellarTransaction(step.transactionXdr, owner, network, async signedXdr => {
+        await verifyAdkOwnerSignature(step, expected, signedXdr);
         signed = {step, expected, signedXdr, sent: false};
         save({...journal, pending: signed});
       });
