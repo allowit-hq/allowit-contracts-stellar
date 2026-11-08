@@ -46,3 +46,7 @@ for names in "allowit_simple_engine allowit_simple_policy_engine" "allowit_commo
   read -r package library <<< "$names"
   mv "target/wasm32v1-none/release/$package.wasm" "target/wasm32v1-none/release/$library.wasm"
 done
+
+# The browser owner verifier embeds this hash. CI rejects a committed copy that differs.
+shasum -a 256 target/wasm32v1-none/release/allowit_common_policy_engine.wasm | cut -d ' ' -f 1 \
+  > crates/allowit-stellar/allowit_common_policy_engine.wasm.sha256

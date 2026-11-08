@@ -4,7 +4,10 @@ use crate::{PolicyLanguage, PolicyParams, PolicyTier, Result, WalletConfig, Wall
 use std::cell::RefCell;
 
 const NETWORK: &str = "stellar:testnet";
-const COMMON_WASM_HASH: &str = "30a48ea031932e9458aa46f989e161aacf6d081b14659b94d9f1372597572b1d";
+/// SHA-256 of the built Common engine Wasm. `scripts/build-contracts.sh` writes the file.
+const COMMON_WASM_HASH: &str =
+    include_str!("../allowit_common_policy_engine.wasm.sha256").trim_ascii_end();
+const _: () = assert!(COMMON_WASM_HASH.len() == 64);
 const INPUT_BYTES: usize = 512 * 1024;
 
 thread_local! {

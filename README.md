@@ -237,6 +237,14 @@ allowit_wallet_engine.wasm
 allowit_engine_parent.wasm
 ```
 
+The build also writes the SHA-256 of the Common Wasm to
+`crates/allowit-stellar/allowit_common_policy_engine.wasm.sha256`. The browser owner verifier
+embeds this file and admits only that Common Wasm. After a Common change, commit the file. Then
+rebuild the verifier on arm64 macOS with `sh scripts/build-browser-owner-verifier.sh --update`.
+That command also writes the verifier hash to `verifierHash` in
+`npm/stellar/src/owner-verifier.ts` and `npm/stellar/dist/owner-verifier.js`. CI rejects a stale
+hash file, verifier or `verifierHash`.
+
 Write a public manifest of source hashes and artifact hashes with `python3 scripts/artifacts.py --output PATH`.
 
 Approved release tags also build, deploy and verify the release on Testnet before publishing its
