@@ -32,6 +32,9 @@ test('browser verifier authenticates its Wasm and binds exact owner funding', as
   await assert.rejects(verifyAdkOwnerStep(step, {...selection, amount: '1.26'}), invalid);
   await assert.rejects(verifyAdkOwnerStep(step, {...selection, wallet: selection.asset}), invalid);
   await assert.rejects(verifyAdkOwnerSignature(step, selection, step.transactionXdr), invalid);
+  // After the time bound, a new step is refused, but the saved signature still verifies for recovery.
   t.mock.method(Date, 'now', () => step.expiresAt * 1000);
   await assert.rejects(verifyAdkOwnerStep(step, selection), invalid);
+  await verifyAdkOwnerSignature(step, selection, signed);
+  await assert.rejects(verifyAdkOwnerSignature(step, selection, step.transactionXdr), invalid);
 });

@@ -79,8 +79,7 @@ async function invoke<T>(payload: object, operation: (module: Verifier, length: 
   }
 }
 
-function verify(step: AdkOwnerStep, expected: AdkOwnerSelection, signedXdr?: string) {
-  const now = Math.floor(Date.now() / 1000);
+function verify(step: AdkOwnerStep, expected: AdkOwnerSelection, now: number, signedXdr?: string) {
   return invoke({ step, expected, now, signedXdr }, (module, length) => {
     if (module.owner_verify(length) !== 1) {
       throw new Error('The Stellar transaction differs from the reviewed owner action.');
@@ -88,12 +87,17 @@ function verify(step: AdkOwnerStep, expected: AdkOwnerSelection, signedXdr?: str
   });
 }
 
+/** Check a step before the owner signs it. The step must be fresh now. */
 export function verifyAdkOwnerStep(step: AdkOwnerStep, expected: AdkOwnerSelection) {
-  return verify(step, expected);
+  return verify(step, expected, Math.floor(Date.now() / 1000));
 }
 
+/**
+ * Check a saved signed step at the last second of its time bound, not at the present time. The time bound already
+ * limits where it can apply, so an expired step still verifies for recovery and receipts.
+ */
 export function verifyAdkOwnerSignature(step: AdkOwnerStep, expected: AdkOwnerSelection, signedXdr: string) {
-  return verify(step, expected, signedXdr);
+  return verify(step, expected, step.expiresAt - 1, signedXdr);
 }
 
 export function deriveAdkOwnerWallet(owner: string, policyInstance: string) {
