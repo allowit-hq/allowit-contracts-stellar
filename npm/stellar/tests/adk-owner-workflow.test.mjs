@@ -61,7 +61,7 @@ function browser(submit) {
   globalThis.fetch = async url => Response.json(url.includes('/accounts/')
     ? {account_id: owner, sequence: '10'} : {hash: url.split('/').pop(), ledger: 42, successful: true});
   const trace = [];
-  const state = {walletMissing: false};
+  const state = {walletMissing: false, renewalDue: false};
   const steps = ['1', '2'];
   const host = {
     admitPortableBuild: () => true,
@@ -72,9 +72,10 @@ function browser(submit) {
         case 'authoring/adopt': return {policies: [policy], selectedId: policyId};
         case 'native/templates': return {server, templates: [{network, asset, assetSymbol: 'XLM', assetIssuer: null, maxFeeStroops: 1000, tiers: {common: moduleDigest}}]};
         case 'native/config?network=stellar:testnet': return {enginePublicKey: server};
-        case 'native/deploy/prepare': return state.walletMissing
-          ? {policyId, wallet, step: {...fundStep('9'), action: 'create_wallet'}}
-          : {policyId, installed: true, installation: {wallet}};
+        case 'native/deploy/prepare':
+          if (state.walletMissing) return {policyId, wallet, step: {...fundStep('9'), action: 'create_wallet'}};
+          if (state.renewalDue) return {policyId, wallet, step: {...fundStep('8'), action: 'extend'}};
+          return {policyId, installed: true, installation: {wallet}};
         case 'micro/policies': return {policies: [policy]};
         case 'native/owner/prepare': return {policyId, wallet, step: fundStep(steps.shift())};
         case 'native/owner/submit': return submit(body);
@@ -144,4 +145,19 @@ test('a wrong wallet signature is never saved, so the owner can sign again', asy
   assert.equal(result.wallet, wallet);
   assert.deepEqual(signatures, ['AAAA1', 'AAAA2']);
   forged.clear();
+});
+
+test('an installed wallet that needs renewal signs the renewal, then the funding', async () => {
+  signatures.length = 0;
+  const {trace, state, input} = browser(body => {
+    const receipt = confirmed(body);
+    if (receipt.transactionHash !== '8'.repeat(64)) return receipt;
+    state.renewalDue = false;
+    return {...receipt, action: 'extend'};
+  });
+  state.renewalDue = true;
+  const result = await deployAdkOwnerDraft(input);
+  assert.equal(result.wallet, wallet);
+  assert.deepEqual(signatures, ['AAAA8', 'AAAA1']);
+  assert.equal(trace.filter(path => path === 'native/deploy/prepare').length, 2);
 });

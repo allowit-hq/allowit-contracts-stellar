@@ -77,6 +77,25 @@ fn stroops(amount: &str) -> Result<i128> {
     Ok(value)
 }
 
+/// The browser has no RPC to observe the network lifetime target, so it reads the target from the
+/// step. The owner fee ceiling bounds the rent of any target, and the footprint stays the selected
+/// wallet instance and code.
+fn extension_target(transaction_xdr: &str) -> Result<u32> {
+    use stellar_xdr::{Operation, OperationBody, TransactionEnvelope};
+    let TransactionEnvelope::Tx(envelope) = crate::read(transaction_xdr)? else {
+        return Err("Expected an unsigned v1 owner transaction".into());
+    };
+    match envelope.tx.operations.as_slice() {
+        [
+            Operation {
+                body: OperationBody::ExtendFootprintTtl(op),
+                ..
+            },
+        ] => Ok(op.extend_to),
+        _ => Err("Expected exactly one wallet lifetime operation".into()),
+    }
+}
+
 fn verify(input: Input) -> Result<()> {
     let Input {
         step,
@@ -143,6 +162,11 @@ fn verify(input: Input) -> Result<()> {
             from: expected.owner.clone(),
             to: wallet,
             amount: stroops(&expected.amount)?,
+        },
+        "extend" if expected.wallet.is_some() => OwnerAction::Extend {
+            wallet,
+            wasm_hash,
+            extend_to: extension_target(&step.transaction_xdr)?,
         },
         _ => return Err("Unsupported browser owner action".into()),
     };

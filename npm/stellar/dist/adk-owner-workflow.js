@@ -191,7 +191,8 @@ export async function deployAdkOwnerDraft({ host, proposal, session, agent, amou
             ensureCurrent();
             await verifyAdkOwnerStep(step, expected);
             ensureCurrent();
-            onStep(step.action === 'fund' ? 'Sign the XLM funding in your wallet…' : 'Sign the deployment in your wallet…');
+            onStep(step.action === 'fund' ? 'Sign the XLM funding in your wallet…'
+                : step.action === 'extend' ? 'Sign the wallet renewal in your wallet…' : 'Sign the deployment in your wallet…');
             let signed;
             // Only verified bytes enter the journal. Invalid bytes there would block every later Resume.
             await signStellarTransaction(step.transactionXdr, owner, network, async (signedXdr) => {
@@ -206,7 +207,8 @@ export async function deployAdkOwnerDraft({ host, proposal, session, agent, amou
         };
         onStep('Preparing the Stellar wallet…');
         let installed;
-        for (let index = 0; index < 3; index++) {
+        // Upload, creation and a lifetime renewal each take one step before the installation reply.
+        for (let index = 0; index < 4; index++) {
             const reply = await ask('native/deploy/prepare', { policyId, agent });
             if (reply.policyId !== policyId)
                 throw new Error('The deployment reply names a different policy.');
@@ -215,7 +217,7 @@ export async function deployAdkOwnerDraft({ host, proposal, session, agent, amou
                 break;
             }
             if (!reply.step || reply.wallet !== expectedWallet
-                || (reply.step.action !== 'upload_wasm' && reply.step.action !== 'create_wallet'))
+                || !['upload_wasm', 'create_wallet', 'extend'].includes(reply.step.action))
                 throw new Error('The Stellar service did not prepare this wallet for deployment.');
             await sign(reply.step, reply.wallet);
         }
