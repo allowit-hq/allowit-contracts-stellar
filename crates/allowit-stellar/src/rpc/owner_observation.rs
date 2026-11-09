@@ -48,6 +48,10 @@ pub(crate) fn network(rpc: &dyn Rpc, selected: &str) -> Result<()> {
 pub(crate) fn head(rpc: &dyn Rpc) -> Result<u32> {
     ledger(&rpc.call("getLatestLedger", json!({}))?["sequence"])
 }
+/// The observation crossed more than one ledger, or the RPC ledgers disagree. A new
+/// observation can succeed.
+pub(crate) const STALE_OBSERVATION: &str =
+    "Owner observation ledger is stale, future or inconsistent";
 /// The most ledgers that an observation may trail the closing head. After the observed read,
 /// a bracket makes up to two more RPC calls. A public RPC call can take as long as a ledger
 /// close (about 5 s, slow calls near 8 s), so two calls can span 4 closes; one more ledger
@@ -63,7 +67,7 @@ pub(crate) fn current(rpc: &dyn Rpc, before: u32, observed: u32) -> Result<u32> 
         || observed > after
         || after.saturating_sub(observed) > MAX_OBSERVATION_LAG
     {
-        return Err("Owner observation ledger is stale, future or inconsistent".into());
+        return Err(STALE_OBSERVATION.into());
     }
     Ok(after)
 }

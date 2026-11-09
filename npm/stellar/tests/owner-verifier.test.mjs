@@ -32,6 +32,22 @@ test('browser verifier authenticates its Wasm and binds exact owner funding', as
   await assert.rejects(verifyAdkOwnerStep(step, {...selection, amount: '1.26'}), invalid);
   await assert.rejects(verifyAdkOwnerStep(step, {...selection, wallet: selection.asset}), invalid);
   await assert.rejects(verifyAdkOwnerSignature(step, selection, step.transactionXdr), invalid);
+  // After the time bound, a new step is refused, but the saved signature still verifies for recovery.
   t.mock.method(Date, 'now', () => step.expiresAt * 1000);
   await assert.rejects(verifyAdkOwnerStep(step, selection), invalid);
+  await verifyAdkOwnerSignature(step, selection, signed);
+  await assert.rejects(verifyAdkOwnerSignature(step, selection, step.transactionXdr), invalid);
+});
+
+test('browser verifier binds a lifetime renewal to the selected wallet and code', async t => {
+  t.mock.method(Date, 'now', () => 1_800_000_000_000);
+  const renewal = JSON.parse(await readFile(new URL('./fixtures/owner-renewal.json', import.meta.url), 'utf8'));
+  const wasm = await readFile(wasmUrl);
+  t.mock.method(globalThis, 'fetch', async () => new Response(wasm));
+  await verifyAdkOwnerStep(renewal.step, renewal.selection);
+  await verifyAdkOwnerSignature(renewal.step, renewal.selection, renewal.signed);
+  // Another policy instance selects another wallet, so the renewal footprint differs.
+  const policyInstance = '05'.repeat(32);
+  const other = {...renewal.selection, policyInstance, wallet: await deriveAdkOwnerWallet(renewal.selection.owner, policyInstance)};
+  await assert.rejects(verifyAdkOwnerStep(renewal.step, other), /differs from the reviewed owner action/);
 });
