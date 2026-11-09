@@ -171,40 +171,13 @@ pub fn tokens_for(rail: &str) -> &'static [Token] {
     }
 }
 
-pub const FAMILY: crate::host::routing::Family = crate::host::routing::Family("stellar");
-pub fn networks() -> Vec<crate::host::routing::RailInfo> {
-    // Native owns protocol aliases. The SDK adds only these historical presentation spellings.
-    static ALIASES: std::sync::OnceLock<Vec<Vec<&'static str>>> = std::sync::OnceLock::new();
-    let aliases = ALIASES.get_or_init(|| {
-        native::networks::NETWORKS
-            .iter()
-            .map(|network| {
-                let mut aliases = network.aliases.to_vec();
-                aliases.push(if network.testnet {
-                    "stellar-testnet"
-                } else {
-                    "stellar-mainnet"
-                });
-                aliases
-            })
-            .collect()
-    });
-    native::networks::NETWORKS
-        .iter()
-        .zip(aliases)
-        .map(|(n, aliases)| crate::host::routing::RailInfo {
-            id: n.id,
-            label: if n.testnet {
-                "Stellar Testnet"
-            } else {
-                "Stellar Mainnet"
-            },
-            aliases,
-            family: FAMILY,
-            testnet: n.testnet,
-        })
-        .collect()
+/// The Stellar Asset Contract id of a token on a network.
+pub fn token_contract(network: &str, token: &Token) -> Option<String> {
+    let asset = native::asset_from_identity(token.code, token.issuer).ok()?;
+    native::sac_address(network, &asset).ok()
 }
+
+pub const FAMILY: crate::host::routing::Family = crate::plugin::FAMILY;
 pub fn capabilities(network: &str) -> crate::host::execution::Capabilities {
     crate::host::execution::Capabilities {
         curve: "ed25519",

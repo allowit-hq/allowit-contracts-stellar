@@ -9,7 +9,9 @@ fn scan(arg: Option<&str>) {
     if let Some(arg) = arg {
         cmd.arg(arg);
     }
-    let out = cmd.output().expect("vendor-boundary needs Node 22 or later on PATH");
+    let out = cmd
+        .output()
+        .expect("vendor-boundary needs Node 22 or later on PATH");
     assert!(
         out.status.success(),
         "vendor-boundary {arg:?} failed:\n{}{}",

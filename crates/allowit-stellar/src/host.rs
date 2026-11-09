@@ -10,8 +10,7 @@ pub mod routing {
     use super::error::{Error, Result};
     pub use allowit_core::vendor::routing::{Family, RailInfo};
     pub fn all() -> &'static [RailInfo] {
-        static RAILS: std::sync::OnceLock<Vec<RailInfo>> = std::sync::OnceLock::new();
-        RAILS.get_or_init(crate::provider::networks)
+        crate::plugin::NETWORKS
     }
     pub fn info(network: &str) -> Result<&'static RailInfo> {
         all()

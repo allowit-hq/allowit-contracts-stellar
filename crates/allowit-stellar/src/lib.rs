@@ -4,6 +4,10 @@
 #[cfg(not(target_arch = "wasm32"))]
 mod host;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod plugin;
+#[cfg(not(target_arch = "wasm32"))]
+pub use plugin::PLUGIN;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod provider;
 #[cfg(all(not(target_arch = "wasm32"), any(test, feature = "test-support")))]
 pub mod test_support;

@@ -61,7 +61,7 @@ jobs:
           workspaces: crates/allowit-stellar -> target
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
       - run: node scripts/vendor-boundary.mjs --self-test && node scripts/vendor-boundary.mjs
       - run: cargo fmt --manifest-path crates/allowit-stellar/Cargo.toml --check
       - run: cargo test --locked --manifest-path crates/allowit-stellar/Cargo.toml

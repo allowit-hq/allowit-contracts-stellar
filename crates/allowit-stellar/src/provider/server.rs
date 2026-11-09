@@ -330,10 +330,19 @@ pub fn same_snapshot(a: &Snapshot, b: &Snapshot) -> Result<bool> {
 }
 pub fn receipt_info(p: &Packet) -> Result<ReceiptInfo> {
     let r: rpc::VerifiedReceipt = decode_packet(p)?;
+    let result: stellar_xdr::TransactionResult = checked(native::read(&r.result_xdr))?;
     Ok(ReceiptInfo {
         transaction_hash: r.transaction_hash,
         status: status(r.status),
         observed_height: u64::from(r.ledger),
+        fee: crate::host::runtime::Fee {
+            native_units: u128::try_from(result.fee_charged)
+                .map_err(|_| Error::config("Invalid Stellar receipt fee"))?,
+            // The engine sets the charge through ServerHooks::charged_fee.
+            charged_units: 0,
+        },
+        // The prepared operation carries its debits; the receipt adds only the fee.
+        debits: Vec::new(),
     })
 }
 pub struct Provider {
