@@ -18,6 +18,7 @@ const MAX_FOOTPRINT: usize = 256;
 pub struct OwnerTransaction {
     pub network: String,
     pub action: String,
+    #[serde(rename = "payload")]
     pub transaction_xdr: String,
     pub transaction_hash: [u8; 32],
     pub expires_at: u64,

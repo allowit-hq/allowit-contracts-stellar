@@ -1,17 +1,16 @@
 //! Core contracts used by the native adapter implementation.
-pub use allowit_policy_sdk::client::error;
-pub use allowit_policy_sdk::vendor::request;
-pub use allowit_policy_sdk::vendor::wallet::{KeyProvider, PrivateSigner, Signer};
-pub use allowit_policy_sdk::vendor::{
+pub use allowit_core::client::error;
+pub use allowit_core::vendor::request;
+pub use allowit_core::vendor::wallet::{KeyProvider, PrivateSigner, Signer};
+pub use allowit_core::vendor::{
     authoring, config, execution, generation, input, owner, owner_session, profiles, request_proof,
     runtime, typed_request,
 };
 pub mod routing {
     use super::error::{Error, Result};
-    pub use allowit_policy_sdk::vendor::routing::{Family, RailInfo};
+    pub use allowit_core::vendor::routing::{Family, RailInfo};
     pub fn all() -> &'static [RailInfo] {
-        static RAILS: std::sync::OnceLock<Vec<RailInfo>> = std::sync::OnceLock::new();
-        RAILS.get_or_init(crate::provider::networks)
+        crate::plugin::NETWORKS
     }
     pub fn info(network: &str) -> Result<&'static RailInfo> {
         all()
@@ -20,7 +19,7 @@ pub mod routing {
             .ok_or_else(|| {
                 Error::usage(format!(
                     "unknown rail {}; run allowit rail ls",
-                    allowit_policy_sdk::client::error::quoted(network)
+                    allowit_core::client::error::quoted(network)
                 ))
             })
     }
@@ -32,6 +31,6 @@ pub mod routing {
     }
 }
 pub mod vendors {
-    pub use allowit_policy_sdk::vendor::profiles::ProfileBinding;
-    pub use allowit_policy_sdk::vendor::{OwnerProvider, RuntimeProvider};
+    pub use allowit_core::vendor::profiles::ProfileBinding;
+    pub use allowit_core::vendor::{OwnerProvider, RuntimeProvider};
 }

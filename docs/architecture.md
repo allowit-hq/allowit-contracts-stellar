@@ -390,20 +390,14 @@ request denies `lifetime_spending_limit`; unpriced state of the day or an unpric
 both daily limits (`Unpriced`). A sum outside its integer range is `Overflow`. Standard
 configuration rejects negative limits.
 
-The op names are the general operations of `AllowitOperation`: `transfer`, `swap`, `deposit`
-and `redeem`, plus three custom-call forms. `custom` admits any custom call, `custom.<function>`
-that function on any contract, and `custom:<contract>.<function>` that function on that contract
-instance. A function is 1 to 32 ASCII letters, digits or underscores. A contract is 1 or more
-ASCII letters or digits on both backends. The core does not check a rail's address format: the rail
-checks each address that it supplies, so an entry that names no address of the rail matches no
-request. For Stellar, `contract_admin.py` accepts only a `C` StrKey before the owner sets the entry.
-A custom call whose contract and function form no such name is admitted by no entry, not even
-`*`. The policy core names no rail operation. The Stellar wallet maps its native calls onto the
-general operations: a SEP-41 transfer is `transfer`, a SEP-56 deposit `deposit`, a router swap
-`swap` and a SEP-56 redeem `redeem`. `operations` returns the request's op
-name, so a policy can `match` it; an op outside the list is `OperationNotAllowed`. Any other value,
-such as `Str` `transfer` or an unknown name, is `InvalidParam`. Even transfers need the param: a
-policy that should only swap or run custom code leaves `transfer` out.
+Stellar admits only the general operations `transfer`, `swap`, `deposit` and `redeem` of
+`AllowitOperation`. The wallet maps its native calls onto them: a SEP-41 transfer is `transfer`, a
+SEP-56 deposit `deposit`, a router swap `swap` and a SEP-56 redeem `redeem`. The policy core names
+no rail operation. Its custom-call entries, described in
+[Allowit core](https://github.com/allowit-hq/allowit-core#operations), admit no Stellar request.
+`operations` returns the request's op name, so a policy can `match` it; an op outside the list is
+`OperationNotAllowed`. Any other value, such as `Str` `transfer` or an unknown name, is
+`InvalidParam`. Even transfers need the param: a policy that should only swap leaves `transfer` out.
 
 ## Standard prefix
 
@@ -450,23 +444,21 @@ when the host verifies the whole signed tree at the wallet's first `require_auth
 Soroswap router and SEP-56 reference vaults, that is before any debit. Atomicity rolls them back on
 any later failure, such as a router's minimum-output check.
 
-## Custom calls, re-entry and panics
+## Debits, re-entry and panics
 
-Two rules hold on every rail:
+Two rules from [Allowit core](https://github.com/allowit-hq/allowit-core#operations) hold on every
+rail: a custom call never moves wallet funds, and a policy never re-enters the wallet. Stellar
+admits no custom call. Each delegated transfer, deposit, swap and redeem authorizes exactly one
+debit, and the canonical rules check it: transfer and deposit one `transfer` of the asset; swap one
+`transfer` of the first path token from the wallet to the first pair for exactly `amount_in`. An
+intercepted redeem authorizes only the call `redeem(shares, wallet, wallet, wallet)`; the vault's
+own code decides the burn and the payout, and only `execute` checks the share debit, the underlying
+asset and `min_assets`.
 
-- A custom call never moves wallet funds. Only the native operations transfer, deposit, swap and
-  redeem debit the wallet. Each authorizes exactly one debit, and the canonical rules check it:
-  transfer and deposit one `transfer` of the asset; swap one `transfer` of the first path token from
-  the wallet to the first pair for exactly `amount_in`. An intercepted redeem authorizes only the
-  call `redeem(shares, wallet, wallet, wallet)`; the vault's own code decides the burn and the
-  payout, and only `execute` checks the share debit, the underlying asset and `min_assets`.
-- A policy never re-enters the wallet, also on a rail that does not block re-entry natively.
+On Stellar the wallet's authorization enforces both rules:
 
-On Stellar both rules follow from the wallet's authorization:
-
-- An agent custom call gets no nested authorization from the wallet, so a contract that it reaches
-  cannot spend for the wallet. An agent deposit grants exactly one: the asset `transfer` of the
-  checked amount from the wallet to the vault. An agent swap grants exactly the signed `transfer`
+- An agent deposit grants exactly one nested authorization: the asset `transfer` of the checked
+  amount from the wallet to the vault. An agent swap grants exactly the signed `transfer`
   sub-invocation. An agent redeem grants only the `redeem` call, and the burn needs no token
   authorization.
 - An intercepted transfer, swap or redeem runs the policy in the wallet's `__check_auth`, which the
@@ -486,35 +478,7 @@ On Stellar both rules follow from the wallet's authorization:
   authorizes the scopes that the owner signs and can call any contract, `token.approve` included.
   An allowance that it leaves is the owner's choice.
 
-`allowit::reentry_transfer` is the only exception. It exists only on rails that implement it.
-Stellar has none, so a policy that calls it does not compile. Where it exists, every condition
-applies:
-
-- only a Custom wallet has it, and the owner approves it at install;
-- it moves one exact amount, which the transfer rules check;
-- the wallet stores the policy state, nonce and replay marker before the transfer;
-- its authorization is one-shot;
-- no other re-entry occurs, and no allowance remains after it.
-
-A policy can check each op with its own params and args:
-
-```rust
-pub fn execute(ctx: &AllowitContext) -> allowit::Result {
-    match allowit::operations(ctx, &ctx.params[allowit::OPERATIONS])? {
-        "custom:CPOOL….swap" => {
-            // "at most 50 XLM per swap"
-            let amount: i128 = allowit::arg(ctx, "amount");
-            let limit: i128 = allowit::param(ctx, "swap_limit");
-            if amount > limit { panic!("swap above swap_limit"); }
-        }
-        "custom:CPOOL….claim" => { /* read claim args */ }
-        _ => {}
-    }
-    Ok(())
-}
-```
-
-An op that the `operations` param admits but that has no arm runs with no per-op checks.
+Stellar does not implement `allowit::reentry_transfer`, so a policy that calls it does not compile.
 
 ### Panics
 
@@ -831,7 +795,11 @@ control native transactions. Its policy source and economic checks run offchain 
 
 ## Crate boundaries
 
-The portable `allowit` package in [Allowit core](https://github.com/allowit-hq/allowit-core/tree/main/crates/allowit) holds the shared rule core (`core.rs`) and both backends. The core with the host
-backend becomes `sdk/core` in the SDK repository, for the offchain server and SDK evaluator. The
-Soroban backend with the policy wallet, protocol, custom policy and engine crates becomes
-`crates/allowit-stellar`. Authored policy names only `allowit::`, so the split does not change policy source.
+[Allowit core](https://github.com/allowit-hq/allowit-core) holds the shared rule core (`core.rs`)
+and its host backend. The offchain server and the SDK evaluator run policies on the host backend.
+`crates/policy` (`allowit-stellar-policy`) is the Soroban backend. Its `build.rs` copies `core.rs`
+from the pinned Core release, and `src/lib.rs` includes that copy. The custody core, protocol,
+engine and wallet contracts build on this backend. `crates/allowit-stellar` (`allowit-stellar`) is
+the offchain rail crate, in its own Cargo workspace. The SDK engine composes it to prepare,
+authorize and settle operations. Authored policy names only `allowit::`, so one source builds on
+both backends.

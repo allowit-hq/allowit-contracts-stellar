@@ -4,7 +4,10 @@ use crate::{PolicyLanguage, PolicyParams, PolicyTier, Result, WalletConfig, Wall
 use std::cell::RefCell;
 
 const NETWORK: &str = "stellar:testnet";
-const COMMON_WASM_HASH: &str = "30a48ea031932e9458aa46f989e161aacf6d081b14659b94d9f1372597572b1d";
+/// SHA-256 of the built Common engine Wasm. `scripts/build-contracts.sh` writes the file.
+const COMMON_WASM_HASH: &str =
+    include_str!("../allowit_common_policy_engine.wasm.sha256").trim_ascii_end();
+const _: () = assert!(COMMON_WASM_HASH.len() == 64);
 const INPUT_BYTES: usize = 512 * 1024;
 
 thread_local! {
@@ -77,6 +80,25 @@ fn stroops(amount: &str) -> Result<i128> {
     Ok(value)
 }
 
+/// The browser has no RPC to observe the network lifetime target, so it reads the target from the
+/// step. The owner fee ceiling bounds the rent of any target, and the footprint stays the selected
+/// wallet instance and code.
+fn extension_target(transaction_xdr: &str) -> Result<u32> {
+    use stellar_xdr::{Operation, OperationBody, TransactionEnvelope};
+    let TransactionEnvelope::Tx(envelope) = crate::read(transaction_xdr)? else {
+        return Err("Expected an unsigned v1 owner transaction".into());
+    };
+    match envelope.tx.operations.as_slice() {
+        [
+            Operation {
+                body: OperationBody::ExtendFootprintTtl(op),
+                ..
+            },
+        ] => Ok(op.extend_to),
+        _ => Err("Expected exactly one wallet lifetime operation".into()),
+    }
+}
+
 fn verify(input: Input) -> Result<()> {
     let Input {
         step,
@@ -143,6 +165,11 @@ fn verify(input: Input) -> Result<()> {
             from: expected.owner.clone(),
             to: wallet,
             amount: stroops(&expected.amount)?,
+        },
+        "extend" if expected.wallet.is_some() => OwnerAction::Extend {
+            wallet,
+            wasm_hash,
+            extend_to: extension_target(&step.transaction_xdr)?,
         },
         _ => return Err("Unsupported browser owner action".into()),
     };

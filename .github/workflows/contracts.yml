@@ -63,8 +63,15 @@ jobs:
           rustup target add wasm32v1-none --toolchain 1.98.0
       - name: Build all contract Wasm
         run: scripts/build-contracts.sh
+      - name: Require the committed Common Wasm hash
+        run: git diff --exit-code crates/allowit-stellar/allowit_common_policy_engine.wasm.sha256
       - name: Local authorization and custody regressions
         run: cargo test --workspace --locked
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Verify browser owner transaction admission
+        run: node --test npm/stellar/tests/owner-verifier.test.mjs
       - name: Native administration and release automation regressions
         run: |
           python3 -m venv "$RUNNER_TEMP/wallet-admin"

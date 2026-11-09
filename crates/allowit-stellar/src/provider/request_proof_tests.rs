@@ -1,8 +1,5 @@
-use crate::host::{
-    error::Error,
-    request_proof::{Protocol, authorize, verify},
-};
-use allowit_stellar_wallet::{self as native, signing};
+use crate::host::request_proof::{Protocol, authorize, verify};
+use crate::{self as native, signing};
 fn protocol() -> Protocol {
     super::server::request_proof_protocol()
 }
@@ -12,7 +9,7 @@ fn signer() -> signing::LocalSigner {
 fn proof(at: u64, path: &str, body: &[u8]) -> String {
     let signer = signer();
     authorize(protocol(), signer.account(), at, path, body, |digest| {
-        signer.sign_digest(digest).map_err(Error::config)
+        signer.sign_digest(digest).map_err(crate::provider::failure)
     })
     .unwrap()
 }

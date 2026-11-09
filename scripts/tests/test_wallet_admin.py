@@ -1138,7 +1138,7 @@ class ContractAdmin(unittest.TestCase):
         import re
         import policy_source
         from core_sources import core_root
-        core = (core_root() / "crates" / "allowit" / "src" / "core.rs").read_text()
+        core = (core_root() / "crates/allowit-core/src/portable/core.rs").read_text()
         for enum, variants in policy_source.ENUMS.items():
             body = re.search(r"pub enum " + enum + r" \{(.*?)\n\s*\}", core, re.S)
             self.assertIsNotNone(body, enum)

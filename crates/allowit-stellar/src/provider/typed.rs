@@ -5,7 +5,7 @@ use crate::host::{
     error::{Error, Result},
     typed_request::operation_nonce,
 };
-use allowit_stellar_wallet::workflow::ExecutionRequest;
+use crate::workflow::ExecutionRequest;
 use serde::Serialize;
 
 #[derive(Debug, Clone, PartialEq)]

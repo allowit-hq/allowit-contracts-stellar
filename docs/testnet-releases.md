@@ -67,7 +67,7 @@ External or unbounded signed packets require separate operator reconciliation.
 Targets remain fixed during the barrier. Initially live resources must remain valid.
 Earlier bounded packets may settle before the barrier completes.
 The controller then freezes current CREATE or REUSE decisions and the expected operator sequence.
-A disappeared REUSE never becomes CREATE.
+A disappeared REUSE never turns into CREATE.
 Missing persistent data alone does not prove absence.
 A conditional target requires successful exact native simulation without restoration metadata before signing.
 A constructor simulation also requires exact Wasm and operator-account readback first.
@@ -92,6 +92,7 @@ A resource without this run's receipt is `observed-existing`.
 ## Outputs and reruns
 
 `source-manifest.json` records the exact tag, source, toolchain, published Core source, sample policy and Wasm hashes.
+Both lockfiles must resolve the one published Core tag that `CORE_SOURCE` in `scripts/testnet_release.py` names. The bundler rejects a Core branch revision, so a release tag needs a published Core tag that holds every Core item the plugin uses.
 The build artifact also carries `release-build.json`, bound to its exact GitHub run and attempt.
 Artifact names include the producing run and attempt to prevent cross-attempt ambiguity.
 The publisher preserves existing source assets and appends an immutable deployment snapshot:

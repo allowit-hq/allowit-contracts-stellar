@@ -5,15 +5,13 @@ use crate::host::{
     profiles::Description,
     runtime::*,
 };
-use allowit_stellar_wallet::{
-    self as native, PreparedOperation, SignedOperation, WalletConfig, WalletRoute, rpc,
-};
+use crate::{self as native, PreparedOperation, SignedOperation, WalletConfig, WalletRoute, rpc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::value::RawValue;
 use std::collections::BTreeMap;
 
 fn checked<T>(r: native::Result<T>) -> Result<T> {
-    r.map_err(Error::config)
+    r.map_err(crate::provider::failure)
 }
 fn decode<T: DeserializeOwned>(v: &RawValue) -> Result<T> {
     serde_json::from_str(v.get()).map_err(|_| Error::config("Invalid retained native packet"))
@@ -90,9 +88,7 @@ impl RetainedPacket for native::workflow::ExecutionRequest {
     }
 }
 
-fn params(
-    v: &BTreeMap<String, allowit_policy_sdk::policy::PolicyValue>,
-) -> Result<native::PolicyParams> {
+fn params(v: &BTreeMap<String, allowit_core::policy::PolicyValue>) -> Result<native::PolicyParams> {
     Ok(native::PolicyParams(
         v.iter()
             .map(|(k, v)| checked(native::PolicyValue::from_core(v)).map(|v| (k.clone(), v)))
@@ -334,10 +330,19 @@ pub fn same_snapshot(a: &Snapshot, b: &Snapshot) -> Result<bool> {
 }
 pub fn receipt_info(p: &Packet) -> Result<ReceiptInfo> {
     let r: rpc::VerifiedReceipt = decode_packet(p)?;
+    let result: stellar_xdr::TransactionResult = checked(native::read(&r.result_xdr))?;
     Ok(ReceiptInfo {
         transaction_hash: r.transaction_hash,
         status: status(r.status),
         observed_height: u64::from(r.ledger),
+        fee: crate::host::runtime::Fee {
+            native_units: u128::try_from(result.fee_charged)
+                .map_err(|_| Error::config("Invalid Stellar receipt fee"))?,
+            // The engine sets the charge through ServerHooks::charged_fee.
+            charged_units: 0,
+        },
+        // The prepared operation carries its debits; the receipt adds only the fee.
+        debits: Vec::new(),
     })
 }
 pub struct Provider {
@@ -956,7 +961,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 }
             }
             OwnerAction::SetPause { paused } => {
-                use allowit_policy_sdk::admin::{DeploymentVersion, SetPause};
+                use allowit_core::admin::{DeploymentVersion, SetPause};
                 let mut admin = native::admin::OwnerAdmin {
                     rpc: self.rpc(),
                     config: &c,
@@ -972,7 +977,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 )?
             }
             OwnerAction::Recover { units, recipient } => {
-                use allowit_policy_sdk::admin::RecoverFunds;
+                use allowit_core::admin::RecoverFunds;
                 let mut admin = native::admin::OwnerAdmin {
                     rpc: self.rpc(),
                     config: &c,
@@ -1089,7 +1094,7 @@ pub fn prepared_metadata(p: &Packet) -> Result<PreparedMetadata> {
     let mut amount = [0u8; 16];
     amount.copy_from_slice(&effect.max_debit.0[16..]);
     let operation = native::retained_operation_from_request(&value.config, &value.request)
-        .map_err(Error::config)?;
+        .map_err(crate::provider::failure)?;
     let (recipient, units) = operation.debit();
     let token = operation.debit_token(&value.config.asset);
     let redeem = operation.kind() == native::OperationKind::Redeem;

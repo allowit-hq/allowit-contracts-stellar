@@ -6,7 +6,7 @@
 //! `scripts/contract_admin.py` does, and evaluates canonical policies with the `allowit` host
 //! backend. Retired source languages remain readable only for signed-packet recovery.
 use crate::*;
-use allowit::{AllowitContext, AllowitRequest, AllowitRule, AllowitTier, AllowitValue};
+use allowit_core::{AllowitContext, AllowitRequest, AllowitRule, AllowitTier, AllowitValue};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -93,15 +93,15 @@ pub enum PolicyLanguage {
 }
 
 /// Canonical param keys, which are also the canonical rule names, in `allowit::RULES` order.
-pub fn param_keys() -> [&'static str; allowit::RULES.len()] {
-    allowit::RULES.map(AllowitRule::key)
+pub fn param_keys() -> [&'static str; allowit_core::RULES.len()] {
+    allowit_core::RULES.map(AllowitRule::key)
 }
-const MAX_PARAMS: usize = allowit::MAX_PARAMS as usize;
-const MAX_ITEMS: usize = allowit::MAX_ITEMS as usize;
-const MAX_TEXT: usize = allowit::MAX_TEXT as usize;
-const KEY_BYTES: usize = allowit::KEY_BYTES as usize;
-const VALUE_BYTES: usize = allowit::VALUE_BYTES as usize;
-const MAX_PARAM_BYTES: usize = allowit::MAX_PARAM_BYTES as usize;
+const MAX_PARAMS: usize = allowit_core::MAX_PARAMS as usize;
+const MAX_ITEMS: usize = allowit_core::MAX_ITEMS as usize;
+const MAX_TEXT: usize = allowit_core::MAX_TEXT as usize;
+const KEY_BYTES: usize = allowit_core::KEY_BYTES as usize;
+const VALUE_BYTES: usize = allowit_core::VALUE_BYTES as usize;
+const MAX_PARAM_BYTES: usize = allowit_core::MAX_PARAM_BYTES as usize;
 
 /// One owner param, execution arg or policy state value: the JSON form of `AllowitValue`.
 /// It serializes as one key naming its type, with `Int` as a decimal string: `{"Int":"5"}`,
@@ -246,14 +246,14 @@ impl PolicyParams {
         Ok(Self(out))
     }
     /// The `allowit` host map.
-    pub fn allowit(&self) -> allowit::AllowitMap {
+    pub fn allowit(&self) -> allowit_core::AllowitMap {
         self.0
             .iter()
             .map(|(k, v)| (k.clone(), v.allowit()))
             .collect()
     }
     /// The params of an `allowit` host map.
-    pub fn from_allowit(map: &allowit::AllowitMap) -> Self {
+    pub fn from_allowit(map: &allowit_core::AllowitMap) -> Self {
         Self(
             map.iter()
                 .map(|(k, v)| (k.clone(), PolicyValue::from_allowit(v)))
@@ -262,24 +262,25 @@ impl PolicyParams {
     }
     /// Check owner params as the wallet does for `tier`.
     pub fn check(&self, tier: PolicyTier) -> Result<()> {
-        allowit::check_params(&self.allowit(), tier.allowit())
+        allowit_core::check_params(&self.allowit(), tier.allowit())
             .map_err(|e| format!("Owner params rejected: {e:?}"))
     }
     /// Check execution args as the wallet does.
     pub fn check_args(&self) -> Result<()> {
-        allowit::check_args(&self.allowit()).map_err(|e| format!("Execution args rejected: {e:?}"))
+        allowit_core::check_args(&self.allowit())
+            .map_err(|e| format!("Execution args rejected: {e:?}"))
     }
 }
 impl PolicyValue {
     /// Convert a common value without erasing its variant. Validate native address encoding.
-    pub fn from_core(value: &allowit_policy_sdk::policy::PolicyValue) -> Result<Self> {
+    pub fn from_core(value: &allowit_core::policy::PolicyValue) -> Result<Self> {
         let native = Self::from_allowit(&value.0);
         native.scval()?;
         Ok(native)
     }
-    pub fn to_core(&self) -> Result<allowit_policy_sdk::policy::PolicyValue> {
+    pub fn to_core(&self) -> Result<allowit_core::policy::PolicyValue> {
         self.scval()?;
-        Ok(allowit_policy_sdk::policy::PolicyValue(self.allowit()))
+        Ok(allowit_core::policy::PolicyValue(self.allowit()))
     }
     /// Contract encoding of `AllowitValue`: a vector of its variant symbol and payload.
     pub fn scval(&self) -> Result<ScVal> {
@@ -332,8 +333,8 @@ impl PolicyValue {
         match self {
             Self::Int(v) => AllowitValue::Int(*v),
             Self::Bool(v) => AllowitValue::Bool(*v),
-            Self::Str(v) => AllowitValue::Str(v.clone()),
-            Self::Addr(v) => AllowitValue::Addr(allowit::Address::new(v.clone())),
+            Self::Str(v) => AllowitValue::Str(v.as_str().into()),
+            Self::Addr(v) => AllowitValue::Addr(allowit_core::Address::new(v.clone())),
             Self::List(v) => AllowitValue::List(v.iter().map(PolicyValue::allowit).collect()),
         }
     }
@@ -341,7 +342,7 @@ impl PolicyValue {
         match value {
             AllowitValue::Int(v) => Self::Int(*v),
             AllowitValue::Bool(v) => Self::Bool(*v),
-            AllowitValue::Str(v) => Self::Str(v.clone()),
+            AllowitValue::Str(v) => Self::Str(v.as_str().into()),
             AllowitValue::Addr(v) => Self::Addr(v.as_str().into()),
             AllowitValue::List(v) => {
                 Self::List(v.as_slice().iter().map(PolicyValue::from_allowit).collect())
@@ -452,7 +453,7 @@ pub fn params_from_json(
 ) -> Result<PolicyParams> {
     let standard = tier.is_some_and(PolicyTier::standard);
     let limit = if standard {
-        allowit::RULES.len()
+        allowit_core::RULES.len()
     } else {
         MAX_PARAMS
     };
@@ -532,7 +533,7 @@ pub fn parse_rules(rules: &[String]) -> Result<Vec<AllowitRule>> {
     rules
         .iter()
         .map(|name| {
-            allowit::RULES
+            allowit_core::RULES
                 .iter()
                 .copied()
                 .find(|rule| rule.key() == name)
@@ -616,7 +617,7 @@ pub fn installed_source_digest(
 }
 
 /// Shared portable source gate from the same released Core dependency as the library.
-pub use allowit_policy_sdk::policy_source::{SourceShape, source_shape};
+pub use allowit_core::policy_source::{SourceShape, source_shape};
 /// The rules a tier installs for `source`: the standard prefix for Common, none otherwise.
 pub fn tier_rules(tier: PolicyTier, source: &str) -> Result<Vec<String>> {
     let shape = source_shape(source)?;
@@ -735,21 +736,21 @@ impl RuleRequest {
 }
 /// A compiled evaluator of the exact installed source, supplied by a host that compiled it
 /// through the server build gate. It is used only when the source is not canonical-only.
-pub type PortableEvaluator<'a> = &'a dyn Fn(&AllowitContext) -> allowit::Result;
+pub type PortableEvaluator<'a> = &'a dyn Fn(&AllowitContext) -> allowit_core::Result;
 
 fn context(params: &PolicyParams, state: &PolicyParams, r: &RuleRequest) -> AllowitContext {
     AllowitContext {
-        env: allowit::AllowitEnv::new(),
+        env: allowit_core::AllowitEnv::new(),
         params: params.allowit().into(),
         state: state.allowit(),
         request: AllowitRequest {
             operation: r.operation.allowit(),
-            asset: allowit::Address::new(r.asset.clone()),
-            recipient: allowit::Address::new(r.recipient.clone()),
+            asset: allowit_core::Address::new(r.asset.clone()),
+            recipient: allowit_core::Address::new(r.recipient.clone()),
             amount: r.amount,
-            token_in: allowit::Address::new(r.token_in.clone()),
+            token_in: allowit_core::Address::new(r.token_in.clone()),
             amount_in: r.amount_in,
-            token_out: r.token_out.clone().map(allowit::Address::new),
+            token_out: r.token_out.clone().map(allowit_core::Address::new),
             min_out: r.min_out,
             now: r.now,
             expires_at: r.expires_at,
@@ -762,20 +763,22 @@ fn context(params: &PolicyParams, state: &PolicyParams, r: &RuleRequest) -> Allo
 }
 /// Run one canonical rule call `allowit::<rule>(ctx, &ctx.params[allowit::<RULE>])?`. An unset
 /// param panics with `MissingParam`, which `allowit::evaluate` returns.
-fn run_rule(ctx: &AllowitContext, rule: AllowitRule) -> allowit::Result {
+fn run_rule(ctx: &AllowitContext, rule: AllowitRule) -> allowit_core::Result {
     let value = &ctx.params[rule.key()];
     match rule {
-        AllowitRule::payment_limit => allowit::payment_limit(ctx, value).map(drop),
+        AllowitRule::payment_limit => allowit_core::payment_limit(ctx, value).map(drop),
         AllowitRule::lifetime_spending_limit => {
-            allowit::lifetime_spending_limit(ctx, value).map(drop)
+            allowit_core::lifetime_spending_limit(ctx, value).map(drop)
         }
-        AllowitRule::daily_spending_limit => allowit::daily_spending_limit(ctx, value).map(drop),
-        AllowitRule::daily_volume_limit => allowit::daily_volume_limit(ctx, value).map(drop),
-        AllowitRule::call_limit => allowit::call_limit(ctx, value).map(drop),
-        AllowitRule::destinations => allowit::destinations(ctx, value).map(drop),
-        AllowitRule::tokens => allowit::tokens(ctx, value).map(drop),
-        AllowitRule::expires_at => allowit::expires_at(ctx, value).map(drop),
-        AllowitRule::operations => allowit::operations(ctx, value).map(drop),
+        AllowitRule::daily_spending_limit => {
+            allowit_core::daily_spending_limit(ctx, value).map(drop)
+        }
+        AllowitRule::daily_volume_limit => allowit_core::daily_volume_limit(ctx, value).map(drop),
+        AllowitRule::call_limit => allowit_core::call_limit(ctx, value).map(drop),
+        AllowitRule::destinations => allowit_core::destinations(ctx, value).map(drop),
+        AllowitRule::tokens => allowit_core::tokens(ctx, value).map(drop),
+        AllowitRule::expires_at => allowit_core::expires_at(ctx, value).map(drop),
+        AllowitRule::operations => allowit_core::operations(ctx, value).map(drop),
     }
 }
 /// What host evaluation established.
@@ -802,13 +805,13 @@ pub fn evaluate(
 ) -> Result<Evaluation> {
     let ctx = context(params, state, request);
     for rule in parse_rules(rules)? {
-        allowit::preflight(&ctx, rule).map_err(|e| format!("Policy prefix denied: {e:?}"))?;
+        allowit_core::preflight(&ctx, rule).map_err(|e| format!("Policy prefix denied: {e:?}"))?;
     }
     let full = if let Some(evaluator) = evaluator {
-        allowit::evaluate(&ctx, evaluator, tier.allowit())
+        allowit_core::evaluate(&ctx, evaluator, tier.allowit())
     } else if shape.canonical_only {
         let prefix = parse_rules(&shape.prefix)?;
-        allowit::evaluate(
+        allowit_core::evaluate(
             &ctx,
             |ctx| {
                 for rule in &prefix {
@@ -825,7 +828,7 @@ pub fn evaluate(
         if tier.standard() {
             params.check(tier)?;
         }
-        allowit::post_flight(&ctx, tier.allowit())
+        allowit_core::post_flight(&ctx, tier.allowit())
             .map_err(|e| format!("Policy state rejected: {e:?}"))?;
         return Ok(Evaluation::Prefix);
     };
@@ -854,7 +857,7 @@ mod tests {
             "{SOURCE}\nfn Ok(_: ()) -> allowit::Result {{ Err(allowit::AllowitError::MissingParam) }}\n"
         );
         let shape = source_shape(&shadowed).unwrap();
-        assert_eq!(shape.prefix.len(), allowit::RULES.len());
+        assert_eq!(shape.prefix.len(), allowit_core::RULES.len());
         assert!(!shape.canonical_only);
         let helper = SOURCE.replace(
             "use allowit::prelude::*;",

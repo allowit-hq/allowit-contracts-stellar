@@ -5,8 +5,8 @@ mod consent;
 pub mod owner;
 pub mod owner_client;
 
-use allowit_stellar_wallet::workflow::ExecutionRequest;
-use allowit_stellar_wallet::{
+use crate::workflow::ExecutionRequest;
+use crate::{
     self as native, ExecutionTerms, OperationStatus, PreparedOperation, SignedOperation,
     WalletConfig, WalletRoute, rpc,
 };

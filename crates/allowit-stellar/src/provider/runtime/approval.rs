@@ -2,7 +2,7 @@
 //! Backs the hidden `allowit wallet approve`: prints a source approval link
 //! and moves no funds.
 use crate::host::error::{Error, Result};
-use allowit_policy_sdk::client::store::Store;
+use allowit_core::client::store::Store;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 /// Admit the Native approval-link network before reading caller input.
@@ -55,7 +55,7 @@ pub struct ApprovalIntent {
     pub intent_digest: String,
 }
 fn hash(value: impl AsRef<[u8]>) -> String {
-    allowit_policy_sdk::digest(value.as_ref())
+    allowit_core::digest(value.as_ref())
 }
 pub fn intent_digest(v: &ApprovalIntent) -> Result<String> {
     let binding = serde_json_canonicalizer::to_vec(&v.binding)
@@ -82,7 +82,7 @@ fn lower_hash(value: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 fn validate_portable(v: &ApprovalIntent) -> Result<()> {
-    use allowit_stellar_wallet::{PolicyParams, PolicyTier};
+    use crate::{PolicyParams, PolicyTier};
     let b = &v.binding;
     let (Some(language), Some(tier), Some(rules), Some(params), Some(params_hash)) =
         (&b.language, &b.tier, &b.rules, &b.params, &b.params_hash)
@@ -108,7 +108,7 @@ fn validate_portable(v: &ApprovalIntent) -> Result<()> {
     };
     let typed: PolicyParams = serde_json::from_value(params.clone())
         .map_err(|_| Error::config("Invalid typed portable params"))?;
-    typed.check(policy_tier).map_err(Error::config)?;
+    typed.check(policy_tier).map_err(crate::provider::failure)?;
     let canonical = crate::host::authoring::canonical_digest(params)?;
     let canonical_identity = crate::host::authoring::portable_identity(
         language,
@@ -147,8 +147,7 @@ pub fn validate(v: &ApprovalIntent) -> Result<()> {
         || b.asset_symbol.len() > 12
         || !b.asset_symbol.bytes().all(|b| b.is_ascii_alphanumeric())
         || u64::from(b.max_fee_stroops) < super::super::server_owner::fee_bounds().minimum
-        || b.max_fee_stroops
-            > allowit_stellar_wallet::max_fee_ceiling(&allowit_stellar_wallet::WalletRoute::Native)
+        || b.max_fee_stroops > crate::max_fee_ceiling(&crate::WalletRoute::Native)
     {
         return Err(Error::config("Invalid Native Stellar policy approval"));
     }
@@ -165,27 +164,26 @@ pub fn validate(v: &ApprovalIntent) -> Result<()> {
         validate_portable(v)?;
     }
     for a in [&v.owner, &b.wallet] {
-        allowit_stellar_wallet::account_key(a).map_err(Error::config)?;
+        crate::account_key(a).map_err(crate::provider::failure)?;
     }
     if let Some(a) = &b.asset_issuer {
-        allowit_stellar_wallet::account_key(a).map_err(Error::config)?;
+        crate::account_key(a).map_err(crate::provider::failure)?;
     }
     if !b.asset.starts_with('C') {
         return Err(Error::config(
             "The installed Stellar asset must be its SAC address",
         ));
     }
-    allowit_stellar_wallet::address(&b.asset).map_err(Error::config)?;
-    let asset =
-        allowit_stellar_wallet::asset_from_identity(&b.asset_symbol, b.asset_issuer.as_deref())
-            .map_err(Error::config)?;
-    if b.asset != allowit_stellar_wallet::sac_address(&v.network, &asset).map_err(Error::config)? {
+    crate::address(&b.asset).map_err(crate::provider::failure)?;
+    let asset = crate::asset_from_identity(&b.asset_symbol, b.asset_issuer.as_deref())
+        .map_err(crate::provider::failure)?;
+    if b.asset != crate::sac_address(&v.network, &asset).map_err(crate::provider::failure)? {
         return Err(Error::config(
             "The Stellar SAC differs from its asset code, issuer or network",
         ));
     }
     for h in [&b.policy_instance, &b.module_digest] {
-        allowit_stellar_wallet::unhex::<32>(h).map_err(Error::config)?;
+        crate::unhex::<32>(h).map_err(crate::provider::failure)?;
         if !h
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -196,7 +194,7 @@ pub fn validate(v: &ApprovalIntent) -> Result<()> {
         }
     }
     if let Some(h) = &b.deployment_id {
-        allowit_stellar_wallet::unhex::<32>(h).map_err(Error::config)?;
+        crate::unhex::<32>(h).map_err(crate::provider::failure)?;
         if !h
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -242,7 +240,7 @@ pub fn approval_for_policy(
             .ok_or_else(|| Error::config("The public Stellar policy is missing source identity"))
     };
     if policy["network"] != "stellar:testnet"
-        || policy["runtime"]["wallet"]["profile"] != "allowit-stellar-native-v1"
+        || policy["runtime"]["wallet"]["profile"] != "allowit-native-v1"
     {
         return Err(Error::config(
             "Use an existing installed Native Stellar Testnet policy",
@@ -414,21 +412,17 @@ mod tests {
         let f = portable_fixture();
         let mut intent: ApprovalIntent = serde_json::from_value(f["intent"].clone()).unwrap();
         // Existing installations can give a distinct owner weight-three administration authority.
-        intent.owner = allowit_stellar_wallet::account_for_seed(&[9; 32]);
+        intent.owner = crate::account_for_seed(&[9; 32]);
         intent.intent_digest = intent_digest(&intent).unwrap();
         validate(&intent).unwrap();
         let mut issued = intent.clone();
         issued.binding.asset_symbol = "USDC".into();
-        issued.binding.asset_issuer = Some(allowit_stellar_wallet::account_for_seed(&[8; 32]));
+        issued.binding.asset_issuer = Some(crate::account_for_seed(&[8; 32]));
         issued.intent_digest = intent_digest(&issued).unwrap();
         assert!(validate(&issued).is_err());
-        issued.binding.asset = allowit_stellar_wallet::sac_address(
+        issued.binding.asset = crate::sac_address(
             &issued.network,
-            &allowit_stellar_wallet::asset_from_identity(
-                "USDC",
-                issued.binding.asset_issuer.as_deref(),
-            )
-            .unwrap(),
+            &crate::asset_from_identity("USDC", issued.binding.asset_issuer.as_deref()).unwrap(),
         )
         .unwrap();
         issued.intent_digest = intent_digest(&issued).unwrap();

@@ -4,7 +4,7 @@
 //! SDK engine submits and observes the exact native hash.
 use crate::contract::{CustodyState, KeptState, PolicyBinding};
 use crate::*;
-use allowit_policy_sdk::admin::{DeployPolicy, DeploymentVersion, RecoverFunds, SetPause};
+use allowit_core::admin::{DeployPolicy, DeploymentVersion, RecoverFunds, SetPause};
 use serde_json::json;
 mod host;
 pub use host::{PolicyInstallation, wallet_salt};

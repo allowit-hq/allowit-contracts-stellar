@@ -66,7 +66,7 @@ export function checkStellarEngineIdentity(v, config) {
     if (!config || typeof config !== 'object')
         throw new Error('The configured Stellar engine identity is unavailable.');
     const c = config;
-    if (c.profile !== 'allowit-stellar-wallet-v1' || !Array.isArray(c.networks) || !c.networks.includes(v.network) || c.enginePublicKey !== v.engine)
+    if (c.profile !== 'allowit-wallet-v1' || !Array.isArray(c.networks) || !c.networks.includes(v.network) || c.enginePublicKey !== v.engine)
         throw new Error('The native setup engine differs from the configured Stellar service. Nothing was signed.');
 }
 export function verifyStellarOwnerSignature(v, signed) {

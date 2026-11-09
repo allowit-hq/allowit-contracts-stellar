@@ -86,7 +86,7 @@ class ReleaseSourceLayouts(unittest.TestCase):
         policy.parent.mkdir(parents=True)
         (root / "Cargo.toml").write_text('[workspace.package]\nversion = "0.3.0"\n')
         (native / "Cargo.toml").write_text('[package]\nversion = "0.3.0"\n')
-        lock = '[[package]]\nname = "allowit"\nversion = "0.3.1"\nsource = "' + release.CORE_SOURCE + '"\n'
+        lock = '[[package]]\nname = "allowit-core"\nversion = "0.5.0"\nsource = "' + release.CORE_SOURCE + '"\n'
         for path in (root / "Cargo.lock", native / "Cargo.lock"):
             path.write_text(lock)
         policy.write_bytes(b"exact policy bytes\n")

@@ -15,7 +15,7 @@ const {connectStellarWallet}=await import('../dist/stellar-wallet.js');
 const issuedAt=Date.parse('2026-01-01T12:00:00Z'),expiresAt=issuedAt+300000;
 function challenge(expiry=expiresAt){
   const issued=new Date(issuedAt).toISOString().replace('.000Z','Z'),expires=new Date(expiry).toISOString().replace('.000Z','Z'),id='ab'.repeat(32);
-  return {id,address:owner,origin,expiresAt:expires,message:`staging.allowit.ai wants you to sign in with your Stellar account:\n${owner}\n\nSign in to AllowIt. This does not authorize spending or move funds.\n\nURI: ${origin}\nVersion: 1\nNonce: ${id}\nIssued At: ${issued}\nExpiration Time: ${expires}`};
+  return {id,address:owner,origin,expiresAt:expires,message:`staging.allowit.ai wants you to sign in with your wallet account:\n${owner}\n\nSign in to AllowIt. This does not authorize spending or move funds.\n\nURI: ${origin}\nVersion: 1\nNonce: ${id}\nIssued At: ${issued}\nExpiration Time: ${expires}`};
 }
 test('caller false, undefined and asynchronous admission reject before signing',async()=>{
   for(const admit of [()=>false,()=>undefined,()=>Promise.resolve(true)]){

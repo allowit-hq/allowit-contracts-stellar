@@ -73,7 +73,7 @@ uses the same thresholds. The host renews an ExternalRef engine's reference and 
 `state()` and administration paths do not load the engine. This preserves parent administration
 when an engine dependency is unavailable. `engine()` can fail if its dependencies need restoration.
 Restore archived entries through reviewed native transactions. Simulation alone does not commit
-lifetime updates. Submit an authorized maintenance transaction when renewal becomes necessary.
+lifetime updates. Submit an authorized maintenance transaction when renewal is necessary.
 
 Parent upgrades must read the retained state layout. The earlier map used `upgrade_authority` and
 `revision`. It cannot be decoded as the current `owner` and `version` map. A named constant does not

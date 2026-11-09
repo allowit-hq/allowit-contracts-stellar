@@ -1,5 +1,5 @@
 //! Native owner builders exercised through complete RPC responses and independent legacy XDR.
-use allowit_stellar_wallet::{
+use allowit_stellar::{
     self as n,
     admin::*,
     owner_intent::*,
@@ -403,22 +403,22 @@ fn installation_preserves_policy_instance_salt_and_constructor_binding() {
 
 #[test]
 fn common_values_keep_variant_and_native_address_validation() {
-    use allowit_policy_sdk::policy::PolicyValue as Common;
+    use allowit_core::policy::PolicyValue as Common;
     let address = account(11);
     for value in [
-        allowit::AllowitValue::Addr(allowit::Address::new(address.clone())),
-        allowit::AllowitValue::Str(address),
-        allowit::AllowitValue::Int(i128::MIN),
-        allowit::AllowitValue::List(vec![allowit::AllowitValue::Bool(true)].into()),
+        allowit_core::AllowitValue::Addr(allowit_core::Address::new(address.clone())),
+        allowit_core::AllowitValue::Str(address.into()),
+        allowit_core::AllowitValue::Int(i128::MIN),
+        allowit_core::AllowitValue::List(vec![allowit_core::AllowitValue::Bool(true)].into()),
     ] {
         let common = Common(value);
         let native = PolicyValue::from_core(&common).unwrap();
         assert_eq!(native.to_core().unwrap(), common);
     }
     assert!(
-        PolicyValue::from_core(&Common(allowit::AllowitValue::Addr(allowit::Address::new(
-            "not a Stellar address"
-        ))))
+        PolicyValue::from_core(&Common(allowit_core::AllowitValue::Addr(
+            allowit_core::Address::new("not a Stellar address")
+        )))
         .is_err()
     );
 }
@@ -811,7 +811,7 @@ fn external_owner_bytes_match_retained_identity_without_fresh_admission() {
         serde_json::from_value::<OwnerTransaction>(persisted.clone()).unwrap(),
         packet
     );
-    assert!(persisted.get("transactionXdr").is_some());
+    assert!(persisted.get("payload").is_some());
     persisted["unexpected"] = json!(true);
     assert!(serde_json::from_value::<OwnerTransaction>(persisted).is_err());
     let x::TransactionEnvelope::Tx(mut original) = read(&packet.transaction_xdr).unwrap() else {
@@ -1012,6 +1012,9 @@ fn current_rpc_not_found_zero_ledger_is_no_receipt() {
     assert!(rpc::receipt_by_hash(&chain, NETWORK, &hash).is_err());
     chain.receipt["oldestLedger"] = json!(5458183);
     chain.receipt["ledger"] = json!("0");
+    assert!(rpc::receipt_by_hash(&chain, NETWORK, &hash).is_err());
+    // Only zero means "no ledger": any other NOT_FOUND ledger must lie in the reported history.
+    chain.receipt["ledger"] = json!(1);
     assert!(rpc::receipt_by_hash(&chain, NETWORK, &hash).is_err());
 }
 

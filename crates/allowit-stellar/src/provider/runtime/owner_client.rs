@@ -1,14 +1,14 @@
 //! Owner HTTP authentication and portable generation. This workflow grants no spending authority.
 pub mod workflow;
 use crate::host::error::{Error, Result};
-use allowit_policy_sdk::transport::http::Method;
-use allowit_stellar_wallet::{self as native, PolicyParams, PolicyTier};
+use crate::{self as native, PolicyParams, PolicyTier};
+use allowit_core::transport::http::Method;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-const SOURCE_PROFILE: &str = "allowit-stellar-transfer-v1";
-const OPERATION: &str = "stellar::sep41_transfer";
+const SOURCE_PROFILE: &str = "allowit-transfer-v1";
+const OPERATION: &str = "allowit::transfer";
 const LANGUAGE: &str = "allowit-portable-v1";
 
 /// The caller owns this owner key. It is independent of any selected agent key.
@@ -58,6 +58,7 @@ struct Template {
     asset: String,
     asset_symbol: String,
     asset_issuer: Option<String>,
+    #[serde(rename = "maxFeeUnits")]
     max_fee_stroops: u32,
 }
 #[derive(Deserialize)]
@@ -123,6 +124,7 @@ pub struct PolicyBinding {
     pub asset: String,
     pub asset_symbol: String,
     pub asset_issuer: Option<String>,
+    #[serde(rename = "maxFeeUnits")]
     pub max_fee_stroops: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<PolicyTier>,
@@ -199,14 +201,14 @@ impl OwnerClient {
         }
         let owner = self.session.owner().to_owned();
         let origin = self.session.origin().to_owned();
-        self.session.authenticate("stellar", now, |challenge| {
+        self.session.authenticate("wallet", now, |challenge| {
             let (issued, expiration) = native::signing::sign_in_message_times(
                 &challenge.message,
                 &owner,
                 &origin,
                 &challenge.id,
             )
-            .map_err(Error::config)?;
+            .map_err(crate::provider::failure)?;
             let issued = crate::host::owner_session::timestamp(issued)?;
             let expiry = crate::host::owner_session::timestamp(&challenge.expires_at)?;
             if expiration != challenge.expires_at
@@ -297,7 +299,8 @@ impl OwnerClient {
                     template.asset_issuer.as_deref(),
                 )
                 .map_err(|_| Error::config("Invalid advertised template asset"))?;
-                if native::sac_address(network, &asset).map_err(Error::config)? != template.asset
+                if native::sac_address(network, &asset).map_err(crate::provider::failure)?
+                    != template.asset
                     || !(super::super::server_owner::fee_bounds().minimum
                         ..=u64::from(native::max_fee_ceiling(&native::WalletRoute::PolicyWallet)))
                         .contains(&u64::from(template.max_fee_stroops))
@@ -355,7 +358,7 @@ impl OwnerClient {
                 id.clone()
             }
         };
-        let result:Generated=self.session.owner_request(Method::Post,"/api/micro/generate",Some(&json!({"prompt":request.prompt,"network":network,"runtime":{"sourceProfile":SOURCE_PROFILE,"wallet":{"kind":wallet.kind,"profile":request.profile}},"operation":{"function":OPERATION},"stellarInstallationId":installation})),now,true)?;
+        let result:Generated=self.session.owner_request(Method::Post,"/api/micro/generate",Some(&json!({"prompt":request.prompt,"network":network,"runtime":{"sourceProfile":SOURCE_PROFILE,"wallet":{"kind":wallet.kind,"profile":request.profile}},"operation":{"function":OPERATION},"installationId":installation})),now,true)?;
         if result.policies.len() > 30 || result.selected_id.is_empty() {
             return Err(Error::uncertain(
                 "Generation returned an invalid workspace identity",
@@ -436,7 +439,7 @@ fn validate_generated(
         || policy.original_intent != request.prompt
         || !policy.ir_hash.is_empty()
         || policy.status != "draft"
-        || policy.source_hash != allowit_policy_sdk::digest(policy.code.as_bytes())
+        || policy.source_hash != allowit_core::digest(policy.code.as_bytes())
         || policy.runtime.source_profile != SOURCE_PROFILE
         || policy.runtime.wallet.kind != kind
         || policy.runtime.wallet.profile != request.profile
@@ -489,8 +492,8 @@ fn validate_generated(
     native::policy::parse_rules(&d.rules)
         .map_err(|_| Error::uncertain("Invalid returned canonical rules"))?;
     let asset = native::asset_from_identity(&b.asset_symbol, b.asset_issuer.as_deref())
-        .map_err(Error::config)?;
-    if native::sac_address(network, &asset).map_err(Error::config)? != b.asset
+        .map_err(crate::provider::failure)?;
+    if native::sac_address(network, &asset).map_err(crate::provider::failure)? != b.asset
         || !(super::super::server_owner::fee_bounds().minimum
             ..=u64::from(native::max_fee_ceiling(&if kind == "contract-wallet" {
                 native::WalletRoute::PolicyWallet
@@ -523,8 +526,8 @@ fn validate_generated(
             .tier
             .ok_or_else(|| Error::uncertain("Missing returned contract policy tier"))?;
         let profile_fits = match tier {
-            PolicyTier::Custom => request.profile == "allowit-stellar-custom-wallet-v1",
-            _ => request.profile == "allowit-stellar-policy-wallet-v1" && d.tier == "standard",
+            PolicyTier::Custom => request.profile == "allowit-custom-wallet-v1",
+            _ => request.profile == "allowit-policy-wallet-v1" && d.tier == "standard",
         };
         if b.route != "policyWallet"
             || !profile_fits
@@ -545,7 +548,7 @@ fn validate_generated(
             if b.template != Some(true) && b.deployment_id == *id && !b.wallet.is_empty() =>
         {
             lower_hash(&b.module_digest)?;
-            native::address(&b.wallet).map_err(Error::config)?;
+            native::address(&b.wallet).map_err(crate::provider::failure)?;
         }
         _ => {
             return Err(Error::uncertain(

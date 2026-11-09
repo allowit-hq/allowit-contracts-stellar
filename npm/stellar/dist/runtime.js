@@ -3,8 +3,8 @@ export const isStellarNetwork = (network) => network === 'stellar:testnet' || ne
 export const isStellarPublicNetwork = (network) => network === 'stellar:mainnet' || network === 'stellar:pubnet';
 export const isStellarPolicy = (policy) => stellarProfile(policy.runtime?.wallet?.profile) && isStellarNetwork(policy.network);
 export const STELLAR_FUNDING_MODE = 'stellar-installed';
-export const STELLAR_SOURCE_PROFILE = 'allowit-stellar-transfer-v1';
-export const STELLAR_OPERATION = 'stellar::sep41_transfer';
+export const STELLAR_SOURCE_PROFILE = 'allowit-transfer-v1';
+export const STELLAR_OPERATION = 'allowit::transfer';
 export function registryProfileValid(profile, kind, sources, operations) {
     return !stellarProfile(profile) || (kind === (STELLAR_PROFILES[profile].route === 'native' ? 'owner-wallet' : 'contract-wallet') && sources.length === 1 && sources[0] === STELLAR_SOURCE_PROFILE && operations.length === 1 && operations[0] === STELLAR_OPERATION);
 }

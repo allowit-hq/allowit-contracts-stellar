@@ -14,7 +14,6 @@
     "code": "// Browser verifier funding fixture.\n",
     "sourceHash": "ce9d41296e0fd159f8995ac3da7c325c23e165f0a5ee4b208f158ae5a6809169",
     "params": {},
-    "wasmHash": "30a48ea031932e9458aa46f989e161aacf6d081b14659b94d9f1372597572b1d",
     "wallet": "CBWIJSMM2H6QKSNBUGP34OKM4L63Y5KUSZPMWVJ7OETSL6LOPQEPOJFD",
     "asset": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
     "maxFeeStroops": 100,

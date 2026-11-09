@@ -1,10 +1,10 @@
 //! Shared classic-account owner setup continuation. Keys remain with the owner.
 use crate::host::error::{Error, Result};
-use allowit_policy_sdk::client::store::Store;
-use allowit_stellar_wallet::{
+use crate::{
     self as native,
     owner::{NativeSetup, prepare_native_setup, validate_native_setup},
 };
+use allowit_core::client::store::Store;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
 pub struct SetupRequest {
@@ -49,11 +49,11 @@ pub fn prepare(store: &Store, request: &SetupRequest, now: u64) -> Result<Native
                 "This Stellar setup request ID already binds another intent",
             ));
         }
-        validate_native_setup(&saved).map_err(Error::config)?;
+        validate_native_setup(&saved).map_err(crate::provider::failure)?;
         return Ok(saved);
     }
-    let state =
-        native::owner::fresh_testnet_owner_account(&request.owner, None).map_err(Error::config)?;
+    let state = native::owner::fresh_testnet_owner_account(&request.owner, None)
+        .map_err(crate::provider::failure)?;
     let prepared = prepare_native_setup(
         &state,
         &request.agent,
@@ -63,12 +63,12 @@ pub fn prepare(store: &Store, request: &SetupRequest, now: u64) -> Result<Native
         request.fee_per_operation,
         now,
     )
-    .map_err(Error::config)?;
+    .map_err(crate::provider::failure)?;
     store.save(&request.request_id, &prepared)?;
     Ok(prepared)
 }
 pub fn signing_url(origin: &str, setup: &NativeSetup) -> Result<String> {
-    validate_native_setup(setup).map_err(Error::config)?;
+    validate_native_setup(setup).map_err(crate::provider::failure)?;
     let origin = crate::host::config::parse_origin(origin)?;
     let bytes = serde_json::to_vec(setup)
         .map_err(|_| Error::config("Cannot encode Stellar owner intent"))?;

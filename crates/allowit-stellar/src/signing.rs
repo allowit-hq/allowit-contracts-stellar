@@ -102,8 +102,7 @@ pub fn sign_in_message_times<'a>(
     nonce: &str,
 ) -> Result<(&'a str, &'a str)> {
     canonical_account_key(owner)?;
-    if allowit_policy_sdk::client::config::parse_origin(origin)
-        .map_err(|_| "Invalid sign-in Origin")?
+    if allowit_core::client::config::parse_origin(origin).map_err(|_| "Invalid sign-in Origin")?
         != origin
         || nonce.len() != 64
         || !nonce
@@ -114,7 +113,7 @@ pub fn sign_in_message_times<'a>(
     }
     let host = origin.split_once("://").ok_or("Invalid sign-in Origin")?.1;
     let prefix = format!(
-        "{host} wants you to sign in with your Stellar account:\n{owner}\n\nSign in to AllowIt. This does not authorize spending or move funds.\n\nURI: {origin}\nVersion: 1\nNonce: {nonce}\nIssued At: "
+        "{host} wants you to sign in with your wallet account:\n{owner}\n\nSign in to AllowIt. This does not authorize spending or move funds.\n\nURI: {origin}\nVersion: 1\nNonce: {nonce}\nIssued At: "
     );
     message
         .strip_prefix(&prefix)

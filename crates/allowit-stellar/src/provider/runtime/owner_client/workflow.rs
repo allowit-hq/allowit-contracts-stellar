@@ -1,6 +1,6 @@
 //! Retained owner workflows. A session identifies the owner; only checked native intent can request a signature.
 use super::*;
-use allowit_policy_sdk::client::store::Store;
+use allowit_core::client::store::Store;
 use native::owner_intent::{self, ExpectedOwnerIntent, OwnerAction, OwnerLimits, OwnerTransaction};
 use native::{OperationStatus, WalletConfig, WalletRoute, rpc};
 
@@ -39,6 +39,7 @@ enum Work {
 struct Step {
     network: String,
     action: String,
+    #[serde(rename = "payload")]
     transaction_xdr: String,
     transaction_hash: String,
     expires_at: u64,
@@ -80,7 +81,7 @@ fn checked<T>(value: native::Result<T>) -> Result<T> {
 }
 fn intent_hash(value: &impl Serialize) -> Result<String> {
     serde_json_canonicalizer::to_vec(value)
-        .map(|b| allowit_policy_sdk::digest(&b))
+        .map(|b| allowit_core::digest(&b))
         .map_err(|_| Error::config("Cannot encode owner workflow identity"))
 }
 pub fn wallet_salt(instance: &[u8; 32]) -> [u8; 32] {
@@ -669,7 +670,7 @@ impl OwnerClient {
                 .owner_request(
                     Method::Post,
                     "/api/native/owner/submit",
-                    Some(&json!({"policyId":selection.policy.id,"transactionXdr":signed})),
+                    Some(&json!({"policyId":selection.policy.id,"payload":signed})),
                     clock()?,
                     true,
                 )
@@ -931,7 +932,7 @@ impl OwnerClient {
                 &signature.signature,
             ))?;
         }
-        let response:Value=self.session.owner_request(Method::Post,"/api/micro/allocation/confirm",Some(&json!({"id":selection.policy.id,"revision":selection.policy.revision,"requestId":id,"stellarSourceApproval":record.signature.iter().collect::<Vec<_>>()})),clock()?,true).map_err(|_|Error::uncertain("Owner activation is uncertain; retain this activation ID and source consent"))?;
+        let response:Value=self.session.owner_request(Method::Post,"/api/micro/allocation/confirm",Some(&json!({"id":selection.policy.id,"revision":selection.policy.revision,"requestId":id,"sourceApproval":record.signature.iter().collect::<Vec<_>>()})),clock()?,true).map_err(|_|Error::uncertain("Owner activation is uncertain; retain this activation ID and source consent"))?;
         if response["active"] != true {
             return Err(Error::uncertain(
                 "Activation has not returned a verified active result",

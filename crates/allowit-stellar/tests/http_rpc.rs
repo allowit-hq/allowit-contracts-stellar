@@ -1,5 +1,5 @@
 //! Native protocol adapter coverage through actual loopback HTTP.
-use allowit_stellar_wallet::rpc::{HttpRpc, Rpc};
+use allowit_stellar::rpc::{HttpRpc, Rpc};
 use serde_json::{Value, json};
 use std::{
     io::{Read, Write},

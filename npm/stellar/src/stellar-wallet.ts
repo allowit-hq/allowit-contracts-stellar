@@ -71,7 +71,7 @@ export function stellarSignInChallengeTimes(challenge: StellarSignInChallenge, o
   try {site = new URL(origin); stellarAccountKey(owner);} catch {throw invalid();}
   if (site.origin !== origin || !['http:', 'https:'].includes(site.protocol) || !/^[0-9a-f]{64}$/.test(challenge.id)
     || challenge.address !== owner || challenge.origin !== origin || typeof challenge.message !== 'string') throw invalid();
-  const prefix = `${site.host} wants you to sign in with your Stellar account:\n${owner}\n\nSign in to AllowIt. This does not authorize spending or move funds.\n\nURI: ${origin}\nVersion: 1\nNonce: ${challenge.id}\nIssued At: `;
+  const prefix = `${site.host} wants you to sign in with your wallet account:\n${owner}\n\nSign in to AllowIt. This does not authorize spending or move funds.\n\nURI: ${origin}\nVersion: 1\nNonce: ${challenge.id}\nIssued At: `;
   if (!challenge.message.startsWith(prefix)) throw invalid();
   const times = challenge.message.slice(prefix.length).split('\nExpiration Time: ');
   const timestamp = (value: string) => {
@@ -88,7 +88,7 @@ export function stellarSignInChallengeTimes(challenge: StellarSignInChallenge, o
 /** A native wallet capability. HTTP sessions and their admission stay with the app. */
 export async function connectStellarWallet(network: StellarNetwork, admitTimes:(times:{issuedAt:number;expiresAt:number})=>boolean, signal?: AbortSignal): Promise<{
   address: string;
-  network: 'stellar';
+  network: 'wallet';
   validateChallenge(challenge: StellarSignInChallenge): void;
   signMessage(message: string): Promise<string>;
 }> {
@@ -97,7 +97,7 @@ export async function connectStellarWallet(network: StellarNetwork, admitTimes:(
   signal?.throwIfAborted(); await checkNetwork(network); signal?.throwIfAborted();
   return {
     address: access.address,
-    network: 'stellar',
+    network: 'wallet',
     validateChallenge(challenge: StellarSignInChallenge): void {if(admitTimes(stellarSignInChallengeTimes(challenge, access.address, location.origin))!==true)throw new Error('The sign-in challenge is invalid or expired. Nothing was signed.');},
     async signMessage(message: string): Promise<string> {
       signal?.throwIfAborted();
@@ -148,7 +148,7 @@ export function stellarAssetContractId(code: string, issuer: string | null, netw
 export async function signStellarSourceApproval(approval: {payload:Record<string,unknown>;message:string;method:string}, policy: {id: string; revision: number; language?:string; network?:string; sourceHash?:string; irHash?:string; code?:string;mint?:string;token?:string;runtime?:{instanceBinding?:Record<string,unknown>}}, session: Session, stillCurrent:()=>boolean=()=>true): Promise<{signer:string;signature:number[]}[]> {
   const current=()=>{if(!stillCurrent())throw new Error('The owner, network or policy changed. Nothing was activated.');};
   current();
-  if (session?.network !== 'stellar') throw new Error('Sign in with the Stellar owner before verifying the wallet.');
+  if (session?.network !== 'wallet') throw new Error('Sign in with the Stellar owner before verifying the wallet.');
   {
     const payload=approval.payload,binding=policy.runtime?.instanceBinding;
     const portable = binding?.portable as Record<string, unknown> | undefined;

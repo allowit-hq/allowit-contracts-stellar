@@ -54,7 +54,7 @@ export function parseStellarOwnerIntent(fragment: string): StellarOwnerIntent {
 export function checkStellarEngineIdentity(v:StellarOwnerIntent,config:unknown):void {
   if(!config||typeof config!=='object')throw new Error('The configured Stellar engine identity is unavailable.');
   const c=config as Record<string,unknown>;
-  if(c.profile!=='allowit-stellar-wallet-v1'||!Array.isArray(c.networks)||!c.networks.includes(v.network)||c.enginePublicKey!==v.engine)throw new Error('The native setup engine differs from the configured Stellar service. Nothing was signed.');
+  if(c.profile!=='allowit-wallet-v1'||!Array.isArray(c.networks)||!c.networks.includes(v.network)||c.enginePublicKey!==v.engine)throw new Error('The native setup engine differs from the configured Stellar service. Nothing was signed.');
 }
 export function verifyStellarOwnerSignature(v: StellarOwnerIntent, signed: string): void {
   checkStellarOwnerIntent(v);
