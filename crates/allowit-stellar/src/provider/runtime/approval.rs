@@ -240,7 +240,7 @@ pub fn approval_for_policy(
             .ok_or_else(|| Error::config("The public Stellar policy is missing source identity"))
     };
     if policy["network"] != "stellar:testnet"
-        || policy["runtime"]["wallet"]["profile"] != "allowit-stellar-native-v1"
+        || policy["runtime"]["wallet"]["profile"] != "allowit-native-v1"
     {
         return Err(Error::config(
             "Use an existing installed Native Stellar Testnet policy",

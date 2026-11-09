@@ -51,7 +51,7 @@ const session = {network: 'stellar', address: owner, expiresAt: '2026-11-07T00:0
 const binding = {wallet, template: true, route: 'policyWallet', tier: 'common', policyInstance, maxFeeStroops: 1000, portable: {paramsHash: proposal.paramsHash}};
 const policy = {id: policyId, revision: 1, network, code, sourceHash: proposal.sourceHash, irHash: '', mint: asset, token: 'XLM', runtime: {instanceBinding: binding}};
 const exported = {
-  version: 1, profile: 'allowit-stellar-wallet-v1', policyId, network, route: 'policyWallet', wallet,
+  version: 1, profile: 'allowit-wallet-v1', policyId, network, route: 'policyWallet', wallet,
   sourceHash: proposal.sourceHash, moduleDigest, irHash: '', unexpected: 'ignored',
   config: {wallet, owner, agent, server, network, route: 'policyWallet', policySource: code, asset,
     assetSymbol: 'XLM', assetIssuer: null, maxFeeStroops: 1000, policyInstance: bytes(policyInstance),

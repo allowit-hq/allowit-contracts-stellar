@@ -304,7 +304,7 @@ export async function deployAdkOwnerDraft({ host, proposal, session, agent, amou
         const config = object(profile.config);
         const endpoints = object(profile.endpoints);
         const reviewed = object(bound.runtime?.instanceBinding?.portable);
-        if (profile.version !== 1 || profile.profile !== 'allowit-stellar-wallet-v1'
+        if (profile.version !== 1 || profile.profile !== 'allowit-wallet-v1'
             || profile.policyId !== policyId || profile.network !== network || profile.route !== 'policyWallet'
             || profile.wallet !== installed || profile.sourceHash !== proposal.sourceHash || profile.moduleDigest !== wasmHash || profile.irHash !== bound.irHash
             || config?.wallet !== installed || config.owner !== owner || config.agent !== agent || config.server !== server

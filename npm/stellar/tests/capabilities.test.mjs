@@ -15,7 +15,7 @@ test('native key codec takes caller entropy and preserves exact StrKey bytes',()
 test('native challenge binds exact fields and returns dates for caller admission',()=>{
   const address=Keypair.fromRawEd25519Seed(Buffer.alloc(32,7)).publicKey(), origin='https://staging.allowit.ai',id='ab'.repeat(32);
   const issued='2026-01-01T12:00:00Z',expiresAt='2026-01-01T12:05:00Z';
-  const message=`staging.allowit.ai wants you to sign in with your Stellar account:\n${address}\n\nSign in to AllowIt. This does not authorize spending or move funds.\n\nURI: ${origin}\nVersion: 1\nNonce: ${id}\nIssued At: ${issued}\nExpiration Time: ${expiresAt}`;
+  const message=`staging.allowit.ai wants you to sign in with your wallet account:\n${address}\n\nSign in to AllowIt. This does not authorize spending or move funds.\n\nURI: ${origin}\nVersion: 1\nNonce: ${id}\nIssued At: ${issued}\nExpiration Time: ${expiresAt}`;
   const challenge={id,address,origin,message,expiresAt};
   assert.deepEqual(stellarSignInChallengeTimes(challenge,address,origin),{issuedAt:Date.parse(issued),expiresAt:Date.parse(expiresAt)});
   for(const changed of [{...challenge,id:'cd'.repeat(32)},{...challenge,origin:'https://other.example'},{...challenge,message:message.replace('Sign in to AllowIt.','Approve a payment.')},{...challenge,message:message+'\nextra'}])assert.throws(()=>stellarSignInChallengeTimes(changed,address,origin));

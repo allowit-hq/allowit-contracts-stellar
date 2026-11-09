@@ -51,19 +51,19 @@ pub static NETWORKS: &[RailInfo] = &[
 /// The wallet profiles a server offers. Hosts choose them by custody and tier.
 pub static PROFILES: &[ProfileInfo] = &[
     ProfileInfo {
-        id: "allowit-stellar-native-v1",
+        id: "allowit-native-v1",
         custody: Custody::Owner,
         tier: None,
         label: "Native multisignature account",
     },
     ProfileInfo {
-        id: "allowit-stellar-policy-wallet-v1",
+        id: "allowit-policy-wallet-v1",
         custody: Custody::Policy,
         tier: Some(Tier::Standard),
         label: "Policy wallet",
     },
     ProfileInfo {
-        id: "allowit-stellar-custom-wallet-v1",
+        id: "allowit-custom-wallet-v1",
         custody: Custody::Policy,
         tier: Some(Tier::Custom),
         label: "Custom policy wallet",
@@ -436,7 +436,8 @@ fn fixtures() -> Fixtures {
             issuer: Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"),
         },
         agent_seed: [7; 32],
-        public_profile: include_bytes!("../tests/fixtures/provider/stellar-approval.json").to_vec(),
+        public_profile: include_bytes!("../tests/fixtures/provider/stellar-public-profile.json")
+            .to_vec(),
         owner_generation: serde_json::from_str(include_str!(
             "../tests/fixtures/provider/stellar-owner-generation.json"
         ))
@@ -480,6 +481,29 @@ mod tests {
         }
         assert!(crate::signing::canonical_account_key(&f.invalid_address).is_err());
         assert_ne!(f.account, f.recipient);
+    }
+
+    #[test]
+    fn the_public_profile_fixture_is_an_importable_profile() {
+        let f = (PLUGIN.test_support().fixtures)();
+        let expected =
+            crate::test_support::approval_public_profile(&crate::test_support::portable_approval());
+        if std::env::var_os("ALLOWIT_WRITE_FIXTURES").is_some() {
+            std::fs::write(
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/provider/stellar-public-profile.json"
+                ),
+                serde_json::to_vec_pretty(&expected).unwrap(),
+            )
+            .unwrap();
+            return;
+        }
+        let actual: serde_json::Value = serde_json::from_slice(&f.public_profile).unwrap();
+        assert_eq!(actual, expected);
+        PLUGIN
+            .decode_profile("stellar:testnet", &f.public_profile)
+            .unwrap();
     }
 
     #[test]
@@ -615,7 +639,7 @@ mod tests {
             .step("stellar:testnet", &packet)
             .unwrap();
         assert_eq!(step.action, "fund");
-        assert_eq!(step.payload, doc["transactionXdr"]);
+        assert_eq!(step.payload, doc["payload"]);
         assert_eq!(crate::hex(&step.hash), doc["transactionHash"]);
         assert_eq!(step.expires_at, now + 300);
         assert!(step.explorer.unwrap().ends_with(&crate::hex(&step.hash)));

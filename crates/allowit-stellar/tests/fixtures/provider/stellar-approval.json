@@ -10,7 +10,7 @@
     "token": "XLM",
     "runtime": {
       "wallet": {
-        "profile": "allowit-stellar-native-v1"
+        "profile": "allowit-native-v1"
       },
       "instanceBinding": {
         "wallet": "GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR",

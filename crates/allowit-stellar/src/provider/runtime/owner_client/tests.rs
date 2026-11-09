@@ -229,7 +229,7 @@ fn funded_wallet_receipt_and_restart_preserve_exact_signed_bytes_and_single_owne
         state
             .owner_submissions
             .iter()
-            .all(|s| s["transactionXdr"] == signed)
+            .all(|s| s["payload"] == signed)
     );
 }
 
@@ -403,7 +403,7 @@ fn generation_validates_prompt_network_and_profile_before_authenticated_http() {
     let mut request = GenerateRequest {
         prompt: "Allow a small payment".into(),
         network: "stellar:unsupported".into(),
-        profile: "allowit-stellar-policy-wallet-v1".into(),
+        profile: "allowit-policy-wallet-v1".into(),
         target: Target::NewWallet,
     };
     let error = client.generate(&request, now).unwrap_err();

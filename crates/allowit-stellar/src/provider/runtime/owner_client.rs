@@ -7,8 +7,8 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-const SOURCE_PROFILE: &str = "allowit-stellar-transfer-v1";
-const OPERATION: &str = "stellar::sep41_transfer";
+const SOURCE_PROFILE: &str = "allowit-transfer-v1";
+const OPERATION: &str = "allowit::transfer";
 const LANGUAGE: &str = "allowit-portable-v1";
 
 /// The caller owns this owner key. It is independent of any selected agent key.
@@ -199,7 +199,7 @@ impl OwnerClient {
         }
         let owner = self.session.owner().to_owned();
         let origin = self.session.origin().to_owned();
-        self.session.authenticate("stellar", now, |challenge| {
+        self.session.authenticate("wallet", now, |challenge| {
             let (issued, expiration) = native::signing::sign_in_message_times(
                 &challenge.message,
                 &owner,
@@ -355,7 +355,7 @@ impl OwnerClient {
                 id.clone()
             }
         };
-        let result:Generated=self.session.owner_request(Method::Post,"/api/micro/generate",Some(&json!({"prompt":request.prompt,"network":network,"runtime":{"sourceProfile":SOURCE_PROFILE,"wallet":{"kind":wallet.kind,"profile":request.profile}},"operation":{"function":OPERATION},"stellarInstallationId":installation})),now,true)?;
+        let result:Generated=self.session.owner_request(Method::Post,"/api/micro/generate",Some(&json!({"prompt":request.prompt,"network":network,"runtime":{"sourceProfile":SOURCE_PROFILE,"wallet":{"kind":wallet.kind,"profile":request.profile}},"operation":{"function":OPERATION},"installationId":installation})),now,true)?;
         if result.policies.len() > 30 || result.selected_id.is_empty() {
             return Err(Error::uncertain(
                 "Generation returned an invalid workspace identity",
@@ -523,8 +523,8 @@ fn validate_generated(
             .tier
             .ok_or_else(|| Error::uncertain("Missing returned contract policy tier"))?;
         let profile_fits = match tier {
-            PolicyTier::Custom => request.profile == "allowit-stellar-custom-wallet-v1",
-            _ => request.profile == "allowit-stellar-policy-wallet-v1" && d.tier == "standard",
+            PolicyTier::Custom => request.profile == "allowit-custom-wallet-v1",
+            _ => request.profile == "allowit-policy-wallet-v1" && d.tier == "standard",
         };
         if b.route != "policyWallet"
             || !profile_fits

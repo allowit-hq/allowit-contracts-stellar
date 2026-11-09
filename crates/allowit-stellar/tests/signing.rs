@@ -163,7 +163,7 @@ fn sign_in_message_binds_canonical_account_origin_and_nonce() {
     let origin = "http://localhost:5173";
     let nonce = "a".repeat(64);
     let message = format!(
-        "localhost:5173 wants you to sign in with your Stellar account:\n{owner}\n\nSign in to AllowIt. This does not authorize spending or move funds.\n\nURI: {origin}\nVersion: 1\nNonce: {nonce}\nIssued At: 2026-11-02T00:00:00Z\nExpiration Time: 2026-11-02T00:05:00Z"
+        "localhost:5173 wants you to sign in with your wallet account:\n{owner}\n\nSign in to AllowIt. This does not authorize spending or move funds.\n\nURI: {origin}\nVersion: 1\nNonce: {nonce}\nIssued At: 2026-11-02T00:00:00Z\nExpiration Time: 2026-11-02T00:05:00Z"
     );
     assert_eq!(
         signing::sign_in_message_times(&message, &owner, origin, &nonce).unwrap(),
@@ -188,7 +188,7 @@ fn sign_in_message_binds_canonical_account_origin_and_nonce() {
     }
     assert!(
         signing::sign_in_message_times(
-            &message.replace("Stellar account", "Foreign account"),
+            &message.replace("wallet account", "Foreign account"),
             &owner,
             origin,
             &nonce

@@ -16,14 +16,14 @@
     "token": "USDC",
     "mint": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
     "runtime": {
-      "sourceProfile": "allowit-stellar-transfer-v1",
+      "sourceProfile": "allowit-transfer-v1",
       "wallet": {
         "kind": "contract-wallet",
-        "profile": "allowit-stellar-policy-wallet-v1"
+        "profile": "allowit-policy-wallet-v1"
       },
-      "operation": "stellar::sep41_transfer",
+      "operation": "allowit::transfer",
       "instanceBinding": {
-        "profile": "allowit-stellar-wallet-v1",
+        "profile": "allowit-wallet-v1",
         "language": "allowit-portable-v1",
         "deploymentId": "0707070707070707070707070707070707070707070707070707070707070707",
         "policyInstance": "0707070707070707070707070707070707070707070707070707070707070707",

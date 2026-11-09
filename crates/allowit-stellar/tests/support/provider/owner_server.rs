@@ -40,7 +40,7 @@ pub fn challenge(owner: &str, origin: &str, now: u64) -> Value {
     let expiry = date(now + 300);
     let host = origin.split_once("://").unwrap().1;
     json!({"id":nonce,"address":owner,"origin":origin,"expiresAt":expiry,
-        "message":format!("{host} wants you to sign in with your Stellar account:\n{owner}\n\nSign in to AllowIt. This does not authorize spending or move funds.\n\nURI: {origin}\nVersion: 1\nNonce: {nonce}\nIssued At: {}\nExpiration Time: {expiry}",date(now))})
+        "message":format!("{host} wants you to sign in with your wallet account:\n{owner}\n\nSign in to AllowIt. This does not authorize spending or move funds.\n\nURI: {origin}\nVersion: 1\nNonce: {nonce}\nIssued At: {}\nExpiration Time: {expiry}",date(now))})
 }
 pub struct Plan {
     pub owner: String,
@@ -71,8 +71,8 @@ impl Plan {
             owner: owner.into(),
             origin: origin.clone(),
             challenge: challenge(owner, &origin, now()),
-            discovery: json!({"wallets":[{"kind":"contract-wallet","profile":"allowit-stellar-policy-wallet-v1","sourceProfiles":["allowit-stellar-transfer-v1"],"networks":["stellar:testnet"],"operations":["stellar::sep41_transfer"],"capabilities":{"generate":true,"fund":true}}],"operations":[{"function":"stellar::sep41_transfer","services":[]}]}),
-            templates: json!({"templates":[{"network":"stellar:testnet","profiles":["allowit-stellar-policy-wallet-v1"],"asset":b["asset"],"assetSymbol":b["assetSymbol"],"assetIssuer":b["assetIssuer"],"maxFeeStroops":b["maxFeeStroops"]}]}),
+            discovery: json!({"wallets":[{"kind":"contract-wallet","profile":"allowit-policy-wallet-v1","sourceProfiles":["allowit-transfer-v1"],"networks":["stellar:testnet"],"operations":["allowit::transfer"],"capabilities":{"generate":true,"fund":true}}],"operations":[{"function":"allowit::transfer","services":[]}]}),
+            templates: json!({"templates":[{"network":"stellar:testnet","profiles":["allowit-policy-wallet-v1"],"asset":b["asset"],"assetSymbol":b["assetSymbol"],"assetIssuer":b["assetIssuer"],"maxFeeStroops":b["maxFeeStroops"]}]}),
             installations: json!({"installations":[]}),
             policy,
             guest_cookie: format!(
@@ -230,7 +230,7 @@ impl Server {
                     reply(
                         &mut stream,
                         200,
-                        json!({"session":{"address":plan.owner,"network":"stellar","expiresAt":date(now()+86400)}}),
+                        json!({"session":{"address":plan.owner,"network":"wallet","expiresAt":date(now()+86400)}}),
                         &format!("Set-Cookie: {cookie}; Path=/; HttpOnly; SameSite=Lax\r\n"),
                     );
                     continue;
@@ -271,7 +271,7 @@ impl Server {
                         );
                     }
                     "/api/native/owner/submit" => {
-                        let signed = body["transactionXdr"].as_str().unwrap();
+                        let signed = body["payload"].as_str().unwrap();
                         captured
                             .lock()
                             .unwrap()

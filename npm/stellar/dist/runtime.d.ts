@@ -9,8 +9,8 @@ export declare const isStellarPolicy: (policy: {
     network: string;
 }) => boolean;
 export declare const STELLAR_FUNDING_MODE = "stellar-installed";
-export declare const STELLAR_SOURCE_PROFILE = "allowit-stellar-transfer-v1";
-export declare const STELLAR_OPERATION = "stellar::sep41_transfer";
+export declare const STELLAR_SOURCE_PROFILE = "allowit-transfer-v1";
+export declare const STELLAR_OPERATION = "allowit::transfer";
 export declare function registryProfileValid(profile: string, kind: string, sources: string[], operations: string[]): boolean;
 export declare const paymentAssetValid: (asset: {
     decimals: number;

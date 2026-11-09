@@ -39,6 +39,7 @@ enum Work {
 struct Step {
     network: String,
     action: String,
+    #[serde(rename = "payload")]
     transaction_xdr: String,
     transaction_hash: String,
     expires_at: u64,
@@ -669,7 +670,7 @@ impl OwnerClient {
                 .owner_request(
                     Method::Post,
                     "/api/native/owner/submit",
-                    Some(&json!({"policyId":selection.policy.id,"transactionXdr":signed})),
+                    Some(&json!({"policyId":selection.policy.id,"payload":signed})),
                     clock()?,
                     true,
                 )
@@ -931,7 +932,7 @@ impl OwnerClient {
                 &signature.signature,
             ))?;
         }
-        let response:Value=self.session.owner_request(Method::Post,"/api/micro/allocation/confirm",Some(&json!({"id":selection.policy.id,"revision":selection.policy.revision,"requestId":id,"stellarSourceApproval":record.signature.iter().collect::<Vec<_>>()})),clock()?,true).map_err(|_|Error::uncertain("Owner activation is uncertain; retain this activation ID and source consent"))?;
+        let response:Value=self.session.owner_request(Method::Post,"/api/micro/allocation/confirm",Some(&json!({"id":selection.policy.id,"revision":selection.policy.revision,"requestId":id,"sourceApproval":record.signature.iter().collect::<Vec<_>>()})),clock()?,true).map_err(|_|Error::uncertain("Owner activation is uncertain; retain this activation ID and source consent"))?;
         if response["active"] != true {
             return Err(Error::uncertain(
                 "Activation has not returned a verified active result",

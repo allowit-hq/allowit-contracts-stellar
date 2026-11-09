@@ -55,15 +55,23 @@ export function walletSignInElement() {
             const { network } = (this.data ?? {});
             const id = canonicalNetwork(network);
             const status = h('p', { class: 'status', role: 'status' });
-            const go = button('Sign in with a Stellar wallet', async () => {
+            const pending = this.data?.message;
+            // Two phases: without a message the element only connects and reports the address; with the
+            // server's address-bound message it signs that message.
+            const go = button(typeof pending === 'string' ? 'Approve the sign-in message' : 'Sign in with a Stellar wallet', async () => {
                 const message = this.data?.message;
                 go.disabled = true;
                 status.textContent = 'Waiting for the wallet…';
                 try {
-                    if (!id || typeof message !== 'string')
+                    if (!id || (message != null && typeof message !== 'string'))
                         throw Object.assign(new Error('The sign-in request is invalid.'), { code: 'invalid' });
                     const { connectWallet, signWalletMessage } = await import('./wallet.js');
                     const address = await connectWallet(id);
+                    if (message == null) {
+                        status.textContent = '';
+                        emit(this, 'allowit-signed-in', { address });
+                        return;
+                    }
                     if (!signInMessageFor(message, address, location.host))
                         throw Object.assign(new Error('The sign-in message does not match this site and account. Nothing was signed.'), { code: 'invalid' });
                     const signature = await signWalletMessage(message, address, id);

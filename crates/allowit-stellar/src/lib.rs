@@ -44,7 +44,7 @@ pub mod signing;
 pub mod x402;
 pub type Result<T> = std::result::Result<T, String>;
 
-pub const PROFILE: &str = "allowit-stellar-wallet-v1";
+pub const PROFILE: &str = "allowit-wallet-v1";
 const MAX_BYTES: usize = 1_048_576;
 
 pub fn hash(bytes: impl AsRef<[u8]>) -> [u8; 32] {

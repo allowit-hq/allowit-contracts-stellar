@@ -46,7 +46,7 @@ export function matchStellarApproval(v, policy, owner, network) {
     const b = policy?.runtime?.instanceBinding;
     if (owner !== v.owner || network !== v.network || !policy || policy.id !== v.policyId || policy.revision !== v.revision || policy.network !== v.network
         || policy.code !== v.source || policy.sourceHash !== v.sourceHash || policy.irHash !== v.irHash || policy.mint !== v.binding.asset || policy.token !== v.binding.assetSymbol
-        || policy.runtime?.wallet.profile !== 'allowit-stellar-native-v1' || !b
+        || policy.runtime?.wallet.profile !== 'allowit-native-v1' || !b
         || b.wallet !== v.binding.wallet || b.route !== 'native' || b.policyInstance !== v.binding.policyInstance || b.moduleDigest !== v.binding.moduleDigest
         || b.asset !== v.binding.asset || b.assetSymbol !== v.binding.assetSymbol || (b.assetIssuer ?? null) !== v.binding.assetIssuer || b.maxFeeStroops !== v.binding.maxFeeStroops
         || (b.deploymentId ?? null) !== v.binding.deploymentId)
@@ -77,9 +77,9 @@ export function publicStellarBundle(value, policy, owner, service, admit) {
         throw new Error('The public agent bundle must name distinct owner, agent and server signers. Nothing was saved.');
     // The server signer must match the independently configured same-origin service (native/config).
     const s = plainObject(service);
-    if (!s || s.profile !== 'allowit-stellar-wallet-v1' || !Array.isArray(s.networks) || !s.networks.includes(policy.network) || s.enginePublicKey !== server)
+    if (!s || s.profile !== 'allowit-wallet-v1' || !Array.isArray(s.networks) || !s.networks.includes(policy.network) || s.enginePublicKey !== server)
         throw new Error('The public agent bundle server differs from the configured Stellar service. Nothing was saved.');
-    if (!b || !c || !e || !binding || b.version !== 1 || b.profile !== 'allowit-stellar-wallet-v1' || b.policyId !== policy.id || b.network !== policy.network
+    if (!b || !c || !e || !binding || b.version !== 1 || b.profile !== 'allowit-wallet-v1' || b.policyId !== policy.id || b.network !== policy.network
         || b.sourceHash !== policy.sourceHash || b.irHash !== policy.irHash || b.wallet !== binding.wallet || b.route !== 'native' || b.moduleDigest !== binding.moduleDigest
         || c.owner !== owner || c.network !== policy.network || c.wallet !== b.wallet || c.route !== 'native' || c.asset !== policy.mint || c.assetSymbol !== policy.token
         || (c.assetIssuer ?? null) !== (binding.assetIssuer ?? null) || c.policySource !== policy.code || c.maxFeeStroops !== binding.maxFeeStroops
@@ -89,7 +89,7 @@ export function publicStellarBundle(value, policy, owner, service, admit) {
     const portable = portableExport(b, c, policy, admit);
     const bytes = (v) => [...v];
     return {
-        ...portable.top, version: 1, profile: 'allowit-stellar-wallet-v1', network: policy.network, policyId: policy.id, sourceHash: policy.sourceHash, irHash: policy.irHash,
+        ...portable.top, version: 1, profile: 'allowit-wallet-v1', network: policy.network, policyId: policy.id, sourceHash: policy.sourceHash, irHash: policy.irHash,
         moduleDigest: binding.moduleDigest, wallet: binding.wallet, route: 'native',
         config: { network: policy.network, policyInstance: bytes(c.policyInstance), wallet: binding.wallet, owner, agent, server, route: 'native', ...portable.config, asset: policy.mint, assetSymbol: policy.token,
             assetIssuer: binding.assetIssuer ?? null, policySource: policy.code, sourceHash: bytes(c.sourceHash), moduleDigest: bytes(c.moduleDigest), maxFeeStroops: binding.maxFeeStroops },

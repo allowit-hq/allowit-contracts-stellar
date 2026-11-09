@@ -71,7 +71,7 @@ export function stellarSignInChallengeTimes(challenge: StellarSignInChallenge, o
   try {site = new URL(origin); stellarAccountKey(owner);} catch {throw invalid();}
   if (site.origin !== origin || !['http:', 'https:'].includes(site.protocol) || !/^[0-9a-f]{64}$/.test(challenge.id)
     || challenge.address !== owner || challenge.origin !== origin || typeof challenge.message !== 'string') throw invalid();
-  const prefix = `${site.host} wants you to sign in with your Stellar account:\n${owner}\n\nSign in to AllowIt. This does not authorize spending or move funds.\n\nURI: ${origin}\nVersion: 1\nNonce: ${challenge.id}\nIssued At: `;
+  const prefix = `${site.host} wants you to sign in with your wallet account:\n${owner}\n\nSign in to AllowIt. This does not authorize spending or move funds.\n\nURI: ${origin}\nVersion: 1\nNonce: ${challenge.id}\nIssued At: `;
   if (!challenge.message.startsWith(prefix)) throw invalid();
   const times = challenge.message.slice(prefix.length).split('\nExpiration Time: ');
   const timestamp = (value: string) => {

@@ -147,7 +147,7 @@ pub fn fund_step(c: &native::WalletConfig, units: i128, now: u64) -> Value {
             resource_fee: 1000,
         }),
     };
-    json!({"action":"fund","network":"stellar:testnet","transactionHash":native::hex(&hash(&tx)),"transactionXdr":enc(&x::TransactionEnvelope::Tx(x::TransactionV1Envelope{tx,signatures:Default::default()})),"expiresAt":now+300})
+    json!({"action":"fund","network":"stellar:testnet","transactionHash":native::hex(&hash(&tx)),"payload":enc(&x::TransactionEnvelope::Tx(x::TransactionV1Envelope{tx,signatures:Default::default()})),"expiresAt":now+300})
 }
 pub fn receipt(signed: &str) -> Value {
     let result = x::TransactionResult {
@@ -295,12 +295,12 @@ impl OwnerLedger {
                             native::hex(
                                 &rpc::signed_transaction_hash(
                                     &c.network,
-                                    v["transactionXdr"].as_str().unwrap(),
+                                    v["payload"].as_str().unwrap(),
                                 )
                                 .unwrap(),
                             ) == params["hash"]
                         })
-                        .map(|v| v["transactionXdr"].as_str().unwrap().into())
+                        .map(|v| v["payload"].as_str().unwrap().into())
                 });
                 Ok(signed
                     .filter(|s| {
@@ -369,7 +369,7 @@ pub fn native_selection() -> OwnerPolicy {
     b.module_digest = native::hex(&c.module_digest);
     b.max_fee_stroops = c.max_fee_stroops;
     selection.policy.runtime.wallet.kind = "owner-wallet".into();
-    selection.policy.runtime.wallet.profile = "allowit-stellar-native-v1".into();
+    selection.policy.runtime.wallet.profile = "allowit-native-v1".into();
     selection.validate().unwrap();
     selection
 }
@@ -413,7 +413,7 @@ pub fn configured_source(c: &native::WalletConfig) -> native::AccountState {
 
 pub(crate) fn change_step(step: &mut Value, change: impl FnOnce(&mut x::Transaction)) {
     let mut envelope = x::TransactionEnvelope::from_xdr_base64(
-        step["transactionXdr"].as_str().unwrap(),
+        step["payload"].as_str().unwrap(),
         x::Limits::none(),
     )
     .unwrap();
@@ -422,7 +422,7 @@ pub(crate) fn change_step(step: &mut Value, change: impl FnOnce(&mut x::Transact
     };
     change(&mut e.tx);
     step["transactionHash"] = json!(native::hex(&hash(&e.tx)));
-    step["transactionXdr"] = json!(enc(&envelope));
+    step["payload"] = json!(enc(&envelope));
 }
 pub fn extend_step(c: &native::WalletConfig, target: u32, now: u64) -> Value {
     let mut step = fund_step(c, 10_000_000, now);

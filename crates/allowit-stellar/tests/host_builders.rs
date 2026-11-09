@@ -811,7 +811,7 @@ fn external_owner_bytes_match_retained_identity_without_fresh_admission() {
         serde_json::from_value::<OwnerTransaction>(persisted.clone()).unwrap(),
         packet
     );
-    assert!(persisted.get("transactionXdr").is_some());
+    assert!(persisted.get("payload").is_some());
     persisted["unexpected"] = json!(true);
     assert!(serde_json::from_value::<OwnerTransaction>(persisted).is_err());
     let x::TransactionEnvelope::Tx(mut original) = read(&packet.transaction_xdr).unwrap() else {

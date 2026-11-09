@@ -113,7 +113,7 @@ pub fn sign_in_message_times<'a>(
     }
     let host = origin.split_once("://").ok_or("Invalid sign-in Origin")?.1;
     let prefix = format!(
-        "{host} wants you to sign in with your Stellar account:\n{owner}\n\nSign in to AllowIt. This does not authorize spending or move funds.\n\nURI: {origin}\nVersion: 1\nNonce: {nonce}\nIssued At: "
+        "{host} wants you to sign in with your wallet account:\n{owner}\n\nSign in to AllowIt. This does not authorize spending or move funds.\n\nURI: {origin}\nVersion: 1\nNonce: {nonce}\nIssued At: "
     );
     message
         .strip_prefix(&prefix)

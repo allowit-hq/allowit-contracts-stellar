@@ -32,12 +32,12 @@
           "tier": "standard",
           "unresolved": []
         },
-        "profile": "allowit-stellar-wallet-v1",
+        "profile": "allowit-wallet-v1",
         "route": "native",
         "wallet": "GDVEU3DD4KOFECV66VIHWEZOYX4ZKR3WV27L464SIIPOU2IUI3JCZA57"
       },
       "wallet": {
-        "profile": "allowit-stellar-native-v1"
+        "profile": "allowit-native-v1"
       }
     },
     "sourceHash": "58aaea8d178d3d1ec38bfb5f7124d1f86e33aaf9618e3e2c5eafa555837ef526",
