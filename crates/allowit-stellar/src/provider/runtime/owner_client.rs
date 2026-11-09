@@ -58,6 +58,7 @@ struct Template {
     asset: String,
     asset_symbol: String,
     asset_issuer: Option<String>,
+    #[serde(rename = "maxFeeUnits")]
     max_fee_stroops: u32,
 }
 #[derive(Deserialize)]
@@ -123,6 +124,7 @@ pub struct PolicyBinding {
     pub asset: String,
     pub asset_symbol: String,
     pub asset_issuer: Option<String>,
+    #[serde(rename = "maxFeeUnits")]
     pub max_fee_stroops: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<PolicyTier>,

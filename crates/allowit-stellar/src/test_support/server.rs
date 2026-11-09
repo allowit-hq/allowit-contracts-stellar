@@ -35,7 +35,7 @@ impl OwnerDocuments {
             origin: origin.into(),
             challenge: owner_signin_challenge(owner, origin, now),
             discovery: json!({"wallets":[{"kind":"contract-wallet","profile":"allowit-policy-wallet-v1","sourceProfiles":["allowit-transfer-v1"],"networks":["stellar:testnet"],"operations":["allowit::transfer"],"capabilities":{"generate":true,"fund":true}}],"operations":[{"function":"allowit::transfer","services":[]}]}),
-            templates: json!({"templates":[{"network":"stellar:testnet","profiles":["allowit-policy-wallet-v1"],"asset":b["asset"],"assetSymbol":b["assetSymbol"],"assetIssuer":b["assetIssuer"],"maxFeeStroops":b["maxFeeStroops"]}]}),
+            templates: json!({"templates":[{"network":"stellar:testnet","profiles":["allowit-policy-wallet-v1"],"asset":b["asset"],"assetSymbol":b["assetSymbol"],"assetIssuer":b["assetIssuer"],"maxFeeUnits":b["maxFeeUnits"]}]}),
             installations: json!({"installations":[]}),
             policy,
         }
@@ -90,7 +90,7 @@ impl OwnerDocuments {
         b.remove("template");
         b.insert("route".into(), json!("native"));
         b.insert("wallet".into(), json!(config.wallet));
-        b.insert("maxFeeStroops".into(), json!(config.max_fee_stroops));
+        b.insert("maxFeeUnits".into(), json!(config.max_fee_stroops));
         let d = &b["portable"];
         let identity = json!({"language":d["language"],"tier":d["tier"],"rules":d["rules"],"sourceHash":d["sourceHash"],"paramsHash":d["paramsHash"]});
         b.insert(

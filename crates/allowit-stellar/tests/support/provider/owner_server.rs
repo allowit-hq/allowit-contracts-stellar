@@ -72,7 +72,7 @@ impl Plan {
             origin: origin.clone(),
             challenge: challenge(owner, &origin, now()),
             discovery: json!({"wallets":[{"kind":"contract-wallet","profile":"allowit-policy-wallet-v1","sourceProfiles":["allowit-transfer-v1"],"networks":["stellar:testnet"],"operations":["allowit::transfer"],"capabilities":{"generate":true,"fund":true}}],"operations":[{"function":"allowit::transfer","services":[]}]}),
-            templates: json!({"templates":[{"network":"stellar:testnet","profiles":["allowit-policy-wallet-v1"],"asset":b["asset"],"assetSymbol":b["assetSymbol"],"assetIssuer":b["assetIssuer"],"maxFeeStroops":b["maxFeeStroops"]}]}),
+            templates: json!({"templates":[{"network":"stellar:testnet","profiles":["allowit-policy-wallet-v1"],"asset":b["asset"],"assetSymbol":b["assetSymbol"],"assetIssuer":b["assetIssuer"],"maxFeeUnits":b["maxFeeUnits"]}]}),
             installations: json!({"installations":[]}),
             policy,
             guest_cookie: format!(

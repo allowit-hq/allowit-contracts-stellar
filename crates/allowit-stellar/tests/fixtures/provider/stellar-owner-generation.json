@@ -35,7 +35,7 @@
         "asset": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
         "assetSymbol": "USDC",
         "assetIssuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
-        "maxFeeStroops": 5000000,
+        "maxFeeUnits": 5000000,
         "portable": {
           "language": "allowit-portable-v1",
           "sourceHash": "a8f7e636fdf9b4937544014f704607eaa605b677ccf152fab99a34230fba6e96",

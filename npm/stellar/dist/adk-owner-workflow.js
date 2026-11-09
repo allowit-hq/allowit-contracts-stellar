@@ -141,8 +141,8 @@ export async function deployAdkOwnerDraft({ host, proposal, session, agent, amou
         const asset = template?.asset;
         if (!template || !wasmHash || !hashPattern.test(wasmHash) || !asset
             || asset !== stellarAssetContractId('XLM', null, network)
-            || template.assetSymbol !== 'XLM' || template.assetIssuer !== null || template.maxFeeStroops !== binding.maxFeeStroops
-            || !Number.isSafeInteger(template.maxFeeStroops) || template.maxFeeStroops < 100
+            || template.assetSymbol !== 'XLM' || template.assetIssuer !== null || template.maxFeeUnits !== binding.maxFeeUnits
+            || !Number.isSafeInteger(template.maxFeeUnits) || template.maxFeeUnits < 100
             || server !== service.enginePublicKey || server === owner || server === agent)
             throw new Error('The Stellar Testnet wallet template does not match the reviewed policy.');
         stellarAccountKey(server);
@@ -223,9 +223,9 @@ export async function deployAdkOwnerDraft({ host, proposal, session, agent, amou
             const now = Math.floor(Date.now() / 1000);
             const expected = {
                 owner, agent, server, policyInstance, code: proposal.code, sourceHash: proposal.sourceHash,
-                params: proposal.params, wasmHash, wallet, asset, policyMaxFeeStroops: template.maxFeeStroops,
+                params: proposal.params, wasmHash, wallet, asset, policyMaxFeeStroops: template.maxFeeUnits,
                 // Upload and creation use the deployment ceiling. Funding and renewal keep the installed policy ceiling.
-                maxFeeStroops: step.action === 'upload_wasm' || step.action === 'create_wallet' ? deploymentFee : template.maxFeeStroops,
+                maxFeeStroops: step.action === 'upload_wasm' || step.action === 'create_wallet' ? deploymentFee : template.maxFeeUnits,
                 amount, nextSequence: await sequence(owner), validUntil: now + 300,
             };
             ensureCurrent();
@@ -310,7 +310,7 @@ export async function deployAdkOwnerDraft({ host, proposal, session, agent, amou
             || config?.wallet !== installed || config.owner !== owner || config.agent !== agent || config.server !== server
             || config.network !== network || config.route !== 'policyWallet' || config.policySource !== proposal.code
             || config.asset !== asset || config.assetSymbol !== 'XLM' || config.assetIssuer !== null
-            || config.maxFeeStroops !== template.maxFeeStroops || bytesHex(config.policyInstance) !== policyInstance
+            || config.maxFeeStroops !== template.maxFeeUnits || bytesHex(config.policyInstance) !== policyInstance
             || bytesHex(config.sourceHash) !== proposal.sourceHash || bytesHex(config.moduleDigest) !== wasmHash
             || !bytesHex(config.sourceDigest) || canonicalApprovalJson(config.rules ?? []) !== canonicalApprovalJson(reviewed?.rules ?? [])
             || endpoints?.execute !== '/api/native/execute' || endpoints.status !== '/api/native/execute/status')
@@ -322,7 +322,7 @@ export async function deployAdkOwnerDraft({ host, proposal, session, agent, amou
             config: {
                 ...portable.config, network, policyInstance: config.policyInstance, wallet: installed, owner, agent, server,
                 route: 'policyWallet', asset, assetSymbol: 'XLM', assetIssuer: null, policySource: proposal.code,
-                sourceHash: config.sourceHash, moduleDigest: config.moduleDigest, maxFeeStroops: template.maxFeeStroops,
+                sourceHash: config.sourceHash, moduleDigest: config.moduleDigest, maxFeeStroops: template.maxFeeUnits,
             },
             endpoints: { execute: endpoints.execute, status: endpoints.status },
         };
