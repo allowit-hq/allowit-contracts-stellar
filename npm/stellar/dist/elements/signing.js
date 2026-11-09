@@ -18,6 +18,27 @@ export async function payloadHash(payload, network) {
     const { TransactionBuilder } = await import('@stellar/stellar-sdk/base');
     return hex(TransactionBuilder.fromXDR(payload, networkPassphrase(network)).hash());
 }
+/**
+ * The wallet's signed envelope is the reviewed transaction (same hash on `network`) and carries a valid
+ * signature by `owner` over that hash.
+ */
+export async function signedPayloadValid(signed, network, hash, owner) {
+    try {
+        const { Keypair, TransactionBuilder } = await import('@stellar/stellar-sdk/base');
+        const tx = TransactionBuilder.fromXDR(signed, networkPassphrase(network));
+        const digest = tx.hash();
+        if (hex(digest) !== hash)
+            return false;
+        const key = Keypair.fromPublicKey(owner);
+        // XDR opaque values wrap their bytes in `value`.
+        const bytes = (v) => Uint8Array.from((v instanceof Uint8Array ? v : v.value));
+        const hint = hex(bytes(key.signatureHint()));
+        return tx.signatures.some(s => hex(bytes(s.hint)) === hint && key.verify(digest, bytes(s.signature)));
+    }
+    catch {
+        return false;
+    }
+}
 /** CAIP-122 sign-in text: the first line names this site, the second line is the signing account. */
 export function signInMessageFor(message, address, host) {
     const lines = message.split('\n');
@@ -93,6 +114,8 @@ export function ownerSignElement() {
                     const owner = typeof data.owner === 'string' && strkey(data.owner) ? data.owner : await connectWallet(id);
                     status.textContent = 'Waiting for the wallet…';
                     const signedPayload = await signWalletTransaction(step.payload, owner, id);
+                    if (!await signedPayloadValid(signedPayload, id, step.hash, owner))
+                        throw Object.assign(new Error('The wallet returned another transaction or no owner signature. Nothing was sent.'), { code: 'mismatch' });
                     status.textContent = 'Signed.';
                     emit(this, 'allowit-signed', { signedPayload, hash: step.hash });
                 }

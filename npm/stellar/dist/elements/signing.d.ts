@@ -10,6 +10,11 @@ export interface OwnerStep {
 export declare function ownerStep(value: unknown): OwnerStep | null;
 /** The transaction hash of `payload` on `network`. The owner signs nothing whose hash differs from the reviewed step. */
 export declare function payloadHash(payload: string, network: string): Promise<string>;
+/**
+ * The wallet's signed envelope is the reviewed transaction (same hash on `network`) and carries a valid
+ * signature by `owner` over that hash.
+ */
+export declare function signedPayloadValid(signed: string, network: string, hash: string, owner: string): Promise<boolean>;
 /** CAIP-122 sign-in text: the first line names this site, the second line is the signing account. */
 export declare function signInMessageFor(message: string, address: string, host: string): boolean;
 export declare function walletSignInElement(): {

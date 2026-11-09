@@ -3,7 +3,7 @@ import test from 'node:test';
 import {Account, Keypair, Networks, Operation, TransactionBuilder} from '@stellar/stellar-sdk/base';
 import plugin, {canonicalNetwork, strkey} from '../dist/plugin.js';
 import {formatUnits} from '../dist/elements/display.js';
-import {ownerStep, payloadHash, signInMessageFor} from '../dist/elements/signing.js';
+import {ownerStep, payloadHash, signInMessageFor, signedPayloadValid} from '../dist/elements/signing.js';
 import {expiry} from '../dist/elements/base.js';
 
 test('plugin identity, networks and element tags follow the SDK contract', () => {
@@ -64,6 +64,18 @@ test('owner steps admit only the rail-neutral shape and sign only the reviewed h
   assert.equal(await payloadHash(step.payload, 'stellar:testnet'), step.hash);
   assert.notEqual(await payloadHash(step.payload, 'stellar:pubnet'), step.hash);
   assert.equal(ownerStep({...step, hash: 'zz'}), null);
+  const key = Keypair.fromRawEd25519Seed(Buffer.alloc(32, 1));
+  assert.equal(await signedPayloadValid(tx.toXDR(), 'stellar:testnet', step.hash, owner), false, 'unsigned');
+  tx.sign(key);
+  assert.equal(await signedPayloadValid(tx.toXDR(), 'stellar:testnet', step.hash, owner), true);
+  const other = new TransactionBuilder(new Account(owner, '41'), {fee: '200', networkPassphrase: Networks.TESTNET})
+    .addOperation(Operation.bumpSequence({bumpTo: '50'})).setTimeout(300).build();
+  other.sign(key);
+  assert.equal(await signedPayloadValid(other.toXDR(), 'stellar:testnet', step.hash, owner), false, 'another transaction');
+  const stranger = Keypair.fromRawEd25519Seed(Buffer.alloc(32, 2));
+  const foreign = TransactionBuilder.fromXDR(step.payload, Networks.TESTNET);
+  foreign.sign(stranger);
+  assert.equal(await signedPayloadValid(foreign.toXDR(), 'stellar:testnet', step.hash, owner), false, 'another signer');
   assert.equal(ownerStep({...step, payload: '<xml/>'}), null);
 });
 
