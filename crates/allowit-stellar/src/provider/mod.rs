@@ -23,13 +23,16 @@ pub const OWNER_STORE_NAMESPACE: &str = "stellar-owner-workflows";
 /// The exit code of a call that got no answer, in the shared CLI exit table.
 pub(crate) const NETWORK_UNAVAILABLE: i32 = 7;
 /// Convert a native failure to a client error. A Stellar RPC call that got no answer keeps the
-/// network-unavailable code, so callers retry it with the same request ID.
+/// network-unavailable code, and an answer with an unknown outcome stays uncertain, so callers
+/// retry both with the same request ID.
 pub(crate) fn failure(message: impl Into<String>) -> Error {
     let message = message.into();
     if message.contains(native::rpc::NETWORK_UNAVAILABLE) {
         let mut error = Error::uncertain(message);
         error.code = NETWORK_UNAVAILABLE;
         error
+    } else if message.contains(native::rpc::TRANSPORT_UNKNOWN) {
+        Error::uncertain(message)
     } else {
         Error::config(message)
     }

@@ -27,6 +27,8 @@ fn transaction_hash_for(network: &str, tx: &Transaction) -> Result<[u8; 32]> {
 /// The failure of a Stellar RPC call that got no answer: a timeout or a connection, DNS or TLS
 /// failure. Nothing was observed, so a retry with the same request ID is safe.
 pub const NETWORK_UNAVAILABLE: &str = "Stellar RPC network unavailable (timeout or connection failure); retry with the same request ID";
+/// The failure of a Stellar RPC call that got an answer whose outcome is unknown.
+pub const TRANSPORT_UNKNOWN: &str = "Stellar RPC transport result is unknown";
 pub trait Rpc: Send + Sync {
     fn call(&self, method: &str, params: Value) -> Result<Value>;
 }
@@ -67,7 +69,7 @@ impl Rpc for HttpRpc {
                     ErrorKind::Json | ErrorKind::Envelope | ErrorKind::Refused => {
                         "Invalid or failed Stellar RPC response"
                     }
-                    _ => "Stellar RPC transport result is unknown",
+                    _ => TRANSPORT_UNKNOWN,
                 }
                 .into()
             })
@@ -1344,7 +1346,7 @@ mod transport_tests {
             .call("getNetwork", json!({}))
             .unwrap_err();
         server.join().unwrap();
-        assert_eq!(error, "Stellar RPC transport result is unknown");
-        assert_eq!(crate::provider::failure(error).code, 3);
+        assert_eq!(error, TRANSPORT_UNKNOWN);
+        assert_eq!(crate::provider::failure(error).code, 5);
     }
 }
