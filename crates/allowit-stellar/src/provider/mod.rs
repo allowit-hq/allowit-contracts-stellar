@@ -232,3 +232,5 @@ pub mod diagnostics;
 
 #[cfg(test)]
 mod request_proof_tests;
+#[cfg(test)]
+mod request_tests;

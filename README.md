@@ -21,6 +21,12 @@ This repository provides native contracts and rail capabilities within the vendo
 Vendors own native signing and chain semantics, plus SVG graphics and vendor web components.
 SDK engine composes the shared workflows. Core owns common policy rules, types and interfaces.
 
+The Stellar package joins the SDK as a plugin. `allowit_stellar::PLUGIN` implements the Core
+`RailPlugin` traits (`vendor::plugin`): execution, owner steps, server hooks and the looped-test
+declaration. The default export of `@allowit/stellar/plugin` is the matching TypeScript plugin with
+its web components. The SDK registers each with one line. The engine, CLI and app reach Stellar only
+through the SDK registry, by network id.
+
 ```mermaid
 flowchart TB
     UI["[allowit-engine]<br/>npm @allowit/ui<br/>Shared policy web components"]
