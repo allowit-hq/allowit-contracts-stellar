@@ -1,0 +1,26 @@
+name: Project review
+on:
+  pull_request:
+permissions:
+  statuses: read
+jobs:
+  project-review:
+    name: Project review
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Report the maintainers' project review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          status=$(gh api "repos/$REPO/commits/$SHA/statuses" \
+            --jq '[.[] | select(.context == "allowit-project/review")][0] // empty | "\(.state)\t\(.description)"')
+          state=${status%%$'\t'*}
+          description=${status#*$'\t'}
+          case "$state" in
+            success) echo "allowit-project/review: success - $description" ;;
+            failure|error) echo "::error::allowit-project/review: $state - $description"; exit 1 ;;
+            *) echo "::notice::Maintainers run the project review before merging; no action needed." ;;
+          esac

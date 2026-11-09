@@ -17,8 +17,6 @@ on:
       - "scripts/build-browser-owner-verifier.sh"
       - "npm/stellar/**"
       - ".github/workflows/stellar-core.yml"
-      - "scripts/vendor-boundary.mjs"
-      - "vendor-boundary.json"
   pull_request:
     paths:
       - "crates/allowit-stellar/**"
@@ -35,8 +33,6 @@ on:
       - "scripts/build-browser-owner-verifier.sh"
       - "npm/stellar/**"
       - ".github/workflows/stellar-core.yml"
-      - "scripts/vendor-boundary.mjs"
-      - "vendor-boundary.json"
   schedule:
     - cron: "17 4 * * *"
   workflow_dispatch:
@@ -62,7 +58,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - run: node scripts/vendor-boundary.mjs --self-test && node scripts/vendor-boundary.mjs
       - run: cargo fmt --manifest-path crates/allowit-stellar/Cargo.toml --check
       - run: cargo test --locked --manifest-path crates/allowit-stellar/Cargo.toml
       - run: cargo clippy --locked --manifest-path crates/allowit-stellar/Cargo.toml --all-targets -- -D warnings
