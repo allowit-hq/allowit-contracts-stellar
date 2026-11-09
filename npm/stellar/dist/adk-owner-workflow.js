@@ -91,7 +91,7 @@ function policyFrom(policies, policyId, proposal) {
 }
 export async function deployAdkOwnerDraft({ host, proposal, session, agent, amount, current, onStep, }) {
     const owner = session.address;
-    if (session.network !== 'stellar')
+    if (session.network !== 'wallet')
         throw new Error('Sign in with the Stellar owner account.');
     stellarAccountKey(owner);
     stellarAccountKey(agent);
@@ -173,7 +173,7 @@ export async function deployAdkOwnerDraft({ host, proposal, session, agent, amou
             let receipt;
             try {
                 // After its time bound, the server only reads the original result. It never sends the step again.
-                receipt = await ask('native/owner/submit', { policyId, transactionXdr: signed.signedXdr });
+                receipt = await ask('native/owner/submit', { policyId, payload: signed.signedXdr });
             }
             catch (error) {
                 const { code, details } = error;
@@ -216,7 +216,7 @@ export async function deployAdkOwnerDraft({ host, proposal, session, agent, amou
             onStep('Checking the saved transaction…');
             await confirm(journal.pending);
         }
-        const sign = async ({ network: stepNetwork, action, transactionXdr, transactionHash, expiresAt }, wallet) => {
+        const sign = async ({ network: stepNetwork, action, payload: transactionXdr, transactionHash, expiresAt }, wallet) => {
             if (journal.pending)
                 throw new Error('Check the saved owner transaction before signing another one.');
             const step = { network: stepNetwork, action, transactionXdr, transactionHash, expiresAt };
@@ -275,7 +275,7 @@ export async function deployAdkOwnerDraft({ host, proposal, session, agent, amou
         const bound = policyFrom(workspace.policies, policyId, proposal);
         if (bound.runtime?.instanceBinding?.wallet !== installed)
             throw new Error('The policy did not retain this deployed wallet.');
-        await host.verifyInstallation(bound, { ...session, network: 'stellar' }, current);
+        await host.verifyInstallation(bound, { ...session, network: 'wallet' }, current);
         ensureCurrent();
         if (journal.pending) {
             if (journal.pending.step.action !== 'fund')

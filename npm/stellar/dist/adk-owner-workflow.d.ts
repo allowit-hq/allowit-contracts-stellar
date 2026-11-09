@@ -28,7 +28,7 @@ export interface AdkOwnerHost {
         expectedOwner?: string;
     }): Promise<T>;
     verifyInstallation(policy: AdkPolicy, session: Session & {
-        network: 'stellar';
+        network: 'wallet';
     }, current: () => boolean): Promise<void>;
     admitPortableBuild: PortableAdmission;
 }

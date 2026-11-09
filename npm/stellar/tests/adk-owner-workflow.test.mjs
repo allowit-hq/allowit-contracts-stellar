@@ -47,7 +47,7 @@ const code = '/// Let the agent use XLM within the approved limit.';
 const params = {payment_limit: {Int: '20000000'}};
 const proposal = {network, revision: 2, title: 'Approve payment', explanation: '', code, params,
   sourceHash: hash(code), paramsHash: hash(JSON.stringify(params))};
-const session = {network: 'stellar', address: owner, expiresAt: '2026-11-07T00:00:00Z'};
+const session = {network: 'wallet', address: owner, expiresAt: '2026-11-07T00:00:00Z'};
 const binding = {wallet, template: true, route: 'policyWallet', tier: 'common', policyInstance, maxFeeStroops: 1000, portable: {paramsHash: proposal.paramsHash}};
 const policy = {id: policyId, revision: 1, network, code, sourceHash: proposal.sourceHash, irHash: '', mint: asset, token: 'XLM', runtime: {instanceBinding: binding}};
 const exported = {
@@ -59,7 +59,7 @@ const exported = {
   endpoints: {execute: '/api/native/execute', status: '/api/native/execute/status'},
 };
 const now = () => Math.floor(Date.now() / 1000);
-const fundStep = id => ({network, action: 'fund', transactionXdr: `AAAA${id}`, transactionHash: id.repeat(64), expiresAt: now() + 60});
+const fundStep = id => ({network, action: 'fund', payload: `AAAA${id}`, transactionHash: id.repeat(64), expiresAt: now() + 60});
 
 /**
  * A browser, server and Horizon model. `submit` answers each owner submission, and each answer uses one owner
@@ -91,7 +91,7 @@ function browser(submit) {
         case 'native/config?network=stellar:testnet': return {enginePublicKey: server};
         case 'native/deploy/prepare':
           if (state.walletMissing) return {policyId, wallet, step: {...fundStep('9'), action: 'create_wallet'}};
-          if (state.renewalDue) return {policyId, wallet, step: {...fundStep('8'), action: 'extend', transactionXdr: `AAAA8S${state.sequence + 1}`}};
+          if (state.renewalDue) return {policyId, wallet, step: {...fundStep('8'), action: 'extend', payload: `AAAA8S${state.sequence + 1}`}};
           return {policyId, installed: true, installation: {wallet}};
         case 'micro/policies': return {policies: [policy]};
         case 'native/owner/prepare': return {policyId, wallet, step: fundStep(steps.shift())};
@@ -107,7 +107,7 @@ function browser(submit) {
   };
   return {entries, trace, state, input: {host, proposal, session, agent, amount: '2', current: () => true, onStep: () => {}}};
 }
-const confirmed = body => ({policyId, action: 'fund', status: 'confirmed', transactionHash: body.transactionXdr.slice(4, 5).repeat(64), ledger: 42});
+const confirmed = body => ({policyId, action: 'fund', status: 'confirmed', transactionHash: body.payload.slice(4, 5).repeat(64), ledger: 42});
 
 test('verifies the installation, funds once, and exports only a public profile', async () => {
   signatures.length = 0;
@@ -136,7 +136,7 @@ test('a lost send expires, and then the owner signs a new step', async t => {
   let lost = true;
   const {entries, state, input} = browser(body => {
     if (lost) throw Object.assign(new Error('The service could not be reached.'), {code: ''});
-    if (body.transactionXdr === 'AAAA1signed') throw Object.assign(new Error('The owner transaction expired.'), {
+    if (body.payload === 'AAAA1signed') throw Object.assign(new Error('The owner transaction expired.'), {
       code: 'owner_transaction_expired', details: {policyId, action: 'fund', transactionHash: '1'.repeat(64)},
     });
     return confirmed(body);
@@ -214,7 +214,7 @@ async function expiredFunding(t) {
   let lost = true;
   const model = browser(body => {
     if (lost) throw Object.assign(new Error('The service could not be reached.'), {code: ''});
-    if (body.transactionXdr === 'AAAA1signed') throw Object.assign(new Error('The owner transaction expired.'), {
+    if (body.payload === 'AAAA1signed') throw Object.assign(new Error('The owner transaction expired.'), {
       code: 'owner_transaction_expired', details: {policyId, action: 'fund', transactionHash: '1'.repeat(64)},
     });
     return confirmed(body);

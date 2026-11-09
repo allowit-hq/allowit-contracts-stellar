@@ -120,7 +120,7 @@ export async function connectStellarWallet(network, admitTimes, signal) {
     signal?.throwIfAborted();
     return {
         address: access.address,
-        network: 'stellar',
+        network: 'wallet',
         validateChallenge(challenge) { if (admitTimes(stellarSignInChallengeTimes(challenge, access.address, location.origin)) !== true)
             throw new Error('The sign-in challenge is invalid or expired. Nothing was signed.'); },
         async signMessage(message) {
@@ -181,7 +181,7 @@ export async function signStellarSourceApproval(approval, policy, session, still
     const current = () => { if (!stillCurrent())
         throw new Error('The owner, network or policy changed. Nothing was activated.'); };
     current();
-    if (session?.network !== 'stellar')
+    if (session?.network !== 'wallet')
         throw new Error('Sign in with the Stellar owner before verifying the wallet.');
     {
         const payload = approval.payload, binding = policy.runtime?.instanceBinding;

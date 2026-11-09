@@ -13,7 +13,9 @@ const bytesHex = (value: unknown) => Array.isArray(value) && value.length === 32
   ? value.map(byte => byte.toString(16).padStart(2, '0')).join('') : '';
 type Signed = {step: AdkOwnerStep; expected: AdkOwnerSelection; signedXdr: string; sent?: boolean};
 type Journal = {agent: string; amount: string; wallet?: string; pending?: Signed; funded?: Signed};
-type Reply = {policyId: string; step?: AdkOwnerStep; wallet?: string; installed?: boolean; installation?: {wallet?: string}};
+/** The engine's rail-neutral owner step: `payload` is the unsigned base64 envelope. */
+type ServerStep = Omit<AdkOwnerStep, 'transactionXdr'> & {payload: string};
+type Reply = {policyId: string; step?: ServerStep; wallet?: string; installed?: boolean; installation?: {wallet?: string}};
 type Receipt = {policyId: string; action: AdkOwnerStep['action']; status: string; transactionHash: string; ledger: number};
 type Template = {network: string; asset: string; assetSymbol: string; assetIssuer: string | null; maxFeeStroops: number; tiers: {common?: string}};
 export type AdkPolicy = PortablePolicy & {revision: number};
@@ -25,7 +27,7 @@ export type AdkPolicy = PortablePolicy & {revision: number};
  */
 export interface AdkOwnerHost {
   request<T>(path: string, body?: unknown, options?: {expectedOwner?: string}): Promise<T>;
-  verifyInstallation(policy: AdkPolicy, session: Session & {network: 'stellar'}, current: () => boolean): Promise<void>;
+  verifyInstallation(policy: AdkPolicy, session: Session & {network: 'wallet'}, current: () => boolean): Promise<void>;
   admitPortableBuild: PortableAdmission;
 }
 
@@ -117,7 +119,7 @@ export async function deployAdkOwnerDraft({
   current: () => boolean; onStep: (step: string) => void;
 }): Promise<{policyId: string; wallet: string; publicProfile: string}> {
   const owner = session.address;
-  if (session.network !== 'stellar') throw new Error('Sign in with the Stellar owner account.');
+  if (session.network !== 'wallet') throw new Error('Sign in with the Stellar owner account.');
   stellarAccountKey(owner);
   stellarAccountKey(agent);
   if (agent === owner || !/^(?:0|[1-9][0-9]{0,9})(?:\.[0-9]{1,7})?$/.test(amount) || !/[1-9]/.test(amount))
@@ -191,7 +193,7 @@ export async function deployAdkOwnerDraft({
       let receipt: Receipt;
       try {
         // After its time bound, the server only reads the original result. It never sends the step again.
-        receipt = await ask<Receipt>('native/owner/submit', {policyId, transactionXdr: signed.signedXdr});
+        receipt = await ask<Receipt>('native/owner/submit', {policyId, payload: signed.signedXdr});
       } catch (error) {
         const {code, details} = error as {code?: unknown; details?: unknown};
         const failed = object(details);
@@ -231,7 +233,7 @@ export async function deployAdkOwnerDraft({
       onStep('Checking the saved transaction…');
       await confirm(journal.pending);
     }
-    const sign = async ({network: stepNetwork, action, transactionXdr, transactionHash, expiresAt}: AdkOwnerStep, wallet: string) => {
+    const sign = async ({network: stepNetwork, action, payload: transactionXdr, transactionHash, expiresAt}: ServerStep, wallet: string) => {
       if (journal.pending) throw new Error('Check the saved owner transaction before signing another one.');
       const step = {network: stepNetwork, action, transactionXdr, transactionHash, expiresAt};
       const now = Math.floor(Date.now() / 1000);
@@ -285,7 +287,7 @@ export async function deployAdkOwnerDraft({
     const workspace = await host.request<{policies: AdkPolicy[]}>('micro/policies', undefined, options);
     const bound = policyFrom(workspace.policies, policyId, proposal);
     if (bound.runtime?.instanceBinding?.wallet !== installed) throw new Error('The policy did not retain this deployed wallet.');
-    await host.verifyInstallation(bound, {...session, network: 'stellar'}, current);
+    await host.verifyInstallation(bound, {...session, network: 'wallet'}, current);
     ensureCurrent();
     if (journal.pending) {
       if (journal.pending.step.action !== 'fund') throw new Error('The saved owner transaction is not a funding transaction.');

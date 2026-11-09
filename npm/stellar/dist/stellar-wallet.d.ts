@@ -41,7 +41,7 @@ export declare function connectStellarWallet(network: StellarNetwork, admitTimes
     expiresAt: number;
 }) => boolean, signal?: AbortSignal): Promise<{
     address: string;
-    network: 'stellar';
+    network: 'wallet';
     validateChallenge(challenge: StellarSignInChallenge): void;
     signMessage(message: string): Promise<string>;
 }>;
