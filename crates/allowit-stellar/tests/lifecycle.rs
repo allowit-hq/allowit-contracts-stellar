@@ -525,7 +525,7 @@ fn requests_reject_other_rails_unbounded_fees_extra_effects_and_wrong_asset() {
     assert!(prepare(&c, &r, &s, 86401, 86700).is_err());
     let (c, r, _) = fixture(WalletRoute::Native, false);
     let mut foreign = serde_json::to_value(r).unwrap();
-    foreign["effect_bounds"][0]["source"]["chain"] = json!("Solana");
+    foreign["effect_bounds"][0]["source"]["chain"] = json!("Foreign");
     assert!(serde_json::from_value::<ExecutionRequest>(foreign).is_err());
     assert_eq!(c.network, "stellar:testnet");
 }

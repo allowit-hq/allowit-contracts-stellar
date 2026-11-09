@@ -188,7 +188,7 @@ fn sign_in_message_binds_canonical_account_origin_and_nonce() {
     }
     assert!(
         signing::sign_in_message_times(
-            &message.replace("Stellar account", "Solana account"),
+            &message.replace("Stellar account", "Foreign account"),
             &owner,
             origin,
             &nonce
