@@ -29,6 +29,11 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+/// Every engine call waits up to this long. Prepare, submit and status each run tens of
+/// sequential ledger reads and simulations on the server, and submit also broadcasts and
+/// polls for the receipt. At public RPC latency (about 5 s per call) these took up to 138 s.
+const ENGINE_TIMEOUT: Duration = Duration::from_secs(180);
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Bundle {
@@ -171,6 +176,15 @@ struct Response {
     operation: Operation,
     signed_operation: Option<SignedOperation>,
     receipt: Option<sdk::rpc::VerifiedReceipt>,
+    /// The engine reported this policy wallet operation `failed` without a chain receipt: it
+    /// released the operation. The status stays `submissionUnknown` until the client proves
+    /// the release itself.
+    #[serde(skip)]
+    released: bool,
+    /// This client proved, or its journal retains its proof, that the packet lapsed without
+    /// executing.
+    #[serde(skip)]
+    lapsed: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -192,6 +206,11 @@ struct Record {
     prepared: Option<PreparedOperation>,
     agent_signature: Option<DetachedSignature>,
     status: Option<OperationStatus>,
+    /// This client's own RPC proved that the retained preparation lapsed without executing.
+    /// The proof is final, so the operation stays `failed` when the wallet nonce later moves
+    /// or RPC is unavailable. An engine `failed` report alone never sets it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    lapsed: bool,
 }
 struct ExecutionProfile {
     policy_id: String,
@@ -340,6 +359,71 @@ pub trait AgentSigner: Send + Sync {
     fn account(&self) -> &str;
     fn sign_hash(&self, digest: &[u8; 32]) -> sdk::Result<[u8; 64]>;
 }
+/// The exit code of a policy denial in the shared CLI exit table.
+const POLICY_DENIED: i32 = 20;
+/// A typed engine refusal. See `provider::diagnostics`.
+#[derive(Deserialize)]
+struct Refusal {
+    code: String,
+    #[serde(default)]
+    details: RefusalDetails,
+}
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RefusalDetails {
+    rule: Option<String>,
+    error: Option<String>,
+    contract_error: Option<u32>,
+}
+/// The client error for a non-2xx engine reply. A 409 `policy_denied` names the denying rule
+/// and error and uses the policy-denial exit code. A 409 `wallet_rejected` is a contract
+/// rejection: the wallet, its asset or a vault refused the operation, and it names the contract
+/// error. Every other reply leaves the operation unresolved.
+fn refusal(status: u16, body: &[u8]) -> Error {
+    let refusal = serde_json::from_slice::<Refusal>(body)
+        .ok()
+        .filter(|_| status == 409);
+    // Engine names reach the terminal only as plain identifiers.
+    let name = |v: &Option<String>| {
+        v.clone().filter(|v| {
+            (1..=64).contains(&v.len()) && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        })
+    };
+    match refusal {
+        Some(Refusal { code, details: d }) if code == "policy_denied" => {
+            let reason = match (name(&d.rule), name(&d.error), d.contract_error) {
+                (Some(rule), Some(error), _) => format!("`{rule}` ({error})"),
+                (Some(rule), None, _) => format!("`{rule}`"),
+                (None, Some(error), Some(code)) => format!("{error} (contract error {code})"),
+                (None, Some(error), None) => error,
+                (None, None, Some(code)) => format!("contract error {code}"),
+                (None, None, None) => "no rule named".into(),
+            };
+            let mut error = Error::api(
+                status,
+                format!("The policy denied this operation: {reason}"),
+            );
+            error.code = POLICY_DENIED;
+            error
+        }
+        Some(Refusal { code, details: d }) if code == "wallet_rejected" => Error::api(
+            status,
+            match (name(&d.error), d.contract_error) {
+                (Some(error), Some(code)) => format!(
+                    "The operation was rejected in simulation: {error} (contract error {code})"
+                ),
+                (None, Some(code)) => {
+                    format!("The operation was rejected in simulation: contract error {code}")
+                }
+                (_, None) => "The operation was rejected in simulation".into(),
+            },
+        ),
+        _ => Error::api(
+            status,
+            "Stellar operation was not resolved; retain the original request ID",
+        ),
+    }
+}
 fn validate_response_receipt(r: &Response) -> Result<()> {
     let p = &r.prepared;
     if let Some(receipt) = &r.receipt {
@@ -403,7 +487,7 @@ impl Client {
         let account = signer.account().to_owned();
         Ok(Self {
             http: HttpClient::new(Options {
-                timeout: Duration::from_secs(30),
+                timeout: ENGINE_TIMEOUT,
                 max_response_bytes: 1_048_576,
                 no_proxy: false,
                 connect_timeout: None,
@@ -436,7 +520,7 @@ impl Client {
         ];
         let response = self
             .http
-            .send_success_body(
+            .send(
                 Request {
                     method: Method::Post,
                     url: &format!("{}{path}", self.origin),
@@ -451,14 +535,14 @@ impl Client {
                 )
             })?;
         if !(200..300).contains(&response.status) {
-            return Err(Error::api(
-                response.status,
-                "Stellar operation was not resolved; retain the original request ID",
-            ));
+            return Err(refusal(response.status, &response.body));
         }
         let mut parsed: Response = serde_json::from_slice(&response.body).map_err(|_| {
             Error::uncertain("Invalid Stellar response; recover the original request ID")
         })?;
+        parsed.released = parsed.prepared.config.route == WalletRoute::PolicyWallet
+            && parsed.operation.status == OperationStatus::Failed
+            && parsed.receipt.is_none();
         parsed.operation.status =
             super::projected_status(&parsed.prepared.config.route, parsed.operation.status);
         Ok(parsed)
@@ -532,12 +616,37 @@ impl Client {
         Ok(())
     }
     fn status(&self, id: &str, record: Option<&Record>) -> Result<Response> {
-        let r = self.post(
+        let mut r = self.post(
             &self.bundle.endpoints.status,
             json!({"policyId":self.bundle.policy_id,"requestId":id}),
         )?;
         self.validate(&r, id, record, true)?;
+        self.settle(&mut r, record)?;
         Ok(r)
+    }
+    /// Report `failed` for a policy wallet operation that this client proved lapsed, now or in
+    /// an earlier query that the journal retains for the same preparation.
+    fn settle(&self, r: &mut Response, record: Option<&Record>) -> Result<()> {
+        let retained = record.is_some_and(|v| v.lapsed && v.prepared.as_ref() == Some(&r.prepared));
+        if retained && r.operation.status == OperationStatus::Confirmed {
+            return Err(Error::uncertain("A terminal Stellar receipt changed"));
+        }
+        r.lapsed = retained || self.proven_release(r, record);
+        if r.lapsed {
+            r.operation.status = OperationStatus::Failed;
+        }
+        Ok(())
+    }
+    /// Whether the engine released the retained policy wallet operation and this client's own
+    /// RPC proves that it lapsed without executing. Without independent RPC, a retained
+    /// preparation or the proof, the operation stays `submissionUnknown`.
+    fn proven_release(&self, r: &Response, record: Option<&Record>) -> bool {
+        r.released
+            && record.and_then(|v| v.prepared.as_ref()) == Some(&r.prepared)
+            && !self.rpc_url.is_empty()
+            && sdk::rpc::HttpRpc::new(&self.rpc_url)
+                .and_then(|rpc| sdk::rpc::operation_lapsed(&rpc, &r.prepared))
+                .unwrap_or(false)
     }
 }
 /// The request retained under this policy and request ID, if any. `exec`
@@ -648,6 +757,7 @@ pub fn exec(
                 prepared: None,
                 agent_signature: None,
                 status: None,
+                lapsed: false,
             },
             None,
         )
@@ -724,23 +834,7 @@ fn poll(
         .ok_or_else(|| Error::usage("The Stellar polling deadline is too large"))?;
     loop {
         let r = c.status(id, record.as_ref())?;
-        let mut old = match record {
-            Some(old) => old,
-            None => Record {
-                backend_origin: Some(c.origin.clone()),
-                policy_id: c.bundle.policy_id.clone(),
-                request_id: id.into(),
-                config: c.bundle.config.clone(),
-                request: r.prepared.request.clone(),
-                prepared: Some(r.prepared.clone()),
-                agent_signature: None,
-                status: None,
-            },
-        };
-        if old.prepared.is_none() {
-            old.prepared = Some(r.prepared.clone());
-        }
-        old.status = Some(r.operation.status.clone());
+        let old = journaled(c, id, record, &r);
         journal.save(name, &old).map_err(journal_error)?;
         record = Some(old);
         if terminal(&r.operation.status) || std::time::Instant::now() >= deadline {
@@ -748,6 +842,29 @@ fn poll(
         }
         std::thread::sleep(Duration::from_secs(1));
     }
+}
+/// The journal record after status `r` for request `id`.
+fn journaled(c: &Client, id: &str, record: Option<Record>, r: &Response) -> Record {
+    let mut old = match record {
+        Some(old) => old,
+        None => Record {
+            backend_origin: Some(c.origin.clone()),
+            policy_id: c.bundle.policy_id.clone(),
+            request_id: id.into(),
+            config: c.bundle.config.clone(),
+            request: r.prepared.request.clone(),
+            prepared: Some(r.prepared.clone()),
+            agent_signature: None,
+            status: None,
+            lapsed: false,
+        },
+    };
+    if old.prepared.is_none() {
+        old.prepared = Some(r.prepared.clone());
+    }
+    old.status = Some(r.operation.status.clone());
+    old.lapsed |= r.lapsed;
+    old
 }
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -1198,6 +1315,7 @@ mod native_revalidation_tests {
                 prepared: None,
                 agent_signature: None,
                 status: None,
+                lapsed: false,
             };
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().canonicalize().unwrap();
@@ -1309,6 +1427,462 @@ mod native_revalidation_tests {
         .unwrap();
         assert!(revalidate_with_rpc_url(&old.prepared, 86402, "").is_err());
         sdk::validate_retained_prepared(&old.prepared).unwrap();
+    }
+    /// Answer one engine request on `listener` with `status` and `body` after `delay`, and
+    /// return the request line and body.
+    fn reply_once(
+        listener: TcpListener,
+        delay: Duration,
+        status: &'static str,
+        body: Vec<u8>,
+    ) -> std::thread::JoinHandle<(String, serde_json::Value)> {
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                header.push(byte[0]);
+            }
+            let header = String::from_utf8(header).unwrap();
+            let length: usize = header
+                .lines()
+                .find_map(|v| {
+                    v.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|s| s.trim().parse().unwrap())
+                })
+                .unwrap();
+            let mut request = vec![0; length];
+            stream.read_exact(&mut request).unwrap();
+            std::thread::sleep(delay);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .and_then(|_| stream.write_all(&body));
+            (
+                header.lines().next().unwrap().to_owned(),
+                serde_json::from_slice(&request).unwrap(),
+            )
+        })
+    }
+    fn engine_client(config: WalletConfig, origin: &str) -> Client {
+        struct TestKey(String);
+        impl AgentSigner for TestKey {
+            fn account(&self) -> &str {
+                &self.0
+            }
+            fn sign_hash(&self, hash: &[u8; 32]) -> sdk::Result<[u8; 64]> {
+                use ed25519_dalek::Signer;
+                Ok(ed25519_dalek::SigningKey::from_bytes(&[43; 32])
+                    .sign(hash)
+                    .to_bytes())
+            }
+        }
+        Client::from_context(
+            ExecutionProfile {
+                policy_id: "engine-policy".into(),
+                config,
+                endpoints: Endpoints {
+                    execute: "/api/native/execute".into(),
+                    status: "/api/native/execute/status".into(),
+                },
+            },
+            Arc::new(TestKey(sdk::account_for_seed(&[43; 32]))),
+            origin,
+            None,
+        )
+        .unwrap()
+    }
+    #[test]
+    fn slow_engine_replies_arrive_for_prepare_submit_and_status() {
+        // Engine prepare took up to 138 s, submit up to 90 s and status up to 44 s on testnet.
+        // Each reply here outlasts the former 30 s submit and status bound.
+        let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
+        let body = serde_json::to_vec(&json!({"prepared":p,"operation":{"id":"slow-engine-001","status":OperationStatus::Prepared,"transactionHash":sdk::hex(&p.transaction_hash)}})).unwrap();
+        std::thread::scope(|scope| {
+            for (path, phase) in [
+                ("/api/native/execute", Some("prepare")),
+                ("/api/native/execute", Some("submit")),
+                ("/api/native/execute/status", None),
+            ] {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let origin = format!("http://{}", listener.local_addr().unwrap());
+                let server = reply_once(listener, Duration::from_secs(32), "200 OK", body.clone());
+                let client = engine_client(p.config.clone(), &origin);
+                let p = &p;
+                scope.spawn(move || {
+                    let response = client.post(
+                        path,
+                        json!({"policyId":"engine-policy","requestId":"slow-engine-001","phase":phase}),
+                    );
+                    let (line, request) = server.join().unwrap();
+                    assert!(line.starts_with(&format!("POST {path} ")));
+                    assert_eq!(request["phase"], json!(phase));
+                    let response = response
+                        .unwrap_or_else(|e| panic!("{path} {phase:?}: {}", e.message));
+                    assert_eq!(response.prepared, *p);
+                });
+            }
+        });
+    }
+    #[test]
+    fn engine_refusals_keep_the_denying_rule_and_exit_code() {
+        // The engine replies of the testnet rerun: a portable rule denial and a Custom wallet
+        // simulation rejection whose contract the RPC did not identify.
+        let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
+        for (status, body, code, text) in [
+            (
+                "409 Conflict",
+                json!({"code":"policy_denied","details":{"contractError":null,"error":"PaymentLimitExceeded","rule":"payment_limit"},"error":"The policy denied this operation: `payment_limit` (PaymentLimitExceeded)."}),
+                20,
+                "Allowit returned HTTP 409: The policy denied this operation: `payment_limit` (PaymentLimitExceeded)",
+            ),
+            (
+                "409 Conflict",
+                json!({"code":"policy_denied","details":{"contractError":18,"error":"PolicyDenied","rule":null},"error":"denied"}),
+                20,
+                "Allowit returned HTTP 409: The policy denied this operation: PolicyDenied (contract error 18)",
+            ),
+            (
+                "409 Conflict",
+                json!({"code":"wallet_rejected","details":{"contract":null,"contractError":18},"error":"The operation failed in simulation: an unidentified contract raised contract error 18."}),
+                4,
+                "Allowit returned HTTP 409: The operation was rejected in simulation: contract error 18",
+            ),
+            (
+                "409 Conflict",
+                json!({"code":"policy_denied","details":{"rule":"payment_limit\u{1b}[2J","error":"Paid\nout"}}),
+                20,
+                "Allowit returned HTTP 409: The policy denied this operation: no rule named",
+            ),
+            (
+                "409 Conflict",
+                json!({"error":"Reconcile the original Stellar operation before preparing another."}),
+                4,
+                "Allowit returned HTTP 409: Stellar operation was not resolved; retain the original request ID",
+            ),
+            (
+                "503 Service Unavailable",
+                json!({"code":"policy_denied","details":{"rule":"payment_limit","error":"PaymentLimitExceeded"}}),
+                4,
+                "Allowit returned HTTP 503: Stellar operation was not resolved; retain the original request ID",
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let server = reply_once(
+                listener,
+                Duration::ZERO,
+                status,
+                serde_json::to_vec(&body).unwrap(),
+            );
+            let error = match engine_client(p.config.clone(), &origin).post(
+                "/api/native/execute",
+                json!({"policyId":"engine-policy","requestId":"denied-001","phase":"prepare"}),
+            ) {
+                Ok(_) => panic!("{body} must be refused"),
+                Err(error) => error,
+            };
+            server.join().unwrap();
+            assert_eq!((error.code, error.message.as_str()), (code, text), "{body}");
+        }
+    }
+    /// A loopback Stellar RPC that answers each JSON-RPC call with `answer(method, params)`
+    /// until `stop` is set, and returns the methods it served.
+    fn rpc_server(
+        answer: impl Fn(&str, &serde_json::Value) -> serde_json::Value + Send + 'static,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<Vec<String>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = stop.clone();
+        let server = std::thread::spawn(move || {
+            let mut methods = Vec::new();
+            while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    header.push(byte[0]);
+                }
+                let length: usize = String::from_utf8(header)
+                    .unwrap()
+                    .lines()
+                    .find_map(|v| {
+                        v.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|s| s.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).unwrap();
+                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let method = request["method"].as_str().unwrap().to_owned();
+                let result = answer(&method, &request["params"]);
+                methods.push(method);
+                let response = serde_json::to_vec(
+                    &json!({"jsonrpc":"2.0","id":request["id"],"result":result}),
+                )
+                .unwrap();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n", response.len()).unwrap();
+                stream.write_all(&response).unwrap();
+            }
+            methods
+        });
+        (url, stop, server)
+    }
+    /// RPC answers for a policy wallet whose fixture packet expires at 86700 with nonce 4: the
+    /// original hash, the closing ledger 130 and its close time, then the fixture's wallet
+    /// discovery replies dated `entries_ledger`.
+    fn lapse_rpc(
+        transaction: serde_json::Value,
+        entries_ledger: u64,
+    ) -> impl Fn(&str, &serde_json::Value) -> serde_json::Value + Send + 'static {
+        let calls = fixture()["calls"].as_array().unwrap().clone();
+        move |method, params| match method {
+            "getTransaction" => transaction.clone(),
+            "getLatestLedger" => json!({"sequence":130}),
+            _ => {
+                let mut result = calls
+                    .iter()
+                    .find(|c| c["method"] == method && c["params"] == *params)
+                    .unwrap_or_else(|| panic!("unexpected {method} {params}"))["result"]
+                    .clone();
+                if method == "getLedgerEntries" {
+                    result["latestLedger"] = json!(entries_ledger);
+                }
+                result
+            }
+        }
+    }
+    #[test]
+    fn released_operation_fails_only_with_an_independent_lapse_proof() {
+        // Common R4.1 on testnet: the engine released the expired operation as `failed`
+        // without a receipt, and the CLI reported `submissionUnknown`.
+        let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
+        assert_eq!((p.expires_at, p.state.nonce), (86700, 4));
+        let not_found =
+            json!({"status":"NOT_FOUND","latestLedger":130,"latestLedgerCloseTime":"86700"});
+        let (rpc, stop, server) = rpc_server(lapse_rpc(not_found.clone(), 130));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let engine = reply_once(
+            listener,
+            Duration::ZERO,
+            "200 OK",
+            serde_json::to_vec(&json!({"prepared":p,"operation":{"id":"released-001","status":OperationStatus::Failed,"transactionHash":sdk::hex(&p.transaction_hash)},"signedOperation":null,"receipt":null})).unwrap(),
+        );
+        let mut client = engine_client(p.config.clone(), &origin);
+        client.rpc_url = rpc.clone();
+        let r = client
+            .post(
+                "/api/native/execute/status",
+                json!({"requestId":"released-001"}),
+            )
+            .unwrap();
+        engine.join().unwrap();
+        assert!(r.released);
+        assert_eq!(r.operation.status, OperationStatus::SubmissionUnknown);
+        let mut record = Record {
+            backend_origin: Some(origin.clone()),
+            policy_id: "engine-policy".into(),
+            request_id: "released-001".into(),
+            config: p.config.clone(),
+            request: p.request.clone(),
+            prepared: Some(p.clone()),
+            agent_signature: None,
+            status: Some(OperationStatus::SubmissionUnknown),
+            lapsed: false,
+        };
+        assert!(client.proven_release(&r, Some(&record)));
+        record.prepared = None;
+        assert!(!client.proven_release(&r, Some(&record)));
+        assert!(!client.proven_release(&r, None));
+        record.prepared = Some(p.clone());
+        let mut unreleased = engine_client(p.config.clone(), &origin);
+        unreleased.rpc_url = rpc.clone();
+        let mut submitted: Response = serde_json::from_value(json!({"prepared":p,"operation":{"id":"released-001","status":OperationStatus::SubmissionUnknown,"transactionHash":sdk::hex(&p.transaction_hash)}})).unwrap();
+        assert!(!unreleased.proven_release(&submitted, Some(&record)));
+        submitted.released = true;
+        unreleased.rpc_url.clear();
+        assert!(!unreleased.proven_release(&submitted, Some(&record)));
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let methods = server.join().unwrap();
+        assert_eq!(methods[0], "getTransaction");
+        assert!(methods.iter().any(|m| m == "getLedgerEntries"));
+
+        let mut advanced = p.clone();
+        advanced.state.nonce = 3;
+        for (transaction, entries_ledger, packet, lapsed) in [
+            (not_found.clone(), 130, &p, true),
+            (
+                json!({"status":"FAILED","latestLedger":130,"latestLedgerCloseTime":86701}),
+                131,
+                &p,
+                true,
+            ),
+            // The closing ledger precedes the expiry: the wallet can still execute it.
+            (
+                json!({"status":"NOT_FOUND","latestLedger":130,"latestLedgerCloseTime":"86699"}),
+                130,
+                &p,
+                false,
+            ),
+            (
+                json!({"status":"SUCCESS","latestLedger":130,"latestLedgerCloseTime":"86700"}),
+                130,
+                &p,
+                false,
+            ),
+            (
+                json!({"status":"NOT_FOUND","latestLedger":130}),
+                130,
+                &p,
+                false,
+            ),
+            // The wallet entries predate the closing ledger.
+            (not_found.clone(), 129, &p, false),
+            // The wallet nonce moved past the packet: some operation executed.
+            (not_found.clone(), 130, &advanced, false),
+        ] {
+            let (rpc, stop, server) = rpc_server(lapse_rpc(transaction.clone(), entries_ledger));
+            let result = sdk::rpc::operation_lapsed(&sdk::rpc::HttpRpc::new(&rpc).unwrap(), packet);
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            server.join().unwrap();
+            assert_eq!(result, Ok(lapsed), "{transaction} at {entries_ledger}");
+        }
+    }
+    /// Advance the wallet nonce in the instance entries of a `getLedgerEntries` reply, as if
+    /// the wallet executed another operation.
+    fn advance_nonce(reply: &mut serde_json::Value) {
+        use stellar_xdr::{LedgerEntryData, Limits, ReadXdr, ScVal, WriteXdr};
+        fn walk(value: &mut ScVal) {
+            let entries = match value {
+                ScVal::Map(Some(map)) => map.0.iter_mut(),
+                ScVal::ContractInstance(instance) => match &mut instance.storage {
+                    Some(map) => map.0.iter_mut(),
+                    None => return,
+                },
+                _ => return,
+            };
+            for entry in entries {
+                match (&entry.key, &mut entry.val) {
+                    (ScVal::Symbol(key), ScVal::U64(nonce)) if key.0.as_slice() == b"nonce" => {
+                        *nonce += 1
+                    }
+                    (_, val) => walk(val),
+                }
+            }
+        }
+        for entry in reply["entries"].as_array_mut().unwrap() {
+            let mut data =
+                LedgerEntryData::from_xdr_base64(entry["xdr"].as_str().unwrap(), Limits::none())
+                    .unwrap();
+            if let LedgerEntryData::ContractData(contract) = &mut data {
+                walk(&mut contract.val);
+            }
+            entry["xdr"] = json!(data.to_xdr_base64(Limits::none()).unwrap());
+        }
+    }
+    #[test]
+    fn proven_failure_stays_failed_after_the_nonce_moves_or_rpc_fails() {
+        // Codex P2 on PR #45: poll journaled only `failed`, so a later status query that could
+        // not repeat the lapse proof overwrote the terminal failure with `submissionUnknown`.
+        let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
+        let not_found =
+            json!({"status":"NOT_FOUND","latestLedger":130,"latestLedgerCloseTime":"86700"});
+        let released = serde_json::to_vec(&json!({"prepared":p,"operation":{"id":"released-001","status":OperationStatus::Failed,"transactionHash":sdk::hex(&p.transaction_hash)},"signedOperation":null,"receipt":null})).unwrap();
+        // One engine status reply that releases the operation, read by a client using `rpc`.
+        let query = |rpc: &str| {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let engine = reply_once(listener, Duration::ZERO, "200 OK", released.clone());
+            let mut client = engine_client(p.config.clone(), &origin);
+            client.rpc_url = rpc.into();
+            let r = client
+                .post(
+                    "/api/native/execute/status",
+                    json!({"requestId":"released-001"}),
+                )
+                .unwrap();
+            engine.join().unwrap();
+            assert!(r.released);
+            (client, r)
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Store::open(&temp.path().canonicalize().unwrap().join("journal")).unwrap();
+        let record: Record = serde_json::from_value(json!({"policyId":"engine-policy","requestId":"released-001","config":p.config,"request":p.request,"prepared":p,"agentSignature":null,"status":OperationStatus::SubmissionUnknown})).unwrap();
+        let (rpc, stop, server) = rpc_server(lapse_rpc(not_found.clone(), 130));
+        let (client, mut r) = query(&rpc);
+        client.settle(&mut r, Some(&record)).unwrap();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().unwrap();
+        assert_eq!(r.operation.status, OperationStatus::Failed);
+        journal
+            .save(
+                "released",
+                &journaled(&client, "released-001", Some(record), &r),
+            )
+            .unwrap();
+
+        let proof = lapse_rpc(not_found, 130);
+        let (moved, stop, server) = rpc_server(move |method, params| {
+            let mut reply = proof(method, params);
+            if method == "getLedgerEntries" {
+                advance_nonce(&mut reply);
+            }
+            reply
+        });
+        assert_eq!(
+            sdk::rpc::operation_lapsed(&sdk::rpc::HttpRpc::new(&moved).unwrap(), &p),
+            Ok(false)
+        );
+        let closed = {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
+        for rpc in [moved.as_str(), closed.as_str(), ""] {
+            let record: Record = journal.load("released").unwrap().unwrap();
+            let (client, mut r) = query(rpc);
+            client.settle(&mut r, Some(&record)).unwrap();
+            assert_eq!(r.operation.status, OperationStatus::Failed, "RPC {rpc:?}");
+            journal
+                .save(
+                    "released",
+                    &journaled(&client, "released-001", Some(record), &r),
+                )
+                .unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().unwrap();
+        let mut record: Record = journal.load("released").unwrap().unwrap();
+        assert_eq!(
+            (record.status.clone(), record.lapsed),
+            (Some(OperationStatus::Failed), true)
+        );
+        // A confirmed engine report contradicts the retained proof.
+        let (client, mut r) = query("");
+        r.operation.status = OperationStatus::Confirmed;
+        assert!(client.settle(&mut r, Some(&record)).is_err());
+        // A journaled `failed` without this client's proof stays unresolved.
+        record.lapsed = false;
+        let (client, mut r) = query("");
+        client.settle(&mut r, Some(&record)).unwrap();
+        assert_eq!(r.operation.status, OperationStatus::SubmissionUnknown);
+        assert!(!journaled(&client, "released-001", Some(record), &r).lapsed);
     }
     #[test]
     fn failed_policy_wallet_envelope_remains_unknown_on_the_server_client_wire() {

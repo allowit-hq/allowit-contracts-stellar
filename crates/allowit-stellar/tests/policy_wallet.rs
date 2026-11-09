@@ -820,9 +820,12 @@ impl rpc::Rpc for DeploymentLedgerClock {
             *elapsed = Some(0);
         } else if let Some(calls) = elapsed.as_mut() {
             // The next ledger closes after two RPC round trips. The original builder
-            // spends those on redundant checks before requesting the owner's entry.
+            // spent those on redundant checks before requesting the owner's entry. A slow
+            // account read lands past the five-ledger observation window.
             let ledger = LEDGER
-                + if *calls < 2 && !self.slow_account {
+                + if self.slow_account {
+                    6
+                } else if *calls < 2 {
                     1
                 } else {
                     2
