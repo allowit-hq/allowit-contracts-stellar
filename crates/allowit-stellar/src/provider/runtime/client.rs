@@ -7,18 +7,18 @@ use crate::host::{
     error::{Error, Result},
     typed_request::operation_nonce,
 };
-use allowit_policy_sdk::{
+use crate::rpc::Rpc;
+use crate::workflow::ExecutionRequest;
+use crate::{
+    self as sdk, DetachedSignature, OperationStatus, PreparedOperation, SignedOperation,
+    WalletConfig, WalletRoute,
+};
+use allowit_core::{
     client::store::Store,
     transport::{
         http::{HttpClient, Method, Request},
         rpc::Options,
     },
-};
-use allowit_stellar_wallet::rpc::Rpc;
-use allowit_stellar_wallet::workflow::ExecutionRequest;
-use allowit_stellar_wallet::{
-    self as sdk, DetachedSignature, OperationStatus, PreparedOperation, SignedOperation,
-    WalletConfig, WalletRoute,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -1324,7 +1324,7 @@ mod native_revalidation_tests {
             journal.save(&key, &record).unwrap();
             let before = std::fs::read(root.join("journal").join(format!(
                 "request-{}.json",
-                allowit_policy_sdk::digest(key.as_bytes())
+                allowit_core::digest(key.as_bytes())
             )))
             .unwrap();
             let roundtrip: Record =
@@ -1347,7 +1347,7 @@ mod native_revalidation_tests {
             assert_eq!(
                 std::fs::read(root.join("journal").join(format!(
                     "request-{}.json",
-                    allowit_policy_sdk::digest(key.as_bytes())
+                    allowit_core::digest(key.as_bytes())
                 )))
                 .unwrap(),
                 before

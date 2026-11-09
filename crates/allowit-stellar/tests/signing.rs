@@ -1,4 +1,4 @@
-use allowit_stellar_wallet::{self as native, signing};
+use allowit_stellar::{self as native, signing};
 use ed25519_dalek::{Signer as _, SigningKey};
 
 #[test]

@@ -43,7 +43,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --locked -p allowit-policy-wallet -p allowit-simple-engine -p allowit-common-engine -p allowit-custom-policy -p allowit-engine-deployer -p allowit-wallet-engine -- --nocapture 2>&1 | tee "$RUNNER_TEMP/wallet-mvp.log"
+          cargo test --locked -p allowit-policy-wallet -p allowit-simple-policy-engine -p allowit-common-policy-engine -p allowit-custom-policy -p allowit-engine-parent -p allowit-wallet-engine -- --nocapture 2>&1 | tee "$RUNNER_TEMP/wallet-mvp.log"
           grep -E "[1-9][0-9]* passed; 0 failed" "$RUNNER_TEMP/wallet-mvp.log"
       - name: Admin transaction tooling
         run: |

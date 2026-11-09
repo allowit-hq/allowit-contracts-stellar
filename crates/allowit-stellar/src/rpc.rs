@@ -9,7 +9,7 @@ pub use diagnostics::{
 };
 pub(crate) mod owner_observation;
 #[cfg(not(target_arch = "wasm32"))]
-use allowit_policy_sdk::transport::rpc::{EnvelopeValidation, ErrorKind, RpcClient};
+use allowit_core::transport::rpc::{EnvelopeValidation, ErrorKind, RpcClient};
 pub use owner_actions::{
     OwnerSettlement, code_uploaded, contract_exists, owner_settlement, vault_redeemable,
 };

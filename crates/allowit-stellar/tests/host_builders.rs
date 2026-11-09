@@ -1,5 +1,5 @@
 //! Native owner builders exercised through complete RPC responses and independent legacy XDR.
-use allowit_stellar_wallet::{
+use allowit_stellar::{
     self as n,
     admin::*,
     owner_intent::*,
@@ -403,22 +403,22 @@ fn installation_preserves_policy_instance_salt_and_constructor_binding() {
 
 #[test]
 fn common_values_keep_variant_and_native_address_validation() {
-    use allowit_policy_sdk::policy::PolicyValue as Common;
+    use allowit_core::policy::PolicyValue as Common;
     let address = account(11);
     for value in [
-        allowit::AllowitValue::Addr(allowit::Address::new(address.clone())),
-        allowit::AllowitValue::Str(address),
-        allowit::AllowitValue::Int(i128::MIN),
-        allowit::AllowitValue::List(vec![allowit::AllowitValue::Bool(true)].into()),
+        allowit_core::AllowitValue::Addr(allowit_core::Address::new(address.clone())),
+        allowit_core::AllowitValue::Str(address.into()),
+        allowit_core::AllowitValue::Int(i128::MIN),
+        allowit_core::AllowitValue::List(vec![allowit_core::AllowitValue::Bool(true)].into()),
     ] {
         let common = Common(value);
         let native = PolicyValue::from_core(&common).unwrap();
         assert_eq!(native.to_core().unwrap(), common);
     }
     assert!(
-        PolicyValue::from_core(&Common(allowit::AllowitValue::Addr(allowit::Address::new(
-            "not a Stellar address"
-        ))))
+        PolicyValue::from_core(&Common(allowit_core::AllowitValue::Addr(
+            allowit_core::Address::new("not a Stellar address")
+        )))
         .is_err()
     );
 }

@@ -1,5 +1,5 @@
 //! Native Horizon and Friendbot semantics over the common HTTP transport.
-use allowit_stellar_wallet::{account_for_seed, owner, passphrase};
+use allowit_stellar::{account_for_seed, owner, passphrase};
 use serde_json::{Value, json};
 use std::{
     io::{Read, Write},

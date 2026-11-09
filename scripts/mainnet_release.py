@@ -28,7 +28,7 @@ DEFAULT_REVISION = None
 DEFAULT_HASHES = {}
 WALLET_KIND = "common_policy_engine"
 POLICY_DENIED = 18
-BUILD_SCRIPTS = ("build-contracts.sh", "stellar-cargo.py", "check-policy-bindings.py", "policy_source.py", "core_sources.py")
+BUILD_SCRIPTS = ("build-contracts.sh", "check-policy-bindings.py", "policy_source.py", "core_sources.py")
 
 # The smoke policy is entirely one standard prefix of canonical calls. Its rules derive from the source.
 SMOKE_SOURCE = b"""use allowit::prelude::*;

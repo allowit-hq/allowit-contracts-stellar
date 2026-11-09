@@ -3,10 +3,10 @@
 use crate::host::input::Formats;
 
 fn account(s: &str) -> bool {
-    s.starts_with('G') && allowit_stellar_wallet::account_key(s).is_ok()
+    s.starts_with('G') && crate::account_key(s).is_ok()
 }
 fn contract(s: &str) -> bool {
-    s.starts_with('C') && allowit_stellar_wallet::address(s).is_ok()
+    s.starts_with('C') && crate::address(s).is_ok()
 }
 fn account_or_contract(s: &str) -> bool {
     account(s) || contract(s)
@@ -57,10 +57,9 @@ fn resolve_asset(
             })
             .flatten()
     });
-    let asset = allowit_stellar_wallet::asset_from_identity(symbol, issuer)
-        .map_err(crate::host::error::Error::usage)?;
-    let address = allowit_stellar_wallet::sac_address(network, &asset)
-        .map_err(crate::host::error::Error::usage)?;
+    let asset =
+        crate::asset_from_identity(symbol, issuer).map_err(crate::host::error::Error::usage)?;
+    let address = crate::sac_address(network, &asset).map_err(crate::host::error::Error::usage)?;
     Ok(crate::host::input::asset::ResolvedAsset {
         symbol: symbol.into(),
         address,
@@ -74,8 +73,8 @@ pub const FORMATS: Formats = Formats {
     wallet_error,
     recipient: (account_or_contract, "a G… or C… strkey"),
     token: (account_or_contract, "a G… issuer or C… contract"),
-    signing_digest: allowit_stellar_wallet::signing::signed_message_digest,
-    account_key: |address| allowit_stellar_wallet::account_key(address).ok(),
+    signing_digest: crate::signing::signed_message_digest,
+    account_key: |address| crate::account_key(address).ok(),
     address_candidate,
     resolve_asset,
     same_wallet: |a, b| a == b,

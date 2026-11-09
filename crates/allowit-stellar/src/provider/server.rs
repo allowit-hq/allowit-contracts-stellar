@@ -5,9 +5,7 @@ use crate::host::{
     profiles::Description,
     runtime::*,
 };
-use allowit_stellar_wallet::{
-    self as native, PreparedOperation, SignedOperation, WalletConfig, WalletRoute, rpc,
-};
+use crate::{self as native, PreparedOperation, SignedOperation, WalletConfig, WalletRoute, rpc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::value::RawValue;
 use std::collections::BTreeMap;
@@ -90,9 +88,7 @@ impl RetainedPacket for native::workflow::ExecutionRequest {
     }
 }
 
-fn params(
-    v: &BTreeMap<String, allowit_policy_sdk::policy::PolicyValue>,
-) -> Result<native::PolicyParams> {
+fn params(v: &BTreeMap<String, allowit_core::policy::PolicyValue>) -> Result<native::PolicyParams> {
     Ok(native::PolicyParams(
         v.iter()
             .map(|(k, v)| checked(native::PolicyValue::from_core(v)).map(|v| (k.clone(), v)))
@@ -956,7 +952,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 }
             }
             OwnerAction::SetPause { paused } => {
-                use allowit_policy_sdk::admin::{DeploymentVersion, SetPause};
+                use allowit_core::admin::{DeploymentVersion, SetPause};
                 let mut admin = native::admin::OwnerAdmin {
                     rpc: self.rpc(),
                     config: &c,
@@ -972,7 +968,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 )?
             }
             OwnerAction::Recover { units, recipient } => {
-                use allowit_policy_sdk::admin::RecoverFunds;
+                use allowit_core::admin::RecoverFunds;
                 let mut admin = native::admin::OwnerAdmin {
                     rpc: self.rpc(),
                     config: &c,

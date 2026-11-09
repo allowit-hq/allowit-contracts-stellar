@@ -15,7 +15,7 @@ crate-type = ["rlib"]
 soroban-sdk.workspace = true
 
 [build-dependencies]
-allowit-common.workspace = true
+allowit-core.workspace = true
 
 [package.metadata.allowit-source]
 repository = "https://github.com/allowit-hq/allowit-core"
@@ -23,9 +23,9 @@ revision = "6aa4235e6229e18d1f9780a6a9fdf80aceb0f348"
 path = "crates/allowit/src/lib.rs"
 scope = "soroban module"
 
-[package.metadata.allowit-common-source]
+[package.metadata.allowit-core-source]
 repository = "https://github.com/allowit-hq/allowit-core"
-tag = "v0.3.2"
-revision = "c6c9f382761a0c5b88afc5524be7220c5c56c244"
-path = "crates/allowit/src/core.rs"
-resource = "allowit_common::SOURCE_CORE_RS"
+tag = "v0.5.0"
+revision = "e3f860a243675f21784e8aedf92303e8004b34bf"
+path = "crates/allowit-core/src/portable/core.rs"
+resource = "allowit_core::SOURCE_CORE_RS"

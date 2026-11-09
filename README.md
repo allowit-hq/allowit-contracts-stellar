@@ -79,18 +79,17 @@ Stellar crate uses a separate workspace. Support crates retain their existing bo
 
 ```mermaid
 flowchart TD
-    S["contracts/allowit-simple-engine<br/>allowit-simple-engine"]
-    C["contracts/allowit-common-engine<br/>allowit-common-engine"]
+    S["contracts/allowit-simple-policy-engine<br/>allowit-simple-policy-engine"]
+    C["contracts/allowit-common-policy-engine<br/>allowit-common-policy-engine"]
     X["contracts/allowit-custom-policy<br/>allowit-custom-policy"]
-    P["contracts/allowit-engine-deployer<br/>allowit-engine-deployer"]
+    P["contracts/allowit-engine-parent<br/>allowit-engine-parent"]
     W["crates/policy-wallet<br/>allowit-policy-wallet"]
     T["crates/protocol<br/>allowit-wallet-protocol"]
     B["crates/policy<br/>allowit-stellar-policy"]
-    CORE["allowit-core<br/>portable allowit"]
+    CORE["allowit-core<br/>portable rules · host primitives"]
     SDK["soroban-sdk"]
     OFF["crates/allowit-stellar<br/>allowit-stellar · off-chain"]
-    HOST["allowit-core<br/>allowit-sdk · host primitives"]
-    E["crates/engine<br/>allowit-wallet-engine · standalone checker"]
+    E["contracts/allowit-wallet-engine<br/>allowit-wallet-engine · standalone checker"]
     S --> W
     S --> T
     C --> W
@@ -112,7 +111,6 @@ flowchart TD
     E --> B
     E --> SDK
     OFF --> CORE
-    OFF --> HOST
 ```
 
 The deployer package retains the EngineParent contract and its stateless-checker behavior.
@@ -287,16 +285,16 @@ The step-by-step guide, including params encoding and owner handoffs, is in [doc
 
 ```
 contracts/
-  allowit-simple-engine/    AllowitSimplePolicyEngine contract
-  allowit-common-engine/    AllowitCommonPolicyEngine contract
-  allowit-custom-policy/    AllowitCustomPolicy contract and sample policy source
-  allowit-engine-deployer/  EngineParent contract for the standalone checker
+  allowit-simple-policy-engine/  AllowitSimplePolicyEngine contract
+  allowit-common-policy-engine/  AllowitCommonPolicyEngine contract
+  allowit-custom-policy/         AllowitCustomPolicy contract and sample policy source
+  allowit-wallet-engine/         Standalone shared rule engine contract
+  allowit-engine-parent/         EngineParent contract for the standalone checker
 crates/
   allowit-stellar/          Off-chain Stellar SDK; separate Cargo workspace
   protocol/                Shared request, receipt and binding types
   policy/                  Soroban policy bindings
   policy-wallet/           Custody core, owner operations and policy_wallet! macro
-  engine/                  Standalone shared rule engine contract
   test-vault/              SEP-56 vault for tests
 npm/stellar/               @allowit/stellar browser package; source, tests and distribution
 scripts/                  Build, policy checks, smoke vectors, administration and release tooling
@@ -352,7 +350,7 @@ cargo test --locked --manifest-path crates/allowit-stellar/Cargo.toml
 cargo clippy --locked --manifest-path crates/allowit-stellar/Cargo.toml --all-targets -- -D warnings
 ```
 
-All packages consume the same `allowit-core` release tag `v0.3.2`. Releases of this repository are annotated git tags `vX.Y.Z`: set `version` in `Cargo.toml` and `crates/allowit-stellar/Cargo.toml`, merge, then tag the merge commit with `git tag -a vX.Y.Z -m vX.Y.Z <commit> && git push origin vX.Y.Z`.
+All packages consume the same `allowit-core` release tag `v0.5.0`. Releases of this repository are annotated git tags `vX.Y.Z`: set `version` in `Cargo.toml`, `crates/allowit-stellar/Cargo.toml` and `npm/stellar/package.json`, merge, then tag the merge commit with `git tag -a vX.Y.Z -m vX.Y.Z <commit> && git push origin vX.Y.Z`.
 
 Keep contract code, the `crates/allowit-stellar` rail crate, build and API documentation and release inputs here. [AGENTS.md](AGENTS.md) describes the repository scope.
 

@@ -234,14 +234,14 @@ pub fn fund_testnet_account(account: &str, endpoint: Option<&str>) -> Result<Str
 }
 #[cfg(not(target_arch = "wasm32"))]
 fn service_origin(endpoint: Option<&str>, default: &str) -> Result<String> {
-    allowit_policy_sdk::client::config::parse_origin(
+    allowit_core::client::config::parse_origin(
         endpoint.filter(|v| !v.is_empty()).unwrap_or(default),
     )
     .map_err(|_| "Stellar service endpoint must be an HTTPS or local HTTP origin".into())
 }
 #[cfg(not(target_arch = "wasm32"))]
 fn service_json(url: &str) -> Result<serde_json::Value> {
-    use allowit_policy_sdk::transport::{
+    use allowit_core::transport::{
         http::{HttpClient, Method, Request},
         rpc::Options,
     };

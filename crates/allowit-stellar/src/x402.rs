@@ -102,12 +102,12 @@ fn checked(
         return Err("x402 authorization must match the one exact approved SAC transfer".into());
     }
     if let Some(expense) = &request.terms.expense {
-        if expense.day != now / allowit::DAY {
+        if expense.day != now / allowit_core::DAY {
             return Err("x402 expense bounds belong to another UTC day".into());
         }
         // The kernel checks the day against the settlement ledger time, which is before the
         // exclusive `expires_at`. Both signers would sign a request that fails after UTC midnight.
-        if (request.expires_at - 1) / allowit::DAY != expense.day {
+        if (request.expires_at - 1) / allowit_core::DAY != expense.day {
             return Err("Priced x402 settlement cannot cross its UTC expense day".into());
         }
     }

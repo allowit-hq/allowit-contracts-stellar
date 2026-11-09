@@ -1,5 +1,5 @@
 //! Deterministic public compatibility fixture. These test keys are never used on chain.
-use allowit_stellar_wallet::{AccountState, account_for_seed, owner::prepare_native_setup};
+use allowit_stellar::{AccountState, account_for_seed, owner::prepare_native_setup};
 fn main() {
     let state = AccountState {
         address: account_for_seed(&[1; 32]),
