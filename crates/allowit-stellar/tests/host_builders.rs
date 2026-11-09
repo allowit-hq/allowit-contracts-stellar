@@ -1013,6 +1013,9 @@ fn current_rpc_not_found_zero_ledger_is_no_receipt() {
     chain.receipt["oldestLedger"] = json!(5458183);
     chain.receipt["ledger"] = json!("0");
     assert!(rpc::receipt_by_hash(&chain, NETWORK, &hash).is_err());
+    // Only zero means "no ledger": any other NOT_FOUND ledger must lie in the reported history.
+    chain.receipt["ledger"] = json!(1);
+    assert!(rpc::receipt_by_hash(&chain, NETWORK, &hash).is_err());
 }
 
 #[test]
