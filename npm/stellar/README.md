@@ -2,7 +2,7 @@
 
 `@allowit/stellar` supplies native profiles, asset derivation, wallet signing, owner handoffs, receipt validation and explorer links. Consumers supply their authenticated REST transport. The adapter does not own application sessions or presentation layout.
 
-The package exports JavaScript modules and TypeScript declarations. Run these commands from `npm/stellar/`:
+The package exports JavaScript modules and TypeScript declarations. `test:browser` reads the Common Wasm that `scripts/build-contracts.sh` builds. Run these commands from `npm/stellar/`:
 
 ```sh
 pnpm install --frozen-lockfile --ignore-scripts

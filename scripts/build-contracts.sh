@@ -30,3 +30,7 @@ if [ "$cargo_target" -ef target ]; then
 else
   "$stellar_bin" contract build --locked --out-dir target/wasm32v1-none/release
 fi
+
+# The browser owner verifier embeds this hash. CI rejects a committed copy that differs.
+shasum -a 256 target/wasm32v1-none/release/allowit_common_policy_engine.wasm | cut -d ' ' -f 1 \
+  > crates/allowit-stellar/allowit_common_policy_engine.wasm.sha256
