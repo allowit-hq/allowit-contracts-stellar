@@ -12,7 +12,7 @@ pnpm --config.ignore-scripts=true pack --dry-run --json
 pnpm --config.ignore-scripts=true pack
 ```
 
-The build regenerates `dist/` from `src/`. Keep the distribution with its source so consumers can install the package with lifecycle scripts disabled. Before a registry release, build a tarball from an immutable repository revision and install that tarball. A repository-root Git dependency cannot select this nested package. Signing retains original signed bytes before broadcast, and recovery observes the original transaction.
+The build regenerates `dist/` from `src/`. Keep the distribution with its source so consumers can install the package with lifecycle scripts disabled. pnpm installs the package from a release tag with a path selector: `github:allowit-hq/allowit-contracts-stellar#vX.Y.Z&path:/npm/stellar`. Signing retains original signed bytes before broadcast, and recovery observes the original transaction.
 
 `customerKeyFromEntropy` encodes caller-supplied entropy. The caller generates entropy and retains the secret. `stellarSignInChallengeTimes` binds the native message and returns its dates. `connectStellarWallet` requires the caller's timestamp-admission capability. The capability must return `true` for admitted dates. HTTP-session freshness rules remain with the consumer.
 
