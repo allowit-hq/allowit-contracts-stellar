@@ -594,4 +594,36 @@ mod tests {
                 .is_err()
         );
     }
+
+    #[test]
+    fn owner_steps_carry_the_unsigned_envelope_and_its_hash() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let c = crate::test_support::request_config(crate::WalletRoute::PolicyWallet, true);
+        let doc = crate::test_support::owner::fund_step(&c, 10, now);
+        // The retained packet holds the hash as bytes; the server reply holds it as hex.
+        let mut retained = doc.clone();
+        retained["transactionHash"] = serde_json::json!(
+            crate::unhex::<32>(doc["transactionHash"].as_str().unwrap()).unwrap()
+        );
+        let raw = RawValue::from_string(retained.to_string()).unwrap();
+        let packet = OwnerPacket(PLUGIN.restore(Kind::Owner, raw).unwrap());
+        let step = PLUGIN
+            .owner_runtime()
+            .step("stellar:testnet", &packet)
+            .unwrap();
+        assert_eq!(step.action, "fund");
+        assert_eq!(step.payload, doc["transactionXdr"]);
+        assert_eq!(crate::hex(&step.hash), doc["transactionHash"]);
+        assert_eq!(step.expires_at, now + 300);
+        assert!(step.explorer.unwrap().ends_with(&crate::hex(&step.hash)));
+        assert!(
+            PLUGIN
+                .owner_runtime()
+                .step("stellar:pubnet", &packet)
+                .is_err()
+        );
+    }
 }
