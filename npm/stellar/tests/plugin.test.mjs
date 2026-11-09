@@ -28,6 +28,8 @@ test('addresses need a valid StrKey checksum', () => {
   assert.equal(plugin.validateAddress('other:testnet', address), false);
   assert.equal(plugin.validateAddress(plugin.test.network, plugin.assets(plugin.test.network)[0].id), true);
   assert.equal(strkey(address.toLowerCase()), null);
+  // A valid checksum with an unsupported version byte.
+  assert.equal(plugin.validateAddress(plugin.test.network, 'GEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBDI'), false);
 });
 
 test('explorer links cover accounts, contracts and transactions', () => {

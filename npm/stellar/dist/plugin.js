@@ -52,6 +52,9 @@ export function strkey(text) {
     }
     if (bytes[33] !== (crc & 255) || bytes[34] !== (crc >>> 8))
         return null;
+    // Version bytes: 6 << 3 for an account (G), 2 << 3 for a contract (C).
+    if (bytes[0] !== (text[0] === 'G' ? 48 : 16))
+        return null;
     return { version: bytes[0], key: new Uint8Array(bytes.slice(1, 33)) };
 }
 const USDC_ISSUER = {

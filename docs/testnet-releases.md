@@ -92,6 +92,7 @@ A resource without this run's receipt is `observed-existing`.
 ## Outputs and reruns
 
 `source-manifest.json` records the exact tag, source, toolchain, published Core source, sample policy and Wasm hashes.
+Both lockfiles must resolve the one published Core tag that `CORE_SOURCE` in `scripts/testnet_release.py` names. The bundler rejects a Core branch revision, so a release tag needs a published Core tag that holds every Core item the plugin uses.
 The build artifact also carries `release-build.json`, bound to its exact GitHub run and attempt.
 Artifact names include the producing run and attempt to prevent cross-attempt ambiguity.
 The publisher preserves existing source assets and appends an immutable deployment snapshot:

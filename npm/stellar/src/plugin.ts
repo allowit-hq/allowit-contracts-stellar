@@ -49,6 +49,8 @@ export function strkey(text: unknown): {version: number; key: Uint8Array} | null
     for (let i = 0; i < 8; i++) crc = ((crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1) & 0xffff;
   }
   if (bytes[33] !== (crc & 255) || bytes[34] !== (crc >>> 8)) return null;
+  // Version bytes: 6 << 3 for an account (G), 2 << 3 for a contract (C).
+  if (bytes[0] !== (text[0] === 'G' ? 48 : 16)) return null;
   return {version: bytes[0], key: new Uint8Array(bytes.slice(1, 33))};
 }
 
