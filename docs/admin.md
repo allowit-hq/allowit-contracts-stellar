@@ -87,7 +87,7 @@ every other canonical param and 28 `operations` entries of the longest form. Sim
 `lifetime_spending_limit`, `daily_spending_limit`, `daily_volume_limit` (nonnegative integers), `call_limit`, `expires_at`
 (unsigned 64-bit integers), `destinations` and `tokens` (address lists), and `operations` (`"*"` or
 a list of op names, such as `["transfer"]`). Custom admits its policy's
-own keys, such as `vendor_cap`. A Custom policy state holds at most 39 keys, the seven standard keys
+own keys, such as `vendor_limit`. A Custom policy state holds at most 39 keys, the seven standard keys
 and 32 policy keys, and 16 KiB counted the same way. No call deletes a state key, and
 `deploy_policy` keeps the state, so a policy write past either bound denies every operation that
 makes it. The standard

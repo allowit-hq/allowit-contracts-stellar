@@ -10,7 +10,7 @@ Build the pinned contracts with `scripts/build-contracts.sh`. Write the manifest
 
 Use separate owner, agent, server and recipient accounts. Owner, agent and server each require only their native master key. The parent administrator requires three distinct weight-one Ed25519 members and thresholds 2/2/2. The server co-signer is separate from the parent-managed checker. The tool checks these authority profiles and does not change them.
 
-Fund the accounts independently. Keep each source above its classic reserve and assigned stage fee caps. The owner also needs the funding principal. Check liabilities and pending transactions separately; preflight does not calculate spendable balances. The example caps total 50 XLM. Initial wallet funding is capped at 0.002 XLM and the single smoke payment at 0.001 XLM. These are ceilings, not fee quotations.
+Fund the accounts independently. Keep each source above its classic reserve and assigned stage fee caps. The owner also needs the funding principal. Check liabilities and pending transactions separately; preflight does not calculate spendable balances. The example fee caps total 50 XLM. Initial wallet funding is at most 0.002 XLM and the single smoke payment at 0.001 XLM. These are ceilings, not fee quotations.
 
 ```sh
 python scripts/mainnet_release.py check --plan /PRIVATE/plan.json --allow-mainnet --output /PRIVATE/check.json
@@ -32,7 +32,7 @@ python scripts/mainnet_release.py settle --plan /PRIVATE/plan.json --allow-mainn
 
 Between preparation and settlement checks, review the exact unsigned packet with an independent secure wallet. Archive signed bytes before an operator broadcasts them. These tools provide no broadcast operation. For funding and execution, provide `--parent` and `--wallet` from their original settled deployment packets.
 
-Each stage has one immutable packet path. Do not overwrite a packet or prepare a replacement under the same plan. Preserve expired, failed and uncertain packets, reconcile them, and obtain a separately reviewed plan before replacement. Copied plans and other signing tools are outside this local cap.
+Each stage has one immutable packet path. Do not overwrite a packet or prepare a replacement under the same plan. Preserve expired, failed and uncertain packets, reconcile them, and obtain a separately reviewed plan before replacement. Copied plans and other signing tools are outside this local control.
 
 ## Two-party execution authorization
 
@@ -51,6 +51,6 @@ Completion verifies the server signature, current signer profiles, original tran
 
 After funding, use `simulate-e2e` with the parent, wallet and a nonzero operation ID. It checks a positive receipt, forbidden recipient, excessive amount, stale deployment version and expiry. After execution, a fresh operation ID plus `--replay-id ORIGINAL_HEX` checks replay rejection. These record-mode simulations do not establish actual signatures or settlement; completion separately enforces the server signature.
 
-`settle` queries the original transaction hash. Missing or uncertain results stay unresolved. Success requires the exact receipt and a charged fee within the original bid and stage cap. Funding checks the wallet's exact balance increase. Execution checks wallet and recipient balances plus the standard policy state keys `calls` and `spent` (payment plus gas ceiling). Concurrent owner activity can prevent exact comparison and requires reconciliation. Use a new status-output filename for each observation.
+`settle` queries the original transaction hash. Missing or uncertain results stay unresolved. Success requires the exact receipt and a charged fee within the original bid and stage fee cap. Funding checks the wallet's exact balance increase. Execution checks wallet and recipient balances plus the standard policy state keys `calls` and `spent` (payment plus gas ceiling). Concurrent owner activity can prevent exact comparison and requires reconciliation. Use a new status-output filename for each observation.
 
 Read simulations do not renew TTL. Follow [administration](admin.md) for submitted lifetime maintenance and restoration. Network deployment and live settlement require separate operator authorization.

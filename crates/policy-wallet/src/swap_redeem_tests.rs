@@ -411,7 +411,7 @@ fn intercepted_reverse_swap_pays_the_other_token_and_counts_the_asset_floor() {
 }
 
 #[test]
-fn intercepted_swap_is_denied_by_operations_tokens_caps_and_unknown_routers() {
+fn intercepted_swap_is_denied_by_operations_tokens_limits_and_unknown_routers() {
     for wasm in [COMMON, CUSTOM] {
         let f = Fixture::new(wasm, true);
         let p = pool(&f, 95, 0);

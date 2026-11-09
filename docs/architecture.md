@@ -39,12 +39,12 @@ Policy source is ordinary synchronous Rust against the portable `allowit` packag
 
 ```rust
 use allowit::prelude::*;
-/// Let my agent pay our invoices. Cap every payment, cap its total spending and pay only vendors
+/// Let my agent pay our invoices. Limit every payment, limit its total spending and pay only vendors
 /// I approve.
 pub fn execute(ctx: &AllowitContext) -> allowit::Result {
-    // "Cap every payment"
+    // "Limit every payment"
     allowit::payment_limit(ctx, &ctx.params[allowit::PAYMENT_LIMIT])?;
-    // "cap its total spending"
+    // "limit its total spending"
     allowit::lifetime_spending_limit(ctx, &ctx.params[allowit::LIFETIME_SPENDING_LIMIT])?;
     // "pay only vendors I approve"
     allowit::destinations(ctx, &ctx.params[allowit::DESTINATIONS])?;
@@ -54,7 +54,7 @@ pub fn execute(ctx: &AllowitContext) -> allowit::Result {
 
 `execute` takes only the context. Each rule call keeps the form
 `allowit::<rule>(ctx, &ctx.params[<key>])?`: the policy reads the param by key and the rule
-decodes the value. A rule may read any key, such as a custom `vendor_cap`.
+decodes the value. A rule may read any key, such as a custom `vendor_limit`.
 
 The function doc comment keeps the owner's original policy prompt. Each inline comment quotes the
 prompt clause that the next call implements.
@@ -214,7 +214,7 @@ The portability test, `crates/policy-wallet/src/portability_tests.rs`, runs one 
    A fixture Wasm built with the `test-catching` feature compiles `src/catching_policy.rs`
    instead, and must return the mapped catching result. That policy catches a daily spending limit error,
    counts it in its own state key and continues, at most twice. When the agent's args name an
-   `invoice`, it also caps the payment with the custom `invoice_cap` param.
+   `invoice`, it also limits the payment with the custom `invoice_limit` param.
 3. `AllowitCommonPolicyEngine`: the real standard Wasm, bound to the sample policy's prefix, must
    return the mapped first prefix preflight error. It skips absent params and rejects a custom
    param with `InvalidParam`.
@@ -276,8 +276,8 @@ Rules are checks: `allowit::<rule>(ctx, &AllowitValue) -> allowit::Result<T>`. E
 value, then returns only its passing constraint, or an `allowit::AllowitError`. A value of the
 wrong type or range is `InvalidParam`. Policy code reads the param unguarded, so an unset param
 stops the run. A rule error that the policy catches denies nothing: the policy decides. Custom
-keys reach policy as `&ctx.params["vendor_cap"]` or as a typed read
-`let cap: i128 = allowit::param(ctx, "vendor_cap");`, and agent args as
+keys reach policy as `&ctx.params["vendor_limit"]` or as a typed read
+`let limit: i128 = allowit::param(ctx, "vendor_limit");`, and agent args as
 `let amount: i128 = allowit::arg(ctx, "amount");`. A typed read returns the type of its binding:
 `i128`, `u64`, `u32`, `bool`, `Address`, `String`, `Vec<AllowitValue>`, `Vec<Address>` or
 `AllowitValue`. It panics when the key is unset or the value has another type or range; see
@@ -504,8 +504,8 @@ pub fn execute(ctx: &AllowitContext) -> allowit::Result {
         "custom:CPOOL….swap" => {
             // "at most 50 XLM per swap"
             let amount: i128 = allowit::arg(ctx, "amount");
-            let cap: i128 = allowit::param(ctx, "swap_cap");
-            if amount > cap { panic!("swap above swap_cap"); }
+            let limit: i128 = allowit::param(ctx, "swap_limit");
+            if amount > limit { panic!("swap above swap_limit"); }
         }
         "custom:CPOOL….claim" => { /* read claim args */ }
         _ => {}
@@ -787,7 +787,7 @@ model: `conversion_units` is the loss ceiling, and `spent_units` equals it plus 
 forward swap's loss cannot exceed `amount_in`. An `execute` redeem checks its loss against the
 vault's `preview_redeem`. The wallet cannot price a swap's other token, so agent and server attest
 a swap's `conversion_units`, and on the intercepted door also a redeem's. Custom policy can add its own params, such as a
-`swap_cap`, in a `match` arm of `operations`.
+`swap_limit`, in a `match` arm of `operations`.
 
 ### Observed effects in `execute`
 

@@ -149,7 +149,7 @@ fn approval_passes_with_exact_constraints() {
     assert_eq!(allowit::expires_at(&c, p(allowit::EXPIRES_AT)), Ok(100));
 }
 #[test]
-fn approval_branch_policy_caps_deposits() {
+fn approval_branch_policy_limits_deposits() {
     let mut c = context();
     edit(&mut c, |s| s.spent = 21);
     assert_eq!(branch::execute(&c), Ok(()));
@@ -203,19 +203,19 @@ fn approval_continues_after_a_caught_rule_error_and_post_flight_applies_its_writ
 #[test]
 fn approval_reads_execution_params_and_custom_params() {
     let mut c = context();
-    // The agent names an invoice; the owner's custom cap then bounds the payment.
+    // The agent names an invoice; the owner's custom limit then bounds the payment.
     put(&mut c.request.args, vectors::INVOICE, int(7));
     assert!(c.request.args.contains(vectors::INVOICE));
     assert_eq!(
         allowit::evaluate(&c, catching::execute, AllowitTier::Custom),
         Err(AllowitError::MissingParam)
     );
-    put(&mut c.params, vectors::INVOICE_CAP, int(9));
+    put(&mut c.params, vectors::INVOICE_LIMIT, int(9));
     assert_eq!(
         catching::execute(&c),
         Err(AllowitError::PaymentLimitExceeded)
     );
-    assert_eq!(allowit::param::<i128>(&c, vectors::INVOICE_CAP), 9);
+    assert_eq!(allowit::param::<i128>(&c, vectors::INVOICE_LIMIT), 9);
     put(&mut c.request.args, vectors::INVOICE, None);
     assert_eq!(catching::execute(&c), Ok(()));
 }
@@ -248,15 +248,15 @@ fn approval_evaluate_keeps_no_write_of_a_denied_run_on_a_reused_env() {
     allowit::set_state(&c, "seen", 1u64).unwrap();
     assert_eq!(allowit::evaluate(&c, policy::execute, custom), Ok(next));
 }
-/// The documented per-op policy on the host: a transfer within the owner's `payment_cap`.
+/// The documented per-op policy on the host: a transfer within the owner's `transfer_limit`.
 fn per_op(ctx: &AllowitContext) -> allowit::Result {
     match allowit::operations(ctx, &ctx.params[allowit::OPERATIONS])? {
         "transfer" => {
-            // "at most the payment cap per transfer"
+            // "at most the transfer limit per transfer"
             let amount: i128 = allowit::arg(ctx, "amount");
-            let cap: i128 = allowit::param(ctx, "payment_cap");
-            if amount > cap {
-                panic!("transfer above payment_cap");
+            let limit: i128 = allowit::param(ctx, "transfer_limit");
+            if amount > limit {
+                panic!("transfer above transfer_limit");
             }
         }
         _ => {}
@@ -271,13 +271,13 @@ fn writing_per_op(c: &AllowitContext) -> allowit::Result {
 #[test]
 fn approval_typed_reads_return_the_binding_type_and_a_policy_panic_denies_without_writes() {
     let mut c = context();
-    put(&mut c.params, "payment_cap", int(10));
+    put(&mut c.params, "transfer_limit", int(10));
     put(&mut c.request.args, "amount", int(10));
     let destinations: allowit::Vec<Address> = allowit::param(&c, allowit::DESTINATIONS);
     let amount: u32 = allowit::arg(&c, "amount");
-    let cap: u64 = allowit::param(&c, "payment_cap");
+    let limit: u64 = allowit::param(&c, "transfer_limit");
     assert_eq!(destinations, vec![c.request.recipient.clone()].into());
-    assert_eq!((amount, cap), (10, 10));
+    assert_eq!((amount, limit), (10, 10));
     let custom = AllowitTier::Custom;
     let next = allowit::evaluate(&c, writing_per_op, custom).unwrap();
     assert_eq!(next.get("seen"), Some(&AllowitValue::Int(1)));
@@ -291,7 +291,7 @@ fn approval_typed_reads_return_the_binding_type_and_a_policy_panic_denies_withou
             Some(AllowitValue::Bool(true)),
             AllowitError::InvalidParam,
         ),
-        ("payment_cap", None, AllowitError::MissingParam),
+        ("transfer_limit", None, AllowitError::MissingParam),
     ];
     for (key, value, error) in cases {
         let mut bad = c.clone();
@@ -457,18 +457,18 @@ fn host_context(v: &Vector) -> AllowitContext {
     AllowitContext {
         env,
         params: params(vec![
-            (allowit::PAYMENT_LIMIT, v.caps[0].map(AllowitValue::Int)),
+            (allowit::PAYMENT_LIMIT, v.limits[0].map(AllowitValue::Int)),
             (
                 allowit::LIFETIME_SPENDING_LIMIT,
-                v.caps[1].map(AllowitValue::Int),
+                v.limits[1].map(AllowitValue::Int),
             ),
             (
                 allowit::DAILY_SPENDING_LIMIT,
-                v.caps[2].map(AllowitValue::Int),
+                v.limits[2].map(AllowitValue::Int),
             ),
             (
                 allowit::DAILY_VOLUME_LIMIT,
-                v.caps[3].map(AllowitValue::Int),
+                v.limits[3].map(AllowitValue::Int),
             ),
             (allowit::CALL_LIMIT, v.call_limit.map(AllowitValue::from)),
             (allowit::DESTINATIONS, addresses(&v.destinations)),
@@ -478,7 +478,10 @@ fn host_context(v: &Vector) -> AllowitContext {
                 v.expires_at_param.map(AllowitValue::from),
             ),
             (allowit::OPERATIONS, v.operations.as_ref().map(operations)),
-            (vectors::INVOICE_CAP, v.invoice_cap.map(AllowitValue::Int)),
+            (
+                vectors::INVOICE_LIMIT,
+                v.invoice_limit.map(AllowitValue::Int),
+            ),
         ]),
         state,
         request: AllowitRequest {
@@ -604,7 +607,7 @@ fn vectors_print_host_outcomes() {
     assert_eq!(over.catching_next, Err(invalid_state as u32));
     assert!(over.next.is_ok());
     // A standard wallet rejects a custom param, also beside few canonical ones.
-    let few = named("invoice_cap_beside_few_params");
+    let few = named("invoice_limit_beside_few_params");
     assert!(few.next.is_ok());
     assert_eq!(few.simple, Err(invalid_param as u32));
     assert_eq!(few.catching_standard, Err(invalid_param as u32));
@@ -639,7 +642,7 @@ fn vectors_print_host_outcomes() {
     let denied = |e: AllowitError| Err(e as u32);
     let recipient = denied(AllowitError::DestinationNotAllowed);
     let token = denied(AllowitError::TokenNotAllowed);
-    let cap = denied(AllowitError::PaymentLimitExceeded);
+    let over_limit = denied(AllowitError::PaymentLimitExceeded);
     assert_eq!(named("swap_unlisted_exchange").policy, recipient);
     assert_eq!(named("swap_other_token_not_allowed").policy, token);
     assert_eq!(
@@ -649,6 +652,9 @@ fn vectors_print_host_outcomes() {
     assert_eq!(named("swap_not_in_operations").policy, not_allowed);
     assert_eq!(named("redeem_not_in_operations").policy, not_allowed);
     assert_eq!(named("only_swaps").policy, not_allowed);
-    assert_eq!(named("swap_over_payment_limit").policy, cap);
-    assert_eq!(named("reverse_swap_floor_over_payment_limit").policy, cap);
+    assert_eq!(named("swap_over_payment_limit").policy, over_limit);
+    assert_eq!(
+        named("reverse_swap_floor_over_payment_limit").policy,
+        over_limit
+    );
 }

@@ -122,7 +122,7 @@ fn changed_fund_packets_never_reach_the_signer_and_rebound_records_are_not_signi
             bad: true,
             before: None,
         };
-        let caps = OwnerCapabilities {
+        let capabilities = OwnerCapabilities {
             store: &store,
             rpc: &chain,
             signer: &bad,
@@ -130,7 +130,7 @@ fn changed_fund_packets_never_reach_the_signer_and_rebound_records_are_not_signi
         };
         assert!(
             client
-                .fund(caps, &selected, "fund-test-001", "1", 10_000)
+                .fund(capabilities, &selected, "fund-test-001", "1", 10_000)
                 .is_err()
         );
         assert_eq!(
@@ -149,7 +149,7 @@ fn changed_fund_packets_never_reach_the_signer_and_rebound_records_are_not_signi
                 bad: true,
                 before: None,
             };
-            let caps = OwnerCapabilities {
+            let capabilities = OwnerCapabilities {
                 store: &store,
                 rpc: &chain,
                 signer: &signer,
@@ -157,7 +157,7 @@ fn changed_fund_packets_never_reach_the_signer_and_rebound_records_are_not_signi
             };
             assert!(
                 client
-                    .fund(caps, &selected, "fund-test-001", "1", 10_000)
+                    .fund(capabilities, &selected, "fund-test-001", "1", 10_000)
                     .is_err()
             );
             assert_eq!(
@@ -192,7 +192,7 @@ fn funded_wallet_receipt_and_restart_preserve_exact_signed_bytes_and_single_owne
     let store = Store::open(&path).unwrap();
     let mut chain = Chain::new(selected.config.clone());
     chain.server = Some(server.state.clone());
-    let caps = OwnerCapabilities {
+    let capabilities = OwnerCapabilities {
         store: &store,
         rpc: &chain,
         signer: &signer,
@@ -200,7 +200,7 @@ fn funded_wallet_receipt_and_restart_preserve_exact_signed_bytes_and_single_owne
     };
     assert_eq!(
         client
-            .fund(caps, &selected, "fund-lost-001", "1", 10_000)
+            .fund(capabilities, &selected, "fund-lost-001", "1", 10_000)
             .unwrap_err()
             .code,
         5
@@ -212,14 +212,14 @@ fn funded_wallet_receipt_and_restart_preserve_exact_signed_bytes_and_single_owne
     let signed = saved["steps"][0]["signedXdr"].clone();
     drop(store);
     let reopened = Store::open(&path).unwrap();
-    let caps = OwnerCapabilities {
+    let capabilities = OwnerCapabilities {
         store: &reopened,
         rpc: &chain,
         signer: &signer,
         clock: &|| Ok(now + 301),
     };
     let out = client
-        .fund(caps, &selected, "fund-lost-001", "1", 10_000)
+        .fund(capabilities, &selected, "fund-lost-001", "1", 10_000)
         .unwrap();
     assert_eq!(out.state, "funded");
     assert_eq!(signer.calls.load(Ordering::SeqCst), prior + 1);

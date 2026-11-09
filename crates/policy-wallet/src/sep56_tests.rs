@@ -375,7 +375,7 @@ fn set_cost(f: &Fixture, e: &mut AllowitExecutionRequest, gas: i128, conversion:
     });
 }
 #[test]
-fn native_xlm_expense_caps_separate_deposit_principal_from_costs_and_daily_total() {
+fn native_xlm_expense_limits_separate_deposit_principal_from_costs_and_daily_total() {
     let f = Fixture::new_native(COMMON);
     let v = vault(&f, 11, None);
     allow_recipient(&f, &v);
@@ -399,7 +399,7 @@ fn native_xlm_expense_caps_separate_deposit_principal_from_costs_and_daily_total
     assert_eq!(f.history().day_total, 53);
 }
 #[test]
-fn expense_and_gross_cap_denials_and_valuation_bound_roll_back_atomic_effects() {
+fn expense_and_gross_limit_denials_and_valuation_bound_roll_back_atomic_effects() {
     for (field, limit) in [(0, 4i128), (1, 4), (2, 52)] {
         let f = Fixture::new_native(COMMON);
         let v = vault(&f, 11, None);
@@ -543,7 +543,7 @@ fn owner_params_update_preserves_prefix_code_usage_and_revokes_old_revision() {
         Err(Ok(AllowitWalletError::StaleRequest))
     );
     f.transfer(20);
-    // Protected history counts every success, including those while a cap was unset.
+    // Protected history counts every success, including those while a limit was unset.
     assert_eq!(f.history().spent, 70);
     assert_eq!(f.history().day_spent, 70);
     assert_eq!(f.history().day_total, 70);
@@ -573,7 +573,7 @@ fn owner_params_update_preserves_prefix_code_usage_and_revokes_old_revision() {
 }
 
 #[test]
-fn disabled_caps_keep_unpriced_history_and_daily_unknown_expires_only_at_rollover() {
+fn disabled_limits_keep_unpriced_history_and_daily_unknown_expires_only_at_rollover() {
     use soroban_sdk::testutils::Ledger;
     let f = Fixture::new(COMMON, false);
     let mut d = f.deployment();
