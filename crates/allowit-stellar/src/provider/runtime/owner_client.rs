@@ -208,7 +208,7 @@ impl OwnerClient {
                 &origin,
                 &challenge.id,
             )
-            .map_err(Error::config)?;
+            .map_err(crate::provider::failure)?;
             let issued = crate::host::owner_session::timestamp(issued)?;
             let expiry = crate::host::owner_session::timestamp(&challenge.expires_at)?;
             if expiration != challenge.expires_at
@@ -299,7 +299,8 @@ impl OwnerClient {
                     template.asset_issuer.as_deref(),
                 )
                 .map_err(|_| Error::config("Invalid advertised template asset"))?;
-                if native::sac_address(network, &asset).map_err(Error::config)? != template.asset
+                if native::sac_address(network, &asset).map_err(crate::provider::failure)?
+                    != template.asset
                     || !(super::super::server_owner::fee_bounds().minimum
                         ..=u64::from(native::max_fee_ceiling(&native::WalletRoute::PolicyWallet)))
                         .contains(&u64::from(template.max_fee_stroops))
@@ -491,8 +492,8 @@ fn validate_generated(
     native::policy::parse_rules(&d.rules)
         .map_err(|_| Error::uncertain("Invalid returned canonical rules"))?;
     let asset = native::asset_from_identity(&b.asset_symbol, b.asset_issuer.as_deref())
-        .map_err(Error::config)?;
-    if native::sac_address(network, &asset).map_err(Error::config)? != b.asset
+        .map_err(crate::provider::failure)?;
+    if native::sac_address(network, &asset).map_err(crate::provider::failure)? != b.asset
         || !(super::super::server_owner::fee_bounds().minimum
             ..=u64::from(native::max_fee_ceiling(&if kind == "contract-wallet" {
                 native::WalletRoute::PolicyWallet
@@ -547,7 +548,7 @@ fn validate_generated(
             if b.template != Some(true) && b.deployment_id == *id && !b.wallet.is_empty() =>
         {
             lower_hash(&b.module_digest)?;
-            native::address(&b.wallet).map_err(Error::config)?;
+            native::address(&b.wallet).map_err(crate::provider::failure)?;
         }
         _ => {
             return Err(Error::uncertain(

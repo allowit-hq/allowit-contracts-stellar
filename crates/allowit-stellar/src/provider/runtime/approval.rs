@@ -108,7 +108,7 @@ fn validate_portable(v: &ApprovalIntent) -> Result<()> {
     };
     let typed: PolicyParams = serde_json::from_value(params.clone())
         .map_err(|_| Error::config("Invalid typed portable params"))?;
-    typed.check(policy_tier).map_err(Error::config)?;
+    typed.check(policy_tier).map_err(crate::provider::failure)?;
     let canonical = crate::host::authoring::canonical_digest(params)?;
     let canonical_identity = crate::host::authoring::portable_identity(
         language,
@@ -164,26 +164,26 @@ pub fn validate(v: &ApprovalIntent) -> Result<()> {
         validate_portable(v)?;
     }
     for a in [&v.owner, &b.wallet] {
-        crate::account_key(a).map_err(Error::config)?;
+        crate::account_key(a).map_err(crate::provider::failure)?;
     }
     if let Some(a) = &b.asset_issuer {
-        crate::account_key(a).map_err(Error::config)?;
+        crate::account_key(a).map_err(crate::provider::failure)?;
     }
     if !b.asset.starts_with('C') {
         return Err(Error::config(
             "The installed Stellar asset must be its SAC address",
         ));
     }
-    crate::address(&b.asset).map_err(Error::config)?;
+    crate::address(&b.asset).map_err(crate::provider::failure)?;
     let asset = crate::asset_from_identity(&b.asset_symbol, b.asset_issuer.as_deref())
-        .map_err(Error::config)?;
-    if b.asset != crate::sac_address(&v.network, &asset).map_err(Error::config)? {
+        .map_err(crate::provider::failure)?;
+    if b.asset != crate::sac_address(&v.network, &asset).map_err(crate::provider::failure)? {
         return Err(Error::config(
             "The Stellar SAC differs from its asset code, issuer or network",
         ));
     }
     for h in [&b.policy_instance, &b.module_digest] {
-        crate::unhex::<32>(h).map_err(Error::config)?;
+        crate::unhex::<32>(h).map_err(crate::provider::failure)?;
         if !h
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -194,7 +194,7 @@ pub fn validate(v: &ApprovalIntent) -> Result<()> {
         }
     }
     if let Some(h) = &b.deployment_id {
-        crate::unhex::<32>(h).map_err(Error::config)?;
+        crate::unhex::<32>(h).map_err(crate::provider::failure)?;
         if !h
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))

@@ -11,7 +11,7 @@ use serde_json::value::RawValue;
 use std::collections::BTreeMap;
 
 fn checked<T>(r: native::Result<T>) -> Result<T> {
-    r.map_err(Error::config)
+    r.map_err(crate::provider::failure)
 }
 fn decode<T: DeserializeOwned>(v: &RawValue) -> Result<T> {
     serde_json::from_str(v.get()).map_err(|_| Error::config("Invalid retained native packet"))
@@ -1094,7 +1094,7 @@ pub fn prepared_metadata(p: &Packet) -> Result<PreparedMetadata> {
     let mut amount = [0u8; 16];
     amount.copy_from_slice(&effect.max_debit.0[16..]);
     let operation = native::retained_operation_from_request(&value.config, &value.request)
-        .map_err(Error::config)?;
+        .map_err(crate::provider::failure)?;
     let (recipient, units) = operation.debit();
     let token = operation.debit_token(&value.config.asset);
     let redeem = operation.kind() == native::OperationKind::Redeem;

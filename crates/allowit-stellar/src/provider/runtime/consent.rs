@@ -1,5 +1,5 @@
 //! One codec for the exact native v1 portable source-consent payload.
-use crate::host::error::{Error, Result};
+use crate::host::error::Result;
 use crate::{PolicyParams, WalletConfig};
 use serde_json::Value;
 pub(super) struct Portable<'a> {
@@ -39,9 +39,9 @@ pub(super) fn payload(
         params: d.params,
         params_hash: d.params_hash,
     })
-    .map_err(Error::config)
+    .map_err(crate::provider::failure)
 }
 
 pub(super) fn message(payload: &Value) -> Result<String> {
-    crate::signing::source_approval_message(payload).map_err(Error::config)
+    crate::signing::source_approval_message(payload).map_err(crate::provider::failure)
 }

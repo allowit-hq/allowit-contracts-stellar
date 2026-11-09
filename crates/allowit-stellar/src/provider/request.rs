@@ -110,10 +110,10 @@ pub fn state(c: &WalletConfig, rpc_url: Option<&str>) -> Result<TrustedState> {
             "a policy wallet request names its current agent account from Stellar RPC; pass --rpc-url URL or set rpc_url for this rail",
         )
     })?;
-    let rpc = sdk::rpc::HttpRpc::new(url).map_err(Error::config)?;
+    let rpc = sdk::rpc::HttpRpc::new(url).map_err(crate::provider::failure)?;
     sdk::rpc::trusted_state_for_discovery(&rpc, c, None)
         .map(|found| found.state)
-        .map_err(Error::config)
+        .map_err(crate::provider::failure)
 }
 
 /// The profile's view of the state: the configured agent account pays.

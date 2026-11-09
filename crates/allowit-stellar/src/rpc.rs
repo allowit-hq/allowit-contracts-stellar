@@ -24,6 +24,9 @@ use std::{
 fn transaction_hash_for(network: &str, tx: &Transaction) -> Result<[u8; 32]> {
     super::transaction_hash(network, tx)
 }
+/// The failure of a Stellar RPC call that got no answer: a timeout or a connection, DNS or TLS
+/// failure. Nothing was observed, so a retry with the same request ID is safe.
+pub const NETWORK_UNAVAILABLE: &str = "Stellar RPC network unavailable (timeout or connection failure); retry with the same request ID";
 pub trait Rpc: Send + Sync {
     fn call(&self, method: &str, params: Value) -> Result<Value>;
 }
@@ -57,6 +60,7 @@ impl Rpc for HttpRpc {
             )
             .map_err(|error| {
                 match error.kind {
+                    ErrorKind::Timeout | ErrorKind::Connection => NETWORK_UNAVAILABLE,
                     ErrorKind::Http => "Stellar RPC rejected the HTTP request",
                     ErrorKind::Size => "RPC response exceeds limit",
                     ErrorKind::MissingResult => "Missing RPC result",
@@ -1282,4 +1286,65 @@ pub fn operation_receipt(
         deposit,
         redeem,
     }))
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod transport_tests {
+    use super::*;
+    use std::{io::Read, net::TcpListener, thread};
+
+    fn rpc(url: &str, timeout: Duration) -> HttpRpc {
+        HttpRpc {
+            client: RpcClient::new(url, timeout, MAX_BYTES)
+                .unwrap()
+                .accept_success_statuses(),
+            id: AtomicU64::new(1),
+        }
+    }
+
+    #[test]
+    fn calls_without_an_answer_are_network_unavailable() {
+        // Connection refused: nothing listens on the port.
+        let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let error = rpc(&url, Duration::from_secs(5))
+            .call("getNetwork", json!({}))
+            .unwrap_err();
+        assert_eq!(error, NETWORK_UNAVAILABLE);
+        // Timeout: the server accepts the request and never answers.
+        let silent = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", silent.local_addr().unwrap());
+        let held = thread::spawn(move || {
+            let (stream, _) = silent.accept().unwrap();
+            thread::sleep(Duration::from_millis(1500));
+            drop(stream);
+        });
+        let error = rpc(&url, Duration::from_millis(300))
+            .call("getNetwork", json!({}))
+            .unwrap_err();
+        assert_eq!(error, NETWORK_UNAVAILABLE);
+        held.join().unwrap();
+        let mapped = crate::provider::failure(error);
+        assert_eq!(mapped.code, crate::provider::NETWORK_UNAVAILABLE);
+        assert_eq!(crate::provider::failure("Missing RPC result").code, 3);
+    }
+
+    #[test]
+    fn a_dropped_answer_stays_unknown() {
+        // The server reads the request, then closes the connection without a reply.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0; 4096];
+            let _ = stream.read(&mut buffer);
+        });
+        let error = rpc(&url, Duration::from_secs(5))
+            .call("getNetwork", json!({}))
+            .unwrap_err();
+        server.join().unwrap();
+        assert_eq!(error, "Stellar RPC transport result is unknown");
+        assert_eq!(crate::provider::failure(error).code, 3);
+    }
 }

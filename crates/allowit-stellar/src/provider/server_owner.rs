@@ -11,14 +11,14 @@ use crate::{self as native, WalletConfig, WalletRoute};
 pub fn configuration(network: &str, document: &[u8]) -> Result<Configuration> {
     let c: WalletConfig = serde_json::from_slice(document)
         .map_err(|_| Error::config("Invalid retained installation"))?;
-    if native::network_id(network).map_err(Error::config)?
-        != native::network_id(&c.network).map_err(Error::config)?
+    if native::network_id(network).map_err(crate::provider::failure)?
+        != native::network_id(&c.network).map_err(crate::provider::failure)?
     {
         return Err(Error::config(
             "Retained installation belongs to another network",
         ));
     }
-    native::validate_retained_configuration(&c).map_err(Error::config)?;
+    native::validate_retained_configuration(&c).map_err(crate::provider::failure)?;
     let custody = match c.route {
         WalletRoute::Native => Custody::Owner,
         WalletRoute::PolicyWallet => Custody::Policy,
@@ -53,7 +53,11 @@ pub fn configuration(network: &str, document: &[u8]) -> Result<Configuration> {
             .params
             .0
             .into_iter()
-            .map(|(k, v)| v.to_core().map(|v| (k, v)).map_err(Error::config))
+            .map(|(k, v)| {
+                v.to_core()
+                    .map(|v| (k, v))
+                    .map_err(crate::provider::failure)
+            })
             .collect::<Result<_>>()?,
         custody,
         custody_encoding,
@@ -76,13 +80,13 @@ pub fn envelope_hash(network: &str, payload: &[u8], require_signature: bool) -> 
     let payload =
         std::str::from_utf8(payload).map_err(|_| Error::usage("Invalid owner signing payload"))?;
     native::owner_intent::owner_envelope_hash(network, payload, require_signature)
-        .map_err(Error::config)
+        .map_err(crate::provider::failure)
 }
 pub fn validate_signed(network: &str, original: &[u8], signed: &[u8]) -> Result<[u8; 32]> {
     let original: native::owner_intent::OwnerTransaction = serde_json::from_slice(original)
         .map_err(|_| Error::config("Invalid retained owner packet"))?;
-    if native::network_id(network).map_err(Error::config)?
-        != native::network_id(&original.network).map_err(Error::config)?
+    if native::network_id(network).map_err(crate::provider::failure)?
+        != native::network_id(&original.network).map_err(crate::provider::failure)?
     {
         return Err(Error::config(
             "Retained owner packet belongs to another network",
@@ -91,7 +95,7 @@ pub fn validate_signed(network: &str, original: &[u8], signed: &[u8]) -> Result<
     let signed =
         std::str::from_utf8(signed).map_err(|_| Error::usage("Invalid signed owner payload"))?;
     native::owner_intent::validate_signed_owner_transaction(&original, signed)
-        .map_err(Error::config)
+        .map_err(crate::provider::failure)
 }
 pub fn with_policy(
     config: &Configuration,
@@ -107,9 +111,9 @@ pub fn with_policy(
     let derived = native::sac_address(
         &c.network,
         &native::asset_from_identity(&i.asset_symbol, i.asset_issuer.as_deref())
-            .map_err(Error::config)?,
+            .map_err(crate::provider::failure)?,
     )
-    .map_err(Error::config)?;
+    .map_err(crate::provider::failure)?;
     if derived != i.asset {
         return Err(Error::config("Admitted asset identity differs"));
     }
@@ -123,7 +127,7 @@ pub fn with_policy(
             .map(|(k, v)| {
                 native::PolicyValue::from_core(&v)
                     .map(|v| (k, v))
-                    .map_err(Error::config)
+                    .map_err(crate::provider::failure)
             })
             .collect::<Result<_>>()?,
     );
@@ -143,17 +147,17 @@ pub fn with_policy(
     configuration(&c.network, &bytes)
 }
 pub fn code_hash(wasm: &[u8]) -> Result<[u8; 32]> {
-    native::admin::check_wallet_code(wasm).map_err(Error::config)
+    native::admin::check_wallet_code(wasm).map_err(crate::provider::failure)
 }
 pub fn connect(endpoint: &str) -> Result<std::sync::Arc<dyn crate::host::runtime::Transport>> {
     struct Transport(native::rpc::HttpRpc);
     impl crate::host::runtime::Transport for Transport {
         fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
-            native::rpc::Rpc::call(&self.0, method, params).map_err(Error::config)
+            native::rpc::Rpc::call(&self.0, method, params).map_err(crate::provider::failure)
         }
     }
     Ok(std::sync::Arc::new(Transport(
-        native::rpc::HttpRpc::new(endpoint).map_err(Error::config)?,
+        native::rpc::HttpRpc::new(endpoint).map_err(crate::provider::failure)?,
     )))
 }
 pub fn fee_bounds() -> crate::host::runtime::owner::FeeBounds {
@@ -180,7 +184,7 @@ pub fn explorer_link(network: &str, kind: &str, id: &str) -> Option<String> {
 }
 pub fn wallet_address(network: &str, owner: &str, instance: &[u8; 32]) -> Result<String> {
     native::admin::wallet_address(network, owner, &native::admin::wallet_salt(instance))
-        .map_err(Error::config)
+        .map_err(crate::provider::failure)
 }
 
 pub fn custody_encoding(c: Custody) -> Result<serde_json::Value> {
@@ -226,8 +230,9 @@ pub fn source_consent<P: serde::Serialize>(
         params: a.params,
         params_hash: a.params_hash,
     })
-    .map_err(Error::config)?;
-    let message = native::signing::source_approval_message(&payload).map_err(Error::config)?;
+    .map_err(crate::provider::failure)?;
+    let message =
+        native::signing::source_approval_message(&payload).map_err(crate::provider::failure)?;
     Ok((payload, message))
 }
 

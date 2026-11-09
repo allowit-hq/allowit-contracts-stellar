@@ -261,7 +261,7 @@ fn clock() -> Result<u64> {
         .map_err(|_| Error::config("System clock precedes the Unix epoch"))
 }
 fn checked<T>(v: sdk::Result<T>) -> Result<T> {
-    v.map_err(Error::config)
+    v.map_err(crate::provider::failure)
 }
 fn journal_error(_: Error) -> Error {
     Error::config("Stellar operation journal is unsafe or unreadable; retain the original journal")
@@ -380,9 +380,21 @@ struct RefusalDetails {
 /// rejection: the wallet, its asset or a vault refused the operation, and it names the contract
 /// error. Every other reply leaves the operation unresolved.
 fn refusal(status: u16, body: &[u8]) -> Error {
-    let refusal = serde_json::from_slice::<Refusal>(body)
-        .ok()
-        .filter(|_| status == 409);
+    let refusal = serde_json::from_slice::<Refusal>(body).ok();
+    // The engine got no answer from the rail network. The request ID stays valid for a retry.
+    if matches!(status, 503 | 504)
+        && refusal
+            .as_ref()
+            .is_some_and(|r| r.code == "network_unavailable")
+    {
+        let mut error = Error::api(
+            status,
+            "network unavailable; retry with the same request ID",
+        );
+        error.code = crate::provider::NETWORK_UNAVAILABLE;
+        return error;
+    }
+    let refusal = refusal.filter(|_| status == 409);
     // Engine names reach the terminal only as plain identifiers.
     let name = |v: &Option<String>| {
         v.clone().filter(|v| {
@@ -1563,6 +1575,18 @@ mod native_revalidation_tests {
                 json!({"error":"Reconcile the original Stellar operation before preparing another."}),
                 4,
                 "Allowit returned HTTP 409: Stellar operation was not resolved; retain the original request ID",
+            ),
+            (
+                "503 Service Unavailable",
+                json!({"code":"network_unavailable","error":"The rail network is unavailable."}),
+                7,
+                "Allowit returned HTTP 503: network unavailable; retry with the same request ID",
+            ),
+            (
+                "504 Gateway Timeout",
+                json!({"code":"network_unavailable","error":"The rail network is unavailable."}),
+                7,
+                "Allowit returned HTTP 504: network unavailable; retry with the same request ID",
             ),
             (
                 "503 Service Unavailable",

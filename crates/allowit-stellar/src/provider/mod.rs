@@ -20,6 +20,21 @@ use zeroize::Zeroizing;
 pub const EXECUTION_STORE_NAMESPACE: &str = "stellar-journal";
 pub const OWNER_STORE_NAMESPACE: &str = "stellar-owner-workflows";
 
+/// The exit code of a call that got no answer, in the shared CLI exit table.
+pub(crate) const NETWORK_UNAVAILABLE: i32 = 7;
+/// Convert a native failure to a client error. A Stellar RPC call that got no answer keeps the
+/// network-unavailable code, so callers retry it with the same request ID.
+pub(crate) fn failure(message: impl Into<String>) -> Error {
+    let message = message.into();
+    if message.contains(native::rpc::NETWORK_UNAVAILABLE) {
+        let mut error = Error::uncertain(message);
+        error.code = NETWORK_UNAVAILABLE;
+        error
+    } else {
+        Error::config(message)
+    }
+}
+
 pub static KEYS: Keys = Keys;
 pub struct Keys;
 struct Key(native::signing::LocalSigner);
@@ -31,12 +46,12 @@ impl KeyProvider for Keys {
     fn derive(&self, entropy: &[u8]) -> Result<Box<dyn PrivateSigner>> {
         native::signing::LocalSigner::from_entropy(entropy)
             .map(|key| Box::new(Key(key)) as Box<dyn PrivateSigner>)
-            .map_err(Error::config)
+            .map_err(crate::provider::failure)
     }
     fn parse(&self, secret: &str) -> Result<Box<dyn PrivateSigner>> {
         native::signing::LocalSigner::from_encoded(secret)
             .map(|key| Box::new(Key(key)) as Box<dyn PrivateSigner>)
-            .map_err(Error::config)
+            .map_err(crate::provider::failure)
     }
     fn validate_identity(&self, address: &str, public_key: &str, key_type: &str) -> Result<()> {
         native::signing::validate_key_identity(address, public_key, key_type).map_err(Error::usage)
@@ -57,7 +72,7 @@ impl PrivateSigner for Key {
         self.0.encoded_secret()
     }
     fn sign_hash(&self, digest: &[u8]) -> Result<Vec<u8>> {
-        self.0.sign_digest(digest).map_err(Error::config)
+        self.0.sign_digest(digest).map_err(crate::provider::failure)
     }
 }
 
