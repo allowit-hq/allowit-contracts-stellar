@@ -4,7 +4,8 @@
  * Importing it touches no DOM; `define()` registers the elements on first use.
  */
 import {stellarExplorerUrl, type ExplorerKind} from './explorer.js';
-import {stellarAssetContract} from './stellar-asset.js';
+import {StrKey} from '@stellar/stellar-sdk/base';
+import {STELLAR_NETWORKS, stellarAssetContract} from './stellar-asset.js';
 import {defineElements, ELEMENTS} from './elements/index.js';
 
 export type ElementKind = 'address'|'explorer-link'|'amount'|'wallet-sign-in'|'owner-sign'|'receipt'|'binding-review';
@@ -13,10 +14,6 @@ export interface RailNetwork {id: string; label: string; testnet: boolean; alias
 export interface AssetInfo {network: string; id: string; symbol: string; decimals: number; stablecoin: boolean; label: string}
 
 const TESTNET = 'stellar:testnet', PUBNET = 'stellar:pubnet';
-const PASSPHRASES: Readonly<Record<string, string>> = {
-  [TESTNET]: 'Test SDF Network ; September 2015',
-  [PUBNET]: 'Public Global Stellar Network ; September 2015',
-};
 export const NETWORKS: readonly RailNetwork[] = Object.freeze([
   {id: TESTNET, label: 'Stellar Testnet', testnet: true, aliases: Object.freeze(['stellar-testnet'])},
   {id: PUBNET, label: 'Stellar Mainnet', testnet: false, aliases: Object.freeze(['stellar:mainnet', 'stellar-mainnet'])},
@@ -29,29 +26,16 @@ export function canonicalNetwork(network: unknown): string | null {
 export function networkPassphrase(network: string): string {
   const id = canonicalNetwork(network);
   if (!id) throw new Error('Select a supported Stellar network.');
-  return PASSPHRASES[id];
+  return STELLAR_NETWORKS[id as keyof typeof STELLAR_NETWORKS].passphrase;
 }
 
-const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-/** StrKey decoding with its checksum. Returns the version byte and the 32-byte key, or null. */
+/** StrKey decoding with its checksum, through the Stellar SDK. Returns the version byte and the 32-byte key, or null. */
 export function strkey(text: unknown): {version: number; key: Uint8Array} | null {
-  if (typeof text !== 'string' || !/^[GC][A-Z2-7]{55}$/.test(text)) return null;
-  const bytes: number[] = [];
-  let value = 0, bits = 0;
-  for (const char of text) {
-    value = (value << 5) | ALPHABET.indexOf(char); bits += 5;
-    if (bits >= 8) {bits -= 8; bytes.push((value >>> bits) & 255);}
-  }
-  if (bytes.length !== 35 || (value & ((1 << bits) - 1)) !== 0) return null;
-  let crc = 0;
-  for (const byte of bytes.slice(0, 33)) {
-    crc ^= byte << 8;
-    for (let i = 0; i < 8; i++) crc = ((crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1) & 0xffff;
-  }
-  if (bytes[33] !== (crc & 255) || bytes[34] !== (crc >>> 8)) return null;
+  if (typeof text !== 'string') return null;
   // Version bytes: 6 << 3 for an account (G), 2 << 3 for a contract (C).
-  if (bytes[0] !== (text[0] === 'G' ? 48 : 16)) return null;
-  return {version: bytes[0], key: new Uint8Array(bytes.slice(1, 33))};
+  if (StrKey.isValidEd25519PublicKey(text)) return {version: 48, key: new Uint8Array(StrKey.decodeEd25519PublicKey(text))};
+  if (StrKey.isValidContract(text)) return {version: 16, key: new Uint8Array(StrKey.decodeContract(text))};
+  return null;
 }
 
 const USDC_ISSUER: Readonly<Record<string, string>> = {
@@ -64,8 +48,8 @@ export function assets(network: string): readonly AssetInfo[] {
   if (!id) return [];
   let list = ASSETS.get(id);
   if (!list) {
-    const passphrase = PASSPHRASES[id];
-    const usdc = strkey(USDC_ISSUER[id])!.key;
+    const passphrase = networkPassphrase(id);
+    const usdc = USDC_ISSUER[id];
     list = Object.freeze([
       {network: id, id: stellarAssetContract('XLM', null, passphrase), symbol: 'XLM', decimals: 7, stablecoin: false, label: 'Lumens'},
       {network: id, id: stellarAssetContract('USDC', usdc, passphrase), symbol: 'USDC', decimals: 7, stablecoin: true, label: 'USD Coin'},

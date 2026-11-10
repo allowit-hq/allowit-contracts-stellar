@@ -20,7 +20,7 @@
 
 ## Build and test
 
-The package exports JavaScript modules and TypeScript declarations. `test:browser` reads the Common Wasm that `scripts/build-contracts.sh` builds. Run these commands from `npm/stellar/`:
+The package exports JavaScript modules and TypeScript declarations. StrKey decoding, asset contract IDs and network passphrases come from `@stellar/stellar-sdk`. `test:browser` reads the Common Wasm that `scripts/build-contracts.sh` builds. Run these commands from `npm/stellar/`:
 
 ```sh
 pnpm install --frozen-lockfile --ignore-scripts
@@ -34,6 +34,6 @@ The build regenerates `dist/` from `src/`. Keep the distribution with its source
 
 `customerKeyFromEntropy` encodes caller-supplied entropy. The caller generates entropy and retains the secret. `stellarSignInChallengeTimes` binds the native message and returns its dates. `connectStellarWallet` requires the caller's timestamp-admission capability. The capability must return `true` for admitted dates. HTTP-session freshness rules remain with the consumer.
 
-`deployAdkOwnerDraft` deploys and funds a reviewed ADK agent draft on Stellar Testnet. The consumer supplies its REST transport, owner confirmation of the installation and portable build admission. When the server reports a sent step as expired, the journal drops the step and keeps its signed bytes under `adkOwnerArchiveKey`. `adkParamLines` labels draft params with the Core registry and shows amounts in XLM.
+`deployAdkOwnerDraft` deploys and funds a reviewed ADK agent draft on Stellar Testnet. The consumer supplies its REST transport, owner confirmation of the installation and portable build admission. A Resume settles the saved step before it signs another one. When the server rejects a sent step with the `OWNER_TRANSACTION_EXPIRED` code and Horizon excludes the transaction, the journal drops the step and keeps its signed bytes under `adkOwnerArchiveKey`. `adkParamLines` labels draft params with the Core registry and shows amounts in XLM.
 
 Portable bundle encoders require a consumer admission callback. The consumer checks authoring metadata and unresolved inputs. The adapter checks native wire types, selected policy identity, hashes and signatures. A missing callback rejects the export.

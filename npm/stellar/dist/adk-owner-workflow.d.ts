@@ -19,6 +19,12 @@ export type AdkPolicy = PortablePolicy & {
     revision: number;
 };
 /**
+ * Typed engine codes of `native/owner/submit` rejections. Each rejection carries
+ * `details: {policyId, action, transactionHash}`; a failed one also carries `ledger`.
+ */
+export declare const OWNER_TRANSACTION_EXPIRED = "owner_transaction_expired";
+export declare const OWNER_TRANSACTION_FAILED = "owner_transaction_failed";
+/**
  * Capabilities that the consumer supplies. `request` is its authenticated REST transport; a rejection carries the
  * server `code` and `details`. `verifyInstallation` confirms the installed wallet with the owner. `admitPortableBuild`
  * is the common portable build admission.

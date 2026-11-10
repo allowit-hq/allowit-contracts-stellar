@@ -9,6 +9,12 @@ const deploymentFee = 2_000_000_000;
 const bytesHex = (value) => Array.isArray(value) && value.length === 32
     && value.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255)
     ? value.map(byte => byte.toString(16).padStart(2, '0')).join('') : '';
+/**
+ * Typed engine codes of `native/owner/submit` rejections. Each rejection carries
+ * `details: {policyId, action, transactionHash}`; a failed one also carries `ledger`.
+ */
+export const OWNER_TRANSACTION_EXPIRED = 'owner_transaction_expired';
+export const OWNER_TRANSACTION_FAILED = 'owner_transaction_failed';
 export function adkOwnerKey(owner, p) {
     return `allowit.stellar.adk.v1:${owner}:${p.revision}:${p.sourceHash}:${p.paramsHash}`;
 }
@@ -179,7 +185,7 @@ export async function deployAdkOwnerDraft({ host, proposal, session, agent, amou
                 const { code, details } = error;
                 const failed = object(details);
                 if (failed?.policyId === policyId && failed.action === signed.step.action && failed.transactionHash === signed.step.transactionHash) {
-                    if (code === 'owner_transaction_expired' && expired()) {
+                    if (code === OWNER_TRANSACTION_EXPIRED && expired()) {
                         const chain = await expiredRecord(signed);
                         if (chain?.successful !== true) {
                             localStorage.setItem(adkOwnerArchiveKey(owner, signed.step.transactionHash), JSON.stringify(signed));
@@ -190,7 +196,7 @@ export async function deployAdkOwnerDraft({ host, proposal, session, agent, amou
                         receipt = { policyId, action: signed.step.action, status: 'confirmed', transactionHash: chain.hash, ledger: chain.ledger };
                     }
                     else {
-                        if (code === 'owner_transaction_failed') {
+                        if (code === OWNER_TRANSACTION_FAILED) {
                             const chain = await horizonRead(`/transactions/${signed.step.transactionHash}`);
                             if (chain.hash === signed.step.transactionHash && chain.ledger === failed.ledger && chain.successful === false)
                                 save({ ...journal, pending: undefined });
