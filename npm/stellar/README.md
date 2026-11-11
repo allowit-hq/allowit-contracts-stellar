@@ -22,9 +22,11 @@ The plugin also supplies `walletKinds(network)`, `walletKind(document)`, `native
 `assetDisplay(network, asset)`. `walletKind` reads the route and tier of a policy, draft, profile or installation and
 returns `native`, `simple`, `standard` or `custom`; the tier `common` is the `standard` kind.
 `review` holds the Review and sign link: `fragment`, `parseLink`, `agentPrompt` and `paramLines`.
-`ownerWorkflow.installAndFund` installs and funds the reviewed wallet. It settles a saved signed step first:
-`owner_transaction_settled` completes it, `owner_transaction_expired` archives its signed bytes and lets the owner
-sign a new step, and `owner_transaction_pending` or `network_unavailable` keeps it for a retry (`OwnerFlowError.retry`).
+`ownerWorkflow.installAndFund` installs and funds the reviewed wallet. One workflow runs per journal key.
+It settles a saved signed step first. `owner_transaction_settled` completes it. On `owner_transaction_expired`
+Horizon decides: a transaction that applied completes the step, proof that it never applied archives its signed
+bytes and lets the owner sign a new step, and an unreadable chain keeps the step. `owner_transaction_pending` and
+`network_unavailable` keep the step for a retry (`OwnerFlowError.retry`).
 
 ## Build and test
 

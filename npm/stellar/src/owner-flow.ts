@@ -3,6 +3,8 @@
  * The host supplies its authenticated transport, the signing of one step and a journal. This module holds the rules
  * for a saved signed step and for the typed replies of the service.
  */
+import {TransactionBuilder} from '@stellar/stellar-sdk/base';
+import {canonicalNetwork, networkPassphrase} from './plugin.js';
 
 /** Rail-neutral owner step. `payload` is opaque text that only this package signs and reads. */
 export interface OwnerStep {action: string; payload: string; hash: string; expiresAt: number; explorer?: string | null}
@@ -13,6 +15,8 @@ export type SignStep = (step: OwnerStep) => Promise<string>;
 export interface OwnerJournal {get(key: string): string | null; set(key: string, value: string): void; remove(key: string): void}
 export type OwnerReceipt = {policyId: string; action: string; status: string; transactionHash: string; ledger?: number};
 export interface InstallAndFundInput {
+  /** The network of the policy. */
+  network: string;
   ask: Ask; sign: SignStep; journal: OwnerJournal; key: string; policyId: string;
   agent: string; amount: string; onStep: (text: string) => void;
 }
@@ -55,6 +59,64 @@ export function ownerArchiveKey(key: string, hash: string): string {
   return `${key}:expired:${hash}`;
 }
 
+const HORIZON: Readonly<Record<string, string>> = {
+  'stellar:testnet': 'https://horizon-testnet.stellar.org',
+  'stellar:pubnet': 'https://horizon.stellar.org',
+};
+const unchecked = () => new OwnerFlowError('The expired signed step could not be checked on the network. It stays saved; resume to check it again.', OWNER_TRANSACTION_EXPIRED, true);
+
+/**
+ * What the chain holds for a signed step past its time bound: its ledger when it applied, or null when it can
+ * never apply. Expiry stops a later application, not an earlier one, so an expiry reply alone proves nothing.
+ * The step never applied only when Horizon has read past the time bound and either holds the failed transaction or
+ * holds none while the source account sequence is still below the transaction's sequence. Anything else throws.
+ */
+async function expiredRecord(network: string, step: OwnerStep, signedPayload: string): Promise<{ledger: number} | null> {
+  const base = HORIZON[canonicalNetwork(network) ?? ''];
+  if (!base) throw unchecked();
+  let source: string, sequence: bigint;
+  try {
+    const envelope = TransactionBuilder.fromXDR(signedPayload, networkPassphrase(network));
+    const transaction = 'innerTransaction' in envelope ? envelope.innerTransaction : envelope;
+    if (Array.from(transaction.hash(), byte => byte.toString(16).padStart(2, '0')).join('') !== step.hash) throw new Error();
+    source = transaction.source;
+    sequence = BigInt(transaction.sequence);
+  } catch {
+    throw unchecked();
+  }
+  const read = async (path: string) => {
+    try {
+      return await fetch(`${base}${path}`, {headers: {Accept: 'application/json'}});
+    } catch {
+      throw unchecked();
+    }
+  };
+  const json = async (response: Response): Promise<Record<string, unknown>> => {
+    const value: unknown = await response.json().catch(() => null);
+    if (!response.ok || !object(value)) throw unchecked();
+    return value;
+  };
+  const root = await json(await read('/'));
+  const closedAt = typeof root.history_latest_ledger_closed_at === 'string' ? Date.parse(root.history_latest_ledger_closed_at) / 1000 : NaN;
+  // Every ledger that can include the transaction closes at or before its time bound. Horizon must have read past it.
+  if (!(closedAt > step.expiresAt)) throw unchecked();
+  const found = await read(`/transactions/${step.hash}`);
+  if (found.status !== 404) {
+    const chain = await json(found);
+    if (chain.hash !== step.hash || typeof chain.successful !== 'boolean' || !Number.isSafeInteger(chain.ledger) || (chain.ledger as number) <= 0) throw unchecked();
+    return chain.successful ? {ledger: chain.ledger as number} : null;
+  }
+  // A missing record alone proves nothing. A source sequence below the transaction's sequence proves it never applied.
+  const account = await json(await read(`/accounts/${source}`));
+  if (account.account_id !== source || typeof account.sequence !== 'string' || !/^[0-9]{1,19}$/.test(account.sequence)
+    || BigInt(account.sequence) >= sequence) throw unchecked();
+  return null;
+}
+
+/** Workflows that run in this page, by journal key. */
+const running = new Set<string>();
+const busy = () => new OwnerFlowError('This wallet setup is already running in this or another tab.', null, true);
+
 function saved(journal: OwnerJournal, key: string): {step: OwnerStep; signedPayload: string} | null {
   const raw = journal.get(key);
   if (raw === null) return null;
@@ -71,12 +133,32 @@ function saved(journal: OwnerJournal, key: string): {step: OwnerStep; signedPayl
  * Signed bytes enter the journal before they are sent, so a reload sends the same signature and never signs a step
  * twice. A saved step is settled first:
  * - confirmed, or `owner_transaction_settled` for the same hash: the step is done;
- * - `owner_transaction_expired`: the step can never apply. Its signed bytes move to the archive key and the owner
- *   signs a new step;
+ * - `owner_transaction_expired`: the chain decides. When the transaction applied before its time bound, the step is
+ *   done. When the chain proves that it never applied, its signed bytes move to the archive key and the owner signs
+ *   a new step. When the chain cannot be read, the step stays saved and the error has `retry` set;
  * - `owner_transaction_pending` or `network_unavailable`: the step stays saved and the error has `retry` set.
  * Any other failure keeps the saved step, so no second signature exists while the first can still apply.
+ * One workflow runs per journal key: a second call in this page or, where the browser has Web Locks, in another tab
+ * is refused before it reads the journal.
  */
-export async function installAndFund({ask, sign, journal, key, policyId, agent, amount, onStep}: InstallAndFundInput): Promise<{wallet: string; receipts: OwnerReceipt[]}> {
+export async function installAndFund(input: InstallAndFundInput): Promise<{wallet: string; receipts: OwnerReceipt[]}> {
+  const name = `allowit.owner-flow:${input.key}`;
+  if (running.has(name)) throw busy();
+  running.add(name);
+  try {
+    const locks = globalThis.navigator?.locks;
+    if (!locks) return await run(input);
+    return await locks.request(name, {ifAvailable: true}, async lock => {
+      if (!lock) throw busy();
+      return run(input);
+    });
+  } finally {
+    running.delete(name);
+  }
+}
+
+async function run({network, ask, sign, journal, key, policyId, agent, amount, onStep}: InstallAndFundInput): Promise<{wallet: string; receipts: OwnerReceipt[]}> {
+  if (!canonicalNetwork(network)) throw new OwnerFlowError('Select a supported Stellar network.', null, false);
   const receipts: OwnerReceipt[] = [];
   const fundedKey = `${key}:funded`;
   const done = (step: OwnerStep, receipt: OwnerReceipt) => {
@@ -101,6 +183,13 @@ export async function installAndFund({ask, sign, journal, key, policyId, agent, 
         return true;
       }
       if (code === OWNER_TRANSACTION_EXPIRED && same) {
+        if (step.expiresAt >= Math.floor(Date.now() / 1000)) throw unchecked();
+        const chain = await expiredRecord(network, step, signedPayload);
+        if (chain) {
+          // The transaction applied before its time bound, so the step is done and is never signed again.
+          done(step, {policyId, action: step.action, status: 'confirmed', transactionHash: step.hash, ledger: chain.ledger});
+          return true;
+        }
         journal.set(ownerArchiveKey(key, step.hash), JSON.stringify({step, signedPayload}));
         journal.remove(key);
         return false;

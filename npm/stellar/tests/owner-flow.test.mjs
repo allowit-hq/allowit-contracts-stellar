@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {installAndFund, ownerArchiveKey, OwnerFlowError} from '../dist/owner-flow.js';
+import {Account, Keypair, Networks, Operation, TransactionBuilder} from '@stellar/stellar-sdk/base';
+import {installAndFund as flow, ownerArchiveKey, OwnerFlowError} from '../dist/owner-flow.js';
+
+const network = 'stellar:testnet';
+const installAndFund = input => flow({network, ...input});
 
 const policyId = 'policy-1', key = 'flow:owner:1', agent = 'GAGENT', amount = '5';
 const hash = n => String(n).repeat(64).slice(0, 64);
@@ -50,18 +54,101 @@ test('the happy path installs, funds and never signs a confirmed funding again',
   assert.deepEqual([again.wallet, again.receipts.length, signed.length], ['CWALLET', 0, 2]);
 });
 
-test('a lost send that expired is archived and the owner signs a new step', async () => {
-  const lost = {step: savedStep('create_wallet', 9), signedPayload: 'signed-create_wallet-9'};
+/** A real signed transaction past its time bound, with the chain replies of one scenario. */
+function expired(action) {
+  const owner = Keypair.random();
+  const transaction = new TransactionBuilder(new Account(owner.publicKey(), '41'), {fee: '100', networkPassphrase: Networks.TESTNET})
+    .addOperation(Operation.bumpSequence({bumpTo: '0'})).setTimebounds(0, Math.floor(Date.now() / 1000) - 60).build();
+  transaction.sign(owner);
+  const txHash = Buffer.from(transaction.hash()).toString('hex');
+  const lost = {step: {action, payload: 'unsigned', hash: txHash, expiresAt: Math.floor(Date.now() / 1000) - 60}, signedPayload: transaction.toXDR()};
+  const horizon = replies => {
+    const seen = [];
+    globalThis.fetch = async url => {
+      const path = new URL(url).pathname;
+      seen.push(path);
+      const reply = path === '/' ? replies.root : path.startsWith('/transactions/') ? replies.transaction : replies.account;
+      if (reply === undefined) throw new Error('offline');
+      return new Response(JSON.stringify(reply.body ?? {}), {status: reply.status ?? 200});
+    };
+    return seen;
+  };
+  const past = {body: {history_latest_ledger_closed_at: new Date().toISOString()}};
+  const account = sequence => ({body: {account_id: owner.publicKey(), sequence}});
+  const refuse = () => { throw refusal('owner_transaction_expired', {policyId, action, transactionHash: txHash}); };
+  return {lost, txHash, horizon, past, account, refuse};
+}
+
+test('a lost send that expired and never applied is archived, and the owner signs a new step', async () => {
+  const {lost, txHash, horizon, past, account, refuse} = expired('create_wallet');
+  // Horizon read past the time bound, holds no transaction, and the owner sequence is below the transaction's.
+  const seen = horizon({root: past, transaction: {status: 404}, account: account('41')});
   const signed = [], journal = journalOf({[key]: JSON.stringify(lost)});
-  const {ask} = service({submit: body => {
-    if (body.payload === lost.signedPayload) throw refusal('owner_transaction_expired', {policyId, action: 'create_wallet', transactionHash: hash(9)});
-    return confirmed(body);
-  }});
+  const {ask} = service({submit: body => body.payload === lost.signedPayload ? refuse() : confirmed(body)});
   const result = await installAndFund({ask, sign: signer(signed), journal, key, policyId, agent, amount, onStep() {}});
   assert.deepEqual(signed, ['create_wallet', 'fund']);
   assert.deepEqual(result.receipts.map(r => r.transactionHash), [hash(1), hash(2)]);
-  assert.deepEqual(JSON.parse(journal.get(ownerArchiveKey(key, hash(9)))), lost);
+  assert.deepEqual(JSON.parse(journal.get(ownerArchiveKey(key, txHash))), lost);
   assert.equal(journal.get(key), null);
+  assert.equal(seen.length, 3);
+});
+
+test('an expired funding that the chain shows applied is done and is never funded again', async () => {
+  const {lost, txHash, horizon, past, refuse} = expired('fund');
+  horizon({root: past, transaction: {body: {hash: txHash, ledger: 77, successful: true}}});
+  const signed = [], journal = journalOf({[key]: JSON.stringify(lost)});
+  const {ask, state, calls} = service({submit: refuse});
+  state.installed = true;
+  const result = await installAndFund({ask, sign: signer(signed), journal, key, policyId, agent, amount, onStep() {}});
+  assert.deepEqual(signed, []);
+  assert.deepEqual(result.receipts, [{policyId, action: 'fund', status: 'confirmed', transactionHash: txHash, ledger: 77}]);
+  assert.equal(journal.get(`${key}:funded`), 'confirmed');
+  assert.equal(calls.some(([path]) => path === 'native/owner/prepare'), false);
+});
+
+test('an expiry reply without chain proof keeps the saved step and signs nothing', async () => {
+  const {lost, txHash, horizon, past, account, refuse} = expired('fund');
+  const stale = {body: {history_latest_ledger_closed_at: new Date((lost.step.expiresAt - 10) * 1000).toISOString()}};
+  const scenarios = [
+    {},                                                                  // Horizon is offline.
+    {root: stale, transaction: {status: 404}, account: account('41')},   // Horizon has not read past the time bound.
+    {root: past, transaction: {status: 404}, account: account('42')},    // The sequence moved: the transaction may have applied.
+    {root: past, transaction: {status: 404}, account: {status: 404}},    // The account cannot be read.
+    {root: past, transaction: {status: 500}},                            // The transaction lookup failed.
+    {root: past, transaction: {body: {hash: hash(3), ledger: 5, successful: true}}}, // Another transaction.
+  ];
+  for (const replies of scenarios) {
+    horizon(replies);
+    const signed = [], journal = journalOf({[key]: JSON.stringify(lost)});
+    const {ask, state} = service({submit: refuse});
+    state.installed = true;
+    await assert.rejects(installAndFund({ask, sign: signer(signed), journal, key, policyId, agent, amount, onStep() {}}),
+      error => error instanceof OwnerFlowError && error.code === 'owner_transaction_expired' && error.retry === true);
+    assert.deepEqual(signed, []);
+    assert.deepEqual(JSON.parse(journal.get(key)), lost);
+    assert.equal(journal.get(ownerArchiveKey(key, txHash)), null);
+    assert.equal(journal.get(`${key}:funded`), null);
+  }
+  // A step whose payload is not that transaction, or whose time bound has not passed, is never dropped either.
+  horizon({root: past, transaction: {status: 404}, account: account('41')});
+  for (const altered of [{...lost, signedPayload: 'not-xdr'}, {...lost, step: {...lost.step, expiresAt: Math.floor(Date.now() / 1000) + 300}}]) {
+    const journal = journalOf({[key]: JSON.stringify(altered)});
+    const {ask, state} = service({submit: refuse});
+    state.installed = true;
+    await assert.rejects(installAndFund({ask, sign: signer([]), journal, key, policyId, agent, amount, onStep() {}}), error => error.retry === true);
+    assert.deepEqual(JSON.parse(journal.get(key)), altered);
+  }
+});
+
+test('one workflow runs per journal key, so a second call never signs', async () => {
+  const signed = [], journal = journalOf();
+  const {ask} = service({submit: confirmed});
+  const input = {ask, sign: signer(signed), journal, key, policyId, agent, amount, onStep() {}};
+  const [first, second] = await Promise.allSettled([installAndFund(input), installAndFund(input)]);
+  assert.equal(first.status, 'fulfilled');
+  assert.ok(second.reason instanceof OwnerFlowError && second.reason.retry && /already running/.test(second.reason.message));
+  assert.deepEqual(signed, ['create_wallet', 'fund']);
+  await assert.rejects(flow({...input, network: 'other:testnet'}), /supported Stellar network/);
 });
 
 test('a saved step that already settled is done without a second signature', async () => {

@@ -1,8 +1,3 @@
-/**
- * The owner workflow that the SDK exposes through the rail plugin: install the reviewed policy wallet, then fund it.
- * The host supplies its authenticated transport, the signing of one step and a journal. This module holds the rules
- * for a saved signed step and for the typed replies of the service.
- */
 /** Rail-neutral owner step. `payload` is opaque text that only this package signs and reads. */
 export interface OwnerStep {
     action: string;
@@ -28,6 +23,8 @@ export type OwnerReceipt = {
     ledger?: number;
 };
 export interface InstallAndFundInput {
+    /** The network of the policy. */
+    network: string;
     ask: Ask;
     sign: SignStep;
     journal: OwnerJournal;
@@ -57,12 +54,15 @@ export declare function ownerArchiveKey(key: string, hash: string): string;
  * Signed bytes enter the journal before they are sent, so a reload sends the same signature and never signs a step
  * twice. A saved step is settled first:
  * - confirmed, or `owner_transaction_settled` for the same hash: the step is done;
- * - `owner_transaction_expired`: the step can never apply. Its signed bytes move to the archive key and the owner
- *   signs a new step;
+ * - `owner_transaction_expired`: the chain decides. When the transaction applied before its time bound, the step is
+ *   done. When the chain proves that it never applied, its signed bytes move to the archive key and the owner signs
+ *   a new step. When the chain cannot be read, the step stays saved and the error has `retry` set;
  * - `owner_transaction_pending` or `network_unavailable`: the step stays saved and the error has `retry` set.
  * Any other failure keeps the saved step, so no second signature exists while the first can still apply.
+ * One workflow runs per journal key: a second call in this page or, where the browser has Web Locks, in another tab
+ * is refused before it reads the journal.
  */
-export declare function installAndFund({ ask, sign, journal, key, policyId, agent, amount, onStep }: InstallAndFundInput): Promise<{
+export declare function installAndFund(input: InstallAndFundInput): Promise<{
     wallet: string;
     receipts: OwnerReceipt[];
 }>;
