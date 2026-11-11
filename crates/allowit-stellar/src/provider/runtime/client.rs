@@ -941,26 +941,34 @@ pub struct ExecutionOutcome {
     pub request_id: String,
     pub status: OperationStatus,
     pub transaction_hash: String,
-    /// The ledger of the verified receipt and the fee that it charged, in stroops.
+    /// The ledger of the verified receipt and the fee that it charged, in stroops. A receipt of a
+    /// fee-bumped transaction holds the inner result, which charges no fee, so it reports none.
     pub settlement: Option<(u32, u64)>,
 }
 fn render(r: &Response) -> Result<ExecutionOutcome> {
     let settlement = r
         .receipt
         .as_ref()
-        .map(|receipt| {
-            let result: stellar_xdr::TransactionResult = checked(sdk::read(&receipt.result_xdr))?;
-            let fee = u64::try_from(result.fee_charged)
-                .map_err(|_| Error::uncertain("Invalid Stellar receipt fee"))?;
-            Ok((receipt.ledger, fee))
-        })
-        .transpose()?;
+        .map(|receipt| receipt_settlement(receipt.ledger, &receipt.result_xdr))
+        .transpose()?
+        .flatten();
     Ok(ExecutionOutcome {
         request_id: r.operation.id.clone(),
         status: r.operation.status.clone(),
         transaction_hash: r.operation.transaction_hash.clone(),
         settlement,
     })
+}
+
+/// The ledger and charged fee of a verified receipt. Every transaction that pays its own fee
+/// charges at least the base fee. A zero fee is the inner result of a fee-bumped transaction:
+/// the outer transaction paid, and the receipt does not hold that amount, so no fee is reported
+/// in place of a wrong one.
+fn receipt_settlement(ledger: u32, result_xdr: &str) -> Result<Option<(u32, u64)>> {
+    let result: stellar_xdr::TransactionResult = checked(sdk::read(result_xdr))?;
+    let fee = u64::try_from(result.fee_charged)
+        .map_err(|_| Error::uncertain("Invalid Stellar receipt fee"))?;
+    Ok((fee > 0).then_some((ledger, fee)))
 }
 
 pub fn verify_native_members(account: &sdk::AccountState, c: &WalletConfig) -> Result<()> {
@@ -1577,6 +1585,29 @@ mod native_revalidation_tests {
             None,
         )
         .unwrap()
+    }
+    #[test]
+    fn a_receipt_reports_its_ledger_and_fee_and_no_fee_for_a_fee_bumped_inner_result() {
+        use stellar_xdr::{
+            Limits, TransactionResult, TransactionResultExt, TransactionResultResult, WriteXdr,
+        };
+        let result = |fee_charged| {
+            TransactionResult {
+                fee_charged,
+                result: TransactionResultResult::TxSuccess(Default::default()),
+                ext: TransactionResultExt::V0,
+            }
+            .to_xdr_base64(Limits::none())
+            .unwrap()
+        };
+        assert_eq!(
+            receipt_settlement(5_661_578, &result(123_456)).unwrap(),
+            Some((5_661_578, 123_456))
+        );
+        // The inner result of a fee-bumped transaction charges nothing; the outer fee is unknown.
+        assert_eq!(receipt_settlement(5_661_578, &result(0)).unwrap(), None);
+        assert!(receipt_settlement(1, &result(-1)).is_err());
+        assert!(receipt_settlement(1, "not-xdr").is_err());
     }
     #[test]
     fn a_status_read_ends_at_its_deadline_and_a_call_without_one_does_not() {

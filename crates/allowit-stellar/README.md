@@ -87,7 +87,8 @@ code, `CODE:ISSUER`, an issuer of a listed token and the Stellar Asset Contract 
 asset shows its code with seven decimals. An unlisted contract is an error, never a placeholder unit.
 
 A settled `exec` or `status` outcome carries `settlement` in its document: `height` is the receipt ledger and `fee`
-is the fee that the transaction result charged, in XLM. The client holds no limit counters and the status reply
+is the fee that the transaction result charged, in XLM. A receipt of a fee-bumped transaction holds the inner result,
+which charges no fee, so its outcome carries no `settlement`. The client holds no limit counters and the status reply
 carries none, so the document reports the fee but not the amount spent against a limit.
 
 `exec` waits up to 180 s for the prepare answer and up to 180 s for the submit answer. `wait` bounds only the status
