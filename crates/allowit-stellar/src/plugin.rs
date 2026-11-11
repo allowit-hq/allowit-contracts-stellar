@@ -49,7 +49,10 @@ pub static NETWORKS: &[RailInfo] = &[
     },
 ];
 
-/// The wallet profiles a server offers. Hosts choose them by custody and tier.
+/// The wallet profiles a server offers. Hosts choose them by custody and tier. Each kind of
+/// [`RailPlugin::wallet_kinds`] has a profile here. The policy wallet profile installs two
+/// kinds, Standard and Simple: one id, one entry per tier. Its Standard entry stays first, so
+/// a host that reads the first entry of an id finds the tier that it found before.
 pub static PROFILES: &[ProfileInfo] = &[
     ProfileInfo {
         id: "allowit-native-v1",
@@ -61,6 +64,12 @@ pub static PROFILES: &[ProfileInfo] = &[
         id: "allowit-policy-wallet-v1",
         custody: Custody::Policy,
         tier: Some(Tier::Standard),
+        label: "Policy wallet",
+    },
+    ProfileInfo {
+        id: "allowit-policy-wallet-v1",
+        custody: Custody::Policy,
+        tier: Some(Tier::Simple),
         label: "Policy wallet",
     },
     ProfileInfo {
@@ -776,6 +785,41 @@ mod tests {
         let profiles = PLUGIN.server().profiles();
         assert!(profiles.iter().any(|p| p.custody == Custody::Owner));
         assert!(profiles.iter().any(|p| p.tier == Some(Tier::Custom)));
+    }
+
+    /// A host refuses a wallet kind that no profile installs, so the two lists must agree: every
+    /// kind that a network advertises has a profile, and every profile installs an advertised
+    /// kind.
+    #[test]
+    fn every_advertised_wallet_kind_has_a_profile_and_every_profile_an_advertised_kind() {
+        let profiles = PLUGIN.server().profiles();
+        for network in NETWORKS {
+            let advertised = PLUGIN.wallet_kinds(network.id);
+            for kind in WalletKind::ALL {
+                let installs = profiles
+                    .iter()
+                    .filter(|profile| profile.wallet_kind() == Some(kind))
+                    .count();
+                assert_eq!(
+                    installs,
+                    usize::from(advertised.contains(&kind)),
+                    "{}: {kind} is advertised {} and has {installs} profiles",
+                    network.id,
+                    advertised.contains(&kind),
+                );
+            }
+        }
+        for profile in profiles {
+            // A profile without a kind could never be chosen.
+            assert!(profile.wallet_kind().is_some(), "{}", profile.id);
+        }
+        // The policy wallet profile serves Standard first, then Simple.
+        let policy_wallet: Vec<_> = profiles
+            .iter()
+            .filter(|profile| profile.id == "allowit-policy-wallet-v1")
+            .map(|profile| profile.tier)
+            .collect();
+        assert_eq!(policy_wallet, [Some(Tier::Standard), Some(Tier::Simple)]);
     }
 
     fn receipt(native_units: u128) -> ReceiptInfo {

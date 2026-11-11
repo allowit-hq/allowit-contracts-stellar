@@ -85,9 +85,11 @@ pub fn rule_denial(code: u32) -> Problem {
 }
 /// A client-visible fault for a rejected operation. Only a structured rule denial of the rail
 /// core's host evaluation, or a rule error code or `PolicyDenied` that the installed `wallet`
-/// itself raised in simulation, becomes `policy_denied`. Other wallet contract errors keep their
-/// own codes. An error that another contract raised, such as the asset contract or a vault, or
-/// whose origin is unknown, is a plain wallet rejection with the raw code. A stale owner
+/// itself raised in simulation, becomes `policy_denied`. That is how a Custom wallet denies: it
+/// compiles its whole policy and reports every rule denial as its own `PolicyDenied`. `contract`
+/// names the wallet only with the proof of `rpc::simulation_fault`. Other wallet contract errors
+/// keep their own codes. An error that another contract raised, such as the asset contract or a
+/// vault, or whose origin is unknown, is a plain wallet rejection with the raw code. A stale owner
 /// observation is `stale_owner_observation`, which a caller can retry once. Anything else stays
 /// a plain conflict.
 pub fn denial(message: &str, contract: Option<&ContractFault>, wallet: &str) -> Problem {
@@ -167,6 +169,77 @@ mod tests {
         let problem = denial(&Error::config(STALE_OBSERVATION).to_string(), None, "");
         assert_eq!(problem.code, "stale_owner_observation");
         assert_eq!(problem.status, 409);
+    }
+    /// A host `error` event of the simulation RPC: `contract` raised or relayed `code`.
+    fn error_event(contract: [u8; 32], code: u32) -> String {
+        use stellar_xdr as x;
+        crate::xdr(&x::DiagnosticEvent {
+            in_successful_contract_call: false,
+            event: x::ContractEvent {
+                ext: x::ExtensionPoint::V0,
+                contract_id: Some(x::ContractId(x::Hash(contract))),
+                type_: x::ContractEventType::Diagnostic,
+                body: x::ContractEventBody::V0(x::ContractEventV0 {
+                    topics: vec![
+                        x::ScVal::Symbol(x::ScSymbol(b"error".to_vec().try_into().unwrap())),
+                        x::ScVal::Error(x::ScError::Contract(code)),
+                    ]
+                    .try_into()
+                    .unwrap(),
+                    data: x::ScVal::Void,
+                }),
+            },
+        })
+        .unwrap()
+    }
+    /// A Custom wallet compiles its whole policy, so its denial exists only as the wallet's own
+    /// `PolicyDenied` in simulation. The host events of the reply prove which contract raised it.
+    #[test]
+    fn a_custom_wallet_denial_is_a_policy_denial_only_with_wallet_provenance() {
+        const WALLET: [u8; 32] = [7; 32];
+        const FOREIGN: [u8; 32] = [8; 32];
+        let wallet = stellar_strkey::Contract(WALLET).to_string();
+        let classify = |code: u32, events: &[String]| {
+            let message = format!("HostError: Error(Contract, #{code})");
+            let fault = simulation_fault(&message, events).unwrap();
+            denial(&message, Some(&fault), &wallet)
+        };
+        // The wallet's policy denied: `PolicyDenied` of the wallet's own error enum.
+        let denied = classify(18, &[error_event(WALLET, 18)]);
+        assert_eq!(denied.code, "policy_denied");
+        assert_eq!(
+            denied.details.unwrap(),
+            json!({"rule":null,"error":"PolicyDenied","contractError":18})
+        );
+        // A wallet whose contract reports the rule error itself names the rule.
+        let limit = E::PaymentLimitExceeded as u32;
+        let named = classify(limit, &[error_event(WALLET, limit)]);
+        assert_eq!(named.code, "policy_denied");
+        assert_eq!(named.details.unwrap()["rule"], "payment_limit");
+        // Another error of the same wallet is a rejection with its own code, never a denial.
+        for (code, expected) in [
+            (17, "wallet_rejected"),
+            (14, "insufficient_funds"),
+            (6, "wallet_paused"),
+            (5, "stale_request"),
+        ] {
+            let other = classify(code, &[error_event(WALLET, code)]);
+            assert_eq!(other.code, expected, "{code}");
+            assert_eq!(other.details.unwrap()["contractError"], code);
+        }
+        // A code that the wallet's enum does not define is a plain conflict.
+        assert_eq!(classify(20, &[error_event(WALLET, 20)]).code, "");
+        // The same code from another contract is a rejection: raised by it alone, relayed
+        // through the wallet, or without events.
+        for events in [
+            vec![error_event(FOREIGN, 18)],
+            vec![error_event(FOREIGN, 18), error_event(WALLET, 18)],
+            vec![],
+        ] {
+            let foreign = classify(18, &events);
+            assert_eq!(foreign.code, "wallet_rejected", "{events:?}");
+            assert_eq!(foreign.details.unwrap()["contractError"], 18);
+        }
     }
     #[test]
     fn only_explicit_wallet_provenance_selects_native_contract_diagnostics() {
