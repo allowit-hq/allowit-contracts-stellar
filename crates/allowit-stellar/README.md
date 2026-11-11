@@ -91,10 +91,11 @@ is the fee that the transaction result charged, in XLM. A receipt of a fee-bumpe
 which charges no fee, so its outcome carries no `settlement`. The client holds no limit counters and the status reply
 carries none, so the document reports the fee but not the amount spent against a limit.
 
-`exec` waits up to 180 s for the prepare answer and up to 180 s for the submit answer. `wait` bounds only the status
-polling after the submit answer: each later status read ends at the deadline and the last outcome is returned.
+`exec` waits up to 180 s for the prepare answer and up to 180 s for the submit answer. `wait` bounds only the engine
+status reads after the submit answer: each later read ends at the deadline and the last outcome is returned.
 A submit that stops early would leave its outcome unknown, so no caller bound ends it. `status` reads once without a
-bound and then polls within `wait`. Long steps report through `allowit_core::client::progress`.
+bound and then polls within `wait`. A status answer that reports a released policy wallet operation starts the lapse
+proof on the caller's RPC; that proof keeps its own 30 s call timeouts and is not cut at the deadline. Long steps report through `allowit_core::client::progress`.
 
 A refused owner submission keeps the server `code` in `Error::api_code`. `owner_transaction_expired` and
 `owner_transaction_settled` are certain (exit 4). `owner_transaction_pending`, no answer and an untyped server error

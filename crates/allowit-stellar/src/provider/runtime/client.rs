@@ -651,7 +651,8 @@ impl Client {
             )
         })
     }
-    /// A status read that ends at `deadline`; `None` means that the deadline ended it.
+    /// A status read whose engine call ends at `deadline`; `None` means that the deadline ended
+    /// it. The lapse proof of an answer runs after the call and is not bounded by `deadline`.
     fn status_within(
         &self,
         id: &str,
@@ -728,10 +729,11 @@ pub fn status(c: &Client, journal: &Store, id: &str, wait: Duration) -> Result<E
 }
 /// Prepares, signs and submits one typed request, then polls within `wait`.
 ///
-/// `wait` bounds only the polling after the submit answer. Prepare and submit each wait up to
-/// [`ENGINE_TIMEOUT`] for the engine: a submit that stops early leaves its outcome unknown, so
-/// no caller bound ends it. The whole call therefore takes at most two engine timeouts plus
-/// `wait`.
+/// `wait` bounds only the engine status reads after the submit answer. Prepare and submit each
+/// wait up to [`ENGINE_TIMEOUT`] for the engine: a submit that stops early leaves its outcome
+/// unknown, so no caller bound ends it. A status answer that reports a released policy wallet
+/// operation also starts the lapse proof on the caller's RPC, which keeps its own timeouts and
+/// runs to its end, because a half-read proof decides nothing.
 pub fn exec(
     c: &Client,
     journal: &Store,
@@ -877,7 +879,9 @@ fn terminal(status: &OperationStatus) -> bool {
 }
 /// Read the status until it is terminal or `wait` ends. `last` is the outcome that the caller
 /// already holds. Without one, the first read is not bounded, because the caller needs one
-/// answer; every later read ends at the deadline and returns the last outcome.
+/// answer; every later engine read ends at the deadline and returns the last outcome. The
+/// deadline covers the engine reads only: the lapse proof of a released operation reads the
+/// caller's RPC with that client's own timeouts after an answer arrived.
 fn poll(
     c: &Client,
     id: &str,
