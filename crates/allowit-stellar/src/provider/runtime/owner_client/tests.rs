@@ -405,6 +405,7 @@ fn generation_validates_prompt_network_and_profile_before_authenticated_http() {
         network: "stellar:unsupported".into(),
         profile: "allowit-policy-wallet-v1".into(),
         target: Target::NewWallet,
+        wallet_kind: None,
     };
     let error = client.generate(&request, now).unwrap_err();
     assert!(error.message.starts_with("unknown rail"));
@@ -434,4 +435,99 @@ fn generation_validates_prompt_network_and_profile_before_authenticated_http() {
         "Select an advertised wallet profile"
     );
     assert_eq!(server.calls("/api/micro/runtime"), 0);
+}
+
+#[test]
+fn generation_sends_the_chosen_wallet_kind_keeps_the_bound_one_and_reports_a_typed_refusal() {
+    use super::{GenerateRequest, Target};
+    use allowit_core::vendor::kinds::WalletKind;
+    let now = wire::now();
+    let generate = |plan: wire::Plan, kind: Option<WalletKind>| {
+        let profile = plan.discovery["wallets"][0]["profile"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let server = wire::Server::new(plan);
+        let mut client = OwnerClient::with_authority(
+            &authority(&server.url),
+            "http://localhost:5173",
+            &account(11),
+        )
+        .unwrap();
+        client.authenticate(&key(), now).unwrap();
+        let request = GenerateRequest {
+            prompt: "Allow a small payment".into(),
+            network: "stellar:testnet".into(),
+            profile,
+            target: Target::NewWallet,
+            wallet_kind: kind,
+        };
+        let result = client.generate(&request, now);
+        let sent = server.state.lock().unwrap().generated.clone();
+        (result, sent)
+    };
+    let plan = || {
+        let mut plan = wire::Plan::new(&account(11));
+        // The stub advertises the profile of its fixture policy.
+        let profile = plan.policy["runtime"]["wallet"]["profile"].clone();
+        plan.discovery["wallets"][0]["profile"] = profile.clone();
+        plan.templates["templates"][0]["profiles"] = json!([profile]);
+        plan
+    };
+    // Without a choice the request names no kind, and a reply without one binds none.
+    let (policy, sent) = generate(plan(), None);
+    let policy = policy.map_err(|e| e.message).unwrap();
+    assert_eq!(policy.wallet_kind, None);
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].get("walletKind").is_none());
+    assert!(
+        serde_json::to_value(&policy)
+            .unwrap()
+            .get("walletKind")
+            .is_none()
+    );
+    // The choice is the top-level `walletKind`, and the bound kind stays on the document.
+    let mut bound = plan();
+    bound.policy["walletKind"] = json!("standard");
+    let (policy, sent) = generate(bound, Some(WalletKind::Standard));
+    let policy = policy.map_err(|e| e.message).unwrap();
+    assert_eq!(sent[0]["walletKind"], "standard");
+    assert_eq!(policy.wallet_kind, Some(WalletKind::Standard));
+    let draft = crate::host::generation::GeneratedDraft {
+        document: serde_json::to_value(&policy).unwrap(),
+        unresolved: Vec::new(),
+    };
+    assert_eq!(draft.wallet_kind(), Some(WalletKind::Standard));
+    // A reply that binds another kind than the chosen one is not returned as the draft.
+    let mut other = plan();
+    other.policy["walletKind"] = json!("custom");
+    let (result, _) = generate(other, Some(WalletKind::Standard));
+    assert_eq!(result.unwrap_err().code, 5);
+    // An unknown kind id in a reply is invalid; ids have no alias.
+    let mut alias = plan();
+    alias.policy["walletKind"] = json!("common");
+    assert!(generate(alias, None).0.is_err());
+    // The typed refusal keeps its code and details.
+    for code in ["wallet_kind_unsupported", "wallet_kind_unknown"] {
+        let mut refused = plan();
+        refused.generation_refusal = Some((
+            400,
+            json!({"error":"This network does not offer the wallet kind","code":code,
+                "details":{"walletKind":"custom","network":"stellar:testnet","reason":"No Custom template is configured"}}),
+        ));
+        let (result, sent) = generate(refused, Some(WalletKind::Custom));
+        let error = result.unwrap_err();
+        assert_eq!(sent[0]["walletKind"], "custom");
+        assert_eq!(error.api_code.as_deref(), Some(code));
+        assert_eq!((error.code, error.status), (4, Some(400)));
+        assert_eq!(
+            error.detail("reason"),
+            Some("No Custom template is configured")
+        );
+        assert_eq!(error.details.as_ref().unwrap()["walletKind"], "custom");
+        assert_eq!(
+            error.details.as_ref().unwrap()["network"],
+            "stellar:testnet"
+        );
+    }
 }

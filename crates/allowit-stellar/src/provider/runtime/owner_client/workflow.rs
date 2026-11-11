@@ -105,6 +105,7 @@ impl OwnerPolicy {
             network: p.network.clone(),
             profile: p.runtime.wallet.profile.clone(),
             target,
+            wallet_kind: None,
         };
         validate_generated(p, &request, &p.network, &p.runtime.wallet.kind)?;
         if c.network != p.network
@@ -157,6 +158,7 @@ pub fn deployment_policy(
         network: policy.network.clone(),
         profile: policy.runtime.wallet.profile.clone(),
         target: Target::NewWallet,
+        wallet_kind: None,
     };
     validate_generated(&policy, &request, &policy.network, "contract-wallet")?;
     let b = &policy.runtime.instance_binding;
@@ -219,6 +221,7 @@ pub fn native_policy(
         network: policy.network.clone(),
         profile: policy.runtime.wallet.profile.clone(),
         target: Target::Installation(b.deployment_id.clone()),
+        wallet_kind: None,
     };
     validate_generated(&policy, &request, &policy.network, "owner-wallet")?;
     let config = WalletConfig {

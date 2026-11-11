@@ -17,6 +17,7 @@ pub trait OwnerSigner {
     fn sign_hash(&self, digest: &[u8; 32]) -> native::Result<[u8; 64]>;
 }
 
+use crate::host::generation::GeneratedDraft;
 pub use crate::host::generation::{GenerateRequest, Target};
 
 pub struct OwnerClient {
@@ -97,6 +98,9 @@ pub struct GeneratedPolicy {
     pub token: String,
     pub mint: String,
     pub runtime: PublicRuntime,
+    /// The wallet kind that the server bound to this policy. A server that names none omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wallet_kind: Option<allowit_core::vendor::kinds::WalletKind>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -358,7 +362,19 @@ impl OwnerClient {
                 id.clone()
             }
         };
-        let result:Generated=self.session.owner_request(Method::Post,"/api/micro/generate",Some(&json!({"prompt":request.prompt,"network":network,"runtime":{"sourceProfile":SOURCE_PROFILE,"wallet":{"kind":wallet.kind,"profile":request.profile}},"operation":{"function":OPERATION},"installationId":installation})),now,true)?;
+        let mut body = json!({"prompt":request.prompt,"network":network,"runtime":{"sourceProfile":SOURCE_PROFILE,"wallet":{"kind":wallet.kind,"profile":request.profile}},"operation":{"function":OPERATION},"installationId":installation});
+        // The owner's choice. The server binds it or refuses with a typed error; without one it
+        // proposes a kind.
+        if let Some(kind) = request.wallet_kind {
+            body[GeneratedDraft::WALLET_KIND_KEY] = json!(kind);
+        }
+        let result: Generated = self.session.owner_request(
+            Method::Post,
+            "/api/micro/generate",
+            Some(&body),
+            now,
+            true,
+        )?;
         if result.policies.len() > 30 || result.selected_id.is_empty() {
             return Err(Error::uncertain(
                 "Generation returned an invalid workspace identity",
@@ -386,6 +402,13 @@ impl OwnerClient {
         let policy =
             selected.ok_or_else(|| Error::uncertain("Generation omitted the selected policy"))?;
         validate_generated(&policy, &request, network, &wallet.kind).map_err(|_|Error::uncertain("Generated policy failed portable identity validation; inspect the owner workspace before retrying"))?;
+        if let (Some(chosen), Some(bound)) = (request.wallet_kind, policy.wallet_kind)
+            && chosen != bound
+        {
+            return Err(Error::uncertain(
+                "Generation bound another wallet kind than the selected one; inspect the owner workspace before retrying",
+            ));
+        }
         let binding = &policy.runtime.instance_binding;
         if let Some(template) = selected_template
             && (binding.asset != template.asset
