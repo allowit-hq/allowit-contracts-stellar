@@ -22,6 +22,9 @@ The plugin also supplies `walletKinds(network)`, `walletKind(document)`, `native
 `assetDisplay(network, asset)`. `walletKind` reads the route and tier of a policy, draft, profile or installation and
 returns `native`, `simple`, `standard` or `custom`; the tier `common` is the `standard` kind.
 `review` holds the Review and sign link: `fragment`, `parseLink`, `agentPrompt` and `paramLines`.
+`parseLink` returns the proposal, which has exactly eight keys, the work prompt, and the values that the chat
+collected beside the proposal: `agent`, `amount` and `walletKind`. Each is null when the link does not carry it.
+`walletKind` is a kind id; the host checks it against `walletKinds(network)` before it offers that kind.
 `ownerWorkflow.installAndFund` installs and funds the reviewed wallet. One workflow runs per journal key.
 It settles a saved signed step first. A confirmation or `owner_transaction_settled` completes it once Horizon holds
 that successful transaction; every Horizon read ends after 15 s. On `owner_transaction_expired`
