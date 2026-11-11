@@ -577,6 +577,16 @@ mod tests {
                 .draft_params("stellar:testnet", &installation)
                 .is_err()
         );
+        // A wallet without params omits them; it has no lines and is still a valid document.
+        let mut parameterless = profile.clone();
+        parameterless["config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("params");
+        let read = PLUGIN
+            .draft_params("stellar:testnet", &parameterless)
+            .unwrap();
+        assert!(read.params.is_empty());
         // Without the issuer the contract has no known unit.
         classic["config"]["assetIssuer"] = serde_json::Value::Null;
         assert!(PLUGIN.draft_params("stellar:testnet", &classic).is_err());
