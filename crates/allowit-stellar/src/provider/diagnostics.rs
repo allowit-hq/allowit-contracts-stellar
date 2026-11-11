@@ -86,7 +86,8 @@ pub fn rule_denial(code: u32) -> Problem {
 /// A client-visible fault for a rejected operation. Only a structured rule denial of the rail
 /// core's host evaluation, or a rule error code or `PolicyDenied` that the installed `wallet`
 /// itself raised in simulation, becomes `policy_denied`. That is how a Custom wallet denies: it
-/// compiles its whole policy and reports every rule denial as its own `PolicyDenied`. `contract`
+/// compiles its whole policy and fails with the denying rule's own code, which names the rule.
+/// A Custom wallet whose code reports `PolicyDenied` names no rule. `contract`
 /// names the wallet only with the proof of `rpc::simulation_fault`. Other wallet contract errors
 /// keep their own codes. An error that another contract raised, such as the asset contract or a
 /// vault, or whose origin is unknown, is a plain wallet rejection with the raw code. A stale owner
@@ -192,8 +193,9 @@ mod tests {
         })
         .unwrap()
     }
-    /// A Custom wallet compiles its whole policy, so its denial exists only as the wallet's own
-    /// `PolicyDenied` in simulation. The host events of the reply prove which contract raised it.
+    /// A Custom wallet compiles its whole policy, so its denial exists only as an error of the
+    /// wallet in simulation: the denying rule's own code, or `PolicyDenied` from a wallet whose
+    /// code reports no rule. The host events of the reply prove which contract raised it.
     #[test]
     fn a_custom_wallet_denial_is_a_policy_denial_only_with_wallet_provenance() {
         const WALLET: [u8; 32] = [7; 32];
