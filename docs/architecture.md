@@ -418,13 +418,17 @@ with `deploy_policy` without code redeployment. `allowit-stellar-admin` warns ab
 rejecting the packet. The preflight runner propagates the first rule error. Repeated rules
 read the same current state and only `post_flight` charges, so a rule cannot charge twice.
 
-Rule denials, including `OperationNotAllowed`, map to `PolicyDenied`. A returned `MissingParam` or
-`InvalidParam` maps to `InvalidParam`; a failed read aborts with its own code instead, see
+On Simple and Common, rule denials, including `OperationNotAllowed`, map to `PolicyDenied`.
+`AllowitCustomPolicy` compiles the whole policy, so it fails the call with the denying rule's own
+`AllowitError` code, for example `PaymentLimitExceeded` (102). These codes start at 101 and never
+share a number with a wallet error. The server names the canonical rule of such a code only when
+the simulation's diagnostic events show that the wallet itself raised it. A returned `MissingParam` or
+`InvalidParam` maps to `InvalidParam` on every tier; a failed read aborts with its own code instead, see
 [Panics](#panics). `InvalidState` maps to `InvalidState`, `Overflow` to
 `Overflow` and `Unsupported` to `UnsupportedOperation`. The host evaluator returns `Panicked` for a
-caught panic. A policy may also return it; onchain it then maps to `PolicyDenied`. A
-failed call rolls back its events, so only the host evaluator and the shared engine return the
-specific rule error.
+caught panic. A policy may also return it; onchain it is then a rule denial. A
+failed call rolls back its events, so a standard wallet's specific rule error comes only from the
+host evaluator and the shared engine.
 
 `AllowitState.policy_state` records every delegated success independently of selected or unset
 rules. With cost bounds it records conservative expenses and gas. Without them it records raw gross

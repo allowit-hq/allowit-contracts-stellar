@@ -31,9 +31,18 @@ impl AllowitPolicy for AllowitCustom {
     fn source_digest(env: &Env) -> Option<BytesN<32>> {
         Some(BytesN::from_array(env, &SOURCE_HASH))
     }
-    /// Run the complete authored policy. Only an error it returns denies.
+    /// Run the complete authored policy. Only an error it returns denies. A rule denial fails the
+    /// call with the policy's own `AllowitError` code, so the caller learns which rule denied; the
+    /// standard tiers report `PolicyDenied`. Invalid configuration, state, overflow and an
+    /// unsupported function keep their wallet codes.
     fn check(ctx: &AllowitContext, _rules: &Vec<AllowitRule>) -> Result<(), AllowitWalletError> {
-        Ok(policy::execute(ctx)?)
+        let Err(error) = policy::execute(ctx) else {
+            return Ok(());
+        };
+        match AllowitWalletError::from(error) {
+            AllowitWalletError::PolicyDenied => ctx.env.panic_with_error(error),
+            other => Err(other),
+        }
     }
 }
 allowit_policy_wallet::policy_wallet!(AllowitCustomPolicy, AllowitCustom);

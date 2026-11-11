@@ -58,6 +58,19 @@ pub(super) fn set_param(
     }
 }
 
+/// How a wallet reports that `rule` denied. A standard tier reports `PolicyDenied`. A wallet that
+/// compiles its whole policy fails the call with the rule's own `AllowitError` code.
+pub(super) fn denial<T>(
+    wasm: &[u8],
+    rule: allowit::AllowitError,
+) -> Result<T, Result<AllowitWalletError, soroban_sdk::InvokeError>> {
+    if wasm == CUSTOM || wasm == CATCHING {
+        Err(Err(soroban_sdk::InvokeError::Contract(rule as u32)))
+    } else {
+        Err(Ok(AllowitWalletError::PolicyDenied))
+    }
+}
+
 /// The transfer arguments of `e`, for edits.
 pub(super) fn transfer_args(e: &mut AllowitExecutionRequest) -> &mut AllowitTransferArgs {
     match &mut e.operation {
@@ -468,6 +481,127 @@ fn simple_requires_both_signers_and_does_not_infer_rules_from_params() {
         Symbol::new(&f.env, "simple_policy_engine")
     );
 }
+/// The distinct contracts whose frames carry a diagnostic `error` event of contract error `code`.
+fn raisers(f: &Fixture, code: u32) -> std::vec::Vec<Address> {
+    use soroban_sdk::xdr::{ContractEventBody, ContractEventType, ScAddress, ScError, ScVal};
+    let mut found = std::vec::Vec::new();
+    for entry in f.env.host().get_diagnostic_events().unwrap().0 {
+        let event = entry.event;
+        let ContractEventBody::V0(body) = &event.body;
+        let raised = matches!(body.topics.as_slice(),
+            [ScVal::Symbol(topic), ScVal::Error(ScError::Contract(raised))]
+                if topic.0.as_slice() == b"error" && *raised == code);
+        let Some(contract) = event.contract_id else {
+            continue;
+        };
+        if event.type_ == ContractEventType::Diagnostic && raised {
+            let address = ScVal::Address(ScAddress::Contract(contract));
+            let address = Address::try_from_val(&f.env, &address).unwrap();
+            if !found.contains(&address) {
+                found.push(address);
+            }
+        }
+    }
+    found
+}
+
+/// A Custom wallet compiles its whole policy, so its denial names the rule: the call fails with
+/// the rule's own `AllowitError` code, which the server maps to the canonical rule. The standard
+/// tiers report `PolicyDenied`. A denial commits nothing and uses no nonce on either tier, and
+/// errors that are not rule denials keep their wallet codes.
+#[test]
+fn a_custom_denial_reports_its_rule_and_commits_nothing() {
+    use allowit::AllowitError as E;
+    for wasm in [COMMON, CUSTOM] {
+        let f = Fixture::new(wasm, false);
+        let edit = |f: &Fixture, key: &str, value: AllowitValue| {
+            let mut p = f.deployment();
+            set_param(&mut p.params, key, Some(value));
+            f.auth(&[&f.owner], "deploy_policy", (p.clone(),).into_val(&f.env));
+            f.client().deploy_policy(&p);
+        };
+        type Configure<'a> = &'a dyn Fn(&Fixture, &mut AllowitExecutionRequest);
+        let cases: [(E, i128, Configure); 5] = [
+            (E::PaymentLimitExceeded, 101, &|_, _| {}),
+            (E::DestinationNotAllowed, 10, &|f, e| {
+                transfer_args(e).to = Address::generate(&f.env)
+            }),
+            (E::DailySpendingLimitExceeded, 60, &|f, _| {
+                edit(f, DAILY_SPENDING_LIMIT, AllowitValue::Int(50))
+            }),
+            (E::CallLimitExceeded, 10, &|f, _| {
+                edit(f, CALL_LIMIT, AllowitValue::Int(0))
+            }),
+            (E::Expired, 10, &|f, _| {
+                f.env.ledger().with_mut(|l| l.timestamp = 1_000_001)
+            }),
+        ];
+        for (rule, amount, configure) in cases {
+            let f = Fixture::new(wasm, false);
+            let mut e = f.execution(amount);
+            configure(&f, &mut e);
+            // The owner edit moved the deployment version; bind the request to the new one.
+            let mut bound = f.execution(amount);
+            bound.operation = e.operation.clone();
+            let before = f.client().state();
+            f.auth(
+                &[&f.agent, &f.server],
+                "execute",
+                (bound.clone(),).into_val(&f.env),
+            );
+            assert_eq!(
+                f.client().try_execute(&bound),
+                denial(wasm, rule),
+                "{rule:?}"
+            );
+            // The host's diagnostic `error` events name the wallet as the one contract that
+            // raised the code. The server needs that proof before it names the rule.
+            let code = match wasm == CUSTOM {
+                true => rule as u32,
+                false => AllowitWalletError::PolicyDenied as u32,
+            };
+            assert_eq!(
+                raisers(&f, code),
+                std::slice::from_ref(&f.wallet),
+                "{rule:?}"
+            );
+            assert_eq!(f.client().state(), before, "{rule:?}");
+            assert_eq!(f.balance(), 1_000, "{rule:?}");
+        }
+        // The denied operation used no nonce: the next execution takes the first one.
+        let e = f.execution(101);
+        f.auth(
+            &[&f.agent, &f.server],
+            "execute",
+            (e.clone(),).into_val(&f.env),
+        );
+        assert_eq!(
+            f.client().try_execute(&e),
+            denial(wasm, E::PaymentLimitExceeded)
+        );
+        assert_eq!(f.transfer(100).amount, 100);
+        assert_eq!((f.client().state().nonce, f.balance()), (1, 900));
+    }
+    // Kernel refusals and invalid owner configuration are not rule denials: a Custom wallet
+    // reports them with the wallet's own codes, as every tier does.
+    let f = Fixture::new(CUSTOM, false);
+    let mut p = f.deployment();
+    set_param(&mut p.params, PAYMENT_LIMIT, Some(AllowitValue::Bool(true)));
+    f.auth(&[&f.owner], "deploy_policy", (p.clone(),).into_val(&f.env));
+    f.client().deploy_policy(&p);
+    assert_eq!(
+        execute_as_actors(&f, &f.execution(10)),
+        Err(AllowitWalletError::InvalidParam)
+    );
+    let f = Fixture::new(CUSTOM, false);
+    f.auth(&[&f.owner], "set_pause", (true, 1u64).into_val(&f.env));
+    f.client().set_pause(&true, &1);
+    assert_eq!(
+        execute_as_actors(&f, &f.execution(10)),
+        Err(AllowitWalletError::Paused)
+    );
+}
+
 #[test]
 fn common_rules_bound_transfers_and_commit_usage_once() {
     let f = Fixture::new(COMMON, false);
@@ -1404,10 +1538,16 @@ fn x402_enforces_compiled_business_rules_without_committing() {
     for wasm in [COMMON, CUSTOM] {
         for case in 0..3 {
             let f = Fixture::new(wasm, true);
-            let denied = Ok(AllowitWalletError::PolicyDenied);
+            use allowit::AllowitError as E;
+            let rule = |error| denial::<()>(wasm, error).unwrap_err();
+            let denied = rule(E::PaymentLimitExceeded);
             let (to, amount, expected) = match case {
                 0 => (f.recipient.clone(), 101, denied),
-                1 => (Address::generate(&f.env), 10, denied),
+                1 => (
+                    Address::generate(&f.env),
+                    10,
+                    rule(E::DestinationNotAllowed),
+                ),
                 _ => {
                     let mut p = f.deployment();
                     set_param(&mut p.params, EXPIRES_AT, None);
