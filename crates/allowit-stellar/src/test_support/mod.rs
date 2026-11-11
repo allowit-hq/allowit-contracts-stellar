@@ -447,6 +447,7 @@ pub fn active_owner_outcome(
         state: "active".into(),
         selection: selection.clone(),
         transactions: vec![],
+        receipts: vec![],
     })
     .unwrap()
 }
