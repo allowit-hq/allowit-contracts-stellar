@@ -32,8 +32,8 @@ dependencies = [
 
 [[package]]
 name = "allowit-core"
-version = "0.5.0"
-source = "git+https://github.com/allowit-hq/allowit-core.git?tag=v0.5.0#e3f860a243675f21784e8aedf92303e8004b34bf"
+version = "0.6.0"
+source = "git+https://github.com/allowit-hq/allowit-core.git?rev=9195f6111811c60f8c5dbe158d614345ae300014#9195f6111811c60f8c5dbe158d614345ae300014"
 dependencies = [
  "serde",
  "serde_json",

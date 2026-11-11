@@ -5,6 +5,8 @@
  */
 import { type ExplorerKind } from './explorer.js';
 import { defineElements } from './elements/index.js';
+import { adkParamLines, parseReviewLink, reviewAgentPrompt } from './adk-owner-link.js';
+import { installAndFund } from './owner-flow.js';
 export type ElementKind = 'address' | 'explorer-link' | 'amount' | 'wallet-sign-in' | 'owner-sign' | 'receipt' | 'binding-review';
 export type Feature = 'transfer' | 'swap' | 'deposit' | 'redeem' | 'owner-setup' | 'deploy' | 'fund' | 'activate' | 'binding-review' | 'explorer-links';
 export interface RailNetwork {
@@ -31,6 +33,29 @@ export declare function strkey(text: unknown): {
     key: Uint8Array;
 } | null;
 export declare function assets(network: string): readonly AssetInfo[];
+/** The selection ids of the wallet kinds. `standard` is the tier that technical names call Common. */
+export type WalletKindId = 'native' | 'simple' | 'standard' | 'custom';
+export interface AssetDisplay {
+    symbol: string;
+    decimals: number;
+    name: string;
+    native: boolean;
+}
+/** Every Stellar network offers the four kinds: a native account and the three policy wallet tiers. */
+export declare function walletKinds(network: string): readonly WalletKindId[];
+/**
+ * The wallet kind that a policy, draft, wallet profile or installation binds, or null when it binds none yet.
+ * It reads the route and tier of `runtime.instanceBinding`, of `config` or of the document itself.
+ */
+export declare function walletKind(document: unknown): WalletKindId | null;
+/** XLM: the native asset and the fee asset of every Stellar network. */
+export declare function nativeAsset(network: string): AssetDisplay | null;
+/**
+ * Display metadata of an asset reference: `native`, a listed code, `CODE:ISSUER`, or the asset contract id of a
+ * listed asset. Another classic asset shows its code with the seven classic decimals. An unlisted contract has no
+ * known unit, so the result is null and never a placeholder.
+ */
+export declare function assetDisplay(network: string, asset: string): AssetDisplay | null;
 export declare function validateAddress(network: string, text: string): boolean;
 export declare function explorerUrl(network: string, kind: ExplorerKind, id: string): string | null;
 declare const plugin: Readonly<{
@@ -49,6 +74,21 @@ declare const plugin: Readonly<{
     validateAddress: typeof validateAddress;
     explorerUrl: typeof explorerUrl;
     assets: typeof assets;
+    walletKinds: typeof walletKinds;
+    walletKind: typeof walletKind;
+    nativeAsset: typeof nativeAsset;
+    assetDisplay: typeof assetDisplay;
+    /** Review and sign links: the fragment, its parser, the agent prompt and the owner-readable params. */
+    review: Readonly<{
+        fragment: "#adk-proposal-v1=";
+        parseLink: typeof parseReviewLink;
+        agentPrompt: typeof reviewAgentPrompt;
+        paramLines: typeof adkParamLines;
+    }>;
+    /** The owner workflow that a host runs after the review. */
+    ownerWorkflow: Readonly<{
+        installAndFund: typeof installAndFund;
+    }>;
     test: Readonly<{
         network: "stellar:testnet";
         skips: Readonly<Partial<Record<Feature, string>>>;

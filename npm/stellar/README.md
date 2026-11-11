@@ -18,6 +18,18 @@
 
 `owner-sign` signs only a transaction whose hash equals the reviewed `step.hash`, and only before `step.expiresAt`. With `expected`, it also runs the owner verifier Wasm on the step. `wallet-sign-in` signs only a CAIP-122 message whose first line names the current site and whose second line is the wallet account. The wallet API loads on the first signing click.
 
+The plugin also supplies `walletKinds(network)`, `walletKind(document)`, `nativeAsset(network)` and
+`assetDisplay(network, asset)`. `walletKind` reads the route and tier of a policy, draft, profile or installation and
+returns `native`, `simple`, `standard` or `custom`; the tier `common` is the `standard` kind.
+`review` holds the Review and sign link: `fragment`, `parseLink`, `agentPrompt` and `paramLines`.
+`ownerWorkflow.installAndFund` installs and funds the reviewed wallet. One workflow runs per journal key.
+It settles a saved signed step first. A confirmation or `owner_transaction_settled` completes it once Horizon holds
+that successful transaction; every Horizon read ends after 15 s. On `owner_transaction_expired`
+Horizon decides: a transaction that applied completes the step, proof that it never applied archives its signed
+bytes and lets the owner sign a new step, and an unreadable chain keeps the step. `owner_transaction_failed` archives the step when Horizon holds that failed transaction. `owner_transaction_pending`
+and `network_unavailable` keep the step for a retry (`OwnerFlowError.retry`). A saved step and the funded marker name
+the policy, agent key and amount; a resume with other inputs is refused.
+
 ## Build and test
 
 The package exports JavaScript modules and TypeScript declarations. StrKey decoding, asset contract IDs and network passphrases come from `@stellar/stellar-sdk`. `test:browser` reads the Common Wasm that `scripts/build-contracts.sh` builds. Run these commands from `npm/stellar/`:

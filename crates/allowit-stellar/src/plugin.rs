@@ -7,7 +7,7 @@ use crate::host::{
     generation::{GenerateRequest, GeneratedDraft},
     input::{
         Formats,
-        asset::{Amount, Token},
+        asset::{Amount, AssetDisplay, Token},
     },
     profiles::{Description, Profile, ProfileBinding},
     request_proof::Protocol,
@@ -19,6 +19,7 @@ use crate::host::{
     vendors::{OwnerProvider, RuntimeProvider},
 };
 use crate::provider::{self, execution, server, server_owner};
+use allowit_core::vendor::kinds::WalletKind;
 use allowit_core::vendor::plugin::{
     Deadlines, ExecutionProvider, Feature, Fixtures, LinkKind, LiveConfig, OwnerRuntime, OwnerStep,
     ProfileInfo, RailPlugin, ServerHooks, StoreOpener, TestSupport,
@@ -110,6 +111,18 @@ impl RailPlugin for Plugin {
     }
     fn tokens(&self, network: &str) -> &'static [Token] {
         provider::tokens_for(network)
+    }
+    fn native_asset(&self, network: &str) -> Result<AssetDisplay> {
+        self::network(network)?;
+        Ok(provider::native_display())
+    }
+    fn asset_display(&self, network: &str, asset: &str) -> Result<AssetDisplay> {
+        provider::asset_display(self::network(network)?.id, asset)
+    }
+    /// Every Stellar network offers the four kinds: a native account and the three policy
+    /// wallet tiers.
+    fn wallet_kinds(&self, _network: &str) -> Vec<WalletKind> {
+        WalletKind::ALL.to_vec()
     }
     fn explorer(&self, network: &str, kind: LinkKind, id: &str) -> Option<String> {
         let kind = match kind {
@@ -452,6 +465,87 @@ fn fixtures() -> Fixtures {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assets_show_their_real_unit_and_an_unknown_contract_has_none() {
+        for network in ["stellar:testnet", "stellar:pubnet"] {
+            let native = PLUGIN.native_asset(network).unwrap();
+            assert_eq!(
+                (
+                    native.symbol.as_str(),
+                    native.decimals,
+                    native.name.as_str(),
+                    native.native
+                ),
+                ("XLM", 7, "Lumens", true)
+            );
+            assert_eq!(native.format(50_000_000), "5 XLM");
+            assert_eq!(PLUGIN.asset_display(network, "native").unwrap(), native);
+            assert_eq!(PLUGIN.asset_display(network, "XLM").unwrap(), native);
+            for token in PLUGIN.tokens(network) {
+                let contract = provider::token_contract(network, token).unwrap();
+                let shown = PLUGIN.asset_display(network, &contract).unwrap();
+                assert_eq!(
+                    (shown.symbol.as_str(), shown.native),
+                    (token.code, token.native)
+                );
+                assert_eq!(PLUGIN.asset_display(network, token.code).unwrap(), shown);
+                if let Some(issuer) = token.issuer {
+                    let named = format!("{}:{issuer}", token.code);
+                    assert_eq!(PLUGIN.asset_display(network, &named).unwrap(), shown);
+                    assert_eq!(shown.name, "USD Coin");
+                    assert_eq!(shown.format(2_500_000), "0.25 USDC");
+                }
+            }
+            // Another classic asset shows its own code with the classic seven decimals.
+            let issuer = PLUGIN.tokens(network)[1].issuer.unwrap();
+            let other = PLUGIN
+                .asset_display(network, &format!("EURC:{issuer}"))
+                .unwrap();
+            assert_eq!(
+                (other.symbol.as_str(), other.decimals, other.native),
+                ("EURC", 7, false)
+            );
+            // No placeholder unit: an unlisted contract, a bare unknown code and a bad issuer fail.
+            let unknown = "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ";
+            for bad in [
+                unknown,
+                "EURC",
+                "",
+                "EURC:not-an-issuer",
+                "TOOLONGASSETCODE:x",
+            ] {
+                assert_eq!(
+                    PLUGIN.asset_display(network, bad).unwrap_err().code,
+                    2,
+                    "{bad}"
+                );
+            }
+        }
+        assert!(PLUGIN.native_asset("other:network").is_err());
+        assert!(PLUGIN.asset_display("other:network", "XLM").is_err());
+    }
+
+    #[test]
+    fn every_network_offers_the_four_wallet_kinds_and_profiles_report_theirs() {
+        for network in PLUGIN.networks() {
+            assert_eq!(PLUGIN.wallet_kinds(network.id), WalletKind::ALL);
+        }
+        let fixtures: Vec<Value> = serde_json::from_str(include_str!(
+            "../tests/fixtures/provider/stellar-portable-descriptors.json"
+        ))
+        .unwrap();
+        let kinds: Vec<_> = fixtures
+            .iter()
+            .map(|vector| {
+                let network = vector["bundle"]["network"].as_str().unwrap();
+                let document = serde_json::to_vec(&vector["bundle"]).unwrap();
+                PLUGIN.wallet_kind(network, &document).unwrap()
+            })
+            .collect();
+        assert_eq!(kinds, WalletKind::ALL);
+        assert!(PLUGIN.wallet_kind("stellar:testnet", b"{}").is_err());
+    }
 
     #[test]
     fn identity_and_networks_follow_the_plugin_contract() {

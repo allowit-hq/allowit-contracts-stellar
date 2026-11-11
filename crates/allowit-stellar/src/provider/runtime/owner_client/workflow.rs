@@ -506,6 +506,9 @@ impl OwnerClient {
                         json!({"policyId":selection.policy.id,"action":"fund","amount":amount}),
                     ),
                 };
+                allowit_core::client::progress::report(
+                    "Preparing the owner transaction with the Allowit server",
+                );
                 let response: Prepared = self
                     .session
                     .owner_request(Method::Post, path, Some(&body), clock()?, true)
@@ -665,6 +668,9 @@ impl OwnerClient {
                 .signed_xdr
                 .as_ref()
                 .expect("retained signed owner packet");
+            allowit_core::client::progress::report(
+                "Submitting the signed owner transaction and waiting for the network",
+            );
             let response: Value = self
                 .session
                 .owner_request(
@@ -674,9 +680,7 @@ impl OwnerClient {
                     clock()?,
                     true,
                 )
-                .map_err(|_| {
-                    Error::uncertain("Owner submission is uncertain; resume this exact workflow ID")
-                })?;
+                .map_err(submit_refusal)?;
             if response["transactionHash"] != native::hex(&hash)
                 || response["status"] != "confirmed"
             {
@@ -684,6 +688,7 @@ impl OwnerClient {
                     "Owner submission has no matching confirmed receipt; retain the workflow",
                 ));
             }
+            allowit_core::client::progress::report("Reading the owner receipt from the network");
             let receipt = checked(rpc::receipt_by_hash(rpc, &selection.config.network, &hash))?
                 .ok_or_else(|| {
                     Error::uncertain("Owner receipt is not yet independently available")
@@ -1342,4 +1347,66 @@ fn verify_original_signature(
         return Err(Error::config("Original owner transaction hash changed"));
     }
     checked(native::signing::verify_digest(owner, hash, signature))
+}
+
+/// The error of a refused or unanswered owner submission. A typed server refusal keeps its code
+/// and text. Only an answer that leaves the outcome unknown is uncertain: no answer, an untyped
+/// server error, or a transaction that the server reports as still pending.
+fn submit_refusal(error: Error) -> Error {
+    const RESUME: &str = "resume this exact workflow ID";
+    match error.api_code.as_deref() {
+        None => Error::uncertain(format!("Owner submission is uncertain; {RESUME}")),
+        Some("owner_transaction_pending") => {
+            let mut pending = Error::uncertain(format!("{} ({RESUME})", error.message));
+            pending.status = error.status;
+            pending.api_code = error.api_code;
+            pending
+        }
+        // The server states that it sent nothing, so a retry of the same workflow is safe.
+        Some(allowit_core::vendor::owner_session::NETWORK_UNAVAILABLE) => {
+            let mut unsent = error;
+            unsent.code = crate::provider::NETWORK_UNAVAILABLE;
+            unsent
+        }
+        Some(_) => error,
+    }
+}
+
+#[cfg(test)]
+mod submit_refusal_tests {
+    use super::*;
+    #[test]
+    fn a_refused_submission_keeps_the_server_code_and_is_uncertain_only_when_unknown() {
+        // No answer or an untyped server error leaves the outcome unknown.
+        let unknown = submit_refusal(Error::uncertain("transport"));
+        assert_eq!((unknown.code, unknown.api_code.as_deref()), (5, None));
+        assert!(unknown.message.contains("resume this exact workflow ID"));
+        // The server knows the outcome: the step expired or already settled.
+        for code in ["owner_transaction_expired", "owner_transaction_settled"] {
+            let typed = submit_refusal(Error::refused(409, code, "The owner transaction expired"));
+            assert_eq!((typed.code, typed.status), (4, Some(409)));
+            assert_eq!(typed.api_code.as_deref(), Some(code));
+            assert!(typed.message.contains("The owner transaction expired"));
+        }
+        // A pending transaction is the one typed answer that stays uncertain.
+        let pending = submit_refusal(Error::refused(
+            409,
+            "owner_transaction_pending",
+            "The owner transaction is pending",
+        ));
+        assert_eq!((pending.code, pending.status), (5, Some(409)));
+        assert_eq!(
+            pending.api_code.as_deref(),
+            Some("owner_transaction_pending")
+        );
+        assert!(pending.message.contains("The owner transaction is pending"));
+        // The server sent nothing: the retry code, not the uncertain code.
+        let unsent = submit_refusal(Error::refused(
+            503,
+            "network_unavailable",
+            "Network unavailable",
+        ));
+        assert_eq!(unsent.code, crate::provider::NETWORK_UNAVAILABLE);
+        assert_eq!(unsent.api_code.as_deref(), Some("network_unavailable"));
+    }
 }

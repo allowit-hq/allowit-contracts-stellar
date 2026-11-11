@@ -161,15 +161,12 @@ pub fn installed_units(config: &WalletConfig, amount: &Amount) -> Result<i128> {
         Asset::Contract(contract) => *contract == config.asset,
     };
     if !matches {
-        return Err(Error {
-            code: 4,
-            message: format!(
-                "the wallet holds only its installed asset {}; {} names another asset",
-                config.asset_symbol, amount.text
-            ),
-            status: None,
-            config: false,
-        });
+        let mut error = Error::usage(format!(
+            "the wallet holds only its installed asset {}; {} names another asset",
+            config.asset_symbol, amount.text
+        ));
+        error.code = 4;
+        return Err(error);
     }
     units(amount)
 }
