@@ -102,7 +102,8 @@ journal retains for its policy; a wallet without a retained operation has no rep
 
 Generation sends the owner's wallet kind as the top-level `walletKind` of the request and keeps the top-level
 `walletKind` of the returned policy. A typed refusal such as `wallet_kind_unsupported` keeps its `details`.
-`RailPlugin::draft_params` returns the params and the installed asset of a draft for display.
+`RailPlugin::draft_params` returns the params and the installed asset of a draft, a policy, a public wallet profile
+or an installation for display.
 
 `exec` waits up to 180 s for the prepare answer and up to 180 s for the submit answer. `wait` bounds only the engine
 status reads after the submit answer: each later read ends at the deadline and the last outcome is returned.

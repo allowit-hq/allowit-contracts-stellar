@@ -151,34 +151,56 @@ pub fn generate(
     })
 }
 
-/// The params of a draft or policy document and the unit of its installed asset. The document
-/// is the one that [`generate`] returns: its params and asset are in
-/// `runtime.instanceBinding.portable`. An asset without a known unit is an error, so no amount
-/// prints with a placeholder unit.
+/// The params of a rail document and the unit of its installed asset. A draft or policy, as
+/// [`generate`] returns it, holds them in `runtime.instanceBinding.portable`. A public wallet
+/// profile or an installation holds them in `config`. Each shape is decoded with the type that
+/// the rail uses for it, so an absent optional field reads as it does everywhere else. A
+/// classic asset that is not listed shows its code through its issuer. An asset without a
+/// known unit is an error, so no amount prints with a placeholder unit.
 pub fn draft_params(
     network: &str,
     document: &serde_json::Value,
 ) -> Result<crate::host::plugin::DraftParams> {
-    let invalid = || Error::config("The document is not a Stellar policy draft");
-    if document.get("network").is_some_and(|v| {
-        v.as_str()
-            .and_then(|v| crate::host::routing::normalize(v).ok())
-            != Some(network)
-    }) {
-        return Err(Error::config("The draft belongs to another network"));
+    let invalid = || Error::config("The document is not a Stellar policy or wallet document");
+    // `stated` is the network of the typed part; a profile also names one at the top level.
+    let (stated, params, address, symbol, issuer) =
+        if document.pointer("/runtime/instanceBinding").is_some() {
+            let policy: runtime::owner_client::GeneratedPolicy =
+                serde_json::from_value(document.clone()).map_err(|_| invalid())?;
+            let binding = policy.runtime.instance_binding;
+            (
+                policy.network,
+                binding.portable.params,
+                binding.portable.asset.address,
+                binding.portable.asset.symbol,
+                binding.asset_issuer,
+            )
+        } else if let Some(config) = document.get("config") {
+            let config: native::WalletConfig =
+                serde_json::from_value(config.clone()).map_err(|_| invalid())?;
+            (
+                config.network,
+                config.params,
+                config.asset,
+                config.asset_symbol,
+                config.asset_issuer,
+            )
+        } else {
+            return Err(invalid());
+        };
+    let top = match document.get("network") {
+        Some(value) => Some(value.as_str().ok_or_else(invalid)?),
+        None => None,
+    };
+    if std::iter::once(stated.as_str())
+        .chain(top)
+        .any(|named| crate::host::routing::normalize(named).ok() != Some(network))
+    {
+        return Err(Error::config("The document belongs to another network"));
     }
-    let binding = document
-        .pointer("/runtime/instanceBinding")
-        .ok_or_else(invalid)?;
-    let portable = &binding["portable"];
-    let params: crate::PolicyParams =
-        serde_json::from_value(portable["params"].clone()).map_err(|_| invalid())?;
-    let address = portable["asset"]["address"].as_str().ok_or_else(invalid)?;
-    let asset = asset_display(network, address).or_else(|_| {
-        let symbol = portable["asset"]["symbol"].as_str().ok_or_else(invalid)?;
-        let issuer = binding["assetIssuer"]
-            .as_str()
-            .ok_or_else(|| Error::unsupported("The asset of this draft has no known unit"))?;
+    let asset = asset_display(network, &address).or_else(|_| {
+        let issuer = issuer
+            .ok_or_else(|| Error::unsupported("The asset of this document has no known unit"))?;
         asset_display(network, &format!("{symbol}:{issuer}"))
     })?;
     let params = params

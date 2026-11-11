@@ -503,6 +503,9 @@ mod tests {
         assert_eq!(read.params.len(), 6);
         // Another network, another document shape and an asset without a unit are errors.
         assert!(PLUGIN.draft_params("stellar:pubnet", &draft).is_err());
+        let mut unnamed = draft.clone();
+        unnamed.as_object_mut().unwrap().remove("network");
+        assert!(PLUGIN.draft_params("stellar:testnet", &unnamed).is_err());
         assert!(PLUGIN.draft_params("stellar:unknown", &draft).is_err());
         assert!(
             PLUGIN
@@ -516,6 +519,85 @@ mod tests {
             .into();
         binding["assetIssuer"] = serde_json::Value::Null;
         assert!(PLUGIN.draft_params("stellar:testnet", &unlisted).is_err());
+    }
+
+    #[test]
+    fn a_wallet_profile_gives_its_params_and_the_unit_of_its_installed_asset() {
+        let fixtures = (TEST_SUPPORT.fixtures)();
+        let profile: serde_json::Value = serde_json::from_slice(&fixtures.public_profile).unwrap();
+        let read = PLUGIN.draft_params("stellar:testnet", &profile).unwrap();
+        assert_eq!(
+            (read.asset.symbol.as_str(), read.asset.native),
+            ("XLM", true)
+        );
+        assert_eq!(read.params.len(), 1);
+        assert_eq!(read.params[0].0, "payment_limit");
+        assert_eq!(read.params[0].1["Int"], "1000");
+        assert!(PLUGIN.draft_params("stellar:pubnet", &profile).is_err());
+        // A classic asset that is not listed shows its code through the issuer of the wallet.
+        let issuer = crate::account_for_seed(&[5; 32]);
+        let asset = crate::asset_from_identity("TEST", Some(&issuer)).unwrap();
+        let mut classic = profile.clone();
+        classic["config"]["asset"] = crate::sac_address("stellar:testnet", &asset)
+            .unwrap()
+            .into();
+        classic["config"]["assetSymbol"] = "TEST".into();
+        classic["config"]["assetIssuer"] = issuer.into();
+        let read = PLUGIN.draft_params("stellar:testnet", &classic).unwrap();
+        assert_eq!(
+            (read.asset.symbol.as_str(), read.asset.decimals),
+            ("TEST", 7)
+        );
+        // An installation names its network only in `config`: the same asset on another
+        // network is refused, and a document that names no network is not read.
+        let mut installation = serde_json::json!({"config": classic["config"]});
+        let read = PLUGIN
+            .draft_params("stellar:testnet", &installation)
+            .unwrap();
+        assert_eq!(read.asset.symbol, "TEST");
+        assert!(
+            PLUGIN
+                .draft_params("stellar:pubnet", &installation)
+                .is_err()
+        );
+        let mut disagreeing = classic.clone();
+        disagreeing["config"]["network"] = "stellar:pubnet".into();
+        assert!(
+            PLUGIN
+                .draft_params("stellar:testnet", &disagreeing)
+                .is_err()
+        );
+        assert!(PLUGIN.draft_params("stellar:pubnet", &disagreeing).is_err());
+        installation["config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("network");
+        assert!(
+            PLUGIN
+                .draft_params("stellar:testnet", &installation)
+                .is_err()
+        );
+        // A wallet without params omits them; it has no lines and is still a valid document.
+        let mut parameterless = profile.clone();
+        parameterless["config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("params");
+        let read = PLUGIN
+            .draft_params("stellar:testnet", &parameterless)
+            .unwrap();
+        assert!(read.params.is_empty());
+        // Without the issuer the contract has no known unit.
+        classic["config"]["assetIssuer"] = serde_json::Value::Null;
+        assert!(PLUGIN.draft_params("stellar:testnet", &classic).is_err());
+        let mut invalid = profile.clone();
+        invalid["config"]["params"] = serde_json::json!({"payment_limit": 5});
+        assert!(PLUGIN.draft_params("stellar:testnet", &invalid).is_err());
+        assert!(
+            PLUGIN
+                .draft_params("stellar:testnet", &serde_json::json!({"params": {}}))
+                .is_err()
+        );
     }
 
     #[test]
