@@ -18,6 +18,14 @@
 
 `owner-sign` signs only a transaction whose hash equals the reviewed `step.hash`, and only before `step.expiresAt`. With `expected`, it also runs the owner verifier Wasm on the step. `wallet-sign-in` signs only a CAIP-122 message whose first line names the current site and whose second line is the wallet account. The wallet API loads on the first signing click.
 
+The plugin also supplies `walletKinds(network)`, `walletKind(document)`, `nativeAsset(network)` and
+`assetDisplay(network, asset)`. `walletKind` reads the route and tier of a policy, draft, profile or installation and
+returns `native`, `simple`, `standard` or `custom`; the tier `common` is the `standard` kind.
+`review` holds the Review and sign link: `fragment`, `parseLink`, `agentPrompt` and `paramLines`.
+`ownerWorkflow.installAndFund` installs and funds the reviewed wallet. It settles a saved signed step first:
+`owner_transaction_settled` completes it, `owner_transaction_expired` archives its signed bytes and lets the owner
+sign a new step, and `owner_transaction_pending` or `network_unavailable` keeps it for a retry (`OwnerFlowError.retry`).
+
 ## Build and test
 
 The package exports JavaScript modules and TypeScript declarations. StrKey decoding, asset contract IDs and network passphrases come from `@stellar/stellar-sdk`. `test:browser` reads the Common Wasm that `scripts/build-contracts.sh` builds. Run these commands from `npm/stellar/`:

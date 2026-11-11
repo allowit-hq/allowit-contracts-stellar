@@ -38,6 +38,21 @@ function policyValue(value, depth = 0) {
     return tag === 'List' && Array.isArray(item) && item.length <= 64 && item.every(entry => policyValue(entry, depth + 1));
 }
 export function parseAdkOwnerLink(fragment) {
+    const { proposal, workPrompt } = parseLink(fragment, false);
+    return { proposal, workPrompt };
+}
+/**
+ * Decode and check a Review and sign link. The envelope may also carry `agent` and `amount`; a missing one is null
+ * and returns the owner to the conversation. Any other key, type or size is refused.
+ */
+export function parseReviewLink(fragment) {
+    return parseLink(fragment, true);
+}
+/** The prompt that the owner gives the agent after signing. */
+export function reviewAgentPrompt(link, origin, policyId, wallet, agent) {
+    return adkAgentPrompt(link.workPrompt, origin, policyId, wallet, agent);
+}
+function parseLink(fragment, review) {
     const invalid = () => new Error('The agent policy link is invalid.');
     if (!fragment.startsWith(ADK_OWNER_FRAGMENT))
         throw invalid();
@@ -52,9 +67,20 @@ export function parseAdkOwnerLink(fragment) {
     catch {
         throw invalid();
     }
-    if (!object(envelope) || Object.keys(envelope).length !== 2 || typeof envelope.workPrompt !== 'string'
+    if (!object(envelope) || typeof envelope.workPrompt !== 'string'
         || !envelope.workPrompt.trim() || envelope.workPrompt.length > 12_000 || !object(envelope.proposal))
         throw invalid();
+    const extra = review ? ['agent', 'amount'] : [];
+    if (!Object.keys(envelope).every(key => key === 'proposal' || key === 'workPrompt' || extra.includes(key)))
+        throw invalid();
+    const optional = (value) => {
+        if (value === undefined || value === null)
+            return null;
+        if (typeof value !== 'string' || value.length > 128)
+            throw invalid();
+        return value.trim() || null;
+    };
+    const agent = optional(envelope.agent), amount = optional(envelope.amount);
     const { network, revision, title, explanation, code, sourceHash, paramsHash, params } = envelope.proposal;
     if (Object.keys(envelope.proposal).length !== 8 || network !== 'stellar:testnet'
         || typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 1 || revision > 0xffffffff
@@ -65,7 +91,7 @@ export function parseAdkOwnerLink(fragment) {
         || typeof paramsHash !== 'string' || !hashPattern.test(paramsHash)
         || !object(params) || Object.keys(params).length > 64 || !Object.values(params).every(value => policyValue(value)))
         throw invalid();
-    return { proposal: { network, revision, title, explanation, code, sourceHash, paramsHash, params }, workPrompt: envelope.workPrompt };
+    return { proposal: { network, revision, title, explanation, code, sourceHash, paramsHash, params }, workPrompt: envelope.workPrompt, agent, amount };
 }
 /** Base units as a decimal, without floating-point rounding. */
 function decimal(units, decimals) {

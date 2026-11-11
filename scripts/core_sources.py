@@ -1,4 +1,4 @@
-"""Resolve exact released Core tooling from this repository's locked Core dependency."""
+"""Resolve exact Core tooling, at a release tag or an exact reviewed revision, from this repository's locked Core dependency."""
 import functools
 import json
 import re
@@ -36,9 +36,9 @@ def core_root():
         raise ValueError("The build must resolve exactly one Core package")
     package = candidates[0]
     source = package.get("source") or ""
-    identity = re.fullmatch(r"git\+" + re.escape(CANONICAL) + r"\?tag=(v\d+\.\d+\.\d+)#([0-9a-f]{40})", source)
-    if identity is None:
-        raise ValueError("Core must resolve to a released canonical Core tag")
+    identity = re.fullmatch(r"git\+" + re.escape(CANONICAL) + r"\?(?:tag=v\d+\.\d+\.\d+|rev=([0-9a-f]{40}))#([0-9a-f]{40})", source)
+    if identity is None or identity.group(1) not in (None, identity.group(2)):
+        raise ValueError("Core must resolve to a canonical Core release tag or exact revision")
     revision = identity.group(2)
     root = Path(package["manifest_path"]).resolve().parents[2]
     if _run(["git", "-C", str(root), "rev-parse", "HEAD"]).decode().strip() != revision:

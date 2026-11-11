@@ -75,6 +75,30 @@ Policy wallet custody calls the layout 4 `execute` entrypoint (`CONTRACT_VERSION
 
 `policy::evaluate` runs a policy on the host as the wallet does. A Common wallet runs its standard prefix first. A canonical-only source, or any source with a compiled evaluator, then runs in full. Otherwise the result is `Evaluation::Prefix`: only the onchain part ran. Fresh classic installs admit only canonical portable source and canonical params.
 
+## Wallet kinds, units and settlement reports
+
+The plugin offers the four Core wallet kinds on every network. `native` is the classic account route. `simple`,
+`standard` and `custom` are the policy wallet tiers `simple`, `common` and `custom`: the selection id `standard`
+names the Common tier. `provider::profiles::wallet_kind` reads the kind of a wallet configuration, and the profile
+binding reports it through `Profile::wallet_kind`.
+
+`RailPlugin::native_asset` returns XLM with seven decimals. `RailPlugin::asset_display` accepts `native`, a listed
+code, `CODE:ISSUER`, an issuer of a listed token and the Stellar Asset Contract id of a listed token. Another classic
+asset shows its code with seven decimals. An unlisted contract is an error, never a placeholder unit.
+
+A settled `exec` or `status` outcome carries `settlement` in its document: `height` is the receipt ledger and `fee`
+is the fee that the transaction result charged, in XLM. The client holds no limit counters and the status reply
+carries none, so the document reports the fee but not the amount spent against a limit.
+
+`exec` waits up to 180 s for the prepare answer and up to 180 s for the submit answer. `wait` bounds only the status
+polling after the submit answer: each later status read ends at the deadline and the last outcome is returned.
+A submit that stops early would leave its outcome unknown, so no caller bound ends it. `status` reads once without a
+bound and then polls within `wait`. Long steps report through `allowit_core::client::progress`.
+
+A refused owner submission keeps the server `code` in `Error::api_code`. `owner_transaction_expired` and
+`owner_transaction_settled` are certain (exit 4). `owner_transaction_pending`, no answer and an untyped server error
+are uncertain (exit 5). `network_unavailable` with `details.retry = "same_request_id"` is exit 7.
+
 ## Owner setup
 
 `admin::PolicyConfig::for_policy` builds the `AllowitPolicyConfig` constructor packet of a validated installation, and `constructor_args` emits it. `admin::Deployer` prepares unsigned setup transactions through Stellar RPC simulation:

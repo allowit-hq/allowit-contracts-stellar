@@ -151,7 +151,7 @@ pub fn generate(
     })
 }
 
-use crate::host::input::asset::Token;
+use crate::host::input::asset::{AssetDisplay, Token};
 const TESTNET: &[Token] = &[
     Token {
         code: "XLM",
@@ -180,6 +180,61 @@ const PUBNET: &[Token] = &[
         issuer: Some("GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"),
     },
 ];
+
+/// The human names of the listed tokens.
+fn token_name(code: &str) -> &str {
+    match code {
+        "XLM" => "Lumens",
+        "USDC" => "USD Coin",
+        other => other,
+    }
+}
+fn display(token: &Token) -> AssetDisplay {
+    AssetDisplay {
+        symbol: token.code.into(),
+        decimals: token.decimals,
+        name: token_name(token.code).into(),
+        native: token.native,
+    }
+}
+/// XLM: the native asset and the fee asset of every Stellar network.
+pub fn native_display() -> AssetDisplay {
+    display(&TESTNET[0])
+}
+/// Display metadata of an asset reference: `native`, a listed code, `CODE:ISSUER`, an issuer of a
+/// listed token, or the Stellar Asset Contract id of a listed token. A classic asset that is not
+/// listed shows its code with the seven decimals of every classic asset. A contract that is not
+/// listed has no known unit, so it is an error and never a placeholder.
+pub fn asset_display(network: &str, asset: &str) -> Result<AssetDisplay> {
+    let tokens = tokens_for(network);
+    if asset == "native" {
+        return Ok(native_display());
+    }
+    let (code, issuer) = match asset.split_once(':') {
+        Some((code, issuer)) => (code, Some(issuer)),
+        None => (asset, None),
+    };
+    if let Some(token) = tokens.iter().find(|t| {
+        (t.code == code && (issuer.is_none() || issuer == t.issuer))
+            || (issuer.is_none() && t.issuer == Some(asset))
+            || (issuer.is_none() && token_contract(network, t).as_deref() == Some(asset))
+    }) {
+        return Ok(display(token));
+    }
+    let Some(issuer) = issuer else {
+        return Err(Error::usage(format!(
+            "unknown Stellar asset {}; name it as CODE:ISSUER",
+            crate::host::error::quoted(asset)
+        )));
+    };
+    native::asset_from_identity(code, Some(issuer)).map_err(Error::usage)?;
+    Ok(AssetDisplay {
+        symbol: code.into(),
+        decimals: 7,
+        name: code.into(),
+        native: false,
+    })
+}
 
 pub fn tokens_for(rail: &str) -> &'static [Token] {
     if rail == "stellar:testnet" {

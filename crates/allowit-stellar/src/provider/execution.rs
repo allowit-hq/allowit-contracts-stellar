@@ -1,6 +1,7 @@
 //! Shared native execution orchestration. Original journal names and signed records remain unchanged.
 use super::runtime::client::{self, ExecutionOutcome};
 use crate::OperationStatus;
+use crate::host::execution::{Quantity, Settlement};
 use crate::host::{
     Signer,
     error::{Error, Result},
@@ -146,10 +147,18 @@ fn render(out: ExecutionOutcome) -> Outcome {
         OperationStatus::Prepared => crate::host::runtime::Status::Prepared,
         OperationStatus::Submitted => crate::host::runtime::Status::Submitted,
     };
-    Outcome {
-        document: serde_json::json!({"requestId":out.request_id,"status":out.status,"transactionHash":out.transaction_hash}),
-        status,
+    let mut document = serde_json::json!({"requestId":out.request_id,"status":out.status,"transactionHash":out.transaction_hash});
+    if let Some((ledger, fee)) = out.settlement {
+        // The transaction pays its fee in the native asset, whatever asset the wallet holds.
+        let settlement = Settlement {
+            height: u64::from(ledger),
+            fee: Quantity::new(i128::from(fee), super::native_display()),
+            amount: None,
+        };
+        document[Settlement::KEY] =
+            serde_json::to_value(settlement).expect("a settlement encodes as JSON");
     }
+    Outcome { document, status }
 }
 
 fn bundle(profile: &Profile) -> Result<&client::Bundle> {
@@ -181,6 +190,25 @@ impl crate::host::execution::RecoveryBinding for client::Retained {
 #[cfg(test)]
 mod storage_boundary_tests {
     use super::*;
+    #[test]
+    fn a_settled_outcome_reports_its_ledger_and_fee_in_the_native_unit() {
+        let outcome = |settlement| ExecutionOutcome {
+            request_id: "transfer-001".into(),
+            status: OperationStatus::Confirmed,
+            transaction_hash: "ab".repeat(32),
+            settlement,
+        };
+        let settled = render(outcome(Some((5_661_578, 123_456)))).document;
+        let settlement = Settlement::of(&settled).unwrap();
+        assert_eq!(settlement.height, 5_661_578);
+        assert_eq!(settlement.fee.units, "123456");
+        assert_eq!(settlement.fee.text, "0.0123456 XLM");
+        assert_eq!(settled["settlement"]["fee"]["asset"]["symbol"], "XLM");
+        assert_eq!(settlement.amount, None);
+        let pending = render(outcome(None)).document;
+        assert!(pending.get("settlement").is_none());
+        assert_eq!(pending["requestId"], "transfer-001");
+    }
     #[test]
     fn build_only_does_not_request_a_caller_store() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(

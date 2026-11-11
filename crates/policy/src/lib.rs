@@ -133,6 +133,14 @@ pub mod soroban {
         env.panic_with_error(error)
     }
 
+    /// Abort the whole contract call: a typed read met a value of another type or range. A value
+    /// carries no environment, so the abort is a panic with no contract error code. The host
+    /// rolls back every write of the invocation.
+    #[track_caller]
+    fn mistyped() -> ! {
+        panic!("allowit: InvalidParam")
+    }
+
     /// Run the policy. A panic aborts the whole contract call, which rolls back every write.
     fn guarded(_env: &AllowitEnv, run: impl FnOnce() -> Result) -> Result {
         run()
@@ -210,3 +218,58 @@ pub mod soroban {
 }
 
 pub use soroban::*;
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+    use super::*;
+    use soroban_sdk::{Env, Map, Symbol, testutils::Address as _, vec};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    /// The Soroban variant of Core's `ok_reads_a_param_as_the_type_of_its_binding`.
+    #[test]
+    fn ok_reads_a_param_as_the_type_of_its_binding_and_a_mistyped_read_aborts() {
+        let env = Env::default();
+        let seller = Address::generate(&env);
+        let mut map = Map::new(&env);
+        let mut set = |key: &str, value: AllowitValue| map.set(Symbol::new(&env, key), value);
+        set("floor", AllowitValue::Int(-7));
+        set("zero", AllowitValue::Int(0));
+        set("output", AllowitValue::Addr(seller.clone()));
+        set(
+            "sellers",
+            AllowitValue::List(vec![&env, AllowitValue::Addr(seller.clone())]),
+        );
+        set("flag", AllowitValue::Bool(true));
+        let params = AllowitParams::new(&env, map).unwrap();
+        let floor: i128 = params["floor"].ok();
+        let zero: u64 = params["zero"].ok();
+        let output: Address = params["output"].ok();
+        let sellers: Vec<Address> = params["sellers"].ok();
+        let same: AllowitValue = params["sellers"].ok();
+        assert_eq!((floor, zero, output), (-7, 0, seller.clone()));
+        assert_eq!(sellers, vec![&env, seller]);
+        assert_eq!(same, params["sellers"]);
+        // A missing key or a value of another type or range aborts the invocation. Nothing
+        // stands in for it.
+        let aborts = |read: &dyn Fn()| catch_unwind(AssertUnwindSafe(read)).is_err();
+        assert!(aborts(&|| {
+            let _: i128 = params["absent"].ok();
+        }));
+        assert!(aborts(&|| {
+            let _: i128 = params["flag"].ok();
+        }));
+        assert!(aborts(&|| {
+            let _: u64 = params["floor"].ok();
+        }));
+        assert!(aborts(&|| {
+            let _: Address = params["sellers"].ok();
+        }));
+        assert!(aborts(&|| {
+            let _: Vec<Address> = params["floor"].ok();
+        }));
+        assert!(!aborts(&|| {
+            let _: i128 = params["floor"].ok();
+        }));
+    }
+}

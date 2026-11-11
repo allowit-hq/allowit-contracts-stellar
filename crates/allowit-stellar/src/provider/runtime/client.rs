@@ -14,7 +14,7 @@ use crate::{
     WalletConfig, WalletRoute,
 };
 use allowit_core::{
-    client::store::Store,
+    client::{progress, store::Store},
     transport::{
         http::{HttpClient, Method, Request},
         rpc::Options,
@@ -25,7 +25,7 @@ use serde_json::json;
 use std::{
     path::Path,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use zeroize::Zeroizing;
 
@@ -513,6 +513,21 @@ impl Client {
         })
     }
     fn post(&self, path: &str, body: serde_json::Value) -> Result<Response> {
+        self.post_within(path, body, None)?.ok_or_else(|| {
+            Error::uncertain(
+                "Stellar transport is uncertain; recover the original request ID with status",
+            )
+        })
+    }
+    /// One engine call that ends at `deadline`. `None` in the result means that the deadline
+    /// ended the call before an answer arrived. Only a read may take a deadline: a state-changing
+    /// call that stops early leaves its outcome unknown.
+    fn post_within(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+        deadline: Option<Instant>,
+    ) -> Result<Option<Response>> {
         let issued_at = clock()?;
         let canonical = serde_json_canonicalizer::to_vec(&body)
             .map_err(|_| Error::config("Cannot encode Stellar request"))?;
@@ -530,22 +545,24 @@ impl Client {
             ("Authorization".into(), proof),
             ("Content-Type".into(), "application/json".into()),
         ];
-        let response = self
-            .http
-            .send(
-                Request {
-                    method: Method::Post,
-                    url: &format!("{}{path}", self.origin),
-                    headers: &headers,
-                    body: Some(&bytes),
-                },
-                None,
-            )
-            .map_err(|_| {
-                Error::uncertain(
+        let response = self.http.send(
+            Request {
+                method: Method::Post,
+                url: &format!("{}{path}", self.origin),
+                headers: &headers,
+                body: Some(&bytes),
+            },
+            deadline,
+        );
+        let response = match response {
+            Ok(response) => response,
+            Err(_) if deadline.is_some_and(|end| Instant::now() >= end) => return Ok(None),
+            Err(_) => {
+                return Err(Error::uncertain(
                     "Stellar transport is uncertain; recover the original request ID with status",
-                )
-            })?;
+                ));
+            }
+        };
         if !(200..300).contains(&response.status) {
             return Err(refusal(response.status, &response.body));
         }
@@ -557,7 +574,7 @@ impl Client {
             && parsed.receipt.is_none();
         parsed.operation.status =
             super::projected_status(&parsed.prepared.config.route, parsed.operation.status);
-        Ok(parsed)
+        Ok(Some(parsed))
     }
     fn validate(
         &self,
@@ -628,13 +645,30 @@ impl Client {
         Ok(())
     }
     fn status(&self, id: &str, record: Option<&Record>) -> Result<Response> {
-        let mut r = self.post(
+        self.status_within(id, record, None)?.ok_or_else(|| {
+            Error::uncertain(
+                "Stellar transport is uncertain; recover the original request ID with status",
+            )
+        })
+    }
+    /// A status read that ends at `deadline`; `None` means that the deadline ended it.
+    fn status_within(
+        &self,
+        id: &str,
+        record: Option<&Record>,
+        deadline: Option<Instant>,
+    ) -> Result<Option<Response>> {
+        let Some(mut r) = self.post_within(
             &self.bundle.endpoints.status,
             json!({"policyId":self.bundle.policy_id,"requestId":id}),
-        )?;
+            deadline,
+        )?
+        else {
+            return Ok(None);
+        };
         self.validate(&r, id, record, true)?;
         self.settle(&mut r, record)?;
-        Ok(r)
+        Ok(Some(r))
     }
     /// Report `failed` for a policy wallet operation that this client proved lapsed, now or in
     /// an earlier query that the journal retains for the same preparation.
@@ -690,9 +724,14 @@ pub fn status(c: &Client, journal: &Store, id: &str, wait: Duration) -> Result<E
             "The journal does not bind this installed Stellar policy",
         ));
     }
-    poll(c, id, old, journal, &name, wait)
+    poll(c, id, old, journal, &name, wait, None)
 }
 /// Prepares, signs and submits one typed request, then polls within `wait`.
+///
+/// `wait` bounds only the polling after the submit answer. Prepare and submit each wait up to
+/// [`ENGINE_TIMEOUT`] for the engine: a submit that stops early leaves its outcome unknown, so
+/// no caller bound ends it. The whole call therefore takes at most two engine timeouts plus
+/// `wait`.
 pub fn exec(
     c: &Client,
     journal: &Store,
@@ -738,7 +777,7 @@ pub fn exec(
         if old.agent_signature.is_some()
             || !matches!(&old.status, None | Some(OperationStatus::Prepared))
         {
-            return poll(c, &id, Some(old), journal, &name, wait);
+            return poll(c, &id, Some(old), journal, &name, wait, None);
         }
         if !same_policy_config(&c.bundle.config, &old.config) {
             return Err(Error::uncertain(
@@ -753,7 +792,7 @@ pub fn exec(
             {
                 Some(response)
             }
-            Ok(_) => return poll(c, &id, Some(old), journal, &name, wait),
+            Ok(_) => return poll(c, &id, Some(old), journal, &name, wait, None),
             Err(error) if error.status == Some(404) && pure_intent => None,
             Err(error) => return Err(error),
         };
@@ -779,6 +818,7 @@ pub fn exec(
     let mut prepared = if let Some(response) = resumed {
         response
     } else {
+        progress::report("Preparing the operation with the Allowit server");
         c.post(
             &c.bundle.endpoints.execute,
             json!({"policyId":policy,"requestId":id,"phase":"prepare","request":request}),
@@ -807,6 +847,7 @@ pub fn exec(
     record.agent_signature = Some(signature.clone());
     record.status = Some(OperationStatus::SubmissionUnknown);
     journal.save(&name, &record).map_err(journal_error)?;
+    progress::report("Submitting the signed operation and waiting for the network");
     let response = c.post(
         &c.bundle.endpoints.execute,
         json!({"policyId":policy,"requestId":id,"phase":"submit","agentSignature":signature}),
@@ -814,10 +855,11 @@ pub fn exec(
     c.validate(&response, &id, Some(&record), false)?;
     record.status = Some(response.operation.status.clone());
     journal.save(&name, &record).map_err(journal_error)?;
+    let submitted = render(&response)?;
     if terminal(&response.operation.status) || wait.is_zero() {
-        return Ok(render(&response));
+        return Ok(submitted);
     }
-    poll(c, &id, Some(record), journal, &name, wait)
+    poll(c, &id, Some(record), journal, &name, wait, Some(submitted))
 }
 fn validate_wait_and_id(id: &str, wait: Duration) -> Result<()> {
     if !crate::host::request::request_id_valid(id) {
@@ -833,6 +875,9 @@ fn validate_wait_and_id(id: &str, wait: Duration) -> Result<()> {
 fn terminal(status: &OperationStatus) -> bool {
     matches!(status, OperationStatus::Confirmed | OperationStatus::Failed)
 }
+/// Read the status until it is terminal or `wait` ends. `last` is the outcome that the caller
+/// already holds. Without one, the first read is not bounded, because the caller needs one
+/// answer; every later read ends at the deadline and returns the last outcome.
 fn poll(
     c: &Client,
     id: &str,
@@ -840,19 +885,31 @@ fn poll(
     journal: &Store,
     name: &str,
     wait: Duration,
+    mut last: Option<ExecutionOutcome>,
 ) -> Result<ExecutionOutcome> {
-    let deadline = std::time::Instant::now()
+    let deadline = Instant::now()
         .checked_add(wait)
         .ok_or_else(|| Error::usage("The Stellar polling deadline is too large"))?;
+    let mut reads = 0u32;
     loop {
-        let r = c.status(id, record.as_ref())?;
+        if reads == 1 {
+            progress::report("Waiting for the operation to settle");
+        }
+        reads += 1;
+        let bound = last.is_some().then_some(deadline);
+        let Some(r) = c.status_within(id, record.as_ref(), bound)? else {
+            return Ok(last.expect("a bounded status read follows an earlier outcome"));
+        };
         let old = journaled(c, id, record, &r);
         journal.save(name, &old).map_err(journal_error)?;
         record = Some(old);
-        if terminal(&r.operation.status) || std::time::Instant::now() >= deadline {
-            return Ok(render(&r));
+        let outcome = render(&r)?;
+        let left = deadline.saturating_duration_since(Instant::now());
+        if terminal(&r.operation.status) || left.is_zero() {
+            return Ok(outcome);
         }
-        std::thread::sleep(Duration::from_secs(1));
+        last = Some(outcome);
+        std::thread::sleep(left.min(Duration::from_secs(1)));
     }
 }
 /// The journal record after status `r` for request `id`.
@@ -884,13 +941,26 @@ pub struct ExecutionOutcome {
     pub request_id: String,
     pub status: OperationStatus,
     pub transaction_hash: String,
+    /// The ledger of the verified receipt and the fee that it charged, in stroops.
+    pub settlement: Option<(u32, u64)>,
 }
-fn render(r: &Response) -> ExecutionOutcome {
-    ExecutionOutcome {
+fn render(r: &Response) -> Result<ExecutionOutcome> {
+    let settlement = r
+        .receipt
+        .as_ref()
+        .map(|receipt| {
+            let result: stellar_xdr::TransactionResult = checked(sdk::read(&receipt.result_xdr))?;
+            let fee = u64::try_from(result.fee_charged)
+                .map_err(|_| Error::uncertain("Invalid Stellar receipt fee"))?;
+            Ok((receipt.ledger, fee))
+        })
+        .transpose()?;
+    Ok(ExecutionOutcome {
         request_id: r.operation.id.clone(),
         status: r.operation.status.clone(),
         transaction_hash: r.operation.transaction_hash.clone(),
-    }
+        settlement,
+    })
 }
 
 pub fn verify_native_members(account: &sdk::AccountState, c: &WalletConfig) -> Result<()> {
@@ -1507,6 +1577,62 @@ mod native_revalidation_tests {
             None,
         )
         .unwrap()
+    }
+    #[test]
+    fn a_status_read_ends_at_its_deadline_and_a_call_without_one_does_not() {
+        let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
+        let body = serde_json::to_vec(&json!({"prepared":p,"operation":{"id":"bounded-001","status":OperationStatus::Prepared,"transactionHash":sdk::hex(&p.transaction_hash)}})).unwrap();
+        let request = || json!({"policyId":"engine-policy","requestId":"bounded-001"});
+        let path = "/api/native/execute/status";
+        // The engine answers after 3 s. A 300 ms deadline ends the read with no answer.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = reply_once(listener, Duration::from_secs(3), "200 OK", body.clone());
+        let client = engine_client(p.config.clone(), &origin);
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(300);
+        let bounded = client.post_within(path, request(), Some(deadline)).unwrap();
+        assert!(bounded.is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        server.join().unwrap();
+        // A refusal before the deadline is still an error, never a silent timeout.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = reply_once(
+            listener,
+            Duration::ZERO,
+            "500 Internal Server Error",
+            b"{}".to_vec(),
+        );
+        let client = engine_client(p.config.clone(), &origin);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        assert!(client.post_within(path, request(), Some(deadline)).is_err());
+        server.join().unwrap();
+        // An expired deadline sends nothing.
+        let client = engine_client(p.config.clone(), "http://127.0.0.1:9");
+        let past = Instant::now() - Duration::from_millis(1);
+        assert!(
+            client
+                .post_within(path, request(), Some(past))
+                .unwrap()
+                .is_none()
+        );
+        // An answer inside the deadline arrives.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = reply_once(listener, Duration::ZERO, "200 OK", body);
+        let client = engine_client(p.config.clone(), &origin);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let answered = client
+            .post_within(path, request(), Some(deadline))
+            .unwrap()
+            .unwrap();
+        assert_eq!(answered.prepared, p);
+        server.join().unwrap();
     }
     #[test]
     fn slow_engine_replies_arrive_for_prepare_submit_and_status() {

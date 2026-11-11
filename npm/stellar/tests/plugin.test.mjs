@@ -104,3 +104,41 @@ test('the asset contract equals the Stellar SDK Asset.contractId for native and 
   assert.notEqual(stellarAssetContract('XLM', issuer, Networks.TESTNET), stellarAssetContract('XLM', null, Networks.TESTNET));
   assert.throws(() => stellarAssetContract('USDC', null, Networks.TESTNET), /invalid/);
 });
+
+test('wallet kinds, the bound kind and asset units come from the plugin', () => {
+  assert.deepEqual(plugin.walletKinds('stellar:testnet'), ['native', 'simple', 'standard', 'custom']);
+  assert.deepEqual(plugin.walletKinds('other:testnet'), []);
+  // The engine stores the binding as route and tier; `common` is the tier of the `standard` kind.
+  const policy = (route, tier) => ({id: 'p', runtime: {instanceBinding: {route, ...(tier ? {tier} : {})}}});
+  assert.equal(plugin.walletKind(policy('native')), 'native');
+  assert.equal(plugin.walletKind(policy('policyWallet', 'simple')), 'simple');
+  assert.equal(plugin.walletKind(policy('policyWallet', 'common')), 'standard');
+  assert.equal(plugin.walletKind(policy('policyWallet', 'custom')), 'custom');
+  assert.equal(plugin.walletKind({route: 'policyWallet', config: {route: 'policyWallet', tier: 'common'}}), 'standard');
+  assert.equal(plugin.walletKind({route: 'native', tier: null}), 'native');
+  for (const none of [policy('policyWallet'), policy('policyWallet', 'standard'), policy('native', 'simple'), policy('odc'), {}, null, 'common'])
+    assert.equal(plugin.walletKind(none), null);
+
+  const xlm = {symbol: 'XLM', decimals: 7, name: 'Lumens', native: true};
+  for (const network of ['stellar:testnet', 'stellar:mainnet']) {
+    assert.deepEqual(plugin.nativeAsset(network), xlm);
+    assert.deepEqual(plugin.assetDisplay(network, 'native'), xlm);
+    assert.deepEqual(plugin.assetDisplay(network, 'XLM'), xlm);
+    const [native, usdc] = plugin.assets(network);
+    assert.deepEqual(plugin.assetDisplay(network, native.id), xlm);
+    assert.deepEqual(plugin.assetDisplay(network, usdc.id), {symbol: 'USDC', decimals: 7, name: 'USD Coin', native: false});
+    assert.deepEqual(plugin.assetDisplay(network, 'USDC'), plugin.assetDisplay(network, usdc.id));
+  }
+  const issuer = plugin.test.fixtures.address;
+  assert.deepEqual(plugin.assetDisplay('stellar:testnet', `USDC:${issuer}`)?.name, 'USD Coin');
+  assert.deepEqual(plugin.assetDisplay('stellar:testnet', `EURC:${issuer}`), {symbol: 'EURC', decimals: 7, name: 'EURC', native: false});
+  // No placeholder unit: an unlisted contract, an unknown code and a bad issuer have no display.
+  const unlisted = 'CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ';
+  for (const bad of [unlisted, 'EURC', '', `EURC:${plugin.test.fixtures.invalidAddress}`, 'A:B:C', `TOOLONGASSETCODE:${issuer}`])
+    assert.equal(plugin.assetDisplay('stellar:testnet', bad), null, bad);
+  assert.equal(plugin.nativeAsset('other:testnet'), null);
+  assert.equal(plugin.assetDisplay('other:testnet', 'XLM'), null);
+  assert.equal(plugin.review.fragment, '#adk-proposal-v1=');
+  assert.equal(typeof plugin.review.parseLink, 'function');
+  assert.equal(typeof plugin.ownerWorkflow.installAndFund, 'function');
+});
