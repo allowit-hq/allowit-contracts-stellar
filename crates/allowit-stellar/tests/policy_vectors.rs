@@ -59,3 +59,35 @@ fn owner_builders_reject_sources_the_python_gate_rejects() {
         }
     }
 }
+
+/// `fixtures/policy-source-cases.json` records the verdict of the Core Python gate
+/// (`scripts/policy_source.py` at Core `22aa2b6`) for each source of this repository's earlier
+/// gate tests: rebinding `allowit`, a file that is not self-contained, code that diverges between
+/// backends, pointer-width, layout, closure and function-value probes, macro placeholders,
+/// param and arg reads outside their context fields, and prefix derivation through comments and
+/// literals. The Rust gate that owner builders and the admin binary use gives the same verdict,
+/// prefix and state-write flag.
+#[test]
+fn source_gate_matches_the_recorded_policy_source_cases() {
+    use allowit_stellar::policy::source_shape;
+    let cases = vectors(include_str!("fixtures/policy-source-cases.json"));
+    assert_eq!(cases.len(), 393);
+    let (mut accepted, mut writers) = (0, 0);
+    for case in &cases {
+        let source = case["source"].as_str().unwrap();
+        match (case["accepted"].as_bool().unwrap(), source_shape(source)) {
+            (true, Ok(shape)) => {
+                let prefix: Vec<String> = serde_json::from_value(case["prefix"].clone()).unwrap();
+                assert_eq!(shape.prefix, prefix, "{source}");
+                assert_eq!(case["writes_state"], shape.writes_state, "{source}");
+                accepted += 1;
+                writers += usize::from(shape.writes_state);
+            }
+            (false, Err(_)) => {}
+            (true, Err(error)) => panic!("Python accepts, Rust rejects: {error}: {source}"),
+            (false, Ok(_)) => panic!("Python rejects, Rust accepts: {source}"),
+        }
+    }
+    assert_eq!(accepted, 36);
+    assert!(writers > 0);
+}

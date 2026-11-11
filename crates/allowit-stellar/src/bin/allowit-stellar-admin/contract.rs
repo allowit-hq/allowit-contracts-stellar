@@ -337,21 +337,10 @@ fn rustc(args: &[&std::ffi::OsStr], what: &str) -> Result<()> {
     }
     Ok(())
 }
-/// Compile authored policy source as the offchain server does: as a module of a `no_std` crate
-/// whose only dependency is `allowit` with only the `std` feature, with overflow checks on. It
-/// fails when the source imports another crate, calls a rail SDK method, orders addresses or
-/// uses a host-only `std` prelude item.
-pub fn host_compile(path: &str) -> Result<()> {
+/// The portable `allowit` library with only the `std` feature, compiled into `out`.
+pub fn host_allowit(out: &Path) -> Result<PathBuf> {
     let portable = core_portable()?;
-    let source = Path::new(path)
-        .canonicalize()
-        .map_err(|_| "Cannot read the policy source")?;
-    let source = source.to_str().ok_or("Policy source path is not UTF-8")?;
-    if source.contains("\"#") || source.contains('\n') {
-        return Err("Policy source path cannot be named in a Rust raw string".into());
-    }
-    let out = Scratch::new()?;
-    let lib = out.0.join("liballowit.rlib");
+    let lib = out.join("liballowit.rlib");
     let os = std::ffi::OsStr::new;
     rustc(
         &[
@@ -365,7 +354,22 @@ pub fn host_compile(path: &str) -> Result<()> {
         ],
         "allowit std backend",
     )?;
-    let host = out.0.join("policy_host.rs");
+    Ok(lib)
+}
+/// Compile authored policy source against `lib` as the offchain server does: as a module of a
+/// `no_std` crate whose only dependency is `allowit` with only the `std` feature, with overflow
+/// checks on. It fails when the source imports another crate, calls a rail SDK method, orders
+/// addresses or uses a host-only `std` prelude item.
+pub fn compile_policy(lib: &Path, out: &Path, path: &str) -> Result<()> {
+    let source = Path::new(path)
+        .canonicalize()
+        .map_err(|_| "Cannot read the policy source")?;
+    let source = source.to_str().ok_or("Policy source path is not UTF-8")?;
+    if source.contains("\"#") || source.contains('\n') {
+        return Err("Policy source path cannot be named in a Rust raw string".into());
+    }
+    let os = std::ffi::OsStr::new;
+    let host = out.join("policy_host.rs");
     std::fs::write(
         &host,
         format!(
@@ -374,7 +378,7 @@ pub fn host_compile(path: &str) -> Result<()> {
     )
     .map_err(|_| "Cannot write the policy host crate")?;
     let mut external = std::ffi::OsString::from("allowit=");
-    external.push(&lib);
+    external.push(lib);
     rustc(
         &[
             os("--crate-type=rlib"),
@@ -383,10 +387,16 @@ pub fn host_compile(path: &str) -> Result<()> {
             &external,
             host.as_os_str(),
             os("-o"),
-            out.0.join("libpolicy_host.rlib").as_os_str(),
+            out.join("libpolicy_host.rlib").as_os_str(),
         ],
         "policy",
     )
+}
+/// The std-only compile of one policy source file in a private directory.
+pub fn host_compile(path: &str) -> Result<()> {
+    let out = Scratch::new()?;
+    let lib = host_allowit(&out.0)?;
+    compile_policy(&lib, &out.0, path)
 }
 
 /// Bind an owner packet to its authored source. Every tier requires one self-contained file that

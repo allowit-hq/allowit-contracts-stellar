@@ -186,13 +186,6 @@ def wallet_code(wasm_hash, path):
         raise ValueError("New wallet code must declare custody layout {}; recover funds before any layout change".format(WALLET_CONTRACT_VERSION))
 
 
-def wallet_layout(state):
-    """Refuse an owner packet for another stored layout. Recovery does not depend on the layout."""
-    if state.get("contract_version") != WALLET_CONTRACT_VERSION:
-        raise ValueError("Wallet state is not layout version {}; recover its funds or redeploy it".format(WALLET_CONTRACT_VERSION))
-    return state
-
-
 LIMITS = {"payment_limit", "lifetime_spending_limit", "daily_spending_limit", "daily_volume_limit"}
 LISTS = {"destinations", "tokens"}
 # This is the native fixed-tier ABI: the fields validated by the type groups below.
