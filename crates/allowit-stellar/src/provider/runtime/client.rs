@@ -203,6 +203,10 @@ struct Response {
     _explorer: Option<serde::de::IgnoredAny>,
     #[serde(default, rename = "walletKind")]
     _wallet_kind: Option<serde::de::IgnoredAny>,
+    /// Per-payment limits are accepted and not read here: the limits route reports them. See
+    /// [`wallet_limits`].
+    #[serde(default, rename = "paymentLimits")]
+    _payment_limits: Option<serde::de::IgnoredAny>,
     /// The engine reported this policy wallet operation `failed` without a chain receipt: it
     /// released the operation. The status stays `submissionUnknown` until the client proves
     /// the release itself.
@@ -419,11 +423,27 @@ fn plain(text: &str) -> Option<String> {
     let text = text.trim().trim_end_matches('.');
     (!text.is_empty()).then(|| text.to_owned())
 }
-/// Whether `error` is an engine reply that neither resolved nor typed the operation: a 409
-/// without a stable code. The engine sends it, for example, while the receipt of a settled
-/// transaction is not yet readable, so the status of the same request ID can still resolve.
+/// The engine code of a read that could not resolve the operation now.
+const OPERATION_UNRESOLVED: &str = "operation_unresolved";
+/// The engine code of an open operation that another request changed during the read.
+const OPERATION_CHANGED: &str = "operation_changed";
+/// The engine code of a preparation or submission that the engine refused.
+const OPERATION_REFUSED: &str = "operation_refused";
+/// Whether `error` is an engine reply that left the operation open for another read of the same
+/// request ID: a 409 `operation_unresolved` or `operation_changed`, or, from an engine that does
+/// not type its conflicts, a 409 without a stable code. The engine sends it, for example, while
+/// the receipt of a settled transaction is not yet readable, so the status can still resolve.
 fn unresolved(error: &Error) -> bool {
-    error.status == Some(409) && error.api_code.is_none() && error.message.contains(UNRESOLVED)
+    error.status == Some(409)
+        && match error.api_code.as_deref() {
+            Some(code) => matches!(code, OPERATION_UNRESOLVED | OPERATION_CHANGED),
+            None => error.message.contains(UNRESOLVED),
+        }
+}
+/// Whether `error` is the engine's refusal of a preparation or submission: a 409
+/// `operation_refused`.
+fn engine_refused(error: &Error) -> bool {
+    error.status == Some(409) && error.api_code.as_deref() == Some(OPERATION_REFUSED)
 }
 /// The unresolved reply `error` as an uncertain outcome: the caller reads the same request ID
 /// again with status.
@@ -432,6 +452,15 @@ fn uncertain(error: Error) -> Error {
         code: Error::uncertain("").code,
         ..error
     }
+}
+/// What one engine call returned.
+enum Sent {
+    /// The HTTP status and the body.
+    Reply(u16, Vec<u8>),
+    /// The deadline of the call ended it before an answer arrived.
+    Deadline,
+    /// No answer arrived: the transport failed.
+    Unanswered,
 }
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -443,8 +472,9 @@ struct RefusalDetails {
 /// The client error for a non-2xx engine reply. A 409 `policy_denied` names the denying rule
 /// and error and uses the policy-denial exit code. A 409 `wallet_rejected` is a contract
 /// rejection: the wallet, its asset or a vault refused the operation, and it names the contract
-/// error. Every other reply leaves the operation unresolved: its message keeps the engine's
-/// message, and the error keeps the engine's stable code when the reply has one.
+/// error. A 409 `operation_refused` is the engine's refusal with the engine's message. Every
+/// other reply leaves the operation unresolved: its message keeps the engine's message, and the
+/// error keeps the engine's stable code when the reply has one.
 fn refusal(status: u16, body: &[u8]) -> Error {
     let refusal = serde_json::from_slice::<Refusal>(body).unwrap_or_default();
     // The engine got no answer from the rail network. The request ID stays valid for a retry.
@@ -457,11 +487,7 @@ fn refusal(status: u16, body: &[u8]) -> Error {
         return error;
     }
     // Engine names reach the terminal only as plain identifiers.
-    let name = |v: &Option<String>| {
-        v.clone().filter(|v| {
-            (1..=64).contains(&v.len()) && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        })
-    };
+    let name = |v: &Option<String>| v.clone().filter(|v| identifier(v).is_some());
     let Refusal {
         code,
         error: reason,
@@ -496,6 +522,14 @@ fn refusal(status: u16, body: &[u8]) -> Error {
                 (_, None) => "The operation was rejected in simulation".into(),
             },
         ),
+        OPERATION_REFUSED if status == 409 => Error::refused(
+            status,
+            code,
+            match plain(&reason) {
+                Some(reason) => format!("The server refused this operation: {reason}"),
+                None => "The server refused this operation".into(),
+            },
+        ),
         _ => {
             let message = match plain(&reason) {
                 Some(reason) => {
@@ -509,6 +543,32 @@ fn refusal(status: u16, body: &[u8]) -> Error {
             }
         }
     }
+}
+/// The client error for a non-2xx reply of the limits route. The read changed nothing and names
+/// no operation, so the message is the engine's own, and the error keeps the engine's stable
+/// code, such as `params_differ_from_wallet` or `operation_unresolved`.
+fn limits_refusal(status: u16, body: &[u8]) -> Error {
+    let refusal = serde_json::from_slice::<Refusal>(body).unwrap_or_default();
+    if matches!(status, 503 | 504) && refusal.code == "network_unavailable" {
+        let mut error = Error::api(status, "network unavailable; read the limits again");
+        error.code = crate::provider::NETWORK_UNAVAILABLE;
+        return error;
+    }
+    let message = match plain(&refusal.error) {
+        Some(reason) => format!("The server did not report the limits: {reason}"),
+        None => "The server did not report the limits".into(),
+    };
+    match identifier(&refusal.code) {
+        Some(code) => Error::refused(status, code, message),
+        None => Error::api(status, message),
+    }
+}
+/// An engine name as a plain identifier: 1 to 64 ASCII letters, digits or underscores. Engine
+/// names reach the terminal only through this function.
+fn identifier(name: &str) -> Option<&str> {
+    ((1..=64).contains(&name.len())
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+    .then_some(name)
 }
 fn validate_response_receipt(r: &Response) -> Result<()> {
     let p = &r.prepared;
@@ -602,6 +662,37 @@ impl Client {
         body: serde_json::Value,
         deadline: Option<Instant>,
     ) -> Result<Option<Response>> {
+        let (status, body) = match self.send(path, REPORTS, body, deadline)? {
+            Sent::Reply(status, body) => (status, body),
+            Sent::Deadline => return Ok(None),
+            Sent::Unanswered => {
+                return Err(Error::uncertain(
+                    "Stellar transport is uncertain; recover the original request ID with status",
+                ));
+            }
+        };
+        if !(200..300).contains(&status) {
+            return Err(refusal(status, &body));
+        }
+        let mut parsed: Response = serde_json::from_slice(&body).map_err(|_| {
+            Error::uncertain("Invalid Stellar response; recover the original request ID")
+        })?;
+        parsed.released = parsed.prepared.config.route == WalletRoute::PolicyWallet
+            && parsed.operation.status == OperationStatus::Failed
+            && parsed.receipt.is_none();
+        parsed.operation.status =
+            super::projected_status(&parsed.prepared.config.route, parsed.operation.status);
+        Ok(Some(parsed))
+    }
+    /// Send one request with the agent proof of exactly `path` and `body`. `query` is outside
+    /// the proof.
+    fn send(
+        &self,
+        path: &str,
+        query: &str,
+        body: serde_json::Value,
+        deadline: Option<Instant>,
+    ) -> Result<Sent> {
         let issued_at = clock()?;
         let canonical = serde_json_canonicalizer::to_vec(&body)
             .map_err(|_| Error::config("Cannot encode Stellar request"))?;
@@ -622,33 +713,50 @@ impl Client {
         let response = self.http.send(
             Request {
                 method: Method::Post,
-                url: &format!("{}{path}{REPORTS}", self.origin),
+                url: &format!("{}{path}{query}", self.origin),
                 headers: &headers,
                 body: Some(&bytes),
             },
             deadline,
         );
-        let response = match response {
-            Ok(response) => response,
-            Err(_) if deadline.is_some_and(|end| Instant::now() >= end) => return Ok(None),
-            Err(_) => {
+        Ok(match response {
+            Ok(response) => Sent::Reply(response.status, response.body),
+            Err(_) if deadline.is_some_and(|end| Instant::now() >= end) => Sent::Deadline,
+            Err(_) => Sent::Unanswered,
+        })
+    }
+    /// The limits of this client's wallet from the engine's limits route. The read names only
+    /// the policy, so a wallet that has executed nothing reads its limits. `None` means that the
+    /// engine has no such route (404): the caller reads the status of a retained operation.
+    fn limits_read(&self) -> Result<Option<WalletLimits>> {
+        let body = json!({"policyId":self.bundle.policy_id});
+        let (status, body) = match self.send(LIMITS_PATH, "", body, None)? {
+            Sent::Reply(status, body) => (status, body),
+            Sent::Deadline | Sent::Unanswered => {
                 return Err(Error::uncertain(
-                    "Stellar transport is uncertain; recover the original request ID with status",
+                    "The server did not answer the limits read",
                 ));
             }
         };
-        if !(200..300).contains(&response.status) {
-            return Err(refusal(response.status, &response.body));
+        if status == 404 {
+            return Ok(None);
         }
-        let mut parsed: Response = serde_json::from_slice(&response.body).map_err(|_| {
-            Error::uncertain("Invalid Stellar response; recover the original request ID")
-        })?;
-        parsed.released = parsed.prepared.config.route == WalletRoute::PolicyWallet
-            && parsed.operation.status == OperationStatus::Failed
-            && parsed.receipt.is_none();
-        parsed.operation.status =
-            super::projected_status(&parsed.prepared.config.route, parsed.operation.status);
-        Ok(Some(parsed))
+        if !(200..300).contains(&status) {
+            return Err(limits_refusal(status, &body));
+        }
+        // The reply is a JSON object. Its other fields, such as the wallet kind, are not read:
+        // the profile binds the kind.
+        let reply: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&body)
+            .map_err(|_| Error::uncertain("Invalid Stellar limits response"))?;
+        let installed = installed_display(&self.bundle.config);
+        Ok(Some(WalletLimits {
+            limits: reply
+                .get("limits")
+                .and_then(|value| reported_limits(value, installed.as_ref()?)),
+            payment_limits: reply
+                .get("paymentLimits")
+                .and_then(|value| reported_payment_limits(value, installed.as_ref()?)),
+        }))
     }
     fn validate(
         &self,
@@ -930,8 +1038,9 @@ pub fn exec(
     ) {
         Ok(response) => response,
         // The engine received the signature and did not resolve the operation in this call, so
-        // only the status of the same request ID can tell what happened to it.
-        Err(error) if unresolved(&error) => {
+        // only the status of the same request ID can tell what happened to it. That also holds
+        // for a refused submission: the status proves that the engine sent nothing.
+        Err(error) if unresolved(&error) || engine_refused(&error) => {
             if wait.is_zero() {
                 return Err(uncertain(error));
             }
@@ -1193,10 +1302,7 @@ fn reported_limits(
     entries
         .iter()
         .map(|entry| {
-            let param = entry["param"].as_str().filter(|v| {
-                (1..=64).contains(&v.len())
-                    && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-            })?;
+            let param = entry["param"].as_str().and_then(identifier)?;
             Some(LimitReport {
                 param: param.into(),
                 limit: reported(&entry["limit"], installed)?,
@@ -1207,11 +1313,76 @@ fn reported_limits(
         .collect()
 }
 
-/// The spending limits of the client's wallet. The engine reports them with the status of an
-/// operation, so this reads the status of the newest operation that the journal retains for
-/// this policy and service. `None` means that the journal retains no such operation or that the
-/// engine sent no report.
+/// The agent route of a policy's limits. It is not part of a wallet profile: every engine that
+/// has the route serves it at this path.
+const LIMITS_PATH: &str = "/api/native/limits";
+
+/// A limit on the amount of one operation, such as `payment_limit`. The policy checks it
+/// against each request, so it keeps no counter and has no spent or remaining amount.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaymentLimit {
+    /// The policy param that holds the limit.
+    pub param: String,
+    pub limit: Quantity,
+}
+
+/// The limits of a wallet as the engine reports them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WalletLimits {
+    /// The counted spending limits. `None` means that the engine could not read the counters
+    /// now, or sent no valid report: an unread counter is never reported as unused.
+    pub limits: Option<Vec<LimitReport>>,
+    /// The limits on one operation. `None` means that the engine did not report them.
+    pub payment_limits: Option<Vec<PaymentLimit>>,
+}
+
+/// Engine per-payment limits as display data, with the bounds of [`reported_limits`]: one
+/// invalid entry drops the whole list.
+fn reported_payment_limits(
+    value: &serde_json::Value,
+    installed: &AssetDisplay,
+) -> Option<Vec<PaymentLimit>> {
+    let entries = value
+        .as_array()
+        .filter(|v| v.len() <= MAX_REPORTED_LIMITS)?;
+    entries
+        .iter()
+        .map(|entry| {
+            Some(PaymentLimit {
+                param: entry["param"].as_str().and_then(identifier)?.into(),
+                limit: reported(&entry["limit"], installed)?,
+            })
+        })
+        .collect()
+}
+
+/// The limits of the client's wallet. The engine's limits route reports them without an
+/// operation. An engine without that route reports only the counted limits, with the status of
+/// an operation: the read then takes the status of the newest operation that the journal
+/// retains for this policy and service. `None` means that such an engine has no retained
+/// operation to read.
+pub fn wallet_limits(c: &Client, journal: &Store) -> Result<Option<WalletLimits>> {
+    if let Some(limits) = c.limits_read()? {
+        return Ok(Some(limits));
+    }
+    Ok(retained_limits(c, journal)?.map(|limits| WalletLimits {
+        limits: Some(limits),
+        payment_limits: None,
+    }))
+}
+
+/// The counted spending limits of the client's wallet. See [`wallet_limits`]. `None` means that
+/// the engine reported no counted limits.
 pub fn limits(c: &Client, journal: &Store) -> Result<Option<Vec<LimitReport>>> {
+    Ok(wallet_limits(c, journal)?.and_then(|limits| limits.limits))
+}
+
+/// The limits that the engine reports with the status of the newest operation that the journal
+/// retains for this policy and service. `None` means that the journal retains no such operation
+/// or that the engine sent no report.
+fn retained_limits(c: &Client, journal: &Store) -> Result<Option<Vec<LimitReport>>> {
     let newest = journal
         .entries::<Record>()
         .map_err(journal_error)?
@@ -1976,8 +2147,17 @@ mod native_revalidation_tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let client = engine_client(p.config.clone(), &origin);
-        // A journal without an operation of this policy has no report, and nothing is sent.
+        // An engine without the limits route answers 404. A journal without an operation of
+        // this policy then has no report, and no status is read.
+        let absent = |listener| reply_once(listener, Duration::ZERO, "404 Not Found", vec![]);
+        let server = absent(listener);
         assert_eq!(limits(&client, &journal).unwrap(), None);
+        let (line, body) = server.join().unwrap();
+        assert!(line.starts_with("POST /api/native/limits "), "{line}");
+        assert_eq!(body, json!({"policyId":"engine-policy"}));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let client = engine_client(p.config.clone(), &origin);
         let server = reply_once(
             listener,
             Duration::ZERO,
@@ -2032,15 +2212,33 @@ mod native_revalidation_tests {
         };
         journal.save(&name, &record).unwrap();
         // The operation of another service is not this wallet's report.
-        assert_eq!(limits(&client, &journal).unwrap(), None);
-        let server = reply_once(
-            listener,
-            Duration::ZERO,
-            "200 OK",
-            serde_json::to_vec(&reply).unwrap(),
+        let elsewhere = TcpListener::bind("127.0.0.1:0").unwrap();
+        let foreign = engine_client(
+            p.config.clone(),
+            &format!("http://{}", elsewhere.local_addr().unwrap()),
         );
+        let server = absent(elsewhere);
+        assert_eq!(limits(&foreign, &journal).unwrap(), None);
+        server.join().unwrap();
+        // After the 404 of the limits route, the read takes the status of the retained operation.
+        let server = std::thread::spawn(move || {
+            let reply = serde_json::to_vec(&reply).unwrap();
+            let first = reply_once(
+                listener.try_clone().unwrap(),
+                Duration::ZERO,
+                "404 Not Found",
+                vec![],
+            )
+            .join()
+            .unwrap();
+            let second = reply_once(listener, Duration::ZERO, "200 OK", reply)
+                .join()
+                .unwrap();
+            (first, second)
+        });
         let read = limits(&reader, &journal);
-        let (line, body) = server.join().unwrap();
+        let ((route, _), (line, body)) = server.join().unwrap();
+        assert!(route.starts_with("POST /api/native/limits "), "{route}");
         assert!(
             line.starts_with("POST /api/native/execute/status?include=limits "),
             "{line}"
@@ -2416,7 +2614,7 @@ mod native_revalidation_tests {
         // A hostile code is not an identifier, so it is not kept.
         let hostile = refusal(409, br#"{"code":"a b\n","error":"x"}"#);
         assert_eq!(hostile.api_code, None);
-        // Only a 409 without a stable code is an unresolved reply.
+        // Another status or another stable code is not an unresolved reply.
         assert!(!unresolved(&refusal(500, b"{}")));
         assert!(!unresolved(&refusal(
             409,
@@ -2424,6 +2622,166 @@ mod native_revalidation_tests {
         )));
         assert!(!unresolved(&refusal(409, br#"{"code":"policy_denied"}"#)));
         assert!(!unresolved(&refusal(409, br#"{"code":"wallet_rejected"}"#)));
+    }
+    #[test]
+    fn typed_conflicts_are_read_again_and_a_typed_refusal_keeps_the_engine_message() {
+        let typed = |code: &str| {
+            json!({"error":"The server could not resolve this operation now. Retry with the same request ID.",
+                "code":code,"details":{"retry":"same_request_id"}})
+        };
+        for code in [OPERATION_UNRESOLVED, OPERATION_CHANGED] {
+            let error = refusal(409, &serde_json::to_vec(&typed(code)).unwrap());
+            assert!(unresolved(&error) && !engine_refused(&error), "{code}");
+            assert_eq!(error.api_code.as_deref(), Some(code));
+            // The same code with another status is not a conflict of this operation.
+            assert!(!unresolved(&refusal(
+                500,
+                &serde_json::to_vec(&typed(code)).unwrap()
+            )));
+            // The status read repeats on the typed reply until the operation resolves.
+            let (outcome, reads, saves) = scripted_poll(
+                Duration::from_secs(30),
+                vec![
+                    refused(409, typed(code)),
+                    status_reply(OperationStatus::Confirmed),
+                ],
+            );
+            assert_eq!(outcome.unwrap().status, OperationStatus::Confirmed);
+            assert_eq!((reads, saves), (2, 1));
+            // At the bound, the outcome is uncertain and keeps the engine's code and message.
+            let (outcome, reads, saves) =
+                scripted_poll(Duration::ZERO, vec![refused(409, typed(code))]);
+            let error = outcome.unwrap_err();
+            assert_eq!(
+                (error.code, error.status, error.api_code.as_deref()),
+                (5, Some(409), Some(code))
+            );
+            assert_eq!(
+                error.message,
+                "Allowit returned HTTP 409: Stellar operation was not resolved: The server could not resolve this operation now. Retry with the same request ID; retain the original request ID"
+            );
+            assert_eq!((reads, saves), (1, 0));
+        }
+        // A refusal is not read again by a status poll, and it shows the engine's reason.
+        let body = json!({"error":"The policy is paused\u{1b}[2J.","code":OPERATION_REFUSED});
+        let error = refusal(409, &serde_json::to_vec(&body).unwrap());
+        assert!(engine_refused(&error) && !unresolved(&error));
+        assert_eq!(
+            (error.code, error.api_code.as_deref(), error.message.as_str()),
+            (
+                4,
+                Some(OPERATION_REFUSED),
+                "Allowit returned HTTP 409: The server refused this operation: The policy is paused[2J"
+            )
+        );
+        assert_eq!(
+            refusal(409, br#"{"code":"operation_refused"}"#).message,
+            "Allowit returned HTTP 409: The server refused this operation"
+        );
+        let (outcome, reads, saves) = scripted_poll(Duration::from_secs(30), vec![refused(409, body)]);
+        assert!(engine_refused(&outcome.unwrap_err()));
+        assert_eq!((reads, saves), (1, 0));
+    }
+    #[test]
+    fn the_limits_route_reports_counted_and_per_payment_limits_without_an_operation() {
+        let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
+        let installed = installed_display(&p.config).expect("the fixture asset has a unit");
+        let quantity = |units: i128| json!(Quantity::new(units, installed.clone()));
+        let counted = json!([{"param":"daily_spending_limit","limit":quantity(50_000_000),
+            "spent":quantity(0),"remaining":quantity(50_000_000)}]);
+        let payment = json!([{"param":"payment_limit","limit":quantity(10_000_000)}]);
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Store::open(&dir.path().canonicalize().unwrap().join("journal")).unwrap();
+        // One read of the route: the reply of the stub engine and what the client sent.
+        let read = |status: &'static str, reply: serde_json::Value| {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let client = engine_client(p.config.clone(), &origin);
+            let server = reply_once(
+                listener,
+                Duration::ZERO,
+                status,
+                serde_json::to_vec(&reply).unwrap(),
+            );
+            let limits = wallet_limits(&client, &journal);
+            let (line, body) = server.join().unwrap();
+            // The proof binds the path without a query and the body `{policyId}`.
+            assert!(line.starts_with("POST /api/native/limits "), "{line}");
+            assert_eq!(body, json!({"policyId":"engine-policy"}));
+            limits
+        };
+        // The journal is empty: the wallet has executed nothing, and the route reports both lists.
+        // Fields that this client does not read, such as the wallet kind, are accepted.
+        let both = read(
+            "200 OK",
+            json!({"walletKind":"standard","limits":counted,"paymentLimits":payment,"later":1}),
+        )
+        .unwrap()
+        .unwrap();
+        let reports = both.limits.unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            (reports[0].param.as_str(), reports[0].spent.units.as_str()),
+            ("daily_spending_limit", "0")
+        );
+        assert_eq!(
+            both.payment_limits,
+            Some(vec![PaymentLimit {
+                param: "payment_limit".into(),
+                limit: Quantity::new(10_000_000, installed.clone()),
+            }])
+        );
+        // Counters that the engine could not read are absent, never zero. The per-payment limits
+        // need no counter.
+        let unread = read("200 OK", json!({"paymentLimits":payment})).unwrap().unwrap();
+        assert_eq!(unread.limits, None);
+        assert_eq!(unread.payment_limits.map(|v| v.len()), Some(1));
+        // A policy without limits reports two empty lists.
+        let none = read("200 OK", json!({"limits":[],"paymentLimits":[]})).unwrap().unwrap();
+        assert_eq!((none.limits, none.payment_limits), (Some(vec![]), Some(vec![])));
+        // One entry in another asset or with a hostile name drops its list.
+        let other = AssetDisplay {
+            symbol: "EVIL".into(),
+            ..installed.clone()
+        };
+        let evil = json!([{"param":"payment_limit","limit":Quantity::new(1, other)}]);
+        let hostile = json!([{"param":"payment limit\n","limit":quantity(1)}]);
+        for list in [evil, hostile] {
+            let read = read("200 OK", json!({"limits":counted,"paymentLimits":list})).unwrap().unwrap();
+            assert_eq!(read.payment_limits, None);
+            assert_eq!(read.limits.map(|v| v.len()), Some(1));
+        }
+        // A wallet that enforces other params reports no limit: the code and the message show.
+        let differ = read(
+            "409 Conflict",
+            json!({"error":"The policy wallet's live params differ from the params its policy shows.",
+                "code":"params_differ_from_wallet"}),
+        )
+        .unwrap_err();
+        assert_eq!(
+            (differ.status, differ.api_code.as_deref(), differ.message.as_str()),
+            (
+                Some(409),
+                Some("params_differ_from_wallet"),
+                "Allowit returned HTTP 409: The server did not report the limits: The policy wallet's live params differ from the params its policy shows"
+            )
+        );
+        let unresolved = read(
+            "409 Conflict",
+            json!({"error":"Busy.","code":OPERATION_UNRESOLVED,"details":{"retry":"same_request_id"}}),
+        )
+        .unwrap_err();
+        assert_eq!(unresolved.api_code.as_deref(), Some(OPERATION_UNRESOLVED));
+        // Another agent's proof is refused with the authentication exit code.
+        let denied = read("401 Unauthorized", json!({"error":"Invalid or expired request signature."})).unwrap_err();
+        assert_eq!((denied.code, denied.api_code), (3, None));
+        // A reply that is not the limits document is not a report.
+        assert_eq!(
+            read("200 OK", json!([])).unwrap_err().message,
+            "Invalid Stellar limits response"
+        );
+        // An engine without the route answers 404: the journal holds no operation to read.
+        assert_eq!(read("404 Not Found", json!({})).unwrap(), None);
     }
     /// A loopback Stellar RPC that answers each JSON-RPC call with `answer(method, params)`
     /// until `stop` is set, and returns the methods it served.

@@ -97,12 +97,27 @@ adds `feeCharged` and `limits` to its reply, and the client copies them to the o
 fee that the spending limits count, and each entry of `limits` is `{param, limit, spent, remaining}`. Each amount is a
 quantity `{units, asset, text}` of the installed asset. These values are engine statements without a chain proof. The
 client accepts only quantities of the installed asset, builds their text itself and drops a report with an invalid
-entry. `ExecutionProvider::limits` reads the limits of a wallet through the status of the newest operation that the
-journal retains for its policy; a wallet without a retained operation has no report.
+entry.
+
+`ExecutionProvider::limits` reads the counted limits of a wallet from `POST /api/native/limits`. The body is
+`{"policyId"}` and the request proof binds that path and body, so a wallet without an operation reads its limits.
+`provider::execution::wallet_limits` returns the same read as `WalletLimits`: `limits`, and `payment_limits` with one
+`{param, limit}` entry for each limit on one operation, such as `payment_limit`. Such a limit keeps no counter. A
+list that the engine omits is `None`: a counter that the engine could not read is never shown as unused. A refusal of
+the route keeps the engine's code and message, for example 409 `params_differ_from_wallet`. An engine without the
+route answers 404; the client then reads the status of the newest operation that the journal retains for the policy,
+and a wallet without a retained operation has no report.
+
+A 409 `operation_unresolved` or `operation_changed` leaves the operation open: a status poll reads the same request ID
+again until the wait ends, then returns exit code 5 with the engine's code and message. A 409 `operation_refused` is
+the engine's refusal of a preparation or submission, with the engine's message. After a refused submission the client
+reads the status within the wait, because only the status proves that the engine sent nothing. A 409 without a code,
+from an engine that does not type its conflicts, is read as `operation_unresolved`.
 
 Server replies are read strictly where they hold signed or bound data: `prepared`, `operation`, `signedOperation`
 and `receipt` of an execute reply, the `runtime.instanceBinding` of a policy, a `config`, an owner `step` and a
-public wallet profile refuse an unknown field. Their top-level reply objects accept `walletKind`. A public wallet
+public wallet profile refuse an unknown field. Their top-level reply objects accept `walletKind`, and an execute or
+status reply accepts `paymentLimits`. The reply of the limits route is display data and accepts every other field. A public wallet
 profile accepts a top-level `walletKind` only when it is the kind that its `config` binds.
 
 Generation sends the owner's wallet kind as the top-level `walletKind` of the request and keeps the top-level
