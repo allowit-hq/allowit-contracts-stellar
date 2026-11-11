@@ -25,8 +25,9 @@ returns `native`, `simple`, `standard` or `custom`; the tier `common` is the `st
 `ownerWorkflow.installAndFund` installs and funds the reviewed wallet. One workflow runs per journal key.
 It settles a saved signed step first. `owner_transaction_settled` completes it. On `owner_transaction_expired`
 Horizon decides: a transaction that applied completes the step, proof that it never applied archives its signed
-bytes and lets the owner sign a new step, and an unreadable chain keeps the step. `owner_transaction_pending` and
-`network_unavailable` keep the step for a retry (`OwnerFlowError.retry`).
+bytes and lets the owner sign a new step, and an unreadable chain keeps the step. `owner_transaction_failed` archives the step when Horizon holds that failed transaction. `owner_transaction_pending`
+and `network_unavailable` keep the step for a retry (`OwnerFlowError.retry`). A saved step and the funded marker name
+the policy, agent key and amount; a resume with other inputs is refused.
 
 ## Build and test
 

@@ -38,6 +38,8 @@ export interface InstallAndFundInput {
 export declare const OWNER_TRANSACTION_EXPIRED = "owner_transaction_expired";
 export declare const OWNER_TRANSACTION_PENDING = "owner_transaction_pending";
 export declare const OWNER_TRANSACTION_SETTLED = "owner_transaction_settled";
+/** The transaction is in a ledger and failed. `details.ledger` names that ledger. */
+export declare const OWNER_TRANSACTION_FAILED = "owner_transaction_failed";
 /** HTTP 503 with `details.retry = "same_request_id"`: the service sent nothing. */
 export declare const NETWORK_UNAVAILABLE = "network_unavailable";
 /** An owner workflow failure with the typed server code, when the service sent one. */
@@ -57,8 +59,11 @@ export declare function ownerArchiveKey(key: string, hash: string): string;
  * - `owner_transaction_expired`: the chain decides. When the transaction applied before its time bound, the step is
  *   done. When the chain proves that it never applied, its signed bytes move to the archive key and the owner signs
  *   a new step. When the chain cannot be read, the step stays saved and the error has `retry` set;
+ * - `owner_transaction_failed`: when the chain holds that failed transaction, its signed bytes move to the archive
+ *   key and the owner signs a new step;
  * - `owner_transaction_pending` or `network_unavailable`: the step stays saved and the error has `retry` set.
  * Any other failure keeps the saved step, so no second signature exists while the first can still apply.
+ * A saved step and the funded marker name the policy, agent key and amount. A resume with other inputs is refused.
  * One workflow runs per journal key: a second call in this page or, where the browser has Web Locks, in another tab
  * is refused before it reads the journal.
  */

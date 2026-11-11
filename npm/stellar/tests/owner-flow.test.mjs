@@ -48,7 +48,7 @@ test('the happy path installs, funds and never signs a confirmed funding again',
   assert.deepEqual(result.receipts.map(r => r.action), ['create_wallet', 'fund']);
   assert.deepEqual(signed, ['create_wallet', 'fund']);
   assert.equal(journal.get(key), null);
-  assert.equal(journal.get(`${key}:funded`), 'confirmed');
+  assert.deepEqual(JSON.parse(journal.get(`${key}:funded`)), {policyId, agent, amount});
   assert.deepEqual(calls.find(([path]) => path === 'native/owner/prepare')[1], {policyId, action: 'fund', amount});
   const again = await installAndFund(input);
   assert.deepEqual([again.wallet, again.receipts.length, signed.length], ['CWALLET', 0, 2]);
@@ -102,7 +102,7 @@ test('an expired funding that the chain shows applied is done and is never funde
   const result = await installAndFund({ask, sign: signer(signed), journal, key, policyId, agent, amount, onStep() {}});
   assert.deepEqual(signed, []);
   assert.deepEqual(result.receipts, [{policyId, action: 'fund', status: 'confirmed', transactionHash: txHash, ledger: 77}]);
-  assert.equal(journal.get(`${key}:funded`), 'confirmed');
+  assert.deepEqual(JSON.parse(journal.get(`${key}:funded`)), {policyId, agent, amount});
   assert.equal(calls.some(([path]) => path === 'native/owner/prepare'), false);
 });
 
@@ -159,7 +159,7 @@ test('a saved step that already settled is done without a second signature', asy
   const result = await installAndFund({ask, sign: signer(signed), journal, key, policyId, agent, amount, onStep() {}});
   assert.deepEqual(signed, []);
   assert.deepEqual(result.receipts, [{policyId, action: 'fund', status: 'confirmed', transactionHash: hash(5), ledger: 42}]);
-  assert.equal(journal.get(`${key}:funded`), 'confirmed');
+  assert.deepEqual(JSON.parse(journal.get(`${key}:funded`)), {policyId, agent, amount});
 });
 
 test('pending, unavailable, foreign and untyped replies keep the saved step and sign nothing', async () => {
@@ -189,8 +189,57 @@ test('signed bytes enter the journal before the send, and a wrong receipt or rep
   const signed = [], journal = journalOf();
   const {ask} = service({submit: body => ({...confirmed(body), transactionHash: hash(8)})});
   await assert.rejects(installAndFund({ask, sign: signer(signed), journal, key, policyId, agent, amount, onStep() {}}), /did not confirm/);
-  assert.equal(JSON.parse(journal.get(key)).signedPayload, 'signed-create_wallet-1');
+  assert.deepEqual(JSON.parse(journal.get(key)), {step: {action: 'create_wallet', payload: 'unsigned-create_wallet-1', hash: hash(1), expiresAt: JSON.parse(journal.get(key)).step.expiresAt}, signedPayload: 'signed-create_wallet-1', policyId, agent, amount});
   const other = service({submit: confirmed});
   await assert.rejects(installAndFund({ask: async (path, body) => ({...await other.ask(path, body), policyId: 'other'}), sign: signer([]), journal: journalOf(), key, policyId, agent, amount, onStep() {}}), /different policy/);
   await assert.rejects(installAndFund({ask, sign: signer([]), journal: journalOf({[key]: '{bad'}), key, policyId, agent, amount, onStep() {}}), /unreadable/);
+});
+
+test('a resume with another amount, agent or policy is refused before anything is sent', async () => {
+  const pending = {step: savedStep('fund', 5), signedPayload: 'signed-fund-5', policyId, agent, amount};
+  for (const [entries, changed] of [
+    [{[key]: JSON.stringify(pending)}, {amount: '10'}],
+    [{[key]: JSON.stringify(pending)}, {agent: 'GOTHER'}],
+    [{[key]: JSON.stringify({...pending, amount: undefined})}, {}],
+    [{[`${key}:funded`]: JSON.stringify({policyId, agent, amount})}, {amount: '10'}],
+    [{[`${key}:funded`]: '{bad'}, {}],
+  ]) {
+    const signed = [], journal = journalOf(entries), before = new Map(journal.map);
+    const {ask, calls} = service({submit: confirmed});
+    await assert.rejects(installAndFund({ask, sign: signer(signed), journal, key, policyId, agent, amount, onStep() {}, ...changed}),
+      error => error instanceof OwnerFlowError && /original wallet setup/.test(error.message));
+    assert.deepEqual([signed, calls], [[], []]);
+    assert.deepEqual(journal.map, before);
+  }
+  // A step and a marker saved without inputs predate them; the same inputs resume them.
+  const journal = journalOf({[key]: JSON.stringify({step: savedStep('fund', 5), signedPayload: 'signed-fund-5'}), [`${key}:funded`]: 'confirmed'});
+  const {ask, state} = service({submit: confirmed});
+  state.installed = true;
+  const result = await installAndFund({ask, sign: signer([]), journal, key, policyId, agent, amount, onStep() {}});
+  assert.deepEqual(result.receipts.map(r => r.action), ['fund']);
+});
+
+test('a failed transaction is replaced only when the chain holds that exact failure', async () => {
+  const pending = {step: savedStep('create_wallet', 5), signedPayload: 'signed-create_wallet-5', policyId, agent, amount};
+  const failed = body => {
+    if (body.payload === pending.signedPayload) throw refusal('owner_transaction_failed', {policyId, action: 'create_wallet', transactionHash: hash(5), ledger: 9});
+    return confirmed(body);
+  };
+  const chain = reply => { globalThis.fetch = async () => { if (!reply) throw new Error('offline'); return new Response(JSON.stringify(reply.body), {status: reply.status ?? 200}); }; };
+  for (const unproven of [null, {status: 404, body: {}}, {body: {hash: hash(5), ledger: 9, successful: true}}, {body: {hash: hash(5), ledger: 8, successful: false}}, {body: {hash: hash(6), ledger: 9, successful: false}}]) {
+    chain(unproven);
+    const signed = [], journal = journalOf({[key]: JSON.stringify(pending)});
+    const {ask} = service({submit: failed});
+    await assert.rejects(installAndFund({ask, sign: signer(signed), journal, key, policyId, agent, amount, onStep() {}}),
+      error => error instanceof OwnerFlowError && error.code === 'owner_transaction_failed' && error.retry === false);
+    assert.deepEqual(signed, []);
+    assert.deepEqual(JSON.parse(journal.get(key)), pending);
+  }
+  chain({body: {hash: hash(5), ledger: 9, successful: false}});
+  const signed = [], journal = journalOf({[key]: JSON.stringify(pending)});
+  const {ask} = service({submit: failed});
+  const result = await installAndFund({ask, sign: signer(signed), journal, key, policyId, agent, amount, onStep() {}});
+  assert.deepEqual(signed, ['create_wallet', 'fund']);
+  assert.equal(result.wallet, 'CWALLET');
+  assert.deepEqual(JSON.parse(journal.get(ownerArchiveKey(key, hash(5)))), {step: pending.step, signedPayload: pending.signedPayload});
 });

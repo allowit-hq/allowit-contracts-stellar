@@ -25,6 +25,8 @@ export interface InstallAndFundInput {
 export const OWNER_TRANSACTION_EXPIRED = 'owner_transaction_expired';
 export const OWNER_TRANSACTION_PENDING = 'owner_transaction_pending';
 export const OWNER_TRANSACTION_SETTLED = 'owner_transaction_settled';
+/** The transaction is in a ledger and failed. `details.ledger` names that ledger. */
+export const OWNER_TRANSACTION_FAILED = 'owner_transaction_failed';
 /** HTTP 503 with `details.retry = "same_request_id"`: the service sent nothing. */
 export const NETWORK_UNAVAILABLE = 'network_unavailable';
 
@@ -117,15 +119,53 @@ async function expiredRecord(network: string, step: OwnerStep, signedPayload: st
 const running = new Set<string>();
 const busy = () => new OwnerFlowError('This wallet setup is already running in this or another tab.', null, true);
 
-function saved(journal: OwnerJournal, key: string): {step: OwnerStep; signedPayload: string} | null {
+/** The inputs that a saved step and a funded marker belong to. */
+type Identity = {policyId: string; agent: string; amount: string};
+const changed = () => new OwnerFlowError('Use the agent key and amount from the original wallet setup. The saved signed step stays saved.', null, false);
+/** True when a saved value names these inputs. A value saved without inputs predates them and names none. */
+function sameInputs(value: Record<string, unknown>, identity: Identity): boolean {
+  const named = (['policyId', 'agent', 'amount'] as const).filter(field => value[field] !== undefined);
+  return named.length === 0 || named.length === 3 && named.every(field => value[field] === identity[field]);
+}
+
+function saved(journal: OwnerJournal, key: string, identity: Identity): {step: OwnerStep; signedPayload: string} | null {
   const raw = journal.get(key);
   if (raw === null) return null;
+  let value: unknown;
   try {
-    const value = JSON.parse(raw) as {step?: Prepared['step']; signedPayload?: unknown};
-    const step = stepOf(value?.step);
-    if (step && typeof value.signedPayload === 'string' && value.signedPayload) return {step, signedPayload: value.signedPayload};
+    value = JSON.parse(raw);
   } catch { /* fall through */ }
-  throw new OwnerFlowError('The saved signed step is unreadable. It stays saved; contact support before signing again.', null, false);
+  const step = object(value) ? stepOf(value.step as Prepared['step']) : null;
+  if (!object(value) || !step || typeof value.signedPayload !== 'string' || !value.signedPayload)
+    throw new OwnerFlowError('The saved signed step is unreadable. It stays saved; contact support before signing again.', null, false);
+  if (!sameInputs(value, identity)) throw changed();
+  return {step, signedPayload: value.signedPayload};
+}
+
+/** True when the funding of these inputs is confirmed. A marker of other inputs is refused. */
+function funded(journal: OwnerJournal, fundedKey: string, identity: Identity): boolean {
+  const raw = journal.get(fundedKey);
+  if (raw === null) return false;
+  if (raw === 'confirmed') return true;
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch { /* fall through */ }
+  if (!object(value) || !sameInputs(value, identity)) throw changed();
+  return true;
+}
+
+/** True when Horizon holds this transaction as failed in the ledger that the service named. */
+async function failedOnChain(network: string, step: OwnerStep, ledger: unknown): Promise<boolean> {
+  const base = HORIZON[canonicalNetwork(network) ?? ''];
+  if (!base || !Number.isSafeInteger(ledger)) return false;
+  try {
+    const response = await fetch(`${base}/transactions/${step.hash}`, {headers: {Accept: 'application/json'}});
+    const chain: unknown = response.ok ? await response.json() : null;
+    return object(chain) && chain.hash === step.hash && chain.ledger === ledger && chain.successful === false;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -136,8 +176,11 @@ function saved(journal: OwnerJournal, key: string): {step: OwnerStep; signedPayl
  * - `owner_transaction_expired`: the chain decides. When the transaction applied before its time bound, the step is
  *   done. When the chain proves that it never applied, its signed bytes move to the archive key and the owner signs
  *   a new step. When the chain cannot be read, the step stays saved and the error has `retry` set;
+ * - `owner_transaction_failed`: when the chain holds that failed transaction, its signed bytes move to the archive
+ *   key and the owner signs a new step;
  * - `owner_transaction_pending` or `network_unavailable`: the step stays saved and the error has `retry` set.
  * Any other failure keeps the saved step, so no second signature exists while the first can still apply.
+ * A saved step and the funded marker name the policy, agent key and amount. A resume with other inputs is refused.
  * One workflow runs per journal key: a second call in this page or, where the browser has Web Locks, in another tab
  * is refused before it reads the journal.
  */
@@ -161,9 +204,10 @@ async function run({network, ask, sign, journal, key, policyId, agent, amount, o
   if (!canonicalNetwork(network)) throw new OwnerFlowError('Select a supported Stellar network.', null, false);
   const receipts: OwnerReceipt[] = [];
   const fundedKey = `${key}:funded`;
+  const identity: Identity = {policyId, agent, amount};
   const done = (step: OwnerStep, receipt: OwnerReceipt) => {
     // A confirmed funding is recorded before its signed bytes leave the journal.
-    if (step.action === 'fund') journal.set(fundedKey, 'confirmed');
+    if (step.action === 'fund') journal.set(fundedKey, JSON.stringify(identity));
     journal.remove(key);
     receipts.push(receipt);
   };
@@ -194,6 +238,12 @@ async function run({network, ask, sign, journal, key, policyId, agent, amount, o
         journal.remove(key);
         return false;
       }
+      // A failed transaction used its sequence and can never apply. The chain must hold that exact failure.
+      if (code === OWNER_TRANSACTION_FAILED && same && await failedOnChain(network, step, about.ledger)) {
+        journal.set(ownerArchiveKey(key, step.hash), JSON.stringify({step, signedPayload}));
+        journal.remove(key);
+        return false;
+      }
       if (code === OWNER_TRANSACTION_PENDING)
         throw new OwnerFlowError('The network has not settled the signed step yet. Resume in a moment; do not sign again.', code, true, error);
       if (code === NETWORK_UNAVAILABLE && about.retry === 'same_request_id')
@@ -207,19 +257,21 @@ async function run({network, ask, sign, journal, key, policyId, agent, amount, o
     done(step, receipt);
     return true;
   };
-  const pending = saved(journal, key);
+  const pending = saved(journal, key, identity);
+  // A funded marker of other inputs is refused before anything is sent.
+  funded(journal, fundedKey, identity);
   if (pending) {
     onStep('Checking the saved signed step…');
-    if (!await submit(pending.step, pending.signedPayload)) onStep('The saved step expired. Preparing a new one…');
+    if (!await submit(pending.step, pending.signedPayload)) onStep('The saved step can never apply. Preparing a new one…');
   }
   const signAndSubmit = async (step: OwnerStep) => {
     if (step.expiresAt <= Math.floor(Date.now() / 1000)) throw new OwnerFlowError('The prepared owner step already expired. Resume to prepare a new one.', null, true);
     onStep(`Sign ${step.action.replace(/_/g, ' ')} in your wallet…`);
     const signedPayload = await sign(step);
     if (typeof signedPayload !== 'string' || !signedPayload) throw new OwnerFlowError('Your wallet did not return the signed step.', null, false);
-    journal.set(key, JSON.stringify({step, signedPayload}));
+    journal.set(key, JSON.stringify({step, signedPayload, ...identity}));
     onStep('Waiting for the network to confirm…');
-    if (!await submit(step, signedPayload)) throw new OwnerFlowError('The signed step expired before the network took it. Resume to prepare a new one.', OWNER_TRANSACTION_EXPIRED, true);
+    if (!await submit(step, signedPayload)) throw new OwnerFlowError('The network did not take the signed step. Resume to prepare a new one.', null, true);
   };
   let wallet: string | undefined;
   for (let i = 0; i < 4 && !wallet; i++) {
@@ -234,7 +286,7 @@ async function run({network, ask, sign, journal, key, policyId, agent, amount, o
   }
   if (!wallet) throw new OwnerFlowError('The wallet installation could not be confirmed.', null, true);
   // A confirmed funding is never prepared or signed again, including after a reload or a failed export.
-  if (!journal.get(fundedKey)) {
+  if (!funded(journal, fundedKey, identity)) {
     onStep('Preparing the funding…');
     const funding = await ask<Prepared>('native/owner/prepare', {policyId, action: 'fund', amount});
     const step = stepOf(funding?.step);
