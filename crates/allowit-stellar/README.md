@@ -100,6 +100,11 @@ client accepts only quantities of the installed asset, builds their text itself 
 entry. `ExecutionProvider::limits` reads the limits of a wallet through the status of the newest operation that the
 journal retains for its policy; a wallet without a retained operation has no report.
 
+Server replies are read strictly where they hold signed or bound data: `prepared`, `operation`, `signedOperation`
+and `receipt` of an execute reply, the `runtime.instanceBinding` of a policy, a `config`, an owner `step` and a
+public wallet profile refuse an unknown field. Their top-level reply objects accept `walletKind`. A public wallet
+profile accepts a top-level `walletKind` only when it is the kind that its `config` binds.
+
 Generation sends the owner's wallet kind as the top-level `walletKind` of the request and keeps the top-level
 `walletKind` of the returned policy. A typed refusal such as `wallet_kind_unsupported` keeps its `details`.
 `RailPlugin::draft_params` returns the params and the installed asset of a draft, a policy, a public wallet profile
