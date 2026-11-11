@@ -929,13 +929,14 @@ pub fn exec(
         json!({"policyId":policy,"requestId":id,"phase":"submit","agentSignature":signature}),
     ) {
         Ok(response) => response,
-        // The engine holds the signature and did not resolve the operation in this call, so
+        // The engine received the signature and did not resolve the operation in this call, so
         // only the status of the same request ID can tell what happened to it.
         Err(error) if unresolved(&error) => {
             if wait.is_zero() {
                 return Err(uncertain(error));
             }
-            let outcome = poll(c, &id, Some(record), journal, &name, wait, None)?;
+            let start = Some(Err(error.clone()));
+            let outcome = poll(c, &id, Some(record), journal, &name, wait, start)?;
             // Still only prepared: the engine did not accept the signature, and `error` says why.
             return if outcome.status == OperationStatus::Prepared {
                 Err(error)
@@ -952,7 +953,15 @@ pub fn exec(
     if terminal(&response.operation.status) || wait.is_zero() {
         return Ok(submitted);
     }
-    poll(c, &id, Some(record), journal, &name, wait, Some(submitted))
+    poll(
+        c,
+        &id,
+        Some(record),
+        journal,
+        &name,
+        wait,
+        Some(Ok(submitted)),
+    )
 }
 fn validate_wait_and_id(id: &str, wait: Duration) -> Result<()> {
     if !crate::host::request::request_id_valid(id) {
@@ -968,7 +977,10 @@ fn validate_wait_and_id(id: &str, wait: Duration) -> Result<()> {
 fn terminal(status: &OperationStatus) -> bool {
     matches!(status, OperationStatus::Confirmed | OperationStatus::Failed)
 }
-/// Read the status until it is terminal or `wait` ends. `last` is the outcome that the caller
+/// The engine answer that a poll starts from: the outcome that the caller already holds, or,
+/// as the error, the unresolved reply to its submit call.
+type Answer = Result<ExecutionOutcome>;
+/// Read the status until it is terminal or `wait` ends. `start` is the answer that the caller
 /// already holds. Without one, the first read is not bounded, because the caller needs one
 /// answer; every later engine read ends at the deadline and returns the last outcome. The
 /// deadline covers the engine reads only: the lapse proof of a released operation reads the
@@ -985,14 +997,14 @@ fn poll(
     journal: &Store,
     name: &str,
     wait: Duration,
-    last: Option<ExecutionOutcome>,
+    start: Option<Answer>,
 ) -> Result<ExecutionOutcome> {
     poll_reads(
         c,
         id,
         record,
         wait,
-        last,
+        start,
         &mut |record, bound| c.status_within(id, record, bound),
         &mut |record| journal.save(name, record).map_err(journal_error),
     )
@@ -1005,7 +1017,7 @@ fn poll_reads(
     id: &str,
     mut record: Option<Record>,
     wait: Duration,
-    mut last: Option<ExecutionOutcome>,
+    start: Option<Answer>,
     read: &mut StatusRead<'_>,
     save: &mut dyn FnMut(&Record) -> Result<()>,
 ) -> Result<ExecutionOutcome> {
@@ -1013,8 +1025,12 @@ fn poll_reads(
         .checked_add(wait)
         .ok_or_else(|| Error::usage("The Stellar polling deadline is too large"))?;
     let mut reads = 0u32;
-    // The newest answer, when it left the operation unresolved.
-    let mut open: Option<Error> = None;
+    // The newest outcome, and the newest answer when it left the operation unresolved.
+    let (mut last, mut open) = match start {
+        Some(Ok(outcome)) => (Some(outcome), None),
+        Some(Err(error)) => (None, Some(error)),
+        None => (None, None),
+    };
     loop {
         if reads == 1 {
             progress::report("Waiting for the operation to settle");
@@ -2214,6 +2230,14 @@ mod native_revalidation_tests {
         wait: Duration,
         script: Vec<Reply>,
     ) -> (Result<ExecutionOutcome>, Vec<bool>, usize) {
+        scripted_poll_from(None, wait, script)
+    }
+    /// [`scripted_poll_bounds`] that starts from the answer that the caller holds.
+    fn scripted_poll_from(
+        start: Option<Answer>,
+        wait: Duration,
+        script: Vec<Reply>,
+    ) -> (Result<ExecutionOutcome>, Vec<bool>, usize) {
         let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
         let client = engine_client(p.config.clone(), "http://127.0.0.1:9");
         let (mut reads, mut saves) = (vec![], 0);
@@ -2222,7 +2246,7 @@ mod native_revalidation_tests {
             "unresolved-001",
             None,
             wait,
-            None,
+            start,
             &mut |_, bound| {
                 reads.push(bound.is_some());
                 script[(reads.len() - 1).min(script.len() - 1)]()
@@ -2314,6 +2338,26 @@ mod native_revalidation_tests {
         );
         assert_eq!(outcome.unwrap().status, OperationStatus::Submitted);
         assert_eq!((bounds.as_slice(), saves), (&[false, true, true][..], 1));
+        // Codex P2, second round: the poll after an unresolved submit answer starts from that
+        // answer, so its first read has the deadline too and the answer is the uncertain outcome.
+        let submit = || {
+            let Err(error) = unresolved_reply()() else {
+                unreachable!()
+            };
+            Some(Err(error))
+        };
+        let (outcome, bounds, _) =
+            scripted_poll_from(submit(), Duration::from_secs(30), vec![ended()]);
+        assert_eq!(bounds, [true]);
+        let error = outcome.unwrap_err();
+        assert_eq!((error.code, error.status), (5, Some(409)));
+        let (outcome, bounds, _) = scripted_poll_from(
+            submit(),
+            Duration::from_secs(30),
+            vec![status_reply(OperationStatus::Confirmed)],
+        );
+        assert_eq!(bounds, [true]);
+        assert_eq!(outcome.unwrap().status, OperationStatus::Confirmed);
     }
     #[test]
     fn a_typed_refusal_or_another_error_ends_the_poll_at_once() {
