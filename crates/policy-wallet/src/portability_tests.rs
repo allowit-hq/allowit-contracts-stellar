@@ -79,6 +79,14 @@ fn wallet_error(code: u32) -> u32 {
     }
     AllowitWalletError::from(error) as u32
 }
+/// The contract error of a policy error code in a Custom wallet: a rule denial keeps its own
+/// `AllowitError` code, and every other error is its wallet error.
+fn custom_error(code: u32) -> u32 {
+    match wallet_error(code) {
+        denied if denied == AllowitWalletError::PolicyDenied as u32 => code,
+        other => other,
+    }
+}
 /// The result of `run` inside `contract` as an error code. An abort, such as an unset
 /// `ctx.params[key]`, rolls the frame back and is its `AllowitError` code, as onchain.
 fn stopped<T>(
@@ -622,14 +630,19 @@ fn one_vector_set_has_matching_outcomes_on_host_custom_standard_and_simple() {
         assert_eq!(outcome.common.clone().map(|_| ()), common, "{}", v.name);
         let simple = custom_param.and(next);
         assert_eq!(outcome.simple.clone().map(|_| ()), simple, "{}", v.name);
+        let policy_result = |tier: Tier| match tier {
+            Tier::Custom => outcome.policy.and(next),
+            Tier::Common => outcome.common.clone().map(|_| ()),
+            Tier::Simple => outcome.simple.clone().map(|_| ()),
+            Tier::Catching => outcome.catching_next.clone().map(|_| ()),
+        };
+        // The standard tiers report a rule denial as `PolicyDenied`. A wallet that compiles its
+        // whole policy reports the rule's own code.
         let expected = |tier: Tier| {
-            match tier {
-                Tier::Custom => outcome.policy.and(next),
-                Tier::Common => outcome.common.clone().map(|_| ()),
-                Tier::Simple => outcome.simple.clone().map(|_| ()),
-                Tier::Catching => outcome.catching_next.clone().map(|_| ()),
-            }
-            .map_err(wallet_error)
+            policy_result(tier).map_err(match tier {
+                Tier::Custom | Tier::Catching => custom_error,
+                Tier::Common | Tier::Simple => wallet_error,
+            })
         };
         // A standard evaluation rejects a custom param, denies the catching policy's write and
         // otherwise equals the plain post-flight, which the standard tiers store.
@@ -646,8 +659,14 @@ fn one_vector_set_has_matching_outcomes_on_host_custom_standard_and_simple() {
             || v.tokens.is_none()
             || v.expires_at_param.is_none()
             || v.operations.is_none();
+        // Common and Custom decide alike; only the code of a rule denial differs.
         if !unset && v.invoice_limit.is_none() {
-            assert_eq!(expected(Tier::Common), expected(Tier::Custom), "{}", v.name);
+            assert_eq!(
+                expected(Tier::Common),
+                policy_result(Tier::Custom).map_err(wallet_error),
+                "{}",
+                v.name
+            );
         }
         if outcome.catching.is_ok() && outcome.policy.is_err() {
             caught.push(v.name);
@@ -792,7 +811,8 @@ fn execution_params_reach_custom_policy_are_signed_and_standard_tiers_ignore_the
     custom.seed(&v, false);
     assert_eq!(custom.execute(&custom.request(&v)), Ok(()));
     v.invoice = true;
-    let over_limit = Err(wallet_error(AllowitError::PaymentLimitExceeded as u32));
+    let over_limit = Err(custom_error(AllowitError::PaymentLimitExceeded as u32));
+    assert_eq!(over_limit, Err(102));
     assert_eq!(custom.execute(&custom.request(&v)), over_limit);
     v.invoice_limit = Some(40);
     custom.seed(&v, false);

@@ -415,21 +415,26 @@ fn intercepted_swap_is_denied_by_operations_tokens_limits_and_unknown_routers() 
     for wasm in [COMMON, CUSTOM] {
         let f = Fixture::new(wasm, true);
         let p = pool(&f, 95, 0);
-        let denied = Err(Ok(AllowitWalletError::PolicyDenied));
-        let cases: [(&str, &dyn Fn()); 4] = [
-            ("operations", &|| {
+        use allowit::AllowitError as E;
+        let cases: [(&str, E, &dyn Fn()); 4] = [
+            ("operations", E::OperationNotAllowed, &|| {
                 allow(&f, &[&p.router], &[&p.token], &["transfer", "redeem"])
             }),
-            ("tokens", &|| allow(&f, &[&p.router], &[], &OPS)),
-            ("payment_limit", &|| {
+            ("tokens", E::TokenNotAllowed, &|| {
+                allow(&f, &[&p.router], &[], &OPS)
+            }),
+            ("payment_limit", E::PaymentLimitExceeded, &|| {
                 allow(&f, &[&p.router], &[&p.token], &OPS);
                 set(&f, PAYMENT_LIMIT, Some(AllowitValue::Int(49)));
             }),
-            ("destinations", &|| allow(&f, &[], &[&p.token], &OPS)),
+            ("destinations", E::DestinationNotAllowed, &|| {
+                allow(&f, &[], &[&p.token], &OPS)
+            }),
         ];
-        for (name, configure) in cases {
+        for (name, rule, configure) in cases {
             configure();
             let (e, a) = swap_request(&f, &p, &[&f.asset, &p.token], 50, 47);
+            let denied = denial(wasm, rule);
             assert_eq!(check(&f, &e, &swap_contexts(&f, &p, &a)), denied, "{name}");
             f.env.set_auths(&[swap_entry(&f, &p, &e, &a, 7)]);
             assert!(!router_swap(&f, &p, &a), "{name}");
@@ -825,12 +830,15 @@ fn redeem_is_denied_by_operations_and_unknown_vaults_and_checks_its_tree() {
         let f = Fixture::new(wasm, true);
         let v = vault(&f, 0);
         let contexts = vec![&f.env, call(&f, &v, "redeem", redeem_call(&f, 40))];
+        use allowit::AllowitError as E;
         allow(&f, &[&v], &[], &["transfer", "swap"]);
         let e = redeem_request(&f, &v, 40, 40);
-        assert_eq!(check(&f, &e, &contexts), Err(Ok(W::PolicyDenied)));
+        let operations = denial(wasm, E::OperationNotAllowed);
+        assert_eq!(check(&f, &e, &contexts), operations);
         allow(&f, &[], &[], &OPS);
         let e = redeem_request(&f, &v, 40, 40);
-        assert_eq!(check(&f, &e, &contexts), Err(Ok(W::PolicyDenied)));
+        let destinations = denial(wasm, E::DestinationNotAllowed);
+        assert_eq!(check(&f, &e, &contexts), destinations);
         allow(&f, &[&v], &[], &OPS);
         let e = redeem_request(&f, &v, 40, 40);
         // Another share amount, receiver or function, and an extra node, reject.
