@@ -35,6 +35,8 @@ const USAGE: &str = "usage: allowit-stellar-admin {inspect,verify-wallet,verify-
 [--engine-wasm HEX] [--owner ACCOUNT] [--config JSON] [--contract CONTRACT] [--method METHOD] \
 [--family {wallet,parent}] [--tier {simple,common,custom}] [--policy-source PATH] [--member MEMBER] \
 [--candidate-member MEMBER] [--max-fee STROOPS] [--arguments JSON]";
+const HELP: &str = "Every action reads public state or prints unsigned XDR. No action signs or submits. \
+Pass only public addresses and hashes, never a secret seed. See docs/admin.md.";
 const BAD_ADDRESS: &str = "Expected a public Stellar G address";
 const MAX_RESPONSE_BYTES: usize = 1 << 20;
 
@@ -501,8 +503,26 @@ fn action_of(args: &[String]) -> Option<&str> {
     None
 }
 
+/// True when `-h` or `--help` stands where a flag can stand, not where a flag's value does.
+fn help_requested(args: &[String]) -> bool {
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        if arg == "-h" || arg == "--help" {
+            return true;
+        }
+        if arg.starts_with('-') && arg != "--allow-mainnet" && !arg.contains('=') {
+            rest.next();
+        }
+    }
+    false
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if help_requested(&args) {
+        println!("{USAGE}\n\n{HELP}");
+        return;
+    }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())

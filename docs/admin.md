@@ -10,7 +10,7 @@ ADMIN_BIN=crates/allowit-stellar/target/release/allowit-stellar-admin
 cargo test --locked --manifest-path crates/allowit-stellar/Cargo.toml --bin allowit-stellar-admin
 ```
 
-The native actions are `inspect`, `verify-wallet`, `verify-admin`, `setup-wallet`, `shutdown-wallet` and `setup-admin`. The contract actions are `upload`, `deploy-parent`, `deploy-wallet`, `read` and `admin`. A preparing action prints unsigned base64 XDR on standard output. A refusal prints one line on standard error and exits with status 1; a usage error exits with status 2. An address error never repeats its input. Run the binary from this checkout: the owner-packet compile reads the locked Core sources through `cargo metadata`.
+The native actions are `inspect`, `verify-wallet`, `verify-admin`, `setup-wallet`, `shutdown-wallet` and `setup-admin`. The contract actions are `upload`, `deploy-parent`, `deploy-wallet`, `read` and `admin`. A preparing action prints unsigned base64 XDR on standard output. A refusal prints one line on standard error and exits with status 1; a usage error exits with status 2. An address error never repeats its input. `--help` prints the usage. Run the binary from this checkout: the owner-packet compile reads the locked Core sources through `cargo metadata`.
 
 The release scripts `scripts/testnet_release.py` and `scripts/mainnet_release.py` use the Python modules `scripts/contract_admin.py` and `scripts/wallet_admin.py` for the same checks. Those modules have no command line. The binary's tests reproduce recorded outputs of both modules (`crates/allowit-stellar/tests/fixtures/native_admin_vectors.json` and `contract_admin_vectors.json`), so the two implementations agree.
 
