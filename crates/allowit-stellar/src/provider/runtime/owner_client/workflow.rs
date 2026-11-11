@@ -27,6 +27,39 @@ pub struct Outcome {
     pub state: String,
     pub selection: OwnerPolicy,
     pub transactions: Vec<String>,
+    /// The verified receipt of each transaction in `transactions`, in the same order. It is
+    /// display data: a later command that reads this document as its selection ignores it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub receipts: Vec<OwnerReceipt>,
+}
+/// What the ledger holds for one owner transaction: its action, hash, status and ledger, with
+/// the explorer link of the transaction when the network has an explorer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OwnerReceipt {
+    pub action: String,
+    pub transaction_hash: String,
+    pub status: OperationStatus,
+    pub ledger: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explorer: Option<String>,
+}
+impl OwnerReceipt {
+    /// The receipt of a retained step, once this client verified it against the ledger.
+    fn of(step: &RetainedStep) -> Option<Self> {
+        let receipt = step.receipt.as_ref()?;
+        Some(Self {
+            action: step.packet.action.clone(),
+            transaction_hash: step.packet.transaction_hash.clone(),
+            status: receipt.status.clone(),
+            ledger: receipt.ledger,
+            explorer: crate::provider::server_owner::explorer_link(
+                &step.packet.network,
+                "tx",
+                &step.packet.transaction_hash,
+            ),
+        })
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -751,6 +784,7 @@ impl OwnerClient {
                 .iter()
                 .map(|s| s.packet.transaction_hash.clone())
                 .collect(),
+            receipts: record.steps.iter().filter_map(OwnerReceipt::of).collect(),
         })
     }
     pub fn verify_binding(&self, selection: &OwnerPolicy, rpc: &dyn rpc::Rpc) -> Result<()> {
@@ -954,6 +988,7 @@ impl OwnerClient {
             state: "active".into(),
             selection: selection.clone(),
             transactions: vec![],
+            receipts: vec![],
         })
     }
     /// Export a public JSON projection after strict native validation.
@@ -1411,5 +1446,63 @@ mod submit_refusal_tests {
         ));
         assert_eq!(unsent.code, crate::provider::NETWORK_UNAVAILABLE);
         assert_eq!(unsent.api_code.as_deref(), Some("network_unavailable"));
+    }
+    #[test]
+    fn an_outcome_reports_each_verified_receipt_and_stays_a_selection_document() {
+        let hash = "ab".repeat(32);
+        let owner = crate::test_support::owner::account(11);
+        let mut step = RetainedStep {
+            packet: Step {
+                network: "stellar:testnet".into(),
+                action: "deploy_wallet".into(),
+                transaction_xdr: String::new(),
+                transaction_hash: hash.clone(),
+                expires_at: 1,
+                _explorer: Some("https://example.invalid/untrusted".into()),
+            },
+            source: crate::test_support::owner::fresh(&owner),
+            validated_at: 1,
+            extend_to: None,
+            signed_xdr: None,
+            signature: None,
+            submitted: true,
+            receipt: None,
+        };
+        // A step without a verified receipt reports none.
+        assert_eq!(OwnerReceipt::of(&step), None);
+        step.receipt = Some(rpc::VerifiedReceipt {
+            transaction_hash: [0xab; 32],
+            status: OperationStatus::Confirmed,
+            ledger: 5_682_550,
+            envelope_xdr: String::new(),
+            result_xdr: String::new(),
+        });
+        let receipt = OwnerReceipt::of(&step).unwrap();
+        // The link is this client's own, never the one that the server sent with the step.
+        assert_eq!(
+            serde_json::to_value(&receipt).unwrap(),
+            json!({"action":"deploy_wallet","transactionHash":hash,"status":"confirmed","ledger":5_682_550,
+                "explorer":format!("https://stellar.expert/explorer/testnet/tx/{hash}")})
+        );
+        let mut outcome = Outcome {
+            request_id: "deploy-0001".into(),
+            state: "installed".into(),
+            selection: crate::test_support::owner::selection(),
+            transactions: vec![hash],
+            receipts: vec![],
+        };
+        let plain = serde_json::to_value(&outcome).unwrap();
+        assert!(plain.get("receipts").is_none());
+        outcome.receipts = vec![receipt.clone()];
+        let reported = serde_json::to_value(&outcome).unwrap();
+        // The next owner command reads either document as its selection.
+        for (document, receipts) in [(plain, vec![]), (reported.clone(), vec![receipt])] {
+            let read: Outcome = serde_json::from_value(document).unwrap();
+            assert_eq!(read.transactions, outcome.transactions);
+            assert_eq!(read.receipts, receipts);
+        }
+        let mut unknown = reported;
+        unknown["extra"] = json!(1);
+        assert!(serde_json::from_value::<Outcome>(unknown).is_err());
     }
 }

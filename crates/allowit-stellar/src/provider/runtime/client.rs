@@ -396,12 +396,42 @@ pub trait AgentSigner: Send + Sync {
 }
 /// The exit code of a policy denial in the shared CLI exit table.
 const POLICY_DENIED: i32 = 20;
-/// A typed engine refusal. See `provider::diagnostics`.
-#[derive(Deserialize)]
+/// The text that starts the message of an engine reply that left the operation unresolved.
+const UNRESOLVED: &str = "Stellar operation was not resolved";
+/// An engine refusal `{error, code, details}`. See `provider::diagnostics`.
+#[derive(Default, Deserialize)]
 struct Refusal {
+    #[serde(default)]
     code: String,
     #[serde(default)]
+    error: String,
+    #[serde(default)]
     details: RefusalDetails,
+}
+/// An engine message as terminal text: its printable ASCII characters, at most 200, without
+/// the final period. Engine text reaches the terminal only through this function.
+fn plain(text: &str) -> Option<String> {
+    let text: String = text
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(200)
+        .collect();
+    let text = text.trim().trim_end_matches('.');
+    (!text.is_empty()).then(|| text.to_owned())
+}
+/// Whether `error` is an engine reply that neither resolved nor typed the operation: a 409
+/// without a stable code. The engine sends it, for example, while the receipt of a settled
+/// transaction is not yet readable, so the status of the same request ID can still resolve.
+fn unresolved(error: &Error) -> bool {
+    error.status == Some(409) && error.api_code.is_none() && error.message.contains(UNRESOLVED)
+}
+/// The unresolved reply `error` as an uncertain outcome: the caller reads the same request ID
+/// again with status.
+fn uncertain(error: Error) -> Error {
+    Error {
+        code: Error::uncertain("").code,
+        ..error
+    }
 }
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -413,15 +443,12 @@ struct RefusalDetails {
 /// The client error for a non-2xx engine reply. A 409 `policy_denied` names the denying rule
 /// and error and uses the policy-denial exit code. A 409 `wallet_rejected` is a contract
 /// rejection: the wallet, its asset or a vault refused the operation, and it names the contract
-/// error. Every other reply leaves the operation unresolved.
+/// error. Every other reply leaves the operation unresolved: its message keeps the engine's
+/// message, and the error keeps the engine's stable code when the reply has one.
 fn refusal(status: u16, body: &[u8]) -> Error {
-    let refusal = serde_json::from_slice::<Refusal>(body).ok();
+    let refusal = serde_json::from_slice::<Refusal>(body).unwrap_or_default();
     // The engine got no answer from the rail network. The request ID stays valid for a retry.
-    if matches!(status, 503 | 504)
-        && refusal
-            .as_ref()
-            .is_some_and(|r| r.code == "network_unavailable")
-    {
+    if matches!(status, 503 | 504) && refusal.code == "network_unavailable" {
         let mut error = Error::api(
             status,
             "network unavailable; retry with the same request ID",
@@ -429,15 +456,19 @@ fn refusal(status: u16, body: &[u8]) -> Error {
         error.code = crate::provider::NETWORK_UNAVAILABLE;
         return error;
     }
-    let refusal = refusal.filter(|_| status == 409);
     // Engine names reach the terminal only as plain identifiers.
     let name = |v: &Option<String>| {
         v.clone().filter(|v| {
             (1..=64).contains(&v.len()) && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
         })
     };
-    match refusal {
-        Some(Refusal { code, details: d }) if code == "policy_denied" => {
+    let Refusal {
+        code,
+        error: reason,
+        details: d,
+    } = refusal;
+    match code.as_str() {
+        "policy_denied" if status == 409 => {
             let reason = match (name(&d.rule), name(&d.error), d.contract_error) {
                 (Some(rule), Some(error), _) => format!("`{rule}` ({error})"),
                 (Some(rule), None, _) => format!("`{rule}`"),
@@ -453,7 +484,7 @@ fn refusal(status: u16, body: &[u8]) -> Error {
             error.code = POLICY_DENIED;
             error
         }
-        Some(Refusal { code, details: d }) if code == "wallet_rejected" => Error::api(
+        "wallet_rejected" if status == 409 => Error::api(
             status,
             match (name(&d.error), d.contract_error) {
                 (Some(error), Some(code)) => format!(
@@ -465,10 +496,18 @@ fn refusal(status: u16, body: &[u8]) -> Error {
                 (_, None) => "The operation was rejected in simulation".into(),
             },
         ),
-        _ => Error::api(
-            status,
-            "Stellar operation was not resolved; retain the original request ID",
-        ),
+        _ => {
+            let message = match plain(&reason) {
+                Some(reason) => {
+                    format!("{UNRESOLVED}: {reason}; retain the original request ID")
+                }
+                None => format!("{UNRESOLVED}; retain the original request ID"),
+            };
+            match name(&Some(code)) {
+                Some(code) => Error::refused(status, code, message),
+                None => Error::api(status, message),
+            }
+        }
     }
 }
 fn validate_response_receipt(r: &Response) -> Result<()> {
@@ -885,10 +924,28 @@ pub fn exec(
     record.status = Some(OperationStatus::SubmissionUnknown);
     journal.save(&name, &record).map_err(journal_error)?;
     progress::report("Submitting the signed operation and waiting for the network");
-    let response = c.post(
+    let response = match c.post(
         &c.bundle.endpoints.execute,
         json!({"policyId":policy,"requestId":id,"phase":"submit","agentSignature":signature}),
-    )?;
+    ) {
+        Ok(response) => response,
+        // The engine received the signature and did not resolve the operation in this call, so
+        // only the status of the same request ID can tell what happened to it.
+        Err(error) if unresolved(&error) => {
+            if wait.is_zero() {
+                return Err(uncertain(error));
+            }
+            let start = Some(Err(error.clone()));
+            let outcome = poll(c, &id, Some(record), journal, &name, wait, start)?;
+            // Still only prepared: the engine did not accept the signature, and `error` says why.
+            return if outcome.status == OperationStatus::Prepared {
+                Err(error)
+            } else {
+                Ok(outcome)
+            };
+        }
+        Err(error) => return Err(error),
+    };
     c.validate(&response, &id, Some(&record), false)?;
     record.status = Some(response.operation.status.clone());
     journal.save(&name, &record).map_err(journal_error)?;
@@ -896,7 +953,15 @@ pub fn exec(
     if terminal(&response.operation.status) || wait.is_zero() {
         return Ok(submitted);
     }
-    poll(c, &id, Some(record), journal, &name, wait, Some(submitted))
+    poll(
+        c,
+        &id,
+        Some(record),
+        journal,
+        &name,
+        wait,
+        Some(Ok(submitted)),
+    )
 }
 fn validate_wait_and_id(id: &str, wait: Duration) -> Result<()> {
     if !crate::host::request::request_id_valid(id) {
@@ -912,35 +977,89 @@ fn validate_wait_and_id(id: &str, wait: Duration) -> Result<()> {
 fn terminal(status: &OperationStatus) -> bool {
     matches!(status, OperationStatus::Confirmed | OperationStatus::Failed)
 }
-/// Read the status until it is terminal or `wait` ends. `last` is the outcome that the caller
+/// The engine answer that a poll starts from: the outcome that the caller already holds, or,
+/// as the error, the unresolved reply to its submit call.
+type Answer = Result<ExecutionOutcome>;
+/// Read the status until it is terminal or `wait` ends. `start` is the answer that the caller
 /// already holds. Without one, the first read is not bounded, because the caller needs one
 /// answer; every later engine read ends at the deadline and returns the last outcome. The
 /// deadline covers the engine reads only: the lapse proof of a released operation reads the
 /// caller's RPC with that client's own timeouts after an answer arrived.
+///
+/// An unresolved reply is not an outcome. A status read changes nothing, so the read repeats
+/// until `wait` ends, and every read after such a reply ends at the deadline. When the wait
+/// ends and the newest answer is an unresolved reply, that reply is the error of an uncertain
+/// outcome, with the engine's message, and the same request ID reads the status again.
 fn poll(
     c: &Client,
     id: &str,
-    mut record: Option<Record>,
+    record: Option<Record>,
     journal: &Store,
     name: &str,
     wait: Duration,
-    mut last: Option<ExecutionOutcome>,
+    start: Option<Answer>,
+) -> Result<ExecutionOutcome> {
+    poll_reads(
+        c,
+        id,
+        record,
+        wait,
+        start,
+        &mut |record, bound| c.status_within(id, record, bound),
+        &mut |record| journal.save(name, record).map_err(journal_error),
+    )
+}
+/// A status read of the retained record that ends at the given deadline, if any.
+type StatusRead<'a> = dyn FnMut(Option<&Record>, Option<Instant>) -> Result<Option<Response>> + 'a;
+/// [`poll`] over the status reads of `read`, retaining each answered record with `save`.
+fn poll_reads(
+    c: &Client,
+    id: &str,
+    mut record: Option<Record>,
+    wait: Duration,
+    start: Option<Answer>,
+    read: &mut StatusRead<'_>,
+    save: &mut dyn FnMut(&Record) -> Result<()>,
 ) -> Result<ExecutionOutcome> {
     let deadline = Instant::now()
         .checked_add(wait)
         .ok_or_else(|| Error::usage("The Stellar polling deadline is too large"))?;
     let mut reads = 0u32;
+    // The newest outcome, and the newest answer when it left the operation unresolved.
+    let (mut last, mut open) = match start {
+        Some(Ok(outcome)) => (Some(outcome), None),
+        Some(Err(error)) => (None, Some(error)),
+        None => (None, None),
+    };
     loop {
         if reads == 1 {
             progress::report("Waiting for the operation to settle");
         }
         reads += 1;
-        let bound = last.is_some().then_some(deadline);
-        let Some(r) = c.status_within(id, record.as_ref(), bound)? else {
-            return Ok(last.expect("a bounded status read follows an earlier outcome"));
+        let bound = (last.is_some() || open.is_some()).then_some(deadline);
+        let r = match read(record.as_ref(), bound) {
+            Ok(Some(r)) => r,
+            // The deadline ended the read, so the newest answer decides.
+            Ok(None) => {
+                return match open {
+                    Some(error) => Err(uncertain(error)),
+                    None => Ok(last.expect("a bounded status read follows an earlier answer")),
+                };
+            }
+            Err(error) if unresolved(&error) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(left.min(Duration::from_secs(1)));
+                if Instant::now() >= deadline {
+                    return Err(uncertain(error));
+                }
+                open = Some(error);
+                continue;
+            }
+            Err(error) => return Err(error),
         };
+        open = None;
         let old = journaled(c, id, record, &r);
-        journal.save(name, &old).map_err(journal_error)?;
+        save(&old)?;
         record = Some(old);
         let outcome = render(&r)?;
         let left = deadline.saturating_duration_since(Instant::now());
@@ -2055,7 +2174,7 @@ mod native_revalidation_tests {
                 "409 Conflict",
                 json!({"error":"Reconcile the original Stellar operation before preparing another."}),
                 4,
-                "Allowit returned HTTP 409: Stellar operation was not resolved; retain the original request ID",
+                "Allowit returned HTTP 409: Stellar operation was not resolved: Reconcile the original Stellar operation before preparing another; retain the original request ID",
             ),
             (
                 "503 Service Unavailable",
@@ -2094,6 +2213,217 @@ mod native_revalidation_tests {
             server.join().unwrap();
             assert_eq!((error.code, error.message.as_str()), (code, text), "{body}");
         }
+    }
+    /// The engine reply of a status read whose settled receipt was not yet readable.
+    const RECEIPT_UNAVAILABLE: &str = "The original terminal receipt is temporarily unavailable. Retain its transaction identity.";
+    /// [`poll_reads`] over scripted status reads; the last one repeats. Returns the outcome,
+    /// the number of reads and the number of retained records.
+    fn scripted_poll(
+        wait: Duration,
+        script: Vec<Reply>,
+    ) -> (Result<ExecutionOutcome>, usize, usize) {
+        let (outcome, bounds, saves) = scripted_poll_bounds(wait, script);
+        (outcome, bounds.len(), saves)
+    }
+    /// [`scripted_poll`] that returns, for each read, whether it had a deadline.
+    fn scripted_poll_bounds(
+        wait: Duration,
+        script: Vec<Reply>,
+    ) -> (Result<ExecutionOutcome>, Vec<bool>, usize) {
+        scripted_poll_from(None, wait, script)
+    }
+    /// [`scripted_poll_bounds`] that starts from the answer that the caller holds.
+    fn scripted_poll_from(
+        start: Option<Answer>,
+        wait: Duration,
+        script: Vec<Reply>,
+    ) -> (Result<ExecutionOutcome>, Vec<bool>, usize) {
+        let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
+        let client = engine_client(p.config.clone(), "http://127.0.0.1:9");
+        let (mut reads, mut saves) = (vec![], 0);
+        let outcome = poll_reads(
+            &client,
+            "unresolved-001",
+            None,
+            wait,
+            start,
+            &mut |_, bound| {
+                reads.push(bound.is_some());
+                script[(reads.len() - 1).min(script.len() - 1)]()
+            },
+            &mut |_| {
+                saves += 1;
+                Ok(())
+            },
+        );
+        (outcome, reads, saves)
+    }
+    /// One scripted status read.
+    type Reply = Box<dyn Fn() -> Result<Option<Response>>>;
+    fn status_reply(status: OperationStatus) -> Reply {
+        let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
+        Box::new(move || {
+            let reply = json!({"prepared":p,"operation":{"id":"unresolved-001","status":status,"transactionHash":sdk::hex(&p.transaction_hash)}});
+            Ok(Some(serde_json::from_value(reply).unwrap()))
+        })
+    }
+    fn refused(status: u16, body: serde_json::Value) -> Reply {
+        Box::new(move || Err(refusal(status, &serde_json::to_vec(&body).unwrap())))
+    }
+    fn unresolved_reply() -> Reply {
+        refused(409, json!({"error":RECEIPT_UNAVAILABLE}))
+    }
+    #[test]
+    fn an_unresolved_status_reply_is_read_again_until_the_operation_resolves() {
+        // Testnet, 2026-11-11: `exec --wait 4m` ended after 9 s with exit 4 on this reply while
+        // the payment settled. The next status read of the same request ID resolves it.
+        let (outcome, reads, saves) = scripted_poll(
+            Duration::from_secs(30),
+            vec![
+                unresolved_reply(),
+                status_reply(OperationStatus::Submitted),
+                unresolved_reply(),
+                status_reply(OperationStatus::Confirmed),
+            ],
+        );
+        assert_eq!(outcome.unwrap().status, OperationStatus::Confirmed);
+        assert_eq!((reads, saves), (4, 2));
+    }
+    #[test]
+    fn an_unresolved_status_is_uncertain_with_the_engine_message_when_the_wait_ends() {
+        let text = "Allowit returned HTTP 409: Stellar operation was not resolved: The original terminal receipt is temporarily unavailable. Retain its transaction identity; retain the original request ID";
+        // Without a wait, one read decides.
+        let (outcome, reads, saves) = scripted_poll(Duration::ZERO, vec![unresolved_reply()]);
+        let error = outcome.unwrap_err();
+        assert_eq!(
+            (error.code, error.status, error.message.as_str()),
+            (5, Some(409), text)
+        );
+        assert_eq!((reads, saves), (1, 0));
+        // With a wait, the read repeats until the wait ends, and never longer.
+        let started = Instant::now();
+        let (outcome, reads, _) =
+            scripted_poll(Duration::from_millis(1500), vec![unresolved_reply()]);
+        let error = outcome.unwrap_err();
+        assert_eq!((error.code, error.message.as_str()), (5, text));
+        assert!(reads >= 2, "{reads}");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(1500) && elapsed < Duration::from_secs(10),
+            "{elapsed:?}"
+        );
+    }
+    #[test]
+    fn every_read_after_an_unresolved_reply_ends_at_the_deadline() {
+        // Codex P2 on this change: a retry without a deadline could wait for the engine timeout
+        // of 180 s after a short `--wait`.
+        let ended: fn() -> Reply = || Box::new(|| Ok(None));
+        let (outcome, bounds, saves) =
+            scripted_poll_bounds(Duration::from_secs(30), vec![unresolved_reply(), ended()]);
+        // The first read needs one answer, so it has no deadline. The deadline ended the second
+        // read, and the newest answer was the unresolved reply.
+        assert_eq!(bounds, [false, true]);
+        let error = outcome.unwrap_err();
+        assert_eq!((error.code, error.status), (5, Some(409)));
+        assert!(error.message.contains("temporarily unavailable"));
+        assert_eq!(saves, 0);
+        // After an answer with a status, the deadline returns that status.
+        let (outcome, bounds, saves) = scripted_poll_bounds(
+            Duration::from_secs(30),
+            vec![
+                unresolved_reply(),
+                status_reply(OperationStatus::Submitted),
+                ended(),
+            ],
+        );
+        assert_eq!(outcome.unwrap().status, OperationStatus::Submitted);
+        assert_eq!((bounds.as_slice(), saves), (&[false, true, true][..], 1));
+        // Codex P2, second round: the poll after an unresolved submit answer starts from that
+        // answer, so its first read has the deadline too and the answer is the uncertain outcome.
+        let submit = || {
+            let Err(error) = unresolved_reply()() else {
+                unreachable!()
+            };
+            Some(Err(error))
+        };
+        let (outcome, bounds, _) =
+            scripted_poll_from(submit(), Duration::from_secs(30), vec![ended()]);
+        assert_eq!(bounds, [true]);
+        let error = outcome.unwrap_err();
+        assert_eq!((error.code, error.status), (5, Some(409)));
+        let (outcome, bounds, _) = scripted_poll_from(
+            submit(),
+            Duration::from_secs(30),
+            vec![status_reply(OperationStatus::Confirmed)],
+        );
+        assert_eq!(bounds, [true]);
+        assert_eq!(outcome.unwrap().status, OperationStatus::Confirmed);
+    }
+    #[test]
+    fn a_typed_refusal_or_another_error_ends_the_poll_at_once() {
+        let uncertain: Reply = Box::new(|| Err(Error::uncertain("Stellar transport is uncertain")));
+        for (script, code, api_code) in [
+            (
+                refused(
+                    409,
+                    json!({"code":"policy_denied","details":{"rule":"payment_limit"}}),
+                ),
+                20,
+                None,
+            ),
+            // A stable code that this client does not interpret stays a refusal with that code.
+            (
+                refused(
+                    409,
+                    json!({"code":"operation_expired","error":"This prepared operation expired before submission."}),
+                ),
+                4,
+                Some("operation_expired"),
+            ),
+            (refused(500, json!({"error":"Internal error."})), 4, None),
+            (uncertain, 5, None),
+        ] {
+            let (outcome, reads, saves) = scripted_poll(Duration::from_secs(30), vec![script]);
+            let error = outcome.unwrap_err();
+            assert_eq!(
+                (error.code, error.api_code.as_deref()),
+                (code, api_code),
+                "{}",
+                error.message
+            );
+            assert_eq!((reads, saves), (1, 0), "{}", error.message);
+        }
+    }
+    #[test]
+    fn an_unresolved_reply_keeps_the_engine_message_as_plain_bounded_text() {
+        let message =
+            |body: serde_json::Value| refusal(409, &serde_json::to_vec(&body).unwrap()).message;
+        assert_eq!(
+            message(json!({"error":"The receipt\u{1b}[2J is\nunavailable.\u{202e}"})),
+            "Allowit returned HTTP 409: Stellar operation was not resolved: The receipt[2J isunavailable; retain the original request ID"
+        );
+        let long = message(json!({"error":"x".repeat(5000)}));
+        assert!(long.len() < 300, "{}", long.len());
+        // A reply without a message, or one that is not JSON, keeps the plain text.
+        for body in [&b"{}"[..], b"<html>", b""] {
+            let error = refusal(409, body);
+            assert_eq!(
+                error.message,
+                "Allowit returned HTTP 409: Stellar operation was not resolved; retain the original request ID"
+            );
+            assert!(unresolved(&error));
+        }
+        // A hostile code is not an identifier, so it is not kept.
+        let hostile = refusal(409, br#"{"code":"a b\n","error":"x"}"#);
+        assert_eq!(hostile.api_code, None);
+        // Only a 409 without a stable code is an unresolved reply.
+        assert!(!unresolved(&refusal(500, b"{}")));
+        assert!(!unresolved(&refusal(
+            409,
+            br#"{"code":"operation_expired"}"#
+        )));
+        assert!(!unresolved(&refusal(409, br#"{"code":"policy_denied"}"#)));
+        assert!(!unresolved(&refusal(409, br#"{"code":"wallet_rejected"}"#)));
     }
     /// A loopback Stellar RPC that answers each JSON-RPC call with `answer(method, params)`
     /// until `stop` is set, and returns the methods it served.
