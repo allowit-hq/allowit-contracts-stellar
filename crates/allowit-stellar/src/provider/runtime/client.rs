@@ -975,8 +975,9 @@ fn terminal(status: &OperationStatus) -> bool {
 /// caller's RPC with that client's own timeouts after an answer arrived.
 ///
 /// An unresolved reply is not an outcome. A status read changes nothing, so the read repeats
-/// until `wait` ends; then the reply is the error of an uncertain outcome, with the engine's
-/// message, and the same request ID reads the status again.
+/// until `wait` ends, and every read after such a reply ends at the deadline. When the wait
+/// ends and the newest answer is an unresolved reply, that reply is the error of an uncertain
+/// outcome, with the engine's message, and the same request ID reads the status again.
 fn poll(
     c: &Client,
     id: &str,
@@ -1012,27 +1013,35 @@ fn poll_reads(
         .checked_add(wait)
         .ok_or_else(|| Error::usage("The Stellar polling deadline is too large"))?;
     let mut reads = 0u32;
+    // The newest answer, when it left the operation unresolved.
+    let mut open: Option<Error> = None;
     loop {
         if reads == 1 {
             progress::report("Waiting for the operation to settle");
         }
         reads += 1;
-        let bound = last.is_some().then_some(deadline);
+        let bound = (last.is_some() || open.is_some()).then_some(deadline);
         let r = match read(record.as_ref(), bound) {
             Ok(Some(r)) => r,
+            // The deadline ended the read, so the newest answer decides.
             Ok(None) => {
-                return Ok(last.expect("a bounded status read follows an earlier outcome"));
+                return match open {
+                    Some(error) => Err(uncertain(error)),
+                    None => Ok(last.expect("a bounded status read follows an earlier answer")),
+                };
             }
             Err(error) if unresolved(&error) => {
                 let left = deadline.saturating_duration_since(Instant::now());
-                if left.is_zero() {
+                std::thread::sleep(left.min(Duration::from_secs(1)));
+                if Instant::now() >= deadline {
                     return Err(uncertain(error));
                 }
-                std::thread::sleep(left.min(Duration::from_secs(1)));
+                open = Some(error);
                 continue;
             }
             Err(error) => return Err(error),
         };
+        open = None;
         let old = journaled(c, id, record, &r);
         save(&old)?;
         record = Some(old);
@@ -2197,18 +2206,26 @@ mod native_revalidation_tests {
         wait: Duration,
         script: Vec<Reply>,
     ) -> (Result<ExecutionOutcome>, usize, usize) {
+        let (outcome, bounds, saves) = scripted_poll_bounds(wait, script);
+        (outcome, bounds.len(), saves)
+    }
+    /// [`scripted_poll`] that returns, for each read, whether it had a deadline.
+    fn scripted_poll_bounds(
+        wait: Duration,
+        script: Vec<Reply>,
+    ) -> (Result<ExecutionOutcome>, Vec<bool>, usize) {
         let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
         let client = engine_client(p.config.clone(), "http://127.0.0.1:9");
-        let (mut reads, mut saves) = (0, 0);
+        let (mut reads, mut saves) = (vec![], 0);
         let outcome = poll_reads(
             &client,
             "unresolved-001",
             None,
             wait,
             None,
-            &mut |_, _| {
-                reads += 1;
-                script[(reads - 1).min(script.len() - 1)]()
+            &mut |_, bound| {
+                reads.push(bound.is_some());
+                script[(reads.len() - 1).min(script.len() - 1)]()
             },
             &mut |_| {
                 saves += 1;
@@ -2271,6 +2288,32 @@ mod native_revalidation_tests {
             elapsed >= Duration::from_millis(1500) && elapsed < Duration::from_secs(10),
             "{elapsed:?}"
         );
+    }
+    #[test]
+    fn every_read_after_an_unresolved_reply_ends_at_the_deadline() {
+        // Codex P2 on this change: a retry without a deadline could wait for the engine timeout
+        // of 180 s after a short `--wait`.
+        let ended: fn() -> Reply = || Box::new(|| Ok(None));
+        let (outcome, bounds, saves) =
+            scripted_poll_bounds(Duration::from_secs(30), vec![unresolved_reply(), ended()]);
+        // The first read needs one answer, so it has no deadline. The deadline ended the second
+        // read, and the newest answer was the unresolved reply.
+        assert_eq!(bounds, [false, true]);
+        let error = outcome.unwrap_err();
+        assert_eq!((error.code, error.status), (5, Some(409)));
+        assert!(error.message.contains("temporarily unavailable"));
+        assert_eq!(saves, 0);
+        // After an answer with a status, the deadline returns that status.
+        let (outcome, bounds, saves) = scripted_poll_bounds(
+            Duration::from_secs(30),
+            vec![
+                unresolved_reply(),
+                status_reply(OperationStatus::Submitted),
+                ended(),
+            ],
+        );
+        assert_eq!(outcome.unwrap().status, OperationStatus::Submitted);
+        assert_eq!((bounds.as_slice(), saves), (&[false, true, true][..], 1));
     }
     #[test]
     fn a_typed_refusal_or_another_error_ends_the_poll_at_once() {
