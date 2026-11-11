@@ -2,13 +2,17 @@
 
 These tools prepare transactions. They do not fund accounts, sign, submit or retry them. Use existing funded accounts. Native preparation reads current sequence and signer state from Horizon. Contract preparation uses Stellar CLI 28.1.0 and RPC. Its `--build-only` flag returns raw, unassembled XDR. The contract tool adds five-minute time bounds, then runs `stellar tx simulate` to assemble resource fees, footprint and authorization entries. It rejects changes to transaction intent or unexpected signatures. Its output is assembled unsigned XDR. `--send=no` returns a read simulation result, not unsigned XDR.
 
-Use Python 3.10 or later (below 4.0) and Stellar CLI 28.1.0. Install the pinned Python SDK in a local virtual environment:
+One Rust binary, `allowit-stellar-admin`, does this work. Build it from `crates/allowit-stellar` and use Stellar CLI 28.1.0 for the contract actions:
 
 ```sh
-python3 -m venv /tmp/allowit-admin
-/tmp/allowit-admin/bin/pip install -r scripts/requirements-admin.txt
-/tmp/allowit-admin/bin/python -m unittest discover -s scripts/tests -v
+cargo build --locked --release --manifest-path crates/allowit-stellar/Cargo.toml --bin allowit-stellar-admin
+ADMIN_BIN=crates/allowit-stellar/target/release/allowit-stellar-admin
+cargo test --locked --manifest-path crates/allowit-stellar/Cargo.toml --bin allowit-stellar-admin
 ```
+
+The native actions are `inspect`, `verify-wallet`, `verify-admin`, `setup-wallet`, `shutdown-wallet` and `setup-admin`. The contract actions are `upload`, `deploy-parent`, `deploy-wallet`, `read` and `admin`. A preparing action prints unsigned base64 XDR on standard output. A refusal prints one line on standard error and exits with status 1; a usage error exits with status 2. An address error never repeats its input. Run the binary from this checkout: the owner-packet compile reads the locked Core sources through `cargo metadata`.
+
+The release scripts `scripts/testnet_release.py` and `scripts/mainnet_release.py` use the Python modules `scripts/contract_admin.py` and `scripts/wallet_admin.py` for the same checks. Those modules have no command line. The binary's tests reproduce recorded outputs of both modules (`crates/allowit-stellar/tests/fixtures/native_admin_vectors.json` and `contract_admin_vectors.json`), so the two implementations agree.
 
 Select `--network testnet` explicitly. Mainnet preparation additionally requires `--allow-mainnet`. Public addresses and hashes belong in arguments. Never pass secret seeds. Use Stellar CLI identities backed by the OS secure store for manual signing. `STELLAR_BIN` selects the CLI executable for contract tooling. Contract subprocesses ignore inherited Stellar signing and network overrides.
 
@@ -19,8 +23,8 @@ The classic CLI retains `--engine` for its service co-signer. This means the wal
 The native wallet owner is its account master key. Setup admits only an existing account with master weight 1, no other signers and default thresholds. It atomically adds agent/engine weight 1, changes owner weight to 3, and sets thresholds 2/2/3. Setup never silently replaces existing authority. Signer verification rejects unexpected signers, hash/preauthorized signers and threshold drift.
 
 ```sh
-python scripts/wallet_admin.py setup-wallet --network testnet --account "$OWNER" --agent "$AGENT" --engine "$ENGINE" > /tmp/setup.xdr
-python scripts/wallet_admin.py verify-wallet --network testnet --account "$OWNER" --agent "$AGENT" --engine "$ENGINE"
+"$ADMIN_BIN" setup-wallet --network testnet --account "$OWNER" --agent "$AGENT" --engine "$ENGINE" > /tmp/setup.xdr
+"$ADMIN_BIN" verify-wallet --network testnet --account "$OWNER" --agent "$AGENT" --engine "$ENGINE"
 ```
 
 Verification succeeds only after the configuration transaction settles. To disable automation, use `shutdown-wallet` with the same addresses. It atomically removes agent and engine and raises all thresholds to 3. Only the owner can authorize it. Prefer `--transaction-source OTHER_OWNER_ACCOUNT` to use an independent owner-only fee/sequence account. All shutdown operations still name the wallet as their source. Sign with both wallet owner and transaction source. This prevents the agent pair from invalidating shutdown through the wallet sequence, although admission and offer checks can still race ledger changes. Verification rejects open Horizon offers. Shutdown reports offers but still prepares signer removal. Revoke signers first, then reconcile offers and allowances. Removing signers does not revoke persistent SAC allowances, liquidity positions or prior issuer changes. Horizon cannot enumerate all SAC allowances. Read and zero allowances for every known spender separately. Treat unknown prior delegations as unresolved. This native profile grants broad low/medium authority, so shutdown cannot promise complete revocation.
@@ -45,12 +49,12 @@ Run `scripts/build-contracts.sh` before contract tests or deployment preparation
 bindings, builds the test fixtures, then rebuilds the default deployable artifacts. Select the
 reviewed source and placement manifest when preparing a policy executable.
 
-Use `contract_admin.py upload --source "$OWNER" --wasm PATH` separately for the engine, parent and
+Use `allowit-stellar-admin upload --source "$OWNER" --wasm PATH` separately for the engine, parent and
 policy wallet Wasm. Review, sign and submit prepared uploads manually, retaining each resulting hash.
 
 Prepare `deploy-parent --source "$ADMIN" --owner "$ADMIN" --engine-wasm HASH --wasm
  target/wasm32v1-none/release/allowit_engine_parent.wasm --wasm-hash PARENT_HASH`, with three
-`--member` values. The script verifies the native admin quorum, local Wasm and creation executable
+`--member` values. The tool verifies the native admin quorum, local Wasm and creation executable
 hash. The constructor creates the shared engine. Read its address with `read --contract
 PARENT_ADDRESS --source "$ADMIN" --method engine`.
 
@@ -150,7 +154,7 @@ Wallets with layout `contract_version` 1 (text-keyed params map), 2 (accounting 
 3 (typed canonical params and raw state values) cannot execute under layout 4, and their accounting
 does not migrate. Owner `recover` and `invoke` still work after an in-place upgrade, because they
 read only the fields they keep; `deploy_policy` rejects an earlier layout with `InvalidState`. Drain
-such a wallet with `recover` and deploy a new one. `contract_admin.py` builds `deploy_policy`
+such a wallet with `recover` and deploy a new one. The tool builds `deploy_policy`
 packets only for layout 4; read an earlier state with that release's tooling. `recover` does not read `state()`, so the tool also drains an upgraded wallet.
 
 Normal operations do not migrate state. An incompatible change uses this explicit maintenance

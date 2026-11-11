@@ -1,7 +1,7 @@
 import copy
 import argparse
 import subprocess
-from io import BytesIO, StringIO
+from io import StringIO
 import json
 import hashlib
 import tempfile
@@ -81,92 +81,6 @@ class NativeAdmin(unittest.TestCase):
             with self.assertRaises((ValueError, argparse.ArgumentTypeError)):
                 wa.owner_only(value)
 
-    def test_setup_unsigned_atomic_exact(self):
-        envelope = wa.prepare(state(), "setup-wallet", "testnet", agent=KEYS[1], engine=KEYS[2], now=1000)
-        tx = TransactionEnvelope.from_xdr(envelope.to_xdr(), wa.PASSPHRASE["testnet"])
-        self.assertEqual(tx.signatures, [])
-        self.assertEqual(tx.transaction.sequence, 43)
-        self.assertEqual(tx.transaction.fee, 300)
-        self.assertEqual(tx.transaction.preconditions.time_bounds.min_time, 0)
-        self.assertEqual(tx.transaction.preconditions.time_bounds.max_time, 1300)
-        ops = tx.transaction.operations
-        self.assertEqual(len(ops), 3)
-        self.assertEqual(ops[0].signer, wa.Signer.ed25519_public_key(KEYS[1], 1))
-        self.assertEqual(ops[1].signer, wa.Signer.ed25519_public_key(KEYS[2], 1))
-        self.assertEqual((ops[2].master_weight, ops[2].low_threshold, ops[2].med_threshold, ops[2].high_threshold), (3, 2, 2, 3))
-        self.assertTrue(all(op.source is None for op in ops))
-
-    def test_setup_rejects_existing_authority(self):
-        for malformed in ("threshold", "signer", "preauth", "duplicate"):
-            value = state()
-            if malformed == "threshold":
-                value["thresholds"]["high_threshold"] = 1
-            else:
-                extra = {"key": KEYS[3], "weight": 1, "type": "ed25519_public_key"}
-                if malformed == "preauth":
-                    extra["type"] = "preauth_tx"
-                if malformed == "duplicate":
-                    extra["key"] = KEYS[0]
-                value["signers"].append(extra)
-            with self.assertRaises((ValueError, argparse.ArgumentTypeError)):
-                wa.prepare(value, "setup-wallet", "testnet", agent=KEYS[1], engine=KEYS[2])
-
-    def test_shutdown_removes_both_and_raises_thresholds(self):
-        value = state()
-        value["signers"][0]["weight"] = 3
-        value["signers"] += [{"key": k, "weight": 1, "type": "ed25519_public_key"} for k in KEYS[1:3]]
-        value["thresholds"] = dict(zip(("low_threshold", "med_threshold", "high_threshold"), (2, 2, 3)))
-        wa.wallet(value, KEYS[1], KEYS[2])
-        tx = wa.prepare(value, "shutdown-wallet", "testnet", agent=KEYS[1], engine=KEYS[2])
-        self.assertEqual([op.signer.weight for op in tx.transaction.operations[:2]], [0, 0])
-        self.assertEqual(tx.transaction.operations[-1].med_threshold, 3)
-        value["signers"].append({"key": KEYS[4], "weight": 1, "type": "ed25519_public_key"})
-        with self.assertRaises((ValueError, argparse.ArgumentTypeError)):
-            wa.wallet(value, KEYS[1], KEYS[2])
-
-    def test_shutdown_separate_sequence_and_operation_source(self):
-        value = state()
-        value["signers"][0]["weight"] = 3
-        value["signers"] += [{"key": k, "weight": 1, "type": "ed25519_public_key"} for k in KEYS[1:3]]
-        value["thresholds"] = dict(zip(("low_threshold", "med_threshold", "high_threshold"), (2, 2, 3)))
-        fee_source = state()
-        fee_source["account_id"] = KEYS[4]
-        fee_source["sequence"] = "100"
-        fee_source["signers"][0]["key"] = KEYS[4]
-        tx = wa.prepare(value, "shutdown-wallet", "testnet", agent=KEYS[1], engine=KEYS[2], source_state=fee_source)
-        self.assertEqual(tx.transaction.source.account_id, KEYS[4])
-        self.assertEqual(tx.transaction.sequence, 101)
-        self.assertTrue(all(op.source.account_id == KEYS[0] for op in tx.transaction.operations))
-        for delegated in KEYS[1:3]:
-            fee_source["account_id"] = delegated
-            fee_source["signers"][0]["key"] = delegated
-            with self.assertRaises(ValueError):
-                wa.prepare(value, "shutdown-wallet", "testnet", agent=KEYS[1], engine=KEYS[2], source_state=fee_source)
-
-    def test_offer_admission(self):
-        for records in ([], [{"id": "1"}]):
-            payload = json.dumps({"_embedded": {"records": records}}).encode()
-            with patch.object(wa, "urlopen", return_value=BytesIO(payload)):
-                if records:
-                    with self.assertRaises(ValueError):
-                        wa.no_offers("testnet", KEYS[0])
-                else:
-                    wa.no_offers("testnet", KEYS[0])
-            if records:
-                with patch.object(wa, "urlopen", return_value=BytesIO(payload)), patch.object(sys, "stderr", new_callable=StringIO) as warnings:
-                    wa.no_offers("testnet", KEYS[0], reject=False)
-                    self.assertIn("Revoke signers first", warnings.getvalue())
-
-    def test_admin_distinct_master_disabled(self):
-        tx = wa.prepare(state(), "setup-admin", "testnet", members=KEYS[1:4])
-        self.assertEqual(len(tx.transaction.operations), 4)
-        last = tx.transaction.operations[-1]
-        self.assertEqual((last.master_weight, last.low_threshold, last.med_threshold, last.high_threshold), (0, 2, 2, 2))
-        tx2 = wa.prepare(state(), "setup-admin", "testnet", members=KEYS[:3])
-        self.assertEqual(tx2.transaction.operations[-1].master_weight, 1)
-        with self.assertRaises((ValueError, argparse.ArgumentTypeError)):
-            wa.prepare(state(), "setup-admin", "testnet", members=[KEYS[1]] * 3)
-
     def test_admin_candidate_exact_admission(self):
         value = state()
         with self.assertRaises(ValueError):
@@ -178,12 +92,6 @@ class NativeAdmin(unittest.TestCase):
         value["signers"][1]["weight"] = 2
         with self.assertRaises(ValueError):
             wa.admin(value, KEYS[1:4])
-
-    def test_bad_identity_and_fee(self):
-        with self.assertRaises((ValueError, argparse.ArgumentTypeError)):
-            wa.prepare(state(), "setup-wallet", "testnet", agent=KEYS[0], engine=KEYS[2])
-        with self.assertRaises((ValueError, argparse.ArgumentTypeError)):
-            wa.prepare(state(), "setup-wallet", "testnet", agent=KEYS[1], engine=KEYS[2], fee=1_000_000)
 
 
 class ContractAdmin(unittest.TestCase):
@@ -393,22 +301,6 @@ class ContractAdmin(unittest.TestCase):
             ca.checked_args("set_admin", {"owner": contract, "version": 0}, "parent")
         with self.assertRaises(ValueError):
             ca.checked_args("recover", {"recipient": KEYS[1], "amount": 0, "version": 0}, "wallet")
-
-    def test_cli_address_errors_do_not_echo_input(self):
-        scripts = Path(__file__).resolve().parents[1]
-        invalid_input = "invalid-private-input-for-test"
-        cases = [
-            ("wallet_admin.py", ["inspect", "--account", invalid_input]),
-            ("wallet_admin.py", ["setup-wallet", "--account", KEYS[0], "--agent", invalid_input]),
-            ("wallet_admin.py", ["setup-admin", "--account", KEYS[0], "--member", invalid_input]),
-            ("contract_admin.py", ["read", "--source", invalid_input]),
-            ("contract_admin.py", ["deploy-parent", "--source", KEYS[0], "--member", invalid_input]),
-        ]
-        for script, arguments in cases:
-            result = subprocess.run([sys.executable, str(scripts / script)] + arguments, capture_output=True, text=True)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertNotIn(invalid_input, result.stdout + result.stderr)
-            self.assertIn("Expected a public Stellar G address", result.stderr)
 
     def test_cli_preparation_cannot_submit(self):
         args = SimpleNamespace(network="testnet", allow_mainnet=False, action="upload", source=KEYS[0], wasm="artifact.wasm")
@@ -1193,33 +1085,6 @@ class ContractAdmin(unittest.TestCase):
             wasm = (ROOT / "target/wasm32v1-none/release" / ("allowit_" + name + ".wasm")).read_bytes()
             self.assertEqual(ca.custody_layout(wasm), ca.WALLET_CONTRACT_VERSION)
         self.assertIsNone(ca.custody_layout((ROOT / "target/wasm32v1-none/release/allowit_wallet_engine.wasm").read_bytes()))
-
-    def test_recover_prepares_without_reading_state(self):
-        contract = StrKey.encode_contract(bytes([2]) * 32)
-        calls = []
-
-        def cli(args, input_data=None):
-            calls.append(args)
-            if args[-1] == "state":
-                # A version 1 State under version 2 code: state() fails with InvalidState.
-                raise subprocess.CalledProcessError(1, args, stderr="Error(Contract, #1)")
-            return "raw-xdr"
-
-        argv = ["contract_admin.py", "admin", "--source", KEYS[0], "--contract", contract, "--method", "recover",
-                "--arguments", json.dumps({"recipient": KEYS[1], "amount": 5})]
-        with patch.object(sys, "argv", argv), patch.object(ca, "fetch", return_value=state()), \
-                patch.object(ca, "cli_run", side_effect=cli), patch.object(ca, "prepare_xdr", return_value="assembled") as prepared, \
-                patch.object(sys, "stdout", new_callable=StringIO) as output:
-            ca.main()
-        self.assertEqual(output.getvalue().strip(), "assembled")
-        self.assertEqual([call[-1] for call in calls], ["5"])
-        self.assertEqual(prepared.call_args.kwargs["candidate"], None)
-        # Other owner methods still check the current state and fail closed.
-        argv[argv.index("recover")] = "set_pause"
-        argv[-1] = json.dumps({"paused": True, "deployment_version": 1})
-        with patch.object(sys, "argv", argv), patch.object(ca, "fetch", return_value=state()), \
-                patch.object(ca, "cli_run", side_effect=cli), self.assertRaises(subprocess.CalledProcessError):
-            ca.main()
 
     def test_secrets_and_hashes_reject(self):
         with self.assertRaises((ValueError, argparse.ArgumentTypeError)):

@@ -1,5 +1,5 @@
-#!/usr/bin/env python3
-"""Prepare explicit Stellar contract setup/admin XDR. Never signs or submits."""
+"""Contract setup and administration checks of the release scripts. They never sign or submit. The
+command-line tool is the Rust binary `allowit-stellar-admin` (see docs/admin.md)."""
 import argparse
 import copy
 import hashlib
@@ -12,7 +12,7 @@ import subprocess
 import sys
 from pathlib import Path
 from stellar_sdk import Address, Network, xdr, StrKey, TransactionEnvelope, InvokeHostFunction, Preconditions, TimeBounds, scval
-from wallet_admin import admin as verify_admin, fetch, owner_only, PASSPHRASE
+from wallet_admin import PASSPHRASE
 # Source admission is loaded only when authoring is requested. Native XDR/readback and
 # Testnet release signing must not resolve or execute authoring tooling with a signing key.
 def checked_code(*args, **kwargs):
@@ -521,71 +521,3 @@ def command(args):
         policy_rules(values["deployment"], getattr(args, "tier", None), getattr(args, "policy_source", None))
         wallet_code(values["deployment"]["wasm_hash"], getattr(args, "wasm", None))
     return ["contract", "invoke", "--id", args.contract, "--build-only"] + base + ["--", args.method] + serialize(values)
-
-
-def main():
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("action", choices=["upload", "deploy-parent", "deploy-wallet", "read", "admin"])
-    p.add_argument("--network", choices=["testnet", "mainnet"], default="testnet")
-    p.add_argument("--allow-mainnet", action="store_true")
-    p.add_argument("--source", required=True, type=account)
-    for flag in ("wasm", "wasm-hash", "engine-wasm", "owner", "agent", "engine", "asset", "policy-instance", "config", "contract", "method"):
-        p.add_argument("--" + flag)
-    p.add_argument("--family", choices=["wallet", "parent"], default="wallet")
-    p.add_argument("--tier", choices=TIERS, help="Wallet tier of an owner packet: simple, common or custom")
-    p.add_argument("--policy-source", help="Authored policy source file; Common rules are its standard prefix")
-    p.add_argument("--member", action="append", default=[], type=account, help="Exactly three public members of the native parent admin")
-    p.add_argument("--candidate-member", action="append", default=[], type=account, help="Three admitted members for parent admin handoff candidate")
-    p.add_argument("--max-fee", type=int, default=10_000_000, help="Maximum total/resource fee in stroops; default 1 XLM")
-    p.add_argument("--arguments", default="{}", help="Public argument JSON; never keys or credentials")
-    args = p.parse_args()
-    prepared = command(args)
-    if args.action == "deploy-parent" or args.action == "admin" and args.family == "parent":
-        verify_admin(fetch(args.network, args.source), args.member)
-        if args.action == "admin" and args.method == "set_admin":
-            verify_admin(fetch(args.network, public_json(args.arguments)["owner"]), args.candidate_member)
-    if args.action == "deploy-wallet" or args.action == "admin" and args.family == "wallet":
-        owner_only(fetch(args.network, args.source))
-
-    # Recover needs no state(): the contract checks its kept owner, under any layout it can read.
-    if args.action == "admin" and not (args.family == "wallet" and args.method == "recover"):
-        state_args = ["contract", "invoke", "--id", args.contract, "--network", args.network,
-                      "--source-account", args.source, "--send=no", "--", "state"]
-        state = json.loads(cli_run(state_args))
-        authority = state["owner"]
-        if args.family == "wallet":
-            values = public_json(args.arguments)
-            if args.method == "deploy_policy":
-                wallet_layout(state)
-                policy = values["deployment"]
-                roles = {key: policy[key] for key in ("owner", "agent", "server")}
-                if len(set(roles.values())) != 3 or args.contract in roles.values():
-                    raise ValueError("Owner, agent, server and policy wallet must be distinct")
-                if roles["owner"] != state["owner"]:
-                    owner_only(fetch(args.network, account(roles["owner"])))
-        if args.source != authority:
-            raise ValueError("Source is not the contract's current owner/admin")
-        values = public_json(args.arguments)
-        if args.family == "parent":
-            if values["version"] != state["version"]:
-                raise ValueError("Expected version does not match current state")
-        else:
-            target = values["deployment"]["deployment_version"] if args.method == "deploy_policy" else values["deployment_version"]
-            if target != state["deployment_version"] + 1:
-                raise ValueError("Policy deployment must use the next version")
-    output = cli_run(prepared)
-    candidate = None
-    if args.action == "admin" and args.method == "set_admin":
-        candidate = public_json(args.arguments)["owner"]
-    elif args.action == "admin" and args.method == "deploy_policy":
-        next_owner = public_json(args.arguments)["deployment"]["owner"]
-        if next_owner != authority:
-            candidate = next_owner
-    print(output if args.action == "read" else prepare_xdr(output, args.source, args.network, max_fee=args.max_fee, candidate=candidate, expected_wasm=args.wasm_hash if args.action.startswith("deploy-") else None))
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except (ValueError, KeyError, TypeError, argparse.ArgumentTypeError) as error:
-        raise SystemExit(str(error)) from None
