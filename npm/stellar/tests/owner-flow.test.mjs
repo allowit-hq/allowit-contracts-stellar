@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import test, {beforeEach} from 'node:test';
 import {Account, Keypair, Networks, Operation, TransactionBuilder} from '@stellar/stellar-sdk/base';
 import {installAndFund as flow, ownerArchiveKey, OwnerFlowError} from '../dist/owner-flow.js';
 
 const network = 'stellar:testnet';
-const installAndFund = input => flow({network, ...input});
+const installAndFund = input => flow({network, historyPauseMs: 0, ...input});
+/** History holds every asked transaction as successful in ledger 7, unless a test replaces it. */
+const settledHistory = async url => new Response(JSON.stringify({hash: new URL(url).pathname.split('/').pop(), ledger: 7, successful: true}));
+beforeEach(() => { globalThis.fetch = settledHistory; });
 
 const policyId = 'policy-1', key = 'flow:owner:1', agent = 'GAGENT', amount = '5';
 const hash = n => String(n).repeat(64).slice(0, 64);
@@ -66,6 +69,7 @@ function expired(action) {
     const seen = [];
     globalThis.fetch = async url => {
       const path = new URL(url).pathname;
+      if (path.startsWith('/transactions/') && !path.endsWith(txHash)) return settledHistory(url);
       seen.push(path);
       const reply = path === '/' ? replies.root : path.startsWith('/transactions/') ? replies.transaction : replies.account;
       if (reply === undefined) throw new Error('offline');
@@ -154,11 +158,11 @@ test('one workflow runs per journal key, so a second call never signs', async ()
 test('a saved step that already settled is done without a second signature', async () => {
   const saved = {step: savedStep('fund', 5), signedPayload: 'signed-fund-5'};
   const signed = [], journal = journalOf({[key]: JSON.stringify(saved)});
-  const {ask, state} = service({submit: () => { throw refusal('owner_transaction_settled', {policyId, action: 'fund', transactionHash: hash(5), ledger: 42}); }});
+  const {ask, state} = service({submit: () => { throw refusal('owner_transaction_settled', {policyId, action: 'fund', transactionHash: hash(5), ledger: 7}); }});
   state.installed = true;
   const result = await installAndFund({ask, sign: signer(signed), journal, key, policyId, agent, amount, onStep() {}});
   assert.deepEqual(signed, []);
-  assert.deepEqual(result.receipts, [{policyId, action: 'fund', status: 'confirmed', transactionHash: hash(5), ledger: 42}]);
+  assert.deepEqual(result.receipts, [{policyId, action: 'fund', status: 'confirmed', transactionHash: hash(5), ledger: 7}]);
   assert.deepEqual(JSON.parse(journal.get(`${key}:funded`)), {policyId, agent, amount});
 });
 
@@ -225,7 +229,7 @@ test('a failed transaction is replaced only when the chain holds that exact fail
     if (body.payload === pending.signedPayload) throw refusal('owner_transaction_failed', {policyId, action: 'create_wallet', transactionHash: hash(5), ledger: 9});
     return confirmed(body);
   };
-  const chain = reply => { globalThis.fetch = async () => { if (!reply) throw new Error('offline'); return new Response(JSON.stringify(reply.body), {status: reply.status ?? 200}); }; };
+  const chain = reply => { globalThis.fetch = async url => { if (!url.endsWith(hash(5))) return settledHistory(url); if (!reply) throw new Error('offline'); return new Response(JSON.stringify(reply.body), {status: reply.status ?? 200}); }; };
   for (const unproven of [null, {status: 404, body: {}}, {body: {hash: hash(5), ledger: 9, successful: true}}, {body: {hash: hash(5), ledger: 8, successful: false}}, {body: {hash: hash(6), ledger: 9, successful: false}}]) {
     chain(unproven);
     const signed = [], journal = journalOf({[key]: JSON.stringify(pending)});
@@ -242,4 +246,34 @@ test('a failed transaction is replaced only when the chain holds that exact fail
   assert.deepEqual(signed, ['create_wallet', 'fund']);
   assert.equal(result.wallet, 'CWALLET');
   assert.deepEqual(JSON.parse(journal.get(ownerArchiveKey(key, hash(5)))), {step: pending.step, signedPayload: pending.signedPayload});
+});
+
+test('a confirmation is trusted only when history holds that successful transaction', async () => {
+  const history = replies => { let n = 0; globalThis.fetch = async url => { const reply = replies[Math.min(n++, replies.length - 1)]; if (!reply) throw new Error('offline'); return new Response(JSON.stringify(reply.body ?? {hash: new URL(url).pathname.split('/').pop(), ledger: 7, successful: true}), {status: reply.status ?? 200}); }; };
+  for (const unproven of [[null], [{status: 404}], [{status: 500}], [{body: {hash: hash(1), ledger: 7, successful: false}}], [{body: {hash: hash(1), ledger: 8, successful: true}}], [{body: {hash: hash(2), ledger: 7, successful: true}}]]) {
+    history(unproven);
+    const signed = [], journal = journalOf();
+    const {ask} = service({submit: confirmed});
+    await assert.rejects(installAndFund({ask, sign: signer(signed), journal, key, policyId, agent, amount, onStep() {}}),
+      error => error instanceof OwnerFlowError && error.retry === true && /could not be checked/.test(error.message));
+    // The signed bytes stay saved and nothing is marked as funded.
+    assert.deepEqual(signed, ['create_wallet']);
+    assert.equal(JSON.parse(journal.get(key)).signedPayload, 'signed-create_wallet-1');
+    assert.equal(journal.get(`${key}:funded`), null);
+  }
+  // History that trails the network by one read still settles the step.
+  history([{status: 404}, {}]);
+  const signed = [], journal = journalOf();
+  const {ask} = service({submit: confirmed});
+  const result = await installAndFund({ask, sign: signer(signed), journal, key, policyId, agent, amount, onStep() {}});
+  assert.deepEqual(result.receipts.map(r => [r.action, r.ledger]), [['create_wallet', 7], ['fund', 7]]);
+  // A settled reply that history does not confirm keeps the saved funding and records nothing.
+  history([{body: {hash: hash(5), ledger: 7, successful: false}}]);
+  const pending = {step: savedStep('fund', 5), signedPayload: 'signed-fund-5', policyId, agent, amount};
+  const kept = journalOf({[key]: JSON.stringify(pending)});
+  const settled = service({submit: () => { throw refusal('owner_transaction_settled', {policyId, action: 'fund', transactionHash: hash(5), ledger: 7}); }});
+  settled.state.installed = true;
+  await assert.rejects(installAndFund({ask: settled.ask, sign: signer([]), journal: kept, key, policyId, agent, amount, onStep() {}}), error => error.retry === true);
+  assert.deepEqual(JSON.parse(kept.get(key)), pending);
+  assert.equal(kept.get(`${key}:funded`), null);
 });

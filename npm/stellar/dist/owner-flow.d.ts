@@ -25,6 +25,8 @@ export type OwnerReceipt = {
 export interface InstallAndFundInput {
     /** The network of the policy. */
     network: string;
+    /** Milliseconds between reads of a transaction that history does not hold yet. The default is 1500. */
+    historyPauseMs?: number;
     ask: Ask;
     sign: SignStep;
     journal: OwnerJournal;
@@ -55,7 +57,8 @@ export declare function ownerArchiveKey(key: string, hash: string): string;
  * Install the reviewed policy wallet, then fund it. The service prepares each owner step and the host signs it.
  * Signed bytes enter the journal before they are sent, so a reload sends the same signature and never signs a step
  * twice. A saved step is settled first:
- * - confirmed, or `owner_transaction_settled` for the same hash: the step is done;
+ * - confirmed, or `owner_transaction_settled` for the same hash: the step is done once the chain holds that
+ *   successful transaction. Until then it stays saved and the error has `retry` set;
  * - `owner_transaction_expired`: the chain decides. When the transaction applied before its time bound, the step is
  *   done. When the chain proves that it never applied, its signed bytes move to the archive key and the owner signs
  *   a new step. When the chain cannot be read, the step stays saved and the error has `retry` set;

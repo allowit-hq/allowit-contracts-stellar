@@ -44,6 +44,40 @@ const HORIZON = {
     'stellar:testnet': 'https://horizon-testnet.stellar.org',
     'stellar:pubnet': 'https://horizon.stellar.org',
 };
+/** Every Horizon read ends after this time, so a stalled read never holds the workflow lock. */
+const HORIZON_TIMEOUT_MS = 15_000;
+/** A read of the public ledger history. A failed or stalled read is null. */
+async function horizonGet(network, path) {
+    const base = HORIZON[canonicalNetwork(network) ?? ''];
+    if (!base)
+        return null;
+    try {
+        return await fetch(`${base}${path}`, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(HORIZON_TIMEOUT_MS) });
+    }
+    catch {
+        return null;
+    }
+}
+const unverified = () => new OwnerFlowError('The network record of the signed step could not be checked. It stays saved; resume to check it again.', null, true);
+/**
+ * The ledger in which the chain holds this transaction as successful. The service's word alone never clears a
+ * signed step or records a funding. History can trail the network by a few seconds, so a missing record is read again.
+ */
+async function settledLedger(network, step, ledger, pause) {
+    for (let attempt = 0; attempt < 5; attempt++) {
+        if (attempt)
+            await new Promise(resolve => setTimeout(resolve, pause));
+        const response = await horizonGet(network, `/transactions/${step.hash}`);
+        if (response?.status === 404)
+            continue;
+        const chain = response?.ok ? await response.json().catch(() => null) : null;
+        if (!object(chain) || chain.hash !== step.hash || chain.successful !== true || !Number.isSafeInteger(chain.ledger)
+            || chain.ledger <= 0 || ledger !== undefined && chain.ledger !== ledger)
+            break;
+        return chain.ledger;
+    }
+    throw unverified();
+}
 const unchecked = () => new OwnerFlowError('The expired signed step could not be checked on the network. It stays saved; resume to check it again.', OWNER_TRANSACTION_EXPIRED, true);
 /**
  * What the chain holds for a signed step past its time bound: its ledger when it applied, or null when it can
@@ -52,9 +86,6 @@ const unchecked = () => new OwnerFlowError('The expired signed step could not be
  * holds none while the source account sequence is still below the transaction's sequence. Anything else throws.
  */
 async function expiredRecord(network, step, signedPayload) {
-    const base = HORIZON[canonicalNetwork(network) ?? ''];
-    if (!base)
-        throw unchecked();
     let source, sequence;
     try {
         const envelope = TransactionBuilder.fromXDR(signedPayload, networkPassphrase(network));
@@ -68,12 +99,10 @@ async function expiredRecord(network, step, signedPayload) {
         throw unchecked();
     }
     const read = async (path) => {
-        try {
-            return await fetch(`${base}${path}`, { headers: { Accept: 'application/json' } });
-        }
-        catch {
+        const response = await horizonGet(network, path);
+        if (!response)
             throw unchecked();
-        }
+        return response;
     };
     const json = async (response) => {
         const value = await response.json().catch(() => null);
@@ -143,23 +172,18 @@ function funded(journal, fundedKey, identity) {
 }
 /** True when Horizon holds this transaction as failed in the ledger that the service named. */
 async function failedOnChain(network, step, ledger) {
-    const base = HORIZON[canonicalNetwork(network) ?? ''];
-    if (!base || !Number.isSafeInteger(ledger))
+    if (!Number.isSafeInteger(ledger))
         return false;
-    try {
-        const response = await fetch(`${base}/transactions/${step.hash}`, { headers: { Accept: 'application/json' } });
-        const chain = response.ok ? await response.json() : null;
-        return object(chain) && chain.hash === step.hash && chain.ledger === ledger && chain.successful === false;
-    }
-    catch {
-        return false;
-    }
+    const response = await horizonGet(network, `/transactions/${step.hash}`);
+    const chain = response?.ok ? await response.json().catch(() => null) : null;
+    return object(chain) && chain.hash === step.hash && chain.ledger === ledger && chain.successful === false;
 }
 /**
  * Install the reviewed policy wallet, then fund it. The service prepares each owner step and the host signs it.
  * Signed bytes enter the journal before they are sent, so a reload sends the same signature and never signs a step
  * twice. A saved step is settled first:
- * - confirmed, or `owner_transaction_settled` for the same hash: the step is done;
+ * - confirmed, or `owner_transaction_settled` for the same hash: the step is done once the chain holds that
+ *   successful transaction. Until then it stays saved and the error has `retry` set;
  * - `owner_transaction_expired`: the chain decides. When the transaction applied before its time bound, the step is
  *   done. When the chain proves that it never applied, its signed bytes move to the archive key and the owner signs
  *   a new step. When the chain cannot be read, the step stays saved and the error has `retry` set;
@@ -190,7 +214,7 @@ export async function installAndFund(input) {
         running.delete(name);
     }
 }
-async function run({ network, ask, sign, journal, key, policyId, agent, amount, onStep }) {
+async function run({ network, ask, sign, journal, key, policyId, agent, amount, onStep, historyPauseMs = 1_500 }) {
     if (!canonicalNetwork(network))
         throw new OwnerFlowError('Select a supported Stellar network.', null, false);
     const receipts = [];
@@ -215,8 +239,8 @@ async function run({ network, ask, sign, journal, key, policyId, agent, amount, 
             // A typed refusal settles the saved step only when it names that exact transaction.
             const same = about.transactionHash === step.hash && (about.policyId === undefined || about.policyId === policyId);
             if (code === OWNER_TRANSACTION_SETTLED && same) {
-                done(step, { policyId, action: step.action, status: 'confirmed', transactionHash: step.hash,
-                    ...(Number.isSafeInteger(about.ledger) ? { ledger: about.ledger } : {}) });
+                const ledger = await settledLedger(network, step, Number.isSafeInteger(about.ledger) ? about.ledger : undefined, historyPauseMs);
+                done(step, { policyId, action: step.action, status: 'confirmed', transactionHash: step.hash, ledger });
                 return true;
             }
             if (code === OWNER_TRANSACTION_EXPIRED && same) {
@@ -247,7 +271,8 @@ async function run({ network, ask, sign, journal, key, policyId, agent, amount, 
         if (!object(receipt) || receipt.policyId !== policyId || receipt.action !== step.action || receipt.status !== 'confirmed'
             || receipt.transactionHash !== step.hash)
             throw new OwnerFlowError('The network did not confirm the signed owner step.', null, false);
-        done(step, receipt);
+        const ledger = await settledLedger(network, step, receipt.ledger, historyPauseMs);
+        done(step, { ...receipt, ledger });
         return true;
     };
     const pending = saved(journal, key, identity);

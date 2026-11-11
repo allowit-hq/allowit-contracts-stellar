@@ -23,7 +23,8 @@ The plugin also supplies `walletKinds(network)`, `walletKind(document)`, `native
 returns `native`, `simple`, `standard` or `custom`; the tier `common` is the `standard` kind.
 `review` holds the Review and sign link: `fragment`, `parseLink`, `agentPrompt` and `paramLines`.
 `ownerWorkflow.installAndFund` installs and funds the reviewed wallet. One workflow runs per journal key.
-It settles a saved signed step first. `owner_transaction_settled` completes it. On `owner_transaction_expired`
+It settles a saved signed step first. A confirmation or `owner_transaction_settled` completes it once Horizon holds
+that successful transaction; every Horizon read ends after 15 s. On `owner_transaction_expired`
 Horizon decides: a transaction that applied completes the step, proof that it never applied archives its signed
 bytes and lets the owner sign a new step, and an unreadable chain keeps the step. `owner_transaction_failed` archives the step when Horizon holds that failed transaction. `owner_transaction_pending`
 and `network_unavailable` keep the step for a retry (`OwnerFlowError.retry`). A saved step and the funded marker name
