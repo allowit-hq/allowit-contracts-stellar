@@ -3,23 +3,8 @@ export interface Session {
     network: string;
     expiresAt: string;
 }
-export type StellarNetwork = 'stellar:testnet' | 'stellar:mainnet' | 'stellar:pubnet';
-export declare const STELLAR_NETWORKS: {
-    readonly 'stellar:testnet': {
-        readonly label: "Testnet";
-        readonly passphrase: "Test SDF Network ; September 2015";
-    };
-    readonly 'stellar:mainnet': {
-        readonly label: "Mainnet";
-        readonly passphrase: "Public Global Stellar Network ; September 2015";
-    };
-    readonly 'stellar:pubnet': {
-        readonly label: "Mainnet";
-        readonly passphrase: "Public Global Stellar Network ; September 2015";
-    };
-};
-/** A checksummed G address proves a key identity. Account thresholds are checked by the SDK/RPC adapter. */
-export declare function stellarAccountKey(address: string): Uint8Array;
+import { STELLAR_NETWORKS, stellarAccountKey, stellarAssetContractId, type StellarNetwork } from './stellar-asset.js';
+export { STELLAR_NETWORKS, stellarAccountKey, stellarAssetContractId, type StellarNetwork };
 /** SEP-53 signs the prefixed digest. It never signs a transaction or authorizes spending. */
 export declare function stellarMessageDigest(message: string): Uint8Array;
 export declare function freighterAvailable(): Promise<boolean>;
@@ -53,8 +38,6 @@ export declare function connectStellarWallet(network: StellarNetwork, admitTimes
 export declare function signStellarTransaction(transactionXdr: string, owner: string, network: StellarNetwork, retain?: (signedXdr: string) => void | Promise<void>): Promise<string>;
 export declare function watchStellarAccount(owner: string, changed: () => void): () => void;
 export declare const canonicalApprovalJson: (value: unknown) => string;
-/** Stellar Asset Contract for an exact asset code, issuer and network. A null issuer means native XLM; issued XLM keeps its issuer. */
-export declare function stellarAssetContractId(code: string, issuer: string | null, network: StellarNetwork): string;
 /** The owner approves an exact Native source against current account administration authority. */
 export declare function signStellarSourceApproval(approval: {
     payload: Record<string, unknown>;

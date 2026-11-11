@@ -91,3 +91,16 @@ test('expiry shows local time and the time left', () => {
   assert.match(expiry(1_000 + 7_200, 1_000_000), /2 h 0 min left/);
   assert.match(expiry(1, 10_000), /expired/);
 });
+
+test('the asset contract equals the Stellar SDK Asset.contractId for native and one issued asset', async () => {
+  const {Asset, Networks} = await import('@stellar/stellar-sdk/base');
+  const {stellarAssetContract} = await import('../dist/stellar-asset.js');
+  const issuer = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
+  assert.equal(stellarAssetContract('XLM', null, Networks.TESTNET), Asset.native().contractId(Networks.TESTNET));
+  assert.equal(stellarAssetContract('XLM', null, Networks.TESTNET), 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC');
+  assert.equal(stellarAssetContract('USDC', issuer, Networks.TESTNET), new Asset('USDC', issuer).contractId(Networks.TESTNET));
+  assert.equal(stellarAssetContract('USDC', issuer, Networks.TESTNET), 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA');
+  // An issued XLM is not native XLM, and a native asset has no other code.
+  assert.notEqual(stellarAssetContract('XLM', issuer, Networks.TESTNET), stellarAssetContract('XLM', null, Networks.TESTNET));
+  assert.throws(() => stellarAssetContract('USDC', null, Networks.TESTNET), /invalid/);
+});

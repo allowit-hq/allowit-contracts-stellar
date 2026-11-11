@@ -3,34 +3,8 @@ import freighter from '@stellar/freighter-api';
 import {ed25519} from '@noble/curves/ed25519';
 import {sha256} from '@noble/hashes/sha256';
 export interface Session {address: string; network: string; expiresAt: string}
-import {stellarAssetContract} from './stellar-asset.js';
-
-export type StellarNetwork = 'stellar:testnet' | 'stellar:mainnet' | 'stellar:pubnet';
-export const STELLAR_NETWORKS = {
-  'stellar:testnet': {label: 'Testnet', passphrase: 'Test SDF Network ; September 2015'},
-  'stellar:mainnet': {label: 'Mainnet', passphrase: 'Public Global Stellar Network ; September 2015'},
-  'stellar:pubnet': {label: 'Mainnet', passphrase: 'Public Global Stellar Network ; September 2015'},
-} as const;
-
-/** A checksummed G address proves a key identity. Account thresholds are checked by the SDK/RPC adapter. */
-export function stellarAccountKey(address: string): Uint8Array {
-  if (!/^G[A-Z2-7]{55}$/.test(address)) throw new Error('Use a valid Stellar account.');
-  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-  const bytes: number[] = [];
-  let value = 0, bits = 0;
-  for (const char of address) {
-    value = (value << 5) | alphabet.indexOf(char); bits += 5;
-    if (bits >= 8) {bits -= 8; bytes.push((value >>> bits) & 255);}
-  }
-  if (bytes.length !== 35 || bytes[0] !== 48 || bits !== 0) throw new Error('Use a valid Stellar account.');
-  let crc = 0;
-  for (const byte of bytes.slice(0, 33)) {
-    crc ^= byte << 8;
-    for (let i = 0; i < 8; i++) crc = ((crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1) & 0xffff;
-  }
-  if (bytes[33] !== (crc & 255) || bytes[34] !== (crc >>> 8)) throw new Error('Use a valid Stellar account.');
-  return new Uint8Array(bytes.slice(1, 33));
-}
+import {STELLAR_NETWORKS, stellarAccountKey, stellarAssetContractId, type StellarNetwork} from './stellar-asset.js';
+export {STELLAR_NETWORKS, stellarAccountKey, stellarAssetContractId, type StellarNetwork};
 
 /** SEP-53 signs the prefixed digest. It never signs a transaction or authorizes spending. */
 export function stellarMessageDigest(message: string): Uint8Array {
@@ -140,10 +114,6 @@ const APPROVAL_PAYLOAD_KEYS = ['version','policyId','revision','network','wallet
 const PORTABLE_APPROVAL_KEYS = [...APPROVAL_PAYLOAD_KEYS, 'language', 'tier', 'rules', 'params', 'paramsHash'];
 const exactPayload = (value: unknown, keys: readonly string[]) => !!value && typeof value === 'object' && !Array.isArray(value)
   && Object.keys(value).length === keys.length && Object.keys(value).every(key => keys.includes(key));
-/** Stellar Asset Contract for an exact asset code, issuer and network. A null issuer means native XLM; issued XLM keeps its issuer. */
-export function stellarAssetContractId(code: string, issuer: string | null, network: StellarNetwork): string {
-  return stellarAssetContract(code, issuer === null ? null : stellarAccountKey(issuer), STELLAR_NETWORKS[network].passphrase);
-}
 /** The owner approves an exact Native source against current account administration authority. */
 export async function signStellarSourceApproval(approval: {payload:Record<string,unknown>;message:string;method:string}, policy: {id: string; revision: number; language?:string; network?:string; sourceHash?:string; irHash?:string; code?:string;mint?:string;token?:string;runtime?:{instanceBinding?:Record<string,unknown>}}, session: Session, stillCurrent:()=>boolean=()=>true): Promise<{signer:string;signature:number[]}[]> {
   const current=()=>{if(!stillCurrent())throw new Error('The owner, network or policy changed. Nothing was activated.');};

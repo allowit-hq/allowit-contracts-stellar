@@ -1,40 +1,29 @@
-import {sha256} from '@noble/hashes/sha256';
+import {Asset, Networks, StrKey} from '@stellar/stellar-sdk/base';
 
-const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-// XDR constants: ENVELOPE_TYPE_CONTRACT_ID, CONTRACT_ID_PREIMAGE_FROM_ASSET and the C strkey version byte (2 << 3).
-const ENVELOPE_TYPE_CONTRACT_ID = 8, FROM_ASSET = 1, CONTRACT_VERSION = 2 << 3;
-const int32 = (value: number) => [(value >>> 24) & 255, (value >>> 16) & 255, (value >>> 8) & 255, value & 255];
-function crc16(bytes: number[]): number {
-  let crc = 0;
-  for (const byte of bytes) {
-    crc ^= byte << 8;
-    for (let i = 0; i < 8; i++) crc = ((crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1) & 0xffff;
-  }
-  return crc;
-}
-function base32(bytes: number[]): string {
-  let value = 0, bits = 0, out = '';
-  for (const byte of bytes) {
-    value = (value << 8) | byte; bits += 8;
-    while (bits >= 5) {bits -= 5; out += ALPHABET[(value >>> bits) & 31];}
-  }
-  return out;
+export type StellarNetwork = 'stellar:testnet' | 'stellar:mainnet' | 'stellar:pubnet';
+/** The one Stellar network table. Passphrases come from the Stellar SDK. `stellar:pubnet` is the canonical Mainnet id. */
+export const STELLAR_NETWORKS = Object.freeze({
+  'stellar:testnet': {label: 'Testnet', passphrase: Networks.TESTNET},
+  'stellar:mainnet': {label: 'Mainnet', passphrase: Networks.PUBLIC},
+  'stellar:pubnet': {label: 'Mainnet', passphrase: Networks.PUBLIC},
+} as const);
+
+/** A checksummed G address proves a key identity. Account thresholds are checked by the SDK/RPC adapter. */
+export function stellarAccountKey(address: string): Uint8Array {
+  if (typeof address !== 'string' || !StrKey.isValidEd25519PublicKey(address)) throw new Error('Use a valid Stellar account.');
+  return new Uint8Array(StrKey.decodeEd25519PublicKey(address));
 }
 
 /**
- * Stellar Asset Contract address for an exact asset code, issuer key and network passphrase. A null issuer means native
- * XLM. Codes are byte-exact, so an issued `XLM` differs from native XLM. Pure: no SDK, wallet or network dependency.
+ * Stellar Asset Contract address for an exact asset code, issuer account and network passphrase. A null issuer means
+ * native XLM. Codes are byte-exact, so an issued `XLM` differs from native XLM.
  */
-export function stellarAssetContract(code: string, issuerKey: Uint8Array | null, passphrase: string): string {
-  if (!/^[A-Za-z0-9]{1,12}$/.test(code) || (issuerKey === null ? code !== 'XLM' : issuerKey.length !== 32)) throw new Error('The Stellar asset code or issuer is invalid.');
-  const width = code.length <= 4 ? 4 : 12;
-  const asset = issuerKey === null ? int32(0) : [
-    ...int32(width === 4 ? 1 : 2),
-    ...Array.from(code, char => char.charCodeAt(0)), ...new Array<number>(width - code.length).fill(0),
-    ...int32(0), ...issuerKey,
-  ];
-  const preimage = [...int32(ENVELOPE_TYPE_CONTRACT_ID), ...sha256(new TextEncoder().encode(passphrase)), ...int32(FROM_ASSET), ...asset];
-  const payload = [CONTRACT_VERSION, ...sha256(Uint8Array.from(preimage))];
-  const crc = crc16(payload);
-  return base32([...payload, crc & 255, crc >>> 8]);
+export function stellarAssetContract(code: string, issuer: string | null, passphrase: string): string {
+  if (typeof code !== 'string' || !/^[A-Za-z0-9]{1,12}$/.test(code) || (issuer === null ? code !== 'XLM' : !StrKey.isValidEd25519PublicKey(issuer)))
+    throw new Error('The Stellar asset code or issuer is invalid.');
+  return (issuer === null ? Asset.native() : new Asset(code, issuer)).contractId(passphrase);
+}
+/** Stellar Asset Contract for an exact asset code, issuer and network. A null issuer means native XLM; issued XLM keeps its issuer. */
+export function stellarAssetContractId(code: string, issuer: string | null, network: StellarNetwork): string {
+  return stellarAssetContract(code, issuer, STELLAR_NETWORKS[network].passphrase);
 }

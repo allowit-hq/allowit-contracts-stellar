@@ -25,7 +25,7 @@ export declare const NETWORKS: readonly RailNetwork[];
 /** The canonical network id for an id or alias, or null. */
 export declare function canonicalNetwork(network: unknown): string | null;
 export declare function networkPassphrase(network: string): string;
-/** StrKey decoding with its checksum. Returns the version byte and the 32-byte key, or null. */
+/** StrKey decoding with its checksum, through the Stellar SDK. Returns the version byte and the 32-byte key, or null. */
 export declare function strkey(text: unknown): {
     version: number;
     key: Uint8Array;

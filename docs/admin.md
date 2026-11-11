@@ -75,7 +75,16 @@ as macros other than the assertion and `matches!` macros, writes to `ctx.env`, t
 and args, list methods, indexing other than `ctx.params[key]` and pointer-width methods. Simple and Common store only standard
 state, so the tool rejects their packets when the source calls `allowit::set_state`. It also runs the std-only
 compile described there, so it needs `rustc`. For `--tier custom`, also build the
-reviewed custom Wasm from the same file, which is the Soroban compile.
+reviewed custom Wasm from the same file, which is the Soroban compile:
+
+```sh
+scripts/build-custom-policy.sh POLICY.rs OUT_DIR
+```
+
+The script builds the committed tree with `POLICY.rs` as `contracts/allowit-custom-policy/policy/policy.rs`
+and leaves the checkout unchanged. It prints one JSON line with `source_digest` (the SHA-256 of
+`POLICY.rs`, the wallet `source_digest`), `wasm_hash` (the SHA-256 of the Wasm, the `--wasm-hash`)
+and the `wasm` path. The same revision, source, Rust toolchain and Stellar CLI give the same Wasm.
 
 Params JSON is an object of key => value, at most 32 keys of 1 to 32 ASCII letters, digits or
 underscores. An absent key is unset. The tool infers each value's `AllowitValue` type: an integer is

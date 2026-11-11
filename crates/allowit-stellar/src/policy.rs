@@ -849,6 +849,44 @@ mod tests {
         assert!(shape.canonical_only);
         assert!(!shape.writes_state);
     }
+    /// White paper placements: Simple checks the source on the server and binds no onchain rule.
+    /// Common binds the whole ordered canonical prefix, `tokens` included. Custom compiles the
+    /// source, so it binds the source bytes and no prefix.
+    #[test]
+    fn each_tier_installs_the_rules_of_its_placement() {
+        let all = param_keys().map(String::from).to_vec();
+        assert!(all.contains(&"tokens".to_string()));
+        assert_eq!(tier_rules(PolicyTier::Simple, SOURCE).unwrap(), [""; 0]);
+        assert_eq!(tier_rules(PolicyTier::Common, SOURCE).unwrap(), all);
+        assert_eq!(tier_rules(PolicyTier::Custom, SOURCE).unwrap(), [""; 0]);
+        // A Common source that calls `tokens` binds it in source order; one that omits it does not.
+        let short = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::operations(ctx, &ctx.params[allowit::OPERATIONS])?;\n    allowit::tokens(ctx, &ctx.params[allowit::TOKENS])?;\n    allowit::payment_limit(ctx, &ctx.params[allowit::PAYMENT_LIMIT])?;\n    allowit::destinations(ctx, &ctx.params[allowit::DESTINATIONS])?;\n    Ok(())\n}\n";
+        let rules = tier_rules(PolicyTier::Common, short).unwrap();
+        assert_eq!(
+            rules,
+            ["operations", "tokens", "payment_limit", "destinations"]
+        );
+        let digest = [7u8; 32];
+        let params = PolicyParams::default();
+        // The owner packet must carry exactly the derived prefix: dropping `tokens` is rejected.
+        let without: Vec<String> = rules.iter().filter(|r| *r != "tokens").cloned().collect();
+        assert!(policy_rules(PolicyTier::Common, short, &rules, &digest, &params).is_ok());
+        assert!(policy_rules(PolicyTier::Common, short, &without, &digest, &params).is_err());
+        assert!(policy_rules(PolicyTier::Simple, short, &rules, &digest, &params).is_err());
+        assert!(policy_rules(PolicyTier::Simple, short, &[], &digest, &params).is_ok());
+        // Custom binds the SHA-256 of the source bytes.
+        assert!(policy_rules(PolicyTier::Custom, short, &[], &digest, &params).is_err());
+        assert!(
+            policy_rules(
+                PolicyTier::Custom,
+                short,
+                &[],
+                &hash(short.as_bytes()),
+                &params
+            )
+            .is_ok()
+        );
+    }
     #[test]
     fn only_a_file_of_allowit_uses_and_the_prefix_is_canonical_only() {
         // A local `fn Ok` shadows the prelude constructor, so the compiled policy would deny
