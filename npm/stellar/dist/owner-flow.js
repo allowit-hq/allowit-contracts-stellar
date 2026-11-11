@@ -82,11 +82,12 @@ const unchecked = () => new OwnerFlowError('The expired signed step could not be
 /**
  * What the chain holds for a signed step past its time bound: its ledger when it applied, or null when it can
  * never apply. Expiry stops a later application, not an earlier one, so an expiry reply alone proves nothing.
+ * The time bound is the maximum time of the signed transaction itself; a transaction without one never expires.
  * The step never applied only when Horizon has read past the time bound and either holds the failed transaction or
  * holds none while the source account sequence is still below the transaction's sequence. Anything else throws.
  */
 async function expiredRecord(network, step, signedPayload) {
-    let source, sequence;
+    let source, sequence, validUntil;
     try {
         const envelope = TransactionBuilder.fromXDR(signedPayload, networkPassphrase(network));
         const transaction = 'innerTransaction' in envelope ? envelope.innerTransaction : envelope;
@@ -94,6 +95,11 @@ async function expiredRecord(network, step, signedPayload) {
             throw new Error();
         source = transaction.source;
         sequence = BigInt(transaction.sequence);
+        // The signed bytes decide when the transaction can no longer apply. The step metadata is unsigned.
+        const maxTime = transaction.timeBounds?.maxTime;
+        if (typeof maxTime !== 'string' || !/^[1-9][0-9]{0,11}$/.test(maxTime))
+            throw new Error();
+        validUntil = Number(maxTime);
     }
     catch {
         throw unchecked();
@@ -112,8 +118,9 @@ async function expiredRecord(network, step, signedPayload) {
     };
     const root = await json(await read('/'));
     const closedAt = typeof root.history_latest_ledger_closed_at === 'string' ? Date.parse(root.history_latest_ledger_closed_at) / 1000 : NaN;
-    // Every ledger that can include the transaction closes at or before its time bound. Horizon must have read past it.
-    if (!(closedAt > step.expiresAt))
+    // Every ledger that can include the transaction closes at or before its signed time bound. The clock and Horizon
+    // must both be past it.
+    if (!(Date.now() / 1000 > validUntil) || !(closedAt > validUntil))
         throw unchecked();
     const found = await read(`/transactions/${step.hash}`);
     if (found.status !== 404) {

@@ -58,10 +58,10 @@ test('the happy path installs, funds and never signs a confirmed funding again',
 });
 
 /** A real signed transaction past its time bound, with the chain replies of one scenario. */
-function expired(action) {
+function expired(action, validUntil = Math.floor(Date.now() / 1000) - 60) {
   const owner = Keypair.random();
   const transaction = new TransactionBuilder(new Account(owner.publicKey(), '41'), {fee: '100', networkPassphrase: Networks.TESTNET})
-    .addOperation(Operation.bumpSequence({bumpTo: '0'})).setTimebounds(0, Math.floor(Date.now() / 1000) - 60).build();
+    .addOperation(Operation.bumpSequence({bumpTo: '0'})).setTimebounds(0, validUntil).build();
   transaction.sign(owner);
   const txHash = Buffer.from(transaction.hash()).toString('hex');
   const lost = {step: {action, payload: 'unsigned', hash: txHash, expiresAt: Math.floor(Date.now() / 1000) - 60}, signedPayload: transaction.toXDR()};
@@ -132,6 +132,18 @@ test('an expiry reply without chain proof keeps the saved step and signs nothing
     assert.deepEqual(JSON.parse(journal.get(key)), lost);
     assert.equal(journal.get(ownerArchiveKey(key, txHash)), null);
     assert.equal(journal.get(`${key}:funded`), null);
+  }
+  // The signed time bound decides, not the step metadata: a transaction that is valid for another hour, or that
+  // has no time bound, can still apply, so it is never replaced.
+  for (const validUntil of [Math.floor(Date.now() / 1000) + 3_600, 0]) {
+    const live = expired('fund', validUntil);
+    live.horizon({root: live.past, transaction: {status: 404}, account: live.account('41')});
+    const signed = [], journal = journalOf({[key]: JSON.stringify(live.lost)});
+    const {ask, state} = service({submit: live.refuse});
+    state.installed = true;
+    await assert.rejects(installAndFund({ask, sign: signer(signed), journal, key, policyId, agent, amount, onStep() {}}), error => error.retry === true);
+    assert.deepEqual(signed, []);
+    assert.deepEqual(JSON.parse(journal.get(key)), live.lost);
   }
   // A step whose payload is not that transaction, or whose time bound has not passed, is never dropped either.
   horizon({root: past, transaction: {status: 404}, account: account('41')});
