@@ -449,6 +449,38 @@ fn checks_and_prepared_xdr_match_the_recorded_vectors() {
 }
 
 #[test]
+fn help_is_a_flag_and_never_the_value_of_another_flag() {
+    let args = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+    for help in [
+        &["--help"][..],
+        &["-h"],
+        &["inspect", "-h"],
+        &["--network", "testnet", "--help"],
+        &["admin", "--allow-mainnet", "--help"],
+        &["read", "--network=mainnet", "-h"],
+    ] {
+        assert!(help_requested(&args(help)), "{help:?}");
+    }
+    for other in [
+        &[][..],
+        &["inspect", "--account", "-h"],
+        &["admin", "--arguments", "--help"],
+        &["read", "--method", "state"],
+    ] {
+        assert!(!help_requested(&args(other)), "{other:?}");
+    }
+    assert_eq!(
+        action_of(&args(&["--network", "testnet", "read"])),
+        Some("read")
+    );
+    assert_eq!(
+        action_of(&args(&["--allow-mainnet", "admin"])),
+        Some("admin")
+    );
+    assert_eq!(action_of(&args(&["--network", "inspect"])), None);
+}
+
+#[test]
 fn every_action_reads_live_state_and_prints_only_public_output() {
     let (owner, agent, engine) = (key(1), key(2), key(3));
     let roles = ["--account", &owner, "--agent", &agent, "--engine", &engine];
