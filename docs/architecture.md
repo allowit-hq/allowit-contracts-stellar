@@ -62,7 +62,7 @@ prompt clause that the next call implements.
 `AllowitCustomPolicy` and the offchain server call `execute` directly. Only an error that the
 policy returns, usually with `?`, denies. A policy may catch a rule error, read it, record it in
 its own state and continue. The standard contract runs only its leading canonical calls, supplied
-by the owner as `rules`, and skips absent params. `scripts/contract_admin.py` derives `rules` from the source file. `scripts/policy_source.py` lexes
+by the owner as `rules`, and skips absent params. The admin binary `allowit-stellar-admin` derives `rules` from the source file. `scripts/policy_source.py` lexes
 Rust comments, including nested block comments, and literals first, so they cannot add or hide calls.
 
 Policy source names `allowit` only as the path root `allowit::`. Any other occurrence of the
@@ -164,8 +164,8 @@ compiles:
   `for item in items` binds an owned item on both backends, also when `items` borrows from
   `ctx.params[key]`, and a dereference `*item` fails both compiles. It has no slice `Deref`.
   `scripts/policy_source.py` runs this compile in `check-policy-bindings.py`, and
-  so in `scripts/build-contracts.sh`, and in `scripts/contract_admin.py` for the owner packets of
-  every tier. These tools need `rustc` (from `RUSTC` or `PATH`). The portability test below and the
+  so in `scripts/build-contracts.sh`. `allowit-stellar-admin` and `scripts/contract_admin.py` run the
+  same compile for the owner packets of every tier. These tools need `rustc` (from `RUSTC` or `PATH`). The portability test below and the
   `policy` job of `.github/workflows/contracts.yml` also compile `scripts/policy-smoke.rs`, which
   includes the branch sources, the same way.
 - The Soroban compile builds the file into `AllowitCustomPolicy`. A host-only item, such as
@@ -354,7 +354,7 @@ earlier Custom code stay unchanged and still count toward the bounds. Their
 `AllowitTier::Standard` post-flight therefore denies any policy write with `Unsupported`, on the
 host as onchain: the server never approves an operation whose state the chain would drop. For every
 tier, the state that `evaluate` returns is exactly the state the wallet stores, and the wallet's
-`policy_state` alone is the server's next `ctx.state`. `scripts/contract_admin.py` rejects a Simple
+`policy_state` alone is the server's next `ctx.state`. `allowit-stellar-admin` rejects a Simple
 or Common packet whose source calls `allowit::set_state`, also through the raw identifier
 `allowit::r#set_state`; such a policy needs Custom.
 
@@ -414,7 +414,7 @@ through `allowit::preflight` as
 discards pass values. This preflight runner is the only place an absent param skips its rule. The
 offchain full policy and `AllowitCustomPolicy` still index it unguarded, so they stop with
 `MissingParam`. An absent prefix param is valid configuration: the owner can set or remove params
-with `deploy_policy` without code redeployment. `scripts/contract_admin.py` warns about it without
+with `deploy_policy` without code redeployment. `allowit-stellar-admin` warns about it without
 rejecting the packet. The preflight runner propagates the first rule error. Repeated rules
 read the same current state and only `post_flight` charges, so a rule cannot charge twice.
 
@@ -548,7 +548,7 @@ owner bindings.
 Earlier code reads State only in its own layout, so a `deploy_policy` code change from version 4
 to an earlier release permanently locks custody. Each
 wallet Wasm declares `allowit_custody_layout` metadata equal to `CONTRACT_VERSION`.
-`contract_admin.py` refuses a code change to Wasm that declares another layout or none. Recover
+`allowit-stellar-admin` refuses a code change to Wasm that declares another layout or none. Recover
 funds before any change across layouts. Every later layout bump needs the same rule.
 
 ## Shared engine

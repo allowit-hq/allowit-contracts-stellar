@@ -165,7 +165,7 @@ pub fn execute(ctx: &AllowitContext) -> allowit::Result {
 - `allowit::param(ctx, key)` and `allowit::arg(ctx, key)` return the typed value of an owner param or an agent arg. They panic when the key is missing or mistyped. A panic denies the run and discards its writes.
 - After approval the wallet and the server run the same `allowit::post_flight`. It updates the standard state keys and applies the policy's `allowit::set_state` writes. Simple and Common never add or change a policy key, so their post-flight denies every policy write, on the server as onchain. Policy keys left by earlier Custom code stay unchanged.
 
-`scripts/policy_source.py` admits policy code through an allowlist, so the same file behaves the same offchain and onchain. `scripts/contract_admin.py` derives the standard `rules` from the source file. The server uses `allowit = { default-features = false, features = ["std"] }` and builds with `overflow-checks = true`. The full authoring rules are in [docs/architecture.md](docs/architecture.md).
+`scripts/policy_source.py` admits policy code through an allowlist, so the same file behaves the same offchain and onchain. The admin binary `allowit-stellar-admin` derives the standard `rules` from the source file. The server uses `allowit = { default-features = false, features = ["std"] }` and builds with `overflow-checks = true`. The full authoring rules are in [docs/architecture.md](docs/architecture.md).
 
 ## Who holds which key
 
@@ -178,7 +178,7 @@ A wallet knows three addresses, and they must all be different.
 A separate **engine parent** contract can manage the code of a shared rule-checking engine. It holds no custody authority: it cannot touch a wallet's funds, configuration or signers. See [docs/engine-parent.md](docs/engine-parent.md).
 
 > [!TIP]
-> No Soroban contract yet? A classic G-address account can get Simple-style authorization with plain multisig: owner weight 3, agent and server weight 1, thresholds 2/2/3. `scripts/wallet_admin.py` prepares exactly that. Classic reserves still apply, and custom onchain policy code needs a contract wallet.
+> No Soroban contract yet? A classic G-address account can get Simple-style authorization with plain multisig: owner weight 3, agent and server weight 1, thresholds 2/2/3. `allowit-stellar-admin setup-wallet` prepares exactly that. Classic reserves still apply, and custom onchain policy code needs a contract wallet.
 
 ## How an operation happens
 
@@ -237,9 +237,10 @@ deployment scope and reruns.
 > [!TIP]
 > The `AllowitCustomPolicy` sample source is `contracts/allowit-custom-policy/policy/policy.rs`. Its contract compiles that file verbatim as a module, and `build.rs` binds `SOURCE_HASH` to its bytes. No SDK code generation is involved. `scripts/policy-smoke.rs` compiles the sample against the host backend with plain `rustc`. `cargo test` builds and runs it, then compares its outcomes on the shared vectors in `scripts/policy-vectors.rs` with the Soroban backend and the custom, standard and simple Wasm. `STELLAR_BIN` selects the Stellar CLI executable.
 
-The administration tools need the pinned Python Stellar SDK. Keep it in a virtual environment:
+The administration tool is one Rust binary. The release scripts need the pinned Python Stellar SDK; keep it in a virtual environment:
 
 ```sh
+cargo build --locked --release --manifest-path crates/allowit-stellar/Cargo.toml --bin allowit-stellar-admin
 python3 -m venv /tmp/allowit-admin
 /tmp/allowit-admin/bin/pip install -r scripts/requirements-admin.txt
 /tmp/allowit-admin/bin/python -m unittest discover -s scripts/tests -v
@@ -266,10 +267,10 @@ invoke(contract, function, args, auth)        owner
 
 `AllowitPolicyConfig` names the `owner`, `agent`, `server`, `asset`, `policy_instance`, `source_digest`, ordered `rules`, `params` and `x402_enabled`. The asset and the policy identity are fixed for the life of the wallet. Everything else changes through `deploy_policy`, which also accepts an optional new Wasm hash. With no new Wasm hash, params change without code redeployment. Both `deploy_policy` and `set_pause` must target exactly the next `deployment_version`. Pause, policy state and the execution nonce survive every deployment.
 
-`scripts/contract_admin.py` prepares unsigned transactions for `upload`, `deploy-parent`, `deploy-wallet` and `admin`. It simulates, assembles fees and authorization entries, and hands you XDR to review and sign with your own keys. Its `read` action runs a read-only simulation of `state`, `engine` or `policy_binding`. It never signs, submits or retries. `scripts/wallet_admin.py` prepares and verifies classic-account multisig (`inspect`, `verify-wallet`, `verify-admin`, `setup-wallet`, `shutdown-wallet`, `setup-admin`) and also never signs or submits. Both tools run from the virtual environment above. Save signed bytes before broadcast and reconcile the original transaction hash after uncertainty.
+`allowit-stellar-admin` prepares unsigned transactions for `upload`, `deploy-parent`, `deploy-wallet` and `admin`. It simulates, assembles fees and authorization entries, and hands you XDR to review and sign with your own keys. Its `read` action runs a read-only simulation of `state`, `engine` or `policy_binding`. It never signs, submits or retries. The same binary prepares and verifies classic-account multisig (`inspect`, `verify-wallet`, `verify-admin`, `setup-wallet`, `shutdown-wallet`, `setup-admin`) and also never signs or submits. The binary needs no Python environment. Save signed bytes before broadcast and reconcile the original transaction hash after uncertainty.
 
 ```sh
-/tmp/allowit-admin/bin/python scripts/contract_admin.py read --network testnet --contract "$WALLET" --source "$OWNER" --method policy_binding
+crates/allowit-stellar/target/release/allowit-stellar-admin read --network testnet --contract "$WALLET" --source "$OWNER" --method policy_binding
 ```
 
 The step-by-step guide, including params encoding and owner handoffs, is in [docs/admin.md](docs/admin.md). Release packets for mainnet are covered in [docs/mainnet.md](docs/mainnet.md).
