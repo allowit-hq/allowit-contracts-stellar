@@ -61,6 +61,10 @@ pub struct Bundle {
     endpoints: Endpoints,
     #[serde(default)]
     source_approval: Option<SourceApproval>,
+    /// The wallet kind that a server names at the top level of a wallet document. It is
+    /// optional; when present it must be the kind that `config` binds.
+    #[serde(default)]
+    wallet_kind: Option<allowit_core::vendor::kinds::WalletKind>,
     /// A public profile never holds this; reading refuses a file that does.
     #[serde(default, deserialize_with = "local_secret")]
     signing_seed: Option<Zeroizing<String>>,
@@ -353,6 +357,14 @@ fn validate_public_bundle(mut bundle: Bundle) -> Result<Bundle> {
         ));
     }
     validate_bundle(&bundle.policy_id, &bundle)?;
+    if bundle
+        .wallet_kind
+        .is_some_and(|named| crate::provider::profiles::wallet_kind(&bundle.config) != Some(named))
+    {
+        return Err(Error::config(
+            "The public Stellar wallet names another wallet kind than its configuration binds",
+        ));
+    }
     if bundle.config.owner == bundle.config.agent
         || bundle.config.owner == bundle.config.server
         || bundle.config.agent == bundle.config.server
@@ -1261,6 +1273,25 @@ mod public_bundle_tests {
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(read_public_bundle(&path).is_err());
         std::fs::remove_file(path).unwrap();
+        // A server may name the wallet kind at the top level. It must be the kind that the
+        // configuration binds; another kind, an unknown id and any other new field are refused.
+        let value = fixture();
+        let bound = decode_public_bundle(&serde_json::to_vec(&value).unwrap()).unwrap();
+        let bound = crate::provider::profiles::wallet_kind(&bound.config).expect("a wallet kind");
+        let with = |kind: serde_json::Value| {
+            let mut named = value.clone();
+            named["walletKind"] = kind;
+            decode_public_bundle(&serde_json::to_vec(&named).unwrap())
+        };
+        assert!(with(json!(bound)).is_ok());
+        assert!(with(serde_json::Value::Null).is_ok());
+        for other in allowit_core::vendor::kinds::WalletKind::ALL {
+            assert_eq!(with(json!(other)).is_ok(), other == bound, "{}", other.id());
+        }
+        assert!(with(json!("common")).is_err());
+        let mut unknown = value.clone();
+        unknown["walletKinds"] = json!(["standard"]);
+        assert!(decode_public_bundle(&serde_json::to_vec(&unknown).unwrap()).is_err());
     }
 }
 
