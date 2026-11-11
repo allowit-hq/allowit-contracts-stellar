@@ -5,7 +5,8 @@ use crate::*;
 mod diagnostics;
 mod owner_actions;
 pub use diagnostics::{
-    ContractFault, WalletError, host_policy_denial, simulation_fault, simulation_resource_fee,
+    ContractFault, WalletError, host_policy_denial, simulated_contract, simulation_fault,
+    simulation_resource_fee,
 };
 pub(crate) mod owner_observation;
 #[cfg(not(target_arch = "wasm32"))]

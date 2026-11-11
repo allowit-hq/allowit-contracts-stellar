@@ -456,6 +456,36 @@ impl Provider {
         ))
     }
 }
+/// The terminal contract error of a refused simulation reply and its client-visible problem.
+/// The fault belongs to `wallet` only when the simulated transaction invokes `wallet`
+/// (`invoked`) and the host events of the reply name it as the one contract that raised the
+/// error. Without both proofs the problem is a plain rejection.
+fn simulation_problem(
+    wallet: &str,
+    invoked: Option<&str>,
+    reply: &serde_json::Value,
+) -> Option<(String, Problem)> {
+    let error = reply["error"].as_str()?;
+    let mut fault = rpc::simulation_fault(error, &diagnostic_events(reply))?;
+    if invoked != Some(wallet) {
+        fault.contract = None;
+    }
+    let problem = super::diagnostics::denial(error, Some(&fault), wallet);
+    Some((error.into(), problem))
+}
+/// The `events` of a simulation reply. An entry that is not a string stays as an empty one,
+/// which does not decode, so a malformed list proves nothing.
+fn diagnostic_events(reply: &serde_json::Value) -> Vec<String> {
+    reply["events"]
+        .as_array()
+        .map(|events| {
+            events
+                .iter()
+                .map(|event| event.as_str().unwrap_or_default().to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
 impl crate::host::vendors::RuntimeProvider for Provider {
     fn problem(&self, error: &Error) -> Problem {
         super::diagnostics::denial(&error.to_string(), None, "")
@@ -473,18 +503,25 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 method: &str,
                 params: serde_json::Value,
             ) -> native::Result<serde_json::Value> {
+                // The contract that this simulation invokes, read from the request itself.
+                let invoked = (method == "simulateTransaction")
+                    .then(|| {
+                        params["transaction"]
+                            .as_str()
+                            .and_then(rpc::simulated_contract)
+                    })
+                    .flatten();
                 let value = self.inner.call(method, params)?;
                 if method == "simulateTransaction"
-                    && let Some(error) = value["error"].as_str()
-                    && let Some(fault) = rpc::simulation_fault(error, &[])
+                    && let Some((error, problem)) =
+                        simulation_problem(&self.wallet, invoked.as_deref(), &value)
                 {
-                    let problem = super::diagnostics::denial(error, Some(&fault), &self.wallet);
                     if let Ok(mut captured) = self.captured.lock() {
-                        *captured = Some((error.into(), problem));
+                        *captured = Some((error.clone(), problem));
                     }
                     // This terminal contract failure propagates directly to this operation.
                     // Missing-export probes and other native response handling remain unchanged.
-                    return Err(error.into());
+                    return Err(error);
                 }
                 Ok(value)
             }
@@ -1486,6 +1523,126 @@ mod diagnostic_regressions {
             .unwrap_err();
         assert!(runtime.problem(&later).details.is_none());
         assert_eq!(first.details.as_ref().unwrap()["contractError"], 18);
+    }
+    /// A host `error` event of the simulation RPC: `contract` raised or relayed error 18.
+    fn error_event(contract: &str) -> serde_json::Value {
+        use stellar_xdr as x;
+        let id = stellar_strkey::Contract::from_string(contract).unwrap().0;
+        let event = x::DiagnosticEvent {
+            in_successful_contract_call: false,
+            event: x::ContractEvent {
+                ext: x::ExtensionPoint::V0,
+                contract_id: Some(x::ContractId(x::Hash(id))),
+                type_: x::ContractEventType::Diagnostic,
+                body: x::ContractEventBody::V0(x::ContractEventV0 {
+                    topics: vec![
+                        x::ScVal::Symbol(x::ScSymbol(b"error".to_vec().try_into().unwrap())),
+                        x::ScVal::Error(x::ScError::Contract(18)),
+                    ]
+                    .try_into()
+                    .unwrap(),
+                    data: x::ScVal::Void,
+                }),
+            },
+        };
+        native::xdr(&event).unwrap().into()
+    }
+    /// The diagnostic session reports a refused simulation as a policy denial only when the
+    /// simulated transaction invokes the installed wallet and the host events of the reply name
+    /// that wallet as the one contract that raised `PolicyDenied`.
+    #[test]
+    fn a_diagnosed_simulation_is_a_policy_denial_only_with_wallet_provenance() {
+        struct Reply {
+            fixture: serde_json::Value,
+            events: serde_json::Value,
+        }
+        impl rpc::Rpc for Reply {
+            fn call(
+                &self,
+                method: &str,
+                params: serde_json::Value,
+            ) -> native::Result<serde_json::Value> {
+                if method == "simulateTransaction" {
+                    return Ok(serde_json::json!({"error": TERMINAL, "events": self.events}));
+                }
+                self.fixture["calls"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|call| call["method"] == method && call["params"] == params)
+                    .map(|call| call["result"].clone())
+                    .ok_or_else(|| format!("Unexpected RPC {method}"))
+            }
+        }
+        const TERMINAL: &str = "HostError: Error(Contract, #18)";
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/provider/stellar-policy-wallet-revalidation-rpc.json"
+        ))
+        .unwrap();
+        let original: PreparedOperation =
+            serde_json::from_value(fixture["prepared"].clone()).unwrap();
+        let wallet = original.config.wallet.clone();
+        let foreign = stellar_strkey::Contract([8; 32]).to_string();
+        let configuration = super::super::server_owner::configuration(
+            "stellar:testnet",
+            &serde_json::to_vec(&original.config).unwrap(),
+        )
+        .unwrap();
+        let installation = installation(&configuration);
+        let retained = retained(&fixture["prepared"]);
+        // Through the session: the revalidation of the fixture simulates a call of its wallet.
+        let diagnose = |events: serde_json::Value| {
+            let rpc = Reply {
+                fixture: fixture.clone(),
+                events,
+            };
+            let runtime = Provider::from_rpc("stellar:testnet", Arc::new(rpc));
+            let session = runtime.diagnostic_session(&installation).unwrap().unwrap();
+            let error = session
+                .provider
+                .revalidate(&installation, &retained, 86402)
+                .unwrap_err();
+            (session.classify)(&error)
+        };
+        let denied = diagnose(serde_json::json!([error_event(&wallet)]));
+        assert_eq!(denied.code, "policy_denied");
+        assert_eq!(denied.status, 409);
+        assert_eq!(
+            denied.details.unwrap(),
+            serde_json::json!({"rule":null,"error":"PolicyDenied","contractError":18})
+        );
+        for events in [
+            // Another contract raised the code and the wallet relayed it.
+            serde_json::json!([error_event(&foreign), error_event(&wallet)]),
+            serde_json::json!([error_event(&foreign)]),
+            // No events, a value that is no list, and an entry that is no string.
+            serde_json::json!([]),
+            serde_json::Value::Null,
+            serde_json::json!([error_event(&wallet), 18]),
+        ] {
+            let rejected = diagnose(events.clone());
+            assert_eq!(rejected.code, "wallet_rejected", "{events}");
+            let details = rejected.details.unwrap();
+            assert_eq!(details["contractError"], 18);
+            assert_eq!(
+                details["contract"].is_null(),
+                events != serde_json::json!([error_event(&foreign)])
+            );
+        }
+        // The transaction must invoke the wallet too: the same events prove nothing for a
+        // simulation of another contract or of no known contract.
+        let reply = serde_json::json!({"error": TERMINAL, "events": [error_event(&wallet)]});
+        let code = |invoked| simulation_problem(&wallet, invoked, &reply).unwrap().1.code;
+        assert_eq!(code(Some(wallet.as_str())), "policy_denied");
+        assert_eq!(code(Some(foreign.as_str())), "wallet_rejected");
+        assert_eq!(code(None), "wallet_rejected");
+        // A reply without a terminal contract error has no fault.
+        for reply in [
+            serde_json::json!({"results": []}),
+            serde_json::json!({"error": "HostError: Error(Budget, ExceededLimit)", "events": [error_event(&wallet)]}),
+        ] {
+            assert!(simulation_problem(&wallet, Some(&wallet), &reply).is_none());
+        }
     }
     #[test]
     fn an_unconsumed_simulation_fault_does_not_classify_a_later_local_error() {

@@ -880,6 +880,149 @@ fn renewal_rejects_invalid_config_and_excessive_installed_fee_before_rpc() {
     assert!(deployer(&chain).extend_wallet(&c, 999).is_err());
 }
 
+/// A host `error` event as the simulation RPC returns it: `contract` raised or relayed `code`.
+fn error_event(
+    type_: x::ContractEventType,
+    contract: Option<[u8; 32]>,
+    topic: &str,
+    code: u32,
+) -> String {
+    xdr(&x::DiagnosticEvent {
+        in_successful_contract_call: false,
+        event: x::ContractEvent {
+            ext: x::ExtensionPoint::V0,
+            contract_id: contract.map(|id| x::ContractId(x::Hash(id))),
+            type_,
+            body: x::ContractEventBody::V0(x::ContractEventV0 {
+                topics: vec![
+                    x::ScVal::Symbol(x::ScSymbol(topic.as_bytes().to_vec().try_into().unwrap())),
+                    x::ScVal::Error(x::ScError::Contract(code)),
+                ]
+                .try_into()
+                .unwrap(),
+                data: x::ScVal::Void,
+            }),
+        },
+    })
+    .unwrap()
+}
+#[test]
+fn only_host_error_events_of_one_contract_attribute_a_simulation_fault() {
+    use x::ContractEventType::{Contract, Diagnostic};
+    const WALLET: [u8; 32] = [7; 32];
+    const FOREIGN: [u8; 32] = [8; 32];
+    let wallet = stellar_strkey::Contract(WALLET).to_string();
+    let origin = |events: &[String]| {
+        rpc::simulation_fault("HostError: Error(Contract, #18)", events)
+            .unwrap()
+            .contract
+    };
+    // The wallet returns its own error: the host records it in the wallet frame, then in the
+    // frame of the transaction, which has no contract id.
+    let own = [
+        error_event(Diagnostic, Some(WALLET), "error", 18),
+        error_event(Diagnostic, None, "error", 18),
+    ];
+    assert_eq!(origin(&own), Some(wallet.clone()));
+    // A caught call that failed with another code does not change the origin of this code.
+    let caught = [
+        error_event(Diagnostic, Some(FOREIGN), "error", 10),
+        own[0].clone(),
+    ];
+    assert_eq!(origin(&caught), Some(wallet));
+    // A contract that the wallet called raised the code; the wallet only relayed it.
+    let relayed = [
+        error_event(Diagnostic, Some(FOREIGN), "error", 18),
+        error_event(Diagnostic, Some(WALLET), "error", 18),
+    ];
+    assert_eq!(origin(&relayed), None);
+    assert_eq!(origin(&[relayed[1].clone(), relayed[0].clone()]), None);
+    for unproved in [
+        // No events, the transaction frame alone, or an event that does not decode.
+        vec![],
+        vec![own[1].clone()],
+        vec![own[0].clone(), "invalid XDR".into()],
+        vec![own[0].clone(), String::new()],
+        // Events that a contract can write: its own event type, or a host log line.
+        vec![error_event(Contract, Some(WALLET), "error", 18)],
+        vec![error_event(
+            x::ContractEventType::System,
+            Some(WALLET),
+            "error",
+            18,
+        )],
+        vec![error_event(Diagnostic, Some(WALLET), "log", 18)],
+        // Another code, raised by the wallet earlier in the same simulation.
+        vec![error_event(Diagnostic, Some(WALLET), "error", 17)],
+    ] {
+        assert_eq!(origin(&unproved), None, "{unproved:?}");
+    }
+    // An error event with more topics is not the host's error record.
+    let long = xdr(&x::DiagnosticEvent {
+        in_successful_contract_call: false,
+        event: x::ContractEvent {
+            ext: x::ExtensionPoint::V0,
+            contract_id: Some(x::ContractId(x::Hash(WALLET))),
+            type_: Diagnostic,
+            body: x::ContractEventBody::V0(x::ContractEventV0 {
+                topics: vec![
+                    x::ScVal::Symbol(x::ScSymbol(b"error".to_vec().try_into().unwrap())),
+                    x::ScVal::Error(x::ScError::Contract(18)),
+                    x::ScVal::Void,
+                ]
+                .try_into()
+                .unwrap(),
+                data: x::ScVal::Void,
+            }),
+        },
+    })
+    .unwrap();
+    assert_eq!(origin(&[long]), None);
+}
+/// The `events` of a Stellar Testnet `simulateTransaction` reply of 2026-11-11: a transfer of the
+/// native asset contract that exceeds the balance of its source account.
+#[test]
+fn a_testnet_simulation_reply_attributes_the_fault_to_the_asset_contract() {
+    let events = [
+        "AAAAAAAAAAAAAAAAAAAAAgAAAAAAAAADAAAADwAAAAdmbl9jYWxsAAAAAA0AAAAg15KLcsJwPM/q9+uf9O9NUEpVqLl5/JtFDqLIQrTRzmEAAAAPAAAACHRyYW5zZmVyAAAAEAAAAAEAAAADAAAAEgAAAAAAAAAAPpY9pFbScU5+nRVeWlC5vUwGQ4zsCynahDIIhsPML3AAAAASAAAAAAAAAABzdv3ojkzWHMD7KUoXhrPx0GH18vHKV0ZfqpMiEblG1gAAAAoAAAAAAAAAAAADjX6kxn//".to_string(),
+        "AAAAAAAAAAAAAAAB15KLcsJwPM/q9+uf9O9NUEpVqLl5/JtFDqLIQrTRzmEAAAACAAAAAAAAAAIAAAAPAAAABWVycm9yAAAAAAAAAgAAAAAAAAAKAAAAEAAAAAEAAAAEAAAADgAAADFyZXN1bHRpbmcgYmFsYW5jZSBpcyBub3Qgd2l0aGluIHRoZSBhbGxvd2VkIHJhbmdlAAAAAAAABgAAAAAAmJaAAAAABv/8cpijsGgBAAAABn//////////".to_string(),
+    ];
+    let fault = rpc::simulation_fault(
+        "HostError: Error(Contract, #10)\n\nEvent log (newest first):\n",
+        &events,
+    )
+    .unwrap();
+    assert_eq!(fault.code, 10);
+    assert_eq!(
+        fault.contract.as_deref(),
+        Some("CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC")
+    );
+}
+#[test]
+fn a_simulated_transaction_names_the_contract_it_invokes() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "fixtures/provider/stellar-policy-wallet-revalidation-rpc.json"
+    ))
+    .unwrap();
+    let wallet = fixture["prepared"]["config"]["wallet"].as_str().unwrap();
+    let mut seen = 0;
+    for call in fixture["calls"].as_array().unwrap() {
+        if call["method"] == "simulateTransaction" {
+            let transaction = call["params"]["transaction"].as_str().unwrap();
+            assert_eq!(
+                rpc::simulated_contract(transaction).as_deref(),
+                Some(wallet)
+            );
+            seen += 1;
+        }
+    }
+    assert_eq!(seen, 2);
+    // Text that is no transaction envelope names no contract.
+    for other in ["", "invalid XDR"] {
+        assert!(rpc::simulated_contract(other).is_none());
+    }
+}
+
 #[test]
 fn native_error_codes_follow_the_contract_and_host_envelope() {
     let source = include_str!("../../policy-wallet/src/lib.rs");
