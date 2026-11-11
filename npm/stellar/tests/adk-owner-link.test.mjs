@@ -38,21 +38,34 @@ test('a review link carries the chat-collected agent key and amount and refuses 
     sourceHash: 'ab'.repeat(32), paramsHash: 'cd'.repeat(32), params: {payment_limit: {Int: '50000000'}}};
   const link = envelope => `#adk-proposal-v1=${Buffer.from(JSON.stringify(envelope)).toString('base64url')}`;
   const full = parseReviewLink(link({proposal, workPrompt: 'Pay Sol 5 XLM.', agent: ' GAGENT ', amount: '5'}));
-  assert.deepEqual(full, {proposal, workPrompt: 'Pay Sol 5 XLM.', agent: 'GAGENT', amount: '5'});
+  assert.deepEqual(full, {proposal, workPrompt: 'Pay Sol 5 XLM.', agent: 'GAGENT', amount: '5', walletKind: null});
   // A missing agent key or amount is null, so the host returns the owner to the conversation.
   const bare = parseReviewLink(link({proposal, workPrompt: 'Pay Sol 5 XLM.'}));
-  assert.deepEqual([bare.agent, bare.amount], [null, null]);
+  assert.deepEqual([bare.agent, bare.amount, bare.walletKind], [null, null, null]);
   assert.equal(parseReviewLink(link({proposal, workPrompt: 'w', agent: '  ', amount: null})).agent, null);
   for (const bad of [
     {proposal, workPrompt: 'w', agent: 7},
     {proposal, workPrompt: 'w', amount: 'x'.repeat(129)},
     {proposal, workPrompt: 'w', extra: true},
+    {proposal, workPrompt: 'w', walletKind: 7},
+    {proposal, workPrompt: 'w', walletKind: ''},
+    {proposal, workPrompt: 'w', walletKind: 'Standard'},
+    {proposal, workPrompt: 'w', walletKind: 'k'.repeat(33)},
+    {proposal: {...proposal, walletKind: 'standard'}, workPrompt: 'w'},
     {proposal: {...proposal, network: 'other:testnet'}, workPrompt: 'w'},
     {proposal: {...proposal, sourceHash: 'zz'}, workPrompt: 'w'},
     {proposal: {...proposal, asset: {symbol: 'X'}}, workPrompt: 'w'},
     {proposal, workPrompt: ''},
   ]) assert.throws(() => parseReviewLink(link(bad)), /agent policy link is invalid/);
   assert.throws(() => parseReviewLink('#other=abc'), /invalid/);
+  // The kind that the owner chose in the chat travels beside the proposal. The eight proposal keys stay exact.
+  for (const kind of ['native', 'simple', 'standard', 'custom']) {
+    const chosen = parseReviewLink(link({proposal, workPrompt: 'w', agent: 'GAGENT', amount: '5', walletKind: kind}));
+    assert.deepEqual(chosen, {proposal, workPrompt: 'w', agent: 'GAGENT', amount: '5', walletKind: kind});
+  }
+  assert.equal(parseReviewLink(link({proposal, workPrompt: 'w', walletKind: null})).walletKind, null);
+  // The owner link without a review step carries no kind.
+  assert.throws(() => parseAdkOwnerLink(link({proposal, workPrompt: 'w', walletKind: 'standard'})), /invalid/);
   const prompt = reviewAgentPrompt(full, 'https://app.allowit.xyz', 'policy-1', 'CWALLET', 'GAGENT');
   assert.match(prompt, /^Pay Sol 5 XLM\.\n/);
   assert.match(prompt, /Policy wallet: CWALLET/);

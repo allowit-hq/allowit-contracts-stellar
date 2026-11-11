@@ -5,6 +5,8 @@ export {ADK_OWNER_FRAGMENT} from './stellar-fragments.js';
 
 const MAX_ENCODED_LENGTH = 87_000;
 const hashPattern = /^[0-9a-f]{64}$/;
+/** A wallet kind id, as the catalogue of the server names it. */
+const kindPattern = /^[a-z]{1,32}$/;
 /** The CLI uses this origin when `ALLOWIT_URL` is not set. */
 const CLI_DEFAULT_ORIGIN = 'https://app.allowit.xyz';
 /** The ADK owner flow funds native XLM on Stellar Testnet. */
@@ -56,12 +58,17 @@ export function parseAdkOwnerLink(fragment: string): AdkOwnerLink {
   return {proposal, workPrompt};
 }
 
-/** A review link: the proposal, the work prompt and the agent key and funding amount that the chat collected. */
-export type ReviewLink = AdkOwnerLink & {agent: string | null; amount: string | null};
+/**
+ * A review link: the proposal, the work prompt and the agent key, funding amount and wallet kind that the chat
+ * collected.
+ */
+export type ReviewLink = AdkOwnerLink & {agent: string | null; amount: string | null; walletKind: string | null};
 
 /**
- * Decode and check a Review and sign link. The envelope may also carry `agent` and `amount`; a missing one is null
- * and returns the owner to the conversation. Any other key, type or size is refused.
+ * Decode and check a Review and sign link. The envelope may also carry `agent`, `amount` and `walletKind`. A missing
+ * agent key or amount is null and returns the owner to the conversation. `walletKind` is the id of the kind that the
+ * owner chose in the chat, or null when the owner chose none; the host offers it only when the rail lists that id.
+ * Any other key, type or size is refused.
  */
 export function parseReviewLink(fragment: string): ReviewLink {
   return parseLink(fragment, true);
@@ -86,7 +93,7 @@ function parseLink(fragment: string, review: boolean): ReviewLink {
   }
   if (!object(envelope) || typeof envelope.workPrompt !== 'string'
     || !envelope.workPrompt.trim() || envelope.workPrompt.length > 12_000 || !object(envelope.proposal)) throw invalid();
-  const extra = review ? ['agent', 'amount'] : [];
+  const extra = review ? ['agent', 'amount', 'walletKind'] : [];
   if (!Object.keys(envelope).every(key => key === 'proposal' || key === 'workPrompt' || extra.includes(key))) throw invalid();
   const optional = (value: unknown) => {
     if (value === undefined || value === null) return null;
@@ -94,6 +101,8 @@ function parseLink(fragment: string, review: boolean): ReviewLink {
     return value.trim() || null;
   };
   const agent = optional(envelope.agent), amount = optional(envelope.amount);
+  const walletKind = envelope.walletKind ?? null;
+  if (walletKind !== null && (typeof walletKind !== 'string' || !kindPattern.test(walletKind))) throw invalid();
   const {network, revision, title, explanation, code, sourceHash, paramsHash, params} = envelope.proposal;
   if (Object.keys(envelope.proposal).length !== 8 || network !== 'stellar:testnet'
     || typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 1 || revision > 0xffffffff
@@ -103,7 +112,7 @@ function parseLink(fragment: string, review: boolean): ReviewLink {
     || typeof sourceHash !== 'string' || !hashPattern.test(sourceHash)
     || typeof paramsHash !== 'string' || !hashPattern.test(paramsHash)
     || !object(params) || Object.keys(params).length > 64 || !Object.values(params).every(value => policyValue(value))) throw invalid();
-  return {proposal: {network, revision, title, explanation, code, sourceHash, paramsHash, params}, workPrompt: envelope.workPrompt, agent, amount};
+  return {proposal: {network, revision, title, explanation, code, sourceHash, paramsHash, params}, workPrompt: envelope.workPrompt, agent, amount, walletKind};
 }
 
 /** Base units as a decimal, without floating-point rounding. */

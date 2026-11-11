@@ -15,14 +15,20 @@ export type AdkOwnerLink = {
 };
 export declare function adkAgentPrompt(workPrompt: string, origin: string, policyId: string, wallet: string, agent: string): string;
 export declare function parseAdkOwnerLink(fragment: string): AdkOwnerLink;
-/** A review link: the proposal, the work prompt and the agent key and funding amount that the chat collected. */
+/**
+ * A review link: the proposal, the work prompt and the agent key, funding amount and wallet kind that the chat
+ * collected.
+ */
 export type ReviewLink = AdkOwnerLink & {
     agent: string | null;
     amount: string | null;
+    walletKind: string | null;
 };
 /**
- * Decode and check a Review and sign link. The envelope may also carry `agent` and `amount`; a missing one is null
- * and returns the owner to the conversation. Any other key, type or size is refused.
+ * Decode and check a Review and sign link. The envelope may also carry `agent`, `amount` and `walletKind`. A missing
+ * agent key or amount is null and returns the owner to the conversation. `walletKind` is the id of the kind that the
+ * owner chose in the chat, or null when the owner chose none; the host offers it only when the rail lists that id.
+ * Any other key, type or size is refused.
  */
 export declare function parseReviewLink(fragment: string): ReviewLink;
 /** The prompt that the owner gives the agent after signing. */
