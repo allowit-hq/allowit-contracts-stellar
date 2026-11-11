@@ -503,6 +503,9 @@ mod tests {
         assert_eq!(read.params.len(), 6);
         // Another network, another document shape and an asset without a unit are errors.
         assert!(PLUGIN.draft_params("stellar:pubnet", &draft).is_err());
+        let mut unnamed = draft.clone();
+        unnamed.as_object_mut().unwrap().remove("network");
+        assert!(PLUGIN.draft_params("stellar:testnet", &unnamed).is_err());
         assert!(PLUGIN.draft_params("stellar:unknown", &draft).is_err());
         assert!(
             PLUGIN
@@ -544,6 +547,35 @@ mod tests {
         assert_eq!(
             (read.asset.symbol.as_str(), read.asset.decimals),
             ("TEST", 7)
+        );
+        // An installation names its network only in `config`: the same asset on another
+        // network is refused, and a document that names no network is not read.
+        let mut installation = serde_json::json!({"config": classic["config"]});
+        let read = PLUGIN
+            .draft_params("stellar:testnet", &installation)
+            .unwrap();
+        assert_eq!(read.asset.symbol, "TEST");
+        assert!(
+            PLUGIN
+                .draft_params("stellar:pubnet", &installation)
+                .is_err()
+        );
+        let mut disagreeing = classic.clone();
+        disagreeing["config"]["network"] = "stellar:pubnet".into();
+        assert!(
+            PLUGIN
+                .draft_params("stellar:testnet", &disagreeing)
+                .is_err()
+        );
+        assert!(PLUGIN.draft_params("stellar:pubnet", &disagreeing).is_err());
+        installation["config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("network");
+        assert!(
+            PLUGIN
+                .draft_params("stellar:testnet", &installation)
+                .is_err()
         );
         // Without the issuer the contract has no known unit.
         classic["config"]["assetIssuer"] = serde_json::Value::Null;

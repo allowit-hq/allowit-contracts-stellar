@@ -161,7 +161,18 @@ pub fn draft_params(
     document: &serde_json::Value,
 ) -> Result<crate::host::plugin::DraftParams> {
     let invalid = || Error::config("The document is not a Stellar policy or wallet document");
-    if document.get("network").is_some_and(|v| {
+    // A draft and a profile name their network at the top level; a profile and an installation
+    // also name it in `config`. Every statement must be the selected network, and the document
+    // must make at least one.
+    let stated: Vec<&serde_json::Value> =
+        [document.get("network"), document.pointer("/config/network")]
+            .into_iter()
+            .flatten()
+            .collect();
+    if stated.is_empty() {
+        return Err(invalid());
+    }
+    if stated.iter().any(|v| {
         v.as_str()
             .and_then(|v| crate::host::routing::normalize(v).ok())
             != Some(network)
