@@ -311,6 +311,38 @@ fn owner_packets_pass_the_std_only_compile_of_the_offchain_server() {
     }
 }
 
+/// `tests/fixtures/policy-source-cases.json` records the std-only compile verdict of the Core
+/// Python helper for sources that the gate tests compiled. Some pass the lexical gate and fail
+/// the compile, such as an address order; the compile is the second guard of an owner packet.
+#[test]
+fn the_std_only_compile_matches_the_recorded_policy_source_cases() {
+    let cases: Vec<Value> = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/policy-source-cases.json"
+    ))
+    .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let lib = host_allowit(directory.path()).unwrap();
+    let path = directory.path().join("policy.rs");
+    let (mut compiled, mut refused) = (0, 0);
+    for case in cases.iter().filter(|case| case["compiles"].is_boolean()) {
+        std::fs::write(&path, case["source"].as_str().unwrap()).unwrap();
+        let result = compile_policy(&lib, directory.path(), path.to_str().unwrap());
+        assert_eq!(
+            json!(result.is_ok()),
+            case["compiles"],
+            "{result:?} for {case}"
+        );
+        match result {
+            Ok(()) => compiled += 1,
+            Err(error) => {
+                assert!(error.contains("std-only compile"), "{error}");
+                refused += 1;
+            }
+        }
+    }
+    assert_eq!((compiled, refused), (17, 10));
+}
+
 #[test]
 fn public_json_rejects_duplicate_keys_at_every_depth() {
     assert!(public_json(r#"{"custom":1,"other":{"a":[{"b":1}]}}"#).is_ok());
