@@ -53,6 +53,8 @@ pub struct Plan {
     pub guest_cookie: String,
     pub rotate_cookie: bool,
     pub lost_generation: bool,
+    /// A status and body that the generation route answers instead of a policy.
+    pub generation_refusal: Option<(u16, Value)>,
     pub redirect_challenge: Option<String>,
     pub redirect_verify: Option<String>,
     pub owner_prepare: Option<Value>,
@@ -81,6 +83,7 @@ impl Plan {
             ),
             rotate_cookie: true,
             lost_generation: false,
+            generation_refusal: None,
             redirect_challenge: None,
             redirect_verify: None,
             owner_prepare: None,
@@ -302,6 +305,10 @@ impl Server {
                     "/api/micro/generate" => {
                         captured.lock().unwrap().generated.push(body.clone());
                         if plan.lost_generation {
+                            continue;
+                        }
+                        if let Some((status, refusal)) = &plan.generation_refusal {
+                            reply(&mut stream, *status, refusal.clone(), "");
                             continue;
                         }
                         let mut policy = plan.policy.clone();

@@ -5,6 +5,8 @@
 use crate::host::{
     config::parse_origin,
     error::{Error, Result},
+    execution::{LimitReport, Quantity},
+    input::asset::AssetDisplay,
     typed_request::operation_nonce,
 };
 use crate::rpc::Rpc;
@@ -28,6 +30,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use zeroize::Zeroizing;
+
+/// The query that asks the engine for the fee that the limits count and for the spending limits
+/// of the policy. It is outside the request proof and changes only the reply.
+const REPORTS: &str = "?include=limits";
 
 /// Every engine call waits up to this long. Prepare, submit and status each run tens of
 /// sequential ledger reads and simulations on the server, and submit also broadcasts and
@@ -176,6 +182,23 @@ struct Response {
     operation: Operation,
     signed_operation: Option<SignedOperation>,
     receipt: Option<sdk::rpc::VerifiedReceipt>,
+    /// The engine's own settlement report. This client reports the settlement of the receipt
+    /// that it verified, so the value is accepted and not read.
+    #[serde(default, rename = "settlement")]
+    _settlement: Option<serde::de::IgnoredAny>,
+    /// The fee that the spending limits count for this operation, in the installed asset. The
+    /// engine sends it and `limits` for [`REPORTS`]. Both are engine statements with no chain
+    /// proof; [`reported`] and [`reported_limits`] admit them as display data.
+    #[serde(default)]
+    fee_charged: Option<serde_json::Value>,
+    #[serde(default)]
+    limits: Option<serde_json::Value>,
+    /// Engine links and the wallet kind are accepted and not read: the rail builds its own
+    /// explorer link, and the profile binds the kind.
+    #[serde(default, rename = "explorer")]
+    _explorer: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "walletKind")]
+    _wallet_kind: Option<serde::de::IgnoredAny>,
     /// The engine reported this policy wallet operation `failed` without a chain receipt: it
     /// released the operation. The status stays `submissionUnknown` until the client proves
     /// the release itself.
@@ -548,7 +571,7 @@ impl Client {
         let response = self.http.send(
             Request {
                 method: Method::Post,
-                url: &format!("{}{path}", self.origin),
+                url: &format!("{}{path}{REPORTS}", self.origin),
                 headers: &headers,
                 body: Some(&bytes),
             },
@@ -948,6 +971,15 @@ pub struct ExecutionOutcome {
     /// The ledger of the verified receipt and the fee that it charged, in stroops. A receipt of a
     /// fee-bumped transaction holds the inner result, which charges no fee, so it reports none.
     pub settlement: Option<(u32, u64)>,
+    /// The one debit of a confirmed operation, in the installed asset. A redeem debits vault
+    /// shares, which have no listed unit, so it reports none.
+    pub amount: Option<Quantity>,
+    /// The fee that the engine counted against the spending limits, in the installed asset.
+    pub fee_charged: Option<Quantity>,
+    /// The spending limits of the policy as the engine reports them.
+    pub limits: Option<Vec<LimitReport>>,
+    /// The explorer link of the transaction, once this client holds its verified receipt.
+    pub explorer: Option<String>,
 }
 fn render(r: &Response) -> Result<ExecutionOutcome> {
     let settlement = r
@@ -956,12 +988,114 @@ fn render(r: &Response) -> Result<ExecutionOutcome> {
         .map(|receipt| receipt_settlement(receipt.ledger, &receipt.result_xdr))
         .transpose()?
         .flatten();
+    let config = &r.prepared.config;
+    let installed = installed_display(config);
     Ok(ExecutionOutcome {
         request_id: r.operation.id.clone(),
         status: r.operation.status.clone(),
         transaction_hash: r.operation.transaction_hash.clone(),
         settlement,
+        amount: (r.receipt.is_some() && r.operation.status == OperationStatus::Confirmed)
+            .then(|| debit(&r.prepared, installed.as_ref()))
+            .flatten(),
+        fee_charged: r
+            .fee_charged
+            .as_ref()
+            .and_then(|value| reported(value, installed.as_ref()?)),
+        limits: r
+            .limits
+            .as_ref()
+            .and_then(|value| reported_limits(value, installed.as_ref()?)),
+        explorer: r.receipt.as_ref().and_then(|_| {
+            crate::provider::server_owner::explorer_link(
+                &config.network,
+                "tx",
+                &r.operation.transaction_hash,
+            )
+        }),
     })
+}
+
+/// The unit of the wallet's installed asset: a listed token, or a classic asset by its code and
+/// issuer. An asset contract that is not listed has no known unit.
+fn installed_display(c: &WalletConfig) -> Option<AssetDisplay> {
+    crate::provider::asset_display(&c.network, &c.asset)
+        .ok()
+        .or_else(|| {
+            let issuer = c.asset_issuer.as_deref()?;
+            crate::provider::asset_display(&c.network, &format!("{}:{issuer}", c.asset_symbol)).ok()
+        })
+}
+
+/// The one debit of a prepared operation as an amount of the installed asset. Transfers and
+/// deposits debit the installed asset. A redeem debits shares of its vault, so it has none.
+fn debit(p: &PreparedOperation, installed: Option<&AssetDisplay>) -> Option<Quantity> {
+    let operation = sdk::operation_from_request(&p.config, &p.request).ok()?;
+    let (_, units) = operation.debit();
+    if operation.debit_token(&p.config.asset) != p.config.asset {
+        return None;
+    }
+    Some(Quantity::new(units, installed?.clone()))
+}
+
+/// An engine quantity as display data. It must count the installed asset; the printed text is
+/// built here from the units and this rail's unit, and engine text is never copied.
+fn reported(value: &serde_json::Value, installed: &AssetDisplay) -> Option<Quantity> {
+    let quantity: Quantity = serde_json::from_value(value.clone()).ok()?;
+    let units: i128 = quantity.units.parse().ok()?;
+    (quantity.asset.symbol == installed.symbol && quantity.asset.decimals == installed.decimals)
+        .then(|| Quantity::new(units, installed.clone()))
+}
+
+/// The most spending limits that one report holds.
+const MAX_REPORTED_LIMITS: usize = 16;
+
+/// Engine limit reports as display data: a bounded list of param names with quantities of the
+/// installed asset. One invalid entry drops the whole report, so a partial list never shows.
+fn reported_limits(
+    value: &serde_json::Value,
+    installed: &AssetDisplay,
+) -> Option<Vec<LimitReport>> {
+    let entries = value
+        .as_array()
+        .filter(|v| v.len() <= MAX_REPORTED_LIMITS)?;
+    entries
+        .iter()
+        .map(|entry| {
+            let param = entry["param"].as_str().filter(|v| {
+                (1..=64).contains(&v.len())
+                    && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            })?;
+            Some(LimitReport {
+                param: param.into(),
+                limit: reported(&entry["limit"], installed)?,
+                spent: reported(&entry["spent"], installed)?,
+                remaining: reported(&entry["remaining"], installed)?,
+            })
+        })
+        .collect()
+}
+
+/// The spending limits of the client's wallet. The engine reports them with the status of an
+/// operation, so this reads the status of the newest operation that the journal retains for
+/// this policy and service. `None` means that the journal retains no such operation or that the
+/// engine sent no report.
+pub fn limits(c: &Client, journal: &Store) -> Result<Option<Vec<LimitReport>>> {
+    let newest = journal
+        .entries::<Record>()
+        .map_err(journal_error)?
+        .into_iter()
+        .filter(|v| {
+            v.policy_id == c.bundle.policy_id
+                && v.backend_origin.as_ref().is_none_or(|o| o == &c.origin)
+                && same_retained_policy_config(&c.bundle.config, &v.config)
+        })
+        .filter_map(|v| Some((v.prepared.as_ref()?.created_at, v.request_id)))
+        .max();
+    let Some((_, id)) = newest else {
+        return Ok(None);
+    };
+    Ok(status(c, journal, &id, Duration::ZERO)?.limits)
 }
 
 /// The ledger and charged fee of a verified receipt. Every transaction that pays its own fee
@@ -1368,7 +1502,10 @@ mod native_revalidation_tests {
                                 header.push(byte[0]);
                             }
                             let header = String::from_utf8(header).unwrap();
-                            assert!(header.starts_with("POST /api/native/execute/status "));
+                            assert!(
+                                header
+                                    .starts_with("POST /api/native/execute/status?include=limits ")
+                            );
                             let length: usize = header
                                 .lines()
                                 .find_map(|line| {
@@ -1670,6 +1807,158 @@ mod native_revalidation_tests {
         server.join().unwrap();
     }
     #[test]
+    fn a_status_reply_reports_the_charged_fee_and_the_limits_in_the_installed_unit() {
+        let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
+        let installed = installed_display(&p.config).expect("the fixture asset has a unit");
+        let other = AssetDisplay {
+            symbol: "EVIL".into(),
+            ..installed.clone()
+        };
+        let quantity = |units: i128| json!(Quantity::new(units, installed.clone()));
+        let limit = |param: &str| json!({"param":param,"limit":quantity(50_000_000),"spent":quantity(12_000_000),"remaining":quantity(38_000_000)});
+        let operation = json!({"id":"limits-001","status":OperationStatus::Prepared,"transactionHash":sdk::hex(&p.transaction_hash)});
+        let reply = json!({"prepared":p,"operation":operation,
+            "settlement":{"height":7,"fee":quantity(100),"amount":null},
+            "feeCharged":quantity(2_500),"limits":[limit("daily_spending_limit"),limit("lifetime_spending_limit")],
+            "explorer":"https://example.invalid/tx","walletKind":"standard"});
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Store::open(&dir.path().canonicalize().unwrap().join("journal")).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let client = engine_client(p.config.clone(), &origin);
+        // A journal without an operation of this policy has no report, and nothing is sent.
+        assert_eq!(limits(&client, &journal).unwrap(), None);
+        let server = reply_once(
+            listener,
+            Duration::ZERO,
+            "200 OK",
+            serde_json::to_vec(&reply).unwrap(),
+        );
+        let response = client
+            .post(
+                "/api/native/execute/status",
+                json!({"policyId":"engine-policy","requestId":"limits-001"}),
+            )
+            .unwrap();
+        let (line, _) = server.join().unwrap();
+        assert!(
+            line.starts_with("POST /api/native/execute/status?include=limits "),
+            "{line}"
+        );
+        let outcome = render(&response).unwrap();
+        assert_eq!(
+            outcome.fee_charged,
+            Some(Quantity::new(2_500, installed.clone()))
+        );
+        let reports = outcome.limits.unwrap();
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].param, "daily_spending_limit");
+        assert_eq!(
+            reports[0].remaining,
+            Quantity::new(38_000_000, installed.clone())
+        );
+        // No receipt: no settlement, no debit and no explorer link, whatever the engine names.
+        assert_eq!(
+            (outcome.settlement, outcome.amount, outcome.explorer),
+            (None, None, None)
+        );
+        // The wallet read asks for the status of the newest retained operation of the policy.
+        let name = sdk::hex(&operation_nonce("engine-policy", "limits-001"));
+        let mut request = p.request.clone();
+        request.operation.nonce = operation_nonce("engine-policy", "limits-001");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let reader = engine_client(p.config.clone(), &origin);
+        let record = Record {
+            backend_origin: Some(reader.origin.clone()),
+            policy_id: "engine-policy".into(),
+            request_id: "limits-001".into(),
+            config: p.config.clone(),
+            request,
+            prepared: Some(p.clone()),
+            agent_signature: None,
+            status: Some(OperationStatus::Prepared),
+            lapsed: false,
+        };
+        journal.save(&name, &record).unwrap();
+        // The operation of another service is not this wallet's report.
+        assert_eq!(limits(&client, &journal).unwrap(), None);
+        let server = reply_once(
+            listener,
+            Duration::ZERO,
+            "200 OK",
+            serde_json::to_vec(&reply).unwrap(),
+        );
+        let read = limits(&reader, &journal);
+        let (line, body) = server.join().unwrap();
+        assert!(
+            line.starts_with("POST /api/native/execute/status?include=limits "),
+            "{line}"
+        );
+        assert_eq!(body["requestId"], "limits-001");
+        // The fixture preparation is not operation `limits-001`, so the reply fails the same
+        // identity checks as every status read and its report is not shown.
+        assert_eq!(
+            read.unwrap_err().message,
+            "Stellar response changed the original operation identity"
+        );
+        // A reply without the reports reads as before.
+        let plain: Response =
+            serde_json::from_value(json!({"prepared":p,"operation":operation})).unwrap();
+        let outcome = render(&plain).unwrap();
+        assert_eq!((outcome.fee_charged, outcome.limits), (None, None));
+        // Engine text is never copied: the text is built from the units and this rail's unit.
+        let mut hostile = quantity(5);
+        hostile["text"] = json!("1000000 USDC\u{1b}[2J");
+        assert_eq!(
+            reported(&hostile, &installed),
+            Some(Quantity::new(5, installed.clone()))
+        );
+        // A quantity of another asset, a non-decimal amount, a hostile param name, an entry
+        // without a field and an oversized list drop the report.
+        assert_eq!(reported(&json!(Quantity::new(5, other)), &installed), None);
+        let mut text = quantity(5);
+        text["units"] = json!("5e3");
+        assert_eq!(reported(&text, &installed), None);
+        let mut missing = limit("payment_limit");
+        missing.as_object_mut().unwrap().remove("spent");
+        for invalid in [
+            json!([limit("daily\u{1b}[2J")]),
+            json!([limit("")]),
+            json!([limit("daily_spending_limit"), missing]),
+            json!(vec![limit("payment_limit"); MAX_REPORTED_LIMITS + 1]),
+            json!({"param":"payment_limit"}),
+        ] {
+            assert_eq!(reported_limits(&invalid, &installed), None, "{invalid}");
+        }
+        assert_eq!(reported_limits(&json!([]), &installed), Some(Vec::new()));
+        // An unknown field is still refused.
+        assert!(
+            serde_json::from_value::<Response>(
+                json!({"prepared":p,"operation":operation,"extra":1})
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn a_confirmed_transfer_reports_its_one_debit_in_the_installed_unit() {
+        let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
+        let installed = installed_display(&p.config).unwrap();
+        let operation = sdk::operation_from_request(&p.config, &p.request).unwrap();
+        let (_, units) = operation.debit();
+        assert!(units > 0);
+        assert_eq!(
+            debit(&p, Some(&installed)),
+            Some(Quantity::new(units, installed.clone()))
+        );
+        // An asset without a known unit reports no amount; it never prints a placeholder unit.
+        assert_eq!(debit(&p, None), None);
+        let mut unlisted = p.config.clone();
+        unlisted.asset = sdk::account_for_seed(&[9; 32]).replacen('G', "C", 1);
+        unlisted.asset_issuer = None;
+        assert_eq!(installed_display(&unlisted), None);
+    }
+    #[test]
     fn slow_engine_replies_arrive_for_prepare_submit_and_status() {
         // Engine prepare took up to 138 s, submit up to 90 s and status up to 44 s on testnet.
         // Each reply here outlasts the former 30 s submit and status bound.
@@ -1692,7 +1981,7 @@ mod native_revalidation_tests {
                         json!({"policyId":"engine-policy","requestId":"slow-engine-001","phase":phase}),
                     );
                     let (line, request) = server.join().unwrap();
-                    assert!(line.starts_with(&format!("POST {path} ")));
+                    assert!(line.starts_with(&format!("POST {path}{REPORTS} ")));
                     assert_eq!(request["phase"], json!(phase));
                     let response = response
                         .unwrap_or_else(|e| panic!("{path} {phase:?}: {}", e.message));

@@ -1,7 +1,9 @@
 //! Shared native execution orchestration. Original journal names and signed records remain unchanged.
 use super::runtime::client::{self, ExecutionOutcome};
 use crate::OperationStatus;
-use crate::host::execution::{Quantity, Settlement};
+use crate::host::execution::{
+    EXPLORER_KEY, FEE_CHARGED_KEY, LimitReport, Limits, Quantity, Settlement,
+};
 use crate::host::{
     Signer,
     error::{Error, Result},
@@ -153,12 +155,30 @@ fn render(out: ExecutionOutcome) -> Outcome {
         let settlement = Settlement {
             height: u64::from(ledger),
             fee: Quantity::new(i128::from(fee), super::native_display()),
-            amount: None,
+            amount: out.amount,
         };
         document[Settlement::KEY] =
             serde_json::to_value(settlement).expect("a settlement encodes as JSON");
     }
+    if let Some(fee) = out.fee_charged {
+        document[FEE_CHARGED_KEY] = serde_json::to_value(fee).expect("a quantity encodes as JSON");
+    }
+    if let Some(limits) = out.limits {
+        document[Limits::KEY] = serde_json::to_value(limits).expect("limit reports encode as JSON");
+    }
+    if let Some(link) = out.explorer {
+        document[EXPLORER_KEY] = link.into();
+    }
     Outcome { document, status }
+}
+/// The spending limits of the profile's wallet, from the engine. See [`client::limits`].
+pub fn limits(
+    profile: Profile,
+    signer: Arc<dyn Signer>,
+    store: &dyn Fn() -> Result<Store>,
+    rpc: Option<String>,
+) -> Result<Option<Vec<LimitReport>>> {
+    client::limits(&client(profile, signer, rpc)?, &store()?)
 }
 
 fn bundle(profile: &Profile) -> Result<&client::Bundle> {
@@ -197,6 +217,10 @@ mod storage_boundary_tests {
             status: OperationStatus::Confirmed,
             transaction_hash: "ab".repeat(32),
             settlement,
+            amount: None,
+            fee_charged: None,
+            limits: None,
+            explorer: None,
         };
         let settled = render(outcome(Some((5_661_578, 123_456)))).document;
         let settlement = Settlement::of(&settled).unwrap();
@@ -208,6 +232,44 @@ mod storage_boundary_tests {
         let pending = render(outcome(None)).document;
         assert!(pending.get("settlement").is_none());
         assert_eq!(pending["requestId"], "transfer-001");
+        for key in [FEE_CHARGED_KEY, Limits::KEY, EXPLORER_KEY] {
+            assert!(pending.get(key).is_none(), "{key}");
+        }
+    }
+    #[test]
+    fn an_outcome_carries_its_debit_the_charged_fee_the_limits_and_the_explorer_link() {
+        let usdc = crate::provider::asset_display("stellar:testnet", "USDC").unwrap();
+        let quantity = |units| Quantity::new(units, usdc.clone());
+        let limits = vec![LimitReport {
+            param: "daily_spending_limit".into(),
+            limit: quantity(50_000_000),
+            spent: quantity(12_000_000),
+            remaining: quantity(38_000_000),
+        }];
+        let document = render(ExecutionOutcome {
+            request_id: "transfer-001".into(),
+            status: OperationStatus::Confirmed,
+            transaction_hash: "ab".repeat(32),
+            settlement: Some((5_661_578, 123_456)),
+            amount: Some(quantity(10_000_000)),
+            fee_charged: Some(quantity(2_500)),
+            limits: Some(limits.clone()),
+            explorer: Some("https://stellar.expert/explorer/testnet/tx/abab".into()),
+        })
+        .document;
+        let settlement = Settlement::of(&document).unwrap();
+        assert_eq!(settlement.amount.unwrap().text, "1 USDC");
+        assert_eq!(settlement.fee.text, "0.0123456 XLM");
+        assert_eq!(
+            crate::host::execution::fee_charged(&document).unwrap().text,
+            "0.00025 USDC"
+        );
+        assert_eq!(Limits::of(&document), Some(limits));
+        assert_eq!(document["limits"][0]["remaining"]["text"], "3.8 USDC");
+        assert_eq!(
+            crate::host::execution::explorer(&document).as_deref(),
+            Some("https://stellar.expert/explorer/testnet/tx/abab")
+        );
     }
     #[test]
     fn build_only_does_not_request_a_caller_store() {

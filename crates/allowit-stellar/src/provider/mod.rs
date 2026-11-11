@@ -151,6 +151,48 @@ pub fn generate(
     })
 }
 
+/// The params of a draft or policy document and the unit of its installed asset. The document
+/// is the one that [`generate`] returns: its params and asset are in
+/// `runtime.instanceBinding.portable`. An asset without a known unit is an error, so no amount
+/// prints with a placeholder unit.
+pub fn draft_params(
+    network: &str,
+    document: &serde_json::Value,
+) -> Result<crate::host::plugin::DraftParams> {
+    let invalid = || Error::config("The document is not a Stellar policy draft");
+    if document.get("network").is_some_and(|v| {
+        v.as_str()
+            .and_then(|v| crate::host::routing::normalize(v).ok())
+            != Some(network)
+    }) {
+        return Err(Error::config("The draft belongs to another network"));
+    }
+    let binding = document
+        .pointer("/runtime/instanceBinding")
+        .ok_or_else(invalid)?;
+    let portable = &binding["portable"];
+    let params: crate::PolicyParams =
+        serde_json::from_value(portable["params"].clone()).map_err(|_| invalid())?;
+    let address = portable["asset"]["address"].as_str().ok_or_else(invalid)?;
+    let asset = asset_display(network, address).or_else(|_| {
+        let symbol = portable["asset"]["symbol"].as_str().ok_or_else(invalid)?;
+        let issuer = binding["assetIssuer"]
+            .as_str()
+            .ok_or_else(|| Error::unsupported("The asset of this draft has no known unit"))?;
+        asset_display(network, &format!("{symbol}:{issuer}"))
+    })?;
+    let params = params
+        .0
+        .iter()
+        .map(|(key, value)| {
+            serde_json::to_value(allowit_core::policy::PolicyValue(value.allowit()))
+                .map(|value| (key.clone(), value))
+                .map_err(|_| invalid())
+        })
+        .collect::<Result<_>>()?;
+    Ok(crate::host::plugin::DraftParams { params, asset })
+}
+
 use crate::host::input::asset::{AssetDisplay, Token};
 const TESTNET: &[Token] = &[
     Token {

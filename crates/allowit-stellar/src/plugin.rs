@@ -3,7 +3,7 @@
 use crate::host::{
     KeyProvider, Signer,
     error::{Error, Result},
-    execution::{Capabilities, Outcome, Recovery, Request},
+    execution::{Capabilities, LimitReport, Outcome, Recovery, Request},
     generation::{GenerateRequest, GeneratedDraft},
     input::{
         Formats,
@@ -162,6 +162,13 @@ impl RailPlugin for Plugin {
             (cx.clock)()
         })
     }
+    fn draft_params(
+        &self,
+        network: &str,
+        document: &serde_json::Value,
+    ) -> Result<allowit_core::vendor::plugin::DraftParams> {
+        provider::draft_params(self::network(network)?.id, document)
+    }
     fn execution(&self) -> &'static dyn ExecutionProvider {
         &EXECUTION
     }
@@ -245,6 +252,15 @@ impl ExecutionProvider for Execution {
         wait: Duration,
     ) -> Result<Outcome> {
         execution::status(profile, signer, store, rpc, id, wait)
+    }
+    fn limits(
+        &self,
+        profile: Profile,
+        signer: Arc<dyn Signer>,
+        store: StoreOpener<'_>,
+        rpc: Option<String>,
+    ) -> Result<Option<Vec<LimitReport>>> {
+        execution::limits(profile, signer, store, rpc)
     }
     fn retained(
         &self,
@@ -465,6 +481,42 @@ fn fixtures() -> Fixtures {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_draft_gives_its_params_and_the_unit_of_its_installed_asset() {
+        let draft = (TEST_SUPPORT.fixtures)().owner_generation["policy"].clone();
+        let read = PLUGIN.draft_params("stellar:testnet", &draft).unwrap();
+        assert_eq!(
+            (read.asset.symbol.as_str(), read.asset.decimals),
+            ("USDC", 7)
+        );
+        let param = |key: &str| {
+            &read
+                .params
+                .iter()
+                .find(|(name, _)| name == key)
+                .unwrap_or_else(|| panic!("{key}"))
+                .1
+        };
+        assert_eq!(param("payment_limit")["Int"], "10000000");
+        assert_eq!(param("operations")["List"][0]["Str"], "transfer");
+        assert_eq!(read.params.len(), 6);
+        // Another network, another document shape and an asset without a unit are errors.
+        assert!(PLUGIN.draft_params("stellar:pubnet", &draft).is_err());
+        assert!(PLUGIN.draft_params("stellar:unknown", &draft).is_err());
+        assert!(
+            PLUGIN
+                .draft_params("stellar:testnet", &serde_json::json!({"params": {}}))
+                .is_err()
+        );
+        let mut unlisted = draft.clone();
+        let binding = &mut unlisted["runtime"]["instanceBinding"];
+        binding["portable"]["asset"]["address"] = crate::account_for_seed(&[9; 32])
+            .replacen('G', "C", 1)
+            .into();
+        binding["assetIssuer"] = serde_json::Value::Null;
+        assert!(PLUGIN.draft_params("stellar:testnet", &unlisted).is_err());
+    }
 
     #[test]
     fn assets_show_their_real_unit_and_an_unknown_contract_has_none() {

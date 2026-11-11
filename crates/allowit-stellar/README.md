@@ -88,8 +88,21 @@ asset shows its code with seven decimals. An unlisted contract is an error, neve
 
 A settled `exec` or `status` outcome carries `settlement` in its document: `height` is the receipt ledger and `fee`
 is the fee that the transaction result charged, in XLM. A receipt of a fee-bumped transaction holds the inner result,
-which charges no fee, so its outcome carries no `settlement`. The client holds no limit counters and the status reply
-carries none, so the document reports the fee but not the amount spent against a limit.
+which charges no fee, so its outcome carries no `settlement`. `settlement.amount` is the one debit of a confirmed
+transfer or deposit, in the installed asset. A redeem debits vault shares, which have no listed unit, so its amount
+is null. A document with a verified receipt also carries `explorer`, this rail's link to the transaction.
+
+Every execute and status request adds the query `include=limits`, which is outside the request proof. The engine then
+adds `feeCharged` and `limits` to its reply, and the client copies them to the outcome document: `feeCharged` is the
+fee that the spending limits count, and each entry of `limits` is `{param, limit, spent, remaining}`. Each amount is a
+quantity `{units, asset, text}` of the installed asset. These values are engine statements without a chain proof. The
+client accepts only quantities of the installed asset, builds their text itself and drops a report with an invalid
+entry. `ExecutionProvider::limits` reads the limits of a wallet through the status of the newest operation that the
+journal retains for its policy; a wallet without a retained operation has no report.
+
+Generation sends the owner's wallet kind as the top-level `walletKind` of the request and keeps the top-level
+`walletKind` of the returned policy. A typed refusal such as `wallet_kind_unsupported` keeps its `details`.
+`RailPlugin::draft_params` returns the params and the installed asset of a draft for display.
 
 `exec` waits up to 180 s for the prepare answer and up to 180 s for the submit answer. `wait` bounds only the engine
 status reads after the submit answer: each later read ends at the deadline and the last outcome is returned.
