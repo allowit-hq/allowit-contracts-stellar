@@ -33,19 +33,38 @@ pub const TRANSPORT_UNKNOWN: &str = "Stellar RPC transport result is unknown";
 pub trait Rpc: Send + Sync {
     fn call(&self, method: &str, params: Value) -> Result<Value>;
 }
+/// The RPC method that reads the newest ledger.
+#[cfg(not(target_arch = "wasm32"))]
+const LATEST_LEDGER: &str = "getLatestLedger";
+/// The bound of a `getLatestLedger` reply. The reply holds the close metadata of the newest
+/// ledger beside its sequence, so its size follows the content of that ledger and not the
+/// request. Testnet ledger 5684062 answered with 1,155,616 characters of metadata, above
+/// [`MAX_BYTES`], and every call that read the head during that ledger failed. Callers read
+/// only the sequence.
+#[cfg(not(target_arch = "wasm32"))]
+const LATEST_LEDGER_MAX_BYTES: usize = 16 * MAX_BYTES;
 /// Stellar JSON-RPC protocol adapter over the bounded common host transport.
 #[cfg(not(target_arch = "wasm32"))]
 pub struct HttpRpc {
     client: RpcClient,
+    /// The same endpoint with the bound of a `getLatestLedger` reply.
+    latest_ledger: RpcClient,
     id: AtomicU64,
 }
 #[cfg(not(target_arch = "wasm32"))]
 impl HttpRpc {
     pub fn new(url: &str) -> Result<Self> {
+        Self::with_timeout(url, Duration::from_secs(30))
+    }
+    fn with_timeout(url: &str, timeout: Duration) -> Result<Self> {
+        let client = |max_bytes| {
+            RpcClient::new(url, timeout, max_bytes)
+                .map(RpcClient::accept_success_statuses)
+                .map_err(|_| "RPC requires HTTPS or local HTTP without credentials")
+        };
         Ok(Self {
-            client: RpcClient::new(url, Duration::from_secs(30), MAX_BYTES)
-                .map_err(|_| "RPC requires HTTPS or local HTTP without credentials")?
-                .accept_success_statuses(),
+            client: client(MAX_BYTES)?,
+            latest_ledger: client(LATEST_LEDGER_MAX_BYTES)?,
             id: AtomicU64::new(1),
         })
     }
@@ -53,7 +72,12 @@ impl HttpRpc {
 #[cfg(not(target_arch = "wasm32"))]
 impl Rpc for HttpRpc {
     fn call(&self, method: &str, params: Value) -> Result<Value> {
-        self.client
+        let client = if method == LATEST_LEDGER {
+            &self.latest_ledger
+        } else {
+            &self.client
+        };
+        client
             .call_with_id(
                 method,
                 &params,
@@ -1297,12 +1321,68 @@ mod transport_tests {
     use std::{io::Read, net::TcpListener, thread};
 
     fn rpc(url: &str, timeout: Duration) -> HttpRpc {
-        HttpRpc {
-            client: RpcClient::new(url, timeout, MAX_BYTES)
-                .unwrap()
-                .accept_success_statuses(),
-            id: AtomicU64::new(1),
-        }
+        HttpRpc::with_timeout(url, timeout).unwrap()
+    }
+
+    /// A loopback RPC that answers one call with a result of `sequence` and `padding` bytes of
+    /// ledger metadata, as `getLatestLedger` does.
+    fn serve_ledger(padding: usize) -> (String, thread::JoinHandle<()>) {
+        use std::io::Write;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            let header = String::from_utf8(request).unwrap().to_ascii_lowercase();
+            let length: usize = header
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .map(|value| value.trim().parse().unwrap())
+                .unwrap();
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).unwrap();
+            let id = serde_json::from_slice::<Value>(&body).unwrap()["id"].clone();
+            let reply = json!({"jsonrpc":"2.0","id":id,
+                "result":{"sequence":5_684_062,"metadataXdr":"A".repeat(padding)}})
+            .to_string();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+        });
+        (url, server)
+    }
+
+    #[test]
+    fn the_newest_ledger_reads_with_its_close_metadata_and_other_replies_keep_their_bound() {
+        // Testnet ledger 5684062 answered `getLatestLedger` with 1,155,616 characters of
+        // metadata: more than the bound of every other reply.
+        let (url, server) = serve_ledger(1_155_616);
+        let latest = rpc(&url, Duration::from_secs(10))
+            .call(LATEST_LEDGER, json!({}))
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(latest["sequence"], 5_684_062);
+        // The same reply to another method is over its bound.
+        let (url, server) = serve_ledger(1_155_616);
+        let error = rpc(&url, Duration::from_secs(10))
+            .call("getLedgerEntries", json!({"keys":[]}))
+            .unwrap_err();
+        server.join().unwrap();
+        assert_eq!(error, "RPC response exceeds limit");
+        // The newest ledger has a bound too.
+        let (url, server) = serve_ledger(LATEST_LEDGER_MAX_BYTES);
+        let error = rpc(&url, Duration::from_secs(10))
+            .call(LATEST_LEDGER, json!({}))
+            .unwrap_err();
+        server.join().unwrap();
+        assert_eq!(error, "RPC response exceeds limit");
     }
 
     #[test]
