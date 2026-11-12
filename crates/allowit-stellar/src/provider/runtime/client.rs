@@ -566,9 +566,8 @@ fn limits_refusal(status: u16, body: &[u8]) -> Error {
 /// An engine name as a plain identifier: 1 to 64 ASCII letters, digits or underscores. Engine
 /// names reach the terminal only through this function.
 fn identifier(name: &str) -> Option<&str> {
-    ((1..=64).contains(&name.len())
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
-    .then_some(name)
+    ((1..=64).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+        .then_some(name)
 }
 fn validate_response_receipt(r: &Response) -> Result<()> {
     let p = &r.prepared;
@@ -2667,7 +2666,11 @@ mod native_revalidation_tests {
         let error = refusal(409, &serde_json::to_vec(&body).unwrap());
         assert!(engine_refused(&error) && !unresolved(&error));
         assert_eq!(
-            (error.code, error.api_code.as_deref(), error.message.as_str()),
+            (
+                error.code,
+                error.api_code.as_deref(),
+                error.message.as_str()
+            ),
             (
                 4,
                 Some(OPERATION_REFUSED),
@@ -2678,7 +2681,8 @@ mod native_revalidation_tests {
             refusal(409, br#"{"code":"operation_refused"}"#).message,
             "Allowit returned HTTP 409: The server refused this operation"
         );
-        let (outcome, reads, saves) = scripted_poll(Duration::from_secs(30), vec![refused(409, body)]);
+        let (outcome, reads, saves) =
+            scripted_poll(Duration::from_secs(30), vec![refused(409, body)]);
         assert!(engine_refused(&outcome.unwrap_err()));
         assert_eq!((reads, saves), (1, 0));
     }
@@ -2733,12 +2737,19 @@ mod native_revalidation_tests {
         );
         // Counters that the engine could not read are absent, never zero. The per-payment limits
         // need no counter.
-        let unread = read("200 OK", json!({"paymentLimits":payment})).unwrap().unwrap();
+        let unread = read("200 OK", json!({"paymentLimits":payment}))
+            .unwrap()
+            .unwrap();
         assert_eq!(unread.limits, None);
         assert_eq!(unread.payment_limits.map(|v| v.len()), Some(1));
         // A policy without limits reports two empty lists.
-        let none = read("200 OK", json!({"limits":[],"paymentLimits":[]})).unwrap().unwrap();
-        assert_eq!((none.limits, none.payment_limits), (Some(vec![]), Some(vec![])));
+        let none = read("200 OK", json!({"limits":[],"paymentLimits":[]}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (none.limits, none.payment_limits),
+            (Some(vec![]), Some(vec![]))
+        );
         // One entry in another asset or with a hostile name drops its list.
         let other = AssetDisplay {
             symbol: "EVIL".into(),
@@ -2747,7 +2758,9 @@ mod native_revalidation_tests {
         let evil = json!([{"param":"payment_limit","limit":Quantity::new(1, other)}]);
         let hostile = json!([{"param":"payment limit\n","limit":quantity(1)}]);
         for list in [evil, hostile] {
-            let read = read("200 OK", json!({"limits":counted,"paymentLimits":list})).unwrap().unwrap();
+            let read = read("200 OK", json!({"limits":counted,"paymentLimits":list}))
+                .unwrap()
+                .unwrap();
             assert_eq!(read.payment_limits, None);
             assert_eq!(read.limits.map(|v| v.len()), Some(1));
         }
@@ -2759,7 +2772,11 @@ mod native_revalidation_tests {
         )
         .unwrap_err();
         assert_eq!(
-            (differ.status, differ.api_code.as_deref(), differ.message.as_str()),
+            (
+                differ.status,
+                differ.api_code.as_deref(),
+                differ.message.as_str()
+            ),
             (
                 Some(409),
                 Some("params_differ_from_wallet"),
@@ -2773,7 +2790,11 @@ mod native_revalidation_tests {
         .unwrap_err();
         assert_eq!(unresolved.api_code.as_deref(), Some(OPERATION_UNRESOLVED));
         // Another agent's proof is refused with the authentication exit code.
-        let denied = read("401 Unauthorized", json!({"error":"Invalid or expired request signature."})).unwrap_err();
+        let denied = read(
+            "401 Unauthorized",
+            json!({"error":"Invalid or expired request signature."}),
+        )
+        .unwrap_err();
         assert_eq!((denied.code, denied.api_code), (3, None));
         // A reply that is not the limits document is not a report.
         assert_eq!(
