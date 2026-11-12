@@ -171,6 +171,16 @@ fn render(out: ExecutionOutcome) -> Outcome {
     }
     Outcome { document, status }
 }
+/// The counted and the per-payment limits of the profile's wallet, from the engine. See
+/// [`client::wallet_limits`].
+pub fn wallet_limits(
+    profile: Profile,
+    signer: Arc<dyn Signer>,
+    store: &dyn Fn() -> Result<Store>,
+    rpc: Option<String>,
+) -> Result<Option<client::WalletLimits>> {
+    client::wallet_limits(&client(profile, signer, rpc)?, &store()?)
+}
 /// The spending limits of the profile's wallet, from the engine. See [`client::limits`].
 pub fn limits(
     profile: Profile,
