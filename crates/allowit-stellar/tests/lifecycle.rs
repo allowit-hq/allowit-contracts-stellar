@@ -352,6 +352,167 @@ fn native_classic_payment_has_real_two_party_signatures() {
         assert_eq!(op.asset, asset_xdr(&c).unwrap());
     }
 }
+/// Agent and server together reach the medium threshold of a Native wallet account. The
+/// network admits more than a payment at that threshold: an offer, a trustline, a data entry,
+/// a new account, a sequence bump. The rail is the gate: it rebuilds the one payment of the
+/// request and signs or assembles nothing else, whatever keys signed the other bytes.
+#[test]
+fn the_native_co_sign_path_signs_only_the_payment_of_its_request() {
+    use ed25519_dalek::{Signer, SigningKey};
+    use stellar_xdr as x;
+    let (c, r, s) = fixture(WalletRoute::Native, false);
+    let p = prepare(&c, &r, &s, 86401, 86700).unwrap();
+    // The control: the unchanged packet takes both signatures.
+    validate_signed(&sign_native(&p), 86401).unwrap();
+    let other = x::MuxedAccount::Ed25519(x::Uint256(
+        account_key(&account_for_seed(&[9; 32])).unwrap(),
+    ));
+    let other_id = x::AccountId(x::PublicKey::PublicKeyTypeEd25519(x::Uint256(
+        account_key(&account_for_seed(&[9; 32])).unwrap(),
+    )));
+    type Change = Box<dyn Fn(&mut x::Transaction)>;
+    let body = |body: x::OperationBody| -> Change {
+        Box::new(move |tx: &mut x::Transaction| {
+            tx.operations = vec![x::Operation {
+                source_account: None,
+                body: body.clone(),
+            }]
+            .try_into()
+            .unwrap();
+        })
+    };
+    let payment = |change: fn(&mut x::PaymentOp, &x::MuxedAccount)| -> Change {
+        let other = other.clone();
+        Box::new(move |tx: &mut x::Transaction| {
+            let mut ops = tx.operations.to_vec();
+            let x::OperationBody::Payment(op) = &mut ops[0].body else {
+                panic!()
+            };
+            change(op, &other);
+            tx.operations = ops.try_into().unwrap();
+        })
+    };
+    let changes: Vec<(&str, Change)> = vec![
+        (
+            "a data entry",
+            body(x::OperationBody::ManageData(x::ManageDataOp {
+                data_name: x::String64("note".try_into().unwrap()),
+                data_value: Some(x::DataValue(vec![1].try_into().unwrap())),
+            })),
+        ),
+        (
+            "a home domain",
+            body(x::OperationBody::SetOptions(x::SetOptionsOp {
+                home_domain: Some(x::String32("example.org".try_into().unwrap())),
+                ..Default::default()
+            })),
+        ),
+        (
+            "a new account",
+            body(x::OperationBody::CreateAccount(x::CreateAccountOp {
+                destination: other_id.clone(),
+                starting_balance: 20_000_000,
+            })),
+        ),
+        (
+            "a sequence bump",
+            body(x::OperationBody::BumpSequence(x::BumpSequenceOp {
+                bump_to: x::SequenceNumber(i64::MAX),
+            })),
+        ),
+        (
+            "an offer",
+            body(x::OperationBody::ManageSellOffer(x::ManageSellOfferOp {
+                selling: x::Asset::Native,
+                buying: x::Asset::CreditAlphanum4(x::AlphaNum4 {
+                    asset_code: x::AssetCode4(*b"JUNK"),
+                    issuer: other_id.clone(),
+                }),
+                amount: 20_000_000,
+                price: x::Price { n: 1, d: 1_000_000 },
+                offer_id: 0,
+            })),
+        ),
+        (
+            "a trustline",
+            body(x::OperationBody::ChangeTrust(x::ChangeTrustOp {
+                line: x::ChangeTrustAsset::CreditAlphanum4(x::AlphaNum4 {
+                    asset_code: x::AssetCode4(*b"JUNK"),
+                    issuer: other_id.clone(),
+                }),
+                limit: i64::MAX,
+            })),
+        ),
+        (
+            "a merge",
+            body(x::OperationBody::AccountMerge(other.clone())),
+        ),
+        (
+            "another destination",
+            payment(|op, other| op.destination = other.clone()),
+        ),
+        ("a larger amount", payment(|op, _| op.amount += 1)),
+        (
+            "a second payment",
+            Box::new(|tx: &mut x::Transaction| {
+                let mut ops = tx.operations.to_vec();
+                ops.push(ops[0].clone());
+                tx.operations = ops.try_into().unwrap();
+            }),
+        ),
+        (
+            "another operation source",
+            Box::new({
+                let other = other.clone();
+                move |tx: &mut x::Transaction| {
+                    let mut ops = tx.operations.to_vec();
+                    ops[0].source_account = Some(other.clone());
+                    tx.operations = ops.try_into().unwrap();
+                }
+            }),
+        ),
+        (
+            "a higher fee",
+            Box::new(|tx: &mut x::Transaction| tx.fee += 1),
+        ),
+    ];
+    for (name, change) in changes {
+        let TransactionEnvelope::Tx(mut envelope) =
+            TransactionEnvelope::from_xdr_base64(&p.transaction_xdr, Limits::none()).unwrap()
+        else {
+            panic!()
+        };
+        change(&mut envelope.tx);
+        let mut changed = p.clone();
+        changed.transaction_hash = transaction_hash(&c.network, &envelope.tx).unwrap();
+        changed.transaction_xdr = TransactionEnvelope::Tx(envelope)
+            .to_xdr_base64(Limits::none())
+            .unwrap();
+        assert_ne!(changed.transaction_hash, p.transaction_hash, "{name}");
+        // Neither role signs these bytes through the rail.
+        assert!(
+            sign(&changed, &[2; 32], 86401).is_err(),
+            "agent signs {name}"
+        );
+        assert!(
+            sign(&changed, &[3; 32], 86401).is_err(),
+            "server signs {name}"
+        );
+        // Signatures of both keys over these bytes, made outside the rail, assemble nothing.
+        let raw = |seed: [u8; 32]| DetachedSignature {
+            signer: account_for_seed(&seed),
+            signature: SigningKey::from_bytes(&seed)
+                .sign(&changed.transaction_hash)
+                .to_bytes()
+                .to_vec(),
+        };
+        assert!(
+            authorize(&changed, &[raw([2; 32]), raw([3; 32])], 86401).is_err(),
+            "both signatures assemble {name}"
+        );
+        assert!(validate_retained_prepared(&changed).is_err(), "{name}");
+    }
+}
 #[test]
 fn live_signers_and_thresholds_replace_the_fixed_template() {
     let (c, r, mut s) = fixture(WalletRoute::Native, false);
