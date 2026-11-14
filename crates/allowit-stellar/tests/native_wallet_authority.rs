@@ -17,7 +17,7 @@ use allowit_stellar::owner_intent::{
 use allowit_stellar::*;
 use ed25519_dalek::{Signer, SigningKey};
 use std::collections::BTreeMap;
-use stellar_xdr::{self as x, WriteXdr};
+use stellar_xdr::{self as x, ReadXdr, WriteXdr};
 
 const NETWORK: &str = "stellar:testnet";
 const RPC: &str = "https://soroban-testnet.stellar.org";
@@ -71,8 +71,45 @@ fn sign(tx: &x::Transaction, keys: &[&SigningKey]) -> String {
     .to_xdr_base64(x::Limits::none())
     .unwrap()
 }
-/// Send a signed transaction and wait for its result. `true` means that the ledger applied it.
-fn settle(rpc: &rpc::HttpRpc, label: &str, envelope: &str) -> bool {
+/// What the ledger did with a transaction.
+#[derive(Debug, PartialEq, Eq)]
+enum Outcome {
+    Applied,
+    /// The transaction result code, with each operation result code of a failed transaction,
+    /// such as `TxBadAuth` or `TxFailed[OpBadAuth]`.
+    Refused(String),
+}
+/// The codes of a transaction result. A refusal is asserted by its code: a transaction that
+/// fails for another reason, such as a missing destination, proves nothing about its signers.
+fn refusal(label: &str, result_xdr: Option<&str>) -> Outcome {
+    let result = x::TransactionResult::from_xdr_base64(
+        result_xdr.unwrap_or_else(|| panic!("{label}: no transaction result")),
+        x::Limits::none(),
+    )
+    .unwrap_or_else(|_| panic!("{label}: unreadable transaction result"));
+    let code = match &result.result {
+        x::TransactionResultResult::TxFailed(operations) => format!(
+            "TxFailed[{}]",
+            operations
+                .iter()
+                .map(|operation| operation.name())
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        other => other.name().to_owned(),
+    };
+    Outcome::Refused(code)
+}
+/// The signatures do not reach the threshold of the transaction itself.
+fn below_transaction_threshold() -> Outcome {
+    Outcome::Refused("TxBadAuth".into())
+}
+/// The signatures reach the transaction, and its one operation needs a higher threshold.
+fn below_operation_threshold() -> Outcome {
+    Outcome::Refused("TxFailed[OpBadAuth]".into())
+}
+/// Send a signed transaction and wait for its result.
+fn settle(rpc: &rpc::HttpRpc, label: &str, envelope: &str) -> Outcome {
     let hash = hex(&rpc::signed_transaction_hash(NETWORK, envelope).unwrap());
     let sent = rpc::Rpc::call(
         rpc,
@@ -82,11 +119,9 @@ fn settle(rpc: &rpc::HttpRpc, label: &str, envelope: &str) -> bool {
     .unwrap();
     let status = sent["status"].as_str().unwrap_or_default().to_owned();
     if status == "ERROR" {
-        println!(
-            "{label}: refused at submission, {hash}, result {}",
-            sent["errorResultXdr"].as_str().unwrap_or_default()
-        );
-        return false;
+        let outcome = refusal(label, sent["errorResultXdr"].as_str());
+        println!("{label}: refused at submission, {hash}, {outcome:?}");
+        return outcome;
     }
     assert!(
         matches!(status.as_str(), "PENDING" | "DUPLICATE"),
@@ -99,11 +134,12 @@ fn settle(rpc: &rpc::HttpRpc, label: &str, envelope: &str) -> bool {
         match got["status"].as_str() {
             Some("SUCCESS") => {
                 println!("{label}: applied, {hash}");
-                return true;
+                return Outcome::Applied;
             }
             Some("FAILED") => {
-                println!("{label}: failed on the ledger, {hash}");
-                return false;
+                let outcome = refusal(label, got["resultXdr"].as_str());
+                println!("{label}: failed on the ledger, {hash}, {outcome:?}");
+                return outcome;
             }
             _ => {}
         }
@@ -252,7 +288,10 @@ fn a_native_wallet_on_testnet_obeys_its_signers_weights_and_thresholds() {
         .unwrap()
         .sign_with_wallet_key(now, |digest| Ok(owner.sign(digest).to_bytes()), &wallet_key)
         .unwrap();
-    assert!(settle(&rpc, "setup by the owner", &signed));
+    assert_eq!(
+        settle(&rpc, "setup by the owner", &signed),
+        Outcome::Applied
+    );
 
     // The ledger holds exactly the roles.
     let live = rpc::get_account(&rpc, &roles.wallet).unwrap();
@@ -292,15 +331,22 @@ fn a_native_wallet_on_testnet_obeys_its_signers_weights_and_thresholds() {
         ),
     ] {
         let tx = wallet_transaction(&rpc, &roles.wallet, payment(&roles.owner, XLM));
-        assert!(!settle(&rpc, label, &sign(&tx, &keys)), "{label}");
+        assert_eq!(
+            settle(&rpc, label, &sign(&tx, &keys)),
+            below_transaction_threshold(),
+            "{label}"
+        );
     }
     // Agent and server together pay.
     let tx = wallet_transaction(&rpc, &roles.wallet, payment(&roles.owner, XLM));
-    assert!(settle(
-        &rpc,
-        "payment by the agent and the server",
-        &sign(&tx, &[&agent, &server])
-    ));
+    assert_eq!(
+        settle(
+            &rpc,
+            "payment by the agent and the server",
+            &sign(&tx, &[&agent, &server])
+        ),
+        Outcome::Applied
+    );
     // Agent and server together change no signer, no threshold and merge nothing.
     let stranger_key = x::SignerKey::Ed25519(x::Uint256(stranger.verifying_key().to_bytes()));
     for (label, body) in [
@@ -343,13 +389,17 @@ fn a_native_wallet_on_testnet_obeys_its_signers_weights_and_thresholds() {
         (
             "agent and server merge the account",
             x::OperationBody::AccountMerge(x::MuxedAccount::Ed25519(x::Uint256(
-                agent.verifying_key().to_bytes(),
+                owner.verifying_key().to_bytes(),
             ))),
         ),
     ] {
         let tx = wallet_transaction(&rpc, &roles.wallet, body);
-        assert!(
-            !settle(&rpc, label, &sign(&tx, &[&agent, &server])),
+        // Each of these needs the high threshold, and the ledger refuses its signers. The
+        // code is asserted: a merge also fails while the account has signers, and that
+        // failure would prove nothing about the threshold.
+        assert_eq!(
+            settle(&rpc, label, &sign(&tx, &[&agent, &server])),
+            below_operation_threshold(),
             "{label}"
         );
     }
@@ -387,7 +437,10 @@ fn a_native_wallet_on_testnet_obeys_its_signers_weights_and_thresholds() {
     );
     // The owner alone pauses. Then agent and server together pay nothing.
     let step = owner_step(&rpc, &roles, &owner, WalletAction::Pause);
-    assert!(settle(&rpc, "pause by the owner alone", &step));
+    assert_eq!(
+        settle(&rpc, "pause by the owner alone", &step),
+        Outcome::Applied
+    );
     assert_eq!(
         rpc::get_account(&rpc, &roles.wallet)
             .unwrap()
@@ -396,11 +449,14 @@ fn a_native_wallet_on_testnet_obeys_its_signers_weights_and_thresholds() {
         WalletStatus::Paused
     );
     let tx = wallet_transaction(&rpc, &roles.wallet, payment(&roles.owner, XLM));
-    assert!(!settle(
-        &rpc,
-        "payment by the agent and the server of a paused wallet",
-        &sign(&tx, &[&agent, &server])
-    ));
+    assert_eq!(
+        settle(
+            &rpc,
+            "payment by the agent and the server of a paused wallet",
+            &sign(&tx, &[&agent, &server])
+        ),
+        below_transaction_threshold()
+    );
     // The owner alone withdraws from the paused wallet, resumes it and closes it.
     let step = owner_step(
         &rpc,
@@ -411,16 +467,25 @@ fn a_native_wallet_on_testnet_obeys_its_signers_weights_and_thresholds() {
             recipient: None,
         },
     );
-    assert!(settle(&rpc, "withdrawal by the owner alone", &step));
+    assert_eq!(
+        settle(&rpc, "withdrawal by the owner alone", &step),
+        Outcome::Applied
+    );
     let step = owner_step(&rpc, &roles, &owner, WalletAction::Resume);
-    assert!(settle(&rpc, "resume by the owner alone", &step));
+    assert_eq!(
+        settle(&rpc, "resume by the owner alone", &step),
+        Outcome::Applied
+    );
     let step = owner_step(
         &rpc,
         &roles,
         &owner,
         WalletAction::Close { token_balance: 0 },
     );
-    assert!(settle(&rpc, "close by the owner alone", &step));
+    assert_eq!(
+        settle(&rpc, "close by the owner alone", &step),
+        Outcome::Applied
+    );
     assert!(
         rpc::find_account(&rpc, &roles.wallet).unwrap().is_none(),
         "the closed wallet account no longer exists"
