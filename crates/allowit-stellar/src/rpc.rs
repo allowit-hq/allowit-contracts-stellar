@@ -226,10 +226,43 @@ pub fn prepare_with(
         PolicyBinding::from_scval(&readonly_call(rpc, c, &state.source, "policy_binding")?)?
             .verify(c, operation.kind())?;
     }
-    let terms = priced_terms(rpc, c, request, terms, &state, now, expires_at)?;
-    let intent = prepare_for_native_preflight(c, request, &terms, &state, now, expires_at)?;
-    simulate(rpc, &intent)
+    let ceiling = terms.expense.as_ref();
+    let mut terms = priced_terms(rpc, c, request, terms, &state, now, expires_at)?;
+    // The invocation that carries the priced expense is simulated on its own. A policy that
+    // reads the gas can need more resources with it than with the provisional expense. Its
+    // bound then follows from its own resource fee, within the ceiling, at most
+    // `REPRICE_ROUNDS` times. After that the bound decides, and `attach_simulation` refuses a
+    // resource fee above it.
+    let mut rounds = 0;
+    loop {
+        let intent = prepare_for_native_preflight(c, request, &terms, &state, now, expires_at)?;
+        let encoded = simulated_resources(rpc, &intent)?;
+        let repriced = match (ceiling, &terms.expense) {
+            (Some(ceiling), Some(signed)) if rounds < REPRICE_ROUNDS => {
+                let resources: SorobanTransactionData = read(&encoded)?;
+                let bound = fee_bound(resources.resource_fee)?.min(ceiling.max_fee_stroops);
+                // The margin of the signed bound absorbs a small change. Only a declared fee
+                // above the signed bound prices the operation again, and only upward.
+                let declared = resources
+                    .resource_fee
+                    .saturating_add(i64::from(INCLUSION_FEE_STROOPS));
+                (declared > i64::from(signed.max_fee_stroops) && bound > signed.max_fee_stroops)
+                    .then(|| ceiling.with_fee_bound(bound))
+            }
+            _ => None,
+        };
+        let Some(expense) = repriced else {
+            let mut prepared = attach_simulation(&intent, &encoded)?;
+            record_native_preflight(&mut prepared)?;
+            return Ok(prepared);
+        };
+        terms.expense = Some(expense?);
+        rounds += 1;
+    }
 }
+/// How often preparation prices an operation again from the simulation of its priced
+/// invocation.
+const REPRICE_ROUNDS: u8 = 2;
 /// `terms` with the expense fee bound lowered from the caller's ceiling to the fee that this
 /// operation can be charged: `fee_bound` of its simulated resource fee, at most the ceiling.
 ///
@@ -239,7 +272,8 @@ pub fn prepare_with(
 /// admits it there. A policy can read the gas of a request and refuse the lowest bound alone, so
 /// a refusal there is not final: the ceiling is tried next. When the wallet refuses both, the
 /// first refusal is the answer. The caller then simulates the operation again with the returned
-/// terms, which decides the policy and the declared fee.
+/// terms, which decides the policy and the declared fee, and prices it again when that
+/// simulation needs a higher bound.
 fn priced_terms(
     rpc: &dyn Rpc,
     c: &WalletConfig,

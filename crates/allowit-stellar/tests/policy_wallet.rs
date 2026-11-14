@@ -717,14 +717,18 @@ fn execute(w: &mut Wallet, request: &x::ScVal, now: u64) -> x::ScVal {
     receipt
 }
 
-/// A chain whose wallet policy refuses every simulated request that carries one of these gas
-/// amounts, as a Custom policy that reads `ctx.request.gas_units` can.
-struct RefusesGas<'a> {
+/// A chain whose wallet policy reads the gas of a request, as a Custom policy that reads
+/// `ctx.request.gas_units` can. It refuses every simulated request that carries one of the
+/// `refused` gas amounts. With `cost`, a recording simulation of a request above the lowest fee
+/// bound needs the resource fee that `cost` gives for its gas.
+struct ReadsGas<'a> {
     chain: &'a ModelChain,
     refused: &'a [i128],
+    cost: Option<fn(i128) -> i64>,
 }
-impl rpc::Rpc for RefusesGas<'_> {
+impl rpc::Rpc for ReadsGas<'_> {
     fn call(&self, method: &str, params: Value) -> Result<Value> {
+        let mut gas = None;
         if method == "simulateTransaction" {
             let x::TransactionEnvelope::Tx(env) = de(params["transaction"].as_str().unwrap())
             else {
@@ -734,12 +738,28 @@ impl rpc::Rpc for RefusesGas<'_> {
                 && call.function_name.0.as_slice() == b"execute"
                 && let x::ScVal::Vec(Some(expense)) = field(&call.args[0], "expense")
                 && expense.len() == 2
-                && self.refused.contains(&int(field(&expense[1], "gas_units")))
             {
+                gas = Some(int(field(&expense[1], "gas_units")));
+            }
+            if gas.is_some_and(|gas| self.refused.contains(&gas)) {
                 return Ok(json!({"error": "the policy refuses this gas"}));
             }
         }
-        self.chain.call(method, params)
+        let record = params["authMode"] == "record";
+        let mut reply = self.chain.call(method, params)?;
+        if let (Some(cost), Some(gas)) = (self.cost, gas)
+            && record
+            && gas > i128::from(INCLUSION_FEE_STROOPS)
+            && reply.get("error").is_none()
+        {
+            let fee = cost(gas);
+            reply["minResourceFee"] = json!(fee.to_string());
+            reply["transactionData"] = json!(b64(&x::SorobanTransactionData {
+                resource_fee: fee,
+                ..Default::default()
+            }));
+        }
+        Ok(reply)
     }
 }
 
@@ -1047,11 +1067,12 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
     chain.0.lock().unwrap().enforce_fee = ENFORCE_FEE;
     // A policy can refuse the lowest fee bound alone. The fee is then simulated at the ceiling,
     // and the signed bound is the same. A refusal of both is the refusal of the lowest bound.
-    let priced = |refused: &[i128]| {
+    let priced = |refused: &[i128], cost: Option<fn(i128) -> i64>| {
         rpc::prepare_with(
-            &RefusesGas {
+            &ReadsGas {
                 chain: &chain,
                 refused,
+                cost,
             },
             &c,
             &transfer,
@@ -1062,16 +1083,42 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
         )
     };
     let lowest = i128::from(INCLUSION_FEE_STROOPS);
-    let bound = priced(&[lowest]).unwrap().terms.expense.unwrap();
+    let bound = priced(&[lowest], None).unwrap().terms.expense.unwrap();
     assert_eq!(
         (bound.gas_units, bound.spent_units),
         (GAS, 10_000_000 + GAS)
     );
     for refused in [&[lowest, i128::from(MAX_FEE)][..], &[GAS][..]] {
         assert!(
-            priced(refused)
+            priced(refused, None)
                 .unwrap_err()
                 .contains("rejected the exact policy operation")
+        );
+    }
+    // A policy can need more resources with the priced gas than with the lowest bound. The
+    // operation is then priced from its own simulation: 3,000 + 100 + 30. Its declared fee,
+    // 3,100, is within that bound.
+    let repriced = priced(&[], Some(|_| 3_000)).unwrap();
+    let bound = repriced.terms.expense.as_ref().unwrap();
+    let x::TransactionEnvelope::Tx(envelope) = de(&repriced.transaction_xdr) else {
+        panic!()
+    };
+    assert_eq!(
+        (bound.gas_units, bound.max_fee_stroops, envelope.tx.fee),
+        (3_130, 3_130, 3_100)
+    );
+    // A resource fee inside the margin of the signed bound prices nothing again.
+    let inside = priced(&[], Some(|_| GAS as i64 - 100)).unwrap();
+    assert_eq!(inside.terms.expense.as_ref().unwrap().gas_units, GAS);
+    // A policy whose cost always exceeds its bound is refused after the pricing rounds, and
+    // one that needs more than the ceiling is refused at the ceiling.
+    for cost in [(|gas| gas as i64) as fn(i128) -> i64, |_| {
+        i64::from(MAX_FEE)
+    }] {
+        assert!(
+            priced(&[], Some(cost))
+                .unwrap_err()
+                .contains("exceeds approved fee bound")
         );
     }
     let receipt = run(
