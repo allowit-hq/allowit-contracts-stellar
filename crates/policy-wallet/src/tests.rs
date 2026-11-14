@@ -2335,3 +2335,114 @@ fn address_kind_checks_tell_accounts_from_contracts() {
     assert_eq!(public_key(&contract), Err(AllowitWalletError::InvalidActor));
     assert!(is_contract(&contract) && !is_contract(&account));
 }
+
+/// The owner alone runs every admin call of a policy wallet, on every wallet kind: pause,
+/// resume, recovery, a params update, an owner change and the passthrough. The agent, the
+/// server, both together and a stranger run none of them, and a refused call changes no state
+/// and moves no funds. Agent and server together only pay, and a paused wallet refuses that too.
+#[test]
+fn only_the_owner_runs_each_admin_call_on_every_wallet_kind() {
+    for (kind, wasm) in [("simple", SIMPLE), ("standard", COMMON), ("custom", CUSTOM)] {
+        let f = Fixture::new(wasm, false);
+        let stranger = Address::generate(&f.env);
+        let groups: [&[&Address]; 4] = [
+            &[&f.agent],
+            &[&f.server],
+            &[&f.agent, &f.server],
+            &[&stranger],
+        ];
+        let refused_admin = |f: &Fixture, paused: bool| {
+            let before = (f.client().state(), f.balance());
+            let version = before.0.deployment_version + 1;
+            let mut params = f.deployment();
+            set_param(
+                &mut params.params,
+                DAILY_SPENDING_LIMIT,
+                Some(AllowitValue::Int(149)),
+            );
+            let mut takeover = f.deployment();
+            takeover.owner = f.agent.clone();
+            for actors in groups {
+                f.auth(actors, "set_pause", (paused, version).into_val(&f.env));
+                assert!(
+                    f.client().try_set_pause(&paused, &version).is_err(),
+                    "{kind}: set_pause({paused}) by {} non-owner signer(s)",
+                    actors.len()
+                );
+                f.auth(
+                    actors,
+                    "recover",
+                    (f.recipient.clone(), 10i128).into_val(&f.env),
+                );
+                assert!(
+                    f.client().try_recover(&f.recipient, &10).is_err(),
+                    "{kind}: recover"
+                );
+                for p in [&params, &takeover] {
+                    f.auth(actors, "deploy_policy", (p.clone(),).into_val(&f.env));
+                    assert!(
+                        f.client().try_deploy_policy(p).is_err(),
+                        "{kind}: deploy_policy"
+                    );
+                }
+                let function = Symbol::new(&f.env, "transfer");
+                let args: Vec<Val> =
+                    (f.wallet.clone(), f.recipient.clone(), 10i128).into_val(&f.env);
+                let auth = Vec::new(&f.env);
+                f.auth(
+                    actors,
+                    "invoke",
+                    (
+                        f.asset.clone(),
+                        function.clone(),
+                        args.clone(),
+                        auth.clone(),
+                    )
+                        .into_val(&f.env),
+                );
+                assert!(
+                    f.client()
+                        .try_invoke(&f.asset, &function, &args, &auth)
+                        .is_err(),
+                    "{kind}: invoke"
+                );
+                assert_eq!((f.client().state(), f.balance()), before, "{kind}");
+            }
+        };
+        // Active wallet: no non-owner pauses, recovers, updates, takes over or passes through.
+        refused_admin(&f, true);
+        // Agent and server together pay.
+        f.transfer(10);
+        assert_eq!(f.balance(), 990, "{kind}");
+        // The owner alone pauses.
+        let version = f.client().state().deployment_version + 1;
+        f.auth(&[&f.owner], "set_pause", (true, version).into_val(&f.env));
+        f.client().set_pause(&true, &version);
+        assert!(f.client().state().paused, "{kind}");
+        // Paused: agent and server together cannot pay, and no non-owner resumes.
+        let e = f.execution(10);
+        f.auth(
+            &[&f.agent, &f.server],
+            "execute",
+            (e.clone(),).into_val(&f.env),
+        );
+        assert_eq!(
+            f.client().try_execute(&e),
+            Err(Ok(AllowitWalletError::Paused)),
+            "{kind}"
+        );
+        refused_admin(&f, false);
+        // The owner alone recovers the funds of a paused wallet, then resumes it.
+        f.auth(
+            &[&f.owner],
+            "recover",
+            (f.recipient.clone(), 990i128).into_val(&f.env),
+        );
+        f.client().recover(&f.recipient, &990);
+        assert_eq!(f.balance(), 0, "{kind}");
+        let version = f.client().state().deployment_version + 1;
+        f.auth(&[&f.owner], "set_pause", (false, version).into_val(&f.env));
+        f.client().set_pause(&false, &version);
+        assert!(!f.client().state().paused, "{kind}");
+    }
+}
