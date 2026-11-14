@@ -109,6 +109,9 @@ struct Step {
 struct RetainedStep {
     packet: Step,
     source: native::AccountState,
+    /// The keypair wallet account as the caller read it, for an owner action on that account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wallet: Option<native::AccountState>,
     validated_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     extend_to: Option<u32>,
@@ -355,6 +358,22 @@ fn expected(record: &Record, step: &RetainedStep) -> Result<ExpectedOwnerIntent>
             salt: wallet_salt(&c.policy_instance),
             x402_enabled: false,
         },
+        (Work::Fund { units, .. }, "fund") if c.route == WalletRoute::Native => {
+            OwnerAction::Wallet {
+                owner_state: step.source.clone(),
+                wallet_state: step.wallet.clone().ok_or_else(|| {
+                    Error::config("Retained wallet funding has no independently read wallet")
+                })?,
+                agent: c.agent.clone(),
+                engine: c.server.clone(),
+                action: native::owner::WalletAction::Fund {
+                    units: i64::try_from(*units)
+                        .map_err(|_| Error::usage("The amount exceeds the native range"))?,
+                },
+                asset_symbol: c.asset_symbol.clone(),
+                asset_issuer: c.asset_issuer.clone(),
+            }
+        }
         (Work::Fund { units, .. }, "fund") => OwnerAction::Fund {
             asset: c.asset.clone(),
             from: c.owner.clone(),
@@ -553,7 +572,10 @@ impl OwnerClient {
         } = capabilities;
         if !crate::host::request::request_id_valid(id)
             || max_fee < 100
-            || selection.config.route != WalletRoute::PolicyWallet
+            // A keypair wallet takes funding here. Its owner creates it with the wallet setup.
+            || !(selection.config.route == WalletRoute::PolicyWallet
+                || (selection.config.route == WalletRoute::Native
+                    && matches!(work, Work::Fund { .. })))
             || signer.account() != self.session.owner()
             || selection.config.owner != self.session.owner()
         {
@@ -706,8 +728,14 @@ impl OwnerClient {
                 } else {
                     None
                 };
+                let wallet = if selection.config.route == WalletRoute::Native {
+                    Some(checked(rpc::get_account(rpc, &selection.config.wallet))?)
+                } else {
+                    None
+                };
                 let retained = RetainedStep {
                     extend_to,
+                    wallet,
                     packet: step,
                     source,
                     validated_at: clock()?,
@@ -908,6 +936,18 @@ impl OwnerClient {
                 .collect(),
             receipts: record.steps.iter().filter_map(OwnerReceipt::of).collect(),
         })
+    }
+    /// Ask the server to register a wallet account that the owner's setup created. The server
+    /// reads the account from the ledger and registers it only with the exact roles of
+    /// `configuration`, for this owner session. A repeated registration changes nothing.
+    pub fn register_native(&self, configuration: &Value, now: u64) -> Result<Value> {
+        self.session.owner_request(
+            Method::Post,
+            "/api/native/register",
+            Some(&json!({ "configuration": configuration })),
+            now,
+            false,
+        )
     }
     pub fn verify_binding(&self, selection: &OwnerPolicy, rpc: &dyn rpc::Rpc) -> Result<()> {
         selection.validate()?;
@@ -1348,13 +1388,14 @@ pub fn configure_native(
             // A wallet account that already exists is this agent's wallet only with the exact
             // roles. Any other authority on it is refused, and nothing is signed.
             if let Some(existing) = checked(rpc::find_account(runtime.rpc(), &wallet))? {
-                checked(
-                    existing
-                        .wallet_status(&request.owner, &request.agent, &request.server)
-                        .map_err(|_| {
-                            "The wallet account of this agent already exists with other signers or thresholds; setup never replaces existing authority".to_owned()
-                        }),
-                )?;
+                if existing
+                    .wallet_status(&request.owner, &request.agent, &request.server)
+                    .is_err()
+                {
+                    return Err(Error::config(
+                        "The wallet account of this agent already exists with other signers or thresholds; setup never replaces existing authority",
+                    ));
+                }
                 return configured(None);
             }
             let source = checked(rpc::get_account(runtime.rpc(), &request.owner))?;
@@ -1705,6 +1746,7 @@ mod submit_refusal_tests {
         let hash = "ab".repeat(32);
         let owner = crate::test_support::owner::account(11);
         let mut step = RetainedStep {
+            wallet: None,
             packet: Step {
                 network: "stellar:testnet".into(),
                 action: "deploy_wallet".into(),

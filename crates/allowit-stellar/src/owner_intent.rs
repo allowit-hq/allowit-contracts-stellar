@@ -220,6 +220,7 @@ pub enum OwnerAction {
     },
     /// One owner action on a wallet account (fund, pause, resume, withdraw or close),
     /// reconstructed from the caller-observed owner and wallet accounts and the selected roles.
+    /// The packet chooses only its fee, within the caller's fee limit, and its expiry.
     Wallet {
         owner_state: AccountState,
         wallet_state: AccountState,
@@ -228,8 +229,6 @@ pub enum OwnerAction {
         action: owner::WalletAction,
         asset_symbol: String,
         asset_issuer: Option<String>,
-        fee_per_operation: u32,
-        created_at: u64,
     },
 }
 impl OwnerAction {
@@ -403,12 +402,20 @@ pub fn validate_owner_transaction(
             action,
             asset_symbol,
             asset_issuer,
-            fee_per_operation,
-            created_at,
         } => {
-            if owner_state.address != limits.owner || *created_at > now {
-                return Err("Wallet action source or time differs from caller intent".into());
+            if owner_state.address != limits.owner {
+                return Err("Wallet action source differs from caller intent".into());
             }
+            // The fee and the expiry are the packet's own, within the limits checked above.
+            // Every operation is rebuilt from the caller's accounts, roles and action.
+            let count = u32::try_from(tx.operations.len()).map_err(err)?;
+            if count == 0 || !tx.fee.is_multiple_of(count) {
+                return Err("Wallet action fee is not a whole fee per operation".into());
+            }
+            let created_at = packet
+                .expires_at
+                .checked_sub(300)
+                .ok_or("Wallet action expiry is invalid")?;
             let exact = owner::prepare_wallet_action(
                 owner_state,
                 wallet_state,
@@ -421,8 +428,8 @@ pub fn validate_owner_transaction(
                 action,
                 &asset_from_identity(asset_symbol, asset_issuer.as_deref())?,
                 &limits.network,
-                *fee_per_operation,
-                *created_at,
+                tx.fee / count,
+                created_at,
             )?;
             if packet != &exact {
                 return Err("Wallet action differs from the exact caller-selected roles".into());
