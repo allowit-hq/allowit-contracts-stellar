@@ -243,16 +243,18 @@ pub fn proof(challenge: &Challenge, receipt: &Value) -> Result<Proof> {
             "The payment receipt names no transaction hash.",
         ));
     }
-    // The verified receipt states the debit. It must be the amount of this challenge.
+    // The verified receipt states the debit, and the server records what the payment bought.
+    // Each one that the document holds must be this challenge, and it must hold one of them.
+    // A fee-bumped transaction reports no settlement, so its record alone binds the purchase.
     let paid = &receipt["settlement"]["amount"];
-    if paid["units"] != challenge.amount.units.as_str()
-        || paid["asset"]["symbol"] != challenge.amount.asset.symbol.as_str()
+    if !paid.is_null()
+        && (paid["units"] != challenge.amount.units.as_str()
+            || paid["asset"]["symbol"] != challenge.amount.asset.symbol.as_str())
     {
         return Err(Error::config(
             "The payment receipt does not state the amount of this challenge.",
         ));
     }
-    // The server records what the payment bought. A record of another purchase is refused.
     let recorded = &receipt["paidService"];
     if !recorded.is_null()
         && *recorded
@@ -261,6 +263,11 @@ pub fn proof(challenge: &Challenge, receipt: &Value) -> Result<Proof> {
     {
         return Err(Error::config(
             "The payment receipt records another purchase.",
+        ));
+    }
+    if paid.is_null() && recorded.is_null() {
+        return Err(Error::config(
+            "The payment receipt states neither the amount nor the purchase of this challenge.",
         ));
     }
     let version = challenge.terms["x402Version"].as_u64().unwrap_or(1);
@@ -529,7 +536,21 @@ mod tests {
         }
         refused(&|r| r["transactionHash"] = json!("ab"), 3);
         refused(&|r| r["transactionHash"] = Value::Null, 3);
-        refused(&|r| r["settlement"] = Value::Null, 3);
+        // Neither the debit nor the record: nothing binds the payment to this challenge.
+        refused(
+            &|r| {
+                r["settlement"] = Value::Null;
+                r.as_object_mut().unwrap().remove("paidService");
+            },
+            3,
+        );
+        refused(
+            &|r| {
+                r["settlement"] = Value::Null;
+                r["paidService"]["amount"] = json!("1");
+            },
+            3,
+        );
         refused(
             &|r| r["settlement"]["amount"]["units"] = json!("2499999"),
             3,
@@ -547,6 +568,10 @@ mod tests {
         let mut plain = receipt(&challenge);
         plain.as_object_mut().unwrap().remove("paidService");
         proof(&challenge, &plain).unwrap();
+        // A fee-bumped transaction reports no settlement: the recorded purchase binds it.
+        let mut bumped = receipt(&challenge);
+        bumped.as_object_mut().unwrap().remove("settlement");
+        proof(&challenge, &bumped).unwrap();
         // A challenge that never accepted the settled proof gets none.
         let mut standard = challenge.clone();
         standard.terms["accepted"]["extra"] = json!({});

@@ -115,7 +115,9 @@ pub fn recover(
             request,
             original.request(),
         )?;
-        if rebuilt.request != *original.request() {
+        if rebuilt.request != *original.request()
+            || request.paid_service.as_ref() != original.paid_service()
+        {
             return Err(Error::usage(
                 "Original request ID already binds different input",
             ));
