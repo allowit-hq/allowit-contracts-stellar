@@ -200,7 +200,7 @@ Policy wallet preparation needs resource simulation before signing. Native confi
 
 A policy wallet counts gas against its spending limits: the `gas_units` of the expense that the server signs. `rpc::prepare_with` treats the caller's expense as a ceiling and lowers it to the fee that the operation can be charged:
 
-1. It simulates the exact invocation in recording mode with the lowest fee bound, the 100-stroop inclusion fee. The wallet runs its whole policy; a denial there is final.
+1. It simulates the exact invocation in recording mode with the lowest fee bound, the 100-stroop inclusion fee. The wallet runs its whole policy. A policy that reads the gas can refuse the lowest bound alone, so a refused operation is simulated once more at the ceiling. When the wallet refuses both, the first refusal is the answer.
 2. `fee_bound` of the simulated resource fee is the signed bound: the resource fee, the inclusion fee and a 1% margin, rounded up. `ExpenseBounds::with_fee_bound` lowers the gas pro rata and rounds up. For XLM the gas is the bound in stroops.
 3. It simulates the invocation again with that expense. This simulation decides the policy, so a debit plus its counted gas above a limit is denied before any signature.
 

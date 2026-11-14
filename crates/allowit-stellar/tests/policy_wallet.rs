@@ -717,6 +717,32 @@ fn execute(w: &mut Wallet, request: &x::ScVal, now: u64) -> x::ScVal {
     receipt
 }
 
+/// A chain whose wallet policy refuses every simulated request that carries one of these gas
+/// amounts, as a Custom policy that reads `ctx.request.gas_units` can.
+struct RefusesGas<'a> {
+    chain: &'a ModelChain,
+    refused: &'a [i128],
+}
+impl rpc::Rpc for RefusesGas<'_> {
+    fn call(&self, method: &str, params: Value) -> Result<Value> {
+        if method == "simulateTransaction" {
+            let x::TransactionEnvelope::Tx(env) = de(params["transaction"].as_str().unwrap())
+            else {
+                panic!()
+            };
+            if let x::HostFunction::InvokeContract(call) = &host_op(&env.tx).host_function
+                && call.function_name.0.as_slice() == b"execute"
+                && let x::ScVal::Vec(Some(expense)) = field(&call.args[0], "expense")
+                && expense.len() == 2
+                && self.refused.contains(&int(field(&expense[1], "gas_units")))
+            {
+                return Ok(json!({"error": "the policy refuses this gas"}));
+            }
+        }
+        self.chain.call(method, params)
+    }
+}
+
 fn terms(principal: i128, ledger: u32) -> ExecutionTerms {
     ExecutionTerms {
         args: PolicyParams::default(),
@@ -1019,6 +1045,35 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
         }
     }
     chain.0.lock().unwrap().enforce_fee = ENFORCE_FEE;
+    // A policy can refuse the lowest fee bound alone. The fee is then simulated at the ceiling,
+    // and the signed bound is the same. A refusal of both is the refusal of the lowest bound.
+    let priced = |refused: &[i128]| {
+        rpc::prepare_with(
+            &RefusesGas {
+                chain: &chain,
+                refused,
+            },
+            &c,
+            &transfer,
+            &terms(10_000_000, ledger),
+            None,
+            NOW,
+            NOW + 300,
+        )
+    };
+    let lowest = i128::from(INCLUSION_FEE_STROOPS);
+    let bound = priced(&[lowest]).unwrap().terms.expense.unwrap();
+    assert_eq!(
+        (bound.gas_units, bound.spent_units),
+        (GAS, 10_000_000 + GAS)
+    );
+    for refused in [&[lowest, i128::from(MAX_FEE)][..], &[GAS][..]] {
+        assert!(
+            priced(refused)
+                .unwrap_err()
+                .contains("rejected the exact policy operation")
+        );
+    }
     let receipt = run(
         &chain,
         &c,

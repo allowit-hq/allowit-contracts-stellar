@@ -233,10 +233,13 @@ pub fn prepare_with(
 /// `terms` with the expense fee bound lowered from the caller's ceiling to the fee that this
 /// operation can be charged: `fee_bound` of its simulated resource fee, at most the ceiling.
 ///
-/// The expense is an argument of the invocation, so the fee is simulated first with the lowest
-/// fee bound, the inclusion fee alone. The wallet runs its whole policy in that simulation, and
-/// its denial there is final: no transaction declares a lower fee. The caller then simulates the
-/// operation again with the returned terms, which decides the policy and the declared fee.
+/// The expense is an argument of the invocation, so the fee is simulated first with a
+/// provisional fee bound. The wallet runs its whole policy in that simulation. The lowest bound,
+/// the inclusion fee alone, is tried first: a limit that admits the operation at its final bound
+/// admits it there. A policy can read the gas of a request and refuse the lowest bound alone, so
+/// a refusal there is not final: the ceiling is tried next. When the wallet refuses both, the
+/// first refusal is the answer. The caller then simulates the operation again with the returned
+/// terms, which decides the policy and the declared fee.
 fn priced_terms(
     rpc: &dyn Rpc,
     c: &WalletConfig,
@@ -255,16 +258,17 @@ fn priced_terms(
             expense: Some(ceiling.with_fee_bound(fee.min(ceiling.max_fee_stroops))?),
         })
     };
-    let probe = prepare_for_native_preflight(
-        c,
-        request,
-        &with_bound(INCLUSION_FEE_STROOPS)?,
-        state,
-        now,
-        expires_at,
-    )?;
-    let resources: SorobanTransactionData = read(&simulated_resources(rpc, &probe)?)?;
-    with_bound(fee_bound(resources.resource_fee)?)
+    let resource_fee = |fee: u32| -> Result<i64> {
+        let probe =
+            prepare_for_native_preflight(c, request, &with_bound(fee)?, state, now, expires_at)?;
+        let resources: SorobanTransactionData = read(&simulated_resources(rpc, &probe)?)?;
+        Ok(resources.resource_fee)
+    };
+    let simulated = match resource_fee(INCLUSION_FEE_STROOPS) {
+        Ok(fee) => fee,
+        Err(lowest) => resource_fee(ceiling.max_fee_stroops).map_err(|_| lowest)?,
+    };
+    with_bound(fee_bound(simulated)?)
 }
 pub(crate) fn reject_restoration(value: &Value) -> Result<()> {
     if value
