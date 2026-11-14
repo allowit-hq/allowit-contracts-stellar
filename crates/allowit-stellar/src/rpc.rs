@@ -524,7 +524,7 @@ pub fn revalidate_prepared(
         || have.instructions < need.instructions
         || have.disk_read_bytes < need.disk_read_bytes
         || have.write_bytes < need.write_bytes
-        || original.resource_fee < required.resource_fee
+        || declared_resource_fee(p)? < required.resource_fee
     {
         return Err("Existing transaction resources do not cover native revalidation".into());
     }
@@ -532,6 +532,17 @@ pub fn revalidate_prepared(
     record_native_preflight(&mut validated)?;
     validate_prepared(&validated, now)?;
     Ok(validated)
+}
+/// The resource fee that the prepared transaction declares. It is the signed bound less the
+/// inclusion fee, so it stays above the simulated resource fee by the margin of the bound.
+fn declared_resource_fee(p: &PreparedOperation) -> Result<i64> {
+    let TransactionEnvelope::Tx(envelope) = read(&p.transaction_xdr)? else {
+        return Err("Unsupported transaction envelope".into());
+    };
+    let TransactionExt::V1(data) = &envelope.tx.ext else {
+        return Err("Existing intent declares no Soroban resources".into());
+    };
+    Ok(data.resource_fee)
 }
 /// Native outcome of one `sendTransaction` attempt. Persistence and retry policy belong to SDK engine.
 #[derive(Clone, Debug, PartialEq, Eq)]
