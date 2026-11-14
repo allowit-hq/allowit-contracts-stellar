@@ -1,4 +1,5 @@
 //! Stellar adapter registration and native workflow bindings.
+pub mod custom_build;
 pub mod execution;
 pub mod formats;
 pub mod owner;

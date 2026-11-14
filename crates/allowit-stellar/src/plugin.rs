@@ -176,6 +176,11 @@ impl RailPlugin for Plugin {
     ) -> Option<&'static dyn allowit_core::vendor::paid_service::PaidServiceProvider> {
         Some(&provider::paid_service::PAID_SERVICE)
     }
+    fn custom_wallet_build(
+        &self,
+    ) -> Option<&'static dyn allowit_core::vendor::custom_build::CustomWalletBuild> {
+        Some(&provider::custom_build::CUSTOM_BUILD)
+    }
     fn draft_params(
         &self,
         network: &str,
@@ -496,6 +501,7 @@ fn fixtures() -> Fixtures {
         live: Some(LiveConfig {
             env: &["ALLOWIT_LIVE_TESTNET"],
         }),
+        wallet_code: provider::custom_build::fixture_wallet_code(),
     }
 }
 

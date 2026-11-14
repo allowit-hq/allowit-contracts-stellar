@@ -75,6 +75,30 @@ Policy wallet custody calls the layout 4 `execute` entrypoint (`CONTRACT_VERSION
 
 `policy::evaluate` runs a policy on the host as the wallet does. A Common wallet runs its standard prefix first. A canonical-only source, or any source with a compiled evaluator, then runs in full. Otherwise the result is `Evaluation::Prefix`: only the onchain part ran. Fresh classic installs admit only canonical portable source and canonical params.
 
+## Custom wallet build
+
+`plugin::PLUGIN.custom_wallet_build()` is the rail's implementation of Core's "build custom wallet" hook
+(`allowit_core::vendor::custom_build::CustomWalletBuild`, [`src/provider/custom_build.rs`](src/provider/custom_build.rs)).
+
+- `build(network, source, work)` builds the `AllowitCustomPolicy` Wasm from the exact bytes of the policy source.
+  The crate embeds the contract workspace of its own revision. The build writes that tree to `work/tree` with the
+  source as `contracts/allowit-custom-policy/policy/policy.rs` and runs
+  `stellar contract build --locked --package allowit-custom-policy`. `work/target` keeps the compiler cache.
+  The build compiles the same files as `scripts/build-custom-policy.sh` does from a checkout of the same revision, so
+  the same source, Rust toolchain and Stellar CLI give the same Wasm. Only source that passes the portable policy
+  gate is compiled.
+- The build needs Stellar CLI 28.1.0 (`stellar` on `PATH`, or the binary that `STELLAR_BIN` names) and rustup, which
+  installs the pinned compiler and the `wasm32v1-none` target from `rust-toolchain.toml`. A missing tool or another
+  CLI release is a `custom_toolchain_missing` refusal that says what to install. A failed compile is
+  `custom_build_failed`.
+- `code_hash` is the SHA-256 of a wallet Wasm of the current custody layout: the hash of the code on the ledger.
+- `sign_message` and `verify_message` are the SEP-53 message signature, the one that a browser wallet makes with
+  `signMessage`. The server presignature and the owner attestation of a build use it, so a local key and a browser
+  wallet sign the same statement.
+
+The rail reports a wallet whose code on the ledger differs from the code of its configuration with the problem code
+`custom_code_hash_mismatch`. `OwnerProvider::custom_build` reads the owner's view of a build from the server.
+
 ## Wallet kinds, units and settlement reports
 
 The plugin offers the four Core wallet kinds on every network. `native` is the classic account route. `simple`,

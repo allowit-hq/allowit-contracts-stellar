@@ -1256,6 +1256,8 @@ pub fn trusted_state_for_discovery(
 ) -> Result<DiscoveredState> {
     trusted_state_inner(rpc, c, accounting, false)
 }
+/// The fault of a wallet whose code on the ledger differs from the code of its configuration.
+pub const EXECUTABLE_DIFFERS: &str = "policy wallet executable differs from installed code";
 fn trusted_state_inner(
     rpc: &dyn Rpc,
     c: &WalletConfig,
@@ -1341,7 +1343,7 @@ fn trusted_state_inner(
         return Err("policy wallet must use an owner-selected Wasm executable".into());
     };
     if module.0 != c.module_digest {
-        return Err("policy wallet executable differs from installed code".into());
+        return Err(EXECUTABLE_DIFFERS.into());
     }
     let storage = instance.storage.ok_or("Missing policy wallet storage")?;
     let state = storage
