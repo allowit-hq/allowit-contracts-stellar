@@ -84,6 +84,15 @@ pub fn validate_retained_owner_transaction(original: &OwnerTransaction) -> Resul
 fn classic_action_matches(action: &str, operations: &[Operation]) -> bool {
     let wallet_sourced = |op: &Operation| op.source_account.is_some();
     match (action, operations) {
+        // The setup of earlier releases configured the owner's own account with three
+        // operations. Its retained packets stay readable; nothing prepares or signs it now.
+        ("native_setup", [a, b, c])
+            if [a, b, c].iter().all(|op| {
+                !wallet_sourced(op) && matches!(op.body, OperationBody::SetOptions(_))
+            }) =>
+        {
+            true
+        }
         ("native_setup", [create, rest @ ..]) => {
             matches!(create.body, OperationBody::CreateAccount(_))
                 && create.source_account.is_none()

@@ -58,6 +58,32 @@ pub fn next_params(c: &WalletConfig, update: &ParamsUpdate) -> Result<PolicyPara
     next.check(tier).map_err(Error::usage)?;
     Ok(next)
 }
+/// The params of a keypair wallet's policy with the update applied, checked as the tier of its
+/// portable binding checks them. The server holds these params; the wallet account holds none.
+pub fn next_keypair_params(
+    c: &WalletConfig,
+    tier: native::PolicyTier,
+    update: &ParamsUpdate,
+) -> Result<PolicyParams> {
+    if c.route != WalletRoute::Native {
+        return Err(Error::unsupported(
+            "A source approval update needs a keypair wallet",
+        ));
+    }
+    let next = PolicyParams(
+        update
+            .apply(&core_params(&c.params)?)?
+            .into_iter()
+            .map(|(key, value)| {
+                native::PolicyValue::from_core(&value)
+                    .map(|value| (key, value))
+                    .map_err(Error::usage)
+            })
+            .collect::<Result<_>>()?,
+    );
+    next.check(tier).map_err(Error::usage)?;
+    Ok(next)
+}
 /// The installation after the update settled: the same wallet, source and identity.
 pub fn updated_config(c: &WalletConfig, update: &ParamsUpdate) -> Result<WalletConfig> {
     let mut next = c.clone();

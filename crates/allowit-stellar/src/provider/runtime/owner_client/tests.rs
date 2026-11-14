@@ -69,11 +69,18 @@ fn native_setup_retains_before_sign_and_recovers_lost_reply_without_another_sign
     drop(store);
     clock.set(clock.get() + 301);
     let reopened = Store::open(&path).unwrap();
-    let signer = key();
+    // The resumed setup reads its retained signed bytes. It asks the signer for nothing, not
+    // even the derivation: a signer that cannot derive the same key again still recovers.
+    let signer = Key {
+        calls: AtomicUsize::new(0),
+        bad: true,
+        before: None,
+    };
     let out =
         workflow::configure_native(&runtime, &reopened, &request, &signer, &|| Ok(clock.get()))
             .unwrap();
     assert_eq!(out["state"], "configured");
+    assert_eq!(out["wallet"], original["setup"]["wallet"]);
     assert_eq!(signer.calls.load(Ordering::SeqCst), 0);
     let recovered: Value = reopened.load(&request.request_id).unwrap().unwrap();
     assert_eq!(recovered["signedXdr"], original["signedXdr"]);

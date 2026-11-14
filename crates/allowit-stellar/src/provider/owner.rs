@@ -239,8 +239,11 @@ impl OwnerProvider for Owner {
             expected_revision: r.expected_revision,
             changes: r.changes.clone(),
         };
-        // An invalid update fails before the journal opens or the server is asked.
-        super::params_update::next_params(&p.config, &update)?;
+        // An invalid update fails before the journal opens or the server is asked. A keypair
+        // wallet holds no params: its workflow checks the update against the portable binding.
+        if p.config.route != crate::WalletRoute::Native {
+            super::params_update::next_params(&p.config, &update)?;
+        }
         let limit = fee(r.fee_limit)?;
         let runtime = runtime(cx.rpc_url)?;
         let store = (cx.store)()?;

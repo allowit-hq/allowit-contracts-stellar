@@ -758,6 +758,45 @@ fn native_setup_rebuilds_exact_roles_thresholds_and_request_identity() {
     *fee_per_operation = u32::MAX;
     assert_refused(&packet, &changed, "native fee overflow");
 }
+/// A retained setup packet of an earlier release configured the owner's own account with three
+/// operations. It stays readable as history, and no intent signs it.
+#[test]
+fn a_retained_setup_of_an_earlier_release_stays_readable_and_is_never_signed() {
+    let (current, expected) = native();
+    let mut legacy = current.clone();
+    modify_tx(&mut legacy, |tx| {
+        let signer = |n: u8| x::Operation {
+            source_account: None,
+            body: x::OperationBody::SetOptions(x::SetOptionsOp {
+                inflation_dest: None,
+                clear_flags: None,
+                set_flags: None,
+                master_weight: None,
+                low_threshold: None,
+                med_threshold: None,
+                high_threshold: None,
+                home_domain: None,
+                signer: Some(x::Signer {
+                    key: x::SignerKey::Ed25519(x::Uint256([n; 32])),
+                    weight: 1,
+                }),
+            }),
+        };
+        let mut weights = signer(0);
+        let x::OperationBody::SetOptions(options) = &mut weights.body else {
+            panic!()
+        };
+        options.signer = None;
+        options.master_weight = Some(3);
+        options.low_threshold = Some(2);
+        options.med_threshold = Some(2);
+        options.high_threshold = Some(3);
+        tx.operations = vec![signer(12), signer(13), weights].try_into().unwrap();
+    });
+    allowit_stellar::owner_intent::validate_retained_owner_transaction(&legacy).unwrap();
+    allowit_stellar::owner_intent::validate_retained_owner_transaction(&current).unwrap();
+    assert_refused(&legacy, &expected, "the setup of an earlier release");
+}
 /// The new account's own key signs its creation once, after the owner. A key of another
 /// account never co-signs.
 #[test]
