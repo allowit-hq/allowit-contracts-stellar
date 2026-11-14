@@ -44,6 +44,15 @@ export declare const OWNER_TRANSACTION_SETTLED = "owner_transaction_settled";
 export declare const OWNER_TRANSACTION_FAILED = "owner_transaction_failed";
 /** HTTP 503 with `details.retry = "same_request_id"`: the service sent nothing. */
 export declare const NETWORK_UNAVAILABLE = "network_unavailable";
+/** Typed codes of a refused params update. `details.param` names the param of a refused value. */
+export declare const PARAM_INVALID = "param_invalid";
+export declare const PARAM_OUT_OF_RANGE = "param_out_of_range";
+/** The policy is not active, or its wallet kind takes no owner-signed update. */
+export declare const UPDATE_UNAVAILABLE = "update_unavailable";
+/** The wallet is at another configuration revision than the update expects. */
+export declare const REVISION_CHANGED = "revision_changed";
+/** The action name of the owner step of a params update. */
+export declare const UPDATE_PARAMS = "update_params";
 /** An owner workflow failure with the typed server code, when the service sent one. */
 export declare class OwnerFlowError extends Error {
     readonly code: string | null;
@@ -73,4 +82,35 @@ export declare function ownerArchiveKey(key: string, hash: string): string;
 export declare function installAndFund(input: InstallAndFundInput): Promise<{
     wallet: string;
     receipts: OwnerReceipt[];
+}>;
+export interface UpdateParamsInput {
+    /** The network of the policy. */
+    network: string;
+    /** Milliseconds between reads of a transaction that history does not hold yet. The default is 1500. */
+    historyPauseMs?: number;
+    /** One journal key per change: a confirmed change is never prepared or signed again under its key. */
+    ask: Ask;
+    sign: SignStep;
+    journal: OwnerJournal;
+    key: string;
+    policyId: string;
+    /** Each changed param with its complete new typed value, such as `{daily_spending_limit: {Int: '50000000'}}`. */
+    params: Record<string, unknown>;
+    /** The configuration revision that the owner reviewed, when the host shows one. */
+    expectedRevision?: number;
+    onStep: (text: string) => void;
+}
+/**
+ * Change installed params on an active wallet with one owner signature. The service checks each value, prepares
+ * the owner step and, when the network confirms it, saves the new params of the installation and of the policy in
+ * one write. The wallet keeps its recorded usage and its request nonce.
+ * The workflow resumes as `installAndFund` does: a saved signed step is settled first, an expired step that never
+ * applied moves to the archive key, and the owner then signs a new step. A confirmed change is never prepared or
+ * signed again under its journal key; `done` is then true and `receipts` is empty.
+ * A refusal of the service keeps its typed code in `OwnerFlowError.code`: `param_invalid`, `param_out_of_range`,
+ * `update_unavailable` or `revision_changed`, and the codes of a refused submission.
+ */
+export declare function updateParams(input: UpdateParamsInput): Promise<{
+    receipts: OwnerReceipt[];
+    done: boolean;
 }>;

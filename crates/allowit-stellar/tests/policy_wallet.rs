@@ -1292,6 +1292,254 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
 
 /// The fee bound is integer money logic that rounds up: it covers the declared fee of every
 /// resource fee, and lowered gas never prices the fee below its rate.
+/// A tier's wallet on a model chain after one settled transfer, with its installation.
+fn wallet_with_usage(tier: PolicyTier) -> (ModelChain, WalletConfig) {
+    let wasm = wasm_for(tier);
+    let module = hash(&wasm);
+    let chain = ModelChain::new(BTreeMap::from([(module, tier)]));
+    let owner = account_for_seed(&OWNER);
+    let deployer = Deployer {
+        rpc: &chain,
+        network: NETWORK,
+        now: NOW,
+        max_fee_stroops: MAX_FEE,
+    };
+    let upload = deployer.upload_wasm(&owner, &wasm).unwrap();
+    owner_submit(&chain, "upload", &upload.transaction_xdr);
+    let salt = [tier as u8 + 0x21; 32];
+    let mut c = WalletConfig {
+        network: NETWORK.into(),
+        policy_instance: [7; 32],
+        wallet: admin::wallet_address(NETWORK, &owner, &salt).unwrap(),
+        owner: owner.clone(),
+        agent: account_for_seed(&AGENT),
+        server: account_for_seed(&SERVER),
+        route: WalletRoute::PolicyWallet,
+        tier: Some(tier),
+        language: PolicyLanguage::Portable,
+        rules: policy::tier_rules(tier, SOURCE).unwrap(),
+        params: params(),
+        source_digest: [0; 32],
+        asset: xlm(),
+        asset_symbol: "XLM".into(),
+        asset_issuer: None,
+        policy_source: SOURCE.into(),
+        source_hash: hash(SOURCE),
+        module_digest: module,
+        max_fee_stroops: MAX_FEE,
+    };
+    c.source_digest =
+        policy::installed_source_digest(tier, &module, &c.asset, &c.rules, SOURCE).unwrap();
+    let config = PolicyConfig::for_policy(&c, false).unwrap();
+    let created = deployer.create_wallet(&config, &wasm, salt).unwrap();
+    owner_submit(&chain, "create", &created.transaction_xdr);
+    chain.fund(1_000_000_000);
+    let found = rpc::trusted_state_for_discovery(&chain, &c, None).unwrap();
+    let ledger = chain.0.lock().unwrap().ledger;
+    let transfer = request::transfer(
+        &c,
+        &found.state,
+        [1; 32],
+        &account_for_seed(&RECIPIENT),
+        10_000_000,
+    )
+    .unwrap();
+    run(
+        &chain,
+        &c,
+        &transfer,
+        &terms(10_000_000, ledger),
+        "transfer",
+    )
+    .unwrap();
+    (chain, c)
+}
+/// The server's owner step of a params update is the packet that the owner reconstructs from
+/// the installation alone. The settled update keeps the recorded usage and the nonce, moves
+/// the configuration revision by one, and is refused at any other revision.
+#[test]
+fn owner_params_update_step_matches_the_owner_reconstruction_and_keeps_usage() {
+    use allowit_core::AllowitValue as V;
+    use allowit_core::policy::PolicyValue as CoreValue;
+    use allowit_core::vendor::plugin::RailPlugin;
+    use allowit_core::vendor::profiles::Description;
+    use allowit_core::vendor::runtime::{Installation, ParamsUpdate, Transport};
+    use allowit_stellar::owner_intent::{
+        ExpectedOwnerIntent, OwnerAction, OwnerLimits, OwnerTransaction, validate_owner_transaction,
+    };
+    use allowit_stellar::provider::params_update;
+    use std::sync::Arc;
+    struct Wire(Arc<ModelChain>);
+    impl Transport for Wire {
+        fn call(&self, method: &str, params: Value) -> allowit_core::client::error::Result<Value> {
+            rpc::Rpc::call(&*self.0, method, params)
+                .map_err(allowit_core::client::error::Error::config)
+        }
+    }
+    for tier in [PolicyTier::Simple, PolicyTier::Common, PolicyTier::Custom] {
+        let (chain, c) = wallet_with_usage(tier);
+        let chain = Arc::new(chain);
+        let before = chain.state();
+        assert_eq!(before.nonce, 1, "{tier:?}");
+        let verified = params_update::verify(&*chain, "policy", &c).unwrap();
+        assert!(verified.matches, "{tier:?} {:?}", verified.comparisons);
+        let change = |units: i128, expected_revision| ParamsUpdate {
+            policy_id: "policy".into(),
+            expected_revision,
+            changes: [("daily_spending_limit".to_owned(), CoreValue(V::Int(units)))].into(),
+        };
+        let update = change(250_000_000, Some(before.deployment_version));
+        let owners = allowit_stellar::PLUGIN.owner_runtime();
+        let document = owners
+            .configuration(NETWORK, &serde_json::to_vec(&c).unwrap())
+            .unwrap();
+        let installation = Installation {
+            description: Description {
+                network: NETWORK.into(),
+                wallet: c.wallet.clone(),
+                agent: c.agent.clone(),
+                policy_id: "policy".into(),
+                owner: c.owner.clone(),
+                server: c.server.clone(),
+                asset: c.asset.clone(),
+                asset_symbol: c.asset_symbol.clone(),
+                source: c.policy_source.clone(),
+                source_hash: hex(&c.source_hash),
+                module_digest: hex(&c.module_digest),
+                params: document.params.clone(),
+            },
+            config: document.document().to_owned(),
+            export: None,
+            authority: None,
+        };
+        let provider = allowit_stellar::PLUGIN
+            .runtime(NETWORK, Arc::new(Wire(chain.clone())))
+            .unwrap();
+        // Another revision than the wallet holds and an unknown param are refused before a
+        // packet exists. A standard tier also refuses a value outside the rule's range; a
+        // Custom wallet takes any typed value, and the server checks the range of a rule.
+        let mut refusals = vec![
+            change(250_000_000, Some(before.deployment_version + 1)),
+            ParamsUpdate {
+                changes: [("vendor_limit".to_owned(), CoreValue(V::Int(1)))].into(),
+                ..update.clone()
+            },
+        ];
+        if tier != PolicyTier::Custom {
+            refusals.push(change(-1, Some(before.deployment_version)));
+        }
+        for refused in refusals {
+            assert!(
+                provider
+                    .prepare_params_update(&installation, &refused, u64::from(MAX_FEE), NOW)
+                    .is_err(),
+                "{tier:?}"
+            );
+        }
+        // A fee limit below the simulated fee, or below the network minimum, prepares nothing.
+        // The limit never raises the installed ceiling.
+        for limit in [0, 99, 100, RECORD_FEE as u64 + 99] {
+            assert!(
+                provider
+                    .prepare_params_update(&installation, &update, limit, NOW)
+                    .is_err(),
+                "{tier:?} {limit}"
+            );
+        }
+        let packet = provider
+            .prepare_params_update(&installation, &update, u64::MAX, NOW)
+            .unwrap();
+        let step = owners.step(NETWORK, &packet).unwrap();
+        let x::TransactionEnvelope::Tx(envelope) = de(&step.payload) else {
+            panic!()
+        };
+        assert!(envelope.tx.fee <= MAX_FEE, "{tier:?}");
+        assert_eq!(step.action, params_update::ACTION);
+        // The owner validates the step against its own reconstruction of the packet.
+        let transaction = OwnerTransaction {
+            network: NETWORK.into(),
+            action: step.action.clone(),
+            transaction_xdr: step.payload.clone(),
+            transaction_hash: step.hash,
+            expires_at: step.expires_at,
+        };
+        let source = rpc::get_account(&*chain, &c.owner).unwrap();
+        let intent = |update: &ParamsUpdate, version: u64| ExpectedOwnerIntent {
+            limits: OwnerLimits {
+                network: NETWORK.into(),
+                owner: c.owner.clone(),
+                next_sequence: source.sequence + 1,
+                max_fee_stroops: MAX_FEE,
+                valid_until: NOW + 300,
+            },
+            action: OwnerAction::UpdatePolicy {
+                wallet: c.wallet.clone(),
+                deployment: Box::new(params_update::deployment(&c, update, false).unwrap()),
+                version,
+            },
+        };
+        let next_version = before.deployment_version + 1;
+        validate_owner_transaction(&transaction, &intent(&update, next_version), NOW).unwrap();
+        // Another value, another revision or another wallet is not the owner's intent.
+        assert!(
+            validate_owner_transaction(
+                &transaction,
+                &intent(&change(260_000_000, None), next_version),
+                NOW
+            )
+            .is_err()
+        );
+        assert!(
+            validate_owner_transaction(&transaction, &intent(&update, next_version + 1), NOW)
+                .is_err()
+        );
+        let mut elsewhere = intent(&update, next_version);
+        if let OwnerAction::UpdatePolicy { wallet, .. } = &mut elsewhere.action {
+            *wallet = vault();
+        }
+        assert!(validate_owner_transaction(&transaction, &elsewhere, NOW).is_err());
+        owner_submit(&chain, "update_params", &step.payload);
+        // Usage and nonce carry over; only the params and the revision changed.
+        let after = chain.state();
+        let next = params_update::updated_config(&c, &update).unwrap();
+        assert_eq!(after.params, next.params, "{tier:?}");
+        assert_eq!(after.deployment_version, next_version);
+        assert_eq!(after.nonce, before.nonce);
+        assert_eq!(after.policy_state, before.policy_state);
+        assert_eq!(
+            (&after.source_digest, &after.rules, &after.owner),
+            (&before.source_digest, &before.rules, &before.owner)
+        );
+        // The stored installation after the update is the one that the ledger now matches.
+        let stored = owners.with_params(&document, &update).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<WalletConfig>(stored.bytes()).unwrap(),
+            next
+        );
+        let fresh = params_update::verify(&*chain, "policy", &next).unwrap();
+        assert!(fresh.matches, "{tier:?} {:?}", fresh.comparisons);
+        assert_eq!(fresh.state.revision, next_version);
+        assert_eq!(fresh.state.counters, verified.state.counters);
+        assert_eq!(fresh.state.counters.as_ref().unwrap().nonce, 1);
+        assert_eq!(
+            fresh.state.counters_from,
+            if tier == PolicyTier::Simple {
+                "server"
+            } else {
+                "ledger"
+            }
+        );
+        let stale = params_update::verify(&*chain, "policy", &c).unwrap();
+        assert!(!stale.matches);
+        // The same update cannot be prepared again: the wallet moved to the next revision, and
+        // the earlier installation no longer describes it.
+        assert!(
+            provider
+                .prepare_params_update(&installation, &update, u64::from(MAX_FEE), NOW)
+                .is_err()
+        );
+    }
+}
 #[test]
 fn a_fee_bound_covers_the_declared_fee_and_lowers_gas_rounded_up() {
     for (resource, bound) in [

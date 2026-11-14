@@ -8,7 +8,7 @@ import { StrKey } from '@stellar/stellar-sdk/base';
 import { STELLAR_NETWORKS, stellarAssetContract } from './stellar-asset.js';
 import { defineElements, ELEMENTS } from './elements/index.js';
 import { ADK_OWNER_FRAGMENT, adkParamLines, parseReviewLink, reviewAgentPrompt } from './adk-owner-link.js';
-import { installAndFund } from './owner-flow.js';
+import { installAndFund, updateParams } from './owner-flow.js';
 const TESTNET = 'stellar:testnet', PUBNET = 'stellar:pubnet';
 export const NETWORKS = Object.freeze([
     { id: TESTNET, label: 'Stellar Testnet', testnet: true, aliases: Object.freeze(['stellar-testnet']) },
@@ -132,8 +132,8 @@ const plugin = Object.freeze({
     assetDisplay,
     /** Review and sign links: the fragment, its parser, the agent prompt and the owner-readable params. */
     review: Object.freeze({ fragment: ADK_OWNER_FRAGMENT, parseLink: parseReviewLink, agentPrompt: reviewAgentPrompt, paramLines: adkParamLines }),
-    /** The owner workflow that a host runs after the review. */
-    ownerWorkflow: Object.freeze({ installAndFund }),
+    /** The owner workflows that a host runs after the review: install and fund, and the signed update of installed params. */
+    ownerWorkflow: Object.freeze({ installAndFund, updateParams }),
     test: Object.freeze({
         network: TESTNET,
         skips: Object.freeze({ swap: 'Stellar has no swap venue in the minimal path' }),

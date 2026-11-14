@@ -1062,6 +1062,44 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         };
         Ok(OwnerPacket(packet(&c.network, &p)?))
     }
+    /// The owner step of a params update: one `deploy_policy` call at the next configuration
+    /// revision that replaces the params and keeps the roles, the source binding, the policy
+    /// state and the nonce. The simulation prices it within the lower of the caller's fee
+    /// limit and the installed fee ceiling.
+    fn prepare_params_update(
+        &self,
+        i: &Installation,
+        update: &ParamsUpdate,
+        fee_limit: u64,
+        now: u64,
+    ) -> Result<OwnerPacket> {
+        use super::params_update;
+        let c = self.config(i)?;
+        let installed = params_update::installed(self.rpc(), &c, update)?;
+        let deployment = params_update::deployment(&c, update, installed.x402_enabled)?;
+        // The preparation refuses a simulated fee above its configured ceiling.
+        let mut bounded = c.clone();
+        bounded.max_fee_stroops = bounded
+            .max_fee_stroops
+            .min(u32::try_from(fee_limit).unwrap_or(u32::MAX));
+        checked(native::validate_config(&bounded))
+            .map_err(|_| Error::usage("The fee limit is below the network minimum"))?;
+        let mut admin = native::admin::OwnerAdmin {
+            rpc: self.rpc(),
+            config: &bounded,
+            now,
+        };
+        let mut p = checked(
+            checked(admin.deploy_policy_source(
+                params_update::next_version(installed.revision)?,
+                deployment,
+                &c.policy_source,
+            ))?
+            .owner_transaction(),
+        )?;
+        p.action = params_update::ACTION.into();
+        Ok(OwnerPacket(packet(&c.network, &p)?))
+    }
     fn read_owner_signed(&self, p: &OwnerPacket, signed_payload: &[u8]) -> Result<OwnerSigned> {
         self.network(p.network())?;
         let original = decode_packet(&p.0)?;

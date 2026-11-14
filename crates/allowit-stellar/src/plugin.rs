@@ -317,6 +317,13 @@ impl OwnerRuntime for Owner {
     fn with_policy(&self, c: &Configuration, identity: PolicyIdentity) -> Result<Configuration> {
         server_owner::with_policy(c, identity)
     }
+    fn with_params(
+        &self,
+        c: &Configuration,
+        update: &crate::host::runtime::ParamsUpdate,
+    ) -> Result<Configuration> {
+        server_owner::with_params(c, update)
+    }
     fn code_hash(&self, wasm: &[u8]) -> Result<[u8; 32]> {
         server_owner::code_hash(wasm)
     }

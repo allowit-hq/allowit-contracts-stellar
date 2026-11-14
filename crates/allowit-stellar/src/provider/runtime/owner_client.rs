@@ -375,32 +375,12 @@ impl OwnerClient {
             now,
             true,
         )?;
-        if result.policies.len() > 30 || result.selected_id.is_empty() {
+        let policy = selected_policy(result)?;
+        if policy.revision != 1 {
             return Err(Error::uncertain(
-                "Generation returned an invalid workspace identity",
+                "Generation returned another revision than the first; inspect the owner workspace before retrying",
             ));
         }
-        #[derive(Deserialize)]
-        struct Identity {
-            id: String,
-        }
-        let mut selected = None;
-        for raw in result.policies {
-            let id: Identity = serde_json::from_str(raw.get())
-                .map_err(|_| Error::uncertain("Generation returned an invalid policy identity"))?;
-            if id.id == result.selected_id {
-                if selected.is_some() {
-                    return Err(Error::uncertain(
-                        "Generation returned a duplicate selected identity",
-                    ));
-                }
-                selected = Some(serde_json::from_str::<GeneratedPolicy>(raw.get()).map_err(
-                    |_| Error::uncertain("Generation returned invalid portable policy fields"),
-                )?);
-            }
-        }
-        let policy =
-            selected.ok_or_else(|| Error::uncertain("Generation omitted the selected policy"))?;
         validate_generated(&policy, &request, network, &wallet.kind).map_err(|_|Error::uncertain("Generated policy failed portable identity validation; inspect the owner workspace before retrying"))?;
         if let (Some(chosen), Some(bound)) = (request.wallet_kind, policy.wallet_kind)
             && chosen != bound
@@ -444,6 +424,181 @@ impl OwnerClient {
         Ok(policy)
     }
 }
+/// The selected policy of a workspace reply, with only its public generation fields.
+fn selected_policy(result: Generated) -> Result<GeneratedPolicy> {
+    if result.policies.len() > 30 || result.selected_id.is_empty() {
+        return Err(Error::uncertain(
+            "Generation returned an invalid workspace identity",
+        ));
+    }
+    #[derive(Deserialize)]
+    struct Identity {
+        id: String,
+    }
+    let mut selected = None;
+    for raw in result.policies {
+        let id: Identity = serde_json::from_str(raw.get())
+            .map_err(|_| Error::uncertain("Generation returned an invalid policy identity"))?;
+        if id.id == result.selected_id {
+            if selected.is_some() {
+                return Err(Error::uncertain(
+                    "Generation returned a duplicate selected identity",
+                ));
+            }
+            selected = Some(
+                serde_json::from_str::<GeneratedPolicy>(raw.get()).map_err(|_| {
+                    Error::uncertain("Generation returned invalid portable policy fields")
+                })?,
+            );
+        }
+    }
+    selected.ok_or_else(|| Error::uncertain("Generation omitted the selected policy"))
+}
+/// The request that a draft itself states: its intent, network, profile and wallet target.
+fn request_of(policy: &GeneratedPolicy) -> GenerateRequest {
+    let binding = &policy.runtime.instance_binding;
+    GenerateRequest {
+        prompt: policy.original_intent.clone(),
+        network: policy.network.clone(),
+        profile: policy.runtime.wallet.profile.clone(),
+        target: if binding.template == Some(true) {
+            Target::NewWallet
+        } else {
+            Target::Installation(binding.deployment_id.clone())
+        },
+        wallet_kind: None,
+    }
+}
+impl OwnerClient {
+    /// The next revision of an unsigned draft. It keeps the draft's identity, network, wallet
+    /// binding and asset; `source_fixed` also keeps the source bytes.
+    fn revised(
+        &self,
+        draft: &GeneratedPolicy,
+        path: &str,
+        body: Value,
+        source_fixed: bool,
+        now: u64,
+    ) -> Result<GeneratedPolicy> {
+        validate_generated(
+            draft,
+            &request_of(draft),
+            &draft.network,
+            &draft.runtime.wallet.kind,
+        )
+        .map_err(|_| Error::usage("The draft is not a valid owner policy draft"))?;
+        if draft.status != "draft" {
+            return Err(Error::usage("Only an unsigned draft can be revised"));
+        }
+        let result: Generated =
+            self.session
+                .owner_request(Method::Post, path, Some(&body), now, true)?;
+        let next = selected_policy(result)?;
+        let changed = || {
+            Error::uncertain(
+                "The revision changed the draft's identity or wallet binding; inspect the owner workspace before retrying",
+            )
+        };
+        validate_generated(
+            &next,
+            &request_of(&next),
+            &draft.network,
+            &draft.runtime.wallet.kind,
+        )
+        .map_err(|_| changed())?;
+        let (old, new) = (
+            &draft.runtime.instance_binding,
+            &next.runtime.instance_binding,
+        );
+        if next.id != draft.id
+            || draft.revision.checked_add(1) != Some(next.revision)
+            || next.wallet_kind != draft.wallet_kind
+            || next.runtime.wallet.profile != draft.runtime.wallet.profile
+            || new.deployment_id != old.deployment_id
+            || new.policy_instance != old.policy_instance
+            || new.wallet != old.wallet
+            || new.route != old.route
+            || new.asset != old.asset
+            || new.asset_symbol != old.asset_symbol
+            || new.asset_issuer != old.asset_issuer
+            || new.max_fee_stroops != old.max_fee_stroops
+            || new.template != old.template
+            || (source_fixed && (next.code != draft.code || new.tier != old.tier))
+        {
+            return Err(changed());
+        }
+        Ok(next)
+    }
+    /// Change typed params of an unsigned draft. The server checks each value against the
+    /// param's type and range; the reply holds exactly the values that were sent.
+    pub fn edit_params(
+        &self,
+        draft: &GeneratedPolicy,
+        changes: &std::collections::BTreeMap<String, allowit_core::policy::PolicyValue>,
+        now: u64,
+    ) -> Result<GeneratedPolicy> {
+        if changes.is_empty() || changes.len() > 64 {
+            return Err(Error::usage("Change one to 64 params"));
+        }
+        let mut sent = std::collections::BTreeMap::new();
+        for (key, value) in changes {
+            if !draft
+                .runtime
+                .instance_binding
+                .portable
+                .params
+                .0
+                .contains_key(key)
+            {
+                return Err(Error::usage(format!(
+                    "This policy reads no param named {key}"
+                )));
+            }
+            sent.insert(
+                key.clone(),
+                native::PolicyValue::from_core(value).map_err(Error::usage)?,
+            );
+        }
+        let next = self.revised(
+            draft,
+            "/api/micro/params",
+            json!({"id":draft.id,"revision":draft.revision,"params":changes}),
+            true,
+            now,
+        )?;
+        let saved = &next.runtime.instance_binding.portable.params.0;
+        let kept = &draft.runtime.instance_binding.portable.params.0;
+        if saved.len() != kept.len()
+            || saved
+                .iter()
+                .any(|(key, value)| sent.get(key).or_else(|| kept.get(key)) != Some(value))
+        {
+            return Err(Error::uncertain(
+                "The saved params differ from the typed edit; inspect the owner workspace before retrying",
+            ));
+        }
+        Ok(next)
+    }
+    /// Revise an unsigned draft in the owner's words. The source can change; the wallet
+    /// binding and the asset stay.
+    pub fn revise(
+        &self,
+        draft: &GeneratedPolicy,
+        instruction: &str,
+        now: u64,
+    ) -> Result<GeneratedPolicy> {
+        if !(5..=3000).contains(&instruction.len()) {
+            return Err(Error::usage("Describe the change in 5 to 3000 characters"));
+        }
+        self.revised(
+            draft,
+            "/api/micro/revise",
+            json!({"id":draft.id,"revision":draft.revision,"prompt":instruction}),
+            false,
+            now,
+        )
+    }
+}
 fn validate_generated(
     policy: &GeneratedPolicy,
     request: &GenerateRequest,
@@ -456,7 +611,7 @@ fn validate_generated(
         Error::uncertain("Returned policy source is outside the portable vocabulary")
     })?;
     if !crate::host::request::request_id_valid(&policy.id)
-        || policy.revision != 1
+        || policy.revision == 0
         || policy.network != network
         || policy.language != LANGUAGE
         || policy.original_intent != request.prompt

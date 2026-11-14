@@ -65,7 +65,30 @@ impl OwnerReceipt {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 enum Work {
     Deploy,
-    Fund { amount: String, units: i128 },
+    Fund {
+        amount: String,
+        units: i128,
+    },
+    /// A params update over the configuration revision that `update` expects. The x402 choice
+    /// is the one that the wallet held when the workflow started; the packet keeps it.
+    UpdateParams {
+        update: crate::host::runtime::ParamsUpdate,
+        x402_enabled: bool,
+    },
+}
+/// The selection after a confirmed params update: the same policy and wallet with the new
+/// params in the installation and in the portable binding.
+fn updated_selection(
+    selection: &OwnerPolicy,
+    update: &crate::host::runtime::ParamsUpdate,
+) -> Result<OwnerPolicy> {
+    let mut next = selection.clone();
+    next.config = crate::provider::params_update::updated_config(&selection.config, update)?;
+    let portable = &mut next.policy.runtime.instance_binding.portable;
+    portable.params = next.config.params.clone();
+    portable.params_hash = crate::host::authoring::canonical_digest(&portable.params)?;
+    next.validate()?;
+    Ok(next)
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -338,6 +361,26 @@ fn expected(record: &Record, step: &RetainedStep) -> Result<ExpectedOwnerIntent>
             to: c.wallet.clone(),
             amount: *units,
         },
+        (
+            Work::UpdateParams {
+                update,
+                x402_enabled,
+            },
+            crate::provider::params_update::ACTION,
+        ) => OwnerAction::UpdatePolicy {
+            wallet: c.wallet.clone(),
+            deployment: Box::new(crate::provider::params_update::deployment(
+                c,
+                update,
+                *x402_enabled,
+            )?),
+            version: crate::provider::params_update::next_version(
+                update.expected_revision.ok_or_else(|| {
+                    Error::config("Retained params update names no configuration revision")
+                })?,
+            )?
+            .0,
+        },
         (_, "extend") => OwnerAction::Extend {
             wallet: c.wallet.clone(),
             wasm_hash: c.module_digest,
@@ -433,6 +476,67 @@ impl OwnerClient {
             max_fee_stroops,
         )
     }
+    /// Change installed params with one owner signature. The packet is reconstructed from the
+    /// owner's document and RPC: the installed roles, source binding and code with the new
+    /// params at the next configuration revision. A resumed request keeps the revision that
+    /// its first run read, so the saved signed step stays the only one.
+    pub fn update_params(
+        &self,
+        capabilities: OwnerCapabilities<'_>,
+        selection: &OwnerPolicy,
+        request_id: &str,
+        update: &crate::host::runtime::ParamsUpdate,
+        max_fee_stroops: u32,
+    ) -> Result<Outcome> {
+        use crate::provider::params_update;
+        if !crate::host::request::request_id_valid(request_id) {
+            return Err(Error::usage("Select a valid owner request ID"));
+        }
+        // The update must be valid for this installation before anything is read or saved.
+        if update.policy_id != selection.policy.id {
+            return Err(Error::config(
+                "The params update names another policy than this installation",
+            ));
+        }
+        params_update::next_params(&selection.config, update)?;
+        let saved = capabilities
+            .store
+            .load::<Value>(request_id)?
+            .and_then(|value| serde_json::from_value::<Record>(value).ok())
+            .and_then(|record| match record.work {
+                Work::UpdateParams {
+                    update: saved,
+                    x402_enabled,
+                } if saved.policy_id == update.policy_id
+                    && saved.changes == update.changes
+                    && update
+                        .expected_revision
+                        .is_none_or(|expected| saved.expected_revision == Some(expected)) =>
+                {
+                    Some(Work::UpdateParams {
+                        update: saved,
+                        x402_enabled,
+                    })
+                }
+                _ => None,
+            });
+        let work = match saved {
+            Some(work) => work,
+            None => {
+                network(capabilities.rpc, &selection.config.network)?;
+                let installed =
+                    params_update::installed(capabilities.rpc, &selection.config, update)?;
+                Work::UpdateParams {
+                    update: crate::host::runtime::ParamsUpdate {
+                        expected_revision: Some(installed.revision),
+                        ..update.clone()
+                    },
+                    x402_enabled: installed.x402_enabled,
+                }
+            }
+        };
+        self.run_owner(capabilities, selection, request_id, work, max_fee_stroops)
+    }
     fn run_owner(
         &self,
         capabilities: OwnerCapabilities<'_>,
@@ -517,11 +621,12 @@ impl OwnerClient {
                 break;
             }
             if record.steps.last().is_none_or(|s| s.receipt.is_some()) {
-                if record
-                    .steps
-                    .last()
-                    .is_some_and(|s| s.packet.action == "fund")
-                {
+                if record.steps.last().is_some_and(|s| {
+                    matches!(
+                        s.packet.action.as_str(),
+                        "fund" | crate::provider::params_update::ACTION
+                    )
+                }) {
                     record.complete = true;
                     store.save(id, &record)?;
                     break;
@@ -541,6 +646,13 @@ impl OwnerClient {
                         "/api/native/owner/prepare",
                         json!({"policyId":selection.policy.id,"action":"fund","amount":amount}),
                     ),
+                    Work::UpdateParams { update, .. } => (
+                        "/api/native/owner/prepare",
+                        json!({"policyId":selection.policy.id,
+                            "action":crate::provider::params_update::ACTION,
+                            "params":update.changes,
+                            "expectedRevision":update.expected_revision}),
+                    ),
                 };
                 allowit_core::client::progress::report(
                     "Preparing the owner transaction with the Allowit server",
@@ -559,7 +671,7 @@ impl OwnerClient {
                 let Some(step) = response.step else {
                     if !matches!(record.work, Work::Deploy) {
                         return Err(Error::uncertain(
-                            "Funding preparation omitted its transaction",
+                            "Owner preparation omitted its transaction",
                         ));
                     }
                     self.verify_binding(selection, rpc)?;
@@ -634,7 +746,7 @@ impl OwnerClient {
                         ));
                     }
                 }
-                if matches!(record.work, Work::Fund { .. }) {
+                if !matches!(record.work, Work::Deploy) {
                     self.verify_binding(selection, rpc)?;
                 }
                 let now = clock()?;
@@ -657,7 +769,7 @@ impl OwnerClient {
                 store.save(id, &record)?;
             }
             verify_retained(&record, &record.steps[index])?;
-            if matches!(record.work, Work::Fund { .. }) && !record.steps[index].submitted {
+            if !matches!(record.work, Work::Deploy) && !record.steps[index].submitted {
                 self.verify_binding(selection, rpc)?;
             }
             let hash = checked(native::unhex(&record.steps[index].packet.transaction_hash))?;
@@ -771,14 +883,24 @@ impl OwnerClient {
         if matches!(record.work, Work::Deploy) {
             self.verify_binding(selection, rpc)?;
         }
+        // The wallet now holds the updated params: the outcome selects that installation.
+        let selection = match &record.work {
+            Work::UpdateParams { update, .. } => {
+                let updated = updated_selection(selection, update)?;
+                self.verify_binding(&updated, rpc)?;
+                updated
+            }
+            _ => selection.clone(),
+        };
         Ok(Outcome {
             request_id: id.into(),
             state: match record.work {
                 Work::Deploy => "installed",
                 Work::Fund { .. } => "funded",
+                Work::UpdateParams { .. } => "updated",
             }
             .into(),
-            selection: selection.clone(),
+            selection,
             transactions: record
                 .steps
                 .iter()
@@ -1012,23 +1134,44 @@ impl OwnerClient {
         activation_id: &str,
         now: u64,
     ) -> Result<Box<serde_json::value::RawValue>> {
-        let activation: Activation = store
+        let saved: Value = store
             .load(activation_id)?
             .ok_or_else(|| Error::config("Complete the retained owner activation before export"))?;
+        let unbound = || Error::config("Export activation does not bind this exact policy");
         let message = super::super::consent::message(&approval_payload(selection)?)?;
-        if !activation.completed
-            || activation.backend != self.session.backend()
-            || activation.origin != self.session.origin()
-            || activation.identity
-                != intent_hash(&json!({"selection":selection,"message":message}))?
-        {
-            return Err(Error::config(
-                "Export activation does not bind this exact policy",
-            ));
-        }
+        let activation = if saved.get("selection").is_some() {
+            // A completed owner-signed params update of an active policy wallet selects the
+            // updated installation: its ID exports that installation as the activation did.
+            let record: Record = serde_json::from_value(saved).map_err(|_| unbound())?;
+            let Work::UpdateParams { update, .. } = &record.work else {
+                return Err(unbound());
+            };
+            if !record.complete
+                || record.backend != self.session.backend()
+                || record.origin != self.session.origin()
+                || selection.config.route != WalletRoute::PolicyWallet
+                || intent_hash(&updated_selection(&record.selection, update)?)?
+                    != intent_hash(selection)?
+            {
+                return Err(unbound());
+            }
+            None
+        } else {
+            let activation: Activation = serde_json::from_value(saved).map_err(|_| unbound())?;
+            if !activation.completed
+                || activation.backend != self.session.backend()
+                || activation.origin != self.session.origin()
+                || activation.identity
+                    != intent_hash(&json!({"selection":selection,"message":message}))?
+            {
+                return Err(unbound());
+            }
+            Some(activation)
+        };
+        let consent = activation.as_ref().and_then(|a| a.signature.as_ref());
         self.verify_binding(selection, rpc)?;
         if selection.config.route == WalletRoute::Native {
-            let signature=activation.signature.as_ref().ok_or_else(||Error::config("Native export requires proven owner source consent. Complete source activation on this device."))?;
+            let signature=consent.ok_or_else(||Error::config("Native export requires proven owner source consent. Complete source activation on this device."))?;
             if signature.signer != self.session.owner() {
                 return Err(Error::config(
                     "Retained source consent belongs to another owner",
@@ -1068,7 +1211,7 @@ impl OwnerClient {
             let mut public: Value = serde_json::from_str(value.get())
                 .map_err(|_| Error::config("Invalid checked public descriptor"))?;
             if public.get("sourceApproval").is_none() {
-                public["sourceApproval"] = json!({"revision":selection.policy.revision,"signatures":activation.signature.iter().collect::<Vec<_>>()});
+                public["sourceApproval"] = json!({"revision":selection.policy.revision,"signatures":consent.into_iter().collect::<Vec<_>>()});
                 value = serde_json::value::RawValue::from_string(
                     serde_json::to_string(&public)
                         .map_err(|_| Error::config("Cannot encode public source consent"))?,

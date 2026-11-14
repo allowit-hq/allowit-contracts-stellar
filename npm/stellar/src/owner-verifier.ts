@@ -1,6 +1,6 @@
 export interface AdkOwnerStep {
   network: string;
-  action: 'upload_wasm' | 'create_wallet' | 'extend' | 'fund';
+  action: 'upload_wasm' | 'create_wallet' | 'extend' | 'fund' | 'update_params';
   transactionXdr: string;
   transactionHash: string;
   expiresAt: number;
@@ -22,6 +22,12 @@ export interface AdkOwnerSelection {
   amount: string;
   nextSequence: string;
   validUntil: number;
+  /**
+   * The params update that the owner reviewed, for an `update_params` step. `params` then holds the complete new
+   * params. `deploymentVersion` is the configuration revision that the update writes, in canonical decimal text,
+   * and `x402Enabled` is the installed x402 choice, which the update keeps.
+   */
+  update?: {deploymentVersion: string; x402Enabled: boolean};
 }
 
 type Verifier = {
@@ -32,7 +38,7 @@ type Verifier = {
 };
 
 const inputLimit = 512 * 1024;
-const verifierHash = '854082e86f09dedcd5bf40326e27771478e2f6d6d5cb696c3e822b7d4f03c798';
+const verifierHash = '2c70ff2922199c03e704eec10772e4af942beb2e594b7912b0943406dd39cb8a';
 let verifier: Promise<Verifier> | undefined;
 
 async function loadVerifier(): Promise<Verifier> {

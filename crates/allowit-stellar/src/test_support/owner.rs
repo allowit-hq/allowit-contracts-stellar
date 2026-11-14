@@ -149,6 +149,64 @@ pub fn fund_step(c: &native::WalletConfig, units: i128, now: u64) -> Value {
     };
     json!({"action":"fund","network":"stellar:testnet","transactionHash":native::hex(&hash(&tx)),"payload":enc(&x::TransactionEnvelope::Tx(x::TransactionV1Envelope{tx,signatures:Default::default()})),"expiresAt":now+300})
 }
+/// The owner step of a params update: one `deploy_policy` call of the owner on the wallet.
+pub fn update_step(
+    c: &native::WalletConfig,
+    deployment: &native::admin::PolicyDeployment,
+    version: u64,
+    now: u64,
+) -> Value {
+    let call = x::InvokeContractArgs {
+        contract_address: addr(&c.wallet),
+        function_name: symbol("deploy_policy"),
+        args: vec![
+            deployment
+                .scval(allowit_core::admin::DeploymentVersion(version))
+                .unwrap(),
+        ]
+        .try_into()
+        .unwrap(),
+    };
+    let auth = x::SorobanAuthorizationEntry {
+        credentials: x::SorobanCredentials::SourceAccount,
+        root_invocation: x::SorobanAuthorizedInvocation {
+            function: x::SorobanAuthorizedFunction::ContractFn(call.clone()),
+            sub_invocations: Default::default(),
+        },
+    };
+    let tx = x::Transaction {
+        source_account: x::MuxedAccount::Ed25519(x::Uint256(
+            native::account_key(&c.owner).unwrap(),
+        )),
+        fee: 1100,
+        seq_num: x::SequenceNumber(42),
+        cond: x::Preconditions::Time(x::TimeBounds {
+            min_time: x::TimePoint(0),
+            max_time: x::TimePoint(now + 300),
+        }),
+        memo: x::Memo::None,
+        operations: vec![x::Operation {
+            source_account: None,
+            body: x::OperationBody::InvokeHostFunction(x::InvokeHostFunctionOp {
+                host_function: x::HostFunction::InvokeContract(call),
+                auth: vec![auth].try_into().unwrap(),
+            }),
+        }]
+        .try_into()
+        .unwrap(),
+        ext: x::TransactionExt::V1(x::SorobanTransactionData {
+            ext: x::SorobanTransactionDataExt::V0,
+            resources: x::SorobanResources {
+                footprint: Default::default(),
+                instructions: 100_000,
+                disk_read_bytes: 100,
+                write_bytes: 100,
+            },
+            resource_fee: 1000,
+        }),
+    };
+    json!({"action":"update_params","network":"stellar:testnet","transactionHash":native::hex(&hash(&tx)),"payload":enc(&x::TransactionEnvelope::Tx(x::TransactionV1Envelope{tx,signatures:Default::default()})),"expiresAt":now+300})
+}
 pub fn receipt(signed: &str) -> Value {
     let result = x::TransactionResult {
         fee_charged: 300,
@@ -163,6 +221,9 @@ pub struct OwnerLedger {
     pub direct_signed: Mutex<Option<String>>,
     pub lose_direct: bool,
     pub events: Mutex<Vec<String>>,
+    /// The params, configuration revision and recorded usage that the wallet holds after an
+    /// owner update. `None` is the installation's params at revision 1 with no usage.
+    pub installed: Mutex<Option<(native::PolicyParams, u64, native::PolicyParams)>>,
 }
 impl OwnerLedger {
     pub fn new(c: native::WalletConfig) -> Self {
@@ -172,6 +233,7 @@ impl OwnerLedger {
             direct_signed: Mutex::new(None),
             lose_direct: false,
             events: Mutex::new(vec![]),
+            installed: Mutex::new(None),
         }
     }
 }
@@ -233,8 +295,14 @@ impl OwnerLedger {
                     };
                     return Ok(account_entry(&state));
                 }
+                let (params, deployment_version, policy_state) = self
+                    .installed
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or((c.params.clone(), 1, Default::default()));
                 let state = native::contract::CustodyState {
-                    policy_state: Default::default(),
+                    policy_state,
                     contract_version: native::CONTRACT_VERSION,
                     owner: c.owner.clone(),
                     agent: c.agent.clone(),
@@ -243,10 +311,10 @@ impl OwnerLedger {
                     policy_instance: c.policy_instance,
                     source_digest: c.source_digest,
                     rules: c.rules.clone(),
-                    params: c.params.clone(),
+                    params,
                     x402_enabled: false,
                     token: c.asset_symbol.clone(),
-                    deployment_version: 1,
+                    deployment_version,
                     nonce: 0,
                     paused: false,
                 }
