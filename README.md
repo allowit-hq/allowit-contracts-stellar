@@ -178,7 +178,7 @@ A wallet knows three addresses, and they must all be different.
 A separate **engine parent** contract can manage the code of a shared rule-checking engine. It holds no custody authority: it cannot touch a wallet's funds, configuration or signers. See [docs/engine-parent.md](docs/engine-parent.md).
 
 > [!TIP]
-> No Soroban contract yet? A classic G-address account can get Simple-style authorization with plain multisig: owner weight 3, agent and server weight 1, thresholds 2/2/3. `allowit-stellar-admin setup-wallet` prepares exactly that. Classic reserves still apply, and custom onchain policy code needs a contract wallet.
+> No Soroban contract yet? A Native wallet gives each agent its own classic G-address account with plain multisig: owner weight 3, agent and server weight 1, the account's own key weight 0, thresholds 2/2/3. The owner creates it with one signed transaction; agent and server pay only together, and the owner alone pauses, withdraws and closes it. See [docs/admin.md](docs/admin.md#one-wallet-account-per-agent). Classic reserves apply, and custom onchain policy code needs a contract wallet.
 
 ## How an operation happens
 
@@ -267,7 +267,7 @@ invoke(contract, function, args, auth)        owner
 
 `AllowitPolicyConfig` names the `owner`, `agent`, `server`, `asset`, `policy_instance`, `source_digest`, ordered `rules`, `params` and `x402_enabled`. The asset and the policy identity are fixed for the life of the wallet. Everything else changes through `deploy_policy`, which also accepts an optional new Wasm hash. With no new Wasm hash, params change without code redeployment. Both `deploy_policy` and `set_pause` must target exactly the next `deployment_version`. Pause, policy state and the execution nonce survive every deployment.
 
-`allowit-stellar-admin` prepares unsigned transactions for `upload`, `deploy-parent`, `deploy-wallet` and `admin`. It simulates, assembles fees and authorization entries, and hands you XDR to review and sign with your own keys. Its `read` action runs a read-only simulation of `state`, `engine` or `policy_binding`. It never signs, submits or retries. The same binary prepares and verifies classic-account multisig (`inspect`, `verify-wallet`, `verify-admin`, `setup-wallet`, `shutdown-wallet`, `setup-admin`) and also never signs or submits. The binary needs no Python environment. Save signed bytes before broadcast and reconcile the original transaction hash after uncertainty.
+`allowit-stellar-admin` prepares unsigned transactions for `upload`, `deploy-parent`, `deploy-wallet` and `admin`. It simulates, assembles fees and authorization entries, and hands you XDR to review and sign with your own keys. Its `read` action runs a read-only simulation of `state`, `engine` or `policy_binding`. It never signs, submits or retries. The same binary prepares and verifies classic-account multisig (`inspect`, `verify-admin`, `setup-admin` and the owner actions on a per-agent Native wallet, `verify-agent-wallet` through `close-agent-wallet`) and also never signs or submits. The binary needs no Python environment. Save signed bytes before broadcast and reconcile the original transaction hash after uncertainty.
 
 ```sh
 crates/allowit-stellar/target/release/allowit-stellar-admin read --network testnet --contract "$WALLET" --source "$OWNER" --method policy_binding

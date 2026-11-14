@@ -10,7 +10,7 @@ ADMIN_BIN=crates/allowit-stellar/target/release/allowit-stellar-admin
 cargo test --locked --manifest-path crates/allowit-stellar/Cargo.toml --bin allowit-stellar-admin
 ```
 
-The native actions are `inspect`, `verify-wallet`, `verify-admin`, `setup-wallet`, `shutdown-wallet` and `setup-admin`. The contract actions are `upload`, `deploy-parent`, `deploy-wallet`, `read` and `admin`. A preparing action prints unsigned base64 XDR on standard output. A refusal prints one line on standard error and exits with status 1; a usage error exits with status 2. An address error never repeats its input. `--help` prints the usage. Run the binary from this checkout: the owner-packet compile reads the locked Core sources through `cargo metadata`.
+The native actions are `inspect`, `verify-admin`, `setup-admin` and the per-agent wallet actions `verify-agent-wallet`, `fund-agent-wallet`, `pause-agent-wallet`, `resume-agent-wallet`, `withdraw-agent-wallet` and `close-agent-wallet`. `verify-wallet`, `setup-wallet` and `shutdown-wallet` are legacy: see [Legacy owner-account profile](#legacy-owner-account-profile). The contract actions are `upload`, `deploy-parent`, `deploy-wallet`, `read` and `admin`. A preparing action prints unsigned base64 XDR on standard output. A refusal prints one line on standard error and exits with status 1; a usage error exits with status 2. An address error never repeats its input. `--help` prints the usage. Run the binary from this checkout: the owner-packet compile reads the locked Core sources through `cargo metadata`.
 
 The release scripts `scripts/testnet_release.py` and `scripts/mainnet_release.py` use the Python modules `scripts/contract_admin.py` and `scripts/wallet_admin.py` for the same checks. Those modules have no command line. The binary's tests reproduce recorded outputs of both modules (`crates/allowit-stellar/tests/fixtures/native_admin_vectors.json` and `contract_admin_vectors.json`), so the two implementations agree.
 
@@ -20,14 +20,52 @@ Select `--network testnet` explicitly. Mainnet preparation additionally requires
 
 The classic CLI retains `--engine` for its service co-signer. This means the wallet `server` role, not the parent-managed shared checker address.
 
-The native wallet owner is its account master key. Setup admits only an existing account with master weight 1, no other signers and default thresholds. It atomically adds agent/engine weight 1, changes owner weight to 3, and sets thresholds 2/2/3. Setup never silently replaces existing authority. Signer verification rejects unexpected signers, hash/preauthorized signers and threshold drift.
+### One wallet account per agent
+
+A Native wallet is its own classic account. Each agent gets one. The owner's account is never the wallet.
+
+| Signer | Weight | Authority |
+| --- | --- | --- |
+| Owner | 3 | Everything, alone: payments, signer changes, the account merge |
+| Agent | 1 | Payments, only together with the server |
+| Server | 1 | Payments, only together with the agent |
+| The account's own key | 0 | None after setup |
+
+The thresholds are 2 (low), 2 (medium) and 3 (high). Agent and server together reach 2. Neither reaches it alone, and together they stay below 3, so they cannot change signers or merge the account. The server co-signs a payment only after its policy check.
+
+**Setup** is one transaction from the owner's account, in `allowit_stellar::owner`. The owner's account pays the fee and the starting balance. The operations create the account, add the owner, the agent and the server as signers, set the thresholds and set the weight of the account's own key to 0. All of it applies atomically. Two signatures are needed: the owner's, and one signature of the new account's own key, because the new account is the source of its own signer operations. A wallet for an issued asset also adds its trustline in the same transaction.
+
+The new account's key is derived, so nothing extra is stored. The owner signs a fixed message that names the network, the agent and a wallet index, through the same message signing as the owner sign-in (SEP-53). The key seed is `SHA-256("allowit-stellar-native-wallet-seed-v1" || signature)`. Ed25519 signatures are deterministic, so the same owner key derives the same account again from the same three values. A signer that signs the same message in two ways still yields a usable one-time key; the setup result then reports `derivation.method` `one-time`, and the address cannot be computed again. After setup the key has weight 0 and carries no authority.
+
+The starting balance holds the reserve of the account: two base reserves and one for each signer, 2.5 XLM, and 0.5 XLM more for a trustline. That reserve stays locked in the account until the owner closes it. Without a named amount the setup sends the reserve and 0.5 XLM for the network fees of the wallet's own payments.
+
+Setup never replaces existing authority. A wallet account that already exists is admitted only with the exact roles. Any other signer, a hash, pre-authorized or signed-payload signer, a threshold other than 2/2/3 or a weight on the account's own key is refused, and nothing is signed. A setup transaction cannot apply twice: the account already exists, and the owner's sequence moved.
+
+**Owner actions** each need one owner signature. The owner's account is the transaction source and pays the fee, so the agent and the server cannot interfere through the wallet's sequence.
 
 ```sh
-"$ADMIN_BIN" setup-wallet --network testnet --account "$OWNER" --agent "$AGENT" --engine "$ENGINE" > /tmp/setup.xdr
-"$ADMIN_BIN" verify-wallet --network testnet --account "$OWNER" --agent "$AGENT" --engine "$ENGINE"
+"$ADMIN_BIN" verify-agent-wallet --network testnet --account "$WALLET" --owner "$OWNER" --agent "$AGENT" --engine "$ENGINE"
+"$ADMIN_BIN" fund-agent-wallet --network testnet --account "$WALLET" --owner "$OWNER" --agent "$AGENT" --engine "$ENGINE" --amount 100000000 > /tmp/fund.xdr
+"$ADMIN_BIN" pause-agent-wallet --network testnet --account "$WALLET" --owner "$OWNER" --agent "$AGENT" --engine "$ENGINE" > /tmp/pause.xdr
+"$ADMIN_BIN" resume-agent-wallet --network testnet --account "$WALLET" --owner "$OWNER" --agent "$AGENT" --engine "$ENGINE" > /tmp/resume.xdr
+"$ADMIN_BIN" withdraw-agent-wallet --network testnet --account "$WALLET" --owner "$OWNER" --agent "$AGENT" --engine "$ENGINE" --amount 50000000 > /tmp/withdraw.xdr
+"$ADMIN_BIN" close-agent-wallet --network testnet --account "$WALLET" --owner "$OWNER" --agent "$AGENT" --engine "$ENGINE" > /tmp/close.xdr
 ```
 
-Verification succeeds only after the configuration transaction settles. To disable automation, use `shutdown-wallet` with the same addresses. It atomically removes agent and engine and raises all thresholds to 3. Only the owner can authorize it. Prefer `--transaction-source OTHER_OWNER_ACCOUNT` to use an independent owner-only fee/sequence account. All shutdown operations still name the wallet as their source. Sign with both wallet owner and transaction source. This prevents the agent pair from invalidating shutdown through the wallet sequence, although admission and offer checks can still race ledger changes. Verification rejects open Horizon offers. Shutdown reports offers but still prepares signer removal. Revoke signers first, then reconcile offers and allowances. Removing signers does not revoke persistent SAC allowances, liquidity positions or prior issuer changes. Horizon cannot enumerate all SAC allowances. Read and zero allowances for every known spender separately. Treat unknown prior delegations as unresolved. This native profile grants broad low/medium authority, so shutdown cannot promise complete revocation.
+- `fund` sends XLM from the owner's account to the wallet.
+- `pause` removes the agent signer. The server alone is below the payment threshold, so no payment settles. `resume` restores the agent signer.
+- `withdraw` sends funds from the wallet to the owner, or to `--recipient`.
+- `close` removes every signer and merges the account into the owner's account. The balance and the reserve return to the owner. The network checks every signature before the first operation, so the owner's signature also authorizes the merge after its own signer is removed.
+
+Amounts are in stroops. The binary prepares these actions for a wallet that holds XLM. The server prepares the same actions for an installed wallet through its owner routes; for a wallet with an issued asset, `close` first returns that asset and removes its trustline.
+
+Verification reads the account's signers, weights and thresholds. The server reads them before every co-signature and refuses a wallet whose signers or thresholds differ from its registered roles.
+
+### Legacy owner-account profile
+
+Earlier releases turned the owner's own account into the wallet: the account key had weight 3, and agent and server were added with weight 1 under thresholds 2/2/3. Agent and server together could then spend the owner's whole account, and one owner account served one agent. No server registers that profile any more.
+
+`setup-wallet`, `verify-wallet` and `shutdown-wallet` still prepare and verify it, so an owner can verify and shut down such an account. The release scripts do not use them. `shutdown-wallet` atomically removes agent and engine and raises all thresholds to 3. Only the owner can authorize it. Prefer `--transaction-source OTHER_OWNER_ACCOUNT` to use an independent owner-only fee/sequence account. Verification rejects open Horizon offers. Shutdown reports offers but still prepares signer removal. Removing signers does not revoke persistent SAC allowances, liquidity positions or prior issuer changes.
 
 Prepare a separate native engine administrator with `setup-admin --account "$ADMIN" --member "$A" --member "$B" --member "$C"`. The three distinct members receive weight 1. All thresholds are set to 2. The account master gets weight 0 unless it is one of those members. `verify-admin` checks that exact configuration. Keep the necessary master and member secure-store identities available before setup.
 
@@ -39,7 +77,7 @@ stellar tx sign --network testnet --sign-with-key owner-secure-identity /tmp/set
 stellar tx send --network testnet /tmp/setup-signed.xdr
 ```
 
-The source account signs initial setup under its existing master authority. Later admin operations need two member signatures on the same envelope. Native envelopes expire after five minutes and bind the next account sequence. Do not reuse them after other transactions consume that sequence. After an uncertain submission, check the original transaction hash and ledger state before preparing a replacement.
+The administrator account signs its initial setup under its existing master authority. Later admin operations need two member signatures on the same envelope. Native envelopes expire after five minutes and bind the next account sequence. Do not reuse them after other transactions consume that sequence. After an uncertain submission, check the original transaction hash and ledger state before preparing a replacement.
 
 ## Contract setup and owner administration
 

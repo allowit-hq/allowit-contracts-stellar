@@ -353,6 +353,91 @@ pub struct Provider {
     transport: std::sync::Arc<dyn rpc::Rpc>,
 }
 impl Provider {
+    /// One owner action on a keypair wallet: a transaction from the owner's account whose
+    /// operations the owner's signature authorizes alone. `Recover` without an amount closes
+    /// the wallet: every signer is removed and the account merges into the owner's account.
+    fn prepare_wallet_owner(
+        &self,
+        c: &WalletConfig,
+        a: OwnerAction,
+        fee_limit: u64,
+        now: u64,
+    ) -> Result<OwnerPacket> {
+        use native::owner::WalletAction;
+        let asset = checked(native::asset_xdr(c))?;
+        let units = |units: i128| {
+            i64::try_from(units).map_err(|_| Error::usage("The amount exceeds the native range"))
+        };
+        let action = match a {
+            OwnerAction::Fund { units: amount } => WalletAction::Fund {
+                units: units(amount)?,
+            },
+            OwnerAction::SetPause { paused: true } => WalletAction::Pause,
+            OwnerAction::SetPause { paused: false } => WalletAction::Resume,
+            OwnerAction::Recover {
+                units: Some(amount),
+                recipient,
+            } => WalletAction::Withdraw {
+                units: units(amount)?,
+                recipient,
+            },
+            OwnerAction::Recover {
+                units: None,
+                recipient: None,
+            } => WalletAction::Close {
+                token_balance: if asset == stellar_xdr::Asset::Native {
+                    0
+                } else {
+                    checked(rpc::trustline_balance(self.rpc(), &c.wallet, &asset))?.unwrap_or(0)
+                },
+            },
+            OwnerAction::Recover { .. } => {
+                return Err(Error::usage("Recovery recipient requires an amount"));
+            }
+            OwnerAction::Upload { .. } | OwnerAction::Create { .. } | OwnerAction::Extend => {
+                return Err(Error::unsupported(
+                    "A keypair wallet has no code: its owner creates it with the wallet setup",
+                ));
+            }
+        };
+        let owner_state = checked(rpc::get_account(self.rpc(), &c.owner))?;
+        let wallet_state = checked(rpc::get_account(self.rpc(), &c.wallet))?;
+        // Each operation bids the same share of the caller's fee limit, within the bounds of
+        // one classic operation.
+        let fee_per_operation = u32::try_from((fee_limit / 6).clamp(100, 10_000))
+            .map_err(|_| Error::usage("Invalid owner fee limit"))?;
+        let p = checked(native::owner::prepare_wallet_action(
+            &owner_state,
+            &wallet_state,
+            native::owner::WalletRoles {
+                wallet: &c.wallet,
+                owner: &c.owner,
+                agent: &c.agent,
+                engine: &c.server,
+            },
+            &action,
+            &asset,
+            &c.network,
+            fee_per_operation,
+            now,
+        ))?;
+        // A fee limit below the minimum fee of every operation prepares nothing: the declared
+        // fee never exceeds the caller's limit.
+        let stellar_xdr::TransactionEnvelope::Tx(envelope) = checked(native::read::<
+            stellar_xdr::TransactionEnvelope,
+        >(&p.transaction_xdr))?
+        else {
+            return Err(Error::config("Invalid prepared owner transaction"));
+        };
+        if u64::from(envelope.tx.fee) > fee_limit {
+            return Err(Error::usage(format!(
+                "The fee limit is below the minimum fee of {} for the {} operations of this action",
+                envelope.tx.fee,
+                envelope.tx.operations.len()
+            )));
+        }
+        Ok(OwnerPacket(packet(&c.network, &p)?))
+    }
     pub fn new(network: &str, endpoint: &str) -> Result<Self> {
         Ok(Self::from_rpc_inner(
             network,
@@ -681,6 +766,14 @@ impl crate::host::vendors::RuntimeProvider for Provider {
     }
     fn resources(&self, i: &Installation) -> Result<Resources> {
         let c = self.config(i)?;
+        if c.route == WalletRoute::Native {
+            // A keypair wallet has no code and no lifetime: it is present when its account is.
+            return Ok(Resources {
+                code_present: true,
+                wallet_present: checked(rpc::find_account(self.rpc(), &c.wallet))?.is_some(),
+                lifetime: None,
+            });
+        }
         let code_present = checked(rpc::code_uploaded(self.rpc(), &c.network, &c.module_digest))?;
         let wallet_present = checked(rpc::contract_exists(self.rpc(), &c.network, &c.wallet))?;
         let lifetime = if wallet_present {
@@ -961,6 +1054,9 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         now: u64,
     ) -> Result<OwnerPacket> {
         let c = self.config(i)?;
+        if c.route == WalletRoute::Native {
+            return self.prepare_wallet_owner(&c, a, fee_limit, now);
+        }
         // Renewal preserves the installed fee budget even when deployment has a larger ceiling.
         let fee_limit = if matches!(&a, OwnerAction::Extend) {
             fee_limit.min(u64::from(c.max_fee_stroops))
@@ -1818,11 +1914,16 @@ mod retained_projection_tests {
         };
         let setup = native::owner::prepare_native_setup(
             &state,
-            &native::account_for_seed(&[12; 32]),
-            &native::account_for_seed(&[13; 32]),
-            "setup-history-001",
-            "stellar:testnet",
-            100,
+            &native::owner::SetupTerms {
+                wallet: &native::account_for_seed(&[14; 32]),
+                agent: &native::account_for_seed(&[12; 32]),
+                engine: &native::account_for_seed(&[13; 32]),
+                request_id: "setup-history-001",
+                network: "stellar:testnet",
+                fee_per_operation: 100,
+                starting_balance: None,
+                trustline: None,
+            },
             1,
         )
         .unwrap();
@@ -1948,11 +2049,16 @@ mod owner_carrier_tests {
         };
         let setup = native::owner::prepare_native_setup(
             &state,
-            &native::account_for_seed(&[12; 32]),
-            &native::account_for_seed(&[13; 32]),
-            "network-test-001",
-            "stellar:testnet",
-            100,
+            &native::owner::SetupTerms {
+                wallet: &native::account_for_seed(&[14; 32]),
+                agent: &native::account_for_seed(&[12; 32]),
+                engine: &native::account_for_seed(&[13; 32]),
+                request_id: "network-test-001",
+                network: "stellar:testnet",
+                fee_per_operation: 100,
+                starting_balance: None,
+                trustline: None,
+            },
             1,
         )
         .unwrap();
@@ -2020,5 +2126,238 @@ mod owner_carrier_tests {
             0,
             "foreign network reached RPC"
         );
+    }
+}
+#[cfg(test)]
+mod keypair_wallet_owner_tests {
+    use super::*;
+    use crate::host::vendors::RuntimeProvider;
+    use crate::test_support::owner::{OwnerLedger, configured_source, native_selection};
+    use std::sync::{Arc, Mutex};
+
+    /// A ledger that holds the owner's account and the wallet account `wallet`.
+    struct Ledger(OwnerLedger, Mutex<native::AccountState>);
+    impl rpc::Rpc for Ledger {
+        fn call(
+            &self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> native::Result<serde_json::Value> {
+            use stellar_xdr as x;
+            let key = (method == "getLedgerEntries")
+                .then(|| native::read::<x::LedgerKey>(params["keys"][0].as_str().unwrap()).ok())
+                .flatten();
+            match key {
+                Some(x::LedgerKey::Account(key)) => {
+                    let x::PublicKey::PublicKeyTypeEd25519(key) = key.account_id.0;
+                    let wallet = self.1.lock().unwrap().clone();
+                    if native::account_for_public_key(&key.0) == wallet.address {
+                        return Ok(crate::test_support::owner::account_entry(&wallet));
+                    }
+                }
+                // The wallet holds 7 units of its issued asset.
+                Some(x::LedgerKey::Trustline(key)) => {
+                    let line = x::LedgerEntryData::Trustline(x::TrustLineEntry {
+                        account_id: key.account_id,
+                        asset: key.asset,
+                        balance: 7,
+                        limit: i64::MAX,
+                        flags: 1,
+                        ext: x::TrustLineEntryExt::V0,
+                    });
+                    return Ok(
+                        serde_json::json!({"entries":[{"xdr":native::xdr(&line).unwrap()}]}),
+                    );
+                }
+                _ => {}
+            }
+            self.0.call(method, params, &[])
+        }
+    }
+    fn fixture() -> (WalletConfig, Arc<Ledger>, Provider, Installation) {
+        let c = native_selection().config;
+        let ledger = Arc::new(Ledger(
+            OwnerLedger::new(c.clone()),
+            Mutex::new(configured_source(&c)),
+        ));
+        let configuration =
+            super::super::server_owner::configuration(&c.network, &serde_json::to_vec(&c).unwrap())
+                .unwrap();
+        let provider = Provider::from_rpc(&c.network, ledger.clone());
+        (c, ledger, provider, installation(&configuration))
+    }
+    fn operations(packet: &OwnerPacket, c: &WalletConfig) -> Vec<stellar_xdr::Operation> {
+        let info = packet.info().unwrap();
+        let payload = String::from_utf8(info.signing_payload).unwrap();
+        let stellar_xdr::TransactionEnvelope::Tx(envelope) = native::read(&payload).unwrap() else {
+            panic!()
+        };
+        // The owner's account is the source and pays; the server attaches no signature.
+        assert_eq!(
+            envelope.tx.source_account,
+            stellar_xdr::MuxedAccount::Ed25519(stellar_xdr::Uint256(
+                native::account_key(&c.owner).unwrap()
+            ))
+        );
+        assert!(envelope.signatures.is_empty());
+        envelope.tx.operations.to_vec()
+    }
+
+    #[test]
+    fn the_server_prepares_each_owner_action_of_a_keypair_wallet_for_one_owner_signature() {
+        let (c, ledger, provider, installation) = fixture();
+        let wallet = Some(stellar_xdr::MuxedAccount::Ed25519(stellar_xdr::Uint256(
+            native::account_key(&c.wallet).unwrap(),
+        )));
+        let prepare = |action| provider.prepare_owner(&installation, action, 100_000, 86_401);
+        // An issued asset returns to the owner and its trustline closes before the merge.
+        let issued = c.asset_issuer.is_some();
+        let closing = if issued { 6 } else { 4 };
+        for (action, name, count) in [
+            (OwnerAction::Fund { units: 5 }, "fund", 1),
+            (OwnerAction::SetPause { paused: true }, "pause", 1),
+            (
+                OwnerAction::Recover {
+                    units: Some(5),
+                    recipient: None,
+                },
+                "withdraw",
+                1,
+            ),
+            (
+                OwnerAction::Recover {
+                    units: None,
+                    recipient: None,
+                },
+                "close",
+                closing,
+            ),
+        ] {
+            let packet = prepare(action).unwrap();
+            assert_eq!(packet.info().unwrap().action, name);
+            let operations = operations(&packet, &c);
+            assert_eq!(operations.len(), count, "{name}");
+            // Only funding comes from the owner's own balance.
+            for operation in &operations {
+                assert_eq!(
+                    operation.source_account,
+                    if name == "fund" { None } else { wallet.clone() },
+                    "{name}"
+                );
+            }
+        }
+        // The declared fee never exceeds the caller's limit: a limit below the minimum fee of
+        // every operation prepares nothing.
+        let close = || OwnerAction::Recover {
+            units: None,
+            recipient: None,
+        };
+        assert!(
+            provider
+                .prepare_owner(&installation, close(), 100, 86_401)
+                .is_err()
+        );
+        let minimum = 100 * closing as u64;
+        let packet = provider
+            .prepare_owner(&installation, close(), minimum, 86_401)
+            .unwrap();
+        let stellar_xdr::TransactionEnvelope::Tx(envelope) =
+            native::read(&String::from_utf8(packet.info().unwrap().signing_payload).unwrap())
+                .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(u64::from(envelope.tx.fee), minimum);
+        // A wallet that is not paused takes no resume, and a keypair wallet has no code.
+        assert!(prepare(OwnerAction::SetPause { paused: false }).is_err());
+        for action in [
+            OwnerAction::Upload { wasm: vec![] },
+            OwnerAction::Create { wasm: vec![] },
+            OwnerAction::Extend,
+            OwnerAction::Recover {
+                units: None,
+                recipient: Some(c.agent.clone()),
+            },
+        ] {
+            assert!(prepare(action).is_err());
+        }
+        // The owner paused the wallet: discovery reports it, and only a resume fits.
+        ledger
+            .1
+            .lock()
+            .unwrap()
+            .signers
+            .retain(|s| s.key != c.agent);
+        assert!(prepare(OwnerAction::SetPause { paused: true }).is_err());
+        let resume = prepare(OwnerAction::SetPause { paused: false }).unwrap();
+        assert_eq!(resume.info().unwrap().action, "resume");
+        let configuration =
+            super::super::server_owner::configuration(&c.network, &serde_json::to_vec(&c).unwrap())
+                .unwrap();
+        let usage = Accounting {
+            nonce: 0,
+            deployment_version: 1,
+            spent_daily: 0,
+            spent_total: 0,
+            spent_day: 0,
+            calls: 0,
+        };
+        assert!(
+            provider
+                .discover_snapshot(&configuration, Some(&usage))
+                .unwrap()
+                .paused
+        );
+    }
+    /// The server signs for a wallet only while the ledger holds exactly the registered roles.
+    #[test]
+    fn a_wallet_whose_signers_or_thresholds_differ_from_its_registration_is_refused() {
+        let (c, ledger, provider, installation) = fixture();
+        let configuration =
+            super::super::server_owner::configuration(&c.network, &serde_json::to_vec(&c).unwrap())
+                .unwrap();
+        let usage = Accounting {
+            nonce: 0,
+            deployment_version: 1,
+            spent_daily: 0,
+            spent_total: 0,
+            spent_day: 0,
+            calls: 0,
+        };
+        provider
+            .discover_snapshot(&configuration, Some(&usage))
+            .unwrap();
+        assert!(provider.resources(&installation).unwrap().wallet_present);
+        let registered = ledger.1.lock().unwrap().clone();
+        let drift: [fn(&mut native::AccountState); 3] = [
+            |a| {
+                a.signers.push(native::AccountSigner {
+                    key: native::account_for_seed(&[99; 32]),
+                    weight: 1,
+                })
+            },
+            |a| a.medium_threshold = 1,
+            |a| a.master_weight = 1,
+        ];
+        for change in drift {
+            let mut changed = registered.clone();
+            change(&mut changed);
+            *ledger.1.lock().unwrap() = changed;
+            assert!(
+                provider
+                    .discover_snapshot(&configuration, Some(&usage))
+                    .is_err()
+            );
+            assert!(
+                provider
+                    .prepare_owner(
+                        &installation,
+                        OwnerAction::SetPause { paused: true },
+                        100_000,
+                        86_401
+                    )
+                    .is_err()
+            );
+        }
     }
 }

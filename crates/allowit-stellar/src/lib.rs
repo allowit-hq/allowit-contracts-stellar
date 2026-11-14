@@ -315,9 +315,11 @@ const FEE_BOUND_MARGIN_DIVISOR: u32 = 100;
 ///
 /// The network charges a transaction at most its declared fee. It refunds the unused part of
 /// the refundable resource fee (rent, events and the return value); the wallet contract cannot
-/// observe that refund. The declared fee of the operation is the resource fee of its final
-/// simulation plus the inclusion fee, and `attach_simulation` refuses a declared fee above the
-/// signed bound, so the counted gas is never below the fee charged. A recording simulation
+/// observe that refund. The declared fee of the operation is its signed bound, and
+/// `attach_simulation` refuses a simulation that needs more, so the counted gas is never below
+/// the fee charged. The declared resource fee is the bound less the inclusion fee: it has the
+/// margin of the bound above the simulated resource fee, so a resource fee that rises between
+/// preparation and execution stays covered. A recording simulation
 /// prices the server's authorization nonce at the longest entry lifetime, so its resource fee
 /// covers the final enforce-mode simulation of the signed entry. The margin covers the change of
 /// the resource fee between the two simulations: rent grows with each closed ledger, and the
@@ -433,32 +435,57 @@ fn automated_roles(c: &WalletConfig) -> Vec<&str> {
     roles
 }
 impl AccountState {
-    /// Check the exact classic-custody setup against independently selected public roles.
+    /// Check the exact wallet account against independently selected public roles: this
+    /// account is the wallet, its own key has weight 0, and its only signers are the owner
+    /// (weight 3), the agent (weight 1) and the server (weight 1) under thresholds 2/2/3.
+    /// A paused wallet, which has no agent signer, is refused: see [`Self::wallet_status`].
     /// This is current admission, not validation of a retained transaction after key rotation.
     pub fn validate_roles(&self, owner: &str, agent: &str, trusted_server: &str) -> Result<()> {
+        match self.wallet_status(owner, agent, trusted_server)? {
+            owner::WalletStatus::Active => Ok(()),
+            owner::WalletStatus::Paused => {
+                Err("This wallet is paused: its owner removed the agent signer".into())
+            }
+        }
+    }
+    /// The wallet account's exact roles, active or paused. Any other signer, a hash or
+    /// pre-authorized signer, a threshold other than 2/2/3 or a weight on the account's own
+    /// key is refused.
+    pub fn wallet_status(
+        &self,
+        owner: &str,
+        agent: &str,
+        trusted_server: &str,
+    ) -> Result<owner::WalletStatus> {
         self.validate_structure()?;
         for role in [owner, agent, trusted_server] {
             signing::canonical_account_key(role)?;
         }
-        if owner != self.address
+        let differs = || -> Result<owner::WalletStatus> {
+            Err("Current native account differs from the independently selected roles".into())
+        };
+        if [owner, agent, trusted_server].contains(&self.address.as_str())
             || owner == agent
             || owner == trusted_server
             || agent == trusted_server
-            || self.master_weight != 3
-            || self.low_threshold != 2
-            || self.medium_threshold != 2
-            || self.high_threshold != 3
-            || self.signers.len() != 2
-            || self
-                .signers
-                .iter()
-                .any(|s| s.weight != 1 || (s.key != agent && s.key != trusted_server))
+            || self.master_weight != 0
+            || self.low_threshold != owner::PAYMENT_THRESHOLD
+            || self.medium_threshold != owner::PAYMENT_THRESHOLD
+            || self.high_threshold != owner::OWNER_THRESHOLD
         {
-            return Err(
-                "Current native account differs from the independently selected roles".into(),
-            );
+            return differs();
         }
-        Ok(())
+        let weight = |key: &str| self.signers.iter().find(|s| s.key == key).map(|s| s.weight);
+        if weight(owner) != Some(owner::OWNER_WEIGHT)
+            || weight(trusted_server) != Some(owner::AUTOMATED_WEIGHT)
+        {
+            return differs();
+        }
+        match (weight(agent), self.signers.len()) {
+            (Some(owner::AUTOMATED_WEIGHT), 3) => Ok(owner::WalletStatus::Active),
+            (None, 2) => Ok(owner::WalletStatus::Paused),
+            _ => differs(),
+        }
     }
     /// Verify every administrator signature and the current high-threshold quorum.
     /// Zero-weight and nonmember signatures are errors even beside a sufficient quorum.
@@ -1726,7 +1753,13 @@ pub fn validate_retained_prepared(p: &PreparedOperation) -> Result<()> {
         expected = authorization::attach(&expected, authorization::server_signature(p, false)?)?;
     }
     if let Some(data) = &p.simulation_data {
-        expected = attach_simulation(&expected, data)?;
+        let current = attach_simulation(&expected, data)?;
+        // A packet of an earlier release declares the simulated resource fee itself.
+        expected = if &current == p {
+            current
+        } else {
+            attach_resources(&expected, data, false)?
+        };
     }
     if &expected != p {
         return Err("Prepared operation changed".into());
@@ -2075,11 +2108,27 @@ pub fn validate_retained_signed(s: &SignedOperation) -> Result<()> {
 }
 
 /// Attach only RPC resource data. The exact invocation and authorization remain unchanged.
+///
+/// An operation with a signed expense bound declares that bound as its fee, and the bound less
+/// the inclusion fee as its resource fee. The network charges the resources that the
+/// transaction uses and refunds the rest, so the declared headroom costs nothing, and the fee
+/// charged stays at or below the gas that the wallet counts. Without it, a resource fee that
+/// rises between this simulation and the server's simulation at execution refuses the
+/// operation.
 pub fn attach_simulation(p: &PreparedOperation, data: &str) -> Result<PreparedOperation> {
+    attach_resources(p, data, true)
+}
+/// `attach_simulation`, or with `headroom` false the rule of earlier releases, which declared
+/// the simulated resource fee itself. Retained packets of those releases stay verifiable.
+fn attach_resources(
+    p: &PreparedOperation,
+    data: &str,
+    headroom: bool,
+) -> Result<PreparedOperation> {
     if !matches!(p.config.route, WalletRoute::PolicyWallet | WalletRoute::Odc) {
         return Err("Resource data is only valid for policy wallet execution".into());
     }
-    let resource: SorobanTransactionData = read(data)?;
+    let mut resource: SorobanTransactionData = read(data)?;
     let required = u32::try_from(resource.resource_fee)
         .map_err(|_| "Invalid resource fee")?
         .checked_add(INCLUSION_FEE_STROOPS)
@@ -2092,11 +2141,18 @@ pub fn attach_simulation(p: &PreparedOperation, data: &str) -> Result<PreparedOp
     {
         return Err("Simulation resource fee exceeds approved fee bound".into());
     }
+    // The signed bound is at least the simulated fee here, and never above the installed
+    // ceiling, so the declared fee is within both.
+    let declared = match &p.terms.expense {
+        Some(expense) if headroom => expense.max_fee_stroops.min(p.config.max_fee_stroops),
+        _ => required,
+    };
+    resource.resource_fee = i64::from(declared - INCLUSION_FEE_STROOPS);
     let TransactionEnvelope::Tx(mut env) = read(&p.transaction_xdr)? else {
         return Err("Unsupported transaction envelope".into());
     };
     env.tx.ext = TransactionExt::V1(resource);
-    env.tx.fee = required;
+    env.tx.fee = declared;
     let mut out = p.clone();
     out.transaction_hash = transaction_hash(&p.config.network, &env.tx)?;
     out.transaction_xdr = xdr(&TransactionEnvelope::Tx(env))?;

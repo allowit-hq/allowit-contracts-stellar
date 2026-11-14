@@ -90,6 +90,37 @@ fn updated_selection(
     next.validate()?;
     Ok(next)
 }
+/// The selection after an owner update of a keypair wallet's policy: the same account, roles
+/// and source with the new params. The module identity of a keypair wallet names its params,
+/// so it changes with them, and the owner approves the new source binding.
+fn updated_keypair_selection(
+    selection: &OwnerPolicy,
+    update: &crate::host::runtime::ParamsUpdate,
+) -> Result<OwnerPolicy> {
+    let mut next = selection.clone();
+    let portable = &mut next.policy.runtime.instance_binding.portable;
+    let tier = match portable.tier.as_str() {
+        "simple" => native::PolicyTier::Simple,
+        "standard" => native::PolicyTier::Common,
+        "custom" => native::PolicyTier::Custom,
+        _ => return Err(Error::config("Invalid portable policy tier")),
+    };
+    next.config.params =
+        crate::provider::params_update::next_keypair_params(&selection.config, tier, update)?;
+    portable.params = next.config.params.clone();
+    portable.params_hash = crate::host::authoring::canonical_digest(&portable.params)?;
+    let identity = crate::host::authoring::portable_identity(
+        &portable.language,
+        &portable.tier,
+        &portable.rules,
+        &portable.source_hash,
+        &portable.params_hash,
+    )?;
+    next.config.module_digest = checked(native::unhex(&identity))?;
+    next.policy.runtime.instance_binding.module_digest = identity;
+    next.validate()?;
+    Ok(next)
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Step {
@@ -109,6 +140,9 @@ struct Step {
 struct RetainedStep {
     packet: Step,
     source: native::AccountState,
+    /// The keypair wallet account as the caller read it, for an owner action on that account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wallet: Option<native::AccountState>,
     validated_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     extend_to: Option<u32>,
@@ -355,6 +389,22 @@ fn expected(record: &Record, step: &RetainedStep) -> Result<ExpectedOwnerIntent>
             salt: wallet_salt(&c.policy_instance),
             x402_enabled: false,
         },
+        (Work::Fund { units, .. }, "fund") if c.route == WalletRoute::Native => {
+            OwnerAction::Wallet {
+                owner_state: step.source.clone(),
+                wallet_state: step.wallet.clone().ok_or_else(|| {
+                    Error::config("Retained wallet funding has no independently read wallet")
+                })?,
+                agent: c.agent.clone(),
+                engine: c.server.clone(),
+                action: native::owner::WalletAction::Fund {
+                    units: i64::try_from(*units)
+                        .map_err(|_| Error::usage("The amount exceeds the native range"))?,
+                },
+                asset_symbol: c.asset_symbol.clone(),
+                asset_issuer: c.asset_issuer.clone(),
+            }
+        }
         (Work::Fund { units, .. }, "fund") => OwnerAction::Fund {
             asset: c.asset.clone(),
             from: c.owner.clone(),
@@ -498,6 +548,9 @@ impl OwnerClient {
                 "The params update names another policy than this installation",
             ));
         }
+        if selection.config.route == WalletRoute::Native {
+            return self.update_keypair_params(capabilities, selection, request_id, update);
+        }
         params_update::next_params(&selection.config, update)?;
         let saved = capabilities
             .store
@@ -537,6 +590,185 @@ impl OwnerClient {
         };
         self.run_owner(capabilities, selection, request_id, work, max_fee_stroops)
     }
+    /// Change the params of a keypair wallet's policy with one owner signature and no ledger
+    /// step. The account holds no params: the server enforces them, so the owner approves the
+    /// new source binding, as at activation. The message is built here from the owner's own
+    /// document and the changes; the server's message must equal it before the owner signs.
+    /// The request ID then exports the updated installation, as an activation ID does.
+    fn update_keypair_params(
+        &self,
+        capabilities: OwnerCapabilities<'_>,
+        selection: &OwnerPolicy,
+        id: &str,
+        update: &crate::host::runtime::ParamsUpdate,
+    ) -> Result<Outcome> {
+        let OwnerCapabilities {
+            store,
+            rpc,
+            signer,
+            clock,
+        } = capabilities;
+        if signer.account() != self.session.owner()
+            || selection.config.owner != self.session.owner()
+        {
+            return Err(Error::usage(
+                "Select the policy of this owner for the update",
+            ));
+        }
+        selection.validate()?;
+        let updated = updated_keypair_selection(selection, update)?;
+        let payload = approval_payload(&updated)?;
+        let message = super::super::consent::message(&payload)?;
+        let identity = intent_hash(&json!({"selection":updated,"message":message}))?;
+        let mut record = match store.load::<Activation>(id)? {
+            Some(saved)
+                if saved.backend == self.session.backend()
+                    && saved.origin == self.session.origin()
+                    && saved.identity == identity =>
+            {
+                saved
+            }
+            Some(_) => {
+                return Err(Error::config(
+                    "Owner request ID already binds another workflow",
+                ));
+            }
+            None => Activation {
+                backend: self.session.backend().to_owned(),
+                origin: self.session.origin().to_owned(),
+                identity,
+                signature: None,
+                completed: false,
+            },
+        };
+        store.save(id, &record)?;
+        let outcome = |selection: OwnerPolicy| Outcome {
+            request_id: id.into(),
+            state: "updated".into(),
+            selection,
+            transactions: vec![],
+            receipts: vec![],
+        };
+        if record.completed {
+            return Ok(outcome(updated));
+        }
+        network(rpc, &selection.config.network)?;
+        // The owner is the account's administrator: only then does its signature approve.
+        let account = checked(rpc::get_account(rpc, &selection.config.wallet))?;
+        checked(account.wallet_status(
+            &selection.config.owner,
+            &selection.config.agent,
+            &selection.config.server,
+        ))?;
+        checked(account.validate_signer_quorum(&[self.session.owner()], account.high_threshold))?;
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Consent {
+            payload: Value,
+            message: String,
+            method: String,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Prepared {
+            policy_id: String,
+            approval: Option<Consent>,
+        }
+        // The server prepares the approval of exactly the locally selected update, or nothing
+        // is signed.
+        let prepare = || -> Result<()> {
+            allowit_core::client::progress::report(
+                "Preparing the source approval with the Allowit server",
+            );
+            let prepared: Prepared = self.session.owner_request(
+                Method::Post,
+                "/api/native/owner/prepare",
+                Some(&json!({"policyId":selection.policy.id,
+                    "action":crate::provider::params_update::ACTION,
+                    "params":update.changes,
+                    "expectedRevision":update.expected_revision})),
+                clock()?,
+                false,
+            )?;
+            let consent = prepared.approval.ok_or_else(|| {
+                Error::config("The server prepared no source approval for this keypair wallet")
+            })?;
+            if prepared.policy_id != selection.policy.id
+                || consent.payload != payload
+                || consent.message != message
+                || consent.method != "sep53"
+            {
+                return Err(Error::config(
+                    "Source consent differs from the exact locally selected update",
+                ));
+            }
+            Ok(())
+        };
+        let digest = native::signing::signed_message_digest(&message);
+        // A retained signature means that an earlier run may already have settled the update:
+        // its submission is resumed first, and the server is asked to prepare again only when
+        // it no longer holds that approval.
+        let resumed = record.signature.is_some();
+        if !resumed {
+            prepare()?;
+            let signature = signer
+                .sign_hash(&digest)
+                .map_err(|_| Error::config("Owner source signer failed"))?;
+            checked(native::signing::verify_digest(
+                self.session.owner(),
+                &digest,
+                &signature,
+            ))?;
+            record.signature = Some(native::DetachedSignature {
+                signer: self.session.owner().to_owned(),
+                signature: signature.to_vec(),
+            });
+            store.save(id, &record)?;
+        }
+        let signature = record
+            .signature
+            .as_ref()
+            .filter(|signature| signature.signer == self.session.owner())
+            .ok_or_else(|| Error::config("Retained source-consent signer differs"))?;
+        checked(native::signing::verify_digest(
+            self.session.owner(),
+            &digest,
+            &signature.signature,
+        ))?;
+        let submit = || -> Result<Value> {
+            self.session.owner_request(
+                Method::Post,
+                "/api/native/owner/submit",
+                Some(&json!({"policyId":selection.policy.id,"payload":message,"sourceApproval":[signature]})),
+                clock()?,
+                true,
+            )
+        };
+        let response = match submit() {
+            // The server holds no such approval any more, or the approval expired, and none
+            // settled: prepare the same update again and submit the retained signature for it.
+            Err(error)
+                if resumed
+                    && (error.status == Some(404)
+                        || error.api_code.as_deref() == Some("owner_transaction_expired")) =>
+            {
+                prepare()?;
+                submit()
+            }
+            result => result,
+        }
+        .map_err(submit_refusal)?;
+        if response["status"] != "confirmed"
+            || response["action"] != crate::provider::params_update::ACTION
+        {
+            return Err(Error::uncertain(
+                "The source approval has no confirmed result; retain the workflow",
+            ));
+        }
+        record.completed = true;
+        store.save(id, &record)?;
+        Ok(outcome(updated))
+    }
     fn run_owner(
         &self,
         capabilities: OwnerCapabilities<'_>,
@@ -553,7 +785,10 @@ impl OwnerClient {
         } = capabilities;
         if !crate::host::request::request_id_valid(id)
             || max_fee < 100
-            || selection.config.route != WalletRoute::PolicyWallet
+            // A keypair wallet takes funding here. Its owner creates it with the wallet setup.
+            || !(selection.config.route == WalletRoute::PolicyWallet
+                || (selection.config.route == WalletRoute::Native
+                    && matches!(work, Work::Fund { .. })))
             || signer.account() != self.session.owner()
             || selection.config.owner != self.session.owner()
         {
@@ -689,7 +924,13 @@ impl OwnerClient {
                     ));
                 }
                 let source = checked(rpc::get_account(rpc, self.session.owner()))?;
-                checked(source.validate_owner_only())?;
+                if selection.config.route == WalletRoute::Native {
+                    // The owner's account is not the wallet: its own key must pay alone, as
+                    // the wallet setup requires. A policy wallet owner is its master key only.
+                    checked(native::owner::check_owner_source(&source))?;
+                } else {
+                    checked(source.validate_owner_only())?;
+                }
                 let extend_to = if step.action == "extend" {
                     let live = checked(rpc::wallet_lifetime(
                         rpc,
@@ -706,8 +947,14 @@ impl OwnerClient {
                 } else {
                     None
                 };
+                let wallet = if selection.config.route == WalletRoute::Native {
+                    Some(checked(rpc::get_account(rpc, &selection.config.wallet))?)
+                } else {
+                    None
+                };
                 let retained = RetainedStep {
                     extend_to,
+                    wallet,
                     packet: step,
                     source,
                     validated_at: clock()?,
@@ -909,6 +1156,18 @@ impl OwnerClient {
             receipts: record.steps.iter().filter_map(OwnerReceipt::of).collect(),
         })
     }
+    /// Ask the server to register a wallet account that the owner's setup created. The server
+    /// reads the account from the ledger and registers it only with the exact roles of
+    /// `configuration`, for this owner session. A repeated registration changes nothing.
+    pub fn register_native(&self, configuration: &Value, now: u64) -> Result<Value> {
+        self.session.owner_request(
+            Method::Post,
+            "/api/native/register",
+            Some(&json!({ "configuration": configuration })),
+            now,
+            false,
+        )
+    }
     pub fn verify_binding(&self, selection: &OwnerPolicy, rpc: &dyn rpc::Rpc) -> Result<()> {
         selection.validate()?;
         let c = &selection.config;
@@ -931,10 +1190,16 @@ impl OwnerClient {
             ));
         }
         if c.route == WalletRoute::Native {
-            return crate::provider::runtime::client::verify_native_members(
-                &checked(rpc::get_account(rpc, &c.wallet))?,
-                c,
-            );
+            // The owner acts on its wallet also while it is paused: the account holds the exact
+            // roles, with or without the agent signer. An agent's own admission stays strict.
+            let account = checked(rpc::get_account(rpc, &c.wallet))?;
+            if account.address != c.wallet {
+                return Err(Error::config(
+                    "Native account differs from the selected wallet",
+                ));
+            }
+            checked(account.wallet_status(&c.owner, &c.agent, &c.server))?;
+            return Ok(());
         }
         let live = checked(rpc::trusted_state_for_discovery(rpc, c, None))?;
         if live.paused
@@ -1066,7 +1331,12 @@ impl OwnerClient {
         }
         if selection.config.route == WalletRoute::Native && record.signature.is_none() {
             let account = checked(rpc::get_account(rpc, &selection.config.wallet))?;
-            crate::provider::runtime::client::verify_native_members(&account, &selection.config)?;
+            // The owner approves a source as the account's administrator, also while paused.
+            checked(account.wallet_status(
+                &selection.config.owner,
+                &selection.config.agent,
+                &selection.config.server,
+            ))?;
             checked(
                 account.validate_signer_quorum(&[self.session.owner()], account.high_threshold),
             )?;
@@ -1231,14 +1501,176 @@ struct NativeSetupRecord {
     identity: String,
     setup: native::owner::NativeSetup,
     source: native::AccountState,
+    /// How the wallet account's one-time key was made: `owner-signature` when the owner's
+    /// signer signs the derivation message the same way twice, so the owner can compute the
+    /// address again; `one-time` when it does not.
+    derivation: String,
     created_at: u64,
     signed_xdr: Option<String>,
     signature: Option<Vec<u8>>,
     submitted: bool,
     receipt: Option<rpc::VerifiedReceipt>,
 }
-/// Configure a fresh Native account through SDK Runtime. No server registration is invented.
-/// Original unsigned intent and signed bytes are retained before direct native transmission.
+/// The index of the first wallet of an agent. The derivation message names it.
+pub const WALLET_INDEX: u32 = 0;
+/// The one-time key of the wallet account of `agent`: the owner signs the derivation message,
+/// and the signature is the seed. Ed25519 signatures are deterministic, so the same owner key
+/// derives the same account again. A signer that signs the same message in two ways still
+/// yields a usable one-time key, which the result reports as `one-time`.
+fn derive_wallet_key(
+    signer: &dyn OwnerSigner,
+    network: &str,
+    agent: &str,
+) -> Result<(native::owner::WalletKey, &'static str)> {
+    let digest = checked(native::owner::wallet_derivation_digest(
+        network,
+        agent,
+        WALLET_INDEX,
+    ))?;
+    let first = checked(signer.sign_hash(&digest))?;
+    let second = checked(signer.sign_hash(&digest))?;
+    checked(native::signing::verify_digest(
+        signer.account(),
+        &digest,
+        &first,
+    ))?;
+    let derivation = if first == second {
+        "owner-signature"
+    } else {
+        "one-time"
+    };
+    Ok((native::owner::WalletKey::from_signature(&first), derivation))
+}
+/// The server's first record of a wallet: the account, its roles and a policy that admits
+/// transfers of XLM. The owner's generated policy replaces it at activation.
+pub fn bootstrap_configuration(
+    network: &str,
+    wallet: &str,
+    owner: &str,
+    agent: &str,
+    server: &str,
+) -> Result<native::WalletConfig> {
+    const SOURCE: &str = "use allowit::prelude::*;\n/// Bootstrap: transfers in the installed asset.\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::operations(ctx, &ctx.params[allowit::OPERATIONS])?;\n    allowit::tokens(ctx, &ctx.params[allowit::TOKENS])?;\n    Ok(())\n}\n";
+    let asset = checked(native::sac_address(network, &stellar_xdr::Asset::Native))?;
+    let instance = native::hash(format!(
+        "allowit-stellar-native-wallet-v1:{network}:{wallet}"
+    ));
+    let config: native::WalletConfig = serde_json::from_value(json!({
+        "network": network, "policyInstance": instance, "wallet": wallet, "owner": owner,
+        "agent": agent, "server": server, "route": "native", "language": "portable",
+        "params": {"operations": {"List": [{"Str": "transfer"}]}, "tokens": {"List": [{"Addr": asset}]}},
+        "asset": asset, "assetSymbol": "XLM", "assetIssuer": null, "policySource": SOURCE,
+        "sourceHash": native::hash(SOURCE), "moduleDigest": vec![0u8; 32],
+        "maxFeeStroops": 100_000,
+    }))
+    .map_err(|_| Error::config("Cannot describe the new wallet"))?;
+    checked(native::validate_config(&config))?;
+    Ok(config)
+}
+/// The result of a wallet setup: the account, its roles and the server's first record of it.
+fn configured(
+    request: &crate::provider::runtime::owner::SetupRequest,
+    wallet: &str,
+    derivation: &str,
+    transaction: Option<(&str, u32)>,
+) -> Result<Value> {
+    let configuration = bootstrap_configuration(
+        &request.network,
+        wallet,
+        &request.owner,
+        &request.agent,
+        &request.server,
+    )?;
+    Ok(
+        json!({"state":"configured","requestId":request.request_id,"network":request.network,"wallet":wallet,"owner":request.owner,"agent":request.agent,"server":request.server,
+        "installation":native::hex(&configuration.policy_instance),"configuration":configuration,
+        "derivation":{"method":derivation,"walletIndex":WALLET_INDEX},
+        "signers":{"owner":native::owner::OWNER_WEIGHT,"agent":native::owner::AUTOMATED_WEIGHT,"server":native::owner::AUTOMATED_WEIGHT,"walletKey":0},
+        "thresholds":{"low":native::owner::PAYMENT_THRESHOLD,"medium":native::owner::PAYMENT_THRESHOLD,"high":native::owner::OWNER_THRESHOLD},
+        "reserveStroops":native::owner::wallet_reserve(false).to_string(),
+        "transactionHash":transaction.map(|t|t.0),"ledger":transaction.map(|t|t.1)}),
+    )
+}
+/// Prepare the setup of the wallet account `wallet` from the owner's current account.
+fn prepare_setup(
+    runtime: &crate::provider::runtime::Runtime,
+    request: &crate::provider::runtime::owner::SetupRequest,
+    identity: &str,
+    wallet: &str,
+    derivation: &str,
+    now: u64,
+) -> Result<NativeSetupRecord> {
+    let source = checked(rpc::get_account(runtime.rpc(), &request.owner))?;
+    let setup = checked(native::owner::prepare_native_setup(
+        &source,
+        &native::owner::SetupTerms {
+            wallet,
+            agent: &request.agent,
+            engine: &request.server,
+            request_id: &request.request_id,
+            network: &request.network,
+            fee_per_operation: request.fee_per_operation,
+            starting_balance: None,
+            trustline: None,
+        },
+        now,
+    ))?;
+    Ok(NativeSetupRecord {
+        identity: identity.into(),
+        setup,
+        source,
+        derivation: derivation.into(),
+        created_at: now,
+        signed_xdr: None,
+        signature: None,
+        submitted: false,
+        receipt: None,
+    })
+}
+/// The retained signed setup holds the owner's retained signature and one valid signature of
+/// the new account's own key, over the exact retained transaction. A resumed setup checks
+/// its signed bytes this way, so it never needs the wallet key again.
+fn verify_setup_signatures(record: &NativeSetupRecord, signature: &[u8; 64]) -> Result<()> {
+    let changed = || Error::config("Retained Native setup bytes changed");
+    let signed = record.signed_xdr.as_deref().ok_or_else(changed)?;
+    let stellar_xdr::TransactionEnvelope::Tx(envelope) =
+        checked(native::read::<stellar_xdr::TransactionEnvelope>(signed))?
+    else {
+        return Err(changed());
+    };
+    let hash: [u8; 32] = checked(native::unhex(&record.setup.transaction_hash))?;
+    let unsigned = stellar_xdr::TransactionEnvelope::Tx(stellar_xdr::TransactionV1Envelope {
+        tx: envelope.tx.clone(),
+        signatures: Default::default(),
+    });
+    let [by_owner, by_wallet] = envelope.signatures.as_slice() else {
+        return Err(changed());
+    };
+    if checked(native::xdr(&unsigned))? != record.setup.transaction_xdr
+        || checked(rpc::signed_transaction_hash(&record.setup.network, signed))? != hash
+        || by_owner.signature.as_slice() != signature
+    {
+        return Err(changed());
+    }
+    checked(native::signing::verify_digest(
+        &record.setup.owner,
+        &hash,
+        by_owner.signature.as_slice(),
+    ))?;
+    checked(native::signing::verify_digest(
+        &record.setup.wallet,
+        &hash,
+        by_wallet.signature.as_slice(),
+    ))
+}
+/// Create one agent's wallet account with one owner-signed transaction, through SDK Runtime.
+/// The owner's signer derives the new account's one-time key, which co-signs once. Original
+/// unsigned intent and signed bytes are retained before direct native transmission. The
+/// result holds the server's first record of the wallet under `configuration`.
+///
+/// A retained request keeps its wallet. Once its transaction is signed, a resume reads the
+/// retained bytes and derives nothing, so a signer that does not sign deterministically still
+/// recovers a lost reply.
 pub fn configure_native(
     runtime: &crate::provider::runtime::Runtime,
     store: &Store,
@@ -1255,6 +1687,7 @@ pub fn configure_native(
     let identity = intent_hash(
         &json!({"network":request.network,"owner":request.owner,"agent":request.agent,"server":request.server,"requestId":request.request_id,"fee":request.fee_per_operation}),
     )?;
+    let mut derived = None;
     let mut record = match store.load::<NativeSetupRecord>(&request.request_id)? {
         Some(record) if record.identity == identity => record,
         Some(_) => {
@@ -1263,59 +1696,46 @@ pub fn configure_native(
             ));
         }
         None => {
-            let source = checked(rpc::get_account(runtime.rpc(), &request.owner))?;
-            let now = clock()?;
-            let setup = checked(native::owner::prepare_native_setup(
-                &source,
-                &request.agent,
-                &request.server,
-                &request.request_id,
-                &request.network,
-                request.fee_per_operation,
-                now,
-            ))?;
-            NativeSetupRecord {
-                identity,
-                setup,
-                source,
-                created_at: now,
-                signed_xdr: None,
-                signature: None,
-                submitted: false,
-                receipt: None,
+            let (key, derivation) = derive_wallet_key(signer, &request.network, &request.agent)?;
+            let wallet = key.account();
+            derived = Some(key);
+            // A wallet account that already exists is this agent's wallet only with the exact
+            // roles. Any other authority on it is refused, and nothing is signed.
+            if let Some(existing) = checked(rpc::find_account(runtime.rpc(), &wallet))? {
+                if existing
+                    .wallet_status(&request.owner, &request.agent, &request.server)
+                    .is_err()
+                {
+                    return Err(Error::config(
+                        "The wallet account of this agent already exists with other signers or thresholds; setup never replaces existing authority",
+                    ));
+                }
+                return configured(request, &wallet, derivation, None);
             }
+            prepare_setup(runtime, request, &identity, &wallet, derivation, clock()?)?
         }
     };
     store.save(&request.request_id, &record)?;
-    let expected = ExpectedOwnerIntent {
-        limits: OwnerLimits {
-            network: request.network.clone(),
-            owner: request.owner.clone(),
-            next_sequence: record
-                .source
-                .sequence
-                .checked_add(1)
-                .ok_or_else(|| Error::config("Native source sequence overflow"))?,
-            max_fee_stroops: record.setup.fee_stroops,
-            valid_until: record.setup.expires_at,
-        },
-        action: OwnerAction::NativeSetup {
-            state: record.source.clone(),
-            agent: request.agent.clone(),
-            engine: request.server.clone(),
-            request_id: request.request_id.clone(),
-            fee_per_operation: request.fee_per_operation,
-            created_at: record.created_at,
-        },
-    };
-    let packet = OwnerTransaction {
-        network: record.setup.network.clone(),
-        action: "native_setup".into(),
-        transaction_xdr: record.setup.transaction_xdr.clone(),
-        transaction_hash: checked(native::unhex(&record.setup.transaction_hash))?,
-        expires_at: record.setup.expires_at,
-    };
     if record.signed_xdr.is_none() {
+        let key = match derived.take() {
+            Some(key) => key,
+            None => derive_wallet_key(signer, &request.network, &request.agent)?.0,
+        };
+        if key.account() != record.setup.wallet {
+            // The owner's signer does not sign deterministically, so this run holds another
+            // one-time key. Nothing was signed for the retained preparation: prepare again
+            // for the key of this run.
+            record = prepare_setup(
+                runtime,
+                request,
+                &identity,
+                &key.account(),
+                "one-time",
+                clock()?,
+            )?;
+            store.save(&request.request_id, &record)?;
+        }
+        let expected = expected_setup(request, &record)?;
         let current = checked(rpc::get_account(runtime.rpc(), &request.owner))?;
         if current != record.source || clock()? < record.created_at {
             return Err(Error::config(
@@ -1327,29 +1747,40 @@ pub fn configure_native(
             &expected,
             clock()?,
         ))?;
-        record.signed_xdr = Some(checked(proof.sign_with(clock()?, |hash| {
-            let signature = signer.sign_hash(hash)?;
-            record.signature = Some(signature.to_vec());
-            Ok(signature)
-        }))?);
+        record.signed_xdr = Some(checked(proof.sign_with_wallet_key(
+            clock()?,
+            |hash| {
+                let signature = signer.sign_hash(hash)?;
+                record.signature = Some(signature.to_vec());
+                Ok(signature)
+            },
+            &key,
+        ))?);
         store.save(&request.request_id, &record)?;
     }
+    let wallet = record.setup.wallet.clone();
+    let expected = expected_setup(request, &record)?;
+    let packet = OwnerTransaction {
+        network: record.setup.network.clone(),
+        action: "native_setup".into(),
+        transaction_xdr: record.setup.transaction_xdr.clone(),
+        transaction_hash: checked(native::unhex(&record.setup.transaction_hash))?,
+        expires_at: record.setup.expires_at,
+    };
     let signature: [u8; 64] = record
         .signature
         .clone()
         .ok_or_else(|| Error::config("Missing retained Native setup signature"))?
         .try_into()
         .map_err(|_| Error::config("Invalid retained Native signature"))?;
-    let retained = checked(owner_intent::validate_owner_transaction(
+    // The retained unsigned packet is still the exact setup of the caller's intent, and the
+    // retained signed bytes are that packet with the owner's and the wallet key's signatures.
+    checked(owner_intent::validate_owner_transaction(
         &packet,
         &expected,
         record.created_at,
     ))?;
-    if checked(retained.sign_with(record.created_at, |_| Ok(signature)))?
-        != *record.signed_xdr.as_ref().unwrap()
-    {
-        return Err(Error::config("Retained Native setup bytes changed"));
-    }
+    verify_setup_signatures(&record, &signature)?;
     if record.receipt.is_none() {
         record.receipt = checked(rpc::receipt_by_hash(
             runtime.rpc(),
@@ -1401,11 +1832,46 @@ pub fn configure_native(
             "The original Native setup failed or its receipt envelope differs",
         ));
     }
-    let account = checked(rpc::get_account(runtime.rpc(), &request.owner))?;
-    checked(account.validate_roles(&request.owner, &request.agent, &request.server))?;
-    Ok(
-        json!({"state":"configured","requestId":request.request_id,"network":request.network,"wallet":request.owner,"owner":request.owner,"agent":request.agent,"server":request.server,"transactionHash":record.setup.transaction_hash,"ledger":receipt.ledger}),
+    let account = checked(rpc::get_account(runtime.rpc(), &wallet))?;
+    // The owner can pause the wallet after setup: a paused wallet is still this wallet.
+    checked(account.wallet_status(&request.owner, &request.agent, &request.server))?;
+    configured(
+        request,
+        &wallet,
+        &record.derivation,
+        Some((&record.setup.transaction_hash, receipt.ledger)),
     )
+}
+/// The caller's own intent for the retained setup: the owner account that the caller read and
+/// the roles of the request.
+fn expected_setup(
+    request: &crate::provider::runtime::owner::SetupRequest,
+    record: &NativeSetupRecord,
+) -> Result<ExpectedOwnerIntent> {
+    Ok(ExpectedOwnerIntent {
+        limits: OwnerLimits {
+            network: request.network.clone(),
+            owner: request.owner.clone(),
+            next_sequence: record
+                .source
+                .sequence
+                .checked_add(1)
+                .ok_or_else(|| Error::config("Native source sequence overflow"))?,
+            max_fee_stroops: record.setup.fee_stroops,
+            valid_until: record.setup.expires_at,
+        },
+        action: OwnerAction::NativeSetup {
+            state: record.source.clone(),
+            wallet: record.setup.wallet.clone(),
+            agent: request.agent.clone(),
+            engine: request.server.clone(),
+            request_id: request.request_id.clone(),
+            fee_per_operation: request.fee_per_operation,
+            starting_balance: None,
+            trustline: None,
+            created_at: record.created_at,
+        },
+    })
 }
 
 /// Read only original transaction receipts. This path requires neither an owner key nor current source admission.
@@ -1595,6 +2061,7 @@ mod submit_refusal_tests {
         let hash = "ab".repeat(32);
         let owner = crate::test_support::owner::account(11);
         let mut step = RetainedStep {
+            wallet: None,
             packet: Step {
                 network: "stellar:testnet".into(),
                 action: "deploy_wallet".into(),

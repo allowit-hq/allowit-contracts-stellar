@@ -20,6 +20,15 @@ impl OwnerSigner for Key<'_> {
         std::sync::OnceLock::get_or_init(&OWNER_ACCOUNT, || account(11))
     }
     fn sign_hash(&self, digest: &[u8; 32]) -> native::Result<[u8; 64]> {
+        // The signature that derives the fixture agent's wallet key authorizes nothing: it is
+        // not a transaction signature, so it is not counted and retains nothing first.
+        let derivation = std::sync::OnceLock::get_or_init(&DERIVATION, || {
+            let c = selection().config;
+            native::owner::wallet_derivation_digest(&c.network, &c.agent, 0).unwrap()
+        });
+        if digest == derivation && !self.bad {
+            return Ok(native::test_support::sign_digest([11; 32], digest));
+        }
         self.calls.fetch_add(1, Ordering::SeqCst);
         if let Some(f) = self.before {
             f();
@@ -32,6 +41,7 @@ impl OwnerSigner for Key<'_> {
     }
 }
 static OWNER_ACCOUNT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static DERIVATION: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
 pub(crate) fn key() -> Key<'static> {
     Key {
         calls: AtomicUsize::new(0),

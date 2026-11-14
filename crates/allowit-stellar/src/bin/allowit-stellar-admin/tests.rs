@@ -512,3 +512,154 @@ fn every_action_reads_live_state_and_prints_only_public_output() {
     let args = arguments(&["inspect", "--account", &owner]).unwrap();
     assert!(run(&args, &other, 1000).is_err());
 }
+
+/// The per-agent wallet actions read the wallet and the owner's account and print the owner's
+/// unsigned transaction. An account that is not the exact profile prepares nothing.
+#[test]
+fn agent_wallet_actions_verify_the_exact_profile_and_prepare_one_owner_transaction() {
+    let (owner, agent, engine, wallet) = (key(1), key(2), key(3), key(6));
+    let wallet_account = |paused: bool| {
+        let mut value = state();
+        value["account_id"] = json!(wallet);
+        value["sequence"] = json!("7");
+        let mut signers = vec![
+            signer_entry(&wallet, 0, "ed25519_public_key"),
+            signer_entry(&owner, 3, "ed25519_public_key"),
+            signer_entry(&engine, 1, "ed25519_public_key"),
+        ];
+        if !paused {
+            signers.push(signer_entry(&agent, 1, "ed25519_public_key"));
+        }
+        value["signers"] = json!(signers);
+        set_thresholds(&mut value, 2, 2, 3);
+        value
+    };
+    let horizon = |wallet_state: Value| {
+        let (owner, wallet) = (owner.clone(), wallet.clone());
+        move |url: &str| -> Result<Value> {
+            if url.ends_with(&wallet) {
+                Ok(wallet_state.clone())
+            } else if url.ends_with(&owner) {
+                Ok(state())
+            } else {
+                Err("unexpected Horizon read".into())
+            }
+        }
+    };
+    let run_action = |action: &str, extra: &[&str], wallet_state: Value| {
+        let mut args = vec![
+            action,
+            "--account",
+            &wallet,
+            "--owner",
+            &owner,
+            "--agent",
+            &agent,
+            "--engine",
+            &engine,
+        ];
+        args.extend(extra);
+        run(&arguments(&args)?, &horizon(wallet_state), 1000).map(|(output, _)| output)
+    };
+    assert!(
+        run_action("verify-agent-wallet", &[], wallet_account(false))
+            .unwrap()
+            .starts_with("Exact agent wallet profile verified: owner 3")
+    );
+    assert!(
+        run_action("verify-agent-wallet", &[], wallet_account(true))
+            .unwrap()
+            .contains("paused")
+    );
+    let owner_account = MuxedAccount::Ed25519(Uint256(public(&owner).unwrap()));
+    let wallet_source = Some(MuxedAccount::Ed25519(Uint256(public(&wallet).unwrap())));
+    for (action, extra, count) in [
+        ("pause-agent-wallet", &[][..], 1),
+        ("withdraw-agent-wallet", &["--amount", "5"][..], 1),
+        ("close-agent-wallet", &[][..], 4),
+    ] {
+        let envelope = decode(&run_action(action, extra, wallet_account(false)).unwrap());
+        // The owner's account pays and signs; every operation acts on the wallet.
+        assert_eq!(envelope.tx.source_account, owner_account, "{action}");
+        assert_eq!(envelope.tx.seq_num.0, 43);
+        assert!(envelope.signatures.is_empty());
+        assert_eq!(envelope.tx.operations.len(), count, "{action}");
+        assert!(
+            envelope
+                .tx
+                .operations
+                .iter()
+                .all(|op| op.source_account == wallet_source)
+        );
+    }
+    let funding = decode(
+        &run_action(
+            "fund-agent-wallet",
+            &["--amount", "5"],
+            wallet_account(false),
+        )
+        .unwrap(),
+    );
+    assert!(funding.tx.operations[0].source_account.is_none());
+    decode(&run_action("resume-agent-wallet", &[], wallet_account(true)).unwrap());
+    assert!(run_action("resume-agent-wallet", &[], wallet_account(false)).is_err());
+    assert!(run_action("pause-agent-wallet", &[], wallet_account(true)).is_err());
+    // Another signer, a threshold change or a weight on the wallet's own key is refused.
+    let mut foreign = wallet_account(false);
+    foreign["signers"]
+        .as_array_mut()
+        .unwrap()
+        .push(signer_entry(&key(5), 1, "ed25519_public_key"));
+    let mut drift = wallet_account(false);
+    drift["thresholds"]["med_threshold"] = json!(1);
+    let mut revived = wallet_account(false);
+    revived["signers"][0]["weight"] = json!(1);
+    let mut hashed = wallet_account(false);
+    hashed["signers"]
+        .as_array_mut()
+        .unwrap()
+        .push(signer_entry(&key(5), 1, "sha256_hash"));
+    for state in [foreign, drift, revived, hashed] {
+        for action in [
+            "verify-agent-wallet",
+            "pause-agent-wallet",
+            "close-agent-wallet",
+        ] {
+            assert!(run_action(action, &[], state.clone()).is_err(), "{action}");
+        }
+    }
+    // The amount belongs to fund and withdraw only, and every role is required.
+    assert!(
+        run_action(
+            "pause-agent-wallet",
+            &["--amount", "5"],
+            wallet_account(false)
+        )
+        .is_err()
+    );
+    assert!(run_action("withdraw-agent-wallet", &[], wallet_account(false)).is_err());
+    assert!(
+        arguments(&[
+            "pause-agent-wallet",
+            "--account",
+            &wallet,
+            "--agent",
+            &agent
+        ])
+        .is_err()
+    );
+    assert!(
+        arguments(&[
+            "verify-wallet",
+            "--account",
+            &owner,
+            "--agent",
+            &agent,
+            "--engine",
+            &engine,
+            "--owner",
+            &owner
+        ])
+        .is_err()
+    );
+}

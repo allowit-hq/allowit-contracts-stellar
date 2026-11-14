@@ -180,13 +180,35 @@ impl OwnerProvider for Owner {
             fee_per_operation: fee(r.fee_per_operation)?,
         };
         request.validate()?;
-        workflow::configure_native(
+        let mut configured = workflow::configure_native(
             &runtime(cx.rpc_url)?,
             &(cx.store)()?,
             &request,
             &super::OwnerSignerRef(cx.signer),
             cx.clock,
-        )
+        )?;
+        // The ledger now holds the wallet. The server registers it from the ledger, so no
+        // server configuration names it. A refusal leaves the wallet set up: the same request
+        // ID asks again and signs nothing.
+        let registration = client(cx)
+            .and_then(|client| {
+                client.register_native(&configured["configuration"], (cx.clock)()?)
+            })
+            .map_err(|error| {
+                let mut refused = Error::api(
+                    error.status.unwrap_or(409),
+                    format!(
+                        "The wallet account {} is set up on the ledger, but the server did not register it: {}. Run the same setup again.",
+                        configured["wallet"].as_str().unwrap_or_default(),
+                        error.message
+                    ),
+                );
+                refused.api_code = error.api_code;
+                refused
+            })?;
+        configured["registered"] = registration["registered"].clone();
+        configured["walletKind"] = serde_json::json!("native");
+        Ok(configured)
     }
     fn status(
         &self,
@@ -217,8 +239,11 @@ impl OwnerProvider for Owner {
             expected_revision: r.expected_revision,
             changes: r.changes.clone(),
         };
-        // An invalid update fails before the journal opens or the server is asked.
-        super::params_update::next_params(&p.config, &update)?;
+        // An invalid update fails before the journal opens or the server is asked. A keypair
+        // wallet holds no params: its workflow checks the update against the portable binding.
+        if p.config.route != crate::WalletRoute::Native {
+            super::params_update::next_params(&p.config, &update)?;
+        }
         let limit = fee(r.fee_limit)?;
         let runtime = runtime(cx.rpc_url)?;
         let store = (cx.store)()?;

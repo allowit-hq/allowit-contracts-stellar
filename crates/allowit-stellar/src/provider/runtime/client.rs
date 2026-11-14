@@ -1779,7 +1779,7 @@ impl Bundle {
     }
     pub fn verify_server_role(&self, server: &str) -> Result<()> {
         if self.config.server != server
-            || (self.config.route == WalletRoute::Native && self.config.owner != self.config.wallet)
+            || (self.config.route == WalletRoute::Native && self.config.owner == self.config.wallet)
         {
             return Err(Error::config(
                 "Profile roles differ from independently configured server authority",

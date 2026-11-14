@@ -784,7 +784,8 @@ fn run(
     let proof = sign(&simulated, &AGENT, NOW)?;
     let signed = authorize(&simulated, &[proof], NOW)?;
     // The signed expense holds the fee bound of this operation, not the caller's ceiling. For
-    // XLM the gas is that bound, and the declared fee of the transaction is within it.
+    // XLM the gas is that bound, and the transaction declares exactly that bound: its resource
+    // fee has the margin of the bound above the simulated fee.
     let bound = simulated.terms.expense.as_ref().ok_or("no expense")?;
     let x::TransactionEnvelope::Tx(envelope) = de(&signed.transaction_xdr) else {
         panic!()
@@ -800,11 +801,15 @@ fn run(
             .as_ref()
             .map_or(0, |e| e.spent_units - e.gas_units)
     );
+    assert_eq!(envelope.tx.fee, bound.max_fee_stroops);
+    let x::TransactionExt::V1(resources) = &envelope.tx.ext else {
+        panic!()
+    };
     assert_eq!(
-        i64::from(envelope.tx.fee),
-        ENFORCE_FEE + i64::from(INCLUSION_FEE_STROOPS)
+        resources.resource_fee,
+        i64::from(bound.max_fee_stroops - INCLUSION_FEE_STROOPS)
     );
-    assert!(envelope.tx.fee <= bound.max_fee_stroops);
+    assert!(resources.resource_fee > ENFORCE_FEE);
     chain.step(name);
     assert_eq!(
         rpc::broadcast(chain, &signed, NOW)?,
@@ -1065,6 +1070,41 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
         }
     }
     chain.0.lock().unwrap().enforce_fee = ENFORCE_FEE;
+    // The network's resource fee rises between preparation and the server's simulation at
+    // execution. The prepared transaction declares its signed bound, so its resource fee
+    // still covers the new simulation and the unchanged transaction proceeds. A release that
+    // declared the simulated fee itself refused the first step here. Only a rise above the
+    // signed bound is refused.
+    let prepared = rpc::prepare_with(
+        &chain,
+        &c,
+        &transfer,
+        &terms(10_000_000, ledger),
+        None,
+        NOW,
+        NOW + 300,
+    )
+    .unwrap();
+    let served = authorize_server(&prepared, &SERVER, NOW, None).unwrap();
+    let simulated = rpc::simulate(&chain, &served).unwrap();
+    let retained: PreparedOperation =
+        serde_json::from_str(&serde_json::to_string(&simulated).unwrap()).unwrap();
+    for (enforce_fee, covered) in [
+        (ENFORCE_FEE + 2, true),
+        (GAS as i64 - 100, true),
+        (GAS as i64 - 99, false),
+    ] {
+        chain.0.lock().unwrap().enforce_fee = enforce_fee;
+        match rpc::revalidate_prepared(&chain, &retained, NOW + 1) {
+            Ok(validated) => {
+                assert!(covered, "a fee of {enforce_fee} is above the signed bound");
+                assert_eq!(validated.transaction_hash, retained.transaction_hash);
+                assert_eq!(validated.transaction_xdr, retained.transaction_xdr);
+            }
+            Err(e) => assert!(!covered && e.contains("do not cover"), "{enforce_fee}: {e}"),
+        }
+    }
+    chain.0.lock().unwrap().enforce_fee = ENFORCE_FEE;
     // A policy can refuse the lowest fee bound alone. The fee is then simulated at the ceiling,
     // and the signed bound is the same. A refusal of both is the refusal of the lowest bound.
     let priced = |refused: &[i128], cost: Option<fn(i128) -> i64>| {
@@ -1096,8 +1136,8 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
         );
     }
     // A policy can need more resources with the priced gas than with the lowest bound. The
-    // operation is then priced from its own simulation: 3,000 + 100 + 30. Its declared fee,
-    // 3,100, is within that bound.
+    // operation is then priced from its own simulation: 3,000 + 100 + 30. It declares that
+    // bound as its fee.
     let repriced = priced(&[], Some(|_| 3_000)).unwrap();
     let bound = repriced.terms.expense.as_ref().unwrap();
     let x::TransactionEnvelope::Tx(envelope) = de(&repriced.transaction_xdr) else {
@@ -1105,7 +1145,7 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
     };
     assert_eq!(
         (bound.gas_units, bound.max_fee_stroops, envelope.tx.fee),
-        (3_130, 3_130, 3_100)
+        (3_130, 3_130, 3_130)
     );
     // A resource fee inside the margin of the signed bound prices nothing again.
     let inside = priced(&[], Some(|_| GAS as i64 - 100)).unwrap();

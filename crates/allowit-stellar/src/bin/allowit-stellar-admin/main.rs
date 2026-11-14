@@ -1,5 +1,9 @@
 //! Stellar administration in one binary. The native account actions prepare unsigned
-//! transactions and verify account profiles from Horizon state. The contract actions (`contract`
+//! transactions and verify account profiles from Horizon state. The `*-agent-wallet` actions
+//! serve the per-agent Native wallet account (`allowit_stellar::owner`). `setup-wallet`,
+//! `verify-wallet` and `shutdown-wallet` are legacy: they serve the owner-account profile of
+//! earlier releases, which no server registers any more, and stay so that an owner can
+//! verify and shut down such an account. The contract actions (`contract`
 //! module) prepare unsigned Soroban transactions with the pinned Stellar CLI. No action signs or
 //! submits, and every input is public.
 #![cfg(not(target_arch = "wasm32"))]
@@ -19,17 +23,37 @@ use stellar_xdr::{
 
 type Result<T> = std::result::Result<T, String>;
 
-const ACTIONS: [&str; 6] = [
+const ACTIONS: [&str; 12] = [
     "inspect",
     "verify-wallet",
     "verify-admin",
     "setup-wallet",
     "shutdown-wallet",
     "setup-admin",
+    "verify-agent-wallet",
+    "fund-agent-wallet",
+    "pause-agent-wallet",
+    "resume-agent-wallet",
+    "withdraw-agent-wallet",
+    "close-agent-wallet",
 ];
-const USAGE: &str = "usage: allowit-stellar-admin {inspect,verify-wallet,verify-admin,setup-wallet,shutdown-wallet,setup-admin} \
-[--network {testnet,mainnet}] [--allow-mainnet] --account ACCOUNT [--agent AGENT] [--engine ENGINE] \
-[--member MEMBER] [--transaction-source ACCOUNT] [--fee FEE]
+/// The owner actions on a per-agent Native wallet account. `--account` is the wallet.
+const AGENT_WALLET_ACTIONS: [&str; 6] = [
+    "verify-agent-wallet",
+    "fund-agent-wallet",
+    "pause-agent-wallet",
+    "resume-agent-wallet",
+    "withdraw-agent-wallet",
+    "close-agent-wallet",
+];
+const USAGE: &str = "usage: allowit-stellar-admin {inspect,verify-admin,setup-admin} \
+[--network {testnet,mainnet}] [--allow-mainnet] --account ACCOUNT [--member MEMBER] [--fee FEE]
+       allowit-stellar-admin {verify,fund,pause,resume,withdraw,close}-agent-wallet \
+[--network {testnet,mainnet}] [--allow-mainnet] --account WALLET --owner OWNER --agent AGENT \
+--engine ENGINE [--amount STROOPS] [--recipient ACCOUNT] [--fee FEE]
+       allowit-stellar-admin {verify-wallet,setup-wallet,shutdown-wallet} (legacy owner-account profile) \
+[--network {testnet,mainnet}] [--allow-mainnet] --account ACCOUNT --agent AGENT --engine ENGINE \
+[--transaction-source ACCOUNT] [--fee FEE]
        allowit-stellar-admin {upload,deploy-parent,deploy-wallet,read,admin} \
 [--network {testnet,mainnet}] [--allow-mainnet] --source ACCOUNT [--wasm PATH] [--wasm-hash HEX] \
 [--engine-wasm HEX] [--owner ACCOUNT] [--config JSON] [--contract CONTRACT] [--method METHOD] \
@@ -354,6 +378,12 @@ struct Arguments {
     members: Vec<String>,
     transaction_source: Option<String>,
     fee: u32,
+    /// `*-agent-wallet`: the owner of the wallet account.
+    owner: Option<String>,
+    /// `fund-agent-wallet` and `withdraw-agent-wallet`: the amount in stroops.
+    amount: Option<i64>,
+    /// `withdraw-agent-wallet`: the recipient; the owner without it.
+    recipient: Option<String>,
 }
 
 fn parse(args: &[String]) -> Result<Arguments> {
@@ -384,6 +414,17 @@ fn parse(args: &[String]) -> Result<Arguments> {
             "--engine" => out.engine = Some(address(value()?)?),
             "--member" => out.members.push(address(value()?)?),
             "--transaction-source" => out.transaction_source = Some(address(value()?)?),
+            "--owner" => out.owner = Some(address(value()?)?),
+            "--recipient" => out.recipient = Some(address(value()?)?),
+            "--amount" => {
+                out.amount = Some(
+                    value()?
+                        .parse::<i64>()
+                        .ok()
+                        .filter(|stroops| *stroops > 0)
+                        .ok_or("--amount expects a positive integer of stroops")?,
+                )
+            }
             "--fee" => out.fee = value()?.parse().map_err(|_| "--fee expects an integer")?,
             _ if !flag.starts_with('-') && out.action.is_empty() => out.action = flag.into(),
             _ => return Err("Unrecognized arguments".into()),
@@ -398,7 +439,24 @@ fn parse(args: &[String]) -> Result<Arguments> {
     }
     horizon(&out.network).map_err(|_| "--network is testnet or mainnet")?;
     out.account = account.ok_or("--account is required")?;
-    let prepares = out.action.starts_with("setup") || out.action.starts_with("shutdown");
+    let agent_wallet = AGENT_WALLET_ACTIONS.contains(&out.action.as_str());
+    let prepares = out.action.starts_with("setup")
+        || out.action.starts_with("shutdown")
+        || (agent_wallet && out.action != "verify-agent-wallet");
+    if agent_wallet && (out.owner.is_none() || out.agent.is_none() || out.engine.is_none()) {
+        return Err("--owner, --agent and --engine are required".into());
+    }
+    if !agent_wallet && (out.owner.is_some() || out.amount.is_some() || out.recipient.is_some()) {
+        return Err("--owner, --amount and --recipient belong to the agent-wallet actions".into());
+    }
+    let takes_amount =
+        ["fund-agent-wallet", "withdraw-agent-wallet"].contains(&out.action.as_str());
+    if takes_amount != out.amount.is_some() {
+        return Err("--amount is required for, and only for, fund and withdraw".into());
+    }
+    if out.recipient.is_some() && out.action != "withdraw-agent-wallet" {
+        return Err("--recipient is supported only for withdraw-agent-wallet".into());
+    }
     if out.network == "mainnet" && prepares && !out.allow_mainnet {
         return Err("Mainnet preparation requires --allow-mainnet".into());
     }
@@ -413,8 +471,97 @@ fn parse(args: &[String]) -> Result<Arguments> {
     Ok(out)
 }
 
+/// The account of a Horizon state as the rail reads it: the weight of its own key, its
+/// thresholds and its other signers of any type.
+fn account_state(state: &Value) -> Result<allowit_stellar::AccountState> {
+    let account = text(state, "account_id")?;
+    public(account)?;
+    let mut master = 0;
+    let mut signers = vec![];
+    for entry in entries(state)? {
+        let key = entry["key"].as_str().ok_or("Invalid signer key")?;
+        let weight = u32::from(byte(&entry["weight"]).ok_or("Invalid signer weight")?);
+        if key == account {
+            master = weight;
+        } else if weight > 0 {
+            signers.push(allowit_stellar::AccountSigner {
+                key: key.into(),
+                weight,
+            });
+        }
+    }
+    let [low, medium, high] = thresholds(state)?;
+    Ok(allowit_stellar::AccountState {
+        address: account.into(),
+        sequence: text(state, "sequence")?
+            .parse()
+            .map_err(|_| "Invalid account sequence")?,
+        master_weight: master,
+        low_threshold: u32::from(low),
+        medium_threshold: u32::from(medium),
+        high_threshold: u32::from(high),
+        signers,
+    })
+}
+/// One action on a per-agent Native wallet account: verify its exact roles, or prepare the
+/// owner's unsigned transaction. The owner's account is the transaction source and pays the fee;
+/// the owner's signature alone authorizes it. The wallet holds XLM.
+fn agent_wallet(args: &Arguments, get: Get, now: u64) -> Result<String> {
+    use allowit_stellar::owner::{WalletAction, WalletRoles, WalletStatus, prepare_wallet_action};
+    let (owner, agent, engine) = (
+        args.owner.as_deref().ok_or(BAD_ADDRESS)?,
+        args.agent.as_deref().ok_or(BAD_ADDRESS)?,
+        args.engine.as_deref().ok_or(BAD_ADDRESS)?,
+    );
+    let wallet = account_state(&fetch(get, &args.network, &args.account)?)?;
+    let status = wallet.wallet_status(owner, agent, engine)?;
+    let action = match args.action.as_str() {
+        "verify-agent-wallet" => {
+            return Ok(match status {
+                WalletStatus::Active => "Exact agent wallet profile verified: owner 3, agent 1, server 1, own key 0, thresholds 2/2/3",
+                WalletStatus::Paused => "Exact agent wallet profile verified, paused: owner 3, server 1, own key 0, no agent signer, thresholds 2/2/3",
+            }
+            .into());
+        }
+        "fund-agent-wallet" => WalletAction::Fund {
+            units: args.amount.ok_or("--amount is required")?,
+        },
+        "pause-agent-wallet" => WalletAction::Pause,
+        "resume-agent-wallet" => WalletAction::Resume,
+        "withdraw-agent-wallet" => WalletAction::Withdraw {
+            units: args.amount.ok_or("--amount is required")?,
+            recipient: args.recipient.clone(),
+        },
+        "close-agent-wallet" => WalletAction::Close { token_balance: 0 },
+        _ => return Err("Unsupported agent wallet action".into()),
+    };
+    let network = match args.network.as_str() {
+        "mainnet" => "stellar:pubnet",
+        _ => "stellar:testnet",
+    };
+    let prepared = prepare_wallet_action(
+        &account_state(&fetch(get, &args.network, owner)?)?,
+        &wallet,
+        WalletRoles {
+            wallet: &args.account,
+            owner,
+            agent,
+            engine,
+        },
+        &action,
+        &stellar_xdr::Asset::Native,
+        network,
+        args.fee,
+        now,
+    )?;
+    Ok(prepared.transaction_xdr)
+}
+
 /// Run one action and return its standard output and an optional warning for standard error.
 fn run(args: &Arguments, get: Get, now: u64) -> Result<(String, Option<&'static str>)> {
+    if AGENT_WALLET_ACTIONS.contains(&args.action.as_str()) {
+        return agent_wallet(args, get, now).map(|output| (output, None));
+    }
     let state = fetch(get, &args.network, &args.account)?;
     let mut warning = None;
     if ["verify-wallet", "shutdown-wallet"].contains(&args.action.as_str()) {

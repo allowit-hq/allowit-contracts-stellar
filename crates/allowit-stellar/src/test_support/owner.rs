@@ -219,6 +219,8 @@ pub struct OwnerLedger {
     pub config: native::WalletConfig,
     pub source: Mutex<native::AccountState>,
     pub direct_signed: Mutex<Option<String>>,
+    /// The wallet account that a submitted setup transaction created.
+    pub created: Mutex<Option<native::AccountState>>,
     pub lose_direct: bool,
     pub events: Mutex<Vec<String>>,
     /// The params, configuration revision and recorded usage that the wallet holds after an
@@ -231,6 +233,7 @@ impl OwnerLedger {
             source: Mutex::new(fresh(&c.owner)),
             config: c,
             direct_signed: Mutex::new(None),
+            created: Mutex::new(None),
             lose_direct: false,
             events: Mutex::new(vec![]),
             installed: Mutex::new(None),
@@ -283,15 +286,19 @@ impl OwnerLedger {
                 }
                 if let x::LedgerKey::Account(a) = key {
                     let x::PublicKey::PublicKeyTypeEd25519(k) = a.account_id.0;
-                    let who = [&c.owner, &c.agent, &c.server]
-                        .into_iter()
-                        .find(|a| native::account_key(a).unwrap() == k.0)
-                        .expect("known fixture account")
-                        .to_owned();
-                    let state = if who == c.owner {
+                    let address = native::account_for_public_key(&k.0);
+                    let created = self.created.lock().unwrap().clone();
+                    let state = if address == c.owner {
                         self.source.lock().unwrap().clone()
+                    } else if created.as_ref().is_some_and(|w| w.address == address) {
+                        created.unwrap()
+                    } else if address == c.agent || address == c.server {
+                        fresh(&address)
+                    } else if c.route == native::WalletRoute::Native && address == c.wallet {
+                        configured_source(c)
                     } else {
-                        fresh(&who)
+                        // An account that no transaction created does not exist.
+                        return Ok(json!({"latestLedger":120,"entries":[]}));
                     };
                     return Ok(account_entry(&state));
                 }
@@ -389,23 +396,23 @@ impl OwnerLedger {
             "sendTransaction" => {
                 let signed = params["transaction"].as_str().unwrap().to_owned();
                 let h = rpc::signed_transaction_hash(&c.network, &signed)?;
-                *self.direct_signed.lock().unwrap() = Some(signed);
-                let mut state = self.source.lock().unwrap();
-                state.sequence += 1;
-                state.master_weight = 3;
-                state.low_threshold = 2;
-                state.medium_threshold = 2;
-                state.high_threshold = 3;
-                state.signers = vec![
-                    native::AccountSigner {
-                        key: c.agent.clone(),
-                        weight: 1,
-                    },
-                    native::AccountSigner {
-                        key: c.server.clone(),
-                        weight: 1,
-                    },
-                ];
+                *self.direct_signed.lock().unwrap() = Some(signed.clone());
+                self.source.lock().unwrap().sequence += 1;
+                // A setup transaction creates the wallet account with its exact roles.
+                if let x::TransactionEnvelope::Tx(e) =
+                    x::TransactionEnvelope::from_xdr_base64(&signed, x::Limits::none()).unwrap()
+                    && let Some(x::OperationBody::CreateAccount(create)) =
+                        e.tx.operations.first().map(|op| &op.body)
+                {
+                    let x::PublicKey::PublicKeyTypeEd25519(key) = &create.destination.0;
+                    *self.created.lock().unwrap() = Some(super::wallet_account(
+                        &native::account_for_public_key(&key.0),
+                        &c.owner,
+                        &c.agent,
+                        &c.server,
+                        0,
+                    ));
+                }
                 if self.lose_direct {
                     Err("lost native reply".into())
                 } else {
@@ -422,7 +429,7 @@ pub fn native_selection() -> OwnerPolicy {
     let mut selection = selection();
     let c = &mut selection.config;
     c.route = native::WalletRoute::Native;
-    c.wallet = c.owner.clone();
+    c.wallet = account(15);
     c.tier = None;
     c.max_fee_stroops = 100_000;
     c.source_digest = [0; 32];
@@ -459,24 +466,7 @@ pub fn descriptor(selection: &OwnerPolicy) -> Value {
     json!({"version":1,"profile":native::PROFILE,"network":c.network,"policyId":p.id,"sourceHash":p.source_hash,"irHash":"","moduleDigest":native::hex(&c.module_digest),"wallet":c.wallet,"route":c.route,"config":c,"language":"allowit-portable-v1","portable":p.runtime.instance_binding.portable,"endpoints":{"execute":"/api/native/execute","status":"/api/native/execute/status"}})
 }
 pub fn configured_source(c: &native::WalletConfig) -> native::AccountState {
-    native::AccountState {
-        address: c.owner.clone(),
-        sequence: 42,
-        master_weight: 3,
-        low_threshold: 2,
-        medium_threshold: 2,
-        high_threshold: 3,
-        signers: vec![
-            native::AccountSigner {
-                key: c.agent.clone(),
-                weight: 1,
-            },
-            native::AccountSigner {
-                key: c.server.clone(),
-                weight: 1,
-            },
-        ],
-    }
+    super::wallet_account(&c.wallet, &c.owner, &c.agent, &c.server, 42)
 }
 
 pub(crate) fn change_step(step: &mut Value, change: impl FnOnce(&mut x::Transaction)) {

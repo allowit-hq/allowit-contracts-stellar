@@ -1,5 +1,8 @@
 //! Deterministic public compatibility fixture. These test keys are never used on chain.
-use allowit_stellar::{AccountState, account_for_seed, owner::prepare_native_setup};
+use allowit_stellar::{
+    AccountState, account_for_seed,
+    owner::{SetupTerms, prepare_native_setup},
+};
 fn main() {
     let state = AccountState {
         address: account_for_seed(&[1; 32]),
@@ -12,11 +15,16 @@ fn main() {
     };
     let v = prepare_native_setup(
         &state,
-        &account_for_seed(&[2; 32]),
-        &account_for_seed(&[3; 32]),
-        "stellar-setup-001",
-        "stellar:testnet",
-        100,
+        &SetupTerms {
+            wallet: &account_for_seed(&[4; 32]),
+            agent: &account_for_seed(&[2; 32]),
+            engine: &account_for_seed(&[3; 32]),
+            request_id: "stellar-setup-001",
+            network: "stellar:testnet",
+            fee_per_operation: 100,
+            starting_balance: None,
+            trustline: None,
+        },
         1_800_000_000,
     )
     .unwrap();

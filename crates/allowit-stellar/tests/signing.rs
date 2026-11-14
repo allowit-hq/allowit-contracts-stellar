@@ -7,10 +7,12 @@ fn classic_roles_and_admin_quorum_bind_current_independent_identities() {
     let agent = native::account_for_seed(&[2; 32]);
     let server = native::account_for_seed(&[3; 32]);
     let stranger = native::account_for_seed(&[4; 32]);
+    let wallet = native::account_for_seed(&[5; 32]);
+    // The wallet is its own account: its key has no weight, and the owner is its heaviest signer.
     let state = native::AccountState {
-        address: owner.clone(),
+        address: wallet.clone(),
         sequence: 42,
-        master_weight: 3,
+        master_weight: 0,
         low_threshold: 2,
         medium_threshold: 2,
         high_threshold: 3,
@@ -23,6 +25,10 @@ fn classic_roles_and_admin_quorum_bind_current_independent_identities() {
                 key: server.clone(),
                 weight: 1,
             },
+            native::AccountSigner {
+                key: owner.clone(),
+                weight: 3,
+            },
         ],
     };
     state.validate_roles(&owner, &agent, &server).unwrap();
@@ -34,13 +40,15 @@ fn classic_roles_and_admin_quorum_bind_current_independent_identities() {
         (&owner, &owner, &server),
         (&owner, &agent, &agent),
         (&owner, &agent, &stranger),
+        (&wallet, &agent, &server),
+        (&owner, &wallet, &server),
     ] {
         assert!(state.validate_roles(o, a, s).is_err());
     }
     for field in 0..7 {
         let mut changed = state.clone();
         match field {
-            0 => changed.master_weight = 2,
+            0 => changed.master_weight = 1,
             1 => changed.low_threshold = 1,
             2 => changed.medium_threshold = 1,
             3 => changed.high_threshold = 2,
@@ -91,8 +99,9 @@ fn classic_roles_and_admin_quorum_bind_current_independent_identities() {
             .validate_authority_signatures(&digest, &[signature(1), signature(2)])
             .is_err()
     );
+    // The account names another administrator: the former owner key signs no consent.
     let mut rotated = state;
-    rotated.master_weight = 0;
+    rotated.signers.pop();
     rotated.signers[0].weight = 3;
     assert!(
         rotated

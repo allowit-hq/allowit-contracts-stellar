@@ -323,11 +323,16 @@ fn native() -> (OwnerTransaction, ExpectedOwnerIntent) {
     };
     let prepared = owner::prepare_native_setup(
         &state,
-        &account(12),
-        &account(13),
-        "intent-fixture-001",
-        "stellar:testnet",
-        100,
+        &owner::SetupTerms {
+            wallet: &account(15),
+            agent: &account(12),
+            engine: &account(13),
+            request_id: "intent-fixture-001",
+            network: "stellar:testnet",
+            fee_per_operation: 100,
+            starting_balance: None,
+            trustline: None,
+        },
         NOW,
     )
     .unwrap();
@@ -343,6 +348,9 @@ fn native() -> (OwnerTransaction, ExpectedOwnerIntent) {
             limits: limits(),
             action: OwnerAction::NativeSetup {
                 state,
+                wallet: account(15),
+                starting_balance: None,
+                trustline: None,
                 agent: account(12),
                 engine: account(13),
                 request_id: "intent-fixture-001".into(),
@@ -678,40 +686,68 @@ fn creation_checks_whole_constructor_target_executable_and_auth_tree() {
 #[test]
 fn native_setup_rebuilds_exact_roles_thresholds_and_request_identity() {
     let (packet, expected) = native();
-    for mode in 0..4 {
+    validate_owner_transaction(&packet, &expected, NOW).unwrap();
+    for mode in 0..8 {
         let mut p = packet.clone();
         modify_tx(&mut p, |tx| {
             let mut ops = tx.operations.to_vec();
-            let x::OperationBody::SetOptions(options) = &mut ops[0].body else {
-                panic!()
-            };
+            // Operations: create the account, add the owner, add the agent, then add the
+            // server and set the thresholds and the weight of the account's own key.
             match mode {
-                0 => options.signer.as_mut().unwrap().weight = 2,
-                1 => {
-                    options.signer.as_mut().unwrap().key =
-                        x::SignerKey::Ed25519(x::Uint256([99; 32]))
-                }
-                2 => {
-                    let x::OperationBody::SetOptions(thresholds) = &mut ops[2].body else {
+                0 | 1 => {
+                    let x::OperationBody::SetOptions(options) = &mut ops[1].body else {
                         panic!()
                     };
-                    thresholds.high_threshold = Some(2);
+                    if mode == 0 {
+                        options.signer.as_mut().unwrap().weight = 2;
+                    } else {
+                        options.signer.as_mut().unwrap().key =
+                            x::SignerKey::Ed25519(x::Uint256([99; 32]));
+                    }
                 }
+                2 | 3 => {
+                    let x::OperationBody::SetOptions(last) = &mut ops[3].body else {
+                        panic!()
+                    };
+                    if mode == 2 {
+                        last.high_threshold = Some(2);
+                    } else {
+                        // The account's own key keeps authority.
+                        last.master_weight = Some(1);
+                    }
+                }
+                4 => {
+                    let x::OperationBody::CreateAccount(create) = &mut ops[0].body else {
+                        panic!()
+                    };
+                    create.starting_balance += 1;
+                }
+                5 => {
+                    let x::OperationBody::CreateAccount(create) = &mut ops[0].body else {
+                        panic!()
+                    };
+                    create.destination = fixture_account(7);
+                }
+                6 => ops[2].source_account = None,
                 _ => tx.memo = x::Memo::Hash(x::Hash([99; 32])),
             }
             tx.operations = ops.try_into().unwrap();
         });
         assert_refused(&p, &expected, "native exact reconstruction");
     }
+    // An owner account whose key cannot pay alone sets up no wallet with one signature.
     let mut changed = expected.clone();
     let OwnerAction::NativeSetup { state, .. } = &mut changed.action else {
         panic!()
     };
-    state.signers.push(AccountSigner {
-        key: account(15),
-        weight: 1,
-    });
-    assert_refused(&packet, &changed, "native nonfresh account");
+    state.medium_threshold = 2;
+    assert_refused(&packet, &changed, "native shared owner account");
+    let mut changed = expected.clone();
+    let OwnerAction::NativeSetup { wallet, .. } = &mut changed.action else {
+        panic!()
+    };
+    *wallet = account(16);
+    assert_refused(&packet, &changed, "native other wallet account");
     let mut changed = expected;
     let OwnerAction::NativeSetup {
         fee_per_operation, ..
@@ -721,6 +757,115 @@ fn native_setup_rebuilds_exact_roles_thresholds_and_request_identity() {
     };
     *fee_per_operation = u32::MAX;
     assert_refused(&packet, &changed, "native fee overflow");
+}
+/// A retained setup packet of an earlier release configured the owner's own account with three
+/// operations. It stays readable as history, and no intent signs it.
+#[test]
+fn a_retained_setup_of_an_earlier_release_stays_readable_and_is_never_signed() {
+    let (current, expected) = native();
+    let mut legacy = current.clone();
+    modify_tx(&mut legacy, |tx| {
+        let signer = |n: u8| x::Operation {
+            source_account: None,
+            body: x::OperationBody::SetOptions(x::SetOptionsOp {
+                inflation_dest: None,
+                clear_flags: None,
+                set_flags: None,
+                master_weight: None,
+                low_threshold: None,
+                med_threshold: None,
+                high_threshold: None,
+                home_domain: None,
+                signer: Some(x::Signer {
+                    key: x::SignerKey::Ed25519(x::Uint256([n; 32])),
+                    weight: 1,
+                }),
+            }),
+        };
+        let mut weights = signer(0);
+        let x::OperationBody::SetOptions(options) = &mut weights.body else {
+            panic!()
+        };
+        options.signer = None;
+        options.master_weight = Some(3);
+        options.low_threshold = Some(2);
+        options.med_threshold = Some(2);
+        options.high_threshold = Some(3);
+        tx.operations = vec![signer(12), signer(13), weights].try_into().unwrap();
+    });
+    allowit_stellar::owner_intent::validate_retained_owner_transaction(&legacy).unwrap();
+    allowit_stellar::owner_intent::validate_retained_owner_transaction(&current).unwrap();
+    assert_refused(&legacy, &expected, "the setup of an earlier release");
+}
+/// The new account's own key signs its creation once, after the owner. A key of another
+/// account never co-signs.
+#[test]
+fn native_setup_takes_the_owner_signature_and_the_wallet_key_signature() {
+    let digest = owner::wallet_derivation_digest("stellar:testnet", &account(12), 0).unwrap();
+    let key = || {
+        owner::WalletKey::from_signature(&SigningKey::from_bytes(&OWNER).sign(&digest).to_bytes())
+    };
+    let state = AccountState {
+        address: owner(),
+        sequence: 41,
+        master_weight: 1,
+        low_threshold: 0,
+        medium_threshold: 0,
+        high_threshold: 0,
+        signers: vec![],
+    };
+    let terms = owner::SetupTerms {
+        wallet: &key().account(),
+        agent: &account(12),
+        engine: &account(13),
+        request_id: "intent-fixture-002",
+        network: "stellar:testnet",
+        fee_per_operation: 100,
+        starting_balance: None,
+        trustline: None,
+    };
+    let prepared = owner::prepare_native_setup(&state, &terms, NOW).unwrap();
+    let expected = ExpectedOwnerIntent {
+        limits: limits(),
+        action: OwnerAction::NativeSetup {
+            state,
+            wallet: key().account(),
+            agent: account(12),
+            engine: account(13),
+            request_id: "intent-fixture-002".into(),
+            fee_per_operation: 100,
+            starting_balance: None,
+            trustline: None,
+            created_at: NOW,
+        },
+    };
+    let sign = |digest: &[u8; 32]| Ok(SigningKey::from_bytes(&OWNER).sign(digest).to_bytes());
+    let signed = validate_native_setup(&prepared, &expected, NOW)
+        .unwrap()
+        .sign_with_wallet_key(NOW, sign, &key())
+        .unwrap();
+    let x::TransactionEnvelope::Tx(envelope) = read(&signed).unwrap() else {
+        panic!()
+    };
+    let hash = unhex::<32>(&prepared.transaction_hash).unwrap();
+    let [by_owner, by_wallet] = envelope.signatures.as_slice() else {
+        panic!("expected the owner signature and the wallet key signature")
+    };
+    allowit_stellar::signing::verify_digest(&owner(), &hash, by_owner.signature.as_slice())
+        .unwrap();
+    allowit_stellar::signing::verify_digest(
+        &key().account(),
+        &hash,
+        by_wallet.signature.as_slice(),
+    )
+    .unwrap();
+    let stranger = owner::WalletKey::from_signature(&[7; 64]);
+    assert!(
+        validate_native_setup(&prepared, &expected, NOW)
+            .unwrap()
+            .sign_with_wallet_key(NOW, sign, &stranger)
+            .is_err()
+    );
 }
 #[test]
 fn sealed_proof_rechecks_time_and_verifies_the_returned_owner_signature() {
@@ -811,22 +956,29 @@ fn deployment_and_setup_adapters_validate_all_public_metadata() {
     let (_, expected) = native();
     let OwnerAction::NativeSetup {
         state,
+        wallet,
         agent,
         engine,
         request_id,
         fee_per_operation,
         created_at,
+        ..
     } = &expected.action
     else {
         unreachable!()
     };
     let prepared = owner::prepare_native_setup(
         state,
-        agent,
-        engine,
-        request_id,
-        "stellar:testnet",
-        *fee_per_operation,
+        &owner::SetupTerms {
+            wallet,
+            agent,
+            engine,
+            request_id,
+            network: "stellar:testnet",
+            fee_per_operation: *fee_per_operation,
+            starting_balance: None,
+            trustline: None,
+        },
         *created_at,
     )
     .unwrap();
@@ -834,7 +986,7 @@ fn deployment_and_setup_adapters_validate_all_public_metadata() {
     for mode in 0..14 {
         let mut p = prepared.clone();
         match mode {
-            0 => p.version = 2,
+            0 => p.version = 1,
             1 => p.profile.push('x'),
             2 => p.request_id.push('x'),
             3 => p.network = "stellar:mainnet".into(),
@@ -842,7 +994,7 @@ fn deployment_and_setup_adapters_validate_all_public_metadata() {
             5 => p.agent = account(14),
             6 => p.engine = account(14),
             7 => p.sequence = "43".into(),
-            8 => p.fee_stroops += 3,
+            8 => p.fee_stroops += 4,
             9 => p.expires_at += 1,
             10 => p.transaction_hash = hex(&[99; 32]),
             11 => p.intent_digest = hex(&[99; 32]),

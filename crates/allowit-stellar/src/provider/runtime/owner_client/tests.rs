@@ -69,11 +69,18 @@ fn native_setup_retains_before_sign_and_recovers_lost_reply_without_another_sign
     drop(store);
     clock.set(clock.get() + 301);
     let reopened = Store::open(&path).unwrap();
-    let signer = key();
+    // The resumed setup reads its retained signed bytes. It asks the signer for nothing, not
+    // even the derivation: a signer that cannot derive the same key again still recovers.
+    let signer = Key {
+        calls: AtomicUsize::new(0),
+        bad: true,
+        before: None,
+    };
     let out =
         workflow::configure_native(&runtime, &reopened, &request, &signer, &|| Ok(clock.get()))
             .unwrap();
     assert_eq!(out["state"], "configured");
+    assert_eq!(out["wallet"], original["setup"]["wallet"]);
     assert_eq!(signer.calls.load(Ordering::SeqCst), 0);
     let recovered: Value = reopened.load(&request.request_id).unwrap().unwrap();
     assert_eq!(recovered["signedXdr"], original["signedXdr"]);
@@ -87,6 +94,105 @@ fn native_setup_retains_before_sign_and_recovers_lost_reply_without_another_sign
             .count(),
         1
     );
+}
+/// The wallet account of an agent exists once. A setup of it under another request ID signs
+/// nothing: it reports the same wallet when the account holds the exact roles, and it is
+/// refused when the account holds any other authority.
+#[test]
+fn a_repeated_setup_signs_nothing_and_an_account_with_other_authority_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().canonicalize().unwrap().join("proof")).unwrap();
+    let c = selection().config;
+    let chain = Arc::new(Chain::new(c.clone()));
+    let runtime = Runtime::from_rpc(chain.clone());
+    let request = |id: &str, agent: &str| SetupRequest {
+        network: c.network.clone(),
+        owner: c.owner.clone(),
+        agent: agent.into(),
+        server: c.server.clone(),
+        request_id: id.into(),
+        fee_per_operation: 100,
+    };
+    let now = wire::now();
+    let signer = key();
+    let first = workflow::configure_native(
+        &runtime,
+        &store,
+        &request("setup-first-001", &c.agent),
+        &signer,
+        &|| Ok(now),
+    )
+    .unwrap();
+    assert_eq!(first["state"], "configured");
+    assert_eq!(signer.calls.load(Ordering::SeqCst), 1);
+    let wallet = first["wallet"].as_str().unwrap().to_owned();
+    // The wallet is a new account, not the owner's, and the result names its roles.
+    assert!(![&c.owner, &c.agent, &c.server].contains(&&wallet));
+    assert_eq!(first["configuration"]["wallet"], wallet);
+    assert_eq!(first["configuration"]["owner"], c.owner);
+    assert_eq!(first["derivation"]["method"], "owner-signature");
+    assert_eq!(first["signers"]["walletKey"], 0);
+    let sent = chain.direct_signed.lock().unwrap().clone().unwrap();
+    let stellar_xdr::TransactionEnvelope::Tx(envelope) = crate::read(&sent).unwrap() else {
+        panic!()
+    };
+    // The owner and the new account's own key signed the one transaction.
+    assert_eq!(envelope.signatures.len(), 2);
+    let sends = || {
+        chain
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.as_str() == "sendTransaction")
+            .count()
+    };
+    assert_eq!(sends(), 1);
+
+    // The same agent under another request ID: the account exists with the exact roles.
+    let signer = key();
+    let again = workflow::configure_native(
+        &runtime,
+        &store,
+        &request("setup-again-001", &c.agent),
+        &signer,
+        &|| Ok(now),
+    )
+    .unwrap();
+    assert_eq!(again["wallet"], wallet);
+    assert_eq!(again["installation"], first["installation"]);
+    assert!(again["transactionHash"].is_null());
+    assert_eq!((signer.calls.load(Ordering::SeqCst), sends()), (0, 1));
+
+    // The account holds a signer that the setup does not name.
+    chain
+        .created
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .signers
+        .push(crate::AccountSigner {
+            key: account(77),
+            weight: 1,
+        });
+    let signer = key();
+    let refused = workflow::configure_native(
+        &runtime,
+        &store,
+        &request("setup-third-001", &c.agent),
+        &signer,
+        &|| Ok(now),
+    )
+    .unwrap_err();
+    assert!(
+        refused
+            .message
+            .contains("already exists with other signers"),
+        "{}",
+        refused.message
+    );
+    assert_eq!((signer.calls.load(Ordering::SeqCst), sends()), (0, 1));
 }
 #[test]
 fn changed_fund_packets_never_reach_the_signer_and_rebound_records_are_not_signing_authority() {

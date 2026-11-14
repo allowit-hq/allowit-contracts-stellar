@@ -172,19 +172,52 @@ pub fn portable_descriptor(config: &mut crate::WalletConfig) -> Value {
         "asset":{"symbol":config.asset_symbol,"address":config.asset,"decimals":7},"unresolved":[],
         "build":{"prefix":shape.prefix,"writesState":shape.writes_state,"libraryRevision":"6aa4235e6229e18d1f9780a6a9fdf80aceb0f348","attempts":1}})
 }
+/// A wallet account with its exact roles: its own key has weight 0, the owner weight 3, and the
+/// agent and the server weight 1 each under thresholds 2/2/3.
+pub fn wallet_account(
+    wallet: &str,
+    owner: &str,
+    agent: &str,
+    server: &str,
+    sequence: i64,
+) -> AccountState {
+    AccountState {
+        address: wallet.into(),
+        sequence,
+        master_weight: 0,
+        low_threshold: 2,
+        medium_threshold: 2,
+        high_threshold: 3,
+        signers: vec![
+            AccountSigner {
+                key: owner.into(),
+                weight: 3,
+            },
+            AccountSigner {
+                key: agent.into(),
+                weight: 1,
+            },
+            AccountSigner {
+                key: server.into(),
+                weight: 1,
+            },
+        ],
+    }
+}
 pub fn agent_fixture(
     policy_id: &str,
     request_id: &str,
     now: u64,
 ) -> (WalletConfig, ExecutionRequest, TrustedState, u64) {
     let owner = sdk::account_for_seed(&[1; 32]);
+    let wallet = sdk::account_for_seed(&[8; 32]);
     let agent = sdk::account_for_seed(&[2; 32]);
     let engine = sdk::account_for_seed(&[3; 32]);
     let source = "use allowit::prelude::*; pub fn execute(ctx: &AllowitContext) -> allowit::Result { Ok(()) }".to_string();
     let mut c = WalletConfig {
         network: "stellar:testnet".into(),
         policy_instance: [7; 32],
-        wallet: owner.clone(),
+        wallet: wallet.clone(),
         owner: owner.clone(),
         agent: agent.clone(),
         server: engine.clone(),
@@ -214,20 +247,20 @@ pub fn agent_fixture(
             nonce: request_nonce(policy_id, request_id),
         },
         input: ExecutionInput::Instructions(vec![NativeInstruction::StellarNativeTransfer {
-            source: fixture_account(&owner),
+            source: fixture_account(&wallet),
             destination: fixture_account(&sdk::account_for_seed(&[6; 32])),
             stroops: 1_000_000,
         }]),
         effect_bounds: vec![WorkflowEffectBound {
             asset: asset.clone(),
-            source: fixture_account(&owner),
+            source: fixture_account(&wallet),
             beneficiary: fixture_account(&sdk::account_for_seed(&[6; 32])),
             max_debit: 1_000_000u64.into(),
             min_credit: 1_000_000u64.into(),
             max_burn: 0u64.into(),
         }],
         fee_bounds: Some(vec![WorkflowFeeBound {
-            payer: fixture_account(&owner),
+            payer: fixture_account(&wallet),
             asset,
             max_fee: 50000u64.into(),
         }]),
@@ -236,24 +269,7 @@ pub fn agent_fixture(
     let s = TrustedState {
         contract_version: None,
         policy_state: None,
-        source: AccountState {
-            address: owner.clone(),
-            sequence: 40,
-            master_weight: 3,
-            low_threshold: 2,
-            medium_threshold: 2,
-            high_threshold: 3,
-            signers: vec![
-                AccountSigner {
-                    key: agent.clone(),
-                    weight: 1,
-                },
-                AccountSigner {
-                    key: engine.clone(),
-                    weight: 1,
-                },
-            ],
-        },
+        source: wallet_account(&wallet, &owner, &agent, &engine, 40),
         nonce: 9,
         deployment_version: 4,
         spent_daily: 0,
@@ -296,11 +312,12 @@ pub fn public_profile(c: &WalletConfig, policy_id: &str) -> Value {
 }
 pub fn request_config(route: WalletRoute, usdc: bool) -> WalletConfig {
     let owner = sdk::account_for_seed(&[1; 32]);
+    let wallet = sdk::account_for_seed(&[8; 32]);
     let source = "use allowit::prelude::*; pub fn execute(ctx: &AllowitContext) -> allowit::Result { Ok(()) }".to_string();
     let mut c = WalletConfig {
         network: "stellar:testnet".into(),
         policy_instance: [7; 32],
-        wallet: owner.clone(),
+        wallet,
         owner,
         agent: sdk::account_for_seed(&[2; 32]),
         server: sdk::account_for_seed(&[3; 32]),
@@ -396,7 +413,7 @@ pub fn approval_public_profile(fixture: &Value) -> Value {
     let mut config = WalletConfig {
         network: "stellar:testnet".into(),
         policy_instance: [7; 32],
-        wallet: fixture["intent"]["owner"].as_str().unwrap().into(),
+        wallet: sdk::account_for_seed(&[8; 32]),
         owner: fixture["intent"]["owner"].as_str().unwrap().into(),
         agent: sdk::account_for_seed(&[2; 32]),
         server: sdk::account_for_seed(&[3; 32]),
