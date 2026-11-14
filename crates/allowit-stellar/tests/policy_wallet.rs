@@ -1521,14 +1521,9 @@ fn owner_params_update_step_matches_the_owner_reconstruction_and_keeps_usage() {
         assert_eq!(fresh.state.revision, next_version);
         assert_eq!(fresh.state.counters, verified.state.counters);
         assert_eq!(fresh.state.counters.as_ref().unwrap().nonce, 1);
-        assert_eq!(
-            fresh.state.counters_from,
-            if tier == PolicyTier::Simple {
-                "server"
-            } else {
-                "ledger"
-            }
-        );
+        // Each tier commits its usage on the ledger, also Simple.
+        assert_eq!(fresh.state.counters_from, "ledger");
+        assert_eq!(fresh.state.counters.as_ref().unwrap().calls, 1, "{tier:?}");
         let stale = params_update::verify(&*chain, "policy", &c).unwrap();
         assert!(!stale.matches);
         // The same update cannot be prepared again: the wallet moved to the next revision, and

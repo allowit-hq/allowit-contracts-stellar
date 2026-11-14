@@ -287,8 +287,9 @@ wallet takes any typed value; the server checks the range of a canonical rule.
 `OwnerProvider::verify` reads the wallet through the owner's RPC, without the server, and compares it with the
 owner's document: executable, source binding, rules, params, wallet kind, roles, asset and policy instance. It
 returns each comparison and the state read-back: the configuration revision, the pause flag, the params and the
-counters (`spent`, `day_spent`, `day`, `calls` and the nonce). A Simple wallet stores its params and nonce and the
-server records its usage, so its counters are marked `server`. A keypair account compares its signers.
+counters (`spent`, `day_spent`, `day`, `calls` and the nonce). Every policy wallet tier commits its usage on the ledger with each operation,
+also a Simple wallet, so the counters of a policy wallet are marked `ledger`. A keypair account compares its
+signers; the server records its usage, so its read-back holds no counters and is marked `server`.
 
 `OwnerProvider::edit_params` and `revise` send the `micro/params` and `micro/revise` owner routes for an unsigned
 draft and check that the reply is the next revision of the same draft on the same wallet binding.

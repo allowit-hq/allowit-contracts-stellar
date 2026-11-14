@@ -297,8 +297,6 @@ pub fn verify(rpc: &dyn rpc::Rpc, policy_id: &str, c: &WalletConfig) -> Result<V
         u64::try_from(counter(key)?)
             .map_err(|_| Error::config(format!("The wallet holds an invalid counter `{key}`")))
     };
-    // A Simple wallet stores its params and nonce; the server records its usage.
-    let on_ledger = c.tier != Some(PolicyTier::Simple);
     Ok(Verification::new(
         policy_id.into(),
         c.network.clone(),
@@ -308,7 +306,9 @@ pub fn verify(rpc: &dyn rpc::Rpc, policy_id: &str, c: &WalletConfig) -> Result<V
             wallet_kind: kind,
             revision: state.deployment_version,
             paused: state.paused,
-            counters_from: if on_ledger { "ledger" } else { "server" }.into(),
+            // Every policy wallet tier commits its usage with each operation, also a Simple
+            // wallet, whose rules the server evaluates: the counters are the ledger's.
+            counters_from: "ledger".into(),
             counters: Some(Counters {
                 spent_total: counter("spent")?,
                 spent_daily: counter("day_spent")?,
