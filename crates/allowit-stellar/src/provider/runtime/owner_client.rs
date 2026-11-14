@@ -531,6 +531,17 @@ impl OwnerClient {
     }
     /// Change typed params of an unsigned draft. The server checks each value against the
     /// param's type and range; the reply holds exactly the values that were sent.
+    /// The owner's view of the build of a Custom policy: the server presignature, the build
+    /// ticket and the build that the server holds.
+    pub fn custom_build(&self, policy_id: &str, now: u64) -> Result<Value> {
+        self.session.owner_request(
+            Method::Post,
+            "/api/native/custom/build",
+            Some(&json!({ "policyId": policy_id })),
+            now,
+            false,
+        )
+    }
     pub fn edit_params(
         &self,
         draft: &GeneratedPolicy,
