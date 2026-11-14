@@ -405,9 +405,9 @@ fn approval_server_only_functions_compile_on_the_host_and_are_unsupported_until_
         allow_above: 9_000,
     };
     assert_eq!(allowit::decision(&c, &ask), Err(AllowitError::Unsupported));
-    for name in [None, Some("invoices")] {
+    for contents in [None, Some("Invoices of this month.")] {
         assert_eq!(
-            allowit::new_decision_context(&c, name),
+            allowit::new_decision_context(&c, contents),
             Err(AllowitError::Unsupported)
         );
     }
