@@ -162,8 +162,10 @@ export function buildAttestElement() {
   return class extends base() {
     render(): void {
       const data = (this.data ?? {}) as Data;
-      const id = canonicalNetwork(data.network), fields = buildAttestation(data.message);
-      if (!id || !fields || fields.network !== id || !strkey(fields.owner) || !strkey(fields.server)) {
+      // The text that was validated and shown is the text that the wallet signs: a later change of `data` is not.
+      const message = typeof data.message === 'string' ? data.message : null;
+      const id = canonicalNetwork(data.network), fields = buildAttestation(message);
+      if (!id || message === null || !fields || fields.network !== id || !strkey(fields.owner) || !strkey(fields.server)) {
         this.replaceChildren(h('p', {class: 'invalid'}, 'This build attestation is invalid.'));
         return;
       }
@@ -179,7 +181,7 @@ export function buildAttestElement() {
           const {connectWallet, signWalletMessage} = await import('./wallet.js');
           const address = await connectWallet(id);
           if (address !== fields.owner) throw Object.assign(new Error('The wallet account is not the owner of this policy. Nothing was signed.'), {code: 'mismatch'});
-          const signature = await signWalletMessage(data.message as string, address, id);
+          const signature = await signWalletMessage(message, address, id);
           status.textContent = 'Signed.';
           emit(this, 'allowit-signed', {signature: hex(Uint8Array.from(atob(signature), c => c.charCodeAt(0))), codeHash: fields.codeHash});
         } catch (error) {
