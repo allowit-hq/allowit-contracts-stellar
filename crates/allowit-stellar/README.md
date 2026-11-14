@@ -150,6 +150,7 @@ requirement of the selected network that this rail can settle. Validation is str
 - The amount (`amount`, or `maxAmountRequired` in version 1) is a positive integer of base units.
 - A named resource equals the requested URL.
 - `extra.challengeId` or `extra.nonce` is the challenge id. `extra.expiresAt` is a Unix time.
+- The accepted terms are at most 4096 bytes of JSON. The proof echoes them, so larger terms are refused.
 
 Allowit settles the payment itself. The agent's transfer goes through the policy and the engine like
 any other operation. The standard `exact` scheme on Stellar has the seller's facilitator submit a

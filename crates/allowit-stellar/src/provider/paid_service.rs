@@ -35,6 +35,9 @@ pub const PROOF_HEADER_V1: &str = "X-PAYMENT";
 pub const PROOF_HEADER_V2: &str = "PAYMENT-SIGNATURE";
 const MAX_CHALLENGE_BYTES: usize = crate::host::paid_service::MAX_CHALLENGE_BYTES;
 const MAX_REQUIREMENTS: usize = 32;
+/// The largest accepted terms, as JSON. The proof echoes them, so this bounds the proof header:
+/// a challenge whose proof a client could not present is refused before any payment.
+pub const MAX_TERMS_BYTES: usize = 4096;
 
 pub struct PaidService;
 pub static PAID_SERVICE: PaidService = PaidService;
@@ -174,6 +177,11 @@ fn requirement(
     let mut terms = json!({"x402Version": version, "accepted": accepted});
     if version >= 2 && document["resource"].is_object() {
         terms["resource"] = document["resource"].clone();
+    }
+    if serde_json::to_vec(&terms).map_or(true, |encoded| encoded.len() > MAX_TERMS_BYTES) {
+        return Err(Error::usage(
+            "The seller's payment terms are too large to present as a proof.",
+        ));
     }
     Ok(Some(Challenge {
         id,
@@ -506,6 +514,33 @@ mod tests {
             },
         );
         assert_eq!(scheme.unwrap_err().code, 2);
+    }
+
+    #[test]
+    fn terms_too_large_to_present_as_a_proof_are_refused_before_payment() {
+        // The proof echoes the accepted terms. A challenge that parses but whose proof no
+        // client could present must never be paid.
+        let mut large = accepted();
+        large["extra"]["note"] = json!("a".repeat(MAX_TERMS_BYTES));
+        let error = parse(&v1(vec![large])).unwrap_err();
+        assert_eq!(error.code, 2);
+        assert!(error.message.contains("too large"), "{}", error.message);
+        let mut accepted = accepted();
+        let object = accepted.as_object_mut().unwrap();
+        object.remove("maxAmountRequired");
+        object.remove("resource");
+        object.insert("amount".into(), json!("70"));
+        let document = json!({"x402Version":2,
+            "resource":{"url":RESOURCE,"description":"d".repeat(MAX_TERMS_BYTES)},
+            "accepts":[accepted.clone()]});
+        let body = serde_json::to_vec(&document).unwrap();
+        assert_eq!(parse(&body).unwrap_err().code, 2);
+        // The largest accepted terms give a proof within a 16 KiB header value.
+        accepted["extra"]["note"] = json!("a".repeat(MAX_TERMS_BYTES - 700));
+        let document = json!({"x402Version":2,"resource":{"url":RESOURCE},"accepts":[accepted]});
+        let challenge = parse(&serde_json::to_vec(&document).unwrap()).unwrap();
+        let proof = proof(&challenge, &receipt(&challenge)).unwrap();
+        assert!(proof.value.len() < 16_384, "{}", proof.value.len());
     }
 
     #[test]
