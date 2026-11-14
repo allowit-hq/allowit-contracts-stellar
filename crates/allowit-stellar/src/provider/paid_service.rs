@@ -12,6 +12,9 @@
 //! states that it takes the proof of a settled transaction: `extra.proof` is
 //! [`SETTLED_PROOF`]. Every other requirement is refused before any payment.
 //!
+//! The proof is built only from a receipt in which the server recorded this purchase: the
+//! resource, the recipient, the amount and the asset of the challenge.
+//!
 //! The seller verifies the proof on its own: the transaction succeeded on the stated network,
 //! moved at least the required amount of the required asset to `payTo`, closed after the
 //! challenge was issued, and its hash was not used for an earlier delivery.
@@ -251,9 +254,26 @@ pub fn proof(challenge: &Challenge, receipt: &Value) -> Result<Proof> {
             "The payment receipt names no transaction hash.",
         ));
     }
-    // The verified receipt states the debit, and the server records what the payment bought.
-    // Each one that the document holds must be this challenge, and it must hold one of them.
-    // A fee-bumped transaction reports no settlement, so its record alone binds the purchase.
+    // The server records what the operation paid for: the resource, the recipient, the amount
+    // and the asset, which it checked against the operation that the policy evaluated. The
+    // record must be this challenge. A receipt without it binds no recipient and no network,
+    // so it proves nothing about this challenge.
+    let recorded = &receipt["paidService"];
+    if recorded.is_null() {
+        return Err(Error::config(
+            "The payment receipt does not record what the payment bought.",
+        ));
+    }
+    if *recorded
+        != serde_json::to_value(challenge.context())
+            .map_err(|_| Error::config("The payment challenge cannot be encoded."))?
+    {
+        return Err(Error::config(
+            "The payment receipt records another purchase.",
+        ));
+    }
+    // The verified receipt states the debit when its transaction reports a settlement. A
+    // fee-bumped transaction reports none. A stated debit must be the challenge amount.
     let paid = &receipt["settlement"]["amount"];
     if !paid.is_null()
         && (paid["units"] != challenge.amount.units.as_str()
@@ -261,21 +281,6 @@ pub fn proof(challenge: &Challenge, receipt: &Value) -> Result<Proof> {
     {
         return Err(Error::config(
             "The payment receipt does not state the amount of this challenge.",
-        ));
-    }
-    let recorded = &receipt["paidService"];
-    if !recorded.is_null()
-        && *recorded
-            != serde_json::to_value(challenge.context())
-                .map_err(|_| Error::config("The payment challenge cannot be encoded."))?
-    {
-        return Err(Error::config(
-            "The payment receipt records another purchase.",
-        ));
-    }
-    if paid.is_null() && recorded.is_null() {
-        return Err(Error::config(
-            "The payment receipt states neither the amount nor the purchase of this challenge.",
         ));
     }
     let version = challenge.terms["x402Version"].as_u64().unwrap_or(1);
@@ -571,11 +576,18 @@ mod tests {
         }
         refused(&|r| r["transactionHash"] = json!("ab"), 3);
         refused(&|r| r["transactionHash"] = Value::Null, 3);
-        // Neither the debit nor the record: nothing binds the payment to this challenge.
+        // No record of the purchase: the debit alone binds no recipient and no network.
         refused(
             &|r| {
-                r["settlement"] = Value::Null;
                 r.as_object_mut().unwrap().remove("paidService");
+            },
+            3,
+        );
+        refused(&|r| r["paidService"] = Value::Null, 3);
+        refused(
+            &|r| {
+                r["paidService"]["payTo"] =
+                    json!("GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN")
             },
             3,
         );
@@ -599,10 +611,6 @@ mod tests {
             3,
         );
         refused(&|r| r["paidService"]["challengeId"] = json!("c-0002"), 3);
-        // A receipt of a server that records no context still proves the payment.
-        let mut plain = receipt(&challenge);
-        plain.as_object_mut().unwrap().remove("paidService");
-        proof(&challenge, &plain).unwrap();
         // A fee-bumped transaction reports no settlement: the recorded purchase binds it.
         let mut bumped = receipt(&challenge);
         bumped.as_object_mut().unwrap().remove("settlement");

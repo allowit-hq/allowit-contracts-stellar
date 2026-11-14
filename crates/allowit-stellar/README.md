@@ -161,9 +161,10 @@ any payment.
 `proof(challenge, receipt)` builds the request header from the outcome document of the confirmed
 operation: `X-PAYMENT` (version 1) or `PAYMENT-SIGNATURE` (version 2), the base64 JSON of
 `{x402Version, scheme, network, payload: {transaction, settled: true, challengeId?}}`. Version 2 also
-echoes `accepted` and `resource`. The receipt must be confirmed. Its `settlement.amount` and its recorded
-`paidService` context must each equal the challenge when present, and one of them must be present. A
-fee-bumped transaction reports no settlement, so its recorded context binds the purchase.
+echoes `accepted` and `resource`. The receipt must be confirmed, and its recorded `paidService` context
+must equal the challenge: the resource, the recipient, the amount and the asset. A receipt without that
+record gives no proof. A stated `settlement.amount` must also equal the challenge amount; a fee-bumped
+transaction states none.
 
 A seller that accepts this proof verifies it on its own:
 
