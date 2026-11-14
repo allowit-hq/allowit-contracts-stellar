@@ -142,7 +142,8 @@ pub fn trustline_balance(rpc: &dyn Rpc, address: &str, asset: &Asset) -> Result<
     let Some(entry) = entries.first() else {
         return Ok(None);
     };
-    let LedgerEntryData::Trustline(line) = read(entry["xdr"].as_str().ok_or("Missing trustline XDR")?)?
+    let LedgerEntryData::Trustline(line) =
+        read(entry["xdr"].as_str().ok_or("Missing trustline XDR")?)?
     else {
         return Err("Wrong ledger entry type".into());
     };

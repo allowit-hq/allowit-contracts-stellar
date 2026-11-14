@@ -2123,7 +2123,11 @@ mod keypair_wallet_owner_tests {
     /// A ledger that holds the owner's account and the wallet account `wallet`.
     struct Ledger(OwnerLedger, Mutex<native::AccountState>);
     impl rpc::Rpc for Ledger {
-        fn call(&self, method: &str, params: serde_json::Value) -> native::Result<serde_json::Value> {
+        fn call(
+            &self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> native::Result<serde_json::Value> {
             use stellar_xdr as x;
             let key = (method == "getLedgerEntries")
                 .then(|| native::read::<x::LedgerKey>(params["keys"][0].as_str().unwrap()).ok())
@@ -2146,7 +2150,9 @@ mod keypair_wallet_owner_tests {
                         flags: 1,
                         ext: x::TrustLineEntryExt::V0,
                     });
-                    return Ok(serde_json::json!({"entries":[{"xdr":native::xdr(&line).unwrap()}]}));
+                    return Ok(
+                        serde_json::json!({"entries":[{"xdr":native::xdr(&line).unwrap()}]}),
+                    );
                 }
                 _ => {}
             }
@@ -2159,11 +2165,9 @@ mod keypair_wallet_owner_tests {
             OwnerLedger::new(c.clone()),
             Mutex::new(configured_source(&c)),
         ));
-        let configuration = super::super::server_owner::configuration(
-            &c.network,
-            &serde_json::to_vec(&c).unwrap(),
-        )
-        .unwrap();
+        let configuration =
+            super::super::server_owner::configuration(&c.network, &serde_json::to_vec(&c).unwrap())
+                .unwrap();
         let provider = Provider::from_rpc(&c.network, ledger.clone());
         (c, ledger, provider, installation(&configuration))
     }
@@ -2241,15 +2245,18 @@ mod keypair_wallet_owner_tests {
             assert!(prepare(action).is_err());
         }
         // The owner paused the wallet: discovery reports it, and only a resume fits.
-        ledger.1.lock().unwrap().signers.retain(|s| s.key != c.agent);
+        ledger
+            .1
+            .lock()
+            .unwrap()
+            .signers
+            .retain(|s| s.key != c.agent);
         assert!(prepare(OwnerAction::SetPause { paused: true }).is_err());
         let resume = prepare(OwnerAction::SetPause { paused: false }).unwrap();
         assert_eq!(resume.info().unwrap().action, "resume");
-        let configuration = super::super::server_owner::configuration(
-            &c.network,
-            &serde_json::to_vec(&c).unwrap(),
-        )
-        .unwrap();
+        let configuration =
+            super::super::server_owner::configuration(&c.network, &serde_json::to_vec(&c).unwrap())
+                .unwrap();
         let usage = Accounting {
             nonce: 0,
             deployment_version: 1,
@@ -2269,11 +2276,9 @@ mod keypair_wallet_owner_tests {
     #[test]
     fn a_wallet_whose_signers_or_thresholds_differ_from_its_registration_is_refused() {
         let (c, ledger, provider, installation) = fixture();
-        let configuration = super::super::server_owner::configuration(
-            &c.network,
-            &serde_json::to_vec(&c).unwrap(),
-        )
-        .unwrap();
+        let configuration =
+            super::super::server_owner::configuration(&c.network, &serde_json::to_vec(&c).unwrap())
+                .unwrap();
         let usage = Accounting {
             nonce: 0,
             deployment_version: 1,
@@ -2308,7 +2313,12 @@ mod keypair_wallet_owner_tests {
             );
             assert!(
                 provider
-                    .prepare_owner(&installation, OwnerAction::SetPause { paused: true }, 100_000, 86_401)
+                    .prepare_owner(
+                        &installation,
+                        OwnerAction::SetPause { paused: true },
+                        100_000,
+                        86_401
+                    )
                     .is_err()
             );
         }

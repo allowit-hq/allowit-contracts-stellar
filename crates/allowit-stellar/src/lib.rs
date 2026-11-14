@@ -443,7 +443,9 @@ impl AccountState {
     pub fn validate_roles(&self, owner: &str, agent: &str, trusted_server: &str) -> Result<()> {
         match self.wallet_status(owner, agent, trusted_server)? {
             owner::WalletStatus::Active => Ok(()),
-            owner::WalletStatus::Paused => Err("This wallet is paused: its owner removed the agent signer".into()),
+            owner::WalletStatus::Paused => {
+                Err("This wallet is paused: its owner removed the agent signer".into())
+            }
         }
     }
     /// The wallet account's exact roles, active or paused. Any other signer, a hash or
@@ -473,12 +475,7 @@ impl AccountState {
         {
             return differs();
         }
-        let weight = |key: &str| {
-            self.signers
-                .iter()
-                .find(|s| s.key == key)
-                .map(|s| s.weight)
-        };
+        let weight = |key: &str| self.signers.iter().find(|s| s.key == key).map(|s| s.weight);
         if weight(owner) != Some(owner::OWNER_WEIGHT)
             || weight(trusted_server) != Some(owner::AUTOMATED_WEIGHT)
         {
@@ -2123,7 +2120,11 @@ pub fn attach_simulation(p: &PreparedOperation, data: &str) -> Result<PreparedOp
 }
 /// `attach_simulation`, or with `headroom` false the rule of earlier releases, which declared
 /// the simulated resource fee itself. Retained packets of those releases stay verifiable.
-fn attach_resources(p: &PreparedOperation, data: &str, headroom: bool) -> Result<PreparedOperation> {
+fn attach_resources(
+    p: &PreparedOperation,
+    data: &str,
+    headroom: bool,
+) -> Result<PreparedOperation> {
     if !matches!(p.config.route, WalletRoute::PolicyWallet | WalletRoute::Odc) {
         return Err("Resource data is only valid for policy wallet execution".into());
     }

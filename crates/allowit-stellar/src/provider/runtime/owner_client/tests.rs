@@ -179,7 +179,9 @@ fn a_repeated_setup_signs_nothing_and_an_account_with_other_authority_is_refused
     )
     .unwrap_err();
     assert!(
-        refused.message.contains("already exists with other signers"),
+        refused
+            .message
+            .contains("already exists with other signers"),
         "{}",
         refused.message
     );
