@@ -421,6 +421,21 @@ impl Provider {
             fee_per_operation,
             now,
         ))?;
+        // A fee limit below the minimum fee of every operation prepares nothing: the declared
+        // fee never exceeds the caller's limit.
+        let stellar_xdr::TransactionEnvelope::Tx(envelope) = checked(native::read::<
+            stellar_xdr::TransactionEnvelope,
+        >(&p.transaction_xdr))?
+        else {
+            return Err(Error::config("Invalid prepared owner transaction"));
+        };
+        if u64::from(envelope.tx.fee) > fee_limit {
+            return Err(Error::usage(format!(
+                "The fee limit is below the minimum fee of {} for the {} operations of this action",
+                envelope.tx.fee,
+                envelope.tx.operations.len()
+            )));
+        }
         Ok(OwnerPacket(packet(&c.network, &p)?))
     }
     pub fn new(network: &str, endpoint: &str) -> Result<Self> {
@@ -2231,6 +2246,28 @@ mod keypair_wallet_owner_tests {
                 );
             }
         }
+        // The declared fee never exceeds the caller's limit: a limit below the minimum fee of
+        // every operation prepares nothing.
+        let close = || OwnerAction::Recover {
+            units: None,
+            recipient: None,
+        };
+        assert!(
+            provider
+                .prepare_owner(&installation, close(), 100, 86_401)
+                .is_err()
+        );
+        let minimum = 100 * closing as u64;
+        let packet = provider
+            .prepare_owner(&installation, close(), minimum, 86_401)
+            .unwrap();
+        let stellar_xdr::TransactionEnvelope::Tx(envelope) =
+            native::read(&String::from_utf8(packet.info().unwrap().signing_payload).unwrap())
+                .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(u64::from(envelope.tx.fee), minimum);
         // A wallet that is not paused takes no resume, and a keypair wallet has no code.
         assert!(prepare(OwnerAction::SetPause { paused: false }).is_err());
         for action in [

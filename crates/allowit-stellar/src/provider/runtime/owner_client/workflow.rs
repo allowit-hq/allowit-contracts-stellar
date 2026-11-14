@@ -674,33 +674,43 @@ impl OwnerClient {
             policy_id: String,
             approval: Option<Consent>,
         }
-        allowit_core::client::progress::report(
-            "Preparing the source approval with the Allowit server",
-        );
-        let prepared: Prepared = self.session.owner_request(
-            Method::Post,
-            "/api/native/owner/prepare",
-            Some(&json!({"policyId":selection.policy.id,
-                "action":crate::provider::params_update::ACTION,
-                "params":update.changes,
-                "expectedRevision":update.expected_revision})),
-            clock()?,
-            false,
-        )?;
-        let consent = prepared.approval.ok_or_else(|| {
-            Error::config("The server prepared no source approval for this keypair wallet")
-        })?;
-        if prepared.policy_id != selection.policy.id
-            || consent.payload != payload
-            || consent.message != message
-            || consent.method != "sep53"
-        {
-            return Err(Error::config(
-                "Source consent differs from the exact locally selected update",
-            ));
-        }
+        // The server prepares the approval of exactly the locally selected update, or nothing
+        // is signed.
+        let prepare = || -> Result<()> {
+            allowit_core::client::progress::report(
+                "Preparing the source approval with the Allowit server",
+            );
+            let prepared: Prepared = self.session.owner_request(
+                Method::Post,
+                "/api/native/owner/prepare",
+                Some(&json!({"policyId":selection.policy.id,
+                    "action":crate::provider::params_update::ACTION,
+                    "params":update.changes,
+                    "expectedRevision":update.expected_revision})),
+                clock()?,
+                false,
+            )?;
+            let consent = prepared.approval.ok_or_else(|| {
+                Error::config("The server prepared no source approval for this keypair wallet")
+            })?;
+            if prepared.policy_id != selection.policy.id
+                || consent.payload != payload
+                || consent.message != message
+                || consent.method != "sep53"
+            {
+                return Err(Error::config(
+                    "Source consent differs from the exact locally selected update",
+                ));
+            }
+            Ok(())
+        };
         let digest = native::signing::signed_message_digest(&message);
-        if record.signature.is_none() {
+        // A retained signature means that an earlier run may already have settled the update:
+        // its submission is resumed first, and the server is asked to prepare again only when
+        // it no longer holds that approval.
+        let resumed = record.signature.is_some();
+        if !resumed {
+            prepare()?;
             let signature = signer
                 .sign_hash(&digest)
                 .map_err(|_| Error::config("Owner source signer failed"))?;
@@ -725,16 +735,25 @@ impl OwnerClient {
             &digest,
             &signature.signature,
         ))?;
-        let response: Value = self
-            .session
-            .owner_request(
+        let submit = || -> Result<Value> {
+            self.session.owner_request(
                 Method::Post,
                 "/api/native/owner/submit",
                 Some(&json!({"policyId":selection.policy.id,"payload":message,"sourceApproval":[signature]})),
                 clock()?,
                 true,
             )
-            .map_err(submit_refusal)?;
+        };
+        let response = match submit() {
+            // The server holds no such approval any more, and none settled: prepare the same
+            // update again and submit the retained signature for it.
+            Err(error) if resumed && error.status == Some(404) => {
+                prepare()?;
+                submit()
+            }
+            result => result,
+        }
+        .map_err(submit_refusal)?;
         if response["status"] != "confirmed"
             || response["action"] != crate::provider::params_update::ACTION
         {
@@ -901,7 +920,13 @@ impl OwnerClient {
                     ));
                 }
                 let source = checked(rpc::get_account(rpc, self.session.owner()))?;
-                checked(source.validate_owner_only())?;
+                if selection.config.route == WalletRoute::Native {
+                    // The owner's account is not the wallet: its own key must pay alone, as
+                    // the wallet setup requires. A policy wallet owner is its master key only.
+                    checked(native::owner::check_owner_source(&source))?;
+                } else {
+                    checked(source.validate_owner_only())?;
+                }
                 let extend_to = if step.action == "extend" {
                     let live = checked(rpc::wallet_lifetime(
                         rpc,
