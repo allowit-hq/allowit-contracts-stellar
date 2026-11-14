@@ -1,5 +1,5 @@
 //! Native Horizon and Friendbot semantics over the common HTTP transport.
-use allowit_stellar::{account_for_seed, owner, passphrase};
+use allowit_stellar::{account_for_seed, owner};
 use serde_json::{Value, json};
 use std::{
     io::{Read, Write},
@@ -40,54 +40,6 @@ fn service(replies: Vec<(String, Value)>) -> (String, thread::JoinHandle<()>) {
         }
     });
     (origin, task)
-}
-
-#[test]
-fn horizon_requires_the_testnet_identity_and_fresh_owner_authority() {
-    let owner = account_for_seed(&[1; 32]);
-    let state = json!({"account_id":owner,"sequence":"42","subentry_count":0,
-        "signers":[{"key":owner,"type":"ed25519_public_key","weight":1}],
-        "thresholds":{"low_threshold":0,"med_threshold":0,"high_threshold":0}});
-    for field in [
-        None,
-        Some("account_id"),
-        Some("subentry_count"),
-        Some("thresholds"),
-    ] {
-        let mut value = state.clone();
-        match field {
-            Some("account_id") => value["account_id"] = json!(account_for_seed(&[2; 32])),
-            Some("subentry_count") => value["subentry_count"] = json!(1),
-            Some("thresholds") => value["thresholds"]["high_threshold"] = json!(1),
-            _ => {}
-        }
-        let (origin, task) = service(vec![
-            (
-                "/".into(),
-                json!({"network_passphrase":passphrase("stellar:testnet").unwrap()}),
-            ),
-            (format!("/accounts/{owner}"), value),
-        ]);
-        let result = owner::fresh_testnet_owner_account(&owner, Some(&origin));
-        if field.is_none() {
-            let state = result.unwrap();
-            assert_eq!(state.sequence, 42);
-            owner::check_fresh(&state).unwrap();
-        } else {
-            assert!(result.is_err());
-        }
-        task.join().unwrap();
-    }
-    let (origin, task) = service(vec![(
-        "/".into(),
-        json!({"network_passphrase":passphrase("stellar:mainnet").unwrap()}),
-    )]);
-    assert!(
-        owner::fresh_testnet_owner_account(&owner, Some(&origin))
-            .unwrap_err()
-            .contains("network differs")
-    );
-    task.join().unwrap();
 }
 
 #[test]

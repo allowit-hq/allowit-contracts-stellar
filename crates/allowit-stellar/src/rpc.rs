@@ -109,6 +109,45 @@ pub fn get_account(rpc: &dyn Rpc, address: &str) -> Result<AccountState> {
     let value = rpc.call("getLedgerEntries", json!({"keys":[xdr(&key)?]}))?;
     account_from_response(&value, address)
 }
+/// The account when the ledger holds it, `None` when it does not exist.
+pub fn find_account(rpc: &dyn Rpc, address: &str) -> Result<Option<AccountState>> {
+    let key = LedgerKey::Account(LedgerKeyAccount {
+        account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(account_key(
+            address,
+        )?))),
+    });
+    let value = rpc.call("getLedgerEntries", json!({"keys":[xdr(&key)?]}))?;
+    if value["entries"].as_array().is_some_and(Vec::is_empty) {
+        return Ok(None);
+    }
+    account_from_response(&value, address).map(Some)
+}
+/// The balance of an issued asset that an account holds, `None` without its trustline.
+pub fn trustline_balance(rpc: &dyn Rpc, address: &str, asset: &Asset) -> Result<Option<i64>> {
+    let line = match asset {
+        Asset::CreditAlphanum4(a) => TrustLineAsset::CreditAlphanum4(a.clone()),
+        Asset::CreditAlphanum12(a) => TrustLineAsset::CreditAlphanum12(a.clone()),
+        Asset::Native => return Err("XLM has no trustline".into()),
+    };
+    let key = LedgerKey::Trustline(LedgerKeyTrustLine {
+        account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(account_key(
+            address,
+        )?))),
+        asset: line,
+    });
+    let value = rpc.call("getLedgerEntries", json!({"keys":[xdr(&key)?]}))?;
+    let entries = value["entries"]
+        .as_array()
+        .ok_or("Missing trustline entries")?;
+    let Some(entry) = entries.first() else {
+        return Ok(None);
+    };
+    let LedgerEntryData::Trustline(line) = read(entry["xdr"].as_str().ok_or("Missing trustline XDR")?)?
+    else {
+        return Err("Wrong ledger entry type".into());
+    };
+    Ok(Some(line.balance))
+}
 /// A native source account dated by the entry response and fresh bracketing heads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountObservation {
@@ -1135,8 +1174,14 @@ fn trusted_state_inner(
     .map_err(err)?;
     if c.route == WalletRoute::Native {
         let source = get_account(rpc, &c.wallet)?;
-        source.validate_structure()?;
+        // The wallet account holds exactly the roles of its installation. A signer or a
+        // threshold that the installation does not name ends every use of the wallet.
+        let paused =
+            source.wallet_status(&c.owner, &c.agent, &c.server)? == owner::WalletStatus::Paused;
         if require_customer_quorum {
+            if paused {
+                return Err("This wallet is paused: its owner removed the agent signer".into());
+            }
             source.validate_wallet(c)?;
         }
         let a = accounting.ok_or("Native wallet requires authoritative policy accounting")?;
@@ -1159,7 +1204,7 @@ fn trusted_state_inner(
                 server: c.server.clone(),
                 policy_instance: c.policy_instance,
             },
-            paused: false,
+            paused,
         });
     }
     let key = LedgerKey::ContractData(LedgerKeyContractData {

@@ -38,7 +38,8 @@ fn fixture_with_wallet(
     let agent = account_for_seed(&[2; 32]);
     let engine = account_for_seed(&[3; 32]);
     let wallet = if route == WalletRoute::Native {
-        owner.clone()
+        // A keypair wallet is its own account, never the owner's.
+        account_for_seed(&[8; 32])
     } else {
         Contract(contract).to_string()
     };
@@ -134,7 +135,7 @@ fn fixture_with_wallet(
         AccountState {
             address: c.wallet.clone(),
             sequence: 40,
-            master_weight: 3,
+            master_weight: 0,
             low_threshold: 2,
             medium_threshold: 2,
             high_threshold: 3,
@@ -146,6 +147,10 @@ fn fixture_with_wallet(
                 AccountSigner {
                     key: engine,
                     weight: 1,
+                },
+                AccountSigner {
+                    key: owner.clone(),
+                    weight: 3,
                 },
             ],
         }
@@ -894,17 +899,10 @@ fn retained_native_status_preserves_signed_bytes_without_new_authorization() {
 fn changed_customer_signer_is_resolved_from_current_native_account() {
     let (mut c, r, mut state) = fixture(WalletRoute::Native, false);
     let old = c.clone();
+    // The owner replaced the agent signer on the ledger.
     c.agent = account_for_seed(&[4; 32]);
     state.agent = c.agent.clone();
-    state.source.master_weight = 0;
-    state.source.signers[0] = AccountSigner {
-        key: c.agent.clone(),
-        weight: 3,
-    };
-    state.source.signers[1].weight = 2;
-    state.source.medium_threshold = 5;
-    state.source.low_threshold = 1;
-    state.source.high_threshold = 1;
+    state.source.signers[0].key = c.agent.clone();
     let rpc = AccountRpc {
         config: c.clone(),
         account: state.source.clone(),
@@ -918,7 +916,9 @@ fn changed_customer_signer_is_resolved_from_current_native_account() {
         spent_day: state.spent_day,
         calls: state.calls,
     };
-    assert!(rpc::trusted_state_for_discovery(&rpc, &old, Some(accounting.clone())).is_ok());
+    // An installation that names the former agent no longer describes the account: neither
+    // discovery nor execution admits it.
+    assert!(rpc::trusted_state_for_discovery(&rpc, &old, Some(accounting.clone())).is_err());
     assert!(rpc::trusted_state(&rpc, &old, Some(accounting.clone())).is_err());
     let live = rpc::trusted_state(&rpc, &c, Some(accounting)).unwrap();
     let p = prepare(&c, &r, &live, 86401, 86700).unwrap();
@@ -933,6 +933,57 @@ fn changed_customer_signer_is_resolved_from_current_native_account() {
     )
     .unwrap();
     validate_signed(&signed, 86401).unwrap();
+}
+/// The wallet account holds exactly its roles. Any drift ends discovery and execution, and a
+/// paused wallet is discovered as paused and admits no execution.
+#[test]
+fn native_discovery_refuses_foreign_signers_threshold_drift_and_reports_a_pause() {
+    let (c, _, state) = fixture(WalletRoute::Native, false);
+    let usage = || rpc::NativeAccounting {
+        nonce: 0,
+        deployment_version: 0,
+        spent_daily: 0,
+        spent_total: 0,
+        spent_day: 1,
+        calls: 0,
+    };
+    let observe = |account: &AccountState| {
+        let rpc = AccountRpc {
+            config: c.clone(),
+            account: account.clone(),
+            wrong_network: false,
+        };
+        (
+            rpc::trusted_state_for_discovery(&rpc, &c, Some(usage())),
+            rpc::trusted_state(&rpc, &c, Some(usage())),
+        )
+    };
+    let (discovered, admitted) = observe(&state.source);
+    assert!(!discovered.unwrap().paused);
+    admitted.unwrap();
+    let mut foreign = state.source.clone();
+    foreign.signers.push(AccountSigner {
+        key: account_for_seed(&[9; 32]),
+        weight: 1,
+    });
+    let mut drifted = state.source.clone();
+    drifted.medium_threshold = 1;
+    let mut heavier = state.source.clone();
+    heavier.signers[0].weight = 2;
+    let mut revived = state.source.clone();
+    revived.master_weight = 1;
+    let mut ownerless = state.source.clone();
+    ownerless.signers.pop();
+    for account in [foreign, drifted, heavier, revived, ownerless] {
+        let (discovered, admitted) = observe(&account);
+        assert!(discovered.is_err() && admitted.is_err());
+    }
+    // The owner paused the wallet: the agent signer is gone.
+    let mut paused = state.source.clone();
+    paused.signers.remove(0);
+    let (discovered, admitted) = observe(&paused);
+    assert!(discovered.unwrap().paused);
+    assert!(admitted.unwrap_err().contains("paused"));
 }
 #[test]
 fn exact_chain_quorum_omits_unused_role_signatures_but_verifies_both_proofs() {
@@ -1206,7 +1257,10 @@ fn rpc_decodes_known_additional_signer_types_without_an_offline_allowlist() {
         spent_day: 1,
         calls: 0,
     };
-    assert!(rpc::trusted_state(&rpc, &c, Some(usage)).is_ok());
+    // The reader decodes every signer type. A wallet with a hash, pre-authorized or
+    // signed-payload signer is no wallet of this installation.
+    assert!(rpc::trusted_state(&rpc, &c, Some(usage.clone())).is_err());
+    assert!(rpc::trusted_state_for_discovery(&rpc, &c, Some(usage)).is_err());
 }
 fn sc_map(fields: Vec<(&str, stellar_xdr::ScVal)>) -> stellar_xdr::ScVal {
     let mut entries: Vec<_> = fields

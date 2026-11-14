@@ -433,32 +433,60 @@ fn automated_roles(c: &WalletConfig) -> Vec<&str> {
     roles
 }
 impl AccountState {
-    /// Check the exact classic-custody setup against independently selected public roles.
+    /// Check the exact wallet account against independently selected public roles: this
+    /// account is the wallet, its own key has weight 0, and its only signers are the owner
+    /// (weight 3), the agent (weight 1) and the server (weight 1) under thresholds 2/2/3.
+    /// A paused wallet, which has no agent signer, is refused: see [`Self::wallet_status`].
     /// This is current admission, not validation of a retained transaction after key rotation.
     pub fn validate_roles(&self, owner: &str, agent: &str, trusted_server: &str) -> Result<()> {
+        match self.wallet_status(owner, agent, trusted_server)? {
+            owner::WalletStatus::Active => Ok(()),
+            owner::WalletStatus::Paused => Err("This wallet is paused: its owner removed the agent signer".into()),
+        }
+    }
+    /// The wallet account's exact roles, active or paused. Any other signer, a hash or
+    /// pre-authorized signer, a threshold other than 2/2/3 or a weight on the account's own
+    /// key is refused.
+    pub fn wallet_status(
+        &self,
+        owner: &str,
+        agent: &str,
+        trusted_server: &str,
+    ) -> Result<owner::WalletStatus> {
         self.validate_structure()?;
         for role in [owner, agent, trusted_server] {
             signing::canonical_account_key(role)?;
         }
-        if owner != self.address
+        let differs = || -> Result<owner::WalletStatus> {
+            Err("Current native account differs from the independently selected roles".into())
+        };
+        if [owner, agent, trusted_server].contains(&self.address.as_str())
             || owner == agent
             || owner == trusted_server
             || agent == trusted_server
-            || self.master_weight != 3
-            || self.low_threshold != 2
-            || self.medium_threshold != 2
-            || self.high_threshold != 3
-            || self.signers.len() != 2
-            || self
-                .signers
-                .iter()
-                .any(|s| s.weight != 1 || (s.key != agent && s.key != trusted_server))
+            || self.master_weight != 0
+            || self.low_threshold != owner::PAYMENT_THRESHOLD
+            || self.medium_threshold != owner::PAYMENT_THRESHOLD
+            || self.high_threshold != owner::OWNER_THRESHOLD
         {
-            return Err(
-                "Current native account differs from the independently selected roles".into(),
-            );
+            return differs();
         }
-        Ok(())
+        let weight = |key: &str| {
+            self.signers
+                .iter()
+                .find(|s| s.key == key)
+                .map(|s| s.weight)
+        };
+        if weight(owner) != Some(owner::OWNER_WEIGHT)
+            || weight(trusted_server) != Some(owner::AUTOMATED_WEIGHT)
+        {
+            return differs();
+        }
+        match (weight(agent), self.signers.len()) {
+            (Some(owner::AUTOMATED_WEIGHT), 3) => Ok(owner::WalletStatus::Active),
+            (None, 2) => Ok(owner::WalletStatus::Paused),
+            _ => differs(),
+        }
     }
     /// Verify every administrator signature and the current high-threshold quorum.
     /// Zero-weight and nonmember signatures are errors even beside a sufficient quorum.

@@ -70,18 +70,53 @@ pub fn validate_retained_owner_transaction(original: &OwnerTransaction) -> Resul
                 ..
             },
         ] => original.action == "extend",
-        [a, b, c] => {
-            original.action == "native_setup"
-                && [a, b, c]
-                    .iter()
-                    .all(|op| matches!(op.body, OperationBody::SetOptions(_)))
-        }
-        _ => false,
+        operations => classic_action_matches(&original.action, operations),
     };
     if !action_matches {
         return Err("Retained owner action differs from its transaction".into());
     }
     Ok(())
+}
+
+/// Whether a classic owner transaction has the operations of its named action: the creation
+/// of a wallet account or one owner action on it. This describes retained bytes; the exact
+/// roles and amounts are checked against caller intent before signing.
+fn classic_action_matches(action: &str, operations: &[Operation]) -> bool {
+    let wallet_sourced = |op: &Operation| op.source_account.is_some();
+    match (action, operations) {
+        ("native_setup", [create, rest @ ..]) => {
+            matches!(create.body, OperationBody::CreateAccount(_))
+                && create.source_account.is_none()
+                && (3..=4).contains(&rest.len())
+                && rest.iter().all(|op| {
+                    wallet_sourced(op)
+                        && matches!(
+                            op.body,
+                            OperationBody::SetOptions(_) | OperationBody::ChangeTrust(_)
+                        )
+                })
+        }
+        ("fund", [op]) => !wallet_sourced(op) && matches!(op.body, OperationBody::Payment(_)),
+        ("withdraw", [op]) => wallet_sourced(op) && matches!(op.body, OperationBody::Payment(_)),
+        ("pause" | "resume", [op]) => {
+            wallet_sourced(op) && matches!(op.body, OperationBody::SetOptions(_))
+        }
+        ("close", [rest @ .., merge]) => {
+            wallet_sourced(merge)
+                && matches!(merge.body, OperationBody::AccountMerge(_))
+                && (2..=5).contains(&rest.len())
+                && rest.iter().all(|op| {
+                    wallet_sourced(op)
+                        && matches!(
+                            op.body,
+                            OperationBody::SetOptions(_)
+                                | OperationBody::ChangeTrust(_)
+                                | OperationBody::Payment(_)
+                        )
+                })
+        }
+        _ => false,
+    }
 }
 
 /// Match external owner-signed bytes to the exact retained unsigned v1 transaction and digest.
@@ -170,13 +205,29 @@ pub enum OwnerAction {
         deployment: Box<admin::PolicyDeployment>,
         version: u64,
     },
-    /// The exact existing three-operation native setup, reconstructed from a caller-observed
-    /// fresh account. No server-provided signer or threshold is accepted as expected intent.
+    /// The exact creation of one agent's wallet account, reconstructed from the caller-observed
+    /// owner account. No server-provided signer or threshold is accepted as expected intent.
     NativeSetup {
         state: AccountState,
+        wallet: String,
         agent: String,
         engine: String,
         request_id: String,
+        fee_per_operation: u32,
+        starting_balance: Option<i64>,
+        trustline: Option<owner::Trustline>,
+        created_at: u64,
+    },
+    /// One owner action on a wallet account (fund, pause, resume, withdraw or close),
+    /// reconstructed from the caller-observed owner and wallet accounts and the selected roles.
+    Wallet {
+        owner_state: AccountState,
+        wallet_state: AccountState,
+        agent: String,
+        engine: String,
+        action: owner::WalletAction,
+        asset_symbol: String,
+        asset_issuer: Option<String>,
         fee_per_operation: u32,
         created_at: u64,
     },
@@ -190,6 +241,7 @@ impl OwnerAction {
             Self::Extend { .. } => "extend",
             Self::UpdatePolicy { .. } => "update_params",
             Self::NativeSetup { .. } => "native_setup",
+            Self::Wallet { action, .. } => action.name(),
         }
     }
 }
@@ -224,9 +276,39 @@ impl ValidatedOwnerTransaction {
     /// Request one signature for exactly the validated digest. Refuse expired proofs and clock
     /// rollback before calling the capability; verify its Ed25519 result before attachment.
     pub fn sign_with(
+        self,
+        now: u64,
+        sign_hash: impl FnOnce(&[u8; 32]) -> Result<[u8; 64]>,
+    ) -> Result<String> {
+        self.sign(now, sign_hash, None)
+    }
+    /// Sign the creation of a wallet account: the owner's signature, then the one signature of
+    /// the new account's own key, which the network requires for the operations that the new
+    /// account is the source of. The key must be the key of the account that the validated
+    /// transaction creates.
+    pub fn sign_with_wallet_key(
+        self,
+        now: u64,
+        sign_hash: impl FnOnce(&[u8; 32]) -> Result<[u8; 64]>,
+        wallet: &owner::WalletKey,
+    ) -> Result<String> {
+        let created = self.envelope.tx.operations.first().and_then(|op| {
+            let OperationBody::CreateAccount(create) = &op.body else {
+                return None;
+            };
+            let PublicKey::PublicKeyTypeEd25519(key) = &create.destination.0;
+            Some(account_for_public_key(&key.0))
+        });
+        if created.as_deref() != Some(&wallet.account()) {
+            return Err("The wallet key differs from the account that this setup creates".into());
+        }
+        self.sign(now, sign_hash, Some(wallet))
+    }
+    fn sign(
         mut self,
         now: u64,
         sign_hash: impl FnOnce(&[u8; 32]) -> Result<[u8; 64]>,
+        wallet: Option<&owner::WalletKey>,
     ) -> Result<String> {
         if now < self.validated_at || now >= self.expires_at {
             return Err("Validated owner transaction is no longer current".into());
@@ -236,12 +318,24 @@ impl ValidatedOwnerTransaction {
             .map_err(err)?
             .verify_strict(&self.digest, &EdSignature::from_bytes(&signature))
             .map_err(|_| "Owner signing capability returned an invalid signature")?;
-        self.envelope.signatures = vec![DecoratedSignature {
+        let mut signatures = vec![DecoratedSignature {
             hint: SignatureHint(self.owner[28..].try_into().unwrap()),
             signature: stellar_xdr::Signature(signature.to_vec().try_into().map_err(err)?),
-        }]
-        .try_into()
-        .map_err(err)?;
+        }];
+        if let Some(wallet) = wallet {
+            let key = account_key(&wallet.account())?;
+            signatures.push(DecoratedSignature {
+                hint: SignatureHint(key[28..].try_into().unwrap()),
+                signature: stellar_xdr::Signature(
+                    wallet
+                        .sign_hash(&self.digest)
+                        .to_vec()
+                        .try_into()
+                        .map_err(err)?,
+                ),
+            });
+        }
+        self.envelope.signatures = signatures.try_into().map_err(err)?;
         xdr(&TransactionEnvelope::Tx(self.envelope))
     }
 }
@@ -289,33 +383,49 @@ pub fn validate_owner_transaction(
         return Err("Prepared owner envelope differs from caller intent".into());
     }
     match &expected.action {
-        OwnerAction::NativeSetup {
-            state,
-            agent,
-            engine,
-            request_id,
-            fee_per_operation,
-            created_at,
-        } => {
-            if state.address != limits.owner || *created_at > now {
-                return Err(
-                    "Native setup source or creation time differs from caller intent".into(),
-                );
+        OwnerAction::NativeSetup { state, .. } => {
+            if state.address != limits.owner {
+                return Err("Native setup source differs from caller intent".into());
             }
-            let exact = owner::prepare_native_setup(
-                state,
-                agent,
-                engine,
-                request_id,
-                &limits.network,
-                *fee_per_operation,
-                *created_at,
-            )?;
+            let exact = exact_native_setup(&expected.action, &limits.network, now)?;
             if packet.transaction_xdr != exact.transaction_xdr
                 || packet.transaction_hash != unhex::<32>(&exact.transaction_hash)?
                 || packet.expires_at != exact.expires_at
             {
                 return Err("Native setup differs from the exact caller-selected template".into());
+            }
+        }
+        OwnerAction::Wallet {
+            owner_state,
+            wallet_state,
+            agent,
+            engine,
+            action,
+            asset_symbol,
+            asset_issuer,
+            fee_per_operation,
+            created_at,
+        } => {
+            if owner_state.address != limits.owner || *created_at > now {
+                return Err("Wallet action source or time differs from caller intent".into());
+            }
+            let exact = owner::prepare_wallet_action(
+                owner_state,
+                wallet_state,
+                owner::WalletRoles {
+                    wallet: &wallet_state.address,
+                    owner: &limits.owner,
+                    agent,
+                    engine,
+                },
+                action,
+                &asset_from_identity(asset_symbol, asset_issuer.as_deref())?,
+                &limits.network,
+                *fee_per_operation,
+                *created_at,
+            )?;
+            if packet != &exact {
+                return Err("Wallet action differs from the exact caller-selected roles".into());
             }
         }
         OwnerAction::Extend {
@@ -523,7 +633,9 @@ fn validate_host(
             }
             admin::validate_auth(&limits.network, &exact, &invoke.auth, None)?;
         }
-        OwnerAction::NativeSetup { .. } | OwnerAction::Extend { .. } => unreachable!(),
+        OwnerAction::NativeSetup { .. }
+        | OwnerAction::Wallet { .. }
+        | OwnerAction::Extend { .. } => unreachable!(),
     }
     Ok(())
 }
@@ -564,6 +676,41 @@ pub fn validate_deployment(
     )
 }
 
+/// The setup that the caller's intent selects, built again from the caller's own values.
+fn exact_native_setup(action: &OwnerAction, network: &str, now: u64) -> Result<owner::NativeSetup> {
+    let OwnerAction::NativeSetup {
+        state,
+        wallet,
+        agent,
+        engine,
+        request_id,
+        fee_per_operation,
+        starting_balance,
+        trustline,
+        created_at,
+    } = action
+    else {
+        return Err("Expected native setup intent".into());
+    };
+    if *created_at > now {
+        return Err("Native setup creation time differs from caller intent".into());
+    }
+    owner::prepare_native_setup(
+        state,
+        &owner::SetupTerms {
+            wallet,
+            agent,
+            engine,
+            request_id,
+            network,
+            fee_per_operation: *fee_per_operation,
+            starting_balance: *starting_balance,
+            trustline: trustline.as_ref(),
+        },
+        *created_at,
+    )
+}
+
 /// Validate the public setup packet's identity digest, metadata and exact native reconstruction
 /// before producing signing authority. The expected fresh account and roles remain caller-owned.
 pub fn validate_native_setup(
@@ -575,26 +722,7 @@ pub fn validate_native_setup(
         return Err("Native setup XDR exceeds limit".into());
     }
     owner::validate_native_setup(packet)?;
-    let OwnerAction::NativeSetup {
-        state,
-        agent,
-        engine,
-        request_id,
-        fee_per_operation,
-        created_at,
-    } = &expected.action
-    else {
-        return Err("Expected native setup intent".into());
-    };
-    let exact = owner::prepare_native_setup(
-        state,
-        agent,
-        engine,
-        request_id,
-        &expected.limits.network,
-        *fee_per_operation,
-        *created_at,
-    )?;
+    let exact = exact_native_setup(&expected.action, &expected.limits.network, now)?;
     if packet != &exact {
         return Err("Native setup metadata differs from caller intent".into());
     }

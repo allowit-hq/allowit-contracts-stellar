@@ -353,6 +353,76 @@ pub struct Provider {
     transport: std::sync::Arc<dyn rpc::Rpc>,
 }
 impl Provider {
+    /// One owner action on a keypair wallet: a transaction from the owner's account whose
+    /// operations the owner's signature authorizes alone. `Recover` without an amount closes
+    /// the wallet: every signer is removed and the account merges into the owner's account.
+    fn prepare_wallet_owner(
+        &self,
+        c: &WalletConfig,
+        a: OwnerAction,
+        fee_limit: u64,
+        now: u64,
+    ) -> Result<OwnerPacket> {
+        use native::owner::WalletAction;
+        let asset = checked(native::asset_xdr(c))?;
+        let units = |units: i128| {
+            i64::try_from(units).map_err(|_| Error::usage("The amount exceeds the native range"))
+        };
+        let action = match a {
+            OwnerAction::Fund { units: amount } => WalletAction::Fund {
+                units: units(amount)?,
+            },
+            OwnerAction::SetPause { paused: true } => WalletAction::Pause,
+            OwnerAction::SetPause { paused: false } => WalletAction::Resume,
+            OwnerAction::Recover {
+                units: Some(amount),
+                recipient,
+            } => WalletAction::Withdraw {
+                units: units(amount)?,
+                recipient,
+            },
+            OwnerAction::Recover {
+                units: None,
+                recipient: None,
+            } => WalletAction::Close {
+                token_balance: if asset == stellar_xdr::Asset::Native {
+                    0
+                } else {
+                    checked(rpc::trustline_balance(self.rpc(), &c.wallet, &asset))?.unwrap_or(0)
+                },
+            },
+            OwnerAction::Recover { .. } => {
+                return Err(Error::usage("Recovery recipient requires an amount"));
+            }
+            OwnerAction::Upload { .. } | OwnerAction::Create { .. } | OwnerAction::Extend => {
+                return Err(Error::unsupported(
+                    "A keypair wallet has no code: its owner creates it with the wallet setup",
+                ));
+            }
+        };
+        let owner_state = checked(rpc::get_account(self.rpc(), &c.owner))?;
+        let wallet_state = checked(rpc::get_account(self.rpc(), &c.wallet))?;
+        // Each operation bids the same share of the caller's fee limit, within the bounds of
+        // one classic operation.
+        let fee_per_operation = u32::try_from((fee_limit / 6).clamp(100, 10_000))
+            .map_err(|_| Error::usage("Invalid owner fee limit"))?;
+        let p = checked(native::owner::prepare_wallet_action(
+            &owner_state,
+            &wallet_state,
+            native::owner::WalletRoles {
+                wallet: &c.wallet,
+                owner: &c.owner,
+                agent: &c.agent,
+                engine: &c.server,
+            },
+            &action,
+            &asset,
+            &c.network,
+            fee_per_operation,
+            now,
+        ))?;
+        Ok(OwnerPacket(packet(&c.network, &p)?))
+    }
     pub fn new(network: &str, endpoint: &str) -> Result<Self> {
         Ok(Self::from_rpc_inner(
             network,
@@ -681,6 +751,14 @@ impl crate::host::vendors::RuntimeProvider for Provider {
     }
     fn resources(&self, i: &Installation) -> Result<Resources> {
         let c = self.config(i)?;
+        if c.route == WalletRoute::Native {
+            // A keypair wallet has no code and no lifetime: it is present when its account is.
+            return Ok(Resources {
+                code_present: true,
+                wallet_present: checked(rpc::find_account(self.rpc(), &c.wallet))?.is_some(),
+                lifetime: None,
+            });
+        }
         let code_present = checked(rpc::code_uploaded(self.rpc(), &c.network, &c.module_digest))?;
         let wallet_present = checked(rpc::contract_exists(self.rpc(), &c.network, &c.wallet))?;
         let lifetime = if wallet_present {
@@ -961,6 +1039,9 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         now: u64,
     ) -> Result<OwnerPacket> {
         let c = self.config(i)?;
+        if c.route == WalletRoute::Native {
+            return self.prepare_wallet_owner(&c, a, fee_limit, now);
+        }
         // Renewal preserves the installed fee budget even when deployment has a larger ceiling.
         let fee_limit = if matches!(&a, OwnerAction::Extend) {
             fee_limit.min(u64::from(c.max_fee_stroops))
@@ -1818,11 +1899,16 @@ mod retained_projection_tests {
         };
         let setup = native::owner::prepare_native_setup(
             &state,
-            &native::account_for_seed(&[12; 32]),
-            &native::account_for_seed(&[13; 32]),
-            "setup-history-001",
-            "stellar:testnet",
-            100,
+            &native::owner::SetupTerms {
+                wallet: &native::account_for_seed(&[14; 32]),
+                agent: &native::account_for_seed(&[12; 32]),
+                engine: &native::account_for_seed(&[13; 32]),
+                request_id: "setup-history-001",
+                network: "stellar:testnet",
+                fee_per_operation: 100,
+                starting_balance: None,
+                trustline: None,
+            },
             1,
         )
         .unwrap();
@@ -1948,11 +2034,16 @@ mod owner_carrier_tests {
         };
         let setup = native::owner::prepare_native_setup(
             &state,
-            &native::account_for_seed(&[12; 32]),
-            &native::account_for_seed(&[13; 32]),
-            "network-test-001",
-            "stellar:testnet",
-            100,
+            &native::owner::SetupTerms {
+                wallet: &native::account_for_seed(&[14; 32]),
+                agent: &native::account_for_seed(&[12; 32]),
+                engine: &native::account_for_seed(&[13; 32]),
+                request_id: "network-test-001",
+                network: "stellar:testnet",
+                fee_per_operation: 100,
+                starting_balance: None,
+                trustline: None,
+            },
             1,
         )
         .unwrap();

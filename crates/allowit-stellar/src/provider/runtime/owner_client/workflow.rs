@@ -1231,14 +1231,76 @@ struct NativeSetupRecord {
     identity: String,
     setup: native::owner::NativeSetup,
     source: native::AccountState,
+    /// How the wallet account's one-time key was made: `owner-signature` when the owner's
+    /// signer signs the derivation message the same way twice, so the owner can compute the
+    /// address again; `one-time` when it does not.
+    derivation: String,
     created_at: u64,
     signed_xdr: Option<String>,
     signature: Option<Vec<u8>>,
     submitted: bool,
     receipt: Option<rpc::VerifiedReceipt>,
 }
-/// Configure a fresh Native account through SDK Runtime. No server registration is invented.
-/// Original unsigned intent and signed bytes are retained before direct native transmission.
+/// The index of the first wallet of an agent. The derivation message names it.
+pub const WALLET_INDEX: u32 = 0;
+/// The one-time key of the wallet account of `agent`: the owner signs the derivation message,
+/// and the signature is the seed. Ed25519 signatures are deterministic, so the same owner key
+/// derives the same account again. A signer that signs the same message in two ways still
+/// yields a usable one-time key, which the result reports as `one-time`.
+fn derive_wallet_key(
+    signer: &dyn OwnerSigner,
+    network: &str,
+    agent: &str,
+) -> Result<(native::owner::WalletKey, &'static str)> {
+    let digest = checked(native::owner::wallet_derivation_digest(
+        network,
+        agent,
+        WALLET_INDEX,
+    ))?;
+    let first = checked(signer.sign_hash(&digest))?;
+    let second = checked(signer.sign_hash(&digest))?;
+    checked(native::signing::verify_digest(
+        signer.account(),
+        &digest,
+        &first,
+    ))?;
+    let derivation = if first == second {
+        "owner-signature"
+    } else {
+        "one-time"
+    };
+    Ok((native::owner::WalletKey::from_signature(&first), derivation))
+}
+/// The server's first record of a wallet: the account, its roles and a policy that admits
+/// transfers of XLM. The owner's generated policy replaces it at activation.
+pub fn bootstrap_configuration(
+    network: &str,
+    wallet: &str,
+    owner: &str,
+    agent: &str,
+    server: &str,
+) -> Result<native::WalletConfig> {
+    const SOURCE: &str = "use allowit::prelude::*;\n/// Bootstrap: transfers in the installed asset.\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::operations(ctx, &ctx.params[allowit::OPERATIONS])?;\n    allowit::tokens(ctx, &ctx.params[allowit::TOKENS])?;\n    Ok(())\n}\n";
+    let asset = checked(native::sac_address(network, &stellar_xdr::Asset::Native))?;
+    let instance = native::hash(format!(
+        "allowit-stellar-native-wallet-v1:{network}:{wallet}"
+    ));
+    let config: native::WalletConfig = serde_json::from_value(json!({
+        "network": network, "policyInstance": instance, "wallet": wallet, "owner": owner,
+        "agent": agent, "server": server, "route": "native", "language": "portable",
+        "params": {"operations": {"List": [{"Str": "transfer"}]}, "tokens": {"List": [{"Addr": asset}]}},
+        "asset": asset, "assetSymbol": "XLM", "assetIssuer": null, "policySource": SOURCE,
+        "sourceHash": native::hash(SOURCE), "moduleDigest": vec![0u8; 32],
+        "maxFeeStroops": 100_000,
+    }))
+    .map_err(|_| Error::config("Cannot describe the new wallet"))?;
+    checked(native::validate_config(&config))?;
+    Ok(config)
+}
+/// Create one agent's wallet account with one owner-signed transaction, through SDK Runtime.
+/// The owner's signer derives the new account's one-time key, which co-signs once. Original
+/// unsigned intent and signed bytes are retained before direct native transmission. The
+/// result holds the server's first record of the wallet under `configuration`.
 pub fn configure_native(
     runtime: &crate::provider::runtime::Runtime,
     store: &Store,
@@ -1252,9 +1314,29 @@ pub fn configure_native(
         return Err(Error::config("Native setup owner signer differs"));
     }
     network(runtime.rpc(), &request.network)?;
+    let (wallet_key, derivation) = derive_wallet_key(signer, &request.network, &request.agent)?;
+    let wallet = wallet_key.account();
     let identity = intent_hash(
-        &json!({"network":request.network,"owner":request.owner,"agent":request.agent,"server":request.server,"requestId":request.request_id,"fee":request.fee_per_operation}),
+        &json!({"network":request.network,"owner":request.owner,"wallet":wallet,"agent":request.agent,"server":request.server,"requestId":request.request_id,"fee":request.fee_per_operation}),
     )?;
+    let configured = |transaction: Option<(&str, u32)>| -> Result<Value> {
+        let configuration = bootstrap_configuration(
+            &request.network,
+            &wallet,
+            &request.owner,
+            &request.agent,
+            &request.server,
+        )?;
+        Ok(
+            json!({"state":"configured","requestId":request.request_id,"network":request.network,"wallet":wallet,"owner":request.owner,"agent":request.agent,"server":request.server,
+            "installation":native::hex(&configuration.policy_instance),"configuration":configuration,
+            "derivation":{"method":derivation,"walletIndex":WALLET_INDEX},
+            "signers":{"owner":native::owner::OWNER_WEIGHT,"agent":native::owner::AUTOMATED_WEIGHT,"server":native::owner::AUTOMATED_WEIGHT,"walletKey":0},
+            "thresholds":{"low":native::owner::PAYMENT_THRESHOLD,"medium":native::owner::PAYMENT_THRESHOLD,"high":native::owner::OWNER_THRESHOLD},
+            "reserveStroops":native::owner::wallet_reserve(false).to_string(),
+            "transactionHash":transaction.map(|t|t.0),"ledger":transaction.map(|t|t.1)}),
+        )
+    };
     let mut record = match store.load::<NativeSetupRecord>(&request.request_id)? {
         Some(record) if record.identity == identity => record,
         Some(_) => {
@@ -1263,21 +1345,39 @@ pub fn configure_native(
             ));
         }
         None => {
+            // A wallet account that already exists is this agent's wallet only with the exact
+            // roles. Any other authority on it is refused, and nothing is signed.
+            if let Some(existing) = checked(rpc::find_account(runtime.rpc(), &wallet))? {
+                checked(
+                    existing
+                        .wallet_status(&request.owner, &request.agent, &request.server)
+                        .map_err(|_| {
+                            "The wallet account of this agent already exists with other signers or thresholds; setup never replaces existing authority".to_owned()
+                        }),
+                )?;
+                return configured(None);
+            }
             let source = checked(rpc::get_account(runtime.rpc(), &request.owner))?;
             let now = clock()?;
             let setup = checked(native::owner::prepare_native_setup(
                 &source,
-                &request.agent,
-                &request.server,
-                &request.request_id,
-                &request.network,
-                request.fee_per_operation,
+                &native::owner::SetupTerms {
+                    wallet: &wallet,
+                    agent: &request.agent,
+                    engine: &request.server,
+                    request_id: &request.request_id,
+                    network: &request.network,
+                    fee_per_operation: request.fee_per_operation,
+                    starting_balance: None,
+                    trustline: None,
+                },
                 now,
             ))?;
             NativeSetupRecord {
                 identity,
                 setup,
                 source,
+                derivation: derivation.into(),
                 created_at: now,
                 signed_xdr: None,
                 signature: None,
@@ -1286,6 +1386,11 @@ pub fn configure_native(
             }
         }
     };
+    if record.setup.wallet != wallet {
+        return Err(Error::config(
+            "The owner's signer derives another wallet account than the retained setup; resume with the original owner key",
+        ));
+    }
     store.save(&request.request_id, &record)?;
     let expected = ExpectedOwnerIntent {
         limits: OwnerLimits {
@@ -1301,10 +1406,13 @@ pub fn configure_native(
         },
         action: OwnerAction::NativeSetup {
             state: record.source.clone(),
+            wallet: wallet.clone(),
             agent: request.agent.clone(),
             engine: request.server.clone(),
             request_id: request.request_id.clone(),
             fee_per_operation: request.fee_per_operation,
+            starting_balance: None,
+            trustline: None,
             created_at: record.created_at,
         },
     };
@@ -1327,11 +1435,15 @@ pub fn configure_native(
             &expected,
             clock()?,
         ))?;
-        record.signed_xdr = Some(checked(proof.sign_with(clock()?, |hash| {
-            let signature = signer.sign_hash(hash)?;
-            record.signature = Some(signature.to_vec());
-            Ok(signature)
-        }))?);
+        record.signed_xdr = Some(checked(proof.sign_with_wallet_key(
+            clock()?,
+            |hash| {
+                let signature = signer.sign_hash(hash)?;
+                record.signature = Some(signature.to_vec());
+                Ok(signature)
+            },
+            &wallet_key,
+        ))?);
         store.save(&request.request_id, &record)?;
     }
     let signature: [u8; 64] = record
@@ -1345,7 +1457,7 @@ pub fn configure_native(
         &expected,
         record.created_at,
     ))?;
-    if checked(retained.sign_with(record.created_at, |_| Ok(signature)))?
+    if checked(retained.sign_with_wallet_key(record.created_at, |_| Ok(signature), &wallet_key))?
         != *record.signed_xdr.as_ref().unwrap()
     {
         return Err(Error::config("Retained Native setup bytes changed"));
@@ -1401,11 +1513,9 @@ pub fn configure_native(
             "The original Native setup failed or its receipt envelope differs",
         ));
     }
-    let account = checked(rpc::get_account(runtime.rpc(), &request.owner))?;
+    let account = checked(rpc::get_account(runtime.rpc(), &wallet))?;
     checked(account.validate_roles(&request.owner, &request.agent, &request.server))?;
-    Ok(
-        json!({"state":"configured","requestId":request.request_id,"network":request.network,"wallet":request.owner,"owner":request.owner,"agent":request.agent,"server":request.server,"transactionHash":record.setup.transaction_hash,"ledger":receipt.ledger}),
-    )
+    configured(Some((&record.setup.transaction_hash, receipt.ledger)))
 }
 
 /// Read only original transaction receipts. This path requires neither an owner key nor current source admission.
