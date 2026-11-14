@@ -97,6 +97,13 @@ pub fn denial(message: &str, contract: Option<&ContractFault>, wallet: &str) -> 
     if contract.is_none() && message == crate::rpc::owner_observation::STALE_OBSERVATION {
         return coded(409, "stale_owner_observation", message);
     }
+    if contract.is_none() && message == crate::rpc::EXECUTABLE_DIFFERS {
+        return coded(
+            409,
+            allowit_core::vendor::custom_build::code::CODE_HASH_MISMATCH,
+            "The wallet's code on the ledger differs from the code of its configuration.",
+        );
+    }
     let named = contract
         .is_none()
         .then(|| crate::rpc::host_policy_denial(message))
@@ -163,6 +170,12 @@ mod tests {
         let local = denial("Policy prefix denied: PaymentLimitExceeded", None, "");
         assert_eq!(local.code, "policy_denied");
         assert!(local.details.unwrap()["contractError"].is_null());
+    }
+    #[test]
+    fn a_wallet_with_other_code_than_its_configuration_has_its_own_code() {
+        let problem = denial(crate::rpc::EXECUTABLE_DIFFERS, None, "wallet");
+        assert_eq!(problem.code, "custom_code_hash_mismatch");
+        assert_eq!(problem.status, 409);
     }
     #[test]
     fn a_stale_owner_observation_has_its_own_code() {
