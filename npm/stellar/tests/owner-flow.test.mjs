@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test, {beforeEach} from 'node:test';
 import {Account, Keypair, Networks, Operation, TransactionBuilder} from '@stellar/stellar-sdk/base';
-import {installAndFund as flow, ownerArchiveKey, OwnerFlowError} from '../dist/owner-flow.js';
+import {installAndFund as flow, ownerArchiveKey, OwnerFlowError, updateParams as update} from '../dist/owner-flow.js';
 
 const network = 'stellar:testnet';
 const installAndFund = input => flow({network, historyPauseMs: 0, ...input});
@@ -288,4 +288,78 @@ test('a confirmation is trusted only when history holds that successful transact
   await assert.rejects(installAndFund({ask: settled.ask, sign: signer([]), journal: kept, key, policyId, agent, amount, onStep() {}}), error => error.retry === true);
   assert.deepEqual(JSON.parse(kept.get(key)), pending);
   assert.equal(kept.get(`${key}:funded`), null);
+});
+
+const updateParams = input => update({network, historyPauseMs: 0, ...input});
+const params = {daily_spending_limit: {Int: '50000000'}};
+/** A service that prepares one `update_params` step for each asked change. */
+function updates({submit, prepare}) {
+  const calls = [], state = {prepared: 0};
+  const ask = async (path, body) => {
+    calls.push([path, body]);
+    if (path === 'native/owner/prepare') return prepare ? prepare(body, state) : {policyId, step: step('update_params', ++state.prepared)};
+    if (path === 'native/owner/submit') return submit(body, state);
+    throw new Error(path);
+  };
+  return {ask, calls, state};
+}
+
+test('a params update signs one step, sends the typed values and is never signed again under its key', async () => {
+  const signed = [], journal = journalOf();
+  const {ask, calls} = updates({submit: confirmed});
+  const input = {ask, sign: signer(signed), journal, key, policyId, params, expectedRevision: 3, onStep() {}};
+  const result = await updateParams(input);
+  assert.deepEqual([result.done, result.receipts.map(r => r.action)], [true, ['update_params']]);
+  assert.deepEqual(signed, ['update_params']);
+  assert.deepEqual(calls[0], ['native/owner/prepare', {policyId, action: 'update_params', params, expectedRevision: 3}]);
+  assert.equal(journal.get(key), null);
+  // The same change under the same key is done: nothing is prepared or signed.
+  const again = await updateParams(input);
+  assert.deepEqual([again.done, again.receipts.length, signed.length, calls.length], [true, 0, 1, 2]);
+  // Another change under that key is refused before anything is sent.
+  await assert.rejects(updateParams({...input, params: {daily_spending_limit: {Int: '1'}}}), error => error instanceof OwnerFlowError && !error.retry);
+  assert.equal(calls.length, 2);
+});
+
+test('a resumed params update settles the saved signed step first and asks for no second signature', async () => {
+  const signed = [], journal = journalOf();
+  let lost = true;
+  const {ask, calls} = updates({submit: body => {
+    if (lost) throw refusal('owner_transaction_pending', {});
+    return confirmed(body);
+  }});
+  const input = {ask, sign: signer(signed), journal, key, policyId, params, onStep() {}};
+  await assert.rejects(updateParams(input), error => error.code === 'owner_transaction_pending' && error.retry === true);
+  const saved = JSON.parse(journal.get(key));
+  assert.equal(saved.signedPayload, 'signed-update_params-1');
+  lost = false;
+  const result = await updateParams(input);
+  assert.deepEqual([result.done, result.receipts.length, signed.length], [true, 1, 1]);
+  // The resume sent the saved bytes and prepared nothing new.
+  assert.deepEqual(calls.filter(([path]) => path === 'native/owner/prepare').length, 1);
+  assert.deepEqual(calls.at(-1), ['native/owner/submit', {policyId, payload: 'signed-update_params-1'}]);
+  // A saved wallet setup step under this key belongs to other inputs and is refused.
+  const other = journalOf({[key]: JSON.stringify({step: savedStep('fund', 4), signedPayload: 'signed-fund-4', policyId, agent, amount})});
+  await assert.rejects(updateParams({...input, journal: other}), error => error instanceof OwnerFlowError && !error.retry);
+});
+
+test('a refused params update keeps the typed code of the service and signs nothing', async () => {
+  for (const code of ['param_out_of_range', 'param_invalid', 'update_unavailable', 'revision_changed']) {
+    const signed = [], journal = journalOf();
+    const {ask} = updates({submit: confirmed, prepare: () => { throw refusal(code, {param: 'daily_spending_limit'}, 400); }});
+    await assert.rejects(updateParams({ask, sign: signer(signed), journal, key, policyId, params, onStep() {}}),
+      error => error instanceof OwnerFlowError && error.code === code && error.retry === false);
+    assert.deepEqual([signed.length, journal.map.size], [0, 0]);
+  }
+  // A reply for another policy or another action is refused before the wallet opens.
+  for (const reply of [{policyId: 'other', step: step('update_params', 1)}, {policyId, step: step('fund', 1)}, {policyId}]) {
+    const signed = [];
+    const {ask} = updates({submit: confirmed, prepare: () => reply});
+    await assert.rejects(updateParams({ask, sign: signer(signed), journal: journalOf(), key, policyId, params, onStep() {}}), OwnerFlowError);
+    assert.equal(signed.length, 0);
+  }
+  // No change, or too many, never reaches the service.
+  const {ask, calls} = updates({submit: confirmed});
+  await assert.rejects(updateParams({ask, sign: signer([]), journal: journalOf(), key, policyId, params: {}, onStep() {}}), error => error.code === 'param_invalid');
+  assert.equal(calls.length, 0);
 });

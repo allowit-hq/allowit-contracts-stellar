@@ -1,5 +1,6 @@
 /**
- * The owner workflow that the SDK exposes through the rail plugin: install the reviewed policy wallet, then fund it.
+ * The owner workflows that the SDK exposes through the rail plugin: install the reviewed policy wallet and fund it,
+ * and change installed params on an active wallet.
  * The host supplies its authenticated transport, the signing of one step and a journal. This module holds the rules
  * for a saved signed step and for the typed replies of the service.
  */
@@ -31,6 +32,15 @@ export const OWNER_TRANSACTION_SETTLED = 'owner_transaction_settled';
 export const OWNER_TRANSACTION_FAILED = 'owner_transaction_failed';
 /** HTTP 503 with `details.retry = "same_request_id"`: the service sent nothing. */
 export const NETWORK_UNAVAILABLE = 'network_unavailable';
+/** Typed codes of a refused params update. `details.param` names the param of a refused value. */
+export const PARAM_INVALID = 'param_invalid';
+export const PARAM_OUT_OF_RANGE = 'param_out_of_range';
+/** The policy is not active, or its wallet kind takes no owner-signed update. */
+export const UPDATE_UNAVAILABLE = 'update_unavailable';
+/** The wallet is at another configuration revision than the update expects. */
+export const REVISION_CHANGED = 'revision_changed';
+/** The action name of the owner step of a params update. */
+export const UPDATE_PARAMS = 'update_params';
 
 /** An owner workflow failure with the typed server code, when the service sent one. */
 export class OwnerFlowError extends Error {
@@ -152,13 +162,17 @@ async function expiredRecord(network: string, step: OwnerStep, signedPayload: st
 const running = new Set<string>();
 const busy = () => new OwnerFlowError('This wallet setup is already running in this or another tab.', null, true);
 
-/** The inputs that a saved step and a funded marker belong to. */
-type Identity = {policyId: string; agent: string; amount: string};
-const changed = () => new OwnerFlowError('Use the agent key and amount from the original wallet setup. The saved signed step stays saved.', null, false);
+/** The inputs that a saved step and a completion marker belong to: the wallet setup or one params update. */
+type Identity = {policyId: string; agent: string; amount: string} | {policyId: string; update: string};
+const FIELDS = ['policyId', 'agent', 'amount', 'update'] as const;
+const changed = (identity: Identity) => new OwnerFlowError('update' in identity
+  ? 'The saved signed step belongs to another change. It stays saved; resume that change first.'
+  : 'Use the agent key and amount from the original wallet setup. The saved signed step stays saved.', null, false);
 /** True when a saved value names these inputs. A value saved without inputs predates them and names none. */
 function sameInputs(value: Record<string, unknown>, identity: Identity): boolean {
-  const named = (['policyId', 'agent', 'amount'] as const).filter(field => value[field] !== undefined);
-  return named.length === 0 || named.length === 3 && named.every(field => value[field] === identity[field]);
+  const named = FIELDS.filter(field => value[field] !== undefined);
+  const inputs = identity as Record<string, string>;
+  return named.length === 0 || named.length === Object.keys(inputs).length && named.every(field => value[field] === inputs[field]);
 }
 
 function saved(journal: OwnerJournal, key: string, identity: Identity): {step: OwnerStep; signedPayload: string} | null {
@@ -171,11 +185,11 @@ function saved(journal: OwnerJournal, key: string, identity: Identity): {step: O
   const step = object(value) ? stepOf(value.step as Prepared['step']) : null;
   if (!object(value) || !step || typeof value.signedPayload !== 'string' || !value.signedPayload)
     throw new OwnerFlowError('The saved signed step is unreadable. It stays saved; contact support before signing again.', null, false);
-  if (!sameInputs(value, identity)) throw changed();
+  if (!sameInputs(value, identity)) throw changed(identity);
   return {step, signedPayload: value.signedPayload};
 }
 
-/** True when the funding of these inputs is confirmed. A marker of other inputs is refused. */
+/** True when the funding or the update of these inputs is confirmed. A marker of other inputs is refused. */
 function funded(journal: OwnerJournal, fundedKey: string, identity: Identity): boolean {
   const raw = journal.get(fundedKey);
   if (raw === null) return false;
@@ -184,7 +198,7 @@ function funded(journal: OwnerJournal, fundedKey: string, identity: Identity): b
   try {
     value = JSON.parse(raw);
   } catch { /* fall through */ }
-  if (!object(value) || !sameInputs(value, identity)) throw changed();
+  if (!object(value) || !sameInputs(value, identity)) throw changed(identity);
   return true;
 }
 
@@ -229,14 +243,17 @@ export async function installAndFund(input: InstallAndFundInput): Promise<{walle
   }
 }
 
-async function run({network, ask, sign, journal, key, policyId, agent, amount, onStep, historyPauseMs = 1_500}: InstallAndFundInput): Promise<{wallet: string; receipts: OwnerReceipt[]}> {
-  if (!canonicalNetwork(network)) throw new OwnerFlowError('Select a supported Stellar network.', null, false);
+/** The parts of one workflow that send, settle and sign its owner steps. */
+interface StepperInput {
+  network: string; historyPauseMs: number; ask: Ask; sign: SignStep; journal: OwnerJournal; key: string; policyId: string;
+  onStep: (text: string) => void; identity: Identity;
+  /** Records a confirmed step before its signed bytes leave the journal. */
+  confirmed: (step: OwnerStep) => void;
+}
+function stepper({network, historyPauseMs, ask, sign, journal, key, policyId, onStep, identity, confirmed}: StepperInput) {
   const receipts: OwnerReceipt[] = [];
-  const fundedKey = `${key}:funded`;
-  const identity: Identity = {policyId, agent, amount};
   const done = (step: OwnerStep, receipt: OwnerReceipt) => {
-    // A confirmed funding is recorded before its signed bytes leave the journal.
-    if (step.action === 'fund') journal.set(fundedKey, JSON.stringify(identity));
+    confirmed(step);
     journal.remove(key);
     receipts.push(receipt);
   };
@@ -287,13 +304,14 @@ async function run({network, ask, sign, journal, key, policyId, agent, amount, o
     done(step, {...receipt, ledger});
     return true;
   };
-  const pending = saved(journal, key, identity);
-  // A funded marker of other inputs is refused before anything is sent.
-  funded(journal, fundedKey, identity);
-  if (pending) {
-    onStep('Checking the saved signed step…');
-    if (!await submit(pending.step, pending.signedPayload)) onStep('The saved step can never apply. Preparing a new one…');
-  }
+  /** Settle the saved signed step, if the journal holds one, before anything else is prepared. */
+  const settleSaved = async () => {
+    const pending = saved(journal, key, identity);
+    if (pending) {
+      onStep('Checking the saved signed step…');
+      if (!await submit(pending.step, pending.signedPayload)) onStep('The saved step can never apply. Preparing a new one…');
+    }
+  };
   const signAndSubmit = async (step: OwnerStep) => {
     if (step.expiresAt <= Math.floor(Date.now() / 1000)) throw new OwnerFlowError('The prepared owner step already expired. Resume to prepare a new one.', null, true);
     onStep(`Sign ${step.action.replace(/_/g, ' ')} in your wallet…`);
@@ -303,6 +321,20 @@ async function run({network, ask, sign, journal, key, policyId, agent, amount, o
     onStep('Waiting for the network to confirm…');
     if (!await submit(step, signedPayload)) throw new OwnerFlowError('The network did not take the signed step. Resume to prepare a new one.', null, true);
   };
+  return {receipts, settleSaved, signAndSubmit};
+}
+
+async function run({network, ask, sign, journal, key, policyId, agent, amount, onStep, historyPauseMs = 1_500}: InstallAndFundInput): Promise<{wallet: string; receipts: OwnerReceipt[]}> {
+  if (!canonicalNetwork(network)) throw new OwnerFlowError('Select a supported Stellar network.', null, false);
+  const fundedKey = `${key}:funded`;
+  const identity: Identity = {policyId, agent, amount};
+  const {receipts, settleSaved, signAndSubmit} = stepper({network, historyPauseMs, ask, sign, journal, key, policyId, onStep, identity,
+    // A confirmed funding is recorded before its signed bytes leave the journal.
+    confirmed: step => {if (step.action === 'fund') journal.set(fundedKey, JSON.stringify(identity));}});
+  // A saved step or a funded marker of other inputs is refused before anything is sent.
+  saved(journal, key, identity);
+  funded(journal, fundedKey, identity);
+  await settleSaved();
   let wallet: string | undefined;
   for (let i = 0; i < 4 && !wallet; i++) {
     onStep('Preparing the wallet…');
@@ -324,4 +356,83 @@ async function run({network, ask, sign, journal, key, policyId, agent, amount, o
     await signAndSubmit(step);
   }
   return {wallet, receipts};
+}
+
+export interface UpdateParamsInput {
+  /** The network of the policy. */
+  network: string;
+  /** Milliseconds between reads of a transaction that history does not hold yet. The default is 1500. */
+  historyPauseMs?: number;
+  /** One journal key per change: a confirmed change is never prepared or signed again under its key. */
+  ask: Ask; sign: SignStep; journal: OwnerJournal; key: string; policyId: string;
+  /** Each changed param with its complete new typed value, such as `{daily_spending_limit: {Int: '50000000'}}`. */
+  params: Record<string, unknown>;
+  /** The configuration revision that the owner reviewed, when the host shows one. */
+  expectedRevision?: number;
+  onStep: (text: string) => void;
+}
+
+/** Canonical text of a JSON value: object keys in code-unit order at every level. */
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
+  if (object(value)) return `{${Object.keys(value).sort().map(k => `${JSON.stringify(k)}:${canonical(value[k])}`).join(',')}}`;
+  return JSON.stringify(value) ?? 'null';
+}
+
+/**
+ * Change installed params on an active wallet with one owner signature. The service checks each value, prepares
+ * the owner step and, when the network confirms it, saves the new params of the installation and of the policy in
+ * one write. The wallet keeps its recorded usage and its request nonce.
+ * The workflow resumes as `installAndFund` does: a saved signed step is settled first, an expired step that never
+ * applied moves to the archive key, and the owner then signs a new step. A confirmed change is never prepared or
+ * signed again under its journal key; `done` is then true and `receipts` is empty.
+ * A refusal of the service keeps its typed code in `OwnerFlowError.code`: `param_invalid`, `param_out_of_range`,
+ * `update_unavailable` or `revision_changed`, and the codes of a refused submission.
+ */
+export async function updateParams(input: UpdateParamsInput): Promise<{receipts: OwnerReceipt[]; done: boolean}> {
+  const name = `allowit.owner-flow:${input.key}`;
+  if (running.has(name)) throw busy();
+  running.add(name);
+  try {
+    const locks = globalThis.navigator?.locks;
+    if (!locks) return await runUpdate(input);
+    return await locks.request(name, {ifAvailable: true}, async lock => {
+      if (!lock) throw busy();
+      return runUpdate(input);
+    });
+  } finally {
+    running.delete(name);
+  }
+}
+
+async function runUpdate({network, ask, sign, journal, key, policyId, params, expectedRevision, onStep, historyPauseMs = 1_500}: UpdateParamsInput): Promise<{receipts: OwnerReceipt[]; done: boolean}> {
+  if (!canonicalNetwork(network)) throw new OwnerFlowError('Select a supported Stellar network.', null, false);
+  if (!object(params) || Object.keys(params).length === 0 || Object.keys(params).length > 32)
+    throw new OwnerFlowError('Change one to 32 params.', PARAM_INVALID, false);
+  if (expectedRevision !== undefined && !(Number.isSafeInteger(expectedRevision) && expectedRevision >= 0))
+    throw new OwnerFlowError('The expected revision is invalid.', REVISION_CHANGED, false);
+  const updatedKey = `${key}:updated`;
+  const identity: Identity = {policyId, update: canonical({params, ...(expectedRevision === undefined ? {} : {expectedRevision})})};
+  const {receipts, settleSaved, signAndSubmit} = stepper({network, historyPauseMs, ask, sign, journal, key, policyId, onStep, identity,
+    // A confirmed update is recorded before its signed bytes leave the journal.
+    confirmed: step => {if (step.action === UPDATE_PARAMS) journal.set(updatedKey, JSON.stringify(identity));}});
+  // A saved step or a marker of another change is refused before anything is sent.
+  saved(journal, key, identity);
+  if (funded(journal, updatedKey, identity)) return {receipts, done: true};
+  await settleSaved();
+  if (funded(journal, updatedKey, identity)) return {receipts, done: true};
+  onStep('Preparing the change…');
+  let prepared: Prepared;
+  try {
+    prepared = await ask<Prepared>('native/owner/prepare', {policyId, action: UPDATE_PARAMS, params, ...(expectedRevision === undefined ? {} : {expectedRevision})});
+  } catch (error) {
+    // The service's reason and typed code reach the owner unchanged.
+    const code = object(error) && typeof error.code === 'string' ? error.code : null;
+    throw new OwnerFlowError(error instanceof Error && error.message ? error.message : 'The change could not be prepared.', code, code === NETWORK_UNAVAILABLE, error);
+  }
+  const step = stepOf(prepared?.step);
+  if (!object(prepared) || prepared.policyId !== policyId || !step || step.action !== UPDATE_PARAMS)
+    throw new OwnerFlowError('The reply differs from this change.', null, false);
+  await signAndSubmit(step);
+  return {receipts, done: true};
 }

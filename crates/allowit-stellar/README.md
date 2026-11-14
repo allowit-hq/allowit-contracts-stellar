@@ -204,7 +204,7 @@ SDK callers retain the original packet and own retries. `rpc::vault_redeemable` 
 
 The binary `allowit-stellar-admin` (`src/bin/allowit-stellar-admin/`) is the administration command line: native account setup, shutdown and verification from Horizon state, and contract upload, deployment, read and owner or parent administration through Stellar CLI 28.1.0. It uses these checks, prints unsigned XDR and never signs or submits. See [docs/admin.md](../../docs/admin.md).
 
-Before signing an untrusted owner step, construct `owner_intent::ExpectedOwnerIntent` from the owner's selected policy, reviewed executable, destination and amount. Its limits name the network, owner, independently observed next sequence, fee ceiling and latest expiry. `validate_owner_transaction` compares the complete unsigned XDR and step metadata with that intent. It supports exact Wasm uploads, policy-wallet creation, funding transfers, instance/code lifetime renewal and the existing three-operation native setup. Creation checks the selected tier, source binding, params, roles, asset, executable and salt-derived wallet. `validate_deployment` also checks the deployment metadata; `validate_native_setup` also checks the native setup identity digest and complete reconstruction. Server-supplied business fields must not become the caller's expected values.
+Before signing an untrusted owner step, construct `owner_intent::ExpectedOwnerIntent` from the owner's selected policy, reviewed executable, destination and amount. Its limits name the network, owner, independently observed next sequence, fee ceiling and latest expiry. `validate_owner_transaction` compares the complete unsigned XDR and step metadata with that intent. It supports exact Wasm uploads, policy-wallet creation, funding transfers, the params update of an installed wallet, instance/code lifetime renewal and the existing three-operation native setup. Creation checks the selected tier, source binding, params, roles, asset, executable and salt-derived wallet. `validate_deployment` also checks the deployment metadata; `validate_native_setup` also checks the native setup identity digest and complete reconstruction. Server-supplied business fields must not become the caller's expected values.
 
 `OwnerAction::Extend` binds one `ExtendFootprintTtl` operation to exactly the selected wallet instance and executable in the read-only footprint. `extend_to` is a relative lifetime in ledgers, at most `max_entry_ttl - 1`, as specified by [Stellar state archival](https://github.com/stellar/stellar-protocol/blob/master/core/cap-0046-12.md). `rpc::wallet_lifetime` reads the matching current entries and archival limit. The renewal threshold includes the same 17,280-ledger headroom as the owner deployment flow, up to the maximum target.
 
@@ -263,5 +263,36 @@ The owner must enable x402. Its raw Ed25519 keys need no funded G-accounts. Nati
 `admin::OwnerAdmin` prepares unsigned owner transactions for `deploy_policy` (the next version with new params, rules or owner keys and the installed code), `deploy_code` (the same with uploaded layout 4 code installed atomically), `set_pause`, `recover` and `recover_to`. `deploy_policy_source` prepares the same update bound to a target source, as `contract_admin.py` binds an owner packet to `--policy-source`; a Common rules-only update uses it with the installed code. `PolicyDeployment::for_source` binds a source and params to the installed tier. Each call checks only what the contract entrypoint reads: `recover` reads the kept fields of any readable layout (1 to 4), so a wallet with a broken binding stays recoverable; `set_pause` and `deploy_code` also need the exact layout 4 state; `deploy_policy` also needs the installed executable and policy binding. Preparation simulates each call in recording mode without auth entries, checks that the recorded entries name exactly the required owners (the current owner, plus the new owner for an owner handoff), and puts those entries in the unsigned transaction for the owners to sign.
 
 An owner handoff returns the new owner in `pending_authorizers`. Its transaction cannot be submitted yet, and its hash is provisional. The new owner signs its recorded entry with a `signature_expiration_ledger` after the latest ledger. `OwnerAdmin::complete_owner_handoff` checks that entry and its signature, simulates again in enforce mode for the final fee and resources, and returns the final transaction and hash. The current owner signs only that transaction.
+
+### Params update of an active wallet
+
+An owner changes installed params on an active policy wallet with one signature. The update is one `deploy_policy`
+call at the next configuration revision. It keeps the owner, agent, server, source binding, rules, x402 choice and
+installed code, and the wallet keeps its policy state and request nonce. The recorded usage therefore stays as it
+was: an update neither raises nor resets a counter. Simple, Common and Custom wallets take the update. A Custom
+wallet takes any typed value; the server checks the range of a canonical rule.
+
+- Server: `RuntimeProvider::prepare_params_update` reads the installed revision and x402 choice from the ledger,
+  refuses an update whose expected revision is not the installed one, and prepares the owner step with the action
+  `update_params`. `OwnerRuntime::with_params` returns the installation to store after the step settles.
+- Owner: `OwnerProvider::update_params` reads the same facts through the owner's RPC and reconstructs the packet
+  from the owner's document with `owner_intent::OwnerAction::UpdatePolicy`. A step with another value, target
+  revision, wallet, owner or code never reaches the signer. The workflow resumes under its request ID: it keeps the
+  revision that its first run read and sends the saved signed bytes again. Its outcome selects the updated
+  installation, and its request ID exports that installation as an activation ID does.
+- A request that the agent prepared under the earlier revision is `StaleRequest` after the update; it uses no
+  nonce and charges nothing. The signed update applies once: a second submission targets a revision that is no
+  longer the next one.
+
+`OwnerProvider::verify` reads the wallet through the owner's RPC, without the server, and compares it with the
+owner's document: executable, source binding, rules, params, wallet kind, roles, asset and policy instance. It
+returns each comparison and the state read-back: the configuration revision, the pause flag, the params and the
+counters (`spent`, `day_spent`, `day`, `calls` and the nonce). A Simple wallet stores its params and nonce and the
+server records its usage, so its counters are marked `server`. A keypair account compares its signers.
+
+`OwnerProvider::edit_params` and `revise` send the `micro/params` and `micro/revise` owner routes for an unsigned
+draft and check that the reply is the next revision of the same draft on the same wallet binding.
+`OwnerProvider::paired_export` returns what the server evaluates (the complete source, its rules and evidence
+functions, every param) and what the wallet kind enforces.
 
 `recover` moves the full balance observed at preparation. An agent payment that settles first makes it fail with `InsufficientFunds`. Pause automation with `set_pause` before a recovery.

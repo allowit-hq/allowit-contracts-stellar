@@ -33,6 +33,17 @@ bytes and lets the owner sign a new step, and an unreadable chain keeps the step
 and `network_unavailable` keep the step for a retry (`OwnerFlowError.retry`). A saved step and the funded marker name
 the policy, agent key and amount; a resume with other inputs is refused.
 
+`ownerWorkflow.updateParams` changes installed params on an active wallet with one owner signature. The host passes
+each changed param with its complete typed value, such as `{daily_spending_limit: {Int: '50000000'}}`, and one journal
+key per change. The service checks the values and prepares the `update_params` step: one call that writes the next
+configuration revision of the wallet and keeps its recorded usage and request nonce. The workflow settles a saved
+signed step first, as `installAndFund` does, and never prepares or signs a confirmed change again under its key.
+A refusal keeps the typed code of the service in `OwnerFlowError.code`: `param_invalid`, `param_out_of_range`,
+`update_unavailable` or `revision_changed`.
+The `owner-sign` element checks an `update_params` step of a Standard wallet against `data.expected` like an install
+step: the selection holds the complete new params and `update: {deploymentVersion, x402Enabled}`. The verifier
+reconstructs the exact policy packet, so a step with another value, revision, wallet or code is not signed.
+
 ## Build and test
 
 The package exports JavaScript modules and TypeScript declarations. StrKey decoding, asset contract IDs and network passphrases come from `@stellar/stellar-sdk`. `test:browser` reads the Common Wasm that `scripts/build-contracts.sh` builds. Run these commands from `npm/stellar/`:

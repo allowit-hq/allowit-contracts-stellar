@@ -146,6 +146,18 @@ pub fn with_policy(
         .map_err(|_| Error::config("Cannot encode new installation projection"))?;
     configuration(&c.network, &bytes)
 }
+/// The installation after a confirmed params update of a policy wallet.
+pub fn with_params(
+    config: &Configuration,
+    update: &crate::host::runtime::ParamsUpdate,
+) -> Result<Configuration> {
+    let c: WalletConfig = serde_json::from_slice(config.bytes())
+        .map_err(|_| Error::config("Invalid retained installation"))?;
+    let next = super::params_update::updated_config(&c, update)?;
+    let bytes = serde_json::to_vec(&next)
+        .map_err(|_| Error::config("Cannot encode the updated installation"))?;
+    configuration(&next.network, &bytes)
+}
 pub fn code_hash(wasm: &[u8]) -> Result<[u8; 32]> {
     native::admin::check_wallet_code(wasm).map_err(crate::provider::failure)
 }

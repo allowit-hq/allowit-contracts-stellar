@@ -531,3 +531,291 @@ fn generation_sends_the_chosen_wallet_kind_keeps_the_bound_one_and_reports_a_typ
         );
     }
 }
+
+fn limit_update(
+    selected: &workflow::OwnerPolicy,
+    units: i128,
+) -> crate::host::runtime::ParamsUpdate {
+    crate::host::runtime::ParamsUpdate {
+        policy_id: selected.policy.id.clone(),
+        expected_revision: None,
+        changes: [(
+            "payment_limit".to_owned(),
+            allowit_core::policy::PolicyValue(allowit_core::AllowitValue::Int(units)),
+        )]
+        .into(),
+    }
+}
+/// The step that a server prepares for `update` over revision 1.
+fn prepared_update(
+    selected: &workflow::OwnerPolicy,
+    update: &crate::host::runtime::ParamsUpdate,
+    now: u64,
+) -> Value {
+    let deployment =
+        crate::provider::params_update::deployment(&selected.config, update, false).unwrap();
+    update_step(&selected.config, &deployment, 2, now)
+}
+#[test]
+fn params_update_signs_one_exact_policy_packet_and_resumes_without_another_signature() {
+    let selected = selection();
+    let update = limit_update(&selected, 20_000_000);
+    let now = wire::now();
+    let mut plan = wire::Plan::new(&account(11));
+    plan.owner_prepare = Some(
+        json!({"policyId":selected.policy.id,"step":prepared_update(&selected, &update, now)}),
+    );
+    plan.lose_owner_reply = true;
+    let server = wire::Server::new(plan);
+    let mut client = OwnerClient::with_authority(
+        &authority(&server.url),
+        "http://localhost:5173",
+        &account(11),
+    )
+    .unwrap();
+    let signer = key();
+    client.authenticate(&signer, now).unwrap();
+    let prior = signer.calls.load(Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().canonicalize().unwrap().join("proof");
+    let store = Store::open(&path).unwrap();
+    let mut chain = Chain::new(selected.config.clone());
+    chain.server = Some(server.state.clone());
+    let usage = crate::policy::params_from_json(
+        &json!({"spent": 7_000_000, "day_spent": 7_000_000, "day": 20_000, "calls": 1}),
+        None,
+    )
+    .unwrap();
+    *chain.installed.lock().unwrap() = Some((selected.config.params.clone(), 1, usage.clone()));
+    let before =
+        crate::provider::params_update::verify(&chain, &selected.policy.id, &selected.config)
+            .unwrap();
+    assert!(before.matches);
+    assert_eq!(before.state.revision, 1);
+    // The reply of the submission is lost: the signed step stays saved and unresolved.
+    let capabilities = OwnerCapabilities {
+        store: &store,
+        rpc: &chain,
+        signer: &signer,
+        clock: &|| Ok(now),
+    };
+    assert_eq!(
+        client
+            .update_params(capabilities, &selected, "update-lost-001", &update, 10_000)
+            .unwrap_err()
+            .code,
+        5
+    );
+    assert_eq!(signer.calls.load(Ordering::SeqCst), prior + 1);
+    let saved: Value = store.load("update-lost-001").unwrap().unwrap();
+    assert_eq!(
+        saved["work"]["updateParams"]["update"]["expectedRevision"],
+        1
+    );
+    assert_eq!(saved["steps"][0]["packet"]["action"], "update_params");
+    let signed = saved["steps"][0]["signedXdr"].clone();
+    // The update settled: the wallet holds the new params at the next revision, and it kept
+    // its recorded usage.
+    let next = crate::provider::params_update::updated_config(&selected.config, &update).unwrap();
+    *chain.installed.lock().unwrap() = Some((next.params.clone(), 2, usage));
+    drop(store);
+    let reopened = Store::open(&path).unwrap();
+    let capabilities = OwnerCapabilities {
+        store: &reopened,
+        rpc: &chain,
+        signer: &signer,
+        clock: &|| Ok(now + 301),
+    };
+    let out = client
+        .update_params(capabilities, &selected, "update-lost-001", &update, 10_000)
+        .unwrap();
+    assert_eq!(out.state, "updated");
+    assert_eq!(out.selection.config, next);
+    assert_eq!(
+        out.selection
+            .policy
+            .runtime
+            .instance_binding
+            .portable
+            .params,
+        next.params
+    );
+    assert_eq!(out.receipts.len(), 1);
+    assert_eq!(out.receipts[0].action, "update_params");
+    // The resumed request asked for no other signature and sent the same signed bytes.
+    assert_eq!(signer.calls.load(Ordering::SeqCst), prior + 1);
+    {
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.owner_submissions.len(), 2);
+        assert!(
+            state
+                .owner_submissions
+                .iter()
+                .all(|s| s["payload"] == signed)
+        );
+    }
+    // The outcome is the owner's new document: the ledger matches it and no longer matches
+    // the earlier one. The counters are those from before the update.
+    let after =
+        crate::provider::params_update::verify(&chain, &out.selection.policy.id, &next).unwrap();
+    assert!(after.matches);
+    assert_eq!(after.state.revision, 2);
+    assert_eq!(after.state.counters, before.state.counters);
+    assert_eq!(
+        after.state.counters.as_ref().unwrap().spent_total,
+        7_000_000
+    );
+    let stale =
+        crate::provider::params_update::verify(&chain, &selected.policy.id, &selected.config)
+            .unwrap();
+    assert!(!stale.matches);
+    assert_eq!(
+        stale
+            .comparisons
+            .iter()
+            .filter(|c| !c.matches)
+            .map(|c| c.field.as_str())
+            .collect::<Vec<_>>(),
+        ["params"]
+    );
+    // A completed update exports the updated installation, and only that one.
+    let other = limit_update(&selected, 30_000_000);
+    let capabilities = OwnerCapabilities {
+        store: &reopened,
+        rpc: &chain,
+        signer: &signer,
+        clock: &|| Ok(now + 301),
+    };
+    assert!(
+        client
+            .update_params(capabilities, &selected, "update-lost-001", &other, 10_000)
+            .is_err(),
+        "a request ID binds one update"
+    );
+    assert_eq!(signer.calls.load(Ordering::SeqCst), prior + 1);
+}
+#[test]
+fn changed_update_packets_and_invalid_updates_never_reach_the_signer() {
+    let selected = selection();
+    let update = limit_update(&selected, 20_000_000);
+    let now = wire::now();
+    let tampered = {
+        // Another value than the owner selected.
+        let other = limit_update(&selected, 90_000_000);
+        let value = prepared_update(&selected, &other, now);
+        // Another target revision.
+        let deployment =
+            crate::provider::params_update::deployment(&selected.config, &update, false).unwrap();
+        let version = update_step(&selected.config, &deployment, 3, now);
+        // A new owner in the packet.
+        let mut handoff = deployment.clone();
+        handoff.owner = account(51);
+        let owner = update_step(&selected.config, &handoff, 2, now);
+        // A funding transfer under the update action.
+        let mut transfer = fund_step(&selected.config, 10_000_000, now);
+        transfer["action"] = json!("update_params");
+        [value, version, owner, transfer]
+    };
+    for step in tampered {
+        let mut plan = wire::Plan::new(&account(11));
+        plan.owner_prepare = Some(json!({"policyId":selected.policy.id,"step":step}));
+        let server = wire::Server::new(plan);
+        let mut client = OwnerClient::with_authority(
+            &authority(&server.url),
+            "http://localhost:5173",
+            &account(11),
+        )
+        .unwrap();
+        let signer = key();
+        client.authenticate(&signer, now).unwrap();
+        let prior = signer.calls.load(Ordering::SeqCst);
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().canonicalize().unwrap().join("proof")).unwrap();
+        let mut chain = Chain::new(selected.config.clone());
+        chain.server = Some(server.state.clone());
+        let capabilities = OwnerCapabilities {
+            store: &store,
+            rpc: &chain,
+            signer: &signer,
+            clock: &|| Ok(now),
+        };
+        assert!(
+            client
+                .update_params(capabilities, &selected, "update-test-001", &update, 10_000)
+                .is_err()
+        );
+        assert_eq!(signer.calls.load(Ordering::SeqCst), prior);
+        assert_eq!(server.calls("/api/native/owner/submit"), 0);
+    }
+    // An update that the installation cannot take is refused before the server is asked.
+    let mut plan = wire::Plan::new(&account(11));
+    plan.owner_prepare = Some(json!({"policyId":selected.policy.id,"step":Value::Null}));
+    let server = wire::Server::new(plan);
+    let mut client = OwnerClient::with_authority(
+        &authority(&server.url),
+        "http://localhost:5173",
+        &account(11),
+    )
+    .unwrap();
+    let signer = key();
+    client.authenticate(&signer, now).unwrap();
+    let prior = signer.calls.load(Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().canonicalize().unwrap().join("proof")).unwrap();
+    let mut chain = Chain::new(selected.config.clone());
+    chain.server = Some(server.state.clone());
+    let value = |v| allowit_core::policy::PolicyValue(v);
+    use allowit_core::AllowitValue as V;
+    let invalid = [
+        // No installed param of this name.
+        ("call_limit", value(V::Int(5)), None),
+        // Another type than the installed value.
+        ("payment_limit", value(V::Bool(true)), None),
+        // Outside the range of the rule.
+        ("payment_limit", value(V::Int(-1)), None),
+        // The value that is installed already.
+        ("payment_limit", value(V::Int(10_000_000)), None),
+        // Another configuration revision than the wallet holds.
+        ("payment_limit", value(V::Int(20_000_000)), Some(7)),
+    ];
+    for (key, value, expected_revision) in invalid {
+        let update = crate::host::runtime::ParamsUpdate {
+            policy_id: selected.policy.id.clone(),
+            expected_revision,
+            changes: [(key.to_owned(), value)].into(),
+        };
+        let capabilities = OwnerCapabilities {
+            store: &store,
+            rpc: &chain,
+            signer: &signer,
+            clock: &|| Ok(now),
+        };
+        assert!(
+            client
+                .update_params(capabilities, &selected, "update-test-002", &update, 10_000)
+                .is_err(),
+            "{key}"
+        );
+        assert_eq!(server.calls("/api/native/owner/prepare"), 0, "{key}");
+        assert_eq!(signer.calls.load(Ordering::SeqCst), prior, "{key}");
+    }
+    // Another policy's update is refused for this installation.
+    let mut foreign = limit_update(&selected, 20_000_000);
+    foreign.policy_id = "0".repeat(64);
+    let capabilities = OwnerCapabilities {
+        store: &store,
+        rpc: &chain,
+        signer: &signer,
+        clock: &|| Ok(now),
+    };
+    assert!(
+        client
+            .update_params(capabilities, &selected, "update-test-003", &foreign, 10_000)
+            .is_err()
+    );
+    assert_eq!(server.calls("/api/native/owner/prepare"), 0);
+    // A keypair account holds no installed params to update.
+    let native = native_selection();
+    let update = limit_update(&native, 20_000_000);
+    assert!(crate::provider::params_update::next_params(&native.config, &update).is_err());
+}

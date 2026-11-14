@@ -59,6 +59,8 @@ pub fn validate_retained_owner_transaction(original: &OwnerTransaction) -> Resul
             HostFunction::InvokeContract(call) => {
                 call.function_name.0.as_slice() == original.action.as_bytes()
                     || (original.action == "fund" && call.function_name.0.as_slice() == b"transfer")
+                    || (original.action == "update_params"
+                        && call.function_name.0.as_slice() == b"deploy_policy")
             }
             _ => false,
         },
@@ -160,6 +162,14 @@ pub enum OwnerAction {
         wasm_hash: [u8; 32],
         extend_to: u32,
     },
+    /// Exactly one `deploy_policy` call on the selected wallet with the complete caller-selected
+    /// packet at the caller-observed next version. The packet installs no code and keeps the
+    /// owner, so the transaction source alone authorizes it.
+    UpdatePolicy {
+        wallet: String,
+        deployment: Box<admin::PolicyDeployment>,
+        version: u64,
+    },
     /// The exact existing three-operation native setup, reconstructed from a caller-observed
     /// fresh account. No server-provided signer or threshold is accepted as expected intent.
     NativeSetup {
@@ -178,6 +188,7 @@ impl OwnerAction {
             Self::CreateWallet { .. } => "create_wallet",
             Self::Fund { .. } => "fund",
             Self::Extend { .. } => "extend",
+            Self::UpdatePolicy { .. } => "update_params",
             Self::NativeSetup { .. } => "native_setup",
         }
     }
@@ -485,6 +496,30 @@ fn validate_host(
                 || invoke.auth[0].credentials != SorobanCredentials::SourceAccount
             {
                 return Err("Owner funding differs from the exact selected transfer".into());
+            }
+            admin::validate_auth(&limits.network, &exact, &invoke.auth, None)?;
+        }
+        OwnerAction::UpdatePolicy {
+            wallet,
+            deployment,
+            version,
+        } => {
+            Contract::from_string(wallet).map_err(err)?;
+            if deployment.owner != limits.owner || deployment.wasm_hash.is_some() {
+                return Err("Owner update must keep the owner and the installed code".into());
+            }
+            let exact = HostFunction::InvokeContract(InvokeContractArgs {
+                contract_address: address(wallet)?,
+                function_name: ScSymbol("deploy_policy".try_into().map_err(err)?),
+                args: vec![deployment.scval(allowit_core::admin::DeploymentVersion(*version))?]
+                    .try_into()
+                    .map_err(err)?,
+            });
+            if invoke.host_function != exact
+                || invoke.auth.len() != 1
+                || invoke.auth[0].credentials != SorobanCredentials::SourceAccount
+            {
+                return Err("Owner update differs from the exact selected policy packet".into());
             }
             admin::validate_auth(&limits.network, &exact, &invoke.auth, None)?;
         }

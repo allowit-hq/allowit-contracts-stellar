@@ -24,7 +24,11 @@ use stellar_xdr::*;
 
 pub mod admin;
 mod authorization;
-#[cfg(all(target_arch = "wasm32", feature = "browser-owner-verifier"))]
+// The bridge is built for the browser. Native test builds compile it to test its checks.
+#[cfg(any(
+    all(target_arch = "wasm32", feature = "browser-owner-verifier"),
+    all(test, not(target_arch = "wasm32"))
+))]
 mod browser_owner;
 pub mod contract;
 pub mod networks;

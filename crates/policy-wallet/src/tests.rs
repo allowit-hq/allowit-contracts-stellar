@@ -628,6 +628,91 @@ fn common_rules_bound_transfers_and_commit_usage_once() {
     assert_eq!(f.history().day_spent, 100);
     assert_eq!(f.history().spent, 250);
 }
+/// An owner params update on an active wallet. Only the owner signs it. Recorded usage and the
+/// request nonce carry over, so an update neither raises nor resets a counter. A request that was
+/// prepared under the earlier revision is stale, and the signed packet applies once.
+#[test]
+fn owner_params_update_keeps_usage_and_nonce_and_fences_earlier_requests() {
+    for wasm in [SIMPLE, COMMON, CUSTOM] {
+        let f = Fixture::new(wasm, false);
+        assert_eq!(f.transfer(100).amount, 100);
+        // Prepared under revision 0, before the update.
+        let pending = f.execution(20);
+        let (usage, before) = (f.client().policy_state(), f.client().state());
+        let mut p = f.deployment();
+        set_param(
+            &mut p.params,
+            DAILY_SPENDING_LIMIT,
+            Some(AllowitValue::Int(120)),
+        );
+        // The agent, the server and a stranger cannot update the params.
+        for actor in [&f.agent, &f.server, &Address::generate(&f.env)] {
+            f.auth(&[actor], "deploy_policy", (p.clone(),).into_val(&f.env));
+            assert!(f.client().try_deploy_policy(&p).is_err());
+            assert_eq!(f.client().state(), before);
+        }
+        f.auth(&[&f.owner], "deploy_policy", (p.clone(),).into_val(&f.env));
+        f.client().deploy_policy(&p);
+        let after = f.client().state();
+        assert_eq!(after.deployment_version, before.deployment_version + 1);
+        assert_eq!(after.nonce, before.nonce);
+        assert_eq!(after.params, p.params);
+        assert_eq!(f.client().policy_state(), usage);
+        assert_eq!(f.balance(), 900);
+        // The signed update applies once.
+        f.auth(&[&f.owner], "deploy_policy", (p.clone(),).into_val(&f.env));
+        assert_eq!(
+            f.client().try_deploy_policy(&p),
+            Err(Ok(AllowitWalletError::StaleRequest))
+        );
+        // The request of the earlier revision is stale. It uses no nonce and charges nothing.
+        assert_eq!(
+            execute_as_actors(&f, &pending),
+            Err(AllowitWalletError::StaleRequest)
+        );
+        assert_eq!(f.client().state(), after);
+        assert_eq!(f.client().policy_state(), usage);
+        if wasm == SIMPLE {
+            // The server enforces a Simple policy; the wallet stores the params only.
+            continue;
+        }
+        // A Custom wallet reports a rule denial with the rule's own code, a standard tier with
+        // `PolicyDenied`; either way the operation does not run.
+        let denied = |amount: i128| {
+            let e = f.execution(amount);
+            f.auth(
+                &[&f.agent, &f.server],
+                "execute",
+                (e.clone(),).into_val(&f.env),
+            );
+            f.client().try_execute(&e).is_err()
+        };
+        // The wallet enforces the new value against the usage it kept: 100 of 120 is spent.
+        assert!(denied(30));
+        assert_eq!(f.transfer(20).amount, 20);
+        assert_eq!(f.history().day_spent, 120);
+        assert_eq!(f.history().spent, 120);
+        assert_eq!(f.history().calls, 2);
+        // A limit below the recorded usage keeps the usage and denies the next operation.
+        let mut lower = f.deployment();
+        set_param(
+            &mut lower.params,
+            DAILY_SPENDING_LIMIT,
+            Some(AllowitValue::Int(50)),
+        );
+        f.auth(
+            &[&f.owner],
+            "deploy_policy",
+            (lower.clone(),).into_val(&f.env),
+        );
+        f.client().deploy_policy(&lower);
+        assert_eq!(f.history().day_spent, 120);
+        assert!(denied(1));
+        assert_eq!(f.history().day_spent, 120);
+        assert_eq!(f.balance(), 880);
+    }
+}
+
 #[test]
 fn common_skips_absent_params_and_rejects_unknown_names_keys_and_values() {
     let f = Fixture::new(COMMON, false);
