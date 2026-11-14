@@ -226,8 +226,83 @@ pub fn prepare_with(
         PolicyBinding::from_scval(&readonly_call(rpc, c, &state.source, "policy_binding")?)?
             .verify(c, operation.kind())?;
     }
-    let intent = prepare_for_native_preflight(c, request, terms, &state, now, expires_at)?;
-    simulate(rpc, &intent)
+    let ceiling = terms.expense.as_ref();
+    let mut terms = priced_terms(rpc, c, request, terms, &state, now, expires_at)?;
+    // The invocation that carries the priced expense is simulated on its own. A policy that
+    // reads the gas can need more resources with it than with the provisional expense. Its
+    // bound then follows from its own resource fee, within the ceiling, at most
+    // `REPRICE_ROUNDS` times. After that the bound decides, and `attach_simulation` refuses a
+    // resource fee above it.
+    let mut rounds = 0;
+    loop {
+        let intent = prepare_for_native_preflight(c, request, &terms, &state, now, expires_at)?;
+        let encoded = simulated_resources(rpc, &intent)?;
+        let repriced = match (ceiling, &terms.expense) {
+            (Some(ceiling), Some(signed)) if rounds < REPRICE_ROUNDS => {
+                let resources: SorobanTransactionData = read(&encoded)?;
+                let bound = fee_bound(resources.resource_fee)?.min(ceiling.max_fee_stroops);
+                // The margin of the signed bound absorbs a small change. Only a declared fee
+                // above the signed bound prices the operation again, and only upward.
+                let declared = resources
+                    .resource_fee
+                    .saturating_add(i64::from(INCLUSION_FEE_STROOPS));
+                (declared > i64::from(signed.max_fee_stroops) && bound > signed.max_fee_stroops)
+                    .then(|| ceiling.with_fee_bound(bound))
+            }
+            _ => None,
+        };
+        let Some(expense) = repriced else {
+            let mut prepared = attach_simulation(&intent, &encoded)?;
+            record_native_preflight(&mut prepared)?;
+            return Ok(prepared);
+        };
+        terms.expense = Some(expense?);
+        rounds += 1;
+    }
+}
+/// How often preparation prices an operation again from the simulation of its priced
+/// invocation.
+const REPRICE_ROUNDS: u8 = 2;
+/// `terms` with the expense fee bound lowered from the caller's ceiling to the fee that this
+/// operation can be charged: `fee_bound` of its simulated resource fee, at most the ceiling.
+///
+/// The expense is an argument of the invocation, so the fee is simulated first with a
+/// provisional fee bound. The wallet runs its whole policy in that simulation. The lowest bound,
+/// the inclusion fee alone, is tried first: a limit that admits the operation at its final bound
+/// admits it there. A policy can read the gas of a request and refuse the lowest bound alone, so
+/// a refusal there is not final: the ceiling is tried next. When the wallet refuses both, the
+/// first refusal is the answer. The caller then simulates the operation again with the returned
+/// terms, which decides the policy and the declared fee, and prices it again when that
+/// simulation needs a higher bound.
+fn priced_terms(
+    rpc: &dyn Rpc,
+    c: &WalletConfig,
+    request: &ExecutionRequest,
+    terms: &ExecutionTerms,
+    state: &TrustedState,
+    now: u64,
+    expires_at: u64,
+) -> Result<ExecutionTerms> {
+    let Some(ceiling) = terms.expense.as_ref().filter(|e| e.max_fee_stroops > 0) else {
+        return Ok(terms.clone());
+    };
+    let with_bound = |fee: u32| -> Result<ExecutionTerms> {
+        Ok(ExecutionTerms {
+            args: terms.args.clone(),
+            expense: Some(ceiling.with_fee_bound(fee.min(ceiling.max_fee_stroops))?),
+        })
+    };
+    let resource_fee = |fee: u32| -> Result<i64> {
+        let probe =
+            prepare_for_native_preflight(c, request, &with_bound(fee)?, state, now, expires_at)?;
+        let resources: SorobanTransactionData = read(&simulated_resources(rpc, &probe)?)?;
+        Ok(resources.resource_fee)
+    };
+    let simulated = match resource_fee(INCLUSION_FEE_STROOPS) {
+        Ok(fee) => fee,
+        Err(lowest) => resource_fee(ceiling.max_fee_stroops).map_err(|_| lowest)?,
+    };
+    with_bound(fee_bound(simulated)?)
 }
 pub(crate) fn reject_restoration(value: &Value) -> Result<()> {
     if value
@@ -746,6 +821,40 @@ pub fn validate_settled_policy_packet(
     Ok(())
 }
 
+/// The gas units that the wallet contract counted against its limits for the transaction of
+/// `receipt`: the `gas_units` of the expense that its `execute` invocation carries. Zero for a
+/// failed transaction, which counts nothing, for an unpriced request and for a transaction that
+/// invokes no policy wallet.
+pub fn counted_gas_units(receipt: &VerifiedReceipt) -> Result<i128> {
+    if receipt.status != OperationStatus::Confirmed {
+        return Ok(0);
+    }
+    let TransactionEnvelope::Tx(envelope) = read(&receipt.envelope_xdr)? else {
+        return Ok(0);
+    };
+    let Some(OperationBody::InvokeHostFunction(op)) =
+        envelope.tx.operations.first().map(|op| &op.body)
+    else {
+        return Ok(0);
+    };
+    let HostFunction::InvokeContract(call) = &op.host_function else {
+        return Ok(0);
+    };
+    let Some(expense) = call
+        .args
+        .first()
+        .filter(|_| call.function_name.0.as_slice() == b"execute")
+        .and_then(|request| map_field(request, "expense").ok())
+    else {
+        return Ok(0);
+    };
+    match expense {
+        ScVal::Vec(Some(variant)) if variant.len() == 2 => {
+            wide(map_field(&variant[1], "gas_units")?)
+        }
+        _ => Ok(0),
+    }
+}
 /// Read a verified terminal receipt. Absence remains unknown and does not release reservations.
 pub fn receipt_by_hash(
     rpc: &dyn Rpc,

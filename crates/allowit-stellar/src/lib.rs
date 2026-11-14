@@ -300,6 +300,31 @@ impl OperationKind {
             .ok_or_else(|| "Unknown policy wallet operation".into())
     }
 }
+/// The inclusion fee that a policy wallet transaction declares on top of its resource fee, in
+/// stroops: the network's minimum base fee.
+pub const INCLUSION_FEE_STROOPS: u32 = 100;
+/// The margin of a fee bound is the simulated resource fee divided by this, rounded up: 1%.
+const FEE_BOUND_MARGIN_DIVISOR: u32 = 100;
+/// The fee bound that a policy wallet operation signs and its wallet counts as gas, from the
+/// resource fee of a recording simulation of the same operation: the resource fee, the
+/// inclusion fee and a 1% margin, rounded up.
+///
+/// The network charges a transaction at most its declared fee. It refunds the unused part of
+/// the refundable resource fee (rent, events and the return value); the wallet contract cannot
+/// observe that refund. The declared fee of the operation is the resource fee of its final
+/// simulation plus the inclusion fee, and `attach_simulation` refuses a declared fee above the
+/// signed bound, so the counted gas is never below the fee charged. A recording simulation
+/// prices the server's authorization nonce at the longest entry lifetime, so its resource fee
+/// covers the final enforce-mode simulation of the signed entry. The margin covers the change of
+/// the resource fee between the two simulations: rent grows with each closed ledger, and the
+/// rent rate follows the ledger state size.
+pub fn fee_bound(resource_fee: i64) -> Result<u32> {
+    let resource = u32::try_from(resource_fee).map_err(|_| "Invalid resource fee")?;
+    resource
+        .checked_add(INCLUSION_FEE_STROOPS)
+        .and_then(|fee| fee.checked_add(resource.div_ceil(FEE_BOUND_MARGIN_DIVISOR)))
+        .ok_or_else(|| "Resource fee overflow".into())
+}
 /// Request-bound conservative economic ceilings in the wallet asset, attested by the server
 /// signer with its authorization: `AllowitExpenseBounds`. Amounts use the wallet asset's seven
 /// decimals. For XLM, gas equals the fee bound in stroops.
@@ -336,6 +361,31 @@ impl ExpenseBounds {
             max_fee_stroops,
             observed_ledger,
             day: now / allowit_core::DAY,
+        })
+    }
+    /// These bounds with the fee bound lowered to `fee_stroops`. Gas falls pro rata and rounds
+    /// up, so it never counts less than the gas rate of these bounds prices `fee_stroops`; for
+    /// XLM it is `fee_stroops` itself. Spent units fall by the same gas.
+    pub fn with_fee_bound(&self, fee_stroops: u32) -> Result<Self> {
+        if fee_stroops == 0 || fee_stroops > self.max_fee_stroops || self.gas_units < 0 {
+            return Err("A fee bound lowers a positive fee ceiling".into());
+        }
+        let ceiling = i128::from(self.max_fee_stroops);
+        let gas_units = self
+            .gas_units
+            .checked_mul(i128::from(fee_stroops))
+            .and_then(|units| units.checked_add(ceiling - 1))
+            .map(|units| units / ceiling)
+            .ok_or("Expense overflow")?;
+        Ok(Self {
+            gas_units,
+            spent_units: self
+                .spent_units
+                .checked_sub(self.gas_units)
+                .and_then(|principal| principal.checked_add(gas_units))
+                .ok_or("Expense overflow")?,
+            max_fee_stroops: fee_stroops,
+            ..self.clone()
         })
     }
 }
@@ -2028,7 +2078,7 @@ pub fn attach_simulation(p: &PreparedOperation, data: &str) -> Result<PreparedOp
     let resource: SorobanTransactionData = read(data)?;
     let required = u32::try_from(resource.resource_fee)
         .map_err(|_| "Invalid resource fee")?
-        .checked_add(100)
+        .checked_add(INCLUSION_FEE_STROOPS)
         .ok_or("Resource fee overflow")?;
     if required > p.config.max_fee_stroops
         || p.terms

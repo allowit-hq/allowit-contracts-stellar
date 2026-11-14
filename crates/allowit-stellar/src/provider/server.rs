@@ -331,6 +331,9 @@ pub fn same_snapshot(a: &Snapshot, b: &Snapshot) -> Result<bool> {
 pub fn receipt_info(p: &Packet) -> Result<ReceiptInfo> {
     let r: rpc::VerifiedReceipt = decode_packet(p)?;
     let result: stellar_xdr::TransactionResult = checked(native::read(&r.result_xdr))?;
+    // A policy wallet counts the gas units of its signed expense. A keypair account has no
+    // counters: the engine prices its fee through ServerHooks::charged_fee.
+    let charged_units = checked(rpc::counted_gas_units(&r))?;
     Ok(ReceiptInfo {
         transaction_hash: r.transaction_hash,
         status: status(r.status),
@@ -338,8 +341,7 @@ pub fn receipt_info(p: &Packet) -> Result<ReceiptInfo> {
         fee: crate::host::runtime::Fee {
             native_units: u128::try_from(result.fee_charged)
                 .map_err(|_| Error::config("Invalid Stellar receipt fee"))?,
-            // The engine sets the charge through ServerHooks::charged_fee.
-            charged_units: 0,
+            charged_units,
         },
         // The prepared operation carries its debits; the receipt adds only the fee.
         debits: Vec::new(),
@@ -1377,6 +1379,100 @@ fn retained(value: &serde_json::Value) -> Prepared {
         .unwrap(),
     )
 }
+#[cfg(test)]
+mod receipt_fee_tests {
+    use super::*;
+    use stellar_xdr::{
+        HostFunction, OperationBody, ScVal, TransactionEnvelope, TransactionResult,
+        TransactionResultExt, TransactionResultResult,
+    };
+
+    /// The receipt facts of `signed` once settled with `fee` paid. `expense` replaces the
+    /// expense of a policy wallet invocation.
+    fn settled(
+        signed: &SignedOperation,
+        expense: Option<&native::ExpenseBounds>,
+        success: bool,
+        fee: i64,
+    ) -> ReceiptInfo {
+        let TransactionEnvelope::Tx(mut envelope) = native::read(&signed.transaction_xdr).unwrap()
+        else {
+            panic!()
+        };
+        if let Some(expense) = expense {
+            let mut operations = envelope.tx.operations.to_vec();
+            let OperationBody::InvokeHostFunction(op) = &mut operations[0].body else {
+                panic!()
+            };
+            let HostFunction::InvokeContract(call) = &mut op.host_function else {
+                panic!()
+            };
+            let mut args = call.args.to_vec();
+            let ScVal::Map(Some(request)) = &args[0] else {
+                panic!()
+            };
+            let mut fields = request.to_vec();
+            let field = fields
+                .iter_mut()
+                .find(|e| matches!(&e.key, ScVal::Symbol(key) if key.0.as_slice() == b"expense"))
+                .unwrap();
+            field.val = native::contract::expense(Some(expense)).unwrap();
+            args[0] = ScVal::Map(Some(stellar_xdr::ScMap(fields.try_into().unwrap())));
+            call.args = args.try_into().unwrap();
+            envelope.tx.operations = operations.try_into().unwrap();
+        }
+        let result = TransactionResult {
+            fee_charged: fee,
+            result: if success {
+                TransactionResultResult::TxSuccess(Default::default())
+            } else {
+                TransactionResultResult::TxFailed(Default::default())
+            },
+            ext: TransactionResultExt::V0,
+        };
+        let network = &signed.prepared.config.network;
+        let receipt = rpc::VerifiedReceipt {
+            transaction_hash: native::transaction_hash(network, &envelope.tx).unwrap(),
+            status: if success {
+                native::OperationStatus::Confirmed
+            } else {
+                native::OperationStatus::Failed
+            },
+            ledger: 9,
+            envelope_xdr: native::xdr(&TransactionEnvelope::Tx(envelope)).unwrap(),
+            result_xdr: native::xdr(&result).unwrap(),
+        };
+        receipt_info(&packet(network, &receipt).unwrap()).unwrap()
+    }
+
+    /// A policy wallet receipt reports the fee paid and, beside it, the gas units that the
+    /// wallet counted: the signed expense, never less than the fee that its bound admits. A
+    /// failed transaction, an unpriced request and a keypair account report no counted units.
+    #[test]
+    fn a_receipt_reports_the_fee_paid_and_the_gas_that_its_wallet_counted() {
+        let wallet = crate::test_support::policy_signed();
+        let expense = native::ExpenseBounds::xlm(2_000_000, 0, 5_000_000, 9, 86_401)
+            .unwrap()
+            .with_fee_bound(2_670_684)
+            .unwrap();
+        let info = settled(&wallet, Some(&expense), true, 2_202_952);
+        assert_eq!(
+            (info.fee.native_units, info.fee.charged_units),
+            (2_202_952, 2_670_684)
+        );
+        assert!(info.fee.charged_units >= info.fee.native_units as i128);
+        let failed = settled(&wallet, Some(&expense), false, 2_202_952);
+        assert_eq!(
+            (failed.fee.native_units, failed.fee.charged_units),
+            (2_202_952, 0)
+        );
+        assert_eq!(settled(&wallet, None, true, 100).fee.charged_units, 0);
+        let account = crate::test_support::native_signed();
+        let info = settled(&account, None, true, 100);
+        assert_eq!((info.fee.native_units, info.fee.charged_units), (100, 0));
+    }
+}
+
 #[cfg(test)]
 mod capability_tests {
     use super::*;

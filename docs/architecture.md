@@ -630,6 +630,12 @@ transaction gas. XLM/stroop identity conversion is intrinsic; other gas conversi
 admitted trusted source. Onchain counters retain ceilings. The server separately settles actual
 expenses and temporary loss. No automatic onchain refund authority follows from that accounting.
 
+The attributable fee ceiling of a request is the fee that its transaction can be charged, not the
+installed fee bound. The rail simulates the exact invocation and signs the simulated resource fee
+plus the inclusion fee plus a 1% margin, and the transaction declares no higher fee. The gas that
+the counters retain is therefore never below the fee charged, and exceeds it by the fee refund
+and the margin. The [rail guide](../crates/allowit-stellar/README.md) gives the steps.
+
 `execute` and the owner-enabled intercepted door require agent and server authority. The kernel
 checks the operation that the tier runs, policy identity, source and module, immutable asset,
 amounts, positive debit, pause, expiry, configuration version, execution nonce, single-use
