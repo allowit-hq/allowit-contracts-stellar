@@ -1204,6 +1204,22 @@ mod tests {
         // A fee account pays for a policy wallet contract, never for an account.
         assert!(fee_account_derivation_message(NETWORK, &first, &second, 0).is_err());
     }
+    /// The fixed vector that the browser package derives too: the same message, the same
+    /// signature and the same account.
+    #[test]
+    fn the_fee_account_derivation_vector_is_stable() {
+        let agent = agent(2);
+        let wallet = policy_wallet(POLICY_WALLET);
+        assert_eq!(
+            fee_account_derivation_message(NETWORK, &agent, &wallet, 0).unwrap(),
+            "Allowit fee account key v1\nNetwork: Test SDF Network ; September 2015\nAgent: GCATS5YOVB6ROX2WUNKGNQ2MP3GMXDMKSG2O4N5CLX3A6W4PZGZZI55U\nPolicy wallet: CACAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAINCW\nFee account index: 0\n\nThis signature derives the one-time setup key of the account that pays the network fees of this agent's policy wallet. It does not authorize spending or move funds."
+        );
+        assert_eq!(
+            fee_key(1, NETWORK, &agent, &wallet, 0).account(),
+            VECTOR_ACCOUNT
+        );
+    }
+    const VECTOR_ACCOUNT: &str = "GD2YKHPRFRN2IO3WBQKAQ3YRDJYD5VH6CVIY6PME5GJ54UA6NP5KI2W7";
     #[test]
     fn a_fee_account_setup_creates_the_exact_roles_with_the_reserve_and_the_float() {
         let agent = agent(2);

@@ -108,8 +108,9 @@ pub fn denial(message: &str, contract: Option<&ContractFault>, wallet: &str) -> 
     }
     if contract.is_none() {
         // The refusals of a fee account, each with what its owner does next.
-        if message == crate::FEE_ACCOUNT_REQUIRED {
-            return coded(409, "fee_account_required", message);
+        if let Some(wallet) = message.strip_prefix(crate::FEE_ACCOUNT_REQUIRED) {
+            return coded(409, "fee_account_required", message)
+                .with_details(json!({"wallet": wallet.trim()}));
         }
         if message == crate::FEE_ACCOUNT_DIFFERS {
             return coded(409, "fee_account_differs", message);

@@ -1189,7 +1189,11 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 // names it as its agent address. A fee account that the ledger already holds
                 // has exactly its roles, or nothing is created.
                 let Some(fee_account) = c.fee_account.as_deref() else {
-                    return checked(Err(native::FEE_ACCOUNT_REQUIRED.into()));
+                    return checked(Err(format!(
+                        "{} {}",
+                        native::FEE_ACCOUNT_REQUIRED,
+                        c.wallet
+                    )));
                 };
                 match checked(rpc::find_account(self.rpc(), fee_account))? {
                     None => return self.prepare_fee_account(&c, fee_account, fee_limit, now),
@@ -2629,6 +2633,228 @@ mod keypair_wallet_owner_tests {
                     )
                     .is_err()
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod fee_account_owner_tests {
+    use super::*;
+    use crate::host::vendors::RuntimeProvider;
+    use crate::test_support::owner::{OwnerLedger, account, selection, wasm};
+    use ed25519_dalek::{Signer as _, SigningKey};
+    use std::sync::{Arc, Mutex};
+
+    const NOW: u64 = 1_800_000_000;
+    /// The key of a fee account, as the owner's signature derives it.
+    fn account_key() -> SigningKey {
+        SigningKey::from_bytes(&[77; 32])
+    }
+    /// A ledger with the owner's account, and the fee account once a test puts one there.
+    struct Ledger(OwnerLedger, Mutex<Option<native::AccountState>>);
+    impl rpc::Rpc for Ledger {
+        fn call(
+            &self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> native::Result<serde_json::Value> {
+            use stellar_xdr as x;
+            if method == "getLedgerEntries"
+                && let Ok(x::LedgerKey::Account(key)) =
+                    native::read::<x::LedgerKey>(params["keys"][0].as_str().unwrap())
+                && let Some(state) = self.1.lock().unwrap().clone()
+            {
+                let x::PublicKey::PublicKeyTypeEd25519(key) = key.account_id.0;
+                if native::account_for_public_key(&key.0) == state.address {
+                    return Ok(crate::test_support::owner::account_entry(&state));
+                }
+            }
+            self.0.call(method, params, &[])
+        }
+    }
+    /// The policy wallet of the owner fixture, with `fee_account` in its installation.
+    fn fixture(fee_account: Option<&str>) -> (WalletConfig, Arc<Ledger>, Provider, Installation) {
+        let mut c = selection().config;
+        c.fee_account = fee_account.map(str::to_owned);
+        let ledger = Arc::new(Ledger(OwnerLedger::new(c.clone()), Mutex::new(None)));
+        let configuration =
+            super::super::server_owner::configuration(&c.network, &serde_json::to_vec(&c).unwrap())
+                .unwrap();
+        let provider = Provider::from_rpc(&c.network, ledger.clone());
+        (c, ledger, provider, installation(&configuration))
+    }
+    fn create(provider: &Provider, i: &Installation) -> Result<OwnerPacket> {
+        provider.prepare_owner(i, OwnerAction::Create { wasm: wasm() }, 1_000_000, NOW)
+    }
+    fn transaction(packet: &OwnerPacket) -> stellar_xdr::Transaction {
+        let payload = String::from_utf8(packet.info().unwrap().signing_payload).unwrap();
+        let stellar_xdr::TransactionEnvelope::Tx(envelope) = native::read(&payload).unwrap() else {
+            panic!()
+        };
+        assert!(envelope.signatures.is_empty());
+        envelope.tx
+    }
+    fn signed(tx: &stellar_xdr::Transaction, network: &str, keys: &[&SigningKey]) -> Vec<u8> {
+        use stellar_xdr as x;
+        let digest = native::transaction_hash(network, tx).unwrap();
+        native::xdr(&x::TransactionEnvelope::Tx(x::TransactionV1Envelope {
+            tx: tx.clone(),
+            signatures: keys
+                .iter()
+                .map(|key| x::DecoratedSignature {
+                    hint: x::SignatureHint(
+                        key.verifying_key().to_bytes()[28..].try_into().unwrap(),
+                    ),
+                    signature: x::Signature(
+                        key.sign(&digest).to_bytes().to_vec().try_into().unwrap(),
+                    ),
+                })
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap(),
+        }))
+        .unwrap()
+        .into_bytes()
+    }
+
+    #[test]
+    fn a_wallet_without_a_fee_account_in_its_installation_is_not_created() {
+        let (_, _, provider, i) = fixture(None);
+        let (c, _, provider, i) = (selection().config, (), provider, i);
+        let refused = create(&provider, &i).unwrap_err();
+        let problem = provider.problem(&refused);
+        assert_eq!(
+            (problem.status, problem.code),
+            (409, "fee_account_required")
+        );
+        // The refusal names the wallet, so the owner's client derives the account for it.
+        assert_eq!(
+            problem.details,
+            Some(serde_json::json!({"wallet": c.wallet}))
+        );
+    }
+
+    #[test]
+    fn the_creation_of_a_wallet_creates_and_funds_its_fee_account_first() {
+        use stellar_xdr as x;
+        let fee_account = native::account_for_public_key(&account_key().verifying_key().to_bytes());
+        let (c, ledger, provider, i) = fixture(Some(&fee_account));
+        // The ledger holds no fee account yet: the step creates it, and no wallet.
+        let packet = create(&provider, &i).unwrap();
+        assert_eq!(
+            packet.info().unwrap().action,
+            native::owner::CREATE_FEE_ACCOUNT
+        );
+        let tx = transaction(&packet);
+        let owner = x::MuxedAccount::Ed25519(x::Uint256(native::account_key(&c.owner).unwrap()));
+        assert_eq!(tx.source_account, owner);
+        let [create_account, signers @ ..] = tx.operations.as_slice() else {
+            panic!()
+        };
+        let x::OperationBody::CreateAccount(created) = &create_account.body else {
+            panic!("the first operation creates the fee account")
+        };
+        // The owner's account pays the reserve and the fee float in the creation itself.
+        assert_eq!(create_account.source_account, None);
+        assert_eq!(
+            created.starting_balance,
+            native::owner::fee_account_starting_balance()
+        );
+        assert_eq!(
+            created.destination,
+            x::AccountId(x::PublicKey::PublicKeyTypeEd25519(x::Uint256(
+                native::account_key(&fee_account).unwrap()
+            )))
+        );
+        assert_eq!(signers.len(), 3);
+        // The owner's own intent, built from the owner's values alone, is this exact step.
+        let owner_state = rpc::get_account(ledger.as_ref(), &c.owner).unwrap();
+        let original: native::owner_intent::OwnerTransaction = decode_packet(&packet.0).unwrap();
+        native::owner_intent::validate_owner_transaction(
+            &original,
+            &native::owner_intent::ExpectedOwnerIntent {
+                limits: native::owner_intent::OwnerLimits {
+                    network: c.network.clone(),
+                    owner: c.owner.clone(),
+                    next_sequence: owner_state.sequence + 1,
+                    max_fee_stroops: 1_000_000,
+                    valid_until: NOW + 300,
+                },
+                action: native::owner_intent::OwnerAction::FeeAccountSetup {
+                    state: owner_state,
+                    account: fee_account.clone(),
+                    agent: c.agent.clone(),
+                    engine: c.server.clone(),
+                    request_id: native::owner::fee_account_request_id(&c.policy_instance),
+                },
+            },
+            NOW,
+        )
+        .unwrap();
+        // The step takes the owner's signature, then the one signature of the new account's
+        // own key. One signature, another order or another key is refused.
+        let owner_key = SigningKey::from_bytes(&[11; 32]);
+        assert_eq!(
+            native::account_for_public_key(&owner_key.verifying_key().to_bytes()),
+            c.owner
+        );
+        let (own, stranger) = (account_key(), SigningKey::from_bytes(&[78; 32]));
+        provider
+            .read_owner_signed(&packet, &signed(&tx, &c.network, &[&owner_key, &own]))
+            .unwrap();
+        for keys in [
+            vec![&owner_key],
+            vec![&own],
+            vec![&own, &owner_key],
+            vec![&owner_key, &stranger],
+            vec![&owner_key, &own, &stranger],
+            vec![],
+        ] {
+            assert!(
+                provider
+                    .read_owner_signed(&packet, &signed(&tx, &c.network, &keys))
+                    .is_err()
+            );
+        }
+
+        // A fee account with another signer, another weight or another threshold creates no
+        // wallet: the wallet would name an account that others control.
+        let exact =
+            crate::test_support::wallet_account(&fee_account, &c.owner, &c.agent, &c.server, 0);
+        exact.validate_roles(&c.owner, &c.agent, &c.server).unwrap();
+        type Change = fn(&mut native::AccountState);
+        let changes: [Change; 5] = [
+            |a| {
+                a.signers.push(native::AccountSigner {
+                    key: account(90),
+                    weight: 1,
+                })
+            },
+            |a| {
+                a.signers
+                    .iter_mut()
+                    .for_each(|s| s.weight = s.weight.max(2))
+            },
+            |a| a.high_threshold = 2,
+            |a| a.master_weight = 1,
+            |a| {
+                a.signers.retain(|s| s.weight == 3);
+            },
+        ];
+        for change in changes {
+            let mut foreign = exact.clone();
+            change(&mut foreign);
+            *ledger.1.lock().unwrap() = Some(foreign);
+            let refused = create(&provider, &i).unwrap_err();
+            assert_eq!(provider.problem(&refused).code, "fee_account_differs");
+        }
+        // With the exact fee account on the ledger the next step is the wallet itself.
+        *ledger.1.lock().unwrap() = Some(exact);
+        match create(&provider, &i) {
+            Ok(packet) => assert_eq!(packet.info().unwrap().action, "create_wallet"),
+            // The test ledger simulates no contract creation. The refusal is not one of the
+            // fee account.
+            Err(refused) => assert!(!provider.problem(&refused).code.starts_with("fee_account")),
         }
     }
 }

@@ -4,8 +4,9 @@
  * The host supplies its authenticated transport, the signing of one step and a journal. This module holds the rules
  * for a saved signed step and for the typed replies of the service.
  */
-import {TransactionBuilder} from '@stellar/stellar-sdk/base';
+import {TransactionBuilder, type Keypair} from '@stellar/stellar-sdk/base';
 import {canonicalNetwork, networkPassphrase} from './plugin.js';
+import {countersignCreation, CREATE_FEE_ACCOUNT, derivationStep, FEE_ACCOUNT_REQUIRED, feeAccountKey} from './fee-account.js';
 
 /** Rail-neutral owner step. `payload` is opaque text that only this package signs and reads. */
 export interface OwnerStep {action: string; payload: string; hash: string; expiresAt: number; explorer?: string | null}
@@ -312,11 +313,13 @@ function stepper({network, historyPauseMs, ask, sign, journal, key, policyId, on
       if (!await submit(pending.step, pending.signedPayload)) onStep('The saved step can never apply. Preparing a new one…');
     }
   };
-  const signAndSubmit = async (step: OwnerStep) => {
+  /** `complete` adds what the step needs beside the owner's signature, before the bytes enter the journal. */
+  const signAndSubmit = async (step: OwnerStep, complete?: (signedPayload: string) => string) => {
     if (step.expiresAt <= Math.floor(Date.now() / 1000)) throw new OwnerFlowError('The prepared owner step already expired. Resume to prepare a new one.', null, true);
     onStep(`Sign ${step.action.replace(/_/g, ' ')} in your wallet…`);
-    const signedPayload = await sign(step);
-    if (typeof signedPayload !== 'string' || !signedPayload) throw new OwnerFlowError('Your wallet did not return the signed step.', null, false);
+    const ownerSigned = await sign(step);
+    if (typeof ownerSigned !== 'string' || !ownerSigned) throw new OwnerFlowError('Your wallet did not return the signed step.', null, false);
+    const signedPayload = complete ? complete(ownerSigned) : ownerSigned;
     journal.set(key, JSON.stringify({step, signedPayload, ...identity}));
     onStep('Waiting for the network to confirm…');
     if (!await submit(step, signedPayload)) throw new OwnerFlowError('The network did not take the signed step. Resume to prepare a new one.', null, true);
@@ -336,15 +339,49 @@ async function run({network, ask, sign, journal, key, policyId, agent, amount, o
   funded(journal, fundedKey, identity);
   await settleSaved();
   let wallet: string | undefined;
-  for (let i = 0; i < 4 && !wallet; i++) {
+  // The one-time key of the fee account. It lives in this call only and is never stored: after a reload the
+  // owner's wallet signs the same message again and derives the same key.
+  let feeKey: Keypair | undefined;
+  // A deployment takes at most the fee account, the code upload, the wallet creation and a lifetime renewal.
+  for (let i = 0; i < 5 && !wallet; i++) {
     onStep('Preparing the wallet…');
-    const reply = await ask<Prepared>('native/deploy/prepare', {policyId, agent});
+    let reply: Prepared;
+    try {
+      reply = await ask<Prepared>('native/deploy/prepare', {policyId, agent, ...(feeKey ? {setup: {feeAccount: feeKey.publicKey()}} : {})});
+    } catch (error) {
+      const {code, details} = (object(error) ? error : {}) as {code?: unknown; details?: unknown};
+      const policyWallet = object(details) ? details.wallet : undefined;
+      // A new policy wallet needs a fee account: the owner's key derives it for that wallet, and the
+      // deployment creates and funds it. The agent holds a key and no account.
+      if (code !== FEE_ACCOUNT_REQUIRED || feeKey || typeof policyWallet !== 'string') throw error;
+      onStep('Sign the fee account key message in your wallet…');
+      let signature: Uint8Array;
+      try {
+        signature = Uint8Array.from(atob(await sign(derivationStep(network, agent, policyWallet))), c => c.charCodeAt(0));
+        feeKey = feeAccountKey(signature);
+      } catch (cause) {
+        throw new OwnerFlowError(cause instanceof Error && cause.message ? cause.message : 'The fee account key could not be derived.', null, true, cause);
+      }
+      i--;
+      continue;
+    }
     if (!object(reply) || reply.policyId !== policyId) throw new OwnerFlowError('The deployment reply names a different policy.', null, false);
     wallet = installedWallet(reply);
     if (wallet) break;
     const step = stepOf(reply.step);
     if (!step) throw new OwnerFlowError('The service did not prepare an owner step for this policy.', null, false);
-    await signAndSubmit(step);
+    if (step.action === CREATE_FEE_ACCOUNT) {
+      // The new account's own key signs its creation once, beside the owner.
+      const key = feeKey;
+      if (!key) throw new OwnerFlowError('The service prepared a fee account that this owner did not derive.', null, false);
+      await signAndSubmit(step, signedPayload => {
+        try {
+          return countersignCreation(network, step, signedPayload, key);
+        } catch (cause) {
+          throw new OwnerFlowError(cause instanceof Error ? cause.message : 'The fee account step could not be signed.', null, false, cause);
+        }
+      });
+    } else await signAndSubmit(step);
   }
   if (!wallet) throw new OwnerFlowError('The wallet installation could not be confirmed.', null, true);
   // A confirmed funding is never prepared or signed again, including after a reload or a failed export.

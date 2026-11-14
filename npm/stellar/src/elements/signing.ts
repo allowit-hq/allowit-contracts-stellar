@@ -1,6 +1,7 @@
 import {canonicalNetwork, networkPassphrase, strkey} from '../plugin.js';
 import {base, emit, expiry, h, type Data} from './base.js';
 import {link} from './display.js';
+import {DERIVE_FEE_ACCOUNT_KEY, feeAccountDerivation, messageDigest} from '../fee-account.js';
 
 type Failure = {code: string; message: string};
 const failure = (error: unknown, code: string): Failure => ({code: String((error as {code?: unknown})?.code ?? code), message: error instanceof Error ? error.message : String(error)});
@@ -97,6 +98,36 @@ export function ownerSignElement() {
       const summary = Array.isArray(data.summary) ? data.summary as {label?: unknown; value?: unknown}[] : [];
       if (!id || !step) {this.replaceChildren(h('p', {class: 'invalid'}, 'This owner step is invalid.')); return;}
       const rows = summary.flatMap(row => [h('dt', {}, String(row.label ?? '')), h('dd', {}, String(row.value ?? ''))]);
+      const cancel = button('Cancel', () => emit(this, 'allowit-cancel'));
+      if (step.action === DERIVE_FEE_ACCOUNT_KEY) {
+        // This step signs a message, never a transaction: the signature derives the one-time key of the fee
+        // account. Only the exact derivation message of this network is signed, and the owner reads what it names.
+        let message: string | null = null;
+        try {message = atob(step.payload);} catch {/* invalid below */}
+        const fields = feeAccountDerivation(message, id);
+        if (message === null || !fields || messageDigest(message) !== step.hash) {this.replaceChildren(h('p', {class: 'invalid'}, 'This owner step is invalid.')); return;}
+        const text = message;
+        rows.push(h('dt', {}, 'Agent public key'), h('dd', {}, link(id, 'address', fields.agent, fields.agent)));
+        rows.push(h('dt', {}, 'Policy wallet'), h('dd', {}, link(id, 'contract', fields.wallet, fields.wallet)));
+        rows.push(h('dt', {}, 'What you sign'), h('dd', {}, 'A message that derives the setup key of the fee account. It moves no funds.'));
+        const status = h('p', {class: 'status', role: 'status'});
+        const sign = button('Sign the message', async () => {
+          sign.disabled = true; status.textContent = 'Waiting for the wallet…';
+          try {
+            if (step.expiresAt <= Date.now() / 1000) throw Object.assign(new Error('This owner step expired. Prepare it again.'), {code: 'expired'});
+            const {connectWallet, signWalletMessage} = await import('./wallet.js');
+            const owner = typeof data.owner === 'string' && strkey(data.owner) ? data.owner : await connectWallet(id);
+            const signedPayload = await signWalletMessage(text, owner, id);
+            status.textContent = 'Signed.';
+            emit(this, 'allowit-signed', {signedPayload, hash: step.hash});
+          } catch (error) {
+            status.textContent = error instanceof Error ? error.message : String(error);
+            emit(this, 'allowit-error', failure(error, 'sign'));
+          } finally {sign.disabled = false;}
+        });
+        this.replaceChildren(h('dl', {class: 'owner-step'}, ...rows), h('div', {class: 'actions'}, sign, cancel), status);
+        return;
+      }
       rows.push(h('dt', {}, 'Transaction'), h('dd', {}, link(id, 'tx', step.hash, `${step.hash.slice(0, 8)}…`)));
       rows.push(h('dt', {}, 'Expires'), h('dd', {}, expiry(step.expiresAt)));
       const status = h('p', {class: 'status', role: 'status'});
@@ -122,7 +153,6 @@ export function ownerSignElement() {
           emit(this, 'allowit-error', failure(error, 'sign'));
         } finally {sign.disabled = false;}
       });
-      const cancel = button('Cancel', () => emit(this, 'allowit-cancel'));
       this.replaceChildren(h('dl', {class: 'owner-step'}, ...rows), h('div', {class: 'actions'}, sign, cancel), status);
     }
   };
