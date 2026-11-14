@@ -28,6 +28,13 @@ const AGENT: [u8; 32] = [2; 32];
 const SERVER: [u8; 32] = [3; 32];
 const RECIPIENT: [u8; 32] = [6; 32];
 const MAX_FEE: u32 = 1_000_000;
+/// The resource fee of a recording simulation. It prices the server's authorization nonce at
+/// the longest entry lifetime, so it is above the enforce-mode fee of the signed entry.
+const RECORD_FEE: i64 = 1_500;
+const ENFORCE_FEE: i64 = 1_000;
+/// The gas that a wallet counts for one operation: `fee_bound(RECORD_FEE)`, the resource fee,
+/// the 100-stroop inclusion fee and the 1% margin.
+const GAS: i128 = 1_615;
 const SOURCE: &str = include_str!("../../../contracts/allowit-custom-policy/policy/policy.rs");
 const VECTORS: &str = "tests/fixtures/policy-wallet-vectors.txt";
 
@@ -91,6 +98,8 @@ struct Model {
     /// transaction.
     steps: Vec<Step>,
     pending_name: String,
+    /// The resource fee of the next enforce-mode simulations.
+    enforce_fee: i64,
 }
 /// A model of Stellar RPC and the layout 4 wallet. It records authorization like Stellar RPC,
 /// applies settled effects and computes post-flight state with the `allowit` host backend.
@@ -101,6 +110,7 @@ impl ModelChain {
             ledger: LEDGER,
             now: NOW,
             tiers,
+            enforce_fee: ENFORCE_FEE,
             ..Default::default()
         };
         for seed in [OWNER, AGENT, SERVER, RECIPIENT, [51; 32]] {
@@ -399,7 +409,7 @@ impl rpc::Rpc for ModelChain {
                     }
                     op.auth.to_vec()
                 };
-                let fee = if record { 1_000i64 } else { 1_500 };
+                let fee = if record { RECORD_FEE } else { m.enforce_fee };
                 Ok(json!({
                     "latestLedger": m.ledger,
                     "minResourceFee": fee.to_string(),
@@ -727,6 +737,28 @@ fn run(
     let simulated = rpc::simulate(chain, &served)?;
     let proof = sign(&simulated, &AGENT, NOW)?;
     let signed = authorize(&simulated, &[proof], NOW)?;
+    // The signed expense holds the fee bound of this operation, not the caller's ceiling. For
+    // XLM the gas is that bound, and the declared fee of the transaction is within it.
+    let bound = simulated.terms.expense.as_ref().ok_or("no expense")?;
+    let x::TransactionEnvelope::Tx(envelope) = de(&signed.transaction_xdr) else {
+        panic!()
+    };
+    assert_eq!(bound.max_fee_stroops, fee_bound(RECORD_FEE)?);
+    assert_eq!(
+        (bound.gas_units, i128::from(bound.max_fee_stroops)),
+        (GAS, GAS)
+    );
+    assert_eq!(
+        bound.spent_units - bound.gas_units,
+        t.expense
+            .as_ref()
+            .map_or(0, |e| e.spent_units - e.gas_units)
+    );
+    assert_eq!(
+        i64::from(envelope.tx.fee),
+        ENFORCE_FEE + i64::from(INCLUSION_FEE_STROOPS)
+    );
+    assert!(envelope.tx.fee <= bound.max_fee_stroops);
     chain.step(name);
     assert_eq!(
         rpc::broadcast(chain, &signed, NOW)?,
@@ -738,6 +770,16 @@ fn run(
     );
     let receipt = rpc::operation_receipt(chain, c, &r.operation.nonce)?.ok_or("no receipt")?;
     assert_eq!(receipt.transfer, rpc::expected_receipt(&simulated)?);
+    // The settled transaction reports the gas that the wallet counted for it.
+    let settled =
+        rpc::receipt_by_hash(chain, &c.network, &signed.transaction_hash)?.ok_or("no receipt")?;
+    assert_eq!(rpc::counted_gas_units(&settled)?, GAS);
+    // A failed transaction counts nothing.
+    let failed = rpc::VerifiedReceipt {
+        status: OperationStatus::Failed,
+        ..settled
+    };
+    assert_eq!(rpc::counted_gas_units(&failed)?, 0);
     Ok(receipt)
 }
 fn owner_submit(chain: &ModelChain, name: &str, xdr: &str) {
@@ -752,6 +794,8 @@ fn owner_submit(chain: &ModelChain, name: &str, xdr: &str) {
         .unwrap()
         .unwrap();
     assert_eq!(receipt.status, OperationStatus::Confirmed);
+    // An owner transaction is no wallet execution: no spending limit counts gas for it.
+    assert_eq!(rpc::counted_gas_units(&receipt).unwrap(), 0);
 }
 fn params() -> PolicyParams {
     policy::params_from_json(
@@ -948,6 +992,33 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
     let recipient = account_for_seed(&RECIPIENT);
     let ledger = chain.0.lock().unwrap().ledger;
     let transfer = request::transfer(&c, &found.state, [1; 32], &recipient, 10_000_000).unwrap();
+    // A final simulation that needs more than the signed fee bound is refused, so no
+    // transaction declares, or pays, a fee above the gas that its wallet counts. The bound
+    // itself is admitted.
+    for (enforce_fee, admitted) in [(GAS as i64 - 99, false), (GAS as i64 - 100, true)] {
+        chain.0.lock().unwrap().enforce_fee = enforce_fee;
+        let prepared = rpc::prepare_with(
+            &chain,
+            &c,
+            &transfer,
+            &terms(10_000_000, ledger),
+            None,
+            NOW,
+            NOW + 300,
+        )
+        .unwrap();
+        let served = authorize_server(&prepared, &SERVER, NOW, None).unwrap();
+        match rpc::simulate(&chain, &served) {
+            Ok(simulated) => {
+                let x::TransactionEnvelope::Tx(envelope) = de(&simulated.transaction_xdr) else {
+                    panic!()
+                };
+                assert!(admitted && i128::from(envelope.tx.fee) == GAS);
+            }
+            Err(e) => assert!(!admitted && e.contains("exceeds approved fee bound"), "{e}"),
+        }
+    }
+    chain.0.lock().unwrap().enforce_fee = ENFORCE_FEE;
     let receipt = run(
         &chain,
         &c,
@@ -962,7 +1033,7 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
     assert_eq!(standard.get("calls"), Some(&PolicyValue::Int(1)));
     assert_eq!(
         standard.get("spent"),
-        Some(&PolicyValue::Int(10_000_000 + i128::from(MAX_FEE)))
+        Some(&PolicyValue::Int(10_000_000 + GAS))
     );
     // A transfer over the payment limit is denied on the host before any signature.
     let ledger = chain.0.lock().unwrap().ledger;
@@ -1043,6 +1114,15 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
     lower
         .0
         .insert("payment_limit".into(), PolicyValue::Int(20_000_000));
+    // The daily limit leaves room for 15,001,000 more units.
+    let Some(PolicyValue::Int(day_spent)) = chain.state().policy_state.get("day_spent").cloned()
+    else {
+        panic!()
+    };
+    lower.0.insert(
+        "daily_spending_limit".into(),
+        PolicyValue::Int(day_spent + 15_001_000),
+    );
     let (deployment, check) =
         PolicyDeployment::for_source(&c, SOURCE, lower.clone(), false).unwrap();
     assert!(check.warnings.is_empty());
@@ -1052,12 +1132,30 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
     owner_submit(&chain, "params", &updated.transaction_xdr);
     assert_eq!(chain.state().params, lower);
     let ledger = chain.0.lock().unwrap().ledger;
-    let again = request::transfer(&c, &found.state, [3; 32], &recipient, 15_000_000).unwrap();
+    // A debit that fits the daily limit with the lowest fee, and not with the fee bound that the
+    // wallet would count, is denied on the host before any signature.
+    let over = request::transfer(&c, &found.state, [8; 32], &recipient, 15_000_000).unwrap();
+    assert!(
+        rpc::prepare_with(
+            &chain,
+            &c,
+            &over,
+            &terms(15_000_000, ledger),
+            None,
+            NOW,
+            NOW + 300
+        )
+        .unwrap_err()
+        .contains("DailySpendingLimitExceeded")
+    );
+    // A debit that fits with the counted fee bound runs. The caller's fee ceiling would not fit.
+    let again = request::transfer(&c, &found.state, [3; 32], &recipient, 14_999_000).unwrap();
+    assert!(14_999_000 + GAS <= 15_001_000 && 14_999_000 + i128::from(MAX_FEE) > 15_001_000);
     let receipt = run(
         &chain,
         &c,
         &again,
-        &terms(15_000_000, ledger),
+        &terms(14_999_000, ledger),
         "transfer_v3",
     )
     .unwrap();
@@ -1088,6 +1186,65 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
     owner_submit(&chain, "recover", &recovery.transaction_xdr);
     let model = chain.0.lock().unwrap();
     model.steps.clone()
+}
+
+/// The fee bound is integer money logic that rounds up: it covers the declared fee of every
+/// resource fee, and lowered gas never prices the fee below its rate.
+#[test]
+fn a_fee_bound_covers_the_declared_fee_and_lowers_gas_rounded_up() {
+    for (resource, bound) in [
+        (0i64, 100u32),
+        (1, 102),
+        (100, 201),
+        (101, 203),
+        (RECORD_FEE, GAS as u32),
+        (2_644_142, 2_670_684),
+    ] {
+        assert_eq!(fee_bound(resource).unwrap(), bound, "{resource}");
+        assert!(i64::from(bound) >= resource + i64::from(INCLUSION_FEE_STROOPS));
+    }
+    assert!(fee_bound(-1).is_err());
+    assert!(fee_bound(i64::from(u32::MAX) - 100).is_err());
+    // XLM: the gas is the bound itself.
+    let xlm = ExpenseBounds::xlm(2_000_000, 0, 5_000_000, 9, NOW).unwrap();
+    let lowered = xlm.with_fee_bound(2_670_684).unwrap();
+    assert_eq!(
+        (
+            lowered.gas_units,
+            lowered.spent_units,
+            lowered.max_fee_stroops
+        ),
+        (2_670_684, 4_670_684, 2_670_684)
+    );
+    assert_eq!(
+        (
+            lowered.observed_ledger,
+            lowered.day,
+            lowered.conversion_units
+        ),
+        (xlm.observed_ledger, xlm.day, 0)
+    );
+    assert_eq!(xlm.with_fee_bound(5_000_000).unwrap(), xlm);
+    // Another asset at 0.1234567 units per stroop: a 5,000,000-stroop ceiling is 617,284 units,
+    // and a 2,670,684-stroop bound is 329,714 units at that rate. Lowered gas rounds up.
+    let priced = ExpenseBounds {
+        gas_units: 617_284,
+        spent_units: 700 + 617_284,
+        conversion_units: 700,
+        ..xlm.clone()
+    };
+    let lowered = priced.with_fee_bound(2_670_684).unwrap();
+    assert_eq!((lowered.gas_units, lowered.spent_units), (329_715, 330_415));
+    assert!(lowered.gas_units >= 329_714 && lowered.conversion_units == 700);
+    assert_eq!(priced.with_fee_bound(1).unwrap().gas_units, 1);
+    for fee in [0, 5_000_001] {
+        assert!(xlm.with_fee_bound(fee).is_err(), "{fee}");
+    }
+    let negative = ExpenseBounds {
+        gas_units: -1,
+        ..xlm
+    };
+    assert!(negative.with_fee_bound(100).is_err());
 }
 
 #[test]

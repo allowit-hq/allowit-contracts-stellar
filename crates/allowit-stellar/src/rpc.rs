@@ -226,8 +226,45 @@ pub fn prepare_with(
         PolicyBinding::from_scval(&readonly_call(rpc, c, &state.source, "policy_binding")?)?
             .verify(c, operation.kind())?;
     }
-    let intent = prepare_for_native_preflight(c, request, terms, &state, now, expires_at)?;
+    let terms = priced_terms(rpc, c, request, terms, &state, now, expires_at)?;
+    let intent = prepare_for_native_preflight(c, request, &terms, &state, now, expires_at)?;
     simulate(rpc, &intent)
+}
+/// `terms` with the expense fee bound lowered from the caller's ceiling to the fee that this
+/// operation can be charged: `fee_bound` of its simulated resource fee, at most the ceiling.
+///
+/// The expense is an argument of the invocation, so the fee is simulated first with the lowest
+/// fee bound, the inclusion fee alone. The wallet runs its whole policy in that simulation, and
+/// its denial there is final: no transaction declares a lower fee. The caller then simulates the
+/// operation again with the returned terms, which decides the policy and the declared fee.
+fn priced_terms(
+    rpc: &dyn Rpc,
+    c: &WalletConfig,
+    request: &ExecutionRequest,
+    terms: &ExecutionTerms,
+    state: &TrustedState,
+    now: u64,
+    expires_at: u64,
+) -> Result<ExecutionTerms> {
+    let Some(ceiling) = terms.expense.as_ref().filter(|e| e.max_fee_stroops > 0) else {
+        return Ok(terms.clone());
+    };
+    let with_bound = |fee: u32| -> Result<ExecutionTerms> {
+        Ok(ExecutionTerms {
+            args: terms.args.clone(),
+            expense: Some(ceiling.with_fee_bound(fee.min(ceiling.max_fee_stroops))?),
+        })
+    };
+    let probe = prepare_for_native_preflight(
+        c,
+        request,
+        &with_bound(INCLUSION_FEE_STROOPS)?,
+        state,
+        now,
+        expires_at,
+    )?;
+    let resources: SorobanTransactionData = read(&simulated_resources(rpc, &probe)?)?;
+    with_bound(fee_bound(resources.resource_fee)?)
 }
 pub(crate) fn reject_restoration(value: &Value) -> Result<()> {
     if value
@@ -746,6 +783,40 @@ pub fn validate_settled_policy_packet(
     Ok(())
 }
 
+/// The gas units that the wallet contract counted against its limits for the transaction of
+/// `receipt`: the `gas_units` of the expense that its `execute` invocation carries. Zero for a
+/// failed transaction, which counts nothing, for an unpriced request and for a transaction that
+/// invokes no policy wallet.
+pub fn counted_gas_units(receipt: &VerifiedReceipt) -> Result<i128> {
+    if receipt.status != OperationStatus::Confirmed {
+        return Ok(0);
+    }
+    let TransactionEnvelope::Tx(envelope) = read(&receipt.envelope_xdr)? else {
+        return Ok(0);
+    };
+    let Some(OperationBody::InvokeHostFunction(op)) =
+        envelope.tx.operations.first().map(|op| &op.body)
+    else {
+        return Ok(0);
+    };
+    let HostFunction::InvokeContract(call) = &op.host_function else {
+        return Ok(0);
+    };
+    let Some(expense) = call
+        .args
+        .first()
+        .filter(|_| call.function_name.0.as_slice() == b"execute")
+        .and_then(|request| map_field(request, "expense").ok())
+    else {
+        return Ok(0);
+    };
+    match expense {
+        ScVal::Vec(Some(variant)) if variant.len() == 2 => {
+            wide(map_field(&variant[1], "gas_units")?)
+        }
+        _ => Ok(0),
+    }
+}
 /// Read a verified terminal receipt. Absence remains unknown and does not release reservations.
 pub fn receipt_by_hash(
     rpc: &dyn Rpc,
