@@ -836,7 +836,7 @@ impl RecoverFunds for OwnerAdmin<'_> {
                 .ok_or("Missing token balance XDR")?,
         )?)?;
         if amount <= 0 {
-            return Err(crate::owner::NOTHING_TO_RETURN.into());
+            return Err("Selected token has no recoverable balance".into());
         }
         let owner = s.owner.address.clone();
         let version = s.deployment_version;

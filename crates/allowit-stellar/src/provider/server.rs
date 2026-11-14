@@ -409,7 +409,7 @@ impl Provider {
                     checked(rpc::trustline_spendable(self.rpc(), &c.wallet, &asset))?.unwrap_or(0)
                 };
                 if spendable <= 0 {
-                    return checked(Err(native::owner::NOTHING_TO_RETURN.into()));
+                    return checked(Err(super::diagnostics::NOTHING_TO_RETURN.into()));
                 }
                 WalletAction::Withdraw {
                     units: spendable,

@@ -2,6 +2,12 @@
 use crate::host::runtime::Problem;
 pub use crate::rpc::{ContractFault, simulation_fault};
 use serde_json::json;
+/// The refusal of a return of funds from a keypair wallet that holds none. Its code is
+/// `nothing_to_return`. A caller that returns the funds as one step of a larger owner action
+/// reads that code as a step that the ledger already shows.
+pub const NOTHING_TO_RETURN: &str = "This wallet holds no funds to return";
+/// The same refusal as `admin::OwnerAdmin::recover_funds` words it for a policy wallet.
+const NOTHING_TO_RECOVER: &str = "Selected token has no recoverable balance";
 fn fail(message: impl Into<String>) -> Problem {
     Problem {
         status: 409,
@@ -97,7 +103,7 @@ pub fn denial(message: &str, contract: Option<&ContractFault>, wallet: &str) -> 
     if contract.is_none() && message == crate::rpc::owner_observation::STALE_OBSERVATION {
         return coded(409, "stale_owner_observation", message);
     }
-    if contract.is_none() && message == crate::owner::NOTHING_TO_RETURN {
+    if contract.is_none() && [NOTHING_TO_RETURN, NOTHING_TO_RECOVER].contains(&message) {
         return coded(409, "nothing_to_return", message);
     }
     let named = contract
@@ -176,9 +182,12 @@ mod tests {
     }
     #[test]
     fn a_return_from_an_empty_wallet_has_its_own_code() {
-        use crate::{host::error::Error, owner::NOTHING_TO_RETURN};
-        let problem = denial(&Error::config(NOTHING_TO_RETURN).to_string(), None, "");
-        assert_eq!((problem.status, problem.code), (409, "nothing_to_return"));
+        use crate::host::error::Error;
+        // The keypair wallet's wording and the policy wallet's wording share the code.
+        for message in [NOTHING_TO_RETURN, NOTHING_TO_RECOVER] {
+            let problem = denial(&Error::config(message).to_string(), None, "");
+            assert_eq!((problem.status, problem.code), (409, "nothing_to_return"));
+        }
     }
     /// A host `error` event of the simulation RPC: `contract` raised or relayed `code`.
     fn error_event(contract: [u8; 32], code: u32) -> String {
