@@ -55,6 +55,7 @@ mod tests {
             wait: Duration::ZERO,
             build_only: true,
             wallet: None,
+            paid_service: None,
         }
     }
 

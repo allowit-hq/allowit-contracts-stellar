@@ -2,6 +2,7 @@
 pub mod execution;
 pub mod formats;
 pub mod owner;
+pub mod paid_service;
 pub mod profiles;
 pub mod request;
 pub mod runtime;

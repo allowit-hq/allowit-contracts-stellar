@@ -2,6 +2,7 @@
 //! profile names the wallet, its roles and the engine endpoints; the agent
 //! key signs. Requests go to the profile's `/api/native/execute` endpoints and
 //! are journaled in caller-supplied private storage before they leave the process.
+use crate::host::paid_service::PaidService;
 use crate::host::{
     config::parse_origin,
     error::{Error, Result},
@@ -207,6 +208,10 @@ struct Response {
     /// [`wallet_limits`].
     #[serde(default, rename = "paymentLimits")]
     _payment_limits: Option<serde::de::IgnoredAny>,
+    /// What the payment bought, as the engine recorded it with the operation: the resource and
+    /// the seller's challenge. An engine statement with no chain proof; see [`recorded`].
+    #[serde(default)]
+    paid_service: Option<serde_json::Value>,
     /// The engine reported this policy wallet operation `failed` without a chain receipt: it
     /// released the operation. The status stays `submissionUnknown` until the client proves
     /// the release itself.
@@ -242,6 +247,11 @@ struct Record {
     /// or RPC is unavailable. An engine `failed` report alone never sets it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     lapsed: bool,
+    /// What the payment buys, when the operation pays a seller's challenge. It is part of the
+    /// original intent: a retry or a recovery with another context is refused before anything
+    /// is signed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    paid_service: Option<PaidService>,
 }
 struct ExecutionProfile {
     policy_id: String,
@@ -922,7 +932,25 @@ pub fn exec(
     request: ExecutionRequest,
     wait: Duration,
 ) -> Result<ExecutionOutcome> {
+    exec_paid(c, journal, request_id, request, wait, None)
+}
+/// [`exec`] for the payment of a seller's challenge. The preparation carries `paid_service`
+/// to the engine, which checks it against the operation and records it. The context is no part
+/// of the operation. The journal keeps it with the original intent, and the engine keeps it
+/// with the original request ID: a retry with another context is refused before anything is
+/// signed, and a retry that resumes a prepared operation does not send it again.
+pub fn exec_paid(
+    c: &Client,
+    journal: &Store,
+    request_id: &str,
+    request: ExecutionRequest,
+    wait: Duration,
+    paid_service: Option<&PaidService>,
+) -> Result<ExecutionOutcome> {
     validate_wait_and_id(request_id, wait)?;
+    if let Some(context) = paid_service {
+        context.validate()?;
+    }
     let policy = c.bundle.policy_id.clone();
     let id = request_id.to_owned();
     if request.operation.nonce != operation_nonce(&policy, &id) {
@@ -952,6 +980,7 @@ pub fn exec(
             || old.request_id != id
             || !same_retained_policy_config(&c.bundle.config, &old.config)
             || old.request != request
+            || old.paid_service.as_ref() != paid_service
         {
             return Err(Error::config(
                 "The original request ID already binds different input",
@@ -992,6 +1021,7 @@ pub fn exec(
                 agent_signature: None,
                 status: None,
                 lapsed: false,
+                paid_service: paid_service.cloned(),
             },
             None,
         )
@@ -1004,7 +1034,7 @@ pub fn exec(
         progress::report("Preparing the operation with the Allowit server");
         c.post(
             &c.bundle.endpoints.execute,
-            json!({"policyId":policy,"requestId":id,"phase":"prepare","request":request}),
+            prepare_body(&policy, &id, &request, paid_service),
         )?
     };
     c.validate(&prepared, &id, Some(&record), false)?;
@@ -1192,6 +1222,9 @@ fn journaled(c: &Client, id: &str, record: Option<Record>, r: &Response) -> Reco
             agent_signature: None,
             status: None,
             lapsed: false,
+            // The engine keeps the context with the request ID. A record that a status read
+            // creates keeps it too, so a later retry with the original context resumes.
+            paid_service: r.paid_service.as_ref().and_then(recorded),
         },
     };
     if old.prepared.is_none() {
@@ -1219,6 +1252,11 @@ pub struct ExecutionOutcome {
     pub limits: Option<Vec<LimitReport>>,
     /// The explorer link of the transaction, once this client holds its verified receipt.
     pub explorer: Option<String>,
+    /// What the payment bought, as the engine recorded it with the operation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paid_service: Option<PaidService>,
+    /// The network of the installed wallet that executed the operation.
+    pub network: String,
 }
 fn render(r: &Response) -> Result<ExecutionOutcome> {
     let settlement = r
@@ -1252,7 +1290,31 @@ fn render(r: &Response) -> Result<ExecutionOutcome> {
                 &r.operation.transaction_hash,
             )
         }),
+        paid_service: r.paid_service.as_ref().and_then(recorded),
+        network: config.network.clone(),
     })
+}
+
+/// The body of a preparation. Only the payment of a seller's challenge names `paidService`, so
+/// every other preparation keeps its exact earlier bytes.
+fn prepare_body(
+    policy: &str,
+    id: &str,
+    request: &ExecutionRequest,
+    paid_service: Option<&PaidService>,
+) -> serde_json::Value {
+    let mut body = json!({"policyId":policy,"requestId":id,"phase":"prepare","request":request});
+    if let Some(context) = paid_service {
+        body["paidService"] = json!(context);
+    }
+    body
+}
+/// The paid-service context that the engine recorded, when it is a bounded context. A value of
+/// another shape is omitted and never shown.
+fn recorded(value: &serde_json::Value) -> Option<PaidService> {
+    serde_json::from_value::<PaidService>(value.clone())
+        .ok()
+        .filter(|context| context.validate().is_ok())
 }
 
 /// The unit of the wallet's installed asset: a listed token, or a classic asset by its code and
@@ -1599,6 +1661,10 @@ impl Retained {
     pub fn signed(&self) -> bool {
         self.0.agent_signature.is_some()
     }
+    /// What the original intent pays for, when it pays a seller's challenge.
+    pub fn paid_service(&self) -> Option<&PaidService> {
+        self.0.paid_service.as_ref()
+    }
 }
 pub fn retained(
     journal: &Store,
@@ -1867,6 +1933,7 @@ mod native_revalidation_tests {
                 agent_signature: None,
                 status: None,
                 lapsed: false,
+                paid_service: None,
             };
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().canonicalize().unwrap();
@@ -2127,6 +2194,87 @@ mod native_revalidation_tests {
         server.join().unwrap();
     }
     #[test]
+    fn a_paid_preparation_names_its_context_and_the_reply_shows_only_a_bounded_one() {
+        let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
+        let context = PaidService {
+            resource: "https://seller.example/report".into(),
+            challenge_id: Some("c-0001".into()),
+            pay_to: p.config.agent.clone(),
+            amount: "2500000".into(),
+            asset: "native".into(),
+        };
+        // An ordinary preparation keeps its exact fields.
+        let plain = prepare_body("engine-policy", "paid-0001", &p.request, None);
+        assert_eq!(
+            plain.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["phase", "policyId", "request", "requestId"]
+        );
+        let paid = prepare_body("engine-policy", "paid-0001", &p.request, Some(&context));
+        assert_eq!(paid["paidService"], json!(context));
+        assert_eq!(paid["request"], plain["request"]);
+        // The engine's record is display data: a bounded context is shown, another shape is
+        // omitted.
+        let operation = json!({"id":"paid-0001","status":OperationStatus::Prepared,"transactionHash":sdk::hex(&p.transaction_hash)});
+        let reply = |recorded: serde_json::Value| -> Response {
+            serde_json::from_value(json!({"prepared":p,"operation":operation,
+                "signedOperation":null,"receipt":null,"paidService":recorded}))
+            .unwrap()
+        };
+        assert_eq!(
+            render(&reply(json!(context))).unwrap().paid_service,
+            Some(context.clone())
+        );
+        for other in [
+            json!(null),
+            json!("https://seller.example/report"),
+            json!({"resource":"javascript:alert(1)","payTo":"G","amount":"1","asset":"native"}),
+            json!({"resource":"https://seller.example/","payTo":"G","amount":"1","asset":"native","note":"x"}),
+        ] {
+            assert_eq!(render(&reply(other)).unwrap().paid_service, None);
+        }
+        // An invalid context never reaches the engine.
+        let mut invalid = context.clone();
+        invalid.resource = "file:///etc/passwd".into();
+        assert!(invalid.validate().is_err());
+        // The journal keeps the context with the original intent, and a record without one
+        // keeps its earlier bytes.
+        let record = |paid_service: Option<PaidService>| Record {
+            backend_origin: None,
+            policy_id: "engine-policy".into(),
+            request_id: "paid-0001".into(),
+            config: p.config.clone(),
+            request: p.request.clone(),
+            prepared: None,
+            agent_signature: None,
+            status: None,
+            lapsed: false,
+            paid_service,
+        };
+        let plain = serde_json::to_value(record(None)).unwrap();
+        assert!(plain.get("paidService").is_none());
+        let kept: Record =
+            serde_json::from_value(serde_json::to_value(record(Some(context.clone()))).unwrap())
+                .unwrap();
+        assert_eq!(kept.paid_service.as_ref(), Some(&context));
+        assert_eq!(Retained(kept).paid_service(), Some(&context));
+        let earlier: Record = serde_json::from_value(plain).unwrap();
+        assert_eq!(earlier.paid_service, None);
+        // A status read without a local record keeps the engine's context, and never
+        // replaces the context of an existing record.
+        let client = engine_client(p.config.clone(), "http://127.0.0.1:1");
+        let recovered = journaled(&client, "paid-0001", None, &reply(json!(context)));
+        assert_eq!(recovered.paid_service.as_ref(), Some(&context));
+        let unpaid = journaled(&client, "paid-0001", None, &reply(json!(null)));
+        assert_eq!(unpaid.paid_service, None);
+        let kept = journaled(
+            &client,
+            "paid-0001",
+            Some(record(None)),
+            &reply(json!(context)),
+        );
+        assert_eq!(kept.paid_service, None);
+    }
+    #[test]
     fn a_status_reply_reports_the_charged_fee_and_the_limits_in_the_installed_unit() {
         let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
         let installed = installed_display(&p.config).expect("the fixture asset has a unit");
@@ -2208,6 +2356,7 @@ mod native_revalidation_tests {
             agent_signature: None,
             status: Some(OperationStatus::Prepared),
             lapsed: false,
+            paid_service: None,
         };
         journal.save(&name, &record).unwrap();
         // The operation of another service is not this wallet's report.
@@ -2920,6 +3069,7 @@ mod native_revalidation_tests {
             agent_signature: None,
             status: Some(OperationStatus::SubmissionUnknown),
             lapsed: false,
+            paid_service: None,
         };
         assert!(client.proven_release(&r, Some(&record)));
         record.prepared = None;

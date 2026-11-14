@@ -3,8 +3,8 @@ pub use allowit_core::client::error;
 pub use allowit_core::vendor::request;
 pub use allowit_core::vendor::wallet::{KeyProvider, PrivateSigner, Signer};
 pub use allowit_core::vendor::{
-    authoring, config, execution, generation, input, owner, owner_session, plugin, profiles,
-    request_proof, runtime, typed_request,
+    authoring, config, execution, generation, input, owner, owner_session, paid_service, plugin,
+    profiles, request_proof, runtime, typed_request,
 };
 pub mod routing {
     use super::error::{Error, Result};

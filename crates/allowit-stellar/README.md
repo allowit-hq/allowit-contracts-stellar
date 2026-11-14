@@ -135,6 +135,50 @@ A refused owner submission keeps the server `code` in `Error::api_code`. `owner_
 `owner_transaction_settled` are certain (exit 4). `owner_transaction_pending`, no answer and an untyped server error
 are uncertain (exit 5). `network_unavailable` with `details.retry = "same_request_id"` is exit 7.
 
+## Paid services (x402)
+
+`provider::paid_service` implements the Core paid-service hook for x402 sellers on Stellar.
+
+`challenge(network, resource, reply)` reads a seller's HTTP 402 reply: the JSON body with `accepts`
+(x402 version 1) or the base64 JSON of the `PAYMENT-REQUIRED` header (version 2). It returns the first
+requirement of the selected network that this rail can settle. Validation is strict:
+
+- `network` is the selected network or one of its aliases. A requirement of another network is skipped.
+- `scheme` is `exact`.
+- `asset` is the Stellar Asset Contract id of a listed token, or `native`. Another contract is refused.
+- `payTo` is a canonical G or C address.
+- The amount (`amount`, or `maxAmountRequired` in version 1) is a positive integer of base units.
+- A named resource equals the requested URL.
+- `extra.challengeId` or `extra.nonce` is the challenge id. `extra.expiresAt` is a Unix time.
+- The accepted terms are at most 4096 bytes of JSON. The proof echoes them, so larger terms are refused.
+
+Allowit settles the payment itself. The agent's transfer goes through the policy and the engine like
+any other operation. The standard `exact` scheme on Stellar has the seller's facilitator submit a
+transaction that the payer signed; Allowit signs no such transaction. A requirement is accepted only
+when the seller states `extra.proof: "settled-transaction"`. Every other requirement is refused before
+any payment.
+
+`proof(challenge, receipt)` builds the request header from the outcome document of the confirmed
+operation: `X-PAYMENT` (version 1) or `PAYMENT-SIGNATURE` (version 2), the base64 JSON of
+`{x402Version, scheme, network, payload: {transaction, settled: true, challengeId?}}`. Version 2 also
+echoes `accepted` and `resource`. The receipt must be confirmed, its `network` must be the network of the
+challenge, and its recorded `paidService` context must equal the challenge: the resource, the recipient, the
+amount and the asset. A receipt without that record gives no proof. A stated `settlement.amount` must also equal the challenge amount; a fee-bumped
+transaction states none.
+
+A seller that accepts this proof verifies it on its own:
+
+1. The transaction `payload.transaction` succeeded on the stated network.
+2. It moved at least the required amount of the required asset to `payTo`.
+3. It closed after the seller issued the challenge.
+4. Its hash was not used for an earlier delivery.
+
+`exec_paid` sends the `paidService` context with the preparation of the transfer. The engine checks it
+against the operation and records it with the request ID. The journal keeps it with the original intent:
+a retry or a recovery of the same request ID with another context is refused before anything is signed.
+The outcome document of a paid operation shows the recorded context under `paidService` and the wallet's
+network under `network`.
+
 ## Owner setup
 
 `admin::PolicyConfig::for_policy` builds the `AllowitPolicyConfig` constructor packet of a validated installation, and `constructor_args` emits it. `admin::Deployer` prepares unsigned setup transactions through Stellar RPC simulation:
