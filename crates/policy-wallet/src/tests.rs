@@ -2336,90 +2336,169 @@ fn address_kind_checks_tell_accounts_from_contracts() {
     assert!(is_contract(&contract) && !is_contract(&account));
 }
 
-/// The owner alone runs every admin call of a policy wallet, on every wallet kind: pause,
-/// resume, recovery, a params update, an owner change and the passthrough. The agent, the
-/// server, both together and a stranger run none of them, and a refused call changes no state
-/// and moves no funds. Agent and server together only pay, and a paused wallet refuses that too.
+/// How one admin call ended.
+#[derive(Debug, PartialEq)]
+enum Outcome {
+    Done,
+    /// The host aborted the call. With mocked authorization this is how a missing
+    /// `require_auth` signer ends; the owner's success with the same arguments in the same
+    /// state shows that nothing else was wrong with the call.
+    Unauthorized,
+    Refused(std::string::String),
+}
+fn outcome<T, C: core::fmt::Debug>(
+    result: Result<Result<T, C>, Result<AllowitWalletError, soroban_sdk::InvokeError>>,
+) -> Outcome {
+    match result {
+        Ok(Ok(_)) => Outcome::Done,
+        Ok(Err(e)) => Outcome::Refused(std::format!("{e:?}")),
+        Err(Err(soroban_sdk::InvokeError::Abort)) => Outcome::Unauthorized,
+        Err(e) => Outcome::Refused(std::format!("{e:?}")),
+    }
+}
+/// The owner's admin calls: everything a policy wallet does outside `execute`.
+#[derive(Clone, Copy, Debug)]
+enum Admin {
+    Pause,
+    Resume,
+    Recover,
+    /// A params-only update through `deploy_policy`.
+    Params,
+    /// The owner passthrough: here a token transfer out of the wallet.
+    Passthrough,
+    /// A code upgrade through `deploy_policy`.
+    Upgrade,
+}
+const ADMIN_MOVES: i128 = 10;
+/// Run `call` on the wallet's current state with only `actors` authorizing it.
+fn admin_call(
+    f: &Fixture,
+    wasm: &[u8],
+    upgrade: &BytesN<32>,
+    call: Admin,
+    actors: &[&Address],
+) -> Outcome {
+    let version = f.client().state().deployment_version + 1;
+    match call {
+        Admin::Pause | Admin::Resume => {
+            let paused = matches!(call, Admin::Pause);
+            f.auth(actors, "set_pause", (paused, version).into_val(&f.env));
+            outcome(f.client().try_set_pause(&paused, &version))
+        }
+        Admin::Recover => {
+            f.auth(
+                actors,
+                "recover",
+                (f.recipient.clone(), ADMIN_MOVES).into_val(&f.env),
+            );
+            outcome(f.client().try_recover(&f.recipient, &ADMIN_MOVES))
+        }
+        Admin::Params | Admin::Upgrade => {
+            let mut p = f.deployment();
+            if matches!(call, Admin::Params) {
+                set_param(
+                    &mut p.params,
+                    DAILY_SPENDING_LIMIT,
+                    Some(AllowitValue::Int(149)),
+                );
+            } else {
+                p.wasm_hash = Some(upgrade.clone());
+                if wasm != CUSTOM {
+                    let kind = if wasm == COMMON {
+                        "common_policy_engine"
+                    } else {
+                        "simple_policy_engine"
+                    };
+                    p.source_digest = standard_prefix_digest(
+                        &f.env,
+                        &Symbol::new(&f.env, kind),
+                        upgrade,
+                        &f.asset,
+                        &p.rules,
+                    );
+                }
+            }
+            f.auth(actors, "deploy_policy", (p.clone(),).into_val(&f.env));
+            outcome(f.client().try_deploy_policy(&p))
+        }
+        Admin::Passthrough => {
+            let function = Symbol::new(&f.env, "transfer");
+            let args: Vec<Val> =
+                (f.wallet.clone(), f.recipient.clone(), ADMIN_MOVES).into_val(&f.env);
+            let auth = Vec::new(&f.env);
+            f.auth(
+                actors,
+                "invoke",
+                (
+                    f.asset.clone(),
+                    function.clone(),
+                    args.clone(),
+                    auth.clone(),
+                )
+                    .into_val(&f.env),
+            );
+            outcome(f.client().try_invoke(&f.asset, &function, &args, &auth))
+        }
+    }
+}
+/// The owner alone runs every admin call of a policy wallet, on every contract wallet kind:
+/// pause, resume, recovery, a params update, the passthrough, a code upgrade and an owner
+/// change. The agent, the server, both together, a stranger and nobody run none of them: each
+/// such call ends as unauthorized and changes no state and moves no funds. The owner then runs
+/// the same call with the same arguments in the same state, so the only difference between the
+/// refusal and the success is who authorized it. Agent and server together only pay, and a
+/// paused wallet refuses that too.
 #[test]
 fn only_the_owner_runs_each_admin_call_on_every_wallet_kind() {
     for (kind, wasm) in [("simple", SIMPLE), ("standard", COMMON), ("custom", CUSTOM)] {
         let f = Fixture::new(wasm, false);
+        // The wallet holds exactly the roles of its owner-signed configuration.
+        let created = f.client().state();
+        assert_eq!(
+            (&created.owner, &created.agent, &created.server),
+            (&f.owner, &f.agent, &f.server),
+            "{kind}"
+        );
+        assert!(!created.paused && created.deployment_version == 0 && created.nonce == 0);
         let stranger = Address::generate(&f.env);
-        let groups: [&[&Address]; 4] = [
+        let mut bytes = Bytes::from_slice(&f.env, wasm);
+        bytes.append(&Bytes::from_slice(&f.env, &[0, 2, 1, b'x']));
+        let upgrade = f.env.deployer().upload_contract_wasm(bytes);
+        let others: [&[&Address]; 5] = [
             &[&f.agent],
             &[&f.server],
             &[&f.agent, &f.server],
             &[&stranger],
+            &[],
         ];
-        let refused_admin = |f: &Fixture, paused: bool| {
-            let before = (f.client().state(), f.balance());
-            let version = before.0.deployment_version + 1;
-            let mut params = f.deployment();
-            set_param(
-                &mut params.params,
-                DAILY_SPENDING_LIMIT,
-                Some(AllowitValue::Int(149)),
-            );
-            let mut takeover = f.deployment();
-            takeover.owner = f.agent.clone();
-            for actors in groups {
-                f.auth(actors, "set_pause", (paused, version).into_val(&f.env));
-                assert!(
-                    f.client().try_set_pause(&paused, &version).is_err(),
-                    "{kind}: set_pause({paused}) by {} non-owner signer(s)",
+        // No one but the owner runs `call`; then the owner alone runs it.
+        let owner_only = |call: Admin, owner: &Address| {
+            let before = (f.client().state(), f.client().policy_state(), f.balance());
+            for actors in others {
+                assert_eq!(
+                    admin_call(&f, wasm, &upgrade, call, actors),
+                    Outcome::Unauthorized,
+                    "{kind}: {call:?} by {} signer(s) that are not the owner",
                     actors.len()
                 );
-                f.auth(
-                    actors,
-                    "recover",
-                    (f.recipient.clone(), 10i128).into_val(&f.env),
+                assert_eq!(
+                    (f.client().state(), f.client().policy_state(), f.balance()),
+                    before,
+                    "{kind}: a refused {call:?} changed the wallet"
                 );
-                assert!(
-                    f.client().try_recover(&f.recipient, &10).is_err(),
-                    "{kind}: recover"
-                );
-                for p in [&params, &takeover] {
-                    f.auth(actors, "deploy_policy", (p.clone(),).into_val(&f.env));
-                    assert!(
-                        f.client().try_deploy_policy(p).is_err(),
-                        "{kind}: deploy_policy"
-                    );
-                }
-                let function = Symbol::new(&f.env, "transfer");
-                let args: Vec<Val> =
-                    (f.wallet.clone(), f.recipient.clone(), 10i128).into_val(&f.env);
-                let auth = Vec::new(&f.env);
-                f.auth(
-                    actors,
-                    "invoke",
-                    (
-                        f.asset.clone(),
-                        function.clone(),
-                        args.clone(),
-                        auth.clone(),
-                    )
-                        .into_val(&f.env),
-                );
-                assert!(
-                    f.client()
-                        .try_invoke(&f.asset, &function, &args, &auth)
-                        .is_err(),
-                    "{kind}: invoke"
-                );
-                assert_eq!((f.client().state(), f.balance()), before, "{kind}");
             }
+            assert_eq!(
+                admin_call(&f, wasm, &upgrade, call, &[owner]),
+                Outcome::Done,
+                "{kind}: {call:?} by the owner alone"
+            );
         };
-        // Active wallet: no non-owner pauses, recovers, updates, takes over or passes through.
-        refused_admin(&f, true);
         // Agent and server together pay.
         f.transfer(10);
         assert_eq!(f.balance(), 990, "{kind}");
-        // The owner alone pauses.
-        let version = f.client().state().deployment_version + 1;
-        f.auth(&[&f.owner], "set_pause", (true, version).into_val(&f.env));
-        f.client().set_pause(&true, &version);
+        owner_only(Admin::Pause, &f.owner);
         assert!(f.client().state().paused, "{kind}");
-        // Paused: agent and server together cannot pay, and no non-owner resumes.
+        // A paused wallet refuses the payment of agent and server together.
         let e = f.execution(10);
         f.auth(
             &[&f.agent, &f.server],
@@ -2431,18 +2510,73 @@ fn only_the_owner_runs_each_admin_call_on_every_wallet_kind() {
             Err(Ok(AllowitWalletError::Paused)),
             "{kind}"
         );
-        refused_admin(&f, false);
-        // The owner alone recovers the funds of a paused wallet, then resumes it.
-        f.auth(
-            &[&f.owner],
-            "recover",
-            (f.recipient.clone(), 990i128).into_val(&f.env),
-        );
-        f.client().recover(&f.recipient, &990);
-        assert_eq!(f.balance(), 0, "{kind}");
-        let version = f.client().state().deployment_version + 1;
-        f.auth(&[&f.owner], "set_pause", (false, version).into_val(&f.env));
-        f.client().set_pause(&false, &version);
+        // The owner recovers from a paused wallet, and only the owner resumes it.
+        owner_only(Admin::Recover, &f.owner);
+        assert_eq!(f.balance(), 980, "{kind}");
+        owner_only(Admin::Resume, &f.owner);
         assert!(!f.client().state().paused, "{kind}");
+        f.transfer(10);
+        assert_eq!(f.balance(), 970, "{kind}");
+        let usage = (f.client().policy_state(), f.client().state().nonce);
+        owner_only(Admin::Params, &f.owner);
+        assert_eq!(
+            f.client()
+                .state()
+                .params
+                .get(Symbol::new(&f.env, DAILY_SPENDING_LIMIT)),
+            Some(AllowitValue::Int(149)),
+            "{kind}"
+        );
+        assert_eq!(
+            (f.client().policy_state(), f.client().state().nonce),
+            usage,
+            "{kind}: an owner update keeps the usage and the nonce"
+        );
+        owner_only(Admin::Passthrough, &f.owner);
+        assert_eq!(f.balance(), 960, "{kind}");
+        owner_only(Admin::Upgrade, &f.owner);
+        assert_eq!(f.client().policy_binding().module_digest, upgrade, "{kind}");
+        f.transfer(10);
+        assert_eq!(f.balance(), 950, "{kind}");
+        // An owner change needs the current owner and the new one. No other pair makes it.
+        let next = Address::generate(&f.env);
+        let mut change = f.deployment();
+        change.owner = next.clone();
+        let before = f.client().state();
+        let pairs: [&[&Address]; 7] = [
+            &[&f.agent],
+            &[&f.server],
+            &[&f.agent, &f.server],
+            &[&f.agent, &f.server, &next],
+            &[&next],
+            &[&f.owner],
+            &[],
+        ];
+        for actors in pairs {
+            f.auth(actors, "deploy_policy", (change.clone(),).into_val(&f.env));
+            assert_eq!(
+                outcome(f.client().try_deploy_policy(&change)),
+                Outcome::Unauthorized,
+                "{kind}: an owner change by {} signer(s)",
+                actors.len()
+            );
+            assert_eq!(f.client().state(), before, "{kind}");
+        }
+        f.auth(
+            &[&f.owner, &next],
+            "deploy_policy",
+            (change.clone(),).into_val(&f.env),
+        );
+        f.client().deploy_policy(&change);
+        assert_eq!(f.client().state().owner, next, "{kind}");
+        // The earlier owner now is a stranger; the new owner alone administers.
+        assert_eq!(
+            admin_call(&f, wasm, &upgrade, Admin::Pause, &[&f.owner]),
+            Outcome::Unauthorized,
+            "{kind}: the earlier owner"
+        );
+        owner_only(Admin::Pause, &next);
+        owner_only(Admin::Recover, &next);
+        assert_eq!(f.balance(), 940, "{kind}");
     }
 }
