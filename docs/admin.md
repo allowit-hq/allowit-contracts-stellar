@@ -128,6 +128,10 @@ and leaves the checkout unchanged. It prints one JSON line with `source_digest` 
 `POLICY.rs`, the wallet `source_digest`), `wasm_hash` (the SHA-256 of the Wasm, the `--wasm-hash`)
 and the `wasm` path. The same revision, source, Rust toolchain and Stellar CLI give the same Wasm.
 
+An owner builds the Wasm of a Custom policy with `allowit policy build`, which runs the same build through the
+rail's build hook ([Custom wallet build](../crates/allowit-stellar/README.md#custom-wallet-build)). The script
+rebuilds a policy independently: its `wasm_hash` equals the code hash that the owner attested.
+
 Params JSON is an object of key => value, at most 32 keys of 1 to 32 ASCII letters, digits or
 underscores. An absent key is unset. The tool infers each value's `AllowitValue` type: an integer is
 `Int`, a boolean `Bool`, a G or C address `Addr`, other text `Str` and a list `List`. A one-key
