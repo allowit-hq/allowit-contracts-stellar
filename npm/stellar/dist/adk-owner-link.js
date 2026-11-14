@@ -7,7 +7,7 @@ const hashPattern = /^[0-9a-f]{64}$/;
 /** A wallet kind id, as the catalogue of the server names it. */
 const kindPattern = /^[a-z]{1,32}$/;
 /** The CLI uses this origin when `ALLOWIT_URL` is not set. */
-const CLI_DEFAULT_ORIGIN = 'https://app.allowit.xyz';
+const CLI_DEFAULT_ORIGIN = 'https://app.allowit.ai';
 /** The ADK owner flow funds native XLM on Stellar Testnet. */
 const XLM = { symbol: 'XLM', decimals: 7, address: stellarAssetContractId('XLM', null, 'stellar:testnet') };
 export function adkAgentPrompt(workPrompt, origin, policyId, wallet, agent) {

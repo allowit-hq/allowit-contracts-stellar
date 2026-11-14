@@ -128,6 +128,71 @@ export function ownerSignElement() {
   };
 }
 
+/** The fields of a custom build attestation message. */
+export interface BuildAttestation {network: string; policy: string; sourceHash: string; codeHash: string; server: string; presignature: string; owner: string}
+const ATTESTATION_TITLE = 'Allowit custom build attestation v1';
+const ATTESTATION_KEYS = ['network', 'policy', 'source-sha256', 'code-sha256', 'server', 'presignature', 'owner'] as const;
+/**
+ * Reads the exact text of a custom build attestation: its title line, then one `key: value` line for each field in
+ * order. Any other text is null. A value is printable ASCII without a space; hashes and the presignature are
+ * lowercase hexadecimal.
+ */
+export function buildAttestation(message: unknown): BuildAttestation | null {
+  if (typeof message !== 'string') return null;
+  const lines = message.split('\n');
+  if (lines.length !== ATTESTATION_KEYS.length + 1 || lines[0] !== ATTESTATION_TITLE) return null;
+  const values: string[] = [];
+  for (const [index, key] of ATTESTATION_KEYS.entries()) {
+    const prefix = `${key}: `, line = lines[index + 1];
+    if (!line.startsWith(prefix)) return null;
+    const value = line.slice(prefix.length);
+    if (!/^[\x21-\x7e]{1,128}$/.test(value) && key !== 'presignature') return null;
+    values.push(value);
+  }
+  const [network, policy, sourceHash, codeHash, server, presignature, owner] = values;
+  if (!/^[0-9a-f]{64}$/.test(sourceHash) || !/^[0-9a-f]{64}$/.test(codeHash) || !/^([0-9a-f]{2}){1,512}$/.test(presignature)) return null;
+  return {network, policy, sourceHash, codeHash, server, presignature, owner};
+}
+
+/**
+ * Signs the owner's attestation of a custom wallet build with the wallet's message signature. It signs only an
+ * attestation message of this network whose owner is the wallet account, and shows what the owner attests.
+ */
+export function buildAttestElement() {
+  return class extends base() {
+    render(): void {
+      const data = (this.data ?? {}) as Data;
+      const id = canonicalNetwork(data.network), fields = buildAttestation(data.message);
+      if (!id || !fields || fields.network !== id || !strkey(fields.owner) || !strkey(fields.server)) {
+        this.replaceChildren(h('p', {class: 'invalid'}, 'This build attestation is invalid.'));
+        return;
+      }
+      const summary = Array.isArray(data.summary) ? data.summary as {label?: unknown; value?: unknown}[] : [];
+      const rows = summary.flatMap(row => [h('dt', {}, String(row.label ?? '')), h('dd', {}, String(row.value ?? ''))]);
+      rows.push(h('dt', {}, 'Policy source hash'), h('dd', {class: 'mono'}, fields.sourceHash));
+      rows.push(h('dt', {}, 'Wallet code hash'), h('dd', {class: 'mono'}, fields.codeHash));
+      rows.push(h('dt', {}, 'Server'), h('dd', {}, link(id, 'address', fields.server, fields.server)));
+      const status = h('p', {class: 'status', role: 'status'});
+      const sign = button('Sign the build attestation', async () => {
+        sign.disabled = true; status.textContent = 'Waiting for the wallet…';
+        try {
+          const {connectWallet, signWalletMessage} = await import('./wallet.js');
+          const address = await connectWallet(id);
+          if (address !== fields.owner) throw Object.assign(new Error('The wallet account is not the owner of this policy. Nothing was signed.'), {code: 'mismatch'});
+          const signature = await signWalletMessage(data.message as string, address, id);
+          status.textContent = 'Signed.';
+          emit(this, 'allowit-signed', {signature: hex(Uint8Array.from(atob(signature), c => c.charCodeAt(0))), codeHash: fields.codeHash});
+        } catch (error) {
+          status.textContent = error instanceof Error ? error.message : String(error);
+          emit(this, 'allowit-error', failure(error, 'sign'));
+        } finally {sign.disabled = false;}
+      });
+      const cancel = button('Cancel', () => emit(this, 'allowit-cancel'));
+      this.replaceChildren(h('dl', {class: 'owner-step'}, ...rows), h('div', {class: 'actions'}, sign, cancel), status);
+    }
+  };
+}
+
 /** Checks an installation's shape and identities, and reports the result. The host keeps the server checks. */
 export function bindingReviewElement() {
   return class extends base() {

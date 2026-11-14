@@ -10,7 +10,7 @@ import {defineElements, ELEMENTS} from './elements/index.js';
 import {ADK_OWNER_FRAGMENT, adkParamLines, parseReviewLink, reviewAgentPrompt} from './adk-owner-link.js';
 import {installAndFund, updateParams} from './owner-flow.js';
 
-export type ElementKind = 'address'|'explorer-link'|'amount'|'wallet-sign-in'|'owner-sign'|'receipt'|'binding-review';
+export type ElementKind = 'address'|'explorer-link'|'amount'|'wallet-sign-in'|'owner-sign'|'build-attest'|'receipt'|'binding-review';
 export type Feature = 'transfer'|'swap'|'deposit'|'redeem'|'owner-setup'|'deploy'|'fund'|'activate'|'binding-review'|'explorer-links';
 export interface RailNetwork {id: string; label: string; testnet: boolean; aliases: readonly string[]}
 export interface AssetInfo {network: string; id: string; symbol: string; decimals: number; stablecoin: boolean; label: string}
