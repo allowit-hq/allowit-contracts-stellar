@@ -116,8 +116,19 @@ fn classic_action_matches(action: &str, operations: &[Operation]) -> bool {
                         )
                 })
         }
+        // A fee account: the creation of the account with its three signer operations.
+        (owner::CREATE_FEE_ACCOUNT, [create, rest @ ..]) => {
+            matches!(create.body, OperationBody::CreateAccount(_))
+                && create.source_account.is_none()
+                && rest.len() == 3
+                && rest
+                    .iter()
+                    .all(|op| wallet_sourced(op) && matches!(op.body, OperationBody::SetOptions(_)))
+        }
         ("fund", [op]) => !wallet_sourced(op) && matches!(op.body, OperationBody::Payment(_)),
-        ("withdraw", [op]) => wallet_sourced(op) && matches!(op.body, OperationBody::Payment(_)),
+        ("withdraw" | owner::RETURN_FEES, [op]) => {
+            wallet_sourced(op) && matches!(op.body, OperationBody::Payment(_))
+        }
         ("pause" | "resume", [op]) => {
             wallet_sourced(op) && matches!(op.body, OperationBody::SetOptions(_))
         }
@@ -165,17 +176,41 @@ pub fn validate_signed_owner_transaction(
     let MuxedAccount::Ed25519(key) = &unsigned.tx.source_account else {
         return Err("Expected a native G-account owner source".into());
     };
-    let [signature] = signed.signatures.as_slice() else {
-        return Err("Exactly one source-owner signature is required".into());
+    // The creation of a fee account also carries the one signature of the new account's own
+    // key: the network requires it for the operations that the new account is the source of.
+    let created = (original.action == owner::CREATE_FEE_ACCOUNT)
+        .then(|| match unsigned.tx.operations.first().map(|op| &op.body) {
+            Some(OperationBody::CreateAccount(create)) => {
+                let PublicKey::PublicKeyTypeEd25519(account) = &create.destination.0;
+                Ok(account.0)
+            }
+            _ => Err("The creation of a fee account names no new account".to_string()),
+        })
+        .transpose()?;
+    let verify = |signer: &[u8; 32], signature: &DecoratedSignature, what: &str| -> Result<()> {
+        if signature.hint.0 != signer[28..] {
+            return Err(format!("{what} signature hint differs"));
+        }
+        signing::verify_digest(
+            &ed25519::PublicKey(*signer).to_string(),
+            &digest,
+            signature.signature.as_slice(),
+        )
     };
-    if signature.hint.0 != key.0[28..] {
-        return Err("Owner signature hint differs".into());
+    match (signed.signatures.as_slice(), created) {
+        ([signature], None) => verify(&key.0, signature, "Owner")?,
+        ([signature, account_signature], Some(account)) => {
+            verify(&key.0, signature, "Owner")?;
+            verify(&account, account_signature, "Fee account")?;
+        }
+        (_, None) => return Err("Exactly one source-owner signature is required".into()),
+        (_, Some(_)) => {
+            return Err(
+                "The creation of a fee account needs the owner's signature, then the one signature of the new account's own key"
+                    .into(),
+            );
+        }
     }
-    signing::verify_digest(
-        &ed25519::PublicKey(key.0).to_string(),
-        &digest,
-        signature.signature.as_slice(),
-    )?;
     Ok(digest)
 }
 
@@ -238,6 +273,16 @@ pub enum OwnerAction {
         trustline: Option<owner::Trustline>,
         created_at: u64,
     },
+    /// The exact creation of the fee account of one policy wallet, reconstructed from the
+    /// caller-observed owner account and the caller's own roles. The packet chooses only its
+    /// fee, within the caller's fee limit, and its expiry.
+    FeeAccountSetup {
+        state: AccountState,
+        account: String,
+        agent: String,
+        engine: String,
+        request_id: String,
+    },
     /// One owner action on a wallet account (fund, pause, resume, withdraw or close),
     /// reconstructed from the caller-observed owner and wallet accounts and the selected roles.
     /// The packet chooses only its fee, within the caller's fee limit, and its expiry.
@@ -260,6 +305,7 @@ impl OwnerAction {
             Self::Extend { .. } => "extend",
             Self::UpdatePolicy { .. } => "update_params",
             Self::NativeSetup { .. } => "native_setup",
+            Self::FeeAccountSetup { .. } => owner::CREATE_FEE_ACCOUNT,
             Self::Wallet { action, .. } => action.name(),
         }
     }
@@ -412,6 +458,44 @@ pub fn validate_owner_transaction(
                 || packet.expires_at != exact.expires_at
             {
                 return Err("Native setup differs from the exact caller-selected template".into());
+            }
+        }
+        OwnerAction::FeeAccountSetup {
+            state,
+            account,
+            agent,
+            engine,
+            request_id,
+        } => {
+            if state.address != limits.owner {
+                return Err("Fee account setup source differs from caller intent".into());
+            }
+            // The fee and the expiry are the packet's own, within the limits checked above.
+            // Every operation, the starting balance and the roles are the caller's.
+            let count = u32::try_from(tx.operations.len()).map_err(err)?;
+            if count == 0 || !tx.fee.is_multiple_of(count) {
+                return Err("Fee account setup fee is not a whole fee per operation".into());
+            }
+            let created_at = packet
+                .expires_at
+                .checked_sub(300)
+                .ok_or("Fee account setup expiry is invalid")?;
+            let exact = owner::setup_transaction(&owner::prepare_fee_account_setup(
+                state,
+                &owner::FeeAccountTerms {
+                    account,
+                    agent,
+                    engine,
+                    request_id,
+                    network: &limits.network,
+                    fee_per_operation: tx.fee / count,
+                },
+                created_at,
+            )?)?;
+            if packet != &exact {
+                return Err(
+                    "Fee account setup differs from the exact caller-selected roles".into(),
+                );
             }
         }
         OwnerAction::Wallet {
@@ -661,6 +745,7 @@ fn validate_host(
             admin::validate_auth(&limits.network, &exact, &invoke.auth, None)?;
         }
         OwnerAction::NativeSetup { .. }
+        | OwnerAction::FeeAccountSetup { .. }
         | OwnerAction::Wallet { .. }
         | OwnerAction::Extend { .. } => unreachable!(),
     }

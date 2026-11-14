@@ -49,6 +49,17 @@ pub mod x402;
 pub type Result<T> = std::result::Result<T, String>;
 
 pub const PROFILE: &str = "allowit-wallet-v1";
+/// The refusal of a wallet creation whose installation names no fee account. Its code is
+/// `fee_account_required`: the owner's client derives the account and names it.
+pub const FEE_ACCOUNT_REQUIRED: &str =
+    "A new policy wallet needs a fee account: the owner's deployment creates and funds it";
+/// The refusal of a policy wallet whose agent address on the ledger is not the fee account of
+/// its installation. Its code is `fee_account_differs`.
+pub const FEE_ACCOUNT_DIFFERS: &str =
+    "The policy wallet's agent address on the ledger differs from its fee account";
+/// The refusal of an operation whose fee account holds less than its network fee. Its code is
+/// `fee_account_empty`: the owner refills the account.
+pub const FEE_ACCOUNT_EMPTY: &str = "The fee account of this policy wallet holds too little XLM for the network fee. Its owner refills it by sending XLM to";
 const MAX_BYTES: usize = 1_048_576;
 
 pub fn hash(bytes: impl AsRef<[u8]>) -> [u8; 32] {
@@ -205,6 +216,12 @@ pub struct WalletConfig {
     pub wallet: String,
     pub owner: String,
     pub agent: String,
+    /// The fee account of a policy wallet: the account that is the wallet's agent address on
+    /// the ledger, sends the agent's operations and pays their network fees. Its owner
+    /// creates and funds it; the agent key and the server sign from it only together. A
+    /// wallet of an earlier release has none: the agent key's own account sends and pays.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_account: Option<String>,
     #[serde(alias = "engine")]
     pub server: String,
     pub route: WalletRoute,
@@ -246,6 +263,11 @@ fn policy_params_empty(params: &PolicyParams) -> bool {
     params.0.is_empty()
 }
 impl WalletConfig {
+    /// The agent address that a policy wallet holds on the ledger: its fee account, or for a
+    /// wallet of an earlier release the agent key's own account.
+    pub fn agent_account(&self) -> &str {
+        self.fee_account.as_deref().unwrap_or(&self.agent)
+    }
     /// The legacy SDK engine name of the installed tier.
     pub fn policy_engine(&self) -> Option<PolicyEngine> {
         self.tier.map(PolicyTier::engine)
@@ -427,9 +449,17 @@ pub struct AccountState {
     pub high_threshold: u32,
     pub signers: Vec<AccountSigner>,
 }
+/// The keys that sign the transaction of an automated operation. The agent and the server
+/// sign together from a wallet account and from the fee account of a policy wallet. The agent
+/// key alone signs from its own account for a policy wallet of an earlier release.
 fn automated_roles(c: &WalletConfig) -> Vec<&str> {
     let mut roles = vec![c.agent.as_str()];
-    if c.route == WalletRoute::Native && c.server != c.agent {
+    let together = match c.route {
+        WalletRoute::Native => true,
+        WalletRoute::PolicyWallet => c.fee_account.is_some(),
+        WalletRoute::Odc => false,
+    };
+    if together && c.server != c.agent {
         roles.push(c.server.as_str());
     }
     roles
@@ -793,6 +823,17 @@ fn validate_config_for(c: &WalletConfig, admit_source: bool) -> Result<()> {
     }
     address(&c.owner)?;
     account_key(&c.agent)?;
+    if let Some(fee_account) = &c.fee_account {
+        account_key(fee_account)?;
+        // The fee account is an account of its own. No role key is its key.
+        if c.route != WalletRoute::PolicyWallet
+            || [&c.owner, &c.agent, &c.server].contains(&fee_account)
+        {
+            return Err(
+                "A fee account belongs to a policy wallet and differs from every role".into(),
+            );
+        }
+    }
     match c.route {
         WalletRoute::Native => {
             account_key(&c.wallet)?;
@@ -1471,6 +1512,15 @@ fn build(
                     "policy wallet executable or current agent transaction source differs".into(),
                 );
             }
+            if let Some(fee_account) = &c.fee_account {
+                // The wallet names exactly the fee account of its installation, and that
+                // account holds exactly its roles: the agent key signs from it only with the
+                // server, and no other key signs from it at all.
+                if state.agent != *fee_account {
+                    return Err(FEE_ACCOUNT_DIFFERS.into());
+                }
+                state.source.validate_roles(&c.owner, &c.agent, &c.server)?;
+            }
             let fee = &r.fee_bounds.as_ref().ok_or("Native fee bound required")?[0];
             if workflow_address(&fee.payer)? != state.source.address {
                 return Err(
@@ -1861,10 +1911,14 @@ pub fn sign_with(
     if p.config.route == WalletRoute::PolicyWallet {
         authorization::server_signature(p, true)?;
     }
-    let allowed = if p.config.route == WalletRoute::Native {
-        signer == p.config.agent || signer == p.config.server
-    } else {
-        signer == p.config.agent
+    // The server signs the transaction of a policy wallet operation only after its own
+    // authorization of that exact operation, which is checked above. Its signature counts
+    // where the fee account is the source.
+    let allowed = match p.config.route {
+        WalletRoute::Native | WalletRoute::PolicyWallet => {
+            signer == p.config.agent || signer == p.config.server
+        }
+        WalletRoute::Odc => signer == p.config.agent,
     };
     if !allowed {
         return Err("Signer has no automated role".into());
@@ -1941,6 +1995,14 @@ pub fn authorize(
         authorization::server_signature(p, true)?;
     }
     let required = automated_roles(&p.config);
+    // A server that signs every transaction that it submits also signs for a policy wallet
+    // of an earlier release, whose agent key signs alone. That signature is not used.
+    let unused = |s: &&DetachedSignature| {
+        p.config.route == WalletRoute::PolicyWallet
+            && p.config.fee_account.is_none()
+            && s.signer == p.config.server
+    };
+    let signatures: Vec<&DetachedSignature> = signatures.iter().filter(|s| !unused(s)).collect();
     let aliased_roles = p.config.route == WalletRoute::Native && p.config.agent == p.config.server;
     if signatures.len() != required.len() && !(aliased_roles && signatures.len() == 2) {
         return Err("Exact automated signature quorum required".into());
@@ -1964,7 +2026,9 @@ pub fn authorize(
             .map_err(err)?
             .verify_strict(&p.transaction_hash, &EdSignature::from_bytes(&sig))
             .map_err(err)?;
-        proofs.entry(s.signer.clone()).or_insert_with(|| s.clone());
+        proofs
+            .entry(s.signer.clone())
+            .or_insert_with(|| (*s).clone());
         verified.insert(
             s.signer.clone(),
             DecoratedSignature {

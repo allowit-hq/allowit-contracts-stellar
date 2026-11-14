@@ -460,6 +460,88 @@ impl Provider {
         }
         Ok(OwnerPacket(packet(&c.network, &p)?))
     }
+    /// The fee of one classic operation of an owner action: an equal share of the caller's
+    /// fee limit, within the bounds of one operation.
+    fn classic_fee(fee_limit: u64) -> Result<u32> {
+        u32::try_from((fee_limit / 6).clamp(100, 10_000))
+            .map_err(|_| Error::usage("Invalid owner fee limit"))
+    }
+    /// The owner step that creates the fee account of a policy wallet: one transaction from
+    /// the owner's account that creates the account with its reserve and the fee float, adds
+    /// the owner, agent and server signers and takes every authority from the account's own
+    /// key. The owner signs it, and the account's own key signs it once.
+    fn prepare_fee_account(
+        &self,
+        c: &WalletConfig,
+        fee_account: &str,
+        fee_limit: u64,
+        now: u64,
+    ) -> Result<OwnerPacket> {
+        let owner_state = checked(rpc::get_account(self.rpc(), &c.owner))?;
+        let setup = checked(native::owner::prepare_fee_account_setup(
+            &owner_state,
+            &native::owner::FeeAccountTerms {
+                account: fee_account,
+                agent: &c.agent,
+                engine: &c.server,
+                request_id: &native::owner::fee_account_request_id(&c.policy_instance),
+                network: &c.network,
+                fee_per_operation: Self::classic_fee(fee_limit)?,
+            },
+            now,
+        ))?;
+        if u64::from(setup.fee_stroops) > fee_limit {
+            return Err(Error::usage(
+                "The fee limit is below the minimum fee of the fee account creation",
+            ));
+        }
+        Ok(OwnerPacket(packet(
+            &c.network,
+            &checked(native::owner::setup_transaction(&setup))?,
+        )?))
+    }
+    /// The owner step that returns the float of a fee account to the owner. The account stays
+    /// with its reserve, so the owner can refill it and resume the wallet. A fee account that
+    /// holds nothing above its reserve, or that its owner closed, has nothing to return.
+    fn prepare_fee_return(
+        &self,
+        c: &WalletConfig,
+        fee_limit: u64,
+        now: u64,
+    ) -> Result<OwnerPacket> {
+        let nothing = || checked(Err(super::diagnostics::NOTHING_TO_RETURN.into()));
+        let Some(fee_account) = c.fee_account.as_deref() else {
+            return nothing();
+        };
+        let Some(account) = checked(rpc::find_account(self.rpc(), fee_account))? else {
+            return nothing();
+        };
+        // An account without its agent signer keeps the reserve of that signer.
+        let paused = checked(account.wallet_status(&c.owner, &c.agent, &c.server))?
+            == native::owner::WalletStatus::Paused;
+        let spendable =
+            checked(rpc::native_balance(self.rpc(), fee_account))?.spendable(i64::from(paused));
+        if spendable <= 0 {
+            return nothing();
+        }
+        let owner_state = checked(rpc::get_account(self.rpc(), &c.owner))?;
+        let p = checked(native::owner::prepare_wallet_action(
+            &owner_state,
+            &account,
+            native::owner::WalletRoles {
+                wallet: fee_account,
+                owner: &c.owner,
+                agent: &c.agent,
+                engine: &c.server,
+            },
+            &native::owner::WalletAction::ReturnFees { units: spendable },
+            &stellar_xdr::Asset::Native,
+            &c.network,
+            Self::classic_fee(fee_limit)?,
+            now,
+        ))?;
+        Ok(OwnerPacket(packet(&c.network, &p)?))
+    }
     pub fn new(network: &str, endpoint: &str) -> Result<Self> {
         Ok(Self::from_rpc_inner(
             network,
@@ -1103,6 +1185,20 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 }
             }
             OwnerAction::Create { wasm } => {
+                // The owner's deployment creates the fee account before the wallet: the wallet
+                // names it as its agent address. A fee account that the ledger already holds
+                // has exactly its roles, or nothing is created.
+                let Some(fee_account) = c.fee_account.as_deref() else {
+                    return checked(Err(native::FEE_ACCOUNT_REQUIRED.into()));
+                };
+                match checked(rpc::find_account(self.rpc(), fee_account))? {
+                    None => return self.prepare_fee_account(&c, fee_account, fee_limit, now),
+                    Some(account) => checked(
+                        account
+                            .validate_roles(&c.owner, &c.agent, &c.server)
+                            .map_err(|_| native::FEE_ACCOUNT_DIFFERS.to_string()),
+                    )?,
+                }
                 let config = checked(native::admin::PolicyConfig::for_policy(&c, false))?;
                 let p = checked(d.create_wallet(
                     &config,
@@ -1141,7 +1237,17 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                     now,
                 };
                 let prepared = match (units, recipient) {
-                    (None, None) => checked(admin.recover_funds(&c.asset))?,
+                    // Everything returns: the wallet's balance first, and when the wallet
+                    // holds nothing, the float of its fee account.
+                    (None, None) => match admin.recover_funds(&c.asset) {
+                        Err(nothing)
+                            if nothing == super::diagnostics::NOTHING_TO_RECOVER
+                                && c.fee_account.is_some() =>
+                        {
+                            return self.prepare_fee_return(&c, fee_limit, now);
+                        }
+                        prepared => checked(prepared)?,
+                    },
                     (Some(units), recipient) => {
                         checked(admin.recover_to(recipient.as_deref().unwrap_or(&c.owner), units))?
                     }
