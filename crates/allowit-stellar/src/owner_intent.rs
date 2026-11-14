@@ -57,10 +57,21 @@ pub fn validate_retained_owner_transaction(original: &OwnerTransaction) -> Resul
             HostFunction::UploadContractWasm(_) => original.action == "upload_wasm",
             HostFunction::CreateContractV2(_) => original.action == "create_wallet",
             HostFunction::InvokeContract(call) => {
-                call.function_name.0.as_slice() == original.action.as_bytes()
-                    || (original.action == "fund" && call.function_name.0.as_slice() == b"transfer")
-                    || (original.action == "update_params"
-                        && call.function_name.0.as_slice() == b"deploy_policy")
+                let function = call.function_name.0.as_slice();
+                // A server retains each step under its own name for the owner action. Those
+                // names describe these contract calls; a pause and a resume differ only in
+                // the first argument.
+                function == original.action.as_bytes()
+                    || match (original.action.as_str(), function) {
+                        ("fund", b"transfer")
+                        | ("update_params", b"deploy_policy")
+                        | ("withdraw", b"recover") => true,
+                        ("pause" | "resume", b"set_pause") => matches!(
+                            call.args.first(),
+                            Some(ScVal::Bool(paused)) if *paused == (original.action == "pause")
+                        ),
+                        _ => false,
+                    }
             }
             _ => false,
         },

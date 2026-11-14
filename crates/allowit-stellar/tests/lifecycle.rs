@@ -1811,6 +1811,79 @@ fn admin_fixture(
         address_v2: false,
     }
 }
+/// A server retains each owner step under its own action name: `pause`, `resume` and
+/// `withdraw`. On a policy wallet those steps call `set_pause` and `recover`. The retained
+/// check must read each name as its call, or the signed step of "stop and return funds" is
+/// refused after the owner signed it.
+#[test]
+fn a_retained_stop_of_a_policy_wallet_keeps_the_servers_action_names() {
+    use allowit_core::admin::{Admin, DeploymentVersion};
+    use allowit_stellar::{admin::OwnerAdmin, owner_intent::validate_retained_owner_transaction};
+    let rpc = admin_fixture(4, Some(stellar_xdr::ScVal::U32(4)));
+    let c = &rpc.base.config;
+    let mut facade = Admin::new(OwnerAdmin {
+        rpc: &rpc,
+        config: c,
+        now: 86401,
+    });
+    let named = |prepared: &allowit_stellar::admin::PreparedOwnerOperation, action: &str| {
+        let mut packet = prepared.owner_transaction().unwrap();
+        packet.action = action.into();
+        validate_retained_owner_transaction(&packet)
+    };
+    let resume = facade.set_pause(false, DeploymentVersion(3)).unwrap();
+    let recover = facade.recover_funds(&c.asset).unwrap();
+    // The contract's own function names stay valid.
+    named(&resume, "set_pause").unwrap();
+    named(&recover, "recover").unwrap();
+    // The server's names.
+    named(&resume, "resume").unwrap();
+    named(&recover, "withdraw").unwrap();
+    // A name describes only its own call: a resume is not a pause, and neither is a
+    // withdrawal.
+    for (prepared, wrong) in [
+        (&resume, "pause"),
+        (&resume, "withdraw"),
+        (&recover, "pause"),
+        (&recover, "resume"),
+        (&recover, "fund"),
+        (&resume, "update_params"),
+    ] {
+        assert_eq!(
+            named(prepared, wrong).unwrap_err(),
+            "Retained owner action differs from its transaction",
+            "{wrong}"
+        );
+    }
+    // A pause of an active wallet.
+    let (config, _, state) = fixture(WalletRoute::PolicyWallet, false);
+    let rpc = AdminRpc {
+        base: PolicyWalletAccountRpc {
+            config,
+            source: state.source,
+            paused: false,
+        },
+        state_contract_version: 4,
+        binding_contract_version: Some(stellar_xdr::ScVal::U32(4)),
+        calls: Mutex::new(vec![]),
+        balance: 1234567,
+        wrong_owner: false,
+        bad_auth: false,
+        address_v2: false,
+    };
+    let mut admin = OwnerAdmin {
+        rpc: &rpc,
+        config: &rpc.base.config,
+        now: 86401,
+    };
+    use allowit_core::admin::SetPause;
+    let pause = admin.set_pause(true, DeploymentVersion(3)).unwrap();
+    let mut packet = pause.owner_transaction().unwrap();
+    packet.action = "pause".into();
+    validate_retained_owner_transaction(&packet).unwrap();
+    packet.action = "resume".into();
+    assert!(validate_retained_owner_transaction(&packet).is_err());
+}
 #[test]
 fn owner_admin_delegates_full_balance_and_versions_without_agent_or_engine_calls() {
     use allowit_core::admin::{Admin, DeploymentVersion};
