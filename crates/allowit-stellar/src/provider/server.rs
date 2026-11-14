@@ -182,6 +182,18 @@ fn accounting(a: Option<&Accounting>) -> Option<rpc::NativeAccounting> {
 fn fee(v: u64) -> Result<u32> {
     u32::try_from(v).map_err(|_| Error::usage("Fee ceiling exceeds the selected native range"))
 }
+/// The operation that a request names: an ordinary request, or the transfer of a request for
+/// a payment authorization that the seller settles.
+fn requested_operation(
+    c: &WalletConfig,
+    r: &native::workflow::ExecutionRequest,
+) -> native::Result<native::StellarOperation> {
+    if native::seller_settled::is_request(r) {
+        native::seller_settled::transfer(c, r).map(native::StellarOperation::Transfer)
+    } else {
+        native::operation_from_request(c, r)
+    }
+}
 fn status(v: native::OperationStatus) -> Status {
     match v {
         native::OperationStatus::Prepared => Status::Prepared,
@@ -335,16 +347,25 @@ pub fn receipt_info(p: &Packet) -> Result<ReceiptInfo> {
     // counters: the engine prices its fee through ServerHooks::charged_fee.
     let charged_units = checked(rpc::counted_gas_units(&r))?;
     Ok(ReceiptInfo {
-        transaction_hash: r.transaction_hash,
+        // The settlement of a payment authorization keeps the identity of the retained
+        // operation, and names the transaction that settled it apart.
+        transaction_hash: r.settles.unwrap_or(r.transaction_hash),
         status: status(r.status),
         observed_height: u64::from(r.ledger),
         fee: crate::host::runtime::Fee {
-            native_units: u128::try_from(result.fee_charged)
-                .map_err(|_| Error::config("Invalid Stellar receipt fee"))?,
+            // The party that submitted a payment authorization paid the fee of its
+            // transaction. The wallet paid and counted none.
+            native_units: if r.settles.is_some() {
+                0
+            } else {
+                u128::try_from(result.fee_charged)
+                    .map_err(|_| Error::config("Invalid Stellar receipt fee"))?
+            },
             charged_units,
         },
         // The prepared operation carries its debits; the receipt adds only the fee.
         debits: Vec::new(),
+        settlement_hash: r.settles.map(|_| r.transaction_hash),
     })
 }
 pub struct Provider {
@@ -546,6 +567,10 @@ impl Provider {
             ));
         }
         checked(native::validate_prepared(&p, now))?;
+        if p.payment_authorization.is_some() {
+            checked(native::seller_settled::revalidate(self.rpc(), &p, now))?;
+            return Ok(p);
+        }
         if c.route == WalletRoute::Native {
             let current = checked(rpc::get_account(self.rpc(), &c.wallet))?;
             checked(current.validate_roles(&c.owner, &c.agent, &c.server))?;
@@ -740,7 +765,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         let c = self.config(i)?;
         let r: native::workflow::ExecutionRequest = serde_json::from_slice(bytes)
             .map_err(|_| Error::usage("Invalid native execution request"))?;
-        checked(native::operation_from_request(&c, &r))?;
+        checked(requested_operation(&c, &r))?;
         let document = RawValue::from_string(
             std::str::from_utf8(bytes)
                 .map_err(|_| Error::usage("Invalid native request encoding"))?
@@ -769,7 +794,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         let c = self.config(i)?;
         self.network(r.network())?;
         let r = decode_packet(&r.0)?;
-        Ok(match checked(native::operation_from_request(&c, &r))? {
+        Ok(match checked(requested_operation(&c, &r))? {
             native::StellarOperation::Transfer(t) => Action::Transfer {
                 recipient: t.recipient,
                 units: t.amount,
@@ -845,6 +870,20 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 "Retained authorization differs from selected installation",
             ));
         }
+        if p.payment_authorization.is_some() {
+            // A payment authorization has no transaction to simulate again. The service's
+            // signature of its digest completes the preparation, and the caller retains it.
+            checked(native::seller_settled::validate(&p))?;
+            if p.payment_authorization
+                .as_ref()
+                .is_some_and(|a| a.server_signature.is_none())
+            {
+                return Err(Error::config("Service authorization is unsigned"));
+            }
+            let out = self.packet(&p)?;
+            retain(&out)?;
+            return Ok(out);
+        }
         checked(native::validate_server_authorization(&p))?;
         let out = checked(self.runtime.finalize_authorization(
             &p,
@@ -883,9 +922,21 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 .transpose()?,
         };
         let accounting = accounting(a);
+        let request: native::workflow::ExecutionRequest = decode_packet(&r.0)?;
+        if native::seller_settled::is_request(&request) {
+            return self.packet(&checked(native::seller_settled::prepare(
+                self.rpc(),
+                &c,
+                &request,
+                &terms,
+                accounting,
+                v.now,
+                v.expires_at,
+            ))?);
+        }
         self.packet(&checked(self.runtime.prepare(
             &c,
-            &decode_packet(&r.0)?,
+            &request,
             &terms,
             accounting,
             v.now,
@@ -907,18 +958,17 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 "Authorization differs from selected installation",
             ));
         }
-        self.packet(&checked(native::authorize_server_using(
-            &p,
-            s.identity(),
-            now,
-            e,
-            |digest| {
-                s.sign_hash(digest)
-                    .map_err(|e| e.message)?
-                    .try_into()
-                    .map_err(|_| "Native signer returned another signature length".into())
-            },
-        ))?)
+        let sign = |digest: &[u8; 32]| -> native::Result<[u8; 64]> {
+            s.sign_hash(digest)
+                .map_err(|e| e.message)?
+                .try_into()
+                .map_err(|_| "Native signer returned another signature length".into())
+        };
+        self.packet(&checked(if p.payment_authorization.is_some() {
+            native::seller_settled::authorize_server(&p, s.identity(), now, e, sign)
+        } else {
+            native::authorize_server_using(&p, s.identity(), now, e, sign)
+        })?)
     }
     fn finalize<'a>(
         &self,
@@ -935,6 +985,22 @@ impl crate::host::vendors::RuntimeProvider for Provider {
             return Err(Error::config(
                 "Authorization differs from selected installation",
             ));
+        }
+        if p.payment_authorization.is_some() {
+            let authorized = checked(native::seller_settled::authorize_server(
+                &p,
+                s.identity(),
+                now,
+                e,
+                |digest| {
+                    let v = s.sign_hash(digest).map_err(|e| e.message)?;
+                    v.try_into()
+                        .map_err(|_| "Native signer returned another signature length".into())
+                },
+            ))?;
+            let out = self.packet(&authorized)?;
+            retain(&out)?;
+            return Ok(out);
         }
         let finalized = checked(self.runtime.finalize_authorization(
             &p,
@@ -961,6 +1027,14 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         // Explicit native RPC revalidation establishes a new in-memory preflight only
         // after checking the retained packet, service authorization and current state.
         // Signing still uses `current`, which requires an existing genuine preflight.
+        if retained.payment_authorization.is_some() {
+            checked(native::seller_settled::revalidate(
+                self.rpc(),
+                &retained,
+                now,
+            ))?;
+            return self.packet(&retained);
+        }
         if c.route == WalletRoute::PolicyWallet {
             self.packet(&checked(self.runtime.revalidate_unsigned(&retained, now))?)
         } else {
@@ -995,7 +1069,11 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 signature: s.bytes.clone(),
             })
             .collect::<Vec<_>>();
-        let signed = checked(native::authorize(&p, &s, now))?;
+        let signed = if p.payment_authorization.is_some() {
+            checked(native::seller_settled::authorize(self.rpc(), &p, &s, now))?
+        } else {
+            checked(native::authorize(&p, &s, now))?
+        };
         Ok(Signed(packet(&p.config.network, &signed)?))
     }
     fn validate_signed(&self, p: &Signed, now: u64) -> Result<()> {
@@ -1005,6 +1083,12 @@ impl crate::host::vendors::RuntimeProvider for Provider {
     fn broadcast(&self, p: &Signed, now: u64) -> Result<Status> {
         self.network(p.network())?;
         let s = signed(p)?;
+        if s.prepared.payment_authorization.is_some() {
+            // The seller's facilitator submits a payment authorization. The service releases
+            // the signed entry and sends nothing.
+            checked(native::validate_signed(&s, now))?;
+            return Ok(Status::Submitted);
+        }
         let observed = match checked(rpc::broadcast(self.rpc(), &s, now))? {
             rpc::Broadcast::Submitted => native::OperationStatus::Submitted,
             rpc::Broadcast::Rejected { .. } => {
@@ -1023,6 +1107,16 @@ impl crate::host::vendors::RuntimeProvider for Provider {
     fn status(&self, p: &Signed) -> Result<Status> {
         self.network(p.network())?;
         let s = signed(p)?;
+        if s.prepared.payment_authorization.is_some() {
+            // Settled once the wallet shows its receipt and the ledger names the transaction.
+            // Until then the entry is open: its lapse is proven apart from this read.
+            return Ok(
+                match checked(native::seller_settled::settlement(self.rpc(), &s.prepared))? {
+                    Some(_) => Status::Confirmed,
+                    None => Status::Submitted,
+                },
+            );
+        }
         let observed = checked(rpc::status_by_hash(
             self.rpc(),
             &s.prepared.config.network,
@@ -1036,6 +1130,17 @@ impl crate::host::vendors::RuntimeProvider for Provider {
     fn observe(&self, p: &Signed) -> Result<Option<Receipt>> {
         self.network(p.network())?;
         let s = signed(p)?;
+        if s.prepared.payment_authorization.is_some() {
+            return checked(native::seller_settled::settlement(self.rpc(), &s.prepared))?
+                .map(|settled| {
+                    verify_native_receipt(&s, &settled.receipt)?;
+                    Ok(Receipt(packet(
+                        &s.prepared.config.network,
+                        &settled.receipt,
+                    )?))
+                })
+                .transpose();
+        }
         let r = checked(rpc::receipt_by_hash(
             self.rpc(),
             &s.prepared.config.network,
@@ -1055,8 +1160,28 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 prepared(p)
             })
             .collect::<Result<Vec<_>>>()?;
-        self.runtime
-            .observe_authorizations(&packets)
+        let mut observed = Vec::new();
+        // The settlement of a payment authorization is another party's transaction: the ledger
+        // names it. An entry that the service did not sign was never released.
+        for p in packets.iter().filter(|p| {
+            p.payment_authorization
+                .as_ref()
+                .is_some_and(|a| a.server_signature.is_some())
+        }) {
+            // An unavailable or invalid read proves no terminal state, as for a known envelope.
+            if let Ok(Some(settled)) = native::seller_settled::settlement(self.rpc(), p) {
+                observed.push(super::runtime::ObservedAuthorization {
+                    signed: settled.signed,
+                    receipt: settled.receipt,
+                });
+            }
+        }
+        observed.extend(
+            self.runtime.observe_authorizations(
+                packets.iter().filter(|p| p.payment_authorization.is_none()),
+            ),
+        );
+        observed
             .into_iter()
             .map(|p| {
                 let network = &p.signed.prepared.config.network;
@@ -1322,7 +1447,12 @@ pub fn prepared_metadata(p: &Packet) -> Result<PreparedMetadata> {
                 .get()
                 .as_bytes(),
         )?,
-        request: RequestPacket(packet(&value.config.network, &value.request)?),
+        // The request that the agent sent: a payment authorization keeps it apart from the
+        // operation that carries the decision.
+        request: RequestPacket(packet(
+            &value.config.network,
+            native::seller_settled::intent(&value),
+        )?),
         operation_id: value.request.operation.nonce,
         created_at: value.created_at,
         expires_at: value.expires_at,
@@ -1330,6 +1460,7 @@ pub fn prepared_metadata(p: &Packet) -> Result<PreparedMetadata> {
         debit_units: i128::from_be_bytes(amount),
         request_hash: value.request_hash,
         debit,
+        seller_settles: value.payment_authorization.is_some(),
     })
 }
 pub fn signed_preparation(p: &Packet) -> Result<Prepared> {
@@ -1401,7 +1532,9 @@ pub fn authority_document(s: &Snapshot) -> Result<serde_json::Value> {
 /// can retain an included envelope whose signature roles rotated; broadcast validates signatures again.
 fn retained_signed_shape(s: &SignedOperation) -> Result<()> {
     checked(native::validate_retained_prepared(&s.prepared))?;
-    if s.prepared.config.route != WalletRoute::PolicyWallet {
+    if s.prepared.config.route != WalletRoute::PolicyWallet
+        || s.prepared.payment_authorization.is_some()
+    {
         return checked(native::validate_retained_signed(s));
     }
     checked(native::validate_server_authorization(&s.prepared))?;
@@ -1597,6 +1730,7 @@ mod receipt_fee_tests {
             ledger: 9,
             envelope_xdr: native::xdr(&TransactionEnvelope::Tx(envelope)).unwrap(),
             result_xdr: native::xdr(&result).unwrap(),
+            settles: None,
         };
         receipt_info(&packet(network, &receipt).unwrap()).unwrap()
     }

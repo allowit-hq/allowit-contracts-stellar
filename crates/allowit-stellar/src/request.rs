@@ -33,8 +33,18 @@ pub fn transfer(
     to: &str,
     amount: i128,
 ) -> Result<ExecutionRequest> {
+    let (instruction, asset) = transfer_instruction(c, to, amount)?;
+    request(c, state, operation_id, instruction, asset, to, amount)
+}
+
+/// The instruction and the asset of a transfer of `amount` of the wallet asset to `to`.
+pub(crate) fn transfer_instruction(
+    c: &WalletConfig,
+    to: &str,
+    amount: i128,
+) -> Result<(NativeInstruction, WorkflowAsset)> {
     let wallet = account(&c.wallet)?;
-    let (instruction, asset) = if asset_xdr(c)? == Asset::Native {
+    Ok(if asset_xdr(c)? == Asset::Native {
         let instruction = NativeInstruction::StellarNativeTransfer {
             source: wallet,
             destination: account(to)?,
@@ -48,8 +58,7 @@ pub fn transfer(
             AbiValue::Signed128(amount),
         ];
         (call(&c.asset, "transfer", arguments)?, token(c, &c.asset)?)
-    };
-    request(c, state, operation_id, instruction, asset, to, amount)
+    })
 }
 
 /// A SEP-56 deposit of `assets` of the wallet asset into `vault` for at least `min_shares`.
@@ -134,7 +143,7 @@ fn token(c: &WalletConfig, token: &str) -> Result<WorkflowAsset> {
     }))
 }
 
-fn units(value: i128) -> Result<Amount256> {
+pub(crate) fn units(value: i128) -> Result<Amount256> {
     let value = u128::try_from(value).map_err(|_| "Amounts must be positive")?;
     let mut bytes = [0; 32];
     bytes[16..].copy_from_slice(&value.to_be_bytes());

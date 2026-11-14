@@ -7,6 +7,7 @@ use crate::host::{
     error::{Error, Result},
     execution::Request as ExecRequest,
     input::asset::{Amount, Asset},
+    paid_service::SettledBy,
     typed_request::operation_nonce,
 };
 use crate::workflow::{AccountKind, ExecutionRequest};
@@ -72,8 +73,21 @@ pub fn build(
             )));
         }
     };
-    let state = state()?;
     let id = operation_nonce(policy_id, &r.request_id);
+    // A seller that settles the payment itself takes a payment authorization: the request names
+    // the transfer and no fee payer, so it reads no chain state.
+    if r.paid_service
+        .as_ref()
+        .is_some_and(|context| context.settled_by == SettledBy::Seller)
+    {
+        if r.op != "transfer" {
+            return Err(Error::usage("only a transfer pays a seller's challenge"));
+        }
+        let request = sdk::seller_settled::request(config, id, &r.to, amount)
+            .map_err(|e| Error::usage(format!("the payment does not fit this wallet: {e}")))?;
+        return TypedRequest::new(policy_id, &r.request_id, request);
+    }
+    let state = state()?;
     let request = match r.op.as_str() {
         "transfer" => sdk::request::transfer(config, &state, id, &r.to, amount),
         "deposit" => sdk::request::deposit(config, &state, id, &r.to, amount, min),

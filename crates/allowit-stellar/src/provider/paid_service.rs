@@ -5,23 +5,28 @@
 //! header (version 2). This module reads the requirement for one Stellar network and builds the
 //! proof that the client presents after the payment settled.
 //!
-//! Allowit settles the payment itself: the policy is evaluated and the transfer is executed
-//! like any other operation, and the proof names the settled transaction. The standard `exact`
-//! scheme on Stellar has the seller's facilitator submit a transaction that the payer signed.
-//! Allowit signs no such transaction. A requirement is therefore accepted only when the seller
-//! states that it takes the proof of a settled transaction: `extra.proof` is
-//! [`SETTLED_PROOF`]. Every other requirement is refused before any payment.
+//! The policy is evaluated on the payment like on any other operation. A requirement states
+//! who settles it:
 //!
-//! The proof is built only from a receipt in which the server recorded this purchase: the
+//! - The standard `exact` scheme: the payer signs one authorization entry for exactly the
+//!   transfer, and the seller's facilitator submits it and pays the network fee
+//!   ([`SettledBy::Seller`]). The proof carries the transaction that holds the signed entry.
+//!   See [`crate::seller_settled`].
+//! - `extra.proof` is [`SETTLED_PROOF`]: Allowit settles the payment itself, and the proof
+//!   names the settled transaction ([`SettledBy::Payer`]). The seller verifies it on its own:
+//!   the transaction succeeded on the stated network, moved at least the required amount of
+//!   the required asset to `payTo`, closed after the challenge was issued, and its hash was
+//!   not used for an earlier delivery.
+//!
+//! Either proof is built only from an outcome in which the server recorded this purchase: the
 //! resource, the recipient, the amount and the asset of the challenge.
-//!
-//! The seller verifies the proof on its own: the transaction succeeded on the stated network,
-//! moved at least the required amount of the required asset to `payTo`, closed after the
-//! challenge was issued, and its hash was not used for an earlier delivery.
 use crate::host::{
     error::{Error, Result},
     execution::Quantity,
-    paid_service::{Challenge, PaidServiceProvider, Proof, SellerReply, challenge_id},
+    paid_service::{
+        Challenge, MAX_SETTLE_WITHIN, PaidServiceProvider, Proof, SellerReply, SettledBy,
+        challenge_id,
+    },
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
@@ -30,6 +35,9 @@ use serde_json::{Value, json};
 pub const SCHEME: &str = "exact";
 /// The value of `extra.proof` by which a seller accepts the proof of a settled transaction.
 pub const SETTLED_PROOF: &str = "settled-transaction";
+/// The key of the signed payment authorization in an outcome document: the transaction that
+/// the client presents when the seller settles.
+pub const AUTHORIZATION_KEY: &str = "paymentAuthorization";
 /// The response header of a version 2 challenge.
 pub const CHALLENGE_HEADER: &str = "PAYMENT-REQUIRED";
 /// The request header of a version 1 proof.
@@ -117,13 +125,27 @@ fn requirement(
             "The seller's payment scheme is not {SCHEME}."
         )));
     }
-    if accepted["extra"]["proof"] != SETTLED_PROOF {
+    let extra = &accepted["extra"];
+    // The seller takes the proof of a settled transaction, or the standard authorization that
+    // its facilitator submits. The standard form exists in version 2, with the network fee
+    // paid by the facilitator.
+    let settled_by = if extra["proof"] == SETTLED_PROOF {
+        SettledBy::Payer
+    } else if !extra["proof"].is_null() {
         return Err(unsupported(
-            "The seller requires a facilitator to settle a transaction that the payer signs. \
-             Allowit settles the payment itself and presents the settled transaction, and this \
-             seller does not accept that proof.",
+            "The seller asks for a proof of payment that this rail does not build.",
         ));
-    }
+    } else if version < 2 {
+        return Err(unsupported(
+            "The seller's payment challenge uses x402 version 1, which has no payment scheme on this network.",
+        ));
+    } else if extra["areFeesSponsored"] == false {
+        return Err(unsupported(
+            "The seller's facilitator does not pay the network fee, and the scheme defines no other payer.",
+        ));
+    } else {
+        SettledBy::Seller
+    };
     // The seller may name the resource. It must be the one that the client asked for.
     let named_resource = if version >= 2 {
         document["resource"]["url"].as_str()
@@ -141,9 +163,10 @@ fn requirement(
     // A listed token by its asset contract, its code or `native`. An unlisted contract has no
     // known unit, so it is refused and never paid.
     let asset = accepted["asset"].as_str().unwrap_or_default();
+    // An authorization names the token contract itself.
     let listed = super::tokens_for(network.id).iter().find(|token| {
         super::token_contract(network.id, token).as_deref() == Some(asset)
-            || (token.native && asset == "native")
+            || (token.native && asset == "native" && settled_by == SettledBy::Payer)
     });
     let Some(token) = listed else {
         return Err(unsupported(
@@ -161,7 +184,6 @@ fn requirement(
         .ok()
         .filter(|units| *units > 0 && !amount.starts_with('0') && !amount.starts_with('+'))
         .ok_or_else(|| Error::usage("The seller's payment challenge names an invalid amount."))?;
-    let extra = &accepted["extra"];
     let id = match extra.get("challengeId").or_else(|| extra.get("nonce")) {
         None | Some(Value::Null) => None,
         Some(value) => {
@@ -176,6 +198,18 @@ fn requirement(
         Some(value) => Some(value.as_u64().ok_or_else(|| {
             Error::usage("The seller's payment challenge has an invalid expiry.")
         })?),
+    };
+    // The seller's bound on the time from the authorization to its settlement.
+    let settle_within = match (&settled_by, &accepted["maxTimeoutSeconds"]) {
+        (SettledBy::Payer, _) | (SettledBy::Seller, Value::Null) => None,
+        (SettledBy::Seller, value) => Some(
+            value
+                .as_u64()
+                .filter(|seconds| (1..=MAX_SETTLE_WITHIN).contains(seconds))
+                .ok_or_else(|| {
+                    Error::usage("The seller's payment challenge has an invalid timeout.")
+                })?,
+        ),
     };
     let mut terms = json!({"x402Version": version, "accepted": accepted});
     if version >= 2 && document["resource"].is_object() {
@@ -195,6 +229,8 @@ fn requirement(
         amount: Quantity::new(i128::from(units), super::display(token)),
         asset: asset.to_owned(),
         expires_at,
+        settled_by,
+        settle_within,
         terms,
     }))
 }
@@ -237,22 +273,43 @@ pub fn challenge(network: &str, resource: &str, reply: &SellerReply<'_>) -> Resu
 pub fn proof(challenge: &Challenge, receipt: &Value) -> Result<Proof> {
     let network = crate::host::routing::info(&challenge.network)
         .map_err(|_| Error::usage("The payment challenge names another rail."))?;
-    if challenge.scheme != SCHEME || challenge.terms["accepted"]["extra"]["proof"] != SETTLED_PROOF
-    {
+    let settled = challenge.terms["accepted"]["extra"]["proof"] == SETTLED_PROOF;
+    if challenge.scheme != SCHEME || settled != (challenge.settled_by == SettledBy::Payer) {
         return Err(unsupported(
-            "The payment challenge does not accept the proof of a settled transaction.",
-        ));
-    }
-    if receipt["status"] != "confirmed" {
-        return Err(Error::uncertain(
-            "The payment is not confirmed. Read its status with the same request ID.",
+            "The payment challenge does not state a proof that this rail builds.",
         ));
     }
     let hash = receipt["transactionHash"].as_str().unwrap_or_default();
-    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(Error::config(
-            "The payment receipt names no transaction hash.",
-        ));
+    // The signed authorization that the seller's facilitator submits, once both the agent and
+    // the server signed it. A settled one is presented again for a delivery that failed.
+    let authorization = receipt[AUTHORIZATION_KEY]["transaction"]
+        .as_str()
+        .unwrap_or_default();
+    if settled {
+        if receipt["status"] != "confirmed" {
+            return Err(Error::uncertain(
+                "The payment is not confirmed. Read its status with the same request ID.",
+            ));
+        }
+        if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(Error::config(
+                "The payment receipt names no transaction hash.",
+            ));
+        }
+    } else {
+        if !matches!(receipt["status"].as_str(), Some("submitted" | "confirmed")) {
+            return Err(Error::uncertain(
+                "The payment authorization is not signed. Read its status with the same request ID.",
+            ));
+        }
+        if authorization.is_empty()
+            || authorization.len() > 8192
+            || STANDARD.decode(authorization).is_err()
+        {
+            return Err(Error::config(
+                "The payment receipt holds no signed payment authorization.",
+            ));
+        }
     }
     // The wallet that executed the operation is on one network. An identical purchase on
     // another network of this rail is another payment.
@@ -292,17 +349,28 @@ pub fn proof(challenge: &Challenge, receipt: &Value) -> Result<Proof> {
     }
     let version = challenge.terms["x402Version"].as_u64().unwrap_or(1);
     let accepted = &challenge.terms["accepted"];
-    let mut payload = json!({"transaction": hash.to_ascii_lowercase(), "settled": true});
-    if let Some(id) = &challenge.id {
-        payload["challengeId"] = json!(id);
-    }
-    let mut document = json!({
-        "x402Version": version,
-        "scheme": SCHEME,
-        // The network as the seller wrote it.
-        "network": accepted["network"].as_str().unwrap_or(network.id),
-        "payload": payload,
-    });
+    let payload = if settled {
+        let mut payload = json!({"transaction": hash.to_ascii_lowercase(), "settled": true});
+        if let Some(id) = &challenge.id {
+            payload["challengeId"] = json!(id);
+        }
+        payload
+    } else {
+        // The standard payload: the transaction that holds the signed authorization entry.
+        json!({"transaction": authorization})
+    };
+    let mut document = if settled {
+        json!({
+            "x402Version": version,
+            "scheme": SCHEME,
+            // The network as the seller wrote it.
+            "network": accepted["network"].as_str().unwrap_or(network.id),
+            "payload": payload,
+        })
+    } else {
+        // The standard payment payload has exactly these fields and the two below.
+        json!({"x402Version": version, "payload": payload})
+    };
     if version >= 2 {
         document["accepted"] = accepted.clone();
         if challenge.terms["resource"].is_object() {
@@ -426,16 +494,134 @@ mod tests {
         );
     }
 
+    /// A version 2 reply with one standard `exact` requirement, changed by `change`.
+    fn standard(change: &dyn Fn(&mut Value)) -> Result<Challenge> {
+        let mut accepted = json!({"scheme":"exact","network":TESTNET,"amount":"2500000",
+            "payTo":PAY_TO,"asset":native_contract(),"maxTimeoutSeconds":300,
+            "extra":{"areFeesSponsored":true}});
+        change(&mut accepted);
+        let document = json!({"x402Version":2,"resource":{"url":RESOURCE},"accepts":[accepted]});
+        let headers = vec![(
+            CHALLENGE_HEADER.to_owned(),
+            STANDARD.encode(serde_json::to_vec(&document).unwrap()),
+        )];
+        challenge(
+            TESTNET,
+            RESOURCE,
+            &SellerReply {
+                status: 402,
+                headers: &headers,
+                body: b"",
+            },
+        )
+    }
+
     #[test]
-    fn a_requirement_that_needs_a_facilitator_is_refused_before_payment() {
-        let mut standard = accepted();
-        standard["extra"] = json!({"areFeesSponsored":true});
-        let error = parse(&v1(vec![standard])).unwrap_err();
+    fn a_standard_requirement_is_settled_by_the_seller_within_its_timeout() {
+        let challenge = standard(&|_| {}).unwrap();
+        assert_eq!(challenge.settled_by, SettledBy::Seller);
+        assert_eq!(challenge.settle_within, Some(300));
+        assert_eq!(challenge.amount.units, "2500000");
+        assert_eq!(challenge.asset, native_contract());
+        let context = challenge.context();
+        context.validate().unwrap();
+        assert_eq!(
+            (context.settled_by, context.settle_within),
+            (SettledBy::Seller, Some(300))
+        );
+        // The settled-transaction form stays the payer's, and carries no timeout.
+        let settled = parse(&v1(vec![accepted()])).unwrap();
+        assert_eq!(
+            (settled.settled_by, settled.settle_within),
+            (SettledBy::Payer, None)
+        );
+        // A seller that states no timeout leaves the validity to the server.
+        let open = standard(&|a| {
+            a.as_object_mut().unwrap().remove("maxTimeoutSeconds");
+        })
+        .unwrap();
+        assert_eq!(open.settle_within, None);
+    }
+
+    #[test]
+    fn a_standard_requirement_that_this_rail_cannot_sign_is_refused_before_payment() {
+        // Another scheme, a fee that the payer would owe, an unknown proof, a timeout out of
+        // bounds, an asset by name, and the standard form in version 1.
+        assert_eq!(
+            standard(&|a| a["scheme"] = json!("upto")).unwrap_err().code,
+            3
+        );
+        let unsponsored =
+            standard(&|a| a["extra"] = json!({"areFeesSponsored":false})).unwrap_err();
+        assert_eq!(unsponsored.code, 3);
+        assert!(
+            unsponsored.message.contains("network fee"),
+            "{}",
+            unsponsored.message
+        );
+        assert_eq!(
+            standard(&|a| a["extra"] = json!({"proof":"other"}))
+                .unwrap_err()
+                .code,
+            3
+        );
+        for timeout in [json!(0), json!(86_401), json!("300"), json!(-5)] {
+            assert_eq!(
+                standard(&|a| a["maxTimeoutSeconds"] = timeout.clone())
+                    .unwrap_err()
+                    .code,
+                2,
+                "{timeout}"
+            );
+        }
+        assert_eq!(
+            standard(&|a| a["asset"] = json!("native"))
+                .unwrap_err()
+                .code,
+            3
+        );
+        let mut first = accepted();
+        first["extra"] = json!({"areFeesSponsored":true});
+        let error = parse(&v1(vec![first])).unwrap_err();
         assert_eq!(error.code, 3);
-        assert!(error.message.contains("facilitator"), "{}", error.message);
-        let mut scheme = accepted();
-        scheme["scheme"] = json!("upto");
-        assert_eq!(parse(&v1(vec![scheme])).unwrap_err().code, 3);
+        assert!(error.message.contains("version 1"), "{}", error.message);
+    }
+
+    #[test]
+    fn the_proof_of_a_standard_requirement_is_the_standard_payment_payload() {
+        let challenge = standard(&|_| {}).unwrap();
+        let transaction = STANDARD.encode(b"signed authorization entry in a transaction");
+        let outcome = |status: &str| {
+            json!({"requestId":"pay-0001","status":status,"transactionHash":"",
+                "network":challenge.network,"paidService":challenge.context(),
+                AUTHORIZATION_KEY:{"transaction":transaction}})
+        };
+        let built = proof(&challenge, &outcome("submitted")).unwrap();
+        assert_eq!(built.header, PROOF_HEADER_V2);
+        let decoded: Value =
+            serde_json::from_slice(&STANDARD.decode(built.value).unwrap()).unwrap();
+        // Exactly the fields of the standard payload: no settled-transaction fields.
+        assert_eq!(
+            decoded,
+            json!({"x402Version":2,"resource":{"url":RESOURCE},
+                "accepted":challenge.terms["accepted"],"payload":{"transaction":transaction}})
+        );
+        // A settled authorization is presented again for a delivery that failed.
+        proof(&challenge, &outcome("confirmed")).unwrap();
+        // Before both signatures exist there is nothing to present.
+        assert_eq!(proof(&challenge, &outcome("prepared")).unwrap_err().code, 5);
+        let mut unsigned = outcome("submitted");
+        unsigned.as_object_mut().unwrap().remove(AUTHORIZATION_KEY);
+        assert!(proof(&challenge, &unsigned).is_err());
+        // The outcome must record this purchase and this network.
+        let mut other = outcome("submitted");
+        other["paidService"]["payTo"] = json!(crate::account_for_seed(&[9; 32]));
+        assert!(proof(&challenge, &other).is_err());
+        let mut network = outcome("submitted");
+        network["network"] = json!("stellar:pubnet");
+        assert!(proof(&challenge, &network).is_err());
+        // A settled-transaction outcome is no proof for a seller that settles itself.
+        assert!(proof(&challenge, &receipt(&challenge)).is_err());
     }
 
     #[test]

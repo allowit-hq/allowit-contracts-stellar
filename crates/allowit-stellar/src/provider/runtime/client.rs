@@ -2,7 +2,7 @@
 //! profile names the wallet, its roles and the engine endpoints; the agent
 //! key signs. Requests go to the profile's `/api/native/execute` endpoints and
 //! are journaled in caller-supplied private storage before they leave the process.
-use crate::host::paid_service::PaidService;
+use crate::host::paid_service::{PaidService, SettledBy};
 use crate::host::{
     config::parse_origin,
     error::{Error, Result},
@@ -581,6 +581,20 @@ fn identifier(name: &str) -> Option<&str> {
 }
 fn validate_response_receipt(r: &Response) -> Result<()> {
     let p = &r.prepared;
+    if let (Some(receipt), true) = (&r.receipt, p.payment_authorization.is_some()) {
+        // Another party's transaction settled the payment authorization. It must carry the
+        // exact signed entry of this operation and must have succeeded.
+        let signed = r.signed_operation.as_ref().ok_or_else(|| {
+            Error::uncertain("Stellar settlement omitted its signed payment authorization")
+        })?;
+        checked(sdk::rpc::validate_settled_policy_packet(signed, receipt))?;
+        if super::projected_status(&p.config.route, receipt.status.clone()) != r.operation.status {
+            return Err(Error::uncertain(
+                "Stellar receipt differs from its retained signed operation",
+            ));
+        }
+        return Ok(());
+    }
     if let Some(receipt) = &r.receipt {
         checked(sdk::rpc::validate_receipt(
             receipt,
@@ -784,8 +798,12 @@ impl Client {
             || !config_matches(&self.bundle.config, &p.config)
             || p.request.operation.nonce != operation_nonce(&self.bundle.policy_id, id)
             || r.operation.transaction_hash != sdk::hex(&p.transaction_hash)
+            // A request for a payment authorization gets one, and no other request does.
             || record.is_some_and(|old| {
-                p.request != old.request
+                sdk::seller_settled::is_request(&old.request) != p.payment_authorization.is_some()
+            })
+            || record.is_some_and(|old| {
+                sdk::seller_settled::intent(p) != &old.request
                     || !config_matches(&old.config, &p.config)
                     || old.prepared.as_ref().is_some_and(|v| v != p)
             })
@@ -958,7 +976,23 @@ pub fn exec_paid(
             "The operation nonce does not bind this policy and request ID",
         ));
     }
-    checked(sdk::operation_from_request(&c.bundle.config, &request))?;
+    if sdk::seller_settled::is_request(&request) {
+        // The seller settles: the request names its transfer and no fee payer. Only the
+        // payment of a challenge that states this form asks for it.
+        if !paid_service.is_some_and(|context| context.settled_by == SettledBy::Seller) {
+            return Err(Error::usage(
+                "Only the payment of a seller's challenge asks for a payment authorization",
+            ));
+        }
+        checked(sdk::seller_settled::transfer(&c.bundle.config, &request))?;
+    } else {
+        if paid_service.is_some_and(|context| context.settled_by == SettledBy::Seller) {
+            return Err(Error::usage(
+                "A payment that the seller settles needs a request for a payment authorization",
+            ));
+        }
+        checked(sdk::operation_from_request(&c.bundle.config, &request))?;
+    }
     let name = sdk::hex(&request.operation.nonce);
     let old = journal.load::<Record>(&name).map_err(journal_error)?;
     if c.bundle.config.language != sdk::PolicyLanguage::Portable
@@ -1257,20 +1291,35 @@ pub struct ExecutionOutcome {
     pub paid_service: Option<PaidService>,
     /// The network of the installed wallet that executed the operation.
     pub network: String,
+    /// The signed payment authorization, when the seller settles the payment: the transaction
+    /// that the client presents to the seller. Its facilitator submits it; this client and the
+    /// engine send nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<String>,
 }
 fn render(r: &Response) -> Result<ExecutionOutcome> {
+    // The facilitator paid the fee of a settled payment authorization: the wallet reports none.
     let settlement = r
         .receipt
         .as_ref()
+        .filter(|receipt| receipt.settles.is_none())
         .map(|receipt| receipt_settlement(receipt.ledger, &receipt.result_xdr))
         .transpose()?
         .flatten();
     let config = &r.prepared.config;
     let installed = installed_display(config);
+    // A payment authorization has no transaction of its own. The transaction of the operation
+    // is the one that settled it, which the verified receipt names.
+    let seller_settles = r.prepared.payment_authorization.is_some();
+    let transaction_hash = match (&r.receipt, seller_settles) {
+        (Some(receipt), true) => sdk::hex(&receipt.transaction_hash),
+        (None, true) => String::new(),
+        _ => r.operation.transaction_hash.clone(),
+    };
     Ok(ExecutionOutcome {
         request_id: r.operation.id.clone(),
         status: r.operation.status.clone(),
-        transaction_hash: r.operation.transaction_hash.clone(),
+        transaction_hash: transaction_hash.clone(),
         settlement,
         amount: (r.receipt.is_some() && r.operation.status == OperationStatus::Confirmed)
             .then(|| debit(&r.prepared, installed.as_ref()))
@@ -1284,14 +1333,15 @@ fn render(r: &Response) -> Result<ExecutionOutcome> {
             .as_ref()
             .and_then(|value| reported_limits(value, installed.as_ref()?)),
         explorer: r.receipt.as_ref().and_then(|_| {
-            crate::provider::server_owner::explorer_link(
-                &config.network,
-                "tx",
-                &r.operation.transaction_hash,
-            )
+            crate::provider::server_owner::explorer_link(&config.network, "tx", &transaction_hash)
         }),
         paid_service: r.paid_service.as_ref().and_then(recorded),
         network: config.network.clone(),
+        authorization: r
+            .signed_operation
+            .as_ref()
+            .filter(|_| seller_settles)
+            .map(|signed| signed.transaction_xdr.clone()),
     })
 }
 
@@ -1691,7 +1741,7 @@ pub fn retained(
         }
         checked(sdk::validate_config(&record.config))?;
         if let Some(p) = &record.prepared {
-            if p.request != record.request
+            if sdk::seller_settled::intent(p) != &record.request
                 || !same_retained_policy_config(&record.config, &p.config)
             {
                 return Err(Error::config("Original retained preparation changed"));
@@ -2202,6 +2252,8 @@ mod native_revalidation_tests {
             pay_to: p.config.agent.clone(),
             amount: "2500000".into(),
             asset: "native".into(),
+            settled_by: Default::default(),
+            settle_within: None,
         };
         // An ordinary preparation keeps its exact fields.
         let plain = prepare_body("engine-policy", "paid-0001", &p.request, None);
@@ -3281,6 +3333,7 @@ mod native_revalidation_tests {
             ledger: 777,
             envelope_xdr: signed.transaction_xdr.clone(),
             result_xdr: result.to_xdr_base64(Limits::none()).unwrap(),
+            settles: None,
         };
         sdk::rpc::validate_settled_policy_packet(&signed, &receipt).unwrap();
         let body = serde_json::to_vec(&json!({"prepared":signed.prepared,"signedOperation":signed,"operation":{"id":"wire-status-001","status":OperationStatus::SubmissionUnknown,"transactionHash":sdk::hex(&receipt.transaction_hash)},"receipt":receipt})).unwrap();

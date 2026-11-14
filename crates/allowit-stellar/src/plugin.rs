@@ -850,6 +850,7 @@ mod tests {
                 charged_units: 0,
             },
             debits: Vec::new(),
+            settlement_hash: None,
         }
     }
 

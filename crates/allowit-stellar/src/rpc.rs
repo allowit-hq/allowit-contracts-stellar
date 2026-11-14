@@ -566,6 +566,14 @@ pub fn revalidate_prepared(
     p: &PreparedOperation,
     now: u64,
 ) -> Result<PreparedOperation> {
+    if p.payment_authorization.is_some() {
+        // A payment authorization has no transaction of its own to simulate again: the wallet
+        // must still be in the state that the entry binds.
+        crate::seller_settled::revalidate(rpc, p, now)?;
+        let mut validated = p.clone();
+        record_native_preflight(&mut validated)?;
+        return Ok(validated);
+    }
     validate_retained_prepared(p)?;
     if p.config.route != WalletRoute::PolicyWallet
         || p.state.contract_version != Some(CONTRACT_VERSION)
@@ -648,6 +656,9 @@ pub enum Broadcast {
 }
 /// Validate a new signed operation and send its exact bytes once.
 pub fn broadcast(rpc: &dyn Rpc, signed: &SignedOperation, now: u64) -> Result<Broadcast> {
+    if signed.prepared.payment_authorization.is_some() {
+        return Err("The payer never sends a payment authorization: the seller settles it".into());
+    }
     validate_signed(signed, now)?;
     send_transaction(
         rpc,
@@ -898,6 +909,11 @@ pub struct VerifiedReceipt {
     pub ledger: u32,
     pub envelope_xdr: String,
     pub result_xdr: String,
+    /// Set when this transaction, which another party submitted, settles a payment
+    /// authorization: the transaction hash of the operation that prepared it. See
+    /// [`crate::seller_settled`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settles: Option<[u8; 32]>,
 }
 /// Recheck a retained receipt before projecting it through another interface.
 pub fn validate_receipt(
@@ -927,6 +943,12 @@ pub fn validate_settled_policy_packet(
     signed: &SignedOperation,
     receipt: &VerifiedReceipt,
 ) -> Result<()> {
+    if signed.prepared.payment_authorization.is_some() {
+        return crate::seller_settled::validate_settled(signed, receipt);
+    }
+    if receipt.settles.is_some() {
+        return Err("The receipt settles a payment authorization, not this operation".into());
+    }
     let prepared = &signed.prepared;
     if prepared.config.route != WalletRoute::PolicyWallet {
         return Err("Chain-only recovery requires a policy wallet packet".into());
@@ -1036,6 +1058,7 @@ fn receipt_from_response(
             .as_str()
             .ok_or("Settlement result is required")?
             .into(),
+        settles: None,
     }))
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
