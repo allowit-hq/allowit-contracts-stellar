@@ -1222,7 +1222,9 @@ fn journaled(c: &Client, id: &str, record: Option<Record>, r: &Response) -> Reco
             agent_signature: None,
             status: None,
             lapsed: false,
-            paid_service: None,
+            // The engine keeps the context with the request ID. A record that a status read
+            // creates keeps it too, so a later retry with the original context resumes.
+            paid_service: r.paid_service.as_ref().and_then(recorded),
         },
     };
     if old.prepared.is_none() {
@@ -2257,6 +2259,20 @@ mod native_revalidation_tests {
         assert_eq!(Retained(kept).paid_service(), Some(&context));
         let earlier: Record = serde_json::from_value(plain).unwrap();
         assert_eq!(earlier.paid_service, None);
+        // A status read without a local record keeps the engine's context, and never
+        // replaces the context of an existing record.
+        let client = engine_client(p.config.clone(), "http://127.0.0.1:1");
+        let recovered = journaled(&client, "paid-0001", None, &reply(json!(context)));
+        assert_eq!(recovered.paid_service.as_ref(), Some(&context));
+        let unpaid = journaled(&client, "paid-0001", None, &reply(json!(null)));
+        assert_eq!(unpaid.paid_service, None);
+        let kept = journaled(
+            &client,
+            "paid-0001",
+            Some(record(None)),
+            &reply(json!(context)),
+        );
+        assert_eq!(kept.paid_service, None);
     }
     #[test]
     fn a_status_reply_reports_the_charged_fee_and_the_limits_in_the_installed_unit() {
