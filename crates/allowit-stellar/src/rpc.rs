@@ -122,9 +122,32 @@ pub fn find_account(rpc: &dyn Rpc, address: &str) -> Result<Option<AccountState>
     }
     account_from_response(&value, address).map(Some)
 }
-/// The XLM that an account holds and has not promised to an open offer, in stroops. The
-/// network locks the account's reserve inside this balance.
-pub fn native_balance(rpc: &dyn Rpc, address: &str) -> Result<i64> {
+/// The XLM of an account as the ledger holds it, in stroops, with what the network locks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeBalance {
+    pub balance: i64,
+    /// The XLM that open offers of the account hold.
+    pub selling: i64,
+    /// The entries whose base reserve the account pays: its own signers, trustlines, offers
+    /// and data, plus the entries that it sponsors, less the entries that another account
+    /// sponsors for it.
+    pub reserved_entries: i64,
+}
+impl NativeBalance {
+    /// The XLM that the account can send while it keeps its reserve and `more_entries`
+    /// further entries, such as a signer that its owner adds later. Never negative.
+    pub fn spendable(&self, more_entries: i64) -> i64 {
+        let entries = 2i64
+            .saturating_add(self.reserved_entries)
+            .saturating_add(more_entries);
+        self.balance
+            .saturating_sub(self.selling)
+            .saturating_sub(entries.saturating_mul(crate::owner::BASE_RESERVE_STROOPS))
+            .max(0)
+    }
+}
+/// Read the XLM of an account and the entries that lock its reserve.
+pub fn native_balance(rpc: &dyn Rpc, address: &str) -> Result<NativeBalance> {
     let key = LedgerKey::Account(LedgerKeyAccount {
         account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(account_key(
             address,
@@ -142,14 +165,23 @@ pub fn native_balance(rpc: &dyn Rpc, address: &str) -> Result<i64> {
     else {
         return Err("Wrong ledger entry type".into());
     };
-    let selling = match &account.ext {
-        AccountEntryExt::V0 => 0,
-        AccountEntryExt::V1(v1) => v1.liabilities.selling,
+    let (selling, sponsoring, sponsored) = match &account.ext {
+        AccountEntryExt::V0 => (0, 0, 0),
+        AccountEntryExt::V1(v1) => {
+            let (sponsoring, sponsored) = match &v1.ext {
+                AccountEntryExtensionV1Ext::V0 => (0, 0),
+                AccountEntryExtensionV1Ext::V2(v2) => {
+                    (i64::from(v2.num_sponsoring), i64::from(v2.num_sponsored))
+                }
+            };
+            (v1.liabilities.selling, sponsoring, sponsored)
+        }
     };
-    account
-        .balance
-        .checked_sub(selling)
-        .ok_or_else(|| "Account balance overflow".into())
+    Ok(NativeBalance {
+        balance: account.balance,
+        selling,
+        reserved_entries: i64::from(account.num_sub_entries) + sponsoring - sponsored,
+    })
 }
 /// The balance of an issued asset that an account holds, `None` without its trustline.
 pub fn trustline_balance(rpc: &dyn Rpc, address: &str, asset: &Asset) -> Result<Option<i64>> {
@@ -177,6 +209,38 @@ pub fn trustline_balance(rpc: &dyn Rpc, address: &str, asset: &Asset) -> Result<
         return Err("Wrong ledger entry type".into());
     };
     Ok(Some(line.balance))
+}
+/// The units of an issued asset that an account can send: its balance less what its open
+/// offers hold. `None` without its trustline.
+pub fn trustline_spendable(rpc: &dyn Rpc, address: &str, asset: &Asset) -> Result<Option<i64>> {
+    let line = match asset {
+        Asset::CreditAlphanum4(a) => TrustLineAsset::CreditAlphanum4(a.clone()),
+        Asset::CreditAlphanum12(a) => TrustLineAsset::CreditAlphanum12(a.clone()),
+        Asset::Native => return Err("XLM has no trustline".into()),
+    };
+    let key = LedgerKey::Trustline(LedgerKeyTrustLine {
+        account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(account_key(
+            address,
+        )?))),
+        asset: line,
+    });
+    let value = rpc.call("getLedgerEntries", json!({"keys":[xdr(&key)?]}))?;
+    let entries = value["entries"]
+        .as_array()
+        .ok_or("Missing trustline entries")?;
+    let Some(entry) = entries.first() else {
+        return Ok(None);
+    };
+    let LedgerEntryData::Trustline(line) =
+        read(entry["xdr"].as_str().ok_or("Missing trustline XDR")?)?
+    else {
+        return Err("Wrong ledger entry type".into());
+    };
+    let selling = match &line.ext {
+        TrustLineEntryExt::V0 => 0,
+        TrustLineEntryExt::V1(v1) => v1.liabilities.selling,
+    };
+    Ok(Some(line.balance.saturating_sub(selling).max(0)))
 }
 /// A native source account dated by the entry response and fresh bracketing heads.
 #[derive(Clone, Debug, PartialEq, Eq)]
