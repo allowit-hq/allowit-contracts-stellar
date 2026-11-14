@@ -4378,6 +4378,20 @@ fn a_fee_account_of_another_agent_or_with_other_authority_serves_no_operation() 
         rpc::prepare(&rpc, &other, &r, None, 86401, 86700).unwrap_err(),
         FEE_ACCOUNT_DIFFERS
     );
+    // An installation without the fee account never stands for this wallet: it would ask
+    // for the agent's signature alone.
+    let mut without = c.clone();
+    without.fee_account = None;
+    assert_eq!(prepared(&without, &s).unwrap_err(), FEE_ACCOUNT_DIFFERS);
+    let rpc = funded(&c, &r, &s);
+    assert_eq!(
+        rpc::prepare(&rpc, &without, &r, None, 86401, 86700).unwrap_err(),
+        FEE_ACCOUNT_DIFFERS
+    );
+    assert_eq!(
+        rpc::trusted_state_for_discovery(&rpc, &without, None).unwrap_err(),
+        FEE_ACCOUNT_DIFFERS
+    );
     // The fee account is an account of its own: no role key and no other route takes one.
     for role in [&c.owner, &c.agent, &c.server] {
         let mut reused = c.clone();

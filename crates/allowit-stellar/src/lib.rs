@@ -53,10 +53,12 @@ pub const PROFILE: &str = "allowit-wallet-v1";
 /// address of the wallet. Its code is `fee_account_required`: the owner's client derives the
 /// account for that wallet and names it.
 pub const FEE_ACCOUNT_REQUIRED: &str = "A new policy wallet needs a fee account, which the owner's deployment creates and funds. The owner's client derives it for the policy wallet";
-/// The refusal of a policy wallet whose agent address on the ledger is not the fee account of
-/// its installation. Its code is `fee_account_differs`.
+/// The refusal of a policy wallet whose agent address on the ledger is not the one of its
+/// installation: its fee account, or the agent key's own account for a wallet of an earlier
+/// release. Also the refusal of a fee account whose signers differ from its roles. Its code
+/// is `fee_account_differs`.
 pub const FEE_ACCOUNT_DIFFERS: &str =
-    "The policy wallet's agent address on the ledger differs from its fee account";
+    "The policy wallet's agent address on the ledger differs from the one of its installation";
 /// The refusal of an operation whose fee account holds less than its network fee. Its code is
 /// `fee_account_empty`: the owner refills the account.
 pub const FEE_ACCOUNT_EMPTY: &str = "The fee account of this policy wallet holds too little XLM for the network fee. Its owner refills it by sending XLM to";
@@ -609,6 +611,16 @@ impl AccountState {
             return Err("Current account signer quorum is insufficient".into());
         }
         Ok(())
+    }
+    /// Whether this account is a fee account of the roles of `c` although `c` names none. An
+    /// installation without a fee account never stands for a wallet that has one: that
+    /// wallet's operations need the server's signature on the transaction, which only the
+    /// installation with the fee account asks for.
+    fn stands_for_fee_account(&self, c: &WalletConfig, agent_address: &str) -> bool {
+        c.route == WalletRoute::PolicyWallet
+            && c.fee_account.is_none()
+            && agent_address != c.agent
+            && self.wallet_status(&c.owner, &c.agent, &c.server).is_ok()
     }
     pub fn validate_wallet(&self, c: &WalletConfig) -> Result<()> {
         if self.address != c.wallet {
@@ -1512,13 +1524,15 @@ fn build(
                     "policy wallet executable or current agent transaction source differs".into(),
                 );
             }
-            if let Some(fee_account) = &c.fee_account {
-                // The wallet names exactly the fee account of its installation, and that
-                // account holds exactly its roles: the agent key signs from it only with the
-                // server, and no other key signs from it at all.
-                if state.agent != *fee_account {
-                    return Err(FEE_ACCOUNT_DIFFERS.into());
-                }
+            // A wallet with a fee account names exactly that account as its agent address.
+            if c.fee_account.as_ref().is_some_and(|f| *f != state.agent)
+                || state.source.stands_for_fee_account(c, &state.agent)
+            {
+                return Err(FEE_ACCOUNT_DIFFERS.into());
+            }
+            if c.fee_account.is_some() {
+                // The fee account holds exactly its roles: the agent key signs from it only
+                // with the server, and no other key signs from it at all.
                 state.source.validate_roles(&c.owner, &c.agent, &c.server)?;
             }
             let fee = &r.fee_bounds.as_ref().ok_or("Native fee bound required")?[0];

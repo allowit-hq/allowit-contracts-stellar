@@ -1393,6 +1393,9 @@ fn current_wallet_state(
     }
     let source = get_account(rpc, &state.agent)?;
     source.validate_structure()?;
+    if source.stands_for_fee_account(c, &state.agent) {
+        return Err(FEE_ACCOUNT_DIFFERS.into());
+    }
     if require_customer_quorum {
         if c.fee_account.is_some() {
             // The fee account holds exactly its roles. A signer or a threshold that the
