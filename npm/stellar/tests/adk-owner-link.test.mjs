@@ -29,7 +29,7 @@ test('the review shows labelled params and the prompt names the RPC and a non-de
   const staging = adkAgentPrompt('Run the approved task.', 'https://staging.allowit.ai', 'policy-id', 'policy-wallet', 'agent-key');
   assert.match(staging, /Stellar Testnet policy: policy-id\nPolicy wallet: policy-wallet\nAgent public key: agent-key/);
   assert.match(staging, /`ALLOWIT_URL=https:\/\/staging\.allowit\.ai allowit --rail stellar:testnet --rpc-url <independent Stellar Testnet RPC URL> wallet import allowit-stellar-profile\.json`/);
-  assert.doesNotMatch(adkAgentPrompt('Run.', 'https://app.allowit.xyz', 'p', 'w', 'a'), /ALLOWIT_URL/);
+  assert.doesNotMatch(adkAgentPrompt('Run.', 'https://app.allowit.ai', 'p', 'w', 'a'), /ALLOWIT_URL/);
 });
 
 test('a review link carries the chat-collected agent key and amount and refuses any other key', async () => {
@@ -66,7 +66,7 @@ test('a review link carries the chat-collected agent key and amount and refuses 
   assert.equal(parseReviewLink(link({proposal, workPrompt: 'w', walletKind: null})).walletKind, null);
   // The owner link without a review step carries no kind.
   assert.throws(() => parseAdkOwnerLink(link({proposal, workPrompt: 'w', walletKind: 'standard'})), /invalid/);
-  const prompt = reviewAgentPrompt(full, 'https://app.allowit.xyz', 'policy-1', 'CWALLET', 'GAGENT');
+  const prompt = reviewAgentPrompt(full, 'https://app.allowit.ai', 'policy-1', 'CWALLET', 'GAGENT');
   assert.match(prompt, /^Pay Sol 5 XLM\.\n/);
   assert.match(prompt, /Policy wallet: CWALLET/);
 });
