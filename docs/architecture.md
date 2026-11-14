@@ -365,8 +365,8 @@ owner-written request and returns its passing constraint:
 `internet_search(ctx, &AllowitInternetSearch { query })` and
 `marketplace_search(ctx, &AllowitMarketplaceSearch { query })` their results,
 `request_screening(ctx, &AllowitRequestScreening { query, deny_below })` the passing score,
-`systemone(ctx, &AllowitSystemOne { id, query, deny_below, allow_above })` the passing confidence,
-and `clear_systemone_context(ctx)` nothing. Scores and confidences are basis points. There they are
+`decision(ctx, &AllowitDecision { id, query, deny_below, allow_above })` the passing confidence,
+and `new_decision_context(ctx, name)` nothing: it starts a new decision context, named by the optional `name`. Scores and confidences are basis points. There they are
 stubs that return `Unsupported` until the server fills them. A Custom policy that calls one does not
 compile, because the Soroban backend has none of them.
 

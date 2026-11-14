@@ -109,6 +109,15 @@ fn version_line(tool: &Path, dir: &Path) -> Option<String> {
         .map(|line| line.trim().to_owned())
 }
 
+/// Whether the complete output of a failed build names a compiler or a Wasm target that rustup
+/// did not supply. That is a toolchain fault, not a fault of the policy source.
+fn missing_toolchain(stderr: &str) -> bool {
+    stderr.contains("wasm32v1-none") && stderr.contains("not be installed")
+        || stderr.contains("wasm32v1-none") && stderr.contains("not installed")
+        || stderr.contains("toolchain") && stderr.contains("is not installed")
+        || stderr.contains("can't find crate for `core`")
+}
+
 /// The last lines of a failed tool run, for the owner. Tool output is local build output.
 fn tail(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
@@ -192,10 +201,7 @@ pub(crate) fn build_with(stellar: &Path, source: &str, work: &Path) -> Result<Wa
         .map_err(|_| toolchain_missing("The Stellar CLI did not start. Install it again."))?;
     if !output.status.success() {
         let log = tail(&output.stderr);
-        // A compiler or target that rustup could not supply is a toolchain fault.
-        if log.contains("wasm32v1-none") && log.contains("not installed")
-            || log.contains("toolchain") && log.contains("is not installed")
-        {
+        if missing_toolchain(&String::from_utf8_lossy(&output.stderr)) {
             return Err(toolchain_missing(format!(
                 "The pinned Rust toolchain or its Wasm target is not installed. Run `rustup target add wasm32v1-none` in {} and build again.\n{log}",
                 tree.display()
@@ -438,6 +444,42 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_wasm_target_is_a_typed_toolchain_refusal_however_long_the_build_log_is() {
+        use std::os::unix::fs::PermissionsExt;
+        let work = tempfile::tempdir().unwrap();
+        // A Stellar CLI of the pinned release whose build fails as rustc does without the target.
+        // The note that names the target is far above the last lines of the log.
+        let stellar = work.path().join("stellar");
+        let noise =
+            "echo 'warning: build failed, waiting for other jobs to finish...' >&2\n".repeat(40);
+        std::fs::write(
+            &stellar,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'stellar {STELLAR_CLI_VERSION} (test)'; exit 0; fi\necho \"error[E0463]: can't find crate for \\`core\\`\" >&2\necho '  = note: the \\`wasm32v1-none\\` target may not be installed' >&2\n{noise}exit 101\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stellar, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = build_with(&stellar, SOURCE, &work.path().join("build")).unwrap_err();
+        assert_eq!(refused(error.clone()), code::TOOLCHAIN_MISSING, "{error}");
+        assert!(
+            error.message.contains("rustup target add wasm32v1-none"),
+            "{error}"
+        );
+        // A failed compile of another cause stays a build failure.
+        std::fs::write(
+            &stellar,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'stellar {STELLAR_CLI_VERSION} (test)'; exit 0; fi\necho 'error: could not download crate' >&2\nexit 101\n"
+            ),
+        )
+        .unwrap();
+        let error = build_with(&stellar, SOURCE, &work.path().join("build")).unwrap_err();
+        assert_eq!(refused(error), code::BUILD_FAILED);
     }
 
     #[test]

@@ -398,17 +398,19 @@ fn approval_server_only_functions_compile_on_the_host_and_are_unsupported_until_
         allowit::request_screening(&c, &screening),
         Err(AllowitError::Unsupported)
     );
-    let ask = allowit::AllowitSystemOne {
+    let ask = allowit::AllowitDecision {
         id: "invoices",
         query: "q",
         deny_below: 2_000,
         allow_above: 9_000,
     };
-    assert_eq!(allowit::systemone(&c, &ask), Err(AllowitError::Unsupported));
-    assert_eq!(
-        allowit::clear_systemone_context(&c),
-        Err(AllowitError::Unsupported)
-    );
+    assert_eq!(allowit::decision(&c, &ask), Err(AllowitError::Unsupported));
+    for name in [None, Some("invoices")] {
+        assert_eq!(
+            allowit::new_decision_context(&c, name),
+            Err(AllowitError::Unsupported)
+        );
+    }
 }
 
 /// Host address text for each universe index.
