@@ -134,10 +134,14 @@ pub struct SetupTerms<'a> {
 }
 
 /// The owner's account pays for setup and signs it alone, so its own key must reach its own
-/// medium threshold.
+/// low threshold, which admits the transaction, and its medium threshold, which admits a
+/// payment.
 pub fn check_owner_source(state: &AccountState) -> Result<()> {
     state.validate_structure()?;
-    if state.master_weight == 0 || state.master_weight < state.medium_threshold {
+    if state.master_weight == 0
+        || state.master_weight < state.low_threshold
+        || state.master_weight < state.medium_threshold
+    {
         return Err("The owner's account key cannot sign a payment alone".into());
     }
     Ok(())
@@ -824,9 +828,15 @@ mod tests {
             assert!(prepare_native_setup(&owner, &terms(&wallet, &agent, &engine), 1).is_err());
         }
         // An owner account whose key cannot pay alone cannot set up a wallet with one signature.
-        let mut shared = owner.clone();
-        shared.medium_threshold = 2;
-        assert!(prepare_native_setup(&shared, &terms(&wallet, &agent, &engine()), 1).is_err());
+        for raise in [
+            |a: &mut AccountState| a.medium_threshold = 2,
+            |a: &mut AccountState| a.low_threshold = 2,
+            |a: &mut AccountState| a.master_weight = 0,
+        ] {
+            let mut shared = owner.clone();
+            raise(&mut shared);
+            assert!(prepare_native_setup(&shared, &terms(&wallet, &agent, &engine()), 1).is_err());
+        }
         let mut low = terms(&wallet, &agent, "");
         let server = engine();
         low.engine = &server;

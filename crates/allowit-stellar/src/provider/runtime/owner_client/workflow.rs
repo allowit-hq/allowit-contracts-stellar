@@ -745,9 +745,13 @@ impl OwnerClient {
             )
         };
         let response = match submit() {
-            // The server holds no such approval any more, and none settled: prepare the same
-            // update again and submit the retained signature for it.
-            Err(error) if resumed && error.status == Some(404) => {
+            // The server holds no such approval any more, or the approval expired, and none
+            // settled: prepare the same update again and submit the retained signature for it.
+            Err(error)
+                if resumed
+                    && (error.status == Some(404)
+                        || error.api_code.as_deref() == Some("owner_transaction_expired")) =>
+            {
                 prepare()?;
                 submit()
             }
@@ -1186,10 +1190,16 @@ impl OwnerClient {
             ));
         }
         if c.route == WalletRoute::Native {
-            return crate::provider::runtime::client::verify_native_members(
-                &checked(rpc::get_account(rpc, &c.wallet))?,
-                c,
-            );
+            // The owner acts on its wallet also while it is paused: the account holds the exact
+            // roles, with or without the agent signer. An agent's own admission stays strict.
+            let account = checked(rpc::get_account(rpc, &c.wallet))?;
+            if account.address != c.wallet {
+                return Err(Error::config(
+                    "Native account differs from the selected wallet",
+                ));
+            }
+            checked(account.wallet_status(&c.owner, &c.agent, &c.server))?;
+            return Ok(());
         }
         let live = checked(rpc::trusted_state_for_discovery(rpc, c, None))?;
         if live.paused
@@ -1321,7 +1331,12 @@ impl OwnerClient {
         }
         if selection.config.route == WalletRoute::Native && record.signature.is_none() {
             let account = checked(rpc::get_account(rpc, &selection.config.wallet))?;
-            crate::provider::runtime::client::verify_native_members(&account, &selection.config)?;
+            // The owner approves a source as the account's administrator, also while paused.
+            checked(account.wallet_status(
+                &selection.config.owner,
+                &selection.config.agent,
+                &selection.config.server,
+            ))?;
             checked(
                 account.validate_signer_quorum(&[self.session.owner()], account.high_threshold),
             )?;
