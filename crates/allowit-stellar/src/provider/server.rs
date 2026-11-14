@@ -1111,9 +1111,12 @@ impl crate::host::vendors::RuntimeProvider for Provider {
             // Settled once the wallet shows its receipt and the ledger names the transaction.
             // Until then the entry is open: its lapse is proven apart from this read.
             return Ok(
-                match checked(native::seller_settled::settlement(self.rpc(), &s.prepared))? {
-                    Some(_) => Status::Confirmed,
-                    None => Status::Submitted,
+                match checked(native::seller_settled::observe(self.rpc(), &s.prepared))? {
+                    native::seller_settled::Observed::Settled(_) => Status::Confirmed,
+                    // Only a keypair wallet's entry lapses here: nothing settled it by its
+                    // expiry ledger, and nothing can settle it now.
+                    native::seller_settled::Observed::Lapsed => Status::Failed,
+                    native::seller_settled::Observed::Open => Status::Submitted,
                 },
             );
         }

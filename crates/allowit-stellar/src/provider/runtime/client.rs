@@ -700,11 +700,16 @@ impl Client {
         let mut parsed: Response = serde_json::from_slice(&body).map_err(|_| {
             Error::uncertain("Invalid Stellar response; recover the original request ID")
         })?;
-        parsed.released = parsed.prepared.config.route == WalletRoute::PolicyWallet
+        // A payment authorization of either custody form can lapse without a transaction.
+        parsed.released = (parsed.prepared.config.route == WalletRoute::PolicyWallet
+            || parsed.prepared.payment_authorization.is_some())
             && parsed.operation.status == OperationStatus::Failed
             && parsed.receipt.is_none();
-        parsed.operation.status =
-            super::projected_status(&parsed.prepared.config.route, parsed.operation.status);
+        parsed.operation.status = if parsed.released {
+            OperationStatus::SubmissionUnknown
+        } else {
+            super::projected_status(&parsed.prepared.config.route, parsed.operation.status)
+        };
         Ok(Some(parsed))
     }
     /// Send one request with the agent proof of exactly `path` and `body`. `query` is outside
@@ -901,7 +906,13 @@ impl Client {
             && record.and_then(|v| v.prepared.as_ref()) == Some(&r.prepared)
             && !self.rpc_url.is_empty()
             && sdk::rpc::HttpRpc::new(&self.rpc_url)
-                .and_then(|rpc| sdk::rpc::operation_lapsed(&rpc, &r.prepared))
+                .and_then(|rpc| {
+                    if r.prepared.payment_authorization.is_some() {
+                        sdk::seller_settled::lapsed(&rpc, &r.prepared)
+                    } else {
+                        sdk::rpc::operation_lapsed(&rpc, &r.prepared)
+                    }
+                })
                 .unwrap_or(false)
     }
 }

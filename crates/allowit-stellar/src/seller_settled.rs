@@ -20,7 +20,16 @@
 //! names the transaction. An entry that did not settle by its expiry lapses as any policy
 //! wallet operation does, once the wallet still shows its nonce after the expiry.
 //!
-//! Only a policy wallet with owner-enabled x402 signs such an entry.
+//! Both custody forms sign such an entry:
+//!
+//! - A policy wallet is a contract account. Its entry carries the wallet's
+//!   `PolicyAuthorization`: the execution packet and the raw signatures of the agent and the
+//!   service over the digest of [`x402`]. The owner must have enabled x402 for the wallet.
+//! - A keypair wallet is a classic account. The agent and the service each sign the host
+//!   payload of the entry, and the entry holds both account signatures. Their weights reach
+//!   the account's medium threshold only together. The ledger keeps no record of the
+//!   operation for such a wallet, so its settlement and its lapse both read the token's
+//!   transfer events up to the expiry ledger of the entry.
 use crate::workflow::{
     Chain, EvidenceKind, EvidenceRef, WorkflowAsset, WorkflowEffectBound, WorkflowFeeBound,
 };
@@ -169,6 +178,16 @@ fn terms_without_gas(terms: &ExecutionTerms) -> Result<ExecutionTerms> {
     Ok(out)
 }
 
+/// The token contract of the wallet's asset: the installed contract of a policy wallet, or
+/// the asset contract of a keypair wallet's classic asset.
+fn token_contract(c: &WalletConfig) -> Result<String> {
+    if c.route == WalletRoute::Native {
+        sac_address(&c.network, &asset_xdr(c)?)
+    } else {
+        Ok(c.asset.clone())
+    }
+}
+
 /// The unsigned entry of `p`: the wallet authorizes `transfer(wallet, recipient, amount)` on
 /// its asset contract. The nonce derives from the operation id, so one request ID has one
 /// entry. The expiry ledger follows the validity of the operation.
@@ -199,7 +218,7 @@ fn entry(p: &PreparedOperation) -> Result<SorobanAuthorizationEntry> {
         }),
         root_invocation: SorobanAuthorizedInvocation {
             function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
-                contract_address: address(&c.asset)?,
+                contract_address: address(&token_contract(c)?)?,
                 function_name: ScSymbol(b"transfer".to_vec().try_into().map_err(err)?),
                 args: vec![
                     ScVal::Address(address(&c.wallet)?),
@@ -227,12 +246,17 @@ fn execution(p: &PreparedOperation, a: &PaymentAuthorization) -> Result<ScVal> {
     )
 }
 
-/// The digest that both signers sign: the wallet's domain, the host payload of the entry and
-/// the execution packet. This is the encoding of [`x402::signing_digest`], without its checks
-/// of the current time, so a retained packet reads after its expiry.
+/// The digest that both signers sign. For a policy wallet: the wallet's domain, the host
+/// payload of the entry and the execution packet, in the encoding of
+/// [`x402::signing_digest`] without its checks of the current time, so a retained packet reads
+/// after its expiry. For a keypair wallet: the host payload of the entry.
 fn digest(p: &PreparedOperation, a: &PaymentAuthorization) -> Result<[u8; 32]> {
     let entry: SorobanAuthorizationEntry = read(&a.authorization_xdr)?;
     let host_payload = authorization::payload(&p.config.network, &entry)?;
+    if p.config.route == WalletRoute::Native {
+        // The signers of a classic account sign the host payload of the entry itself.
+        return Ok(host_payload);
+    }
     let domain = ScVal::Vec(Some(
         vec![
             value_symbol("allowit_wallet_v1")?,
@@ -281,8 +305,8 @@ fn signature(bytes: &[u8]) -> Result<[u8; 64]> {
 pub fn validate(p: &PreparedOperation) -> Result<()> {
     let a = part(p)?;
     let c = &p.config;
-    if c.route != WalletRoute::PolicyWallet {
-        return Err("Only a policy wallet signs a payment authorization".into());
+    if !matches!(c.route, WalletRoute::PolicyWallet | WalletRoute::Native) {
+        return Err("This wallet signs no payment authorization".into());
     }
     if !is_request(&a.request)
         || a.request.operation != p.request.operation
@@ -299,9 +323,14 @@ pub fn validate(p: &PreparedOperation) -> Result<()> {
     {
         return Err("The payment authorization differs from its operation".into());
     }
-    if let Some(bytes) = &a.server_signature {
-        signing::verify_digest(&c.server, &a.digest, bytes)
-            .map_err(|_| "Invalid service signature of the payment authorization")?;
+    match (&a.server_signature, &c.route) {
+        (None, _) => {}
+        // The service of a keypair wallet signs with the agent when the entry is assembled.
+        (Some(_), WalletRoute::Native) => {
+            return Err("A keypair wallet's preparation holds no service signature".into());
+        }
+        (Some(bytes), _) => signing::verify_digest(&c.server, &a.digest, bytes)
+            .map_err(|_| "Invalid service signature of the payment authorization")?,
     }
     Ok(())
 }
@@ -324,17 +353,23 @@ pub fn admit(p: &PreparedOperation, now: u64) -> Result<[u8; 32]> {
         p.expires_at,
         None,
     )?;
-    let digest = x402::signing_digest(&signing_request(p)?, now).map_err(|error| {
-        if p.state
-            .policy_state
-            .as_ref()
-            .is_some_and(|state| !state.x402_enabled)
-        {
-            DISABLED.to_owned()
-        } else {
-            error
-        }
-    })?;
+    let digest = if p.config.route == WalletRoute::Native {
+        // The exact roles, weights and thresholds of the wallet account, as for a payment.
+        p.state.source.validate_wallet(&p.config)?;
+        digest(p, a)?
+    } else {
+        x402::signing_digest(&signing_request(p)?, now).map_err(|error| {
+            if p.state
+                .policy_state
+                .as_ref()
+                .is_some_and(|state| !state.x402_enabled)
+            {
+                DISABLED.to_owned()
+            } else {
+                error
+            }
+        })?
+    };
     if digest != a.digest {
         return Err("The payment authorization digest differs".into());
     }
@@ -353,19 +388,22 @@ pub fn prepare(
     now: u64,
     expires_at: u64,
 ) -> Result<PreparedOperation> {
-    if c.route != WalletRoute::PolicyWallet {
-        return Err("Only a policy wallet signs a payment authorization".into());
-    }
+    let policy_wallet = match c.route {
+        WalletRoute::PolicyWallet => true,
+        WalletRoute::Native => false,
+        WalletRoute::Odc => return Err("This wallet signs no payment authorization".into()),
+    };
     let t = transfer(c, r)?;
-    let found = rpc::trusted_state_for_discovery(rpc, c, None)?;
+    let found = rpc::trusted_state_for_discovery(rpc, c, accounting.clone())?;
     if found.paused {
         return Err("The wallet is paused".into());
     }
-    if found
-        .state
-        .policy_state
-        .as_ref()
-        .is_none_or(|state| !state.x402_enabled)
+    if policy_wallet
+        && found
+            .state
+            .policy_state
+            .as_ref()
+            .is_none_or(|state| !state.x402_enabled)
     {
         return Err(DISABLED.into());
     }
@@ -380,9 +418,11 @@ pub fn prepare(
     };
     a.digest = digest(&p, &a)?;
     p.payment_authorization = Some(Box::new(a));
-    // The simulation above established the preflight of the operation. It now binds the
-    // authorization part too.
-    record_native_preflight(&mut p)?;
+    if policy_wallet {
+        // The simulation above established the preflight of the operation. It now binds the
+        // authorization part too.
+        record_native_preflight(&mut p)?;
+    }
     admit(&p, now)?;
     Ok(p)
 }
@@ -398,7 +438,7 @@ pub fn authorize_server(
     sign_hash: impl FnOnce(&[u8; 32]) -> Result<[u8; 64]>,
 ) -> Result<PreparedOperation> {
     let a = part(p)?;
-    if signer_account != p.config.server {
+    if p.config.route != WalletRoute::PolicyWallet || signer_account != p.config.server {
         return Err("Configured policy service signer required".into());
     }
     if a.server_signature.is_some() {
@@ -424,6 +464,14 @@ pub fn authorize_server(
 /// revision, x402 enabled and no pause. Another state means that the entry cannot settle.
 pub fn revalidate(rpc: &dyn rpc::Rpc, p: &PreparedOperation, now: u64) -> Result<()> {
     admit(p, now)?;
+    if p.config.route == WalletRoute::Native {
+        let current = rpc::get_account(rpc, &p.config.wallet)?;
+        current.validate_roles(&p.config.owner, &p.config.agent, &p.config.server)?;
+        if current != p.state.source {
+            return Err("The wallet changed since this payment authorization was prepared".into());
+        }
+        return Ok(());
+    }
     let found = rpc::trusted_state_for_discovery(rpc, &p.config, None)?;
     let enabled = found
         .state
@@ -441,8 +489,9 @@ pub fn revalidate(rpc: &dyn rpc::Rpc, p: &PreparedOperation, now: u64) -> Result
     Ok(())
 }
 
-/// The agent's signature of the digest of `p`, after the same admission as [`admit`]. The
-/// service's signature must be present: the agent signs only what the service approved.
+/// A role's signature of the digest of `p`, after the same admission as [`admit`]. The agent
+/// of a policy wallet signs only what the service approved: the service's signature must be
+/// present. The agent and the service of a keypair wallet both sign here.
 pub fn sign(
     p: &PreparedOperation,
     signer: &str,
@@ -450,10 +499,16 @@ pub fn sign(
     sign_hash: impl FnOnce(&[u8; 32]) -> Result<[u8; 64]>,
 ) -> Result<DetachedSignature> {
     let digest = admit(p, now)?;
-    if part(p)?.server_signature.is_none() {
-        return Err("Service authorization is unsigned".into());
-    }
-    if signer != p.config.agent {
+    let allowed = if p.config.route == WalletRoute::Native {
+        // The agent and the service of a keypair wallet sign the same payload.
+        signer == p.config.agent || signer == p.config.server
+    } else {
+        if part(p)?.server_signature.is_none() {
+            return Err("Service authorization is unsigned".into());
+        }
+        signer == p.config.agent
+    };
+    if !allowed {
         return Err("Signer has no automated role".into());
     }
     let signature = sign_hash(&digest)?;
@@ -495,33 +550,99 @@ fn payload_transaction(entry: &SorobanAuthorizationEntry) -> Result<String> {
     }))
 }
 
-/// The signed entry: the entry of `p` with the wallet's `PolicyAuthorization` as its
-/// signature, in the encoding of [`x402::assemble`].
+/// The role signatures that a signed authorization holds, in role order: the agent alone for
+/// a policy wallet, whose preparation holds the service's signature, and the agent then the
+/// service for a keypair wallet.
+fn roles(c: &WalletConfig) -> Vec<&str> {
+    if c.route == WalletRoute::Native {
+        vec![c.agent.as_str(), c.server.as_str()]
+    } else {
+        vec![c.agent.as_str()]
+    }
+}
+
+/// Check `signatures` against the roles of `p`: one valid signature of the digest per role,
+/// in role order.
+fn role_signatures(
+    p: &PreparedOperation,
+    a: &PaymentAuthorization,
+    signatures: &[DetachedSignature],
+) -> Result<Vec<[u8; 64]>> {
+    let roles = roles(&p.config);
+    if p.config.agent == p.config.server || signatures.len() != roles.len() {
+        return Err("Every automated role must sign the payment authorization once".into());
+    }
+    roles
+        .iter()
+        .zip(signatures)
+        .map(|(role, proof)| {
+            if proof.signer != *role {
+                return Err("A role signature names another signer".into());
+            }
+            signing::verify_digest(role, &a.digest, &proof.signature)
+                .map_err(|_| "Invalid role signature of the payment authorization")?;
+            signature(&proof.signature)
+        })
+        .collect()
+}
+
+/// The signed entry of `p`. A policy wallet's entry holds the wallet's `PolicyAuthorization`,
+/// in the encoding of [`x402::assemble`]. A keypair wallet's entry holds the account
+/// signatures of the agent and the service, in the order of their public keys.
 fn signed_entry(
     p: &PreparedOperation,
     a: &PaymentAuthorization,
-    agent_signature: &[u8; 64],
+    signatures: &[[u8; 64]],
 ) -> Result<SorobanAuthorizationEntry> {
-    let server_signature = signature(
-        a.server_signature
-            .as_deref()
-            .ok_or("Service authorization is unsigned")?,
-    )?;
+    let c = &p.config;
     let mut entry: SorobanAuthorizationEntry = read(&a.authorization_xdr)?;
     let SorobanCredentials::Address(credentials) = &mut entry.credentials else {
         return Err("A payment authorization needs wallet-address authorization".into());
     };
-    credentials.signature = value_map(vec![
-        ("execution", execution(p, a)?),
-        ("agent_signature", value_bytes(agent_signature)?),
-        ("server_signature", value_bytes(&server_signature)?),
-    ])?;
+    credentials.signature = if c.route == WalletRoute::Native {
+        let [agent, server] = signatures else {
+            return Err("A keypair wallet's entry holds two account signatures".into());
+        };
+        let mut signers = [
+            (account_key(&c.agent)?, agent),
+            (account_key(&c.server)?, server),
+        ];
+        signers.sort_by_key(|(key, _)| *key);
+        ScVal::Vec(Some(
+            signers
+                .iter()
+                .map(|(key, signature)| {
+                    value_map(vec![
+                        ("public_key", value_bytes(key)?),
+                        ("signature", value_bytes(*signature)?),
+                    ])
+                })
+                .collect::<Result<Vec<_>>>()?
+                .try_into()
+                .map_err(err)?,
+        ))
+    } else {
+        let [agent] = signatures else {
+            return Err("A policy wallet's entry holds the agent's signature".into());
+        };
+        let server = signature(
+            a.server_signature
+                .as_deref()
+                .ok_or("Service authorization is unsigned")?,
+        )?;
+        value_map(vec![
+            ("execution", execution(p, a)?),
+            ("agent_signature", value_bytes(agent)?),
+            ("server_signature", value_bytes(&server)?),
+        ])?
+    };
     Ok(entry)
 }
 
-/// Assemble the signed authorization from the agent's signature and check it against the
-/// ledger: the enforce-mode simulation of the payload runs the wallet's own check with both
-/// signatures. A wallet that refuses it releases nothing to the seller.
+/// Assemble the signed authorization from the role signatures and check it against the
+/// ledger: the enforce-mode simulation of the payload runs the wallet's own check, or the
+/// account's signature check, with both signatures. A wallet that refuses it releases
+/// nothing to the seller.
 pub fn authorize(
     rpc: &dyn rpc::Rpc,
     p: &PreparedOperation,
@@ -529,29 +650,20 @@ pub fn authorize(
     now: u64,
 ) -> Result<SignedOperation> {
     let a = part(p)?;
-    let [agent] = signatures else {
-        return Err("A payment authorization takes the agent's signature alone".into());
-    };
-    if agent.signer != p.config.agent {
-        return Err("Signer has no automated role".into());
-    }
     revalidate(rpc, p, now)?;
-    let agent_signature = signature(&agent.signature)?;
-    let server_signature = signature(
-        a.server_signature
-            .as_deref()
-            .ok_or("Service authorization is unsigned")?,
-    )?;
-    // The reviewed assembly verifies both signatures and every binding at `now`.
-    let assembled = x402::assemble(
-        &signing_request(p)?,
-        &agent_signature,
-        &server_signature,
-        now,
-    )?;
-    let entry = signed_entry(p, a, &agent_signature)?;
-    if assembled != xdr(&entry)? {
-        return Err("The assembled payment authorization differs".into());
+    let verified = role_signatures(p, a, signatures)?;
+    let entry = signed_entry(p, a, &verified)?;
+    if p.config.route == WalletRoute::PolicyWallet {
+        let server = signature(
+            a.server_signature
+                .as_deref()
+                .ok_or("Service authorization is unsigned")?,
+        )?;
+        // The reviewed assembly verifies both signatures and every binding at `now`.
+        let assembled = x402::assemble(&signing_request(p)?, &verified[0], &server, now)?;
+        if assembled != xdr(&entry)? {
+            return Err("The assembled payment authorization differs".into());
+        }
     }
     let transaction = payload_transaction(&entry)?;
     let simulated = rpc.call(
@@ -566,15 +678,15 @@ pub fn authorize(
         prepared: p.clone(),
         transaction_xdr: transaction,
         transaction_hash: p.transaction_hash,
-        role_signatures: vec![agent.clone()],
+        role_signatures: signatures.to_vec(),
     };
     validate_signed(&signed)?;
     Ok(signed)
 }
 
 /// The signed entry that `s` carries, after checking the whole retained packet: the
-/// preparation, the service's and the agent's signatures of its digest, and a payload that is
-/// exactly the transaction of the signed entry.
+/// preparation, every role's signature of its digest, and a payload that is exactly the
+/// transaction of the signed entry.
 fn retained_entry(s: &SignedOperation) -> Result<SorobanAuthorizationEntry> {
     let p = &s.prepared;
     let a = part(p)?;
@@ -582,15 +694,7 @@ fn retained_entry(s: &SignedOperation) -> Result<SorobanAuthorizationEntry> {
     if s.transaction_hash != p.transaction_hash {
         return Err("Signed transaction identity differs".into());
     }
-    let [agent] = s.role_signatures.as_slice() else {
-        return Err("A payment authorization holds the agent's signature".into());
-    };
-    if agent.signer != p.config.agent {
-        return Err("The agent's signature names another signer".into());
-    }
-    signing::verify_digest(&agent.signer, &a.digest, &agent.signature)
-        .map_err(|_| "Invalid agent signature of the payment authorization")?;
-    let entry = signed_entry(p, a, &signature(&agent.signature)?)?;
+    let entry = signed_entry(p, a, &role_signatures(p, a, &s.role_signatures)?)?;
     if s.transaction_xdr != payload_transaction(&entry)? {
         return Err("The payment authorization payload differs".into());
     }
@@ -602,18 +706,18 @@ pub fn validate_signed(s: &SignedOperation) -> Result<()> {
     retained_entry(s).map(drop)
 }
 
-/// Whether the transaction of `receipt` carries `entry` in its one invocation.
-fn carries(receipt: &rpc::VerifiedReceipt, entry: &SorobanAuthorizationEntry) -> Result<bool> {
+/// The authorization entries of the one invocation of `receipt`'s transaction.
+fn carried(receipt: &rpc::VerifiedReceipt) -> Result<Vec<SorobanAuthorizationEntry>> {
     let TransactionEnvelope::Tx(envelope) = read(&receipt.envelope_xdr)? else {
-        return Ok(false);
+        return Ok(Vec::new());
     };
     let [operation] = envelope.tx.operations.as_slice() else {
-        return Ok(false);
+        return Ok(Vec::new());
     };
     let OperationBody::InvokeHostFunction(op) = &operation.body else {
-        return Ok(false);
+        return Ok(Vec::new());
     };
-    Ok(op.auth.iter().any(|carried| carried == entry))
+    Ok(op.auth.to_vec())
 }
 
 /// Check that `receipt` is the settlement of `s`: a successful transaction, on the network of
@@ -628,41 +732,50 @@ pub fn validate_settled(s: &SignedOperation, receipt: &rpc::VerifiedReceipt) -> 
     )?;
     if receipt.settles != Some(s.prepared.transaction_hash)
         || receipt.status != OperationStatus::Confirmed
-        || !carries(receipt, &entry)?
+        || !carried(receipt)?.contains(&entry)
     {
         return Err("The receipt does not settle this payment authorization".into());
     }
     Ok(())
 }
 
-fn topic(value: &ScVal) -> Result<String> {
-    xdr(value)
-}
-
-/// The transactions in which the token reported a transfer from the wallet to the payee of
-/// `p`, from the ledger of its preparation through the expiry ledger of its entry.
-fn transfer_transactions(rpc: &dyn rpc::Rpc, p: &PreparedOperation) -> Result<Vec<[u8; 32]>> {
-    let a = part(p)?;
-    let c = &p.config;
-    let t = retained_transfer(c, &p.request)?;
+/// The expiry ledger of the entry of `a`: the last ledger in which it can settle.
+fn expiry_ledger(a: &PaymentAuthorization) -> Result<u32> {
     let entry: SorobanAuthorizationEntry = read(&a.authorization_xdr)?;
     let SorobanCredentials::Address(credentials) = &entry.credentials else {
         return Err("A payment authorization needs wallet-address authorization".into());
     };
-    let last = credentials.signature_expiration_ledger;
+    Ok(credentials.signature_expiration_ledger)
+}
+
+/// What the token's transfer events show for the entry of `p`.
+struct Transfers {
+    /// The transactions in which the token reported a transfer from the wallet to the payee,
+    /// from the ledger of the preparation through the expiry ledger of the entry.
+    transactions: Vec<[u8; 32]>,
+    /// The events cover every ledger through the expiry ledger: the ledger passed it, and the
+    /// read reached the end of the events or an event after it.
+    complete: bool,
+}
+
+fn transfers(rpc: &dyn rpc::Rpc, p: &PreparedOperation) -> Result<Transfers> {
+    let a = part(p)?;
+    let c = &p.config;
+    let t = retained_transfer(c, &p.request)?;
+    let last = u64::from(expiry_ledger(a)?);
     let prefix = [
-        topic(&value_symbol("transfer")?)?,
-        topic(&ScVal::Address(address(&c.wallet)?))?,
-        topic(&ScVal::Address(address(&t.recipient)?))?,
+        xdr(&value_symbol("transfer")?)?,
+        xdr(&ScVal::Address(address(&c.wallet)?))?,
+        xdr(&ScVal::Address(address(&t.recipient)?))?,
     ];
     // A token reports three topics. An asset contract adds the asset as the fourth.
     let mut with_asset = prefix.to_vec();
     with_asset.push("*".into());
-    let mut found = Vec::new();
+    let mut transactions = Vec::new();
     let mut cursor: Option<String> = None;
     for _ in 0..8 {
         let mut params = json!({
-            "filters": [{"type": "contract", "contractIds": [c.asset], "topics": [prefix, with_asset]}],
+            "filters": [{"type": "contract", "contractIds": [token_contract(c)?], "topics": [prefix, with_asset]}],
             "pagination": {"limit": 200},
         });
         match &cursor {
@@ -670,24 +783,33 @@ fn transfer_transactions(rpc: &dyn rpc::Rpc, p: &PreparedOperation) -> Result<Ve
             None => params["startLedger"] = json!(p.state.ledger),
         }
         let reply = rpc.call("getEvents", params)?;
+        let latest = reply["latestLedger"]
+            .as_u64()
+            .ok_or("Missing latest ledger of the events")?;
         let events = reply["events"].as_array().ok_or("Missing ledger events")?;
         for event in events {
             let ledger = event["ledger"].as_u64().ok_or("Invalid event ledger")?;
-            if ledger > u64::from(last) {
-                return Ok(found);
+            if ledger > last {
+                return Ok(Transfers {
+                    transactions,
+                    complete: true,
+                });
             }
             let hash = unhex::<32>(
                 event["txHash"]
                     .as_str()
                     .ok_or("Invalid event transaction")?,
             )?;
-            if !found.contains(&hash) {
-                found.push(hash);
+            if !transactions.contains(&hash) {
+                transactions.push(hash);
             }
         }
         let next = reply["cursor"].as_str().map(str::to_owned);
         if events.len() < 200 || next.is_none() || next == cursor {
-            return Ok(found);
+            return Ok(Transfers {
+                transactions,
+                complete: latest > last,
+            });
         }
         cursor = next;
     }
@@ -700,39 +822,91 @@ pub struct Settlement {
     pub receipt: rpc::VerifiedReceipt,
 }
 
-/// Read the settlement of the authorization of `p` from the ledger. `None` means that the
-/// wallet has executed no operation of this id: the entry is open or lapsed, and
-/// [`rpc::operation_lapsed`] proves a lapse. The wallet's own receipt under the operation id
-/// shows that the entry settled; the token's transfer event then names the transaction, and
-/// the transaction must carry the wallet's entry of `p` with both signatures.
-pub fn settlement(rpc: &dyn rpc::Rpc, p: &PreparedOperation) -> Result<Option<Settlement>> {
+/// What the ledger shows of the authorization of `p`.
+pub enum Observed {
+    /// A successful transaction carries the entry.
+    Settled(Box<Settlement>),
+    /// The entry did not settle and can no longer settle: its expiry ledger passed and no
+    /// transaction of the token's transfers through that ledger carries it. Only a keypair
+    /// wallet reports this here; a policy wallet's lapse is [`rpc::operation_lapsed`].
+    Lapsed,
+    /// Neither is established.
+    Open,
+}
+
+/// The role signatures of the entry `found` on the ledger, in role order.
+fn carried_signatures(
+    c: &WalletConfig,
+    found: &SorobanAuthorizationEntry,
+) -> Result<Vec<DetachedSignature>> {
+    let SorobanCredentials::Address(credentials) = &found.credentials else {
+        return Err("The settled entry is no address authorization".into());
+    };
+    let bytes = |value: &ScVal| match value {
+        ScVal::Bytes(bytes) => Ok(bytes.to_vec()),
+        _ => Err("The settled entry holds an invalid signature".to_owned()),
+    };
+    if c.route != WalletRoute::Native {
+        return Ok(vec![DetachedSignature {
+            signer: c.agent.clone(),
+            signature: bytes(rpc::map_field(&credentials.signature, "agent_signature")?)?,
+        }]);
+    }
+    let ScVal::Vec(Some(signers)) = &credentials.signature else {
+        return Err("The settled entry holds no account signatures".into());
+    };
+    roles(c)
+        .into_iter()
+        .map(|role| {
+            let key = value_bytes(&account_key(role)?)?;
+            let signer = signers
+                .iter()
+                .find(|signer| rpc::map_field(signer, "public_key").ok() == Some(&key))
+                .ok_or("The settled entry lacks a role signature")?;
+            Ok(DetachedSignature {
+                signer: role.to_owned(),
+                signature: bytes(rpc::map_field(signer, "signature")?)?,
+            })
+        })
+        .collect()
+}
+
+/// Read what the ledger shows of the authorization of `p`.
+///
+/// A policy wallet stores a receipt under the operation id when the entry settles. Without
+/// that receipt the entry is open. With it, the token's transfer event names the
+/// transaction. A keypair wallet stores nothing, so the transfer events are read at once, and
+/// a complete read without the entry after its expiry ledger proves the lapse.
+///
+/// The transaction must succeed and carry the wallet's entry of `p`, which the nonce binds,
+/// with the signatures of the roles.
+pub fn observe(rpc: &dyn rpc::Rpc, p: &PreparedOperation) -> Result<Observed> {
     let a = part(p)?;
     validate_retained_prepared(p)?;
-    let Some(executed) = rpc::operation_receipt(rpc, &p.config, &p.request.operation.nonce)? else {
-        return Ok(None);
-    };
-    if executed.transfer != rpc::expected_receipt(p)? {
-        return Err("The wallet executed another operation under this id".into());
+    let policy_wallet = p.config.route == WalletRoute::PolicyWallet;
+    if policy_wallet {
+        let Some(executed) = rpc::operation_receipt(rpc, &p.config, &p.request.operation.nonce)?
+        else {
+            return Ok(Observed::Open);
+        };
+        if executed.transfer != rpc::expected_receipt(p)? {
+            return Err("The wallet executed another operation under this id".into());
+        }
+    } else if rpc.call("getNetwork", json!({}))?["passphrase"] != passphrase(&p.config.network)? {
+        return Err("Stellar RPC network differs from installation".into());
     }
     let unsigned: SorobanAuthorizationEntry = read(&a.authorization_xdr)?;
-    for hash in transfer_transactions(rpc, p)? {
-        let Some(mut receipt) = rpc::receipt_by_hash(rpc, &p.config.network, &hash)? else {
+    let found = transfers(rpc, p)?;
+    for hash in &found.transactions {
+        let Some(mut receipt) = rpc::receipt_by_hash(rpc, &p.config.network, hash)? else {
             continue;
         };
         if receipt.status != OperationStatus::Confirmed {
             continue;
         }
-        let TransactionEnvelope::Tx(envelope) = read(&receipt.envelope_xdr)? else {
-            continue;
-        };
-        let Some(OperationBody::InvokeHostFunction(op)) =
-            envelope.tx.operations.first().map(|op| &op.body)
-        else {
-            continue;
-        };
         // The entry of this operation, whatever its signature: the nonce binds it.
-        let Some(carried) = op.auth.iter().find(|carried| {
-            let mut bare = (*carried).clone();
+        let Some(entry) = carried(&receipt)?.into_iter().find(|entry| {
+            let mut bare = entry.clone();
             if let SorobanCredentials::Address(credentials) = &mut bare.credentials {
                 credentials.signature = ScVal::Void;
             }
@@ -740,29 +914,45 @@ pub fn settlement(rpc: &dyn rpc::Rpc, p: &PreparedOperation) -> Result<Option<Se
         }) else {
             continue;
         };
-        let SorobanCredentials::Address(credentials) = &carried.credentials else {
-            continue;
-        };
-        let ScVal::Bytes(agent_signature) =
-            rpc::map_field(&credentials.signature, "agent_signature")?
-        else {
-            return Err("The settled entry holds no agent signature".into());
-        };
         let signed = SignedOperation {
             prepared: p.clone(),
-            transaction_xdr: payload_transaction(carried)?,
+            transaction_xdr: payload_transaction(&entry)?,
             transaction_hash: p.transaction_hash,
-            role_signatures: vec![DetachedSignature {
-                signer: p.config.agent.clone(),
-                signature: agent_signature.to_vec(),
-            }],
+            role_signatures: carried_signatures(&p.config, &entry)?,
         };
         receipt.settles = Some(p.transaction_hash);
         validate_settled(&signed, &receipt)?;
-        return Ok(Some(Settlement { signed, receipt }));
+        return Ok(Observed::Settled(Box::new(Settlement { signed, receipt })));
     }
-    Err(
-        "The wallet executed this payment, and the ledger events no longer name its transaction"
-            .into(),
-    )
+    if policy_wallet {
+        return Err(
+            "The wallet executed this payment, and the ledger events no longer name its transaction"
+                .into(),
+        );
+    }
+    Ok(if found.complete {
+        Observed::Lapsed
+    } else {
+        Observed::Open
+    })
+}
+
+/// The settlement of the authorization of `p`, when the ledger shows it.
+pub fn settlement(rpc: &dyn rpc::Rpc, p: &PreparedOperation) -> Result<Option<Settlement>> {
+    Ok(match observe(rpc, p)? {
+        Observed::Settled(settled) => Some(*settled),
+        Observed::Lapsed | Observed::Open => None,
+    })
+}
+
+/// Whether the authorization of `p` lapsed: it did not settle and can no longer settle.
+/// A policy wallet proves it with its nonce after the expiry ([`rpc::operation_lapsed`]), a
+/// keypair wallet with the token's transfer events through the expiry ledger of the entry.
+/// `false` means not proven.
+pub fn lapsed(rpc: &dyn rpc::Rpc, p: &PreparedOperation) -> Result<bool> {
+    part(p)?;
+    if p.config.route == WalletRoute::PolicyWallet {
+        return rpc::operation_lapsed(rpc, p);
+    }
+    Ok(matches!(observe(rpc, p)?, Observed::Lapsed))
 }
