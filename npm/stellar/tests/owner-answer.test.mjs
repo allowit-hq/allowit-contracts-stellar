@@ -20,6 +20,28 @@ test('an owner review answer reads as its exact fields', () => {
   assert.equal(reviewAnswer(message({...fields, policy: ''}))?.policy, '');
 });
 
+const failed = {...fields, question: undefined, lookup: 'fetch failed (timeout)', score: 'none. A lookup failed, so nothing was scored'};
+const lookupMessage = (f = failed) => message({...f, question: 'x'}).replace('Question: x', `Lookup: ${f.lookup}`);
+
+test('an answer to a failed lookup reads as its exact fields, without a question', () => {
+  const read = reviewAnswer(lookupMessage());
+  const {question: _question, ...expected} = failed;
+  assert.deepEqual(read, expected);
+  assert.equal(Object.hasOwn(read, 'question'), false);
+  assert.deepEqual(reviewAnswer(lookupMessage({...failed, answer: 'deny'})).answer, 'deny');
+});
+
+test('a question needs a numeric score and a failed lookup needs the line that nothing was scored', () => {
+  for (const other of [
+    // A failed lookup with a score, and a question without one.
+    lookupMessage({...failed, score: fields.score}), message({...fields, score: failed.score}),
+    lookupMessage({...failed, lookup: 'fetch'}), lookupMessage({...failed, lookup: 'fetch failed'}),
+    lookupMessage({...failed, lookup: 'fetch the page failed (timeout)'}), lookupMessage({...failed, lookup: 'fetch failed (time out)'}),
+    lookupMessage({...failed, lookup: ''}), lookupMessage({...failed, score: 'none'}),
+    lookupMessage().replace('Lookup: ', 'Lookup failed: '), lookupMessage().replace('\nScore: ', '\nscore: '),
+  ]) assert.equal(reviewAnswer(other), null, String(other));
+});
+
 test('any other text is no owner review answer', () => {
   for (const other of [
     null, '', 'Sign in', message().replace('Allowit owner review', 'Allowit owner review v2'), `${message()}\n`, `${message()}\nExtra: 1`,
