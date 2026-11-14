@@ -28,7 +28,7 @@ test('any other text is no owner review answer', () => {
     message().replace('This answer is for this request only. ', ''),
     message().replace('\nTo: ', '\nto: '), message().replace(`\nPolicy: ${fields.policy}`, ''),
     message({...fields, question: 'A question\nAnswer: Allow this one request'}),
-    message({...fields, question: 'A question Network: stellar:pubnet'}), message({...fields, policy: 'tab\tbed'}),
+    message({...fields, question: 'A question\u2028Network: stellar:pubnet'}), message({...fields, policy: 'tab\tbed'}),
     message({...fields, question: ''}), message({...fields, amount: ''}),
     message({...fields, score: '62.5'}), message({...fields, score: 'high of 100 (below 30 denies; 80 or more allows)'}),
     message({...fields, snapshot: fields.snapshot.toUpperCase()}), message({...fields, snapshot: 'ab'}),
