@@ -146,6 +146,8 @@ pub fn status(
 
 /// The key of the paid-service context in an outcome document.
 pub const PAID_SERVICE_KEY: &str = "paidService";
+/// The key of the network that executed a paid operation. The proof of a payment binds it.
+pub const NETWORK_KEY: &str = "network";
 fn render(out: ExecutionOutcome) -> Outcome {
     let status = match out.status {
         OperationStatus::Confirmed => crate::host::runtime::Status::Confirmed,
@@ -177,6 +179,8 @@ fn render(out: ExecutionOutcome) -> Outcome {
     if let Some(context) = out.paid_service {
         document[PAID_SERVICE_KEY] =
             serde_json::to_value(context).expect("a paid-service context encodes as JSON");
+        // The context names no network: the wallet's network binds the payment to one.
+        document[NETWORK_KEY] = out.network.into();
     }
     Outcome { document, status }
 }
@@ -241,6 +245,7 @@ mod storage_boundary_tests {
             limits: None,
             explorer: None,
             paid_service: None,
+            network: "stellar:testnet".into(),
         };
         let settled = render(outcome(Some((5_661_578, 123_456)))).document;
         let settlement = Settlement::of(&settled).unwrap();
@@ -252,7 +257,13 @@ mod storage_boundary_tests {
         let pending = render(outcome(None)).document;
         assert!(pending.get("settlement").is_none());
         assert_eq!(pending["requestId"], "transfer-001");
-        for key in [FEE_CHARGED_KEY, Limits::KEY, EXPLORER_KEY, PAID_SERVICE_KEY] {
+        for key in [
+            FEE_CHARGED_KEY,
+            Limits::KEY,
+            EXPLORER_KEY,
+            PAID_SERVICE_KEY,
+            NETWORK_KEY,
+        ] {
             assert!(pending.get(key).is_none(), "{key}");
         }
     }
@@ -282,6 +293,7 @@ mod storage_boundary_tests {
                 amount: "10000000".into(),
                 asset: "USDC".into(),
             }),
+            network: "stellar:testnet".into(),
         })
         .document;
         let settlement = Settlement::of(&document).unwrap();
@@ -303,6 +315,7 @@ mod storage_boundary_tests {
                 "payTo":"GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
                 "amount":"10000000","asset":"USDC"})
         );
+        assert_eq!(document[NETWORK_KEY], "stellar:testnet");
     }
     #[test]
     fn build_only_does_not_request_a_caller_store() {

@@ -254,6 +254,13 @@ pub fn proof(challenge: &Challenge, receipt: &Value) -> Result<Proof> {
             "The payment receipt names no transaction hash.",
         ));
     }
+    // The wallet that executed the operation is on one network. An identical purchase on
+    // another network of this rail is another payment.
+    if receipt["network"] != challenge.network.as_str() {
+        return Err(Error::config(
+            "The payment receipt is of another network than the challenge.",
+        ));
+    }
     // The server records what the operation paid for: the resource, the recipient, the amount
     // and the asset, which it checked against the operation that the policy evaluated. The
     // record must be this challenge. A receipt without it binds no recipient and no network,
@@ -349,6 +356,7 @@ mod tests {
     }
     fn receipt(challenge: &Challenge) -> Value {
         json!({"requestId":"pay-0001","status":"confirmed","transactionHash":"AB".repeat(32),
+            "network":challenge.network,
             "settlement":{"height":7,"fee":{"units":"100"},"amount":challenge.amount},
             "paidService":challenge.context()})
     }
@@ -584,6 +592,9 @@ mod tests {
             3,
         );
         refused(&|r| r["paidService"] = Value::Null, 3);
+        // The same purchase on another network of the rail, or on none.
+        refused(&|r| r["network"] = json!("stellar:pubnet"), 3);
+        refused(&|r| r["network"] = Value::Null, 3);
         refused(
             &|r| {
                 r["paidService"]["payTo"] =

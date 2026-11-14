@@ -161,9 +161,9 @@ any payment.
 `proof(challenge, receipt)` builds the request header from the outcome document of the confirmed
 operation: `X-PAYMENT` (version 1) or `PAYMENT-SIGNATURE` (version 2), the base64 JSON of
 `{x402Version, scheme, network, payload: {transaction, settled: true, challengeId?}}`. Version 2 also
-echoes `accepted` and `resource`. The receipt must be confirmed, and its recorded `paidService` context
-must equal the challenge: the resource, the recipient, the amount and the asset. A receipt without that
-record gives no proof. A stated `settlement.amount` must also equal the challenge amount; a fee-bumped
+echoes `accepted` and `resource`. The receipt must be confirmed, its `network` must be the network of the
+challenge, and its recorded `paidService` context must equal the challenge: the resource, the recipient, the
+amount and the asset. A receipt without that record gives no proof. A stated `settlement.amount` must also equal the challenge amount; a fee-bumped
 transaction states none.
 
 A seller that accepts this proof verifies it on its own:
@@ -176,7 +176,8 @@ A seller that accepts this proof verifies it on its own:
 `exec_paid` sends the `paidService` context with the preparation of the transfer. The engine checks it
 against the operation and records it with the request ID. The journal keeps it with the original intent:
 a retry or a recovery of the same request ID with another context is refused before anything is signed.
-The outcome document shows the recorded context under `paidService`.
+The outcome document of a paid operation shows the recorded context under `paidService` and the wallet's
+network under `network`.
 
 ## Owner setup
 

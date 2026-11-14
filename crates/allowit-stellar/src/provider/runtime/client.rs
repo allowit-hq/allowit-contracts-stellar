@@ -1253,6 +1253,8 @@ pub struct ExecutionOutcome {
     /// What the payment bought, as the engine recorded it with the operation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paid_service: Option<PaidService>,
+    /// The network of the installed wallet that executed the operation.
+    pub network: String,
 }
 fn render(r: &Response) -> Result<ExecutionOutcome> {
     let settlement = r
@@ -1287,6 +1289,7 @@ fn render(r: &Response) -> Result<ExecutionOutcome> {
             )
         }),
         paid_service: r.paid_service.as_ref().and_then(recorded),
+        network: config.network.clone(),
     })
 }
 
