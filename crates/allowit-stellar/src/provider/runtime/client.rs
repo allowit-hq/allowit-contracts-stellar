@@ -2,6 +2,7 @@
 //! profile names the wallet, its roles and the engine endpoints; the agent
 //! key signs. Requests go to the profile's `/api/native/execute` endpoints and
 //! are journaled in caller-supplied private storage before they leave the process.
+use crate::host::paid_service::PaidService;
 use crate::host::{
     config::parse_origin,
     error::{Error, Result},
@@ -207,6 +208,10 @@ struct Response {
     /// [`wallet_limits`].
     #[serde(default, rename = "paymentLimits")]
     _payment_limits: Option<serde::de::IgnoredAny>,
+    /// What the payment bought, as the engine recorded it with the operation: the resource and
+    /// the seller's challenge. An engine statement with no chain proof; see [`recorded`].
+    #[serde(default)]
+    paid_service: Option<serde_json::Value>,
     /// The engine reported this policy wallet operation `failed` without a chain receipt: it
     /// released the operation. The status stays `submissionUnknown` until the client proves
     /// the release itself.
@@ -922,7 +927,24 @@ pub fn exec(
     request: ExecutionRequest,
     wait: Duration,
 ) -> Result<ExecutionOutcome> {
+    exec_paid(c, journal, request_id, request, wait, None)
+}
+/// [`exec`] for the payment of a seller's challenge. The preparation carries `paid_service`
+/// to the engine, which checks it against the operation and records it. The context is no part
+/// of the operation: the engine keeps it with the original request ID, so a retry that resumes
+/// a prepared operation does not send it again.
+pub fn exec_paid(
+    c: &Client,
+    journal: &Store,
+    request_id: &str,
+    request: ExecutionRequest,
+    wait: Duration,
+    paid_service: Option<&PaidService>,
+) -> Result<ExecutionOutcome> {
     validate_wait_and_id(request_id, wait)?;
+    if let Some(context) = paid_service {
+        context.validate()?;
+    }
     let policy = c.bundle.policy_id.clone();
     let id = request_id.to_owned();
     if request.operation.nonce != operation_nonce(&policy, &id) {
@@ -1004,7 +1026,7 @@ pub fn exec(
         progress::report("Preparing the operation with the Allowit server");
         c.post(
             &c.bundle.endpoints.execute,
-            json!({"policyId":policy,"requestId":id,"phase":"prepare","request":request}),
+            prepare_body(&policy, &id, &request, paid_service),
         )?
     };
     c.validate(&prepared, &id, Some(&record), false)?;
@@ -1219,6 +1241,9 @@ pub struct ExecutionOutcome {
     pub limits: Option<Vec<LimitReport>>,
     /// The explorer link of the transaction, once this client holds its verified receipt.
     pub explorer: Option<String>,
+    /// What the payment bought, as the engine recorded it with the operation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paid_service: Option<PaidService>,
 }
 fn render(r: &Response) -> Result<ExecutionOutcome> {
     let settlement = r
@@ -1252,7 +1277,30 @@ fn render(r: &Response) -> Result<ExecutionOutcome> {
                 &r.operation.transaction_hash,
             )
         }),
+        paid_service: r.paid_service.as_ref().and_then(recorded),
     })
+}
+
+/// The body of a preparation. Only the payment of a seller's challenge names `paidService`, so
+/// every other preparation keeps its exact earlier bytes.
+fn prepare_body(
+    policy: &str,
+    id: &str,
+    request: &ExecutionRequest,
+    paid_service: Option<&PaidService>,
+) -> serde_json::Value {
+    let mut body = json!({"policyId":policy,"requestId":id,"phase":"prepare","request":request});
+    if let Some(context) = paid_service {
+        body["paidService"] = json!(context);
+    }
+    body
+}
+/// The paid-service context that the engine recorded, when it is a bounded context. A value of
+/// another shape is omitted and never shown.
+fn recorded(value: &serde_json::Value) -> Option<PaidService> {
+    serde_json::from_value::<PaidService>(value.clone())
+        .ok()
+        .filter(|context| context.validate().is_ok())
 }
 
 /// The unit of the wallet's installed asset: a listed token, or a classic asset by its code and
@@ -2125,6 +2173,50 @@ mod native_revalidation_tests {
             .unwrap();
         assert_eq!(answered.prepared, p);
         server.join().unwrap();
+    }
+    #[test]
+    fn a_paid_preparation_names_its_context_and_the_reply_shows_only_a_bounded_one() {
+        let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
+        let context = PaidService {
+            resource: "https://seller.example/report".into(),
+            challenge_id: Some("c-0001".into()),
+            pay_to: p.config.agent.clone(),
+            amount: "2500000".into(),
+            asset: "native".into(),
+        };
+        // An ordinary preparation keeps its exact fields.
+        let plain = prepare_body("engine-policy", "paid-0001", &p.request, None);
+        assert_eq!(
+            plain.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["phase", "policyId", "request", "requestId"]
+        );
+        let paid = prepare_body("engine-policy", "paid-0001", &p.request, Some(&context));
+        assert_eq!(paid["paidService"], json!(context));
+        assert_eq!(paid["request"], plain["request"]);
+        // The engine's record is display data: a bounded context is shown, another shape is
+        // omitted.
+        let operation = json!({"id":"paid-0001","status":OperationStatus::Prepared,"transactionHash":sdk::hex(&p.transaction_hash)});
+        let reply = |recorded: serde_json::Value| -> Response {
+            serde_json::from_value(json!({"prepared":p,"operation":operation,
+                "signedOperation":null,"receipt":null,"paidService":recorded}))
+            .unwrap()
+        };
+        assert_eq!(
+            render(&reply(json!(context))).unwrap().paid_service,
+            Some(context.clone())
+        );
+        for other in [
+            json!(null),
+            json!("https://seller.example/report"),
+            json!({"resource":"javascript:alert(1)","payTo":"G","amount":"1","asset":"native"}),
+            json!({"resource":"https://seller.example/","payTo":"G","amount":"1","asset":"native","note":"x"}),
+        ] {
+            assert_eq!(render(&reply(other)).unwrap().paid_service, None);
+        }
+        // An invalid context never reaches the engine.
+        let mut invalid = context;
+        invalid.resource = "file:///etc/passwd".into();
+        assert!(invalid.validate().is_err());
     }
     #[test]
     fn a_status_reply_reports_the_charged_fee_and_the_limits_in_the_installed_unit() {

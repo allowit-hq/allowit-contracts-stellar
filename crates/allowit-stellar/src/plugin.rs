@@ -171,6 +171,11 @@ impl RailPlugin for Plugin {
             (cx.clock)()
         })
     }
+    fn paid_service(
+        &self,
+    ) -> Option<&'static dyn allowit_core::vendor::paid_service::PaidServiceProvider> {
+        Some(&provider::paid_service::PAID_SERVICE)
+    }
     fn draft_params(
         &self,
         network: &str,

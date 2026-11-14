@@ -236,6 +236,7 @@ mod tests {
             wait: std::time::Duration::ZERO,
             build_only: true,
             wallet: None,
+            paid_service: None,
         };
         let error = build("policy-1", &c, &request, || unreachable!()).unwrap_err();
         assert_eq!(error.code, 3, "{}", error.message);

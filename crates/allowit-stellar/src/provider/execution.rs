@@ -67,12 +67,13 @@ pub fn execute(
     r: &Request,
 ) -> Result<Outcome> {
     let typed = typed(&profile, store, rpc.as_deref(), r)?;
-    client::exec(
+    client::exec_paid(
         &client(profile, signer, rpc)?,
         &store()?,
         &r.request_id,
         typed.request,
         r.wait,
+        r.paid_service.as_ref(),
     )
     .map(render)
 }
@@ -141,6 +142,8 @@ pub fn status(
     client::status(&client(profile, signer, rpc)?, &store()?, id, wait).map(render)
 }
 
+/// The key of the paid-service context in an outcome document.
+pub const PAID_SERVICE_KEY: &str = "paidService";
 fn render(out: ExecutionOutcome) -> Outcome {
     let status = match out.status {
         OperationStatus::Confirmed => crate::host::runtime::Status::Confirmed,
@@ -168,6 +171,10 @@ fn render(out: ExecutionOutcome) -> Outcome {
     }
     if let Some(link) = out.explorer {
         document[EXPLORER_KEY] = link.into();
+    }
+    if let Some(context) = out.paid_service {
+        document[PAID_SERVICE_KEY] =
+            serde_json::to_value(context).expect("a paid-service context encodes as JSON");
     }
     Outcome { document, status }
 }
@@ -231,6 +238,7 @@ mod storage_boundary_tests {
             fee_charged: None,
             limits: None,
             explorer: None,
+            paid_service: None,
         };
         let settled = render(outcome(Some((5_661_578, 123_456)))).document;
         let settlement = Settlement::of(&settled).unwrap();
@@ -242,7 +250,7 @@ mod storage_boundary_tests {
         let pending = render(outcome(None)).document;
         assert!(pending.get("settlement").is_none());
         assert_eq!(pending["requestId"], "transfer-001");
-        for key in [FEE_CHARGED_KEY, Limits::KEY, EXPLORER_KEY] {
+        for key in [FEE_CHARGED_KEY, Limits::KEY, EXPLORER_KEY, PAID_SERVICE_KEY] {
             assert!(pending.get(key).is_none(), "{key}");
         }
     }
@@ -265,6 +273,13 @@ mod storage_boundary_tests {
             fee_charged: Some(quantity(2_500)),
             limits: Some(limits.clone()),
             explorer: Some("https://stellar.expert/explorer/testnet/tx/abab".into()),
+            paid_service: Some(crate::host::paid_service::PaidService {
+                resource: "https://seller.example/report".into(),
+                challenge_id: Some("c-0001".into()),
+                pay_to: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into(),
+                amount: "10000000".into(),
+                asset: "USDC".into(),
+            }),
         })
         .document;
         let settlement = Settlement::of(&document).unwrap();
@@ -279,6 +294,12 @@ mod storage_boundary_tests {
         assert_eq!(
             crate::host::execution::explorer(&document).as_deref(),
             Some("https://stellar.expert/explorer/testnet/tx/abab")
+        );
+        assert_eq!(
+            document[PAID_SERVICE_KEY],
+            serde_json::json!({"resource":"https://seller.example/report","challengeId":"c-0001",
+                "payTo":"GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+                "amount":"10000000","asset":"USDC"})
         );
     }
     #[test]
@@ -315,6 +336,7 @@ mod storage_boundary_tests {
             wait: Duration::ZERO,
             build_only: true,
             wallet: None,
+            paid_service: None,
         };
         let output = build(
             &profile,
