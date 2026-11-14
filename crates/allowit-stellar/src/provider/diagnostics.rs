@@ -97,6 +97,9 @@ pub fn denial(message: &str, contract: Option<&ContractFault>, wallet: &str) -> 
     if contract.is_none() && message == crate::rpc::owner_observation::STALE_OBSERVATION {
         return coded(409, "stale_owner_observation", message);
     }
+    if contract.is_none() && message == crate::owner::NOTHING_TO_RETURN {
+        return coded(409, "nothing_to_return", message);
+    }
     let named = contract
         .is_none()
         .then(|| crate::rpc::host_policy_denial(message))
@@ -170,6 +173,12 @@ mod tests {
         let problem = denial(&Error::config(STALE_OBSERVATION).to_string(), None, "");
         assert_eq!(problem.code, "stale_owner_observation");
         assert_eq!(problem.status, 409);
+    }
+    #[test]
+    fn a_return_from_an_empty_wallet_has_its_own_code() {
+        use crate::{host::error::Error, owner::NOTHING_TO_RETURN};
+        let problem = denial(&Error::config(NOTHING_TO_RETURN).to_string(), None, "");
+        assert_eq!((problem.status, problem.code), (409, "nothing_to_return"));
     }
     /// A host `error` event of the simulation RPC: `contract` raised or relayed `code`.
     fn error_event(contract: [u8; 32], code: u32) -> String {

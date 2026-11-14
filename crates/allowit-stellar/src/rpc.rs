@@ -122,6 +122,35 @@ pub fn find_account(rpc: &dyn Rpc, address: &str) -> Result<Option<AccountState>
     }
     account_from_response(&value, address).map(Some)
 }
+/// The XLM that an account holds and has not promised to an open offer, in stroops. The
+/// network locks the account's reserve inside this balance.
+pub fn native_balance(rpc: &dyn Rpc, address: &str) -> Result<i64> {
+    let key = LedgerKey::Account(LedgerKeyAccount {
+        account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(account_key(
+            address,
+        )?))),
+    });
+    let value = rpc.call("getLedgerEntries", json!({"keys":[xdr(&key)?]}))?;
+    let entries = value["entries"]
+        .as_array()
+        .ok_or("Missing account entries")?;
+    if entries.len() != 1 {
+        return Err("Native account not found".into());
+    }
+    let LedgerEntryData::Account(account) =
+        read(entries[0]["xdr"].as_str().ok_or("Missing account XDR")?)?
+    else {
+        return Err("Wrong ledger entry type".into());
+    };
+    let selling = match &account.ext {
+        AccountEntryExt::V0 => 0,
+        AccountEntryExt::V1(v1) => v1.liabilities.selling,
+    };
+    account
+        .balance
+        .checked_sub(selling)
+        .ok_or_else(|| "Account balance overflow".into())
+}
 /// The balance of an issued asset that an account holds, `None` without its trustline.
 pub fn trustline_balance(rpc: &dyn Rpc, address: &str, asset: &Asset) -> Result<Option<i64>> {
     let line = match asset {

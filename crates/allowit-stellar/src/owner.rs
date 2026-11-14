@@ -32,6 +32,10 @@ const MAX_STARTING_BALANCE: i64 = 1_000_000_000_000_000;
 const DERIVATION_TITLE: &str = "Allowit Native wallet key v1";
 const SEED_DOMAIN: &[u8] = b"allowit-stellar-native-wallet-seed-v1";
 
+/// The refusal of a return of funds from a wallet that holds none. A caller that returns the
+/// funds as one step of a larger action reads its code, `nothing_to_return`, as "already done".
+pub const NOTHING_TO_RETURN: &str = "This wallet holds no funds to return";
+
 /// The balance that the network locks in a wallet account: the account, its three signers and
 /// its trustline.
 pub fn wallet_reserve(trustline: bool) -> i64 {

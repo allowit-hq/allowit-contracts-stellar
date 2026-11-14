@@ -391,8 +391,25 @@ impl Provider {
                     checked(rpc::trustline_balance(self.rpc(), &c.wallet, &asset))?.unwrap_or(0)
                 },
             },
-            OwnerAction::Recover { .. } => {
-                return Err(Error::usage("Recovery recipient requires an amount"));
+            // Every spendable unit returns and the account stays. It keeps the reserve of its
+            // complete roles, so its owner can restore the agent signer and fund it again.
+            OwnerAction::Recover {
+                units: None,
+                recipient: Some(recipient),
+            } => {
+                let spendable = if asset == stellar_xdr::Asset::Native {
+                    checked(rpc::native_balance(self.rpc(), &c.wallet))?
+                        .saturating_sub(native::owner::wallet_reserve(false))
+                } else {
+                    checked(rpc::trustline_balance(self.rpc(), &c.wallet, &asset))?.unwrap_or(0)
+                };
+                if spendable <= 0 {
+                    return checked(Err(native::owner::NOTHING_TO_RETURN.into()));
+                }
+                WalletAction::Withdraw {
+                    units: spendable,
+                    recipient: Some(recipient),
+                }
             }
             OwnerAction::Upload { .. } | OwnerAction::Create { .. } | OwnerAction::Extend => {
                 return Err(Error::unsupported(
@@ -2135,8 +2152,9 @@ mod keypair_wallet_owner_tests {
     use crate::test_support::owner::{OwnerLedger, configured_source, native_selection};
     use std::sync::{Arc, Mutex};
 
-    /// A ledger that holds the owner's account and the wallet account `wallet`.
-    struct Ledger(OwnerLedger, Mutex<native::AccountState>);
+    /// A ledger that holds the owner's account and the wallet account `wallet`, with the
+    /// wallet's XLM balance and its balance of an issued asset.
+    struct Ledger(OwnerLedger, Mutex<native::AccountState>, Mutex<(i64, i64)>);
     impl rpc::Rpc for Ledger {
         fn call(
             &self,
@@ -2152,15 +2170,24 @@ mod keypair_wallet_owner_tests {
                     let x::PublicKey::PublicKeyTypeEd25519(key) = key.account_id.0;
                     let wallet = self.1.lock().unwrap().clone();
                     if native::account_for_public_key(&key.0) == wallet.address {
-                        return Ok(crate::test_support::owner::account_entry(&wallet));
+                        let entry = crate::test_support::owner::account_entry(&wallet);
+                        let x::LedgerEntryData::Account(mut account) =
+                            native::read(entry["entries"][0]["xdr"].as_str().unwrap()).unwrap()
+                        else {
+                            panic!()
+                        };
+                        account.balance = self.2.lock().unwrap().0;
+                        let account = x::LedgerEntryData::Account(account);
+                        return Ok(
+                            serde_json::json!({"entries":[{"xdr":native::xdr(&account).unwrap()}]}),
+                        );
                     }
                 }
-                // The wallet holds 7 units of its issued asset.
                 Some(x::LedgerKey::Trustline(key)) => {
                     let line = x::LedgerEntryData::Trustline(x::TrustLineEntry {
                         account_id: key.account_id,
                         asset: key.asset,
-                        balance: 7,
+                        balance: self.2.lock().unwrap().1,
                         limit: i64::MAX,
                         flags: 1,
                         ext: x::TrustLineEntryExt::V0,
@@ -2175,10 +2202,14 @@ mod keypair_wallet_owner_tests {
         }
     }
     fn fixture() -> (WalletConfig, Arc<Ledger>, Provider, Installation) {
-        let c = native_selection().config;
+        fixture_for(native_selection().config)
+    }
+    /// The wallet of `c` with 10,000 XLM and 7 units of its issued asset.
+    fn fixture_for(c: WalletConfig) -> (WalletConfig, Arc<Ledger>, Provider, Installation) {
         let ledger = Arc::new(Ledger(
             OwnerLedger::new(c.clone()),
             Mutex::new(configured_source(&c)),
+            Mutex::new((100_000_000_000, 7)),
         ));
         let configuration =
             super::super::server_owner::configuration(&c.network, &serde_json::to_vec(&c).unwrap())
@@ -2201,6 +2232,94 @@ mod keypair_wallet_owner_tests {
         );
         assert!(envelope.signatures.is_empty());
         envelope.tx.operations.to_vec()
+    }
+
+    /// The one payment of a return of every spendable unit: its amount and its destination.
+    fn returned(packet: &OwnerPacket, c: &WalletConfig) -> (i64, stellar_xdr::MuxedAccount) {
+        assert_eq!(packet.info().unwrap().action, "withdraw");
+        let operations = operations(packet, c);
+        let [operation] = operations.as_slice() else {
+            panic!("a return is one payment")
+        };
+        assert_eq!(
+            operation.source_account,
+            Some(stellar_xdr::MuxedAccount::Ed25519(stellar_xdr::Uint256(
+                native::account_key(&c.wallet).unwrap()
+            )))
+        );
+        let stellar_xdr::OperationBody::Payment(payment) = &operation.body else {
+            panic!("a return is one payment")
+        };
+        assert_eq!(payment.asset, native::asset_xdr(c).unwrap());
+        (payment.amount, payment.destination.clone())
+    }
+    #[test]
+    fn a_return_of_every_spendable_unit_keeps_the_account_and_the_reserve_of_its_roles() {
+        let everything = |recipient: &str| OwnerAction::Recover {
+            units: None,
+            recipient: Some(recipient.into()),
+        };
+        let account = |address: &str| {
+            stellar_xdr::MuxedAccount::Ed25519(stellar_xdr::Uint256(
+                native::account_key(address).unwrap(),
+            ))
+        };
+        let nothing = |provider: &Provider, installation: &Installation, owner: &str| {
+            let refused = provider
+                .prepare_owner(installation, everything(owner), 100_000, 86_401)
+                .unwrap_err();
+            let problem = provider.problem(&refused);
+            assert_eq!(
+                (problem.status, problem.code),
+                (409, "nothing_to_return"),
+                "{}",
+                problem.message
+            );
+        };
+        // An issued asset: the whole balance of the trustline returns, to the named recipient.
+        let (c, ledger, provider, installation) = fixture();
+        assert!(c.asset_issuer.is_some());
+        for recipient in [&c.owner, &c.agent] {
+            let packet = provider
+                .prepare_owner(&installation, everything(recipient), 100_000, 86_401)
+                .unwrap();
+            assert_eq!(returned(&packet, &c), (7, account(recipient)));
+        }
+        ledger.2.lock().unwrap().1 = 0;
+        nothing(&provider, &installation, &c.owner);
+
+        // XLM: everything above the reserve of the account with its three signers returns.
+        let mut c = native_selection().config;
+        c.asset_symbol = "XLM".into();
+        c.asset_issuer = None;
+        c.asset = native::sac_address(&c.network, &native::asset_xdr(&c).unwrap()).unwrap();
+        let (c, ledger, provider, installation) = fixture_for(c);
+        let reserve = native::owner::wallet_reserve(false);
+        let packet = provider
+            .prepare_owner(&installation, everything(&c.owner), 100_000, 86_401)
+            .unwrap();
+        assert_eq!(
+            returned(&packet, &c),
+            (100_000_000_000 - reserve, account(&c.owner))
+        );
+        // A paused wallet has two signers and a lower network minimum. The return still keeps
+        // the reserve of three signers, so the resume that restores the agent signer fits.
+        ledger
+            .1
+            .lock()
+            .unwrap()
+            .signers
+            .retain(|s| s.key != c.agent);
+        ledger.2.lock().unwrap().0 = reserve + 1;
+        let packet = provider
+            .prepare_owner(&installation, everything(&c.owner), 100_000, 86_401)
+            .unwrap();
+        assert_eq!(returned(&packet, &c), (1, account(&c.owner)));
+        // A wallet at its reserve, or below it, returns nothing: the answer has its own code.
+        for balance in [reserve, reserve - 5_000_000, 0] {
+            ledger.2.lock().unwrap().0 = balance;
+            nothing(&provider, &installation, &c.owner);
+        }
     }
 
     #[test]
@@ -2274,10 +2393,6 @@ mod keypair_wallet_owner_tests {
             OwnerAction::Upload { wasm: vec![] },
             OwnerAction::Create { wasm: vec![] },
             OwnerAction::Extend,
-            OwnerAction::Recover {
-                units: None,
-                recipient: Some(c.agent.clone()),
-            },
         ] {
             assert!(prepare(action).is_err());
         }
