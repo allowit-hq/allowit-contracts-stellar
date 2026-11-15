@@ -176,6 +176,11 @@ impl RailPlugin for Plugin {
     ) -> Option<&'static dyn allowit_core::vendor::paid_service::PaidServiceProvider> {
         Some(&provider::paid_service::PAID_SERVICE)
     }
+    fn settlement_service(
+        &self,
+    ) -> Option<&'static dyn allowit_core::vendor::settlement_service::SettlementProvider> {
+        Some(&crate::settlement_service::SERVICE)
+    }
     fn custom_wallet_build(
         &self,
     ) -> Option<&'static dyn allowit_core::vendor::custom_build::CustomWalletBuild> {

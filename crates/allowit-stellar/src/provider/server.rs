@@ -1231,7 +1231,10 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 }
             }
             OwnerAction::Create { wasm } => {
-                let config = checked(native::admin::PolicyConfig::for_policy(&c, false))?;
+                let config = checked(native::admin::PolicyConfig::for_policy(
+                    &c,
+                    native::admin::x402_at_creation(&c),
+                ))?;
                 let p = checked(d.create_wallet(
                     &config,
                     &wasm,

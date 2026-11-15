@@ -579,6 +579,17 @@ fn identifier(name: &str) -> Option<&str> {
     ((1..=64).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
         .then_some(name)
 }
+/// The status of `p` as this client reports it. An engine report of `failed` for a policy
+/// wallet operation, or for a payment authorization of either custody form, is no proof: such
+/// an operation can end without a transaction, so it stays `submissionUnknown` until this
+/// client proves the lapse itself.
+fn projected(p: &PreparedOperation, status: OperationStatus) -> OperationStatus {
+    if p.payment_authorization.is_some() && status == OperationStatus::Failed {
+        OperationStatus::SubmissionUnknown
+    } else {
+        super::projected_status(&p.config.route, status)
+    }
+}
 fn validate_response_receipt(r: &Response) -> Result<()> {
     let p = &r.prepared;
     if let (Some(receipt), true) = (&r.receipt, p.payment_authorization.is_some()) {
@@ -588,7 +599,7 @@ fn validate_response_receipt(r: &Response) -> Result<()> {
             Error::uncertain("Stellar settlement omitted its signed payment authorization")
         })?;
         checked(sdk::rpc::validate_settled_policy_packet(signed, receipt))?;
-        if super::projected_status(&p.config.route, receipt.status.clone()) != r.operation.status {
+        if projected(p, receipt.status.clone()) != r.operation.status {
             return Err(Error::uncertain(
                 "Stellar receipt differs from its retained signed operation",
             ));
@@ -601,7 +612,7 @@ fn validate_response_receipt(r: &Response) -> Result<()> {
             &p.config.network,
             &p.transaction_hash,
         ))?;
-        if super::projected_status(&p.config.route, receipt.status.clone()) != r.operation.status
+        if projected(p, receipt.status.clone()) != r.operation.status
             || r.signed_operation
                 .as_ref()
                 .is_none_or(|v| v.transaction_xdr != receipt.envelope_xdr)
@@ -705,11 +716,7 @@ impl Client {
             || parsed.prepared.payment_authorization.is_some())
             && parsed.operation.status == OperationStatus::Failed
             && parsed.receipt.is_none();
-        parsed.operation.status = if parsed.released {
-            OperationStatus::SubmissionUnknown
-        } else {
-            super::projected_status(&parsed.prepared.config.route, parsed.operation.status)
-        };
+        parsed.operation.status = projected(&parsed.prepared, parsed.operation.status);
         Ok(Some(parsed))
     }
     /// Send one request with the agent proof of exactly `path` and `body`. `query` is outside
@@ -851,8 +858,8 @@ impl Client {
             ));
         }
         if let Some(old) = record.and_then(|v| v.status.as_ref())
-            && terminal(&super::projected_status(&p.config.route, old.clone()))
-            && super::projected_status(&p.config.route, old.clone()) != r.operation.status
+            && terminal(&projected(p, old.clone()))
+            && projected(p, old.clone()) != r.operation.status
         {
             return Err(Error::uncertain("A terminal Stellar receipt changed"));
         }
@@ -987,7 +994,8 @@ pub fn exec_paid(
             "The operation nonce does not bind this policy and request ID",
         ));
     }
-    if sdk::seller_settled::is_request(&request) {
+    let seller_settles = sdk::seller_settled::is_request(&request);
+    if seller_settles {
         // The seller settles: the request names its transfer and no fee payer. Only the
         // payment of a challenge that states this form asks for it.
         if !paid_service.is_some_and(|context| context.settled_by == SettledBy::Seller) {
@@ -1034,6 +1042,9 @@ pub fn exec_paid(
         if old.agent_signature.is_some()
             || !matches!(&old.status, None | Some(OperationStatus::Prepared))
         {
+            // A signed payment authorization waits for the seller, not for this call: one
+            // read tells whether it is still open, settled or expired.
+            let wait = if seller_settles { Duration::ZERO } else { wait };
             return poll(c, &id, Some(old), journal, &name, wait, None);
         }
         if !same_policy_config(&c.bundle.config, &old.config) {
@@ -1133,7 +1144,9 @@ pub fn exec_paid(
     record.status = Some(response.operation.status.clone());
     journal.save(&name, &record).map_err(journal_error)?;
     let submitted = render(&response)?;
-    if terminal(&response.operation.status) || wait.is_zero() {
+    // A signed payment authorization is complete here: the caller presents it to the seller,
+    // whose facilitator submits it. Waiting would only spend its validity.
+    if terminal(&response.operation.status) || wait.is_zero() || seller_settles {
         return Ok(submitted);
     }
     poll(

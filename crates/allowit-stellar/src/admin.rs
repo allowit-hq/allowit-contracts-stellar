@@ -124,6 +124,17 @@ pub struct PolicyConfig {
     pub params: PolicyParams,
     pub x402_enabled: bool,
 }
+/// Whether a new wallet of `c` is created with x402 payment authorizations enabled.
+///
+/// A new policy wallet admits payment authorizations for a seller's facilitator: each one
+/// needs the raw signatures of the agent and the server and passes the wallet's own policy
+/// check, as an execution does. The custom-account check needs both roles as account keys.
+/// The owner disables it, or enables it on an earlier wallet, with a signed update.
+pub fn x402_at_creation(c: &WalletConfig) -> bool {
+    c.route == WalletRoute::PolicyWallet
+        && account_key(&c.agent).is_ok()
+        && account_key(&c.server).is_ok()
+}
 impl PolicyConfig {
     /// The constructor packet of a validated installation. `config.wallet` is the address that
     /// `wallet_address` derives, and `config.module_digest` the uploaded Wasm hash.

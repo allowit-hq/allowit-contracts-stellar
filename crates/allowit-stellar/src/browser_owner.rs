@@ -176,7 +176,7 @@ fn verify(input: Input) -> Result<()> {
         "create_wallet" => OwnerAction::CreateWallet {
             config: Box::new(installation(&expected, &wallet)?),
             salt,
-            x402_enabled: false,
+            x402_enabled: crate::admin::x402_at_creation(&installation(&expected, &wallet)?),
         },
         // The packet keeps the installed roles, source binding and code and holds the complete
         // new params at the revision that the host read.

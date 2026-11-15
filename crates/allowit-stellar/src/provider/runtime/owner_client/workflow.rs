@@ -387,7 +387,7 @@ fn expected(record: &Record, step: &RetainedStep) -> Result<ExpectedOwnerIntent>
         (Work::Deploy, "create_wallet") => OwnerAction::CreateWallet {
             config: Box::new(c.clone()),
             salt: wallet_salt(&c.policy_instance),
-            x402_enabled: false,
+            x402_enabled: crate::admin::x402_at_creation(c),
         },
         (Work::Fund { units, .. }, "fund") if c.route == WalletRoute::Native => {
             OwnerAction::Wallet {
