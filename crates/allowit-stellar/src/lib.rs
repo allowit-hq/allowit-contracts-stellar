@@ -1763,6 +1763,10 @@ pub fn validate_retained_prepared(p: &PreparedOperation) -> Result<()> {
             PacketUse::Retained
         },
     )?;
+    // The authorization part is checked against the operation around it, not rebuilt here.
+    expected
+        .payment_authorization
+        .clone_from(&p.payment_authorization);
     if p.config.route == WalletRoute::PolicyWallet {
         expected = authorization::attach(&expected, authorization::server_signature(p, false)?)?;
     }
@@ -1775,10 +1779,6 @@ pub fn validate_retained_prepared(p: &PreparedOperation) -> Result<()> {
             attach_resources(&expected, data, false)?
         };
     }
-    // The authorization part is checked against the operation around it, not rebuilt here.
-    expected
-        .payment_authorization
-        .clone_from(&p.payment_authorization);
     if &expected != p {
         return Err("Prepared operation changed".into());
     }
