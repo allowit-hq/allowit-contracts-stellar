@@ -926,39 +926,18 @@ fn changed_update_packets_and_invalid_updates_never_reach_the_signer() {
     assert!(crate::provider::params_update::next_params(&native.config, &update).is_err());
 }
 
-/// A generated draft fits the wallet profile that the owner asked for. A source with a host
-/// part goes to a Simple or Standard wallet although its analysis says `custom`: the server
-/// evaluates it. A source that is more than canonical rules and has no host part does not.
+/// A wallet fits the profile of its tier. A Simple or Common wallet has the policy wallet
+/// profile for canonical rules and for a source that the server evaluates in full.
 #[test]
-fn a_draft_with_a_host_part_fits_the_policy_wallet_profile() {
+fn a_wallet_fits_the_profile_of_its_tier() {
     use super::profile_fits;
     use crate::PolicyTier;
     const WALLET: &str = "allowit-policy-wallet-v1";
     const CUSTOM: &str = "allowit-custom-wallet-v1";
-    let source = |body: &str| {
-        format!(
-            "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {{\n    allowit::payment_limit(ctx, &ctx.params[allowit::PAYMENT_LIMIT])?;\n{body}    Ok(())\n}}\n"
-        )
-    };
-    let canonical = source("");
-    let hosted = source("    allowit::decision(ctx, &question)?;\n");
-    let observed = source("    catalog::report(ctx, 1)?;\n");
-    let branches = source("    assert!(ctx.request.amount > 0);\n");
     for tier in [PolicyTier::Simple, PolicyTier::Common] {
-        assert!(profile_fits(tier, WALLET, "standard", &canonical));
-        assert!(profile_fits(tier, WALLET, "custom", &hosted));
-        assert!(profile_fits(tier, WALLET, "custom", &observed));
-        // Deterministic code beyond the canonical rules needs a contract that compiles it.
-        assert!(!profile_fits(tier, WALLET, "custom", &branches));
-        assert!(!profile_fits(tier, CUSTOM, "standard", &canonical));
-        assert!(!profile_fits(tier, CUSTOM, "custom", &hosted));
+        assert!(profile_fits(tier, WALLET));
+        assert!(!profile_fits(tier, CUSTOM));
     }
-    // A Custom wallet compiles whatever source it gets, under its own profile.
-    assert!(profile_fits(
-        PolicyTier::Custom,
-        CUSTOM,
-        "custom",
-        &branches
-    ));
-    assert!(!profile_fits(PolicyTier::Custom, WALLET, "custom", &hosted));
+    assert!(profile_fits(PolicyTier::Custom, CUSTOM));
+    assert!(!profile_fits(PolicyTier::Custom, WALLET));
 }

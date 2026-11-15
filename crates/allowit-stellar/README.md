@@ -75,7 +75,7 @@ Policy wallet custody calls the layout 4 `execute` entrypoint (`CONTRACT_VERSION
 
 `policy::evaluate` runs a policy on the host as the wallet does. A Common wallet runs its standard prefix first. A canonical-only source, or any source with a compiled evaluator, then runs in full. Otherwise the result is `Evaluation::Prefix`: only the onchain part ran. Fresh classic installs admit only canonical portable source and canonical params.
 
-A source can have a host part: a call of a server function (`allowit::decision`, `allowit::fetch` and the others that only a server runs) or of a host evidence function. No contract runs it. A Simple or Common wallet takes such a source: the contract runs its standard prefix or no rule, and the server evaluates the whole source through the evaluator of `authorize_preparation` before it co-signs. The owner client admits a generated draft with a host part on the policy wallet profile, although the analysis of that source says `custom`. A Custom wallet compiles its whole source, so it takes no host part, and a classic account takes canonical source only.
+A Simple or Common wallet takes a source that is more than canonical rules, such as one that calls a server function (`allowit::decision`, `allowit::fetch` and the others that only a server runs): the contract runs its standard prefix or no rule, and the server evaluates the whole source through the evaluator of `authorize_preparation` before it co-signs. The owner client admits a generated draft of such a source on the policy wallet profile; the host decides which sources it binds to which wallet kind. A Custom wallet compiles its whole source, so no server function runs for it, and a classic account takes canonical source only.
 
 ## Price observation
 

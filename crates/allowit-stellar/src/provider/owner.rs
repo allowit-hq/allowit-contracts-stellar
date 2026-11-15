@@ -425,42 +425,6 @@ fn tokens(source: &str) -> Vec<Token> {
     }
     out
 }
-/// Whether checked `source` has a host part: it calls a server function or a host evidence
-/// function. No contract runs either. The server evaluates such a source before it co-signs.
-pub(crate) fn has_host_part(source: &str) -> bool {
-    !host_functions(source).is_empty() || !source_calls(source).1.is_empty()
-}
-/// The server functions that the code of `source` calls, as `allowit::<function>`, in source
-/// order. The portable vocabulary admits three kinds of `allowit::` calls: the canonical rules,
-/// the value and state helpers, and the server functions, which only a server can run.
-pub(crate) fn host_functions(source: &str) -> Vec<String> {
-    const HELPERS: [&str; 4] = ["param", "arg", "get_state", "set_state"];
-    let tokens = tokens(source);
-    let mut functions = Vec::<String>::new();
-    for (at, window) in tokens.windows(4).enumerate() {
-        let [
-            Token::Ident(namespace),
-            Token::Path,
-            Token::Ident(function),
-            Token::Open,
-        ] = window
-        else {
-            continue;
-        };
-        if (at > 0 && tokens[at - 1] == Token::Path)
-            || namespace != "allowit"
-            || allowit_core::vendor::kinds::STANDARD_PARAMS.contains(&function.as_str())
-            || HELPERS.contains(&function.as_str())
-        {
-            continue;
-        }
-        let name = format!("allowit::{function}");
-        if !functions.contains(&name) {
-            functions.push(name);
-        }
-    }
-    functions
-}
 /// The calls of checked source, in source order and without repeats: the canonical rules
 /// (`allowit::<rule>`) and the host evidence functions (`<namespace>::<function>` of another
 /// lowercase namespace). The source gate admits no other lowercase path call. Comments and
@@ -506,33 +470,6 @@ mod paired_export_tests {
         let (rules, evidence) = source_calls(source);
         assert_eq!(rules, ["operations", "tokens", "payment_limit"]);
         assert_eq!(evidence, ["catalog::report"]);
-    }
-    #[test]
-    fn a_host_part_is_a_server_function_or_an_evidence_function() {
-        let source = |body: &str| {
-            format!(
-                "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {{\n    allowit::payment_limit(ctx, &ctx.params[allowit::PAYMENT_LIMIT])?;\n{body}    Ok(())\n}}\n"
-            )
-        };
-        // Canonical rules and the value and state helpers run in a contract.
-        let canonical = source(
-            "    let limit: i128 = allowit::param(ctx, \"limit\")?;\n    allowit::set_state(ctx, \"seen\", limit)?;\n",
-        );
-        assert_eq!(host_functions(&canonical), Vec::<String>::new());
-        assert!(!has_host_part(&canonical));
-        // A server function, once for each name, in source order.
-        let decides = source(
-            "    allowit::fetch(ctx, &request)?;\n    allowit::decision(ctx, &question)?;\n    allowit :: decision (ctx, &other)?;\n    // allowit::price(ctx, &quote) in a comment\n",
-        );
-        assert_eq!(
-            host_functions(&decides),
-            ["allowit::fetch", "allowit::decision"]
-        );
-        assert!(has_host_part(&decides));
-        // A host evidence function of another namespace.
-        let observes = source("    catalog::report(ctx, 1)?;\n");
-        assert_eq!(host_functions(&observes), Vec::<String>::new());
-        assert!(has_host_part(&observes));
     }
     #[test]
     fn source_calls_ignores_comments_and_literals_and_reads_spaced_paths() {
