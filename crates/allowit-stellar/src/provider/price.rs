@@ -7,7 +7,8 @@
 //! 1. The root: the newest ledger that Horizon ingested and its close time. That time is the
 //!    time of the observation, so a Horizon that lags gives a stale observation.
 //! 2. The order book of the pair. Selling `amount` of `from` consumes its bids, best price
-//!    first. The observed price is what those bids pay for the whole amount.
+//!    first. The observed price is what those bids pay for the whole amount. The depth is what
+//!    the bids inside the host's band buy: a bid above the band counts as little as one below.
 //! 3. The newest order book trades of the pair. Their volume-weighted average is the trade
 //!    average, over the trades that closed in the last [`RECENT`] seconds.
 //!
@@ -113,7 +114,8 @@ pub fn classic(network: &str, asset: &str) -> Result<Classic, String> {
 pub struct Observation {
     /// What the bids pay for the whole amount, or for the part that they fill.
     pub price: i128,
-    /// Units of `from` that the bids inside the band fill. Without a band, every bid counts.
+    /// Units of `from` that the bids inside the band fill: at or above its lower bound and at
+    /// or below its upper bound. Without a band, every bid counts.
     pub depth: i128,
     /// Volume-weighted average price of the recent trades. Zero without one.
     pub trade_average: i128,
@@ -238,15 +240,22 @@ pub fn observe(
         // Units of `from` that this bid buys.
         let fills = scaled(sells, d, n)?;
         let inside = match band {
-            // price >= expected * (10000 - slip) / 10000, with price = n / d * SCALE.
+            // The band is `expected` plus or minus `slip` basis points, and the price of this
+            // bid is n / d * SCALE. A bid above the band is no more inside it than one below.
             Some((expected, slip)) => {
-                let floor = expected
-                    .checked_mul(i128::from(10_000u32.saturating_sub(slip)))
-                    .and_then(|value| value.checked_mul(d));
                 let price = n
                     .checked_mul(SCALE)
                     .and_then(|value| value.checked_mul(10_000));
-                matches!((price, floor), (Some(price), Some(floor)) if price >= floor)
+                let bound = |points: i128| {
+                    expected
+                        .checked_mul(points)
+                        .and_then(|value| value.checked_mul(d))
+                };
+                let slip = i128::from(slip.min(10_000));
+                matches!(
+                    (price, bound(10_000 - slip), bound(10_000 + slip)),
+                    (Some(price), Some(floor), Some(ceiling)) if price >= floor && price <= ceiling
+                )
             }
             None => true,
         };
@@ -282,7 +291,9 @@ pub fn observe(
                 .as_str()
                 .ok_or("Invalid Horizon trades")?,
         )?;
-        if closed > observed_at || observed_at - closed > RECENT {
+        // Horizon can ingest a ledger between the root request and this one. A trade of that
+        // newer ledger is recent too.
+        if observed_at.saturating_sub(closed) > RECENT {
             continue;
         }
         let amount = |name: &str| units(trade[name].as_str().ok_or("Invalid Horizon trades")?);
@@ -529,10 +540,83 @@ mod tests {
         let all = observe(&horizon, NETWORK, "native", USDC, 1_000_000_000, None)
             .unwrap()
             .depth;
-        // No deviation: only the best level, 130.2207151 USDC at 2000000/13611907.
-        assert_eq!(within(0), 1_302_207_151 * 13_611_907 / 2_000_000);
-        assert!(within(0) < within(100) && within(100) < within(1_000));
+        // One basis point: only the best level, 130.2207151 USDC at 2000000/13611907. No bid
+        // pays exactly the expected price, so no deviation at all leaves no depth.
+        assert_eq!(within(1), 1_302_207_151 * 13_611_907 / 2_000_000);
+        assert_eq!(within(0), 0);
+        assert!(within(1) < within(100) && within(100) < within(1_000));
         assert_eq!(within(10_000), all);
+    }
+
+    /// A book and trades that the test states: bids of `(n, d, amount of to)`, and trades of
+    /// `(close time, base amount, counter amount)`, at ledger 7 closed at 00:17:40.
+    fn stated(bids: &[(i64, i64, &str)], trades: &[(&str, &str, &str)]) -> Recorded {
+        let bids: Vec<Value> = bids
+            .iter()
+            .map(|(n, d, amount)| json!({"price_r": {"n": n, "d": d}, "amount": amount}))
+            .collect();
+        let trades: Vec<Value> = trades
+            .iter()
+            .map(|(closed, base, counter)| {
+                json!({"ledger_close_time": closed, "base_amount": base, "counter_amount": counter})
+            })
+            .collect();
+        Recorded {
+            answers: vec![
+                ("/order_book", json!({"bids": bids, "asks": []})),
+                ("/trades", json!({"_embedded": {"records": trades}})),
+                (
+                    "/",
+                    json!({"history_latest_ledger": 7,
+                        "history_latest_ledger_closed_at": "2026-11-14T18:17:40Z"}),
+                ),
+            ],
+            asked: Default::default(),
+        }
+    }
+
+    /// A bid above the band is outside it. Five units at 2 and a hundred at 0.9 give an average
+    /// inside a band of 1 plus or minus 10% for 105 units, and only the hundred are inside it.
+    #[test]
+    fn a_bid_above_the_band_adds_no_depth() {
+        let horizon = stated(&[(2, 1, "10"), (9, 10, "90")], &[]);
+        let observed = observe(
+            &horizon,
+            NETWORK,
+            "native",
+            USDC,
+            105 * SCALE,
+            Some((SCALE, 1_000)),
+        )
+        .unwrap();
+        assert_eq!(observed.price, 9_523_809);
+        assert_eq!(observed.depth, 100 * SCALE);
+        // The bounds themselves are inside: 0.9 and 1.1 with 10%.
+        let edges = stated(&[(11, 10, "11"), (9, 10, "9")], &[]);
+        let observed =
+            observe(&edges, NETWORK, "native", USDC, SCALE, Some((SCALE, 1_000))).unwrap();
+        assert_eq!(observed.depth, 20 * SCALE);
+    }
+
+    /// The trade average is the volume-weighted price of the trades of the last hour. A trade
+    /// of a ledger that Horizon ingested after the root request counts too.
+    #[test]
+    fn the_trade_average_counts_the_last_hour_and_a_newer_ledger() {
+        let horizon = stated(
+            &[(1, 1, "100")],
+            &[
+                // A newer ledger than the one that the root named.
+                ("2026-11-14T18:17:45Z", "10", "11"),
+                ("2026-11-14T18:17:40Z", "10", "10"),
+                ("2026-11-14T17:17:40Z", "20", "19"),
+                // One second more than an hour before the ledger.
+                ("2026-11-14T17:17:39Z", "1000", "1"),
+            ],
+        );
+        let observed = observe(&horizon, NETWORK, "native", USDC, SCALE, None).unwrap();
+        assert_eq!(observed.trades, 3);
+        assert_eq!(observed.trade_average, 10_000_000);
+        assert_eq!(observed.observed_at, 1_794_680_260);
     }
 
     #[test]

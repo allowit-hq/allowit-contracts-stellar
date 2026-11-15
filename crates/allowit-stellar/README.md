@@ -82,8 +82,8 @@ A source can have a host part: a call of a server function (`allowit::decision`,
 The rail registers one policy function, `price` (`provider::price`), for `allowit::price` of a server policy. The host sends `{"network", "from", "to", "amount"}` and, when it states its band, `"price"` and `"slip"`; amounts and prices are decimal text. The function answers `{"price", "depth", "tradeAverage", "trades", "observedAt", "source"}`, and the host applies the band. It reads the public Horizon of the network with three requests:
 
 - the root: the newest ledger that Horizon ingested. Its close time is `observedAt`, so a Horizon that lags gives a stale observation;
-- the order book of the pair: selling `amount` of `from` consumes its bids, best price first. `price` is what they pay for the whole amount, in units of `to` for each unit of `from`, scaled by 10^7. `depth` is the units of `from` that the bids inside the band buy, or that every bid buys when the host states no band;
-- the newest 20 order book trades of the pair: `tradeAverage` is the volume-weighted average of those that closed in the last hour, and `trades` is their number.
+- the order book of the pair: selling `amount` of `from` consumes its bids, best price first. `price` is what they pay for the whole amount, in units of `to` for each unit of `from`, scaled by 10^7. `depth` is the units of `from` that the bids inside the band buy, at or above its lower bound and at or below its upper bound, or that every bid buys when the host states no band;
+- the newest 20 order book trades of the pair: `tradeAverage` is the volume-weighted average of those that closed in the hour before that ledger or after it, and `trades` is their number.
 
 It reads the direct order book only: no path through another asset and no liquidity pool. An asset is `native`, `CODE:ISSUER`, the code of a listed token, or the Stellar Asset Contract id of the native asset or of a listed token. The contract id of another asset does not tell its code and issuer, so it names no order book. The tests replay recorded answers of the Testnet Horizon (`src/provider/price_fixtures/`).
 
