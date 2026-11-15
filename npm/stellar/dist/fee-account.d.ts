@@ -82,6 +82,12 @@ export declare function feeAccount(input: {
     document: unknown;
     fetch?: typeof fetch;
 }): Promise<FeeAccountState | null>;
+/** Storage for a signed refill until the network settles it. */
+export interface RefillJournal {
+    get(key: string): string | null;
+    set(key: string, value: string): void;
+    remove(key: string): void;
+}
 export interface RefillFeesInput {
     network: string;
     /** The owner's account: the source of the payment. */
@@ -98,13 +104,27 @@ export interface RefillFeesInput {
         expiresAt: number;
     }) => Promise<string>;
     onStep: (text: string) => void;
+    /** Keeps the signed payment until the network settles it, so an uncertain send never leads to a second payment. */
+    journal?: RefillJournal;
+    /** The journal key of this fee account's refill. */
+    key?: string;
     fetch?: typeof fetch;
+}
+/** An uncertain refill: the signed payment stays saved, and the next call settles it before it signs anything. */
+export declare class RefillPendingError extends Error {
+    readonly retry = true;
+    constructor(message: string, cause?: unknown);
 }
 /**
  * Refills a fee account: one payment of XLM from the owner's account, which the owner's wallet signs. This module
  * builds the payment from the owner's own sequence and sends the signed bytes to the public network itself.
+ *
+ * With a journal, the signed bytes are saved before they are sent. A send whose result is unknown keeps them, and
+ * the next call settles that payment first: it is done when the network holds it as successful, it is sent again
+ * while its time bound lasts, and it is dropped only when the network holds it as failed or has read past its time
+ * bound without it. Only then is a new payment prepared, so one refill is never paid twice.
  */
-export declare function refillFees({ network, owner, feeAccount: destination, amount, sign, onStep, fetch: send }: RefillFeesInput): Promise<{
+export declare function refillFees({ network, owner, feeAccount: destination, amount, sign, onStep, journal, key, fetch: send }: RefillFeesInput): Promise<{
     transactionHash: string;
     ledger: number;
 }>;

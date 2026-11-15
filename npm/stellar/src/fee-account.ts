@@ -162,6 +162,8 @@ export async function feeAccount(input: {network: string; document: unknown; fet
   return {address: named.address, exists: true, balance: balance.toString(), spendable: spendable.toString(), low, text: xlmText(spendable), refill};
 }
 
+/** Storage for a signed refill until the network settles it. */
+export interface RefillJournal {get(key: string): string | null; set(key: string, value: string): void; remove(key: string): void}
 export interface RefillFeesInput {
   network: string;
   /** The owner's account: the source of the payment. */
@@ -173,40 +175,114 @@ export interface RefillFeesInput {
   /** Shows the payment in the `owner-sign` element and resolves with the exact signed payload. */
   sign: (step: {action: string; payload: string; hash: string; expiresAt: number}) => Promise<string>;
   onStep: (text: string) => void;
+  /** Keeps the signed payment until the network settles it, so an uncertain send never leads to a second payment. */
+  journal?: RefillJournal;
+  /** The journal key of this fee account's refill. */
+  key?: string;
   fetch?: typeof fetch;
+}
+
+/** An uncertain refill: the signed payment stays saved, and the next call settles it before it signs anything. */
+export class RefillPendingError extends Error {
+  readonly retry = true;
+  constructor(message: string, cause?: unknown) {
+    super(message, {cause});
+    this.name = 'RefillPendingError';
+  }
+}
+
+type Saved = {hash: string; signedPayload: string; expiresAt: number; owner: string; feeAccount: string; amount: string};
+function savedRefill(journal: RefillJournal | undefined, key: string | undefined): Saved | null {
+  if (!journal || !key) return null;
+  const raw = journal.get(key);
+  if (raw === null) return null;
+  let value: unknown;
+  try {value = JSON.parse(raw);} catch { /* unreadable below */ }
+  if (!object(value) || typeof value.hash !== 'string' || !/^[0-9a-f]{64}$/.test(value.hash) || typeof value.signedPayload !== 'string'
+    || !Number.isSafeInteger(value.expiresAt) || typeof value.owner !== 'string' || typeof value.feeAccount !== 'string' || typeof value.amount !== 'string')
+    throw new RefillPendingError('The saved signed refill is unreadable. It stays saved; nothing was signed.');
+  return value as unknown as Saved;
 }
 
 /**
  * Refills a fee account: one payment of XLM from the owner's account, which the owner's wallet signs. This module
  * builds the payment from the owner's own sequence and sends the signed bytes to the public network itself.
+ *
+ * With a journal, the signed bytes are saved before they are sent. A send whose result is unknown keeps them, and
+ * the next call settles that payment first: it is done when the network holds it as successful, it is sent again
+ * while its time bound lasts, and it is dropped only when the network holds it as failed or has read past its time
+ * bound without it. Only then is a new payment prepared, so one refill is never paid twice.
  */
-export async function refillFees({network, owner, feeAccount: destination, amount, sign, onStep, fetch: send = fetch}: RefillFeesInput): Promise<{transactionHash: string; ledger: number}> {
+export async function refillFees({network, owner, feeAccount: destination, amount, sign, onStep, journal, key, fetch: send = fetch}: RefillFeesInput): Promise<{transactionHash: string; ledger: number}> {
   const units = stroops(amount);
   if (!StrKey.isValidEd25519PublicKey(owner) || !StrKey.isValidEd25519PublicKey(destination) || owner === destination)
     throw new Error('The refill needs the owner account and the fee account.');
   if (units === null || units <= 0n) throw new Error('Enter an amount of XLM with at most seven decimals.');
   const base = horizon(network), passphrase = networkPassphrase(network);
+  const json = async (response: Response): Promise<unknown> => response.json().catch(() => null);
+  const get = (path: string) => send(`${base}${path}`, {headers: {Accept: 'application/json'}, signal: AbortSignal.timeout(15_000)});
+  const settled = (result: unknown, hash: string) => object(result) && result.hash === hash && result.successful === true && Number.isSafeInteger(result.ledger)
+    ? {transactionHash: hash, ledger: result.ledger as number} : null;
+  /** Sends signed bytes. Null means that the network gave no certain answer. */
+  const submit = async (signedPayload: string, hash: string) => {
+    const sent = await send(`${base}/transactions`, {
+      method: 'POST', headers: {Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded'},
+      body: `tx=${encodeURIComponent(signedPayload)}`, signal: AbortSignal.timeout(60_000),
+    }).catch(() => null);
+    return sent?.ok ? settled(await json(sent), hash) : null;
+  };
+  const pending = (cause?: unknown) => new RefillPendingError('The network did not confirm the refill. The signed payment stays saved: refill again to check it. Nothing is signed twice.', cause);
+
+  const saved = savedRefill(journal, key);
+  if (saved && journal && key) {
+    if (saved.owner !== owner || saved.feeAccount !== destination) throw new RefillPendingError('A signed refill of another account is saved under this key. It stays saved.');
+    onStep('Checking the saved refill…');
+    const found = await get(`/transactions/${saved.hash}`).catch(() => null);
+    if (!found) throw pending();
+    if (found.ok) {
+      const done = settled(await json(found), saved.hash);
+      journal.remove(key);
+      // A payment that the network holds as failed used its sequence and can never apply: a new one is prepared.
+      if (done) return done;
+    } else if (found.status !== 404) throw pending();
+    else if (saved.expiresAt >= Math.floor(Date.now() / 1000)) {
+      // The same signed bytes go again while their time bound lasts.
+      const done = await submit(saved.signedPayload, saved.hash);
+      if (!done) throw pending();
+      journal.remove(key);
+      return done;
+    } else {
+      // Past its time bound the payment can no longer apply once the network has read past that time without it.
+      const root = await get('/').then(json, () => null);
+      const closedAt = object(root) && typeof root.history_latest_ledger_closed_at === 'string' ? Date.parse(root.history_latest_ledger_closed_at) / 1000 : NaN;
+      const again = await get(`/transactions/${saved.hash}`).catch(() => null);
+      if (!(closedAt > saved.expiresAt) || again?.status !== 404) throw pending();
+      journal.remove(key);
+    }
+  }
+
   onStep('Preparing the refill…');
-  const read = await send(`${base}/accounts/${owner}`, {headers: {Accept: 'application/json'}, signal: AbortSignal.timeout(15_000)});
-  const account: unknown = read.ok ? await read.json().catch(() => null) : null;
+  const read = await get(`/accounts/${owner}`);
+  const account: unknown = read.ok ? await json(read) : null;
   if (!object(account) || account.account_id !== owner || typeof account.sequence !== 'string' || !/^[0-9]{1,19}$/.test(account.sequence))
     throw new Error('The owner account could not be read from the network.');
   const tx = new TransactionBuilder(new Account(owner, account.sequence), {fee: '100', networkPassphrase: passphrase})
     .addOperation(Operation.payment({destination, asset: Asset.native(), amount}))
     .setTimeout(300)
     .build();
-  const hash = hex(tx.hash());
+  const hash = hex(tx.hash()), expiresAt = Number(tx.timeBounds?.maxTime);
   onStep('Sign the refill in your wallet…');
-  const signedPayload = await sign({action: REFILL_FEES, payload: tx.toXDR(), hash, expiresAt: Number(tx.timeBounds?.maxTime)});
+  const signedPayload = await sign({action: REFILL_FEES, payload: tx.toXDR(), hash, expiresAt});
   const signed = TransactionBuilder.fromXDR(signedPayload, passphrase);
   if ('innerTransaction' in signed || hex(signed.hash()) !== hash || signed.signatures.length !== 1) throw new Error('The wallet returned another transaction. Nothing was sent.');
+  // The signed bytes are saved before they leave: an unknown result is settled from them, never signed again.
+  if (journal && key) journal.set(key, JSON.stringify({hash, signedPayload, expiresAt, owner, feeAccount: destination, amount} satisfies Saved));
   onStep('Waiting for the network to confirm…');
-  const sent = await send(`${base}/transactions`, {
-    method: 'POST', headers: {Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded'},
-    body: `tx=${encodeURIComponent(signedPayload)}`, signal: AbortSignal.timeout(60_000),
-  });
-  const result: unknown = await sent.json().catch(() => null);
-  if (!sent.ok || !object(result) || result.hash !== hash || result.successful !== true || !Number.isSafeInteger(result.ledger))
+  const done = await submit(signedPayload, hash);
+  if (!done) {
+    if (journal && key) throw pending();
     throw new Error('The network did not confirm the refill. Check the fee account balance before you sign again.');
-  return {transactionHash: hash, ledger: result.ledger as number};
+  }
+  if (journal && key) journal.remove(key);
+  return done;
 }

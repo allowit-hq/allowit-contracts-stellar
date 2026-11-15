@@ -159,6 +159,86 @@ test('the refill is one payment of XLM from the owner to the fee account, sent t
   await assert.rejects(refillFees({...input, feeAccount: owner.publicKey()}));
 });
 
+test('a refill whose result is unknown stays saved and is settled before anything is signed again', async () => {
+  const owner = Keypair.random();
+  const map = new Map(), journal = {get: k => map.get(k) ?? null, set: (k, v) => void map.set(k, v), remove: k => void map.delete(k)};
+  const signedSteps = [];
+  const sign = async prepared => {
+    signedSteps.push(prepared.hash);
+    const tx = TransactionBuilder.fromXDR(prepared.payload, Networks.TESTNET);
+    tx.sign(owner);
+    return tx.toXDR();
+  };
+  // What the network holds: `ledger` once the payment applied; `lost` drops the reply of a send that applied.
+  const chain = {applied: new Set(), lost: true, posts: [], root: new Date().toISOString(), down: false};
+  const send = async (url, init = {}) => {
+    const path = new URL(String(url)).pathname;
+    if (chain.down) throw new Error('offline');
+    if (init.method === 'POST') {
+      const tx = TransactionBuilder.fromXDR(decodeURIComponent(String(init.body).slice(3)), Networks.TESTNET);
+      const hash = Buffer.from(tx.hash()).toString('hex');
+      chain.posts.push(hash);
+      chain.applied.add(hash);
+      if (chain.lost) throw new Error('the reply was lost');
+      return new Response(JSON.stringify({hash, successful: true, ledger: 9}));
+    }
+    if (path === '/') return new Response(JSON.stringify({history_latest_ledger_closed_at: chain.root}));
+    // Each prepared payment takes the next sequence of the owner, so no two payments of this test are the same.
+    if (path.startsWith('/accounts/')) return new Response(JSON.stringify(horizonAccount(owner.publicKey(), '100.0000000', {sequence: String(41 + signedSteps.length)})));
+    const hash = path.split('/').pop();
+    return chain.applied.has(hash) ? new Response(JSON.stringify({hash, successful: true, ledger: 9})) : new Response('{}', {status: 404});
+  };
+  const input = {network, owner: owner.publicKey(), feeAccount: ACCOUNT, amount: '5', sign, onStep() {}, journal, key: 'refill', fetch: send};
+  // The send applied and its reply was lost: the signed payment stays saved.
+  await assert.rejects(refillFees(input), error => error.name === 'RefillPendingError' && error.retry === true);
+  assert.equal(signedSteps.length, 1);
+  const saved = JSON.parse(journal.get('refill'));
+  assert.equal(saved.hash, signedSteps[0]);
+  // The next refill finds that payment on the network: it is done, and nothing is signed or sent again.
+  chain.lost = false;
+  assert.deepEqual(await refillFees(input), {transactionHash: signedSteps[0], ledger: 9});
+  assert.deepEqual([signedSteps.length, chain.posts.length, journal.get('refill')], [1, 1, null]);
+
+  // A send that never reached the network: the same bytes go again while their time bound lasts.
+  chain.down = true;
+  await assert.rejects(refillFees(input), /offline/);
+  chain.down = false; chain.lost = true;
+  await assert.rejects(refillFees(input), error => error.name === 'RefillPendingError');
+  const second = JSON.parse(journal.get('refill'));
+  chain.applied.delete(second.hash);
+  chain.lost = false;
+  assert.deepEqual(await refillFees(input), {transactionHash: second.hash, ledger: 9});
+  assert.deepEqual([signedSteps.length, chain.posts.filter(h => h === second.hash).length, journal.get('refill')], [2, 2, null]);
+
+  // An unreachable network keeps the saved payment and signs nothing.
+  chain.lost = true;
+  await assert.rejects(refillFees(input), error => error.name === 'RefillPendingError');
+  const third = JSON.parse(journal.get('refill'));
+  chain.applied.delete(third.hash);
+  chain.down = true;
+  await assert.rejects(refillFees(input), error => error.name === 'RefillPendingError');
+  assert.equal(signedSteps.length, 3);
+  assert.equal(JSON.parse(journal.get('refill')).hash, third.hash);
+  // Past its time bound, with the network read past that time and no such payment, it can never apply:
+  // only then does the owner sign a new one.
+  chain.down = false; chain.lost = false;
+  journal.set('refill', JSON.stringify({...third, expiresAt: Math.floor(Date.now() / 1000) - 60}));
+  chain.root = new Date(Date.now() - 120_000).toISOString();
+  await assert.rejects(refillFees(input), error => error.name === 'RefillPendingError');
+  assert.equal(signedSteps.length, 3);
+  chain.root = new Date().toISOString();
+  const fourth = await refillFees(input);
+  assert.equal(signedSteps.length, 4);
+  assert.equal(fourth.transactionHash, signedSteps[3]);
+  assert.notEqual(fourth.transactionHash, third.hash);
+  // A saved refill of another fee account is never settled as this one.
+  journal.set('refill', JSON.stringify({...third, feeAccount: owner.publicKey()}));
+  await assert.rejects(refillFees(input), error => error.name === 'RefillPendingError');
+  journal.set('refill', 'not json');
+  await assert.rejects(refillFees(input), error => error.name === 'RefillPendingError');
+  assert.equal(signedSteps.length, 4);
+});
+
 // The deployment of a policy wallet through the owner workflow.
 const policyId = 'policy-1', key = 'flow:owner:1', amount = '5';
 const hash64 = n => String(n).repeat(64).slice(0, 64);
