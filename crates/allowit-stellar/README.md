@@ -75,6 +75,18 @@ Policy wallet custody calls the layout 4 `execute` entrypoint (`CONTRACT_VERSION
 
 `policy::evaluate` runs a policy on the host as the wallet does. A Common wallet runs its standard prefix first. A canonical-only source, or any source with a compiled evaluator, then runs in full. Otherwise the result is `Evaluation::Prefix`: only the onchain part ran. Fresh classic installs admit only canonical portable source and canonical params.
 
+A source can have a host part: a call of a server function (`allowit::decision`, `allowit::fetch` and the others that only a server runs) or of a host evidence function. No contract runs it. A Simple or Common wallet takes such a source: the contract runs its standard prefix or no rule, and the server evaluates the whole source through the evaluator of `authorize_preparation` before it co-signs. The owner client admits a generated draft with a host part on the policy wallet profile, although the analysis of that source says `custom`. A Custom wallet compiles its whole source, so it takes no host part, and a classic account takes canonical source only.
+
+## Price observation
+
+The rail registers one policy function, `price` (`provider::price`), for `allowit::price` of a server policy. The host sends `{"network", "from", "to", "amount"}` and, when it states its band, `"price"` and `"slip"`; amounts and prices are decimal text. The function answers `{"price", "depth", "tradeAverage", "trades", "observedAt", "source"}`, and the host applies the band. It reads the public Horizon of the network with three requests:
+
+- the root: the newest ledger that Horizon ingested. Its close time is `observedAt`, so a Horizon that lags gives a stale observation;
+- the order book of the pair: selling `amount` of `from` consumes its bids, best price first. `price` is what they pay for the whole amount, in units of `to` for each unit of `from`, scaled by 10^7. `depth` is the units of `from` that the bids inside the band buy, or that every bid buys when the host states no band;
+- the newest 20 order book trades of the pair: `tradeAverage` is the volume-weighted average of those that closed in the last hour, and `trades` is their number.
+
+It reads the direct order book only: no path through another asset and no liquidity pool. An asset is `native`, `CODE:ISSUER`, the code of a listed token, or the Stellar Asset Contract id of the native asset or of a listed token. The contract id of another asset does not tell its code and issuer, so it names no order book. The tests replay recorded answers of the Testnet Horizon (`src/provider/price_fixtures/`).
+
 ## Custom wallet build
 
 `plugin::PLUGIN.custom_wallet_build()` is the rail's implementation of Core's "build custom wallet" hook

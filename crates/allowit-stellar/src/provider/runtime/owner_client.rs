@@ -610,6 +610,20 @@ impl OwnerClient {
         )
     }
 }
+/// Whether a draft whose source analysis says `draft_tier` fits the wallet profile that the
+/// owner asked for, on a wallet of `tier`. A Custom wallet compiles its whole source. A Simple
+/// or Standard wallet holds canonical rules, or a source with a host part: the server
+/// evaluates that source before it co-signs, and the contract runs its canonical prefix or no
+/// rule. The analysis of such a source says `custom`, because it is more than canonical rules.
+fn profile_fits(tier: PolicyTier, profile: &str, draft_tier: &str, source: &str) -> bool {
+    match tier {
+        PolicyTier::Custom => profile == "allowit-custom-wallet-v1",
+        _ => {
+            profile == "allowit-policy-wallet-v1"
+                && (draft_tier == "standard" || crate::provider::owner::has_host_part(source))
+        }
+    }
+}
 fn validate_generated(
     policy: &GeneratedPolicy,
     request: &GenerateRequest,
@@ -714,19 +728,8 @@ fn validate_generated(
         let tier = b
             .tier
             .ok_or_else(|| Error::uncertain("Missing returned contract policy tier"))?;
-        let profile_fits = match tier {
-            PolicyTier::Custom => request.profile == "allowit-custom-wallet-v1",
-            // A Simple or Standard wallet holds canonical rules, or a source with a host
-            // part: the server evaluates that source before it co-signs, and the contract
-            // runs its canonical prefix or no rule.
-            _ => {
-                request.profile == "allowit-policy-wallet-v1"
-                    && (d.tier == "standard"
-                        || !crate::provider::owner::host_functions(&policy.code).is_empty())
-            }
-        };
         if b.route != "policyWallet"
-            || !profile_fits
+            || !profile_fits(tier, &request.profile, &d.tier, &policy.code)
             || b.deployment_id != b.policy_instance
             || (tier.standard() && shape.writes_state)
         {
