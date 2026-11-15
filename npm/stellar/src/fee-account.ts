@@ -210,7 +210,30 @@ function savedRefill(journal: RefillJournal | undefined, key: string | undefined
  * while its time bound lasts, and it is dropped only when the network holds it as failed or has read past its time
  * bound without it. Only then is a new payment prepared, so one refill is never paid twice.
  */
-export async function refillFees({network, owner, feeAccount: destination, amount, sign, onStep, journal, key, fetch: send = fetch}: RefillFeesInput): Promise<{transactionHash: string; ledger: number}> {
+export async function refillFees(input: RefillFeesInput): Promise<{transactionHash: string; ledger: number}> {
+  // One refill runs per journal key: a second call in this page or, where the browser has Web Locks, in another
+  // tab is refused before it reads the journal. So no call reads an empty journal while another one signs, and
+  // no call removes the saved payment of another.
+  if (!input.journal || !input.key) return refill(input);
+  const name = `allowit.refill:${input.key}`;
+  const busy = () => new RefillPendingError('A refill of this fee account is already running in this or another tab. Nothing was signed.');
+  if (refilling.has(name)) throw busy();
+  refilling.add(name);
+  try {
+    const locks = globalThis.navigator?.locks;
+    if (!locks) return await refill(input);
+    return await locks.request(name, {ifAvailable: true}, async lock => {
+      if (!lock) throw busy();
+      return refill(input);
+    });
+  } finally {
+    refilling.delete(name);
+  }
+}
+/** Refills that run in this page, by lock name. */
+const refilling = new Set<string>();
+
+async function refill({network, owner, feeAccount: destination, amount, sign, onStep, journal, key, fetch: send = fetch}: RefillFeesInput): Promise<{transactionHash: string; ledger: number}> {
   const units = stroops(amount);
   if (!StrKey.isValidEd25519PublicKey(owner) || !StrKey.isValidEd25519PublicKey(destination) || owner === destination)
     throw new Error('The refill needs the owner account and the fee account.');

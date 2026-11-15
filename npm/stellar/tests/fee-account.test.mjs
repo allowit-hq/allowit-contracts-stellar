@@ -281,6 +281,39 @@ test('a refill whose result is unknown stays saved and is settled before anythin
   assert.equal(signedSteps.length, 5);
 });
 
+test('one refill runs per journal key: a second call signs nothing and leaves the journal alone', async () => {
+  const owner = Keypair.random();
+  const map = new Map(), journal = {get: k => map.get(k) ?? null, set: (k, v) => void map.set(k, v), remove: k => void map.delete(k)};
+  let release = () => {}, signs = 0;
+  const waiting = new Promise(resolve => {release = resolve;});
+  const sign = async prepared => {
+    signs++;
+    await waiting;
+    const tx = TransactionBuilder.fromXDR(prepared.payload, Networks.TESTNET);
+    tx.sign(owner);
+    return tx.toXDR();
+  };
+  const send = async (url, init = {}) => {
+    if (init.method === 'POST') {
+      const tx = TransactionBuilder.fromXDR(decodeURIComponent(String(init.body).slice(3)), Networks.TESTNET);
+      return new Response(JSON.stringify({hash: Buffer.from(tx.hash()).toString('hex'), successful: true, ledger: 9}));
+    }
+    return new Response(JSON.stringify(horizonAccount(owner.publicKey(), '100.0000000')));
+  };
+  const input = {network, owner: owner.publicKey(), feeAccount: ACCOUNT, amount: '5', sign, onStep() {}, journal, key: 'one', fetch: send};
+  const first = refillFees(input);
+  // While the first refill waits for its signature, a second one of the same key is refused before it reads anything.
+  await assert.rejects(refillFees(input), error => error.name === 'RefillPendingError' && /already running/.test(error.message));
+  // Another fee account's key is not held.
+  const other = refillFees({...input, key: 'two', sign: async prepared => { const tx = TransactionBuilder.fromXDR(prepared.payload, Networks.TESTNET); tx.sign(owner); return tx.toXDR(); }});
+  assert.equal((await other).ledger, 9);
+  release();
+  assert.equal((await first).ledger, 9);
+  assert.equal(signs, 1);
+  // The key is free again.
+  assert.equal((await refillFees(input)).ledger, 9);
+});
+
 // The deployment of a policy wallet through the owner workflow.
 const policyId = 'policy-1', key = 'flow:owner:1', amount = '5';
 const hash64 = n => String(n).repeat(64).slice(0, 64);

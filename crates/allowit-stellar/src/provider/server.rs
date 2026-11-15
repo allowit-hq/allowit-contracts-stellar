@@ -443,8 +443,12 @@ impl Provider {
             fee_per_operation,
             now,
         ))?;
-        // A fee limit below the minimum fee of every operation prepares nothing: the declared
-        // fee never exceeds the caller's limit.
+        Self::within_fee_limit(&p, fee_limit)?;
+        Ok(OwnerPacket(packet(&c.network, &p)?))
+    }
+    /// A fee limit below the minimum fee of every operation prepares nothing: the declared fee
+    /// of a classic owner transaction never exceeds the caller's limit.
+    fn within_fee_limit(p: &native::owner_intent::OwnerTransaction, fee_limit: u64) -> Result<()> {
         let stellar_xdr::TransactionEnvelope::Tx(envelope) = checked(native::read::<
             stellar_xdr::TransactionEnvelope,
         >(&p.transaction_xdr))?
@@ -458,7 +462,7 @@ impl Provider {
                 envelope.tx.operations.len()
             )));
         }
-        Ok(OwnerPacket(packet(&c.network, &p)?))
+        Ok(())
     }
     /// The fee of one classic operation of an owner action: an equal share of the caller's
     /// fee limit, within the bounds of one operation.
@@ -490,15 +494,9 @@ impl Provider {
             },
             now,
         ))?;
-        if u64::from(setup.fee_stroops) > fee_limit {
-            return Err(Error::usage(
-                "The fee limit is below the minimum fee of the fee account creation",
-            ));
-        }
-        Ok(OwnerPacket(packet(
-            &c.network,
-            &checked(native::owner::setup_transaction(&setup))?,
-        )?))
+        let p = checked(native::owner::setup_transaction(&setup))?;
+        Self::within_fee_limit(&p, fee_limit)?;
+        Ok(OwnerPacket(packet(&c.network, &p)?))
     }
     /// The owner step that returns the float of a fee account to the owner. The account stays
     /// with its reserve, so the owner can refill it and resume the wallet. A fee account that
@@ -540,6 +538,7 @@ impl Provider {
             Self::classic_fee(fee_limit)?,
             now,
         ))?;
+        Self::within_fee_limit(&p, fee_limit)?;
         Ok(OwnerPacket(packet(&c.network, &p)?))
     }
     pub fn new(network: &str, endpoint: &str) -> Result<Self> {
@@ -2739,6 +2738,12 @@ mod fee_account_owner_tests {
         use stellar_xdr as x;
         let fee_account = native::account_for_public_key(&account_key().verifying_key().to_bytes());
         let (c, ledger, provider, i) = fixture(Some(&fee_account));
+        // A fee limit below the minimum fee of the four operations prepares nothing.
+        assert!(
+            provider
+                .prepare_owner(&i, OwnerAction::Create { wasm: wasm() }, 399, NOW)
+                .is_err()
+        );
         // The ledger holds no fee account yet: the step creates it, and no wallet.
         let packet = create(&provider, &i).unwrap();
         assert_eq!(

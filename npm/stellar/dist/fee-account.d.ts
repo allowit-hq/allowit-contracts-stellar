@@ -124,7 +124,7 @@ export declare class RefillPendingError extends Error {
  * while its time bound lasts, and it is dropped only when the network holds it as failed or has read past its time
  * bound without it. Only then is a new payment prepared, so one refill is never paid twice.
  */
-export declare function refillFees({ network, owner, feeAccount: destination, amount, sign, onStep, journal, key, fetch: send }: RefillFeesInput): Promise<{
+export declare function refillFees(input: RefillFeesInput): Promise<{
     transactionHash: string;
     ledger: number;
 }>;
