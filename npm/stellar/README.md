@@ -43,6 +43,9 @@ signature. The workflow derives the account's one-time key from it, names the ac
 enter the journal. The key is never stored: after a reload the owner signs the same message again. The element shows
 what a `create_fee_account` step funds: the account and the XLM that it starts with.
 
+With `expected.feeAccount` the owner verifier admits the `create_fee_account` step of exactly that account for the
+selected agent and server, and reconstructs the creation and each update with the fee account as the agent address.
+
 `ownerWorkflow.feeAccount({network, document})` reads the fee account that an installation, profile or policy names
 from Horizon: `{address, exists, balance, spendable, low, text, refill}`. `low` is true below two operations at the
 wallet's fee ceiling. It is null for a document without a fee account. `ownerWorkflow.refillFees` builds one payment

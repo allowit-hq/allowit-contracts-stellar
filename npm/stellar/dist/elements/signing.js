@@ -133,8 +133,8 @@ export function ownerSignElement() {
                     return;
                 }
                 const text = message;
-                rows.push(h('dt', {}, 'Agent public key'), h('dd', {}, link(id, 'address', fields.agent, fields.agent)));
-                rows.push(h('dt', {}, 'Policy wallet'), h('dd', {}, link(id, 'contract', fields.wallet, fields.wallet)));
+                rows.push(h('dt', {}, 'Fee account for agent'), h('dd', {}, link(id, 'address', fields.agent, fields.agent)));
+                rows.push(h('dt', {}, 'Fee account for wallet'), h('dd', {}, link(id, 'contract', fields.wallet, fields.wallet)));
                 rows.push(h('dt', {}, 'What you sign'), h('dd', {}, 'A message that derives the setup key of the fee account. It moves no funds.'));
                 const status = h('p', { class: 'status', role: 'status' });
                 const sign = button('Sign the message', async () => {
