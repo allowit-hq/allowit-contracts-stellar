@@ -1764,7 +1764,7 @@ pub fn retained(
                 }
                 checked(sdk::signing::verify_digest(
                     &signature.signer,
-                    &p.transaction_hash,
+                    &sdk::seller_settled::signing_hash(p),
                     &signature.signature,
                 ))?;
             }

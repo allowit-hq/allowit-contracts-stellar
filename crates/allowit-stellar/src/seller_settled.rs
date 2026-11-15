@@ -158,6 +158,14 @@ pub fn intent(p: &PreparedOperation) -> &ExecutionRequest {
         .map_or(&p.request, |a| &a.request)
 }
 
+/// What a role signs for `p`: the digest of its payment authorization, or the hash of its
+/// transaction.
+pub fn signing_hash(p: &PreparedOperation) -> [u8; 32] {
+    p.payment_authorization
+        .as_deref()
+        .map_or(p.transaction_hash, |a| a.digest)
+}
+
 fn part(p: &PreparedOperation) -> Result<&PaymentAuthorization> {
     p.payment_authorization
         .as_deref()
@@ -522,8 +530,10 @@ pub fn sign(
 
 /// The transaction that the agent presents to the seller: one invocation of the transfer with
 /// the signed entry, from a placeholder source. The facilitator replaces the source, the
-/// sequence number and the fee, so nothing here pays or can be submitted as it is.
-fn payload_transaction(entry: &SorobanAuthorizationEntry) -> Result<String> {
+/// sequence number and the fee, so nothing here pays or can be submitted as it is. Its time
+/// bound ends with the validity of the operation: a facilitator reads the transaction with
+/// tools that require one.
+fn payload_transaction(p: &PreparedOperation, entry: &SorobanAuthorizationEntry) -> Result<String> {
     let SorobanAuthorizedFunction::ContractFn(call) = &entry.root_invocation.function else {
         return Err("A payment authorization invokes one contract".into());
     };
@@ -531,7 +541,10 @@ fn payload_transaction(entry: &SorobanAuthorizationEntry) -> Result<String> {
         source_account: MuxedAccount::Ed25519(Uint256([0; 32])),
         fee: PAYLOAD_FEE,
         seq_num: SequenceNumber(1),
-        cond: Preconditions::None,
+        cond: Preconditions::Time(TimeBounds {
+            min_time: TimePoint(0),
+            max_time: TimePoint(p.expires_at),
+        }),
         memo: Memo::None,
         operations: vec![Operation {
             source_account: None,
@@ -665,7 +678,7 @@ pub fn authorize(
             return Err("The assembled payment authorization differs".into());
         }
     }
-    let transaction = payload_transaction(&entry)?;
+    let transaction = payload_transaction(p, &entry)?;
     let simulated = rpc.call(
         "simulateTransaction",
         json!({"transaction": transaction, "authMode": "enforce"}),
@@ -695,7 +708,7 @@ fn retained_entry(s: &SignedOperation) -> Result<SorobanAuthorizationEntry> {
         return Err("Signed transaction identity differs".into());
     }
     let entry = signed_entry(p, a, &role_signatures(p, a, &s.role_signatures)?)?;
-    if s.transaction_xdr != payload_transaction(&entry)? {
+    if s.transaction_xdr != payload_transaction(p, &entry)? {
         return Err("The payment authorization payload differs".into());
     }
     Ok(entry)
@@ -916,7 +929,7 @@ pub fn observe(rpc: &dyn rpc::Rpc, p: &PreparedOperation) -> Result<Observed> {
         };
         let signed = SignedOperation {
             prepared: p.clone(),
-            transaction_xdr: payload_transaction(&entry)?,
+            transaction_xdr: payload_transaction(p, &entry)?,
             transaction_hash: p.transaction_hash,
             role_signatures: carried_signatures(&p.config, &entry)?,
         };
