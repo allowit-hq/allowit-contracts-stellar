@@ -9,6 +9,7 @@
 import {Account, Asset, Keypair, Operation, StrKey, TransactionBuilder} from '@stellar/stellar-sdk/base';
 import {sha256} from '@noble/hashes/sha256';
 import {canonicalNetwork, networkPassphrase} from './plugin.js';
+import {expiredRecord, horizonGet, horizonOrigin} from './chain-record.js';
 
 /** The action of the step that signs the derivation message. Its payload is the base64 text of the message. */
 export const DERIVE_FEE_ACCOUNT_KEY = 'derive_fee_account_key';
@@ -117,12 +118,8 @@ export interface FeeAccountState {
   refill: {amount: string; text: string};
 }
 
-const HORIZON: Readonly<Record<string, string>> = {
-  'stellar:testnet': 'https://horizon-testnet.stellar.org',
-  'stellar:pubnet': 'https://horizon.stellar.org',
-};
 function horizon(network: string): string {
-  const base = HORIZON[canonicalNetwork(network) ?? ''];
+  const base = horizonOrigin(network);
   if (!base) throw new Error('Select a supported Stellar network.');
   return base;
 }
@@ -237,28 +234,49 @@ export async function refillFees({network, owner, feeAccount: destination, amoun
   if (saved && journal && key) {
     if (saved.owner !== owner || saved.feeAccount !== destination) throw new RefillPendingError('A signed refill of another account is saved under this key. It stays saved.');
     onStep('Checking the saved refill…');
-    const found = await get(`/transactions/${saved.hash}`).catch(() => null);
+    // The saved bytes decide: their hash and their own time bound, never the saved metadata.
+    let validUntil: number;
+    try {
+      const tx = TransactionBuilder.fromXDR(saved.signedPayload, passphrase);
+      if ('innerTransaction' in tx || hex(tx.hash()) !== saved.hash) throw new Error();
+      validUntil = Number(tx.timeBounds?.maxTime);
+      if (!Number.isSafeInteger(validUntil) || validUntil <= 0) throw new Error();
+    } catch (cause) {
+      throw new RefillPendingError('The saved signed refill is unreadable. It stays saved; nothing was signed.', cause);
+    }
+    const found = await horizonGet(network, `/transactions/${saved.hash}`, send);
     if (!found) throw pending();
+    let replace = false;
     if (found.ok) {
-      const done = settled(await json(found), saved.hash);
-      journal.remove(key);
-      // A payment that the network holds as failed used its sequence and can never apply: a new one is prepared.
-      if (done) return done;
+      // Only the record of this exact payment settles it: successful, or failed in a ledger. Any other answer,
+      // such as a cut or incomplete reply, proves nothing and keeps the payment saved.
+      const record = await json(found);
+      const done = settled(record, saved.hash);
+      if (done) {
+        journal.remove(key);
+        return done;
+      }
+      if (!object(record) || record.hash !== saved.hash || record.successful !== false || !Number.isSafeInteger(record.ledger)) throw pending();
+      // The network holds the payment as failed: it used its sequence and can never apply.
+      replace = true;
     } else if (found.status !== 404) throw pending();
-    else if (saved.expiresAt >= Math.floor(Date.now() / 1000)) {
+    else if (validUntil >= Math.floor(Date.now() / 1000)) {
       // The same signed bytes go again while their time bound lasts.
       const done = await submit(saved.signedPayload, saved.hash);
       if (!done) throw pending();
       journal.remove(key);
       return done;
     } else {
-      // Past its time bound the payment can no longer apply once the network has read past that time without it.
-      const root = await get('/').then(json, () => null);
-      const closedAt = object(root) && typeof root.history_latest_ledger_closed_at === 'string' ? Date.parse(root.history_latest_ledger_closed_at) / 1000 : NaN;
-      const again = await get(`/transactions/${saved.hash}`).catch(() => null);
-      if (!(closedAt > saved.expiresAt) || again?.status !== 404) throw pending();
-      journal.remove(key);
+      // Past its time bound a missing record proves nothing: history can lack an applied payment. The payment
+      // never applied only when the owner's sequence is still below the payment's sequence.
+      const record = await expiredRecord(network, saved.hash, saved.signedPayload, send).catch(cause => {throw pending(cause);});
+      if (record) {
+        journal.remove(key);
+        return {transactionHash: saved.hash, ledger: record.ledger};
+      }
+      replace = true;
     }
+    if (replace) journal.remove(key);
   }
 
   onStep('Preparing the refill…');

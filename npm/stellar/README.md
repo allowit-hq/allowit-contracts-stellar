@@ -50,7 +50,10 @@ selected agent and server, and reconstructs the creation and each update with th
 from Horizon: `{address, exists, balance, spendable, low, text, refill}`. `low` is true below two operations at the
 wallet's fee ceiling. It is null for a document without a fee account. `ownerWorkflow.refillFees` builds one payment
 of XLM from the owner's account to the fee account, has the host's `sign` sign it as the step `refill_fees` and sends
-the signed bytes to Horizon itself.
+the signed bytes to Horizon itself. With `journal` and `key` the signed payment is saved before it is sent. A result
+that is unknown rejects with `RefillPendingError` and keeps it; the next call settles it first. It is done when Horizon
+holds it as successful, it is sent again while its own time bound lasts, and a new payment is signed only when Horizon
+holds it as failed or has read past its time bound while the owner's sequence is still below the payment's sequence.
 
 `ownerWorkflow.updateParams` changes installed params on an active wallet with one owner signature. The host passes
 each changed param with its complete typed value, such as `{daily_spending_limit: {Int: '50000000'}}`, and one journal
