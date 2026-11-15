@@ -1301,9 +1301,18 @@ impl OwnerClient {
             return Ok(());
         }
         let live = checked(rpc::trusted_state_for_discovery(rpc, c, None))?;
+        // The wallet's agent address is the fee account of the selection, and that account
+        // holds exactly its roles, with or without the agent signer.
+        if c.fee_account.is_some() {
+            checked(
+                live.state
+                    .source
+                    .wallet_status(&c.owner, &c.agent, &c.server),
+            )?;
+        }
         if live.paused
             || live.state.owner != c.owner
-            || live.state.agent != c.agent
+            || live.state.agent != c.agent_account()
             || live.state.server != c.server
             || live.state.policy_instance != c.policy_instance
             || live.state.module_digest != c.module_digest
