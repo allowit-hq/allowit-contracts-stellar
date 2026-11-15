@@ -2770,27 +2770,73 @@ mod fee_account_owner_tests {
         // The owner's own intent, built from the owner's values alone, is this exact step.
         let owner_state = rpc::get_account(ledger.as_ref(), &c.owner).unwrap();
         let original: native::owner_intent::OwnerTransaction = decode_packet(&packet.0).unwrap();
-        native::owner_intent::validate_owner_transaction(
-            &original,
-            &native::owner_intent::ExpectedOwnerIntent {
-                limits: native::owner_intent::OwnerLimits {
-                    network: c.network.clone(),
-                    owner: c.owner.clone(),
-                    next_sequence: owner_state.sequence + 1,
-                    max_fee_stroops: 1_000_000,
-                    valid_until: NOW + 300,
+        use native::owner_intent::{ExpectedOwnerIntent, OwnerAction as Intent, OwnerLimits};
+        let limits = OwnerLimits {
+            network: c.network.clone(),
+            owner: c.owner.clone(),
+            next_sequence: owner_state.sequence + 1,
+            max_fee_stroops: 1_000_000,
+            valid_until: NOW + 300,
+        };
+        let intent = |account: &str, agent: &str, engine: &str, request_id: String| {
+            Intent::FeeAccountSetup {
+                state: owner_state.clone(),
+                account: account.into(),
+                agent: agent.into(),
+                engine: engine.into(),
+                request_id,
+            }
+        };
+        let request_id = native::owner::fee_account_request_id(&c.policy_instance);
+        let validate = |limits: &OwnerLimits, action: Intent| {
+            native::owner_intent::validate_owner_transaction(
+                &original,
+                &ExpectedOwnerIntent {
+                    limits: limits.clone(),
+                    action,
                 },
-                action: native::owner_intent::OwnerAction::FeeAccountSetup {
-                    state: owner_state,
-                    account: fee_account.clone(),
-                    agent: c.agent.clone(),
-                    engine: c.server.clone(),
-                    request_id: native::owner::fee_account_request_id(&c.policy_instance),
-                },
-            },
-            NOW,
+                NOW,
+            )
+            .map(drop)
+        };
+        validate(
+            &limits,
+            intent(&fee_account, &c.agent, &c.server, request_id.clone()),
         )
         .unwrap();
+        // Another account, agent, server or wallet, or a fee, sequence or lifetime outside the
+        // owner's limits, is not the step that this owner selected.
+        let other = account(90);
+        for action in [
+            intent(&other, &c.agent, &c.server, request_id.clone()),
+            intent(&fee_account, &other, &c.server, request_id.clone()),
+            intent(&fee_account, &c.agent, &other, request_id.clone()),
+            intent(
+                &fee_account,
+                &c.agent,
+                &c.server,
+                native::owner::fee_account_request_id(&[9; 32]),
+            ),
+        ] {
+            assert!(validate(&limits, action).is_err());
+        }
+        type Limit = fn(&mut OwnerLimits);
+        let narrower: [Limit; 3] = [
+            |l| l.max_fee_stroops = 399,
+            |l| l.next_sequence += 1,
+            |l| l.valid_until = NOW + 299,
+        ];
+        for narrow in narrower {
+            let mut changed = limits.clone();
+            narrow(&mut changed);
+            assert!(
+                validate(
+                    &changed,
+                    intent(&fee_account, &c.agent, &c.server, request_id.clone())
+                )
+                .is_err()
+            );
+        }
         // The step takes the owner's signature, then the one signature of the new account's
         // own key. One signature, another order or another key is refused.
         let owner_key = SigningKey::from_bytes(&[11; 32]);
