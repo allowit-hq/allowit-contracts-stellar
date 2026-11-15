@@ -1563,6 +1563,15 @@ pub fn verify_receipt(r: &Packet, p: &Packet) -> Result<()> {
     verify_native_receipt(&signed, &receipt)
 }
 fn verify_native_receipt(signed: &SignedOperation, receipt: &rpc::VerifiedReceipt) -> Result<()> {
+    // Another party's transaction settles a payment authorization of either custody form.
+    if signed.prepared.payment_authorization.is_some() {
+        return checked(native::seller_settled::validate_settled(signed, receipt));
+    }
+    if receipt.settles.is_some() {
+        return Err(Error::config(
+            "The receipt settles a payment authorization, not this operation",
+        ));
+    }
     if signed.prepared.config.route == WalletRoute::PolicyWallet {
         checked(rpc::validate_settled_policy_packet(signed, receipt))
     } else {
