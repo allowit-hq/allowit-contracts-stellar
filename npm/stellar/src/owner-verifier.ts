@@ -1,6 +1,6 @@
 export interface AdkOwnerStep {
   network: string;
-  action: 'upload_wasm' | 'create_wallet' | 'extend' | 'fund' | 'update_params';
+  action: 'create_fee_account' | 'upload_wasm' | 'create_wallet' | 'extend' | 'fund' | 'update_params';
   transactionXdr: string;
   transactionHash: string;
   expiresAt: number;
