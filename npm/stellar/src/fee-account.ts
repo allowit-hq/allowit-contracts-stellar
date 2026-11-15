@@ -24,6 +24,8 @@ const TITLE = 'Allowit fee account key v1';
 const PURPOSE = "This signature derives the one-time setup key of the account that pays the network fees of this agent's policy wallet. It does not authorize spending or move funds.";
 const SEED_DOMAIN = new TextEncoder().encode('allowit-stellar-native-wallet-seed-v1');
 const BASE_RESERVE = 5_000_000n;
+/** The float of a new fee account, in stroops: what the owner's deployment funds above the reserve. */
+const FEE_FLOAT = 50_000_000n;
 
 const hex = (bytes: Uint8Array) => Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
 const object = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -111,6 +113,8 @@ export interface FeeAccountState {
   /** True when less than two operations at the wallet's fee ceiling remain. */
   low: boolean;
   text: string;
+  /** The refill that the page offers: the float of a new fee account, as a decimal amount and with its unit. */
+  refill: {amount: string; text: string};
 }
 
 const HORIZON: Readonly<Record<string, string>> = {
@@ -141,7 +145,8 @@ export async function feeAccount(input: {network: string; document: unknown; fet
   const named = feeAccountOf(input.document);
   if (!named) return null;
   const response = await (input.fetch ?? fetch)(`${horizon(input.network)}/accounts/${named.address}`, {headers: {Accept: 'application/json'}, signal: AbortSignal.timeout(15_000)});
-  if (response.status === 404) return {address: named.address, exists: false, balance: '0', spendable: '0', low: true, text: xlmText(0n)};
+  const refill = {amount: xlmText(FEE_FLOAT).replace(' XLM', ''), text: xlmText(FEE_FLOAT)};
+  if (response.status === 404) return {address: named.address, exists: false, balance: '0', spendable: '0', low: true, text: xlmText(0n), refill};
   const account: unknown = response.ok ? await response.json().catch(() => null) : null;
   const native = object(account) && Array.isArray(account.balances) ? account.balances.find(b => object(b) && b.asset_type === 'native') : null;
   const balance = object(native) && typeof native.balance === 'string' ? stroops(native.balance) : null;
@@ -154,7 +159,7 @@ export async function feeAccount(input: {network: string; document: unknown; fet
   const spendable = above > 0n ? above : 0n;
   // Two operations at the fee ceiling of the wallet; a 1 XLM ceiling when the document names none.
   const low = spendable < 2n * BigInt(named.maxFeeStroops ?? 10_000_000);
-  return {address: named.address, exists: true, balance: balance.toString(), spendable: spendable.toString(), low, text: xlmText(spendable)};
+  return {address: named.address, exists: true, balance: balance.toString(), spendable: spendable.toString(), low, text: xlmText(spendable), refill};
 }
 
 export interface RefillFeesInput {

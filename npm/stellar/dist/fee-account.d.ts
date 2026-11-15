@@ -63,6 +63,11 @@ export interface FeeAccountState {
     /** True when less than two operations at the wallet's fee ceiling remain. */
     low: boolean;
     text: string;
+    /** The refill that the page offers: the float of a new fee account, as a decimal amount and with its unit. */
+    refill: {
+        amount: string;
+        text: string;
+    };
 }
 /** Stroops of a decimal XLM amount with at most seven decimals, or null. */
 export declare function stroops(amount: string): bigint | null;

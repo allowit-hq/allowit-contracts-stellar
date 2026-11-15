@@ -23,6 +23,8 @@ const TITLE = 'Allowit fee account key v1';
 const PURPOSE = "This signature derives the one-time setup key of the account that pays the network fees of this agent's policy wallet. It does not authorize spending or move funds.";
 const SEED_DOMAIN = new TextEncoder().encode('allowit-stellar-native-wallet-seed-v1');
 const BASE_RESERVE = 5000000n;
+/** The float of a new fee account, in stroops: what the owner's deployment funds above the reserve. */
+const FEE_FLOAT = 50000000n;
 const hex = (bytes) => Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
 const object = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 /** The SEP-53 digest of a wallet message, as lowercase hexadecimal. */
@@ -129,8 +131,9 @@ export async function feeAccount(input) {
     if (!named)
         return null;
     const response = await (input.fetch ?? fetch)(`${horizon(input.network)}/accounts/${named.address}`, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(15_000) });
+    const refill = { amount: xlmText(FEE_FLOAT).replace(' XLM', ''), text: xlmText(FEE_FLOAT) };
     if (response.status === 404)
-        return { address: named.address, exists: false, balance: '0', spendable: '0', low: true, text: xlmText(0n) };
+        return { address: named.address, exists: false, balance: '0', spendable: '0', low: true, text: xlmText(0n), refill };
     const account = response.ok ? await response.json().catch(() => null) : null;
     const native = object(account) && Array.isArray(account.balances) ? account.balances.find(b => object(b) && b.asset_type === 'native') : null;
     const balance = object(native) && typeof native.balance === 'string' ? stroops(native.balance) : null;
@@ -143,7 +146,7 @@ export async function feeAccount(input) {
     const spendable = above > 0n ? above : 0n;
     // Two operations at the fee ceiling of the wallet; a 1 XLM ceiling when the document names none.
     const low = spendable < 2n * BigInt(named.maxFeeStroops ?? 10_000_000);
-    return { address: named.address, exists: true, balance: balance.toString(), spendable: spendable.toString(), low, text: xlmText(spendable) };
+    return { address: named.address, exists: true, balance: balance.toString(), spendable: spendable.toString(), low, text: xlmText(spendable), refill };
 }
 /**
  * Refills a fee account: one payment of XLM from the owner's account, which the owner's wallet signs. This module

@@ -97,12 +97,12 @@ test('the fee account read shows the XLM above the reserve and says when it runs
     return new Response(JSON.stringify(horizonAccount(ACCOUNT, balance, extra)));
   }});
   // The account and its three signers lock 2.5 XLM. A new fee account holds 5 XLM above that.
-  assert.deepEqual(await read('7.5000000'), {address: ACCOUNT, exists: true, balance: '75000000', spendable: '50000000', low: false, text: '5 XLM'});
+  assert.deepEqual(await read('7.5000000'), {address: ACCOUNT, exists: true, balance: '75000000', spendable: '50000000', low: false, text: '5 XLM', refill: {amount: '5', text: '5 XLM'}});
   // Less than two operations at the 1 XLM fee ceiling is low; exactly two is not.
   assert.equal((await read('4.5000000')).low, false);
-  assert.deepEqual(await read('4.4999999'), {address: ACCOUNT, exists: true, balance: '44999999', spendable: '19999999', low: true, text: '1.9999999 XLM'});
+  assert.deepEqual(await read('4.4999999'), {address: ACCOUNT, exists: true, balance: '44999999', spendable: '19999999', low: true, text: '1.9999999 XLM', refill: {amount: '5', text: '5 XLM'}});
   // A balance at or below the reserve pays nothing.
-  assert.deepEqual(await read('2.5000000'), {address: ACCOUNT, exists: true, balance: '25000000', spendable: '0', low: true, text: '0 XLM'});
+  assert.deepEqual(await read('2.5000000'), {address: ACCOUNT, exists: true, balance: '25000000', spendable: '0', low: true, text: '0 XLM', refill: {amount: '5', text: '5 XLM'}});
   assert.equal((await read('1.0000000')).spendable, '0');
   // An account that the ledger does not hold was closed, or never created.
   const closed = await feeAccount({network, document, fetch: async () => new Response('{}', {status: 404})});
