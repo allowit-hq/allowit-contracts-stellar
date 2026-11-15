@@ -716,7 +716,14 @@ fn validate_generated(
             .ok_or_else(|| Error::uncertain("Missing returned contract policy tier"))?;
         let profile_fits = match tier {
             PolicyTier::Custom => request.profile == "allowit-custom-wallet-v1",
-            _ => request.profile == "allowit-policy-wallet-v1" && d.tier == "standard",
+            // A Simple or Standard wallet holds canonical rules, or a source with a host
+            // part: the server evaluates that source before it co-signs, and the contract
+            // runs its canonical prefix or no rule.
+            _ => {
+                request.profile == "allowit-policy-wallet-v1"
+                    && (d.tier == "standard"
+                        || !crate::provider::owner::host_functions(&policy.code).is_empty())
+            }
         };
         if b.route != "policyWallet"
             || !profile_fits

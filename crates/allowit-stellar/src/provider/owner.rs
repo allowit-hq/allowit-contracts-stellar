@@ -429,6 +429,37 @@ fn tokens(source: &str) -> Vec<Token> {
 /// (`allowit::<rule>`) and the host evidence functions (`<namespace>::<function>` of another
 /// lowercase namespace). The source gate admits no other lowercase path call. Comments and
 /// literals hold no call, and a path may have whitespace around `::`.
+/// The server functions that the code of `source` calls, as `allowit::<function>`, in source
+/// order. The portable vocabulary admits three kinds of `allowit::` calls: the canonical rules,
+/// the value and state helpers, and the server functions, which only a server can run.
+pub(crate) fn host_functions(source: &str) -> Vec<String> {
+    const HELPERS: [&str; 4] = ["param", "arg", "get_state", "set_state"];
+    let tokens = tokens(source);
+    let mut functions = Vec::<String>::new();
+    for (at, window) in tokens.windows(4).enumerate() {
+        let [
+            Token::Ident(namespace),
+            Token::Path,
+            Token::Ident(function),
+            Token::Open,
+        ] = window
+        else {
+            continue;
+        };
+        if (at > 0 && tokens[at - 1] == Token::Path)
+            || namespace != "allowit"
+            || allowit_core::vendor::kinds::STANDARD_PARAMS.contains(&function.as_str())
+            || HELPERS.contains(&function.as_str())
+        {
+            continue;
+        }
+        let name = format!("allowit::{function}");
+        if !functions.contains(&name) {
+            functions.push(name);
+        }
+    }
+    functions
+}
 fn source_calls(source: &str) -> (Vec<String>, Vec<String>) {
     let tokens = tokens(source);
     let (mut rules, mut evidence) = (Vec::<String>::new(), Vec::<String>::new());
