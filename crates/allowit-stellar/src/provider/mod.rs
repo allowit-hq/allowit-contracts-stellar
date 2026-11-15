@@ -5,6 +5,7 @@ pub mod formats;
 pub mod owner;
 pub mod paid_service;
 pub mod params_update;
+pub mod price;
 pub mod profiles;
 pub mod request;
 pub mod runtime;

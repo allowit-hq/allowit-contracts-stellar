@@ -1,0 +1,611 @@
+//! The `price` evidence function of the Stellar rail: what the order book of a pair pays now.
+//!
+//! A server policy calls `allowit::price` with an expected price and a band. The host asks this
+//! function for one observation and applies the band itself. The observation reads the public
+//! Horizon of the network, with three requests:
+//!
+//! 1. The root: the newest ledger that Horizon ingested and its close time. That time is the
+//!    time of the observation, so a Horizon that lags gives a stale observation.
+//! 2. The order book of the pair. Selling `amount` of `from` consumes its bids, best price
+//!    first. The observed price is what those bids pay for the whole amount.
+//! 3. The newest order book trades of the pair. Their volume-weighted average is the trade
+//!    average, over the trades that closed in the last [`RECENT`] seconds.
+//!
+//! The observation reads the direct order book only. It reads no path through another asset
+//! and no liquidity pool, so a best path pays this price or more. Prices are units of `to` for
+//! each unit of `from`, scaled by [`SCALE`]. Every classic asset has seven decimals, so the
+//! ratio of base units is the ratio of display units.
+use super::{token_contract, tokens_for};
+use crate as native;
+use serde_json::{Value, json};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+
+/// Prices are scaled by 10^7, as in `AllowitPrice`.
+pub const SCALE: i128 = 10_000_000;
+/// A trade counts toward the trade average for this many seconds after its ledger closed.
+pub const RECENT: u64 = 3_600;
+/// Most price levels of each side that one observation reads. It is Horizon's maximum.
+pub const MAX_LEVELS: usize = 200;
+/// Most trades behind one trade average.
+pub const MAX_TRADES: usize = 20;
+/// The name that hosts look the function up by.
+pub const FUNCTION: &str = "price";
+
+/// The public Horizon of a network.
+fn horizon(network: &str) -> Result<&'static str, String> {
+    match network {
+        "stellar:testnet" => Ok("https://horizon-testnet.stellar.org"),
+        "stellar:pubnet" => Ok("https://horizon.stellar.org"),
+        _ => Err(format!("no Horizon is known for {network}")),
+    }
+}
+
+/// One read of Horizon: the JSON body of `path` under the endpoint of the network.
+pub trait Horizon {
+    fn get(&self, path: &str) -> Result<Value, String>;
+    /// The host of the endpoint, for the source of the observation. Never a credential.
+    fn host(&self) -> String;
+}
+
+/// A classic asset as Horizon names it in a query.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Classic {
+    pub code: String,
+    /// `None` for the native asset.
+    pub issuer: Option<String>,
+}
+
+impl Classic {
+    fn native() -> Self {
+        Self {
+            code: "XLM".into(),
+            issuer: None,
+        }
+    }
+    /// The query fields of this asset under `prefix`, such as `selling` or `base`.
+    fn query(&self, prefix: &str) -> String {
+        match &self.issuer {
+            None => format!("{prefix}_asset_type=native"),
+            Some(issuer) => format!(
+                "{prefix}_asset_type=credit_alphanum{}&{prefix}_asset_code={}&{prefix}_asset_issuer={issuer}",
+                if self.code.len() <= 4 { 4 } else { 12 },
+                self.code
+            ),
+        }
+    }
+}
+
+/// The classic asset that `asset` names on `network`: `native`, `CODE:ISSUER`, the code of a
+/// listed token, or a Stellar Asset Contract id of the native asset or of a listed token. The
+/// contract id of another asset does not tell its code and issuer, so it names no order book.
+pub fn classic(network: &str, asset: &str) -> Result<Classic, String> {
+    if asset == "native" || native::sac_address(network, &native::Asset::Native)? == asset {
+        return Ok(Classic::native());
+    }
+    if let Some((code, issuer)) = asset.split_once(':') {
+        native::asset_from_identity(code, Some(issuer))?;
+        return Ok(Classic {
+            code: code.into(),
+            issuer: Some(issuer.into()),
+        });
+    }
+    tokens_for(network)
+        .iter()
+        .find(|token| {
+            token.code == asset || token_contract(network, token).as_deref() == Some(asset)
+        })
+        .map(|token| match token.issuer {
+            Some(issuer) => Classic {
+                code: token.code.into(),
+                issuer: Some(issuer.into()),
+            },
+            None => Classic::native(),
+        })
+        .ok_or_else(|| {
+            format!(
+                "{asset} names no asset whose order book this rail can read; name it as CODE:ISSUER"
+            )
+        })
+}
+
+/// One observation, in the shape that hosts read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Observation {
+    /// What the bids pay for the whole amount, or for the part that they fill.
+    pub price: i128,
+    /// Units of `from` that the bids inside the band fill. Without a band, every bid counts.
+    pub depth: i128,
+    /// Volume-weighted average price of the recent trades. Zero without one.
+    pub trade_average: i128,
+    pub trades: u32,
+    /// Close time of the newest ledger that Horizon ingested.
+    pub observed_at: u64,
+    pub source: String,
+}
+
+impl Observation {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "price": self.price.to_string(),
+            "depth": self.depth.to_string(),
+            "tradeAverage": self.trade_average.to_string(),
+            "trades": self.trades,
+            "observedAt": self.observed_at,
+            "source": self.source,
+        })
+    }
+}
+
+/// Base units of a Horizon amount: decimal text with at most seven decimals.
+fn units(text: &str) -> Result<i128, String> {
+    let invalid = || "Invalid Horizon amount".to_string();
+    let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+    if whole.is_empty()
+        || fraction.len() > 7
+        || !whole
+            .bytes()
+            .chain(fraction.bytes())
+            .all(|b| b.is_ascii_digit())
+    {
+        return Err(invalid());
+    }
+    let whole: i128 = whole.parse().map_err(|_| invalid())?;
+    let fraction: i128 = format!("{fraction:0<7}").parse().map_err(|_| invalid())?;
+    whole
+        .checked_mul(SCALE)
+        .and_then(|value| value.checked_add(fraction))
+        .ok_or_else(invalid)
+}
+
+/// A positive integer that Horizon writes as a number or as decimal text.
+fn positive(value: &Value) -> Result<i128, String> {
+    value
+        .as_i64()
+        .map(i128::from)
+        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "Invalid Horizon price".to_string())
+}
+
+fn seconds(text: &str) -> Result<u64, String> {
+    OffsetDateTime::parse(text, &Rfc3339)
+        .ok()
+        .and_then(|time| u64::try_from(time.unix_timestamp()).ok())
+        .ok_or_else(|| "Invalid Horizon time".to_string())
+}
+
+/// `a * b / c`, rounded down. An overflow is an error and never a wrapped value.
+fn scaled(a: i128, b: i128, c: i128) -> Result<i128, String> {
+    a.checked_mul(b)
+        .and_then(|product| product.checked_div(c))
+        .ok_or_else(|| "The price observation overflows".to_string())
+}
+
+/// The expected price and the largest deviation in basis points, when the host states them.
+pub type Band = Option<(i128, u32)>;
+
+/// Observe what selling `amount` base units of `from` for `to` pays on `network`.
+pub fn observe(
+    horizon: &dyn Horizon,
+    network: &str,
+    from: &str,
+    to: &str,
+    amount: i128,
+    band: Band,
+) -> Result<Observation, String> {
+    if amount <= 0 {
+        return Err("A price observation needs a positive amount".into());
+    }
+    let (from, to) = (classic(network, from)?, classic(network, to)?);
+    if from == to {
+        return Err("A price observation needs two assets".into());
+    }
+    let root = horizon.get("/")?;
+    let ledger = root["history_latest_ledger"]
+        .as_u64()
+        .ok_or("Invalid Horizon root")?;
+    let observed_at = seconds(
+        root["history_latest_ledger_closed_at"]
+            .as_str()
+            .ok_or("Invalid Horizon root")?,
+    )?;
+
+    // Selling `from` consumes the bids: offers that sell `to` for `from`. Horizon lists them
+    // best price first, each with the amount of `to` that it sells.
+    let book = horizon.get(&format!(
+        "/order_book?{}&{}&limit={MAX_LEVELS}",
+        from.query("selling"),
+        to.query("buying")
+    ))?;
+    let bids = book["bids"]
+        .as_array()
+        .ok_or("Invalid Horizon order book")?;
+    let (mut remaining, mut paid, mut depth) = (amount, 0i128, 0i128);
+    let mut last: Option<(i128, i128)> = None;
+    for bid in bids.iter().take(MAX_LEVELS) {
+        let (n, d) = (
+            positive(&bid["price_r"]["n"])?,
+            positive(&bid["price_r"]["d"])?,
+        );
+        // A book whose bids are not in price order is not one that this function can walk.
+        if let Some((last_n, last_d)) = last
+            && n.checked_mul(last_d) > last_n.checked_mul(d)
+        {
+            return Err("Invalid Horizon order book".into());
+        }
+        last = Some((n, d));
+        let sells = units(bid["amount"].as_str().ok_or("Invalid Horizon order book")?)?;
+        // Units of `from` that this bid buys.
+        let fills = scaled(sells, d, n)?;
+        let inside = match band {
+            // price >= expected * (10000 - slip) / 10000, with price = n / d * SCALE.
+            Some((expected, slip)) => {
+                let floor = expected
+                    .checked_mul(i128::from(10_000u32.saturating_sub(slip)))
+                    .and_then(|value| value.checked_mul(d));
+                let price = n
+                    .checked_mul(SCALE)
+                    .and_then(|value| value.checked_mul(10_000));
+                matches!((price, floor), (Some(price), Some(floor)) if price >= floor)
+            }
+            None => true,
+        };
+        if inside {
+            depth = depth
+                .checked_add(fills)
+                .ok_or("The price observation overflows")?;
+        }
+        let take = remaining.min(fills);
+        paid = paid
+            .checked_add(scaled(take, n, d)?)
+            .ok_or("The price observation overflows")?;
+        remaining -= take;
+    }
+    let filled = amount - remaining;
+    if filled == 0 {
+        return Err("The order book of the pair holds no bid".into());
+    }
+    let price = scaled(paid, SCALE, filled)?;
+
+    let trades = horizon.get(&format!(
+        "/trades?{}&{}&trade_type=orderbook&order=desc&limit={MAX_TRADES}",
+        from.query("base"),
+        to.query("counter")
+    ))?;
+    let records = trades["_embedded"]["records"]
+        .as_array()
+        .ok_or("Invalid Horizon trades")?;
+    let (mut sold, mut bought, mut count) = (0i128, 0i128, 0u32);
+    for trade in records.iter().take(MAX_TRADES) {
+        let closed = seconds(
+            trade["ledger_close_time"]
+                .as_str()
+                .ok_or("Invalid Horizon trades")?,
+        )?;
+        if closed > observed_at || observed_at - closed > RECENT {
+            continue;
+        }
+        let amount = |name: &str| units(trade[name].as_str().ok_or("Invalid Horizon trades")?);
+        sold = sold
+            .checked_add(amount("base_amount")?)
+            .ok_or("The price observation overflows")?;
+        bought = bought
+            .checked_add(amount("counter_amount")?)
+            .ok_or("The price observation overflows")?;
+        count += 1;
+    }
+    let trade_average = if sold > 0 {
+        scaled(bought, SCALE, sold)?
+    } else {
+        0
+    };
+    Ok(Observation {
+        price,
+        depth,
+        trade_average,
+        trades: count,
+        observed_at,
+        source: format!("{} ledger {ledger}", horizon.host()),
+    })
+}
+
+/// The public Horizon of a network over the bounded host transport.
+#[cfg(not(target_arch = "wasm32"))]
+struct Public(&'static str);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Horizon for Public {
+    fn get(&self, path: &str) -> Result<Value, String> {
+        use allowit_core::transport::{
+            http::{HttpClient, Method, Request},
+            rpc::Options,
+        };
+        let client = HttpClient::new(Options {
+            timeout: std::time::Duration::from_secs(5),
+            max_response_bytes: 1_048_576,
+            no_proxy: false,
+            connect_timeout: None,
+        })
+        .map_err(|_| "Cannot initialize the Horizon transport")?;
+        let url = format!("{}{path}", self.0);
+        let response = client
+            .send_success_body(
+                Request {
+                    method: Method::Get,
+                    url: &url,
+                    headers: &[("accept".to_string(), "application/json".to_string())],
+                    body: None,
+                },
+                None,
+            )
+            .map_err(|_| "Horizon did not answer")?;
+        if response.status != 200 {
+            return Err(format!("Horizon answered HTTP {}", response.status));
+        }
+        serde_json::from_slice(&response.body).map_err(|_| "Invalid Horizon response".into())
+    }
+    fn host(&self) -> String {
+        self.0.trim_start_matches("https://").to_owned()
+    }
+}
+
+/// The evidence function. `args` are `{"network", "from", "to", "amount"}` and, when the host
+/// states its band, `"price"` and `"slip"`. Amounts and prices are decimal text. `facts` are
+/// the host's own: its `network` is the network that the policy runs for, and it decides.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn price(args: &Value, facts: &Value) -> Result<Value, String> {
+    let text = |name: &str| {
+        args[name]
+            .as_str()
+            .ok_or_else(|| format!("A price observation needs `{name}`"))
+    };
+    let network = match (facts["network"].as_str(), args["network"].as_str()) {
+        (Some(host), Some(asked)) if host != asked => {
+            return Err("A price observation is for the network of its policy".into());
+        }
+        (Some(network), _) | (None, Some(network)) => network,
+        (None, None) => return Err("A price observation needs `network`".into()),
+    };
+    let amount: i128 = text("amount")?
+        .parse()
+        .map_err(|_| "A price observation needs a decimal `amount`")?;
+    let band = match (args["price"].as_str(), args["slip"].as_u64()) {
+        (Some(price), Some(slip)) => Some((
+            price
+                .parse::<i128>()
+                .ok()
+                .filter(|price| *price > 0)
+                .ok_or("A price band needs a positive decimal `price`")?,
+            u32::try_from(slip)
+                .ok()
+                .filter(|slip| *slip <= 10_000)
+                .ok_or("A price band needs `slip` in basis points")?,
+        )),
+        _ => None,
+    };
+    let observed = observe(
+        &Public(horizon(network)?),
+        network,
+        text("from")?,
+        text("to")?,
+        amount,
+        band,
+    )?;
+    Ok(observed.to_json())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NETWORK: &str = "stellar:testnet";
+    const USDC: &str = "USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+
+    /// Recorded answers of the public Testnet Horizon, by request path.
+    struct Recorded {
+        answers: Vec<(&'static str, Value)>,
+        asked: std::cell::RefCell<Vec<String>>,
+    }
+    impl Recorded {
+        fn new(root: &str, book: &str, trades: &str) -> Self {
+            let json = |text: &str| serde_json::from_str(text).unwrap();
+            Self {
+                answers: vec![
+                    ("/order_book", json(book)),
+                    ("/trades", json(trades)),
+                    ("/", json(root)),
+                ],
+                asked: Default::default(),
+            }
+        }
+    }
+    impl Horizon for Recorded {
+        fn get(&self, path: &str) -> Result<Value, String> {
+            self.asked.borrow_mut().push(path.to_owned());
+            self.answers
+                .iter()
+                .find(|(prefix, _)| path.starts_with(prefix))
+                .map(|(_, answer)| answer.clone())
+                .ok_or_else(|| "no recorded answer".to_string())
+        }
+        fn host(&self) -> String {
+            "horizon-testnet.stellar.org".into()
+        }
+    }
+
+    /// XLM and USDC on Testnet at ledger 5735831: a book with bids near 0.147 USDC, and
+    /// order book trades that closed six hours before.
+    fn quiet() -> Recorded {
+        Recorded::new(
+            include_str!("price_fixtures/quiet/root.json"),
+            include_str!("price_fixtures/quiet/order_book.json"),
+            include_str!("price_fixtures/quiet/trades.json"),
+        )
+    }
+
+    #[test]
+    fn an_asset_is_named_by_its_identity_a_listed_code_or_its_contract() {
+        let usdc = Classic {
+            code: "USDC".into(),
+            issuer: Some(USDC.split_once(':').unwrap().1.into()),
+        };
+        let native_contract = native::sac_address(NETWORK, &native::Asset::Native).unwrap();
+        let usdc_contract = token_contract(NETWORK, &tokens_for(NETWORK)[1]).unwrap();
+        for (asset, expected) in [
+            ("native", Classic::native()),
+            ("XLM", Classic::native()),
+            (native_contract.as_str(), Classic::native()),
+            ("USDC", usdc.clone()),
+            (USDC, usdc.clone()),
+            (usdc_contract.as_str(), usdc.clone()),
+        ] {
+            assert_eq!(classic(NETWORK, asset).unwrap(), expected, "{asset}");
+        }
+        assert_eq!(
+            usdc.query("buying"),
+            format!(
+                "buying_asset_type=credit_alphanum4&buying_asset_code=USDC&buying_asset_issuer={}",
+                usdc.issuer.as_deref().unwrap()
+            )
+        );
+        assert_eq!(Classic::native().query("base"), "base_asset_type=native");
+        // A contract that is not listed, a bad issuer and free text name no order book.
+        for asset in [
+            "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA",
+            "USDC:GBAD",
+            "dollars",
+        ] {
+            assert!(classic(NETWORK, asset).is_err(), "{asset}");
+        }
+    }
+
+    #[test]
+    fn the_bids_price_the_whole_amount_best_price_first() {
+        let horizon = quiet();
+        // 100 XLM: the best bid pays 2000000/13611907 USDC for each XLM and buys 886 XLM.
+        let small = observe(&horizon, NETWORK, "native", USDC, 1_000_000_000, None).unwrap();
+        assert_eq!(small.price, 1_469_301);
+        assert_eq!(small.observed_at, 1_794_702_800);
+        assert_eq!(small.source, "horizon-testnet.stellar.org ledger 5735831");
+        // The recorded trades closed six hours before the ledger: none is recent.
+        assert_eq!((small.trades, small.trade_average), (0, 0));
+        assert_eq!(
+            *horizon.asked.borrow(),
+            [
+                "/".to_string(),
+                format!(
+                    "/order_book?selling_asset_type=native&buying_asset_type=credit_alphanum4&buying_asset_code=USDC&buying_asset_issuer={}&limit=200",
+                    USDC.split_once(':').unwrap().1
+                ),
+                format!(
+                    "/trades?base_asset_type=native&counter_asset_type=credit_alphanum4&counter_asset_code=USDC&counter_asset_issuer={}&trade_type=orderbook&order=desc&limit=20",
+                    USDC.split_once(':').unwrap().1
+                ),
+            ]
+        );
+        // A larger amount reaches worse bids, so it gets a lower price.
+        let large = observe(&horizon, NETWORK, "native", USDC, 20_000_000_000, None).unwrap();
+        assert!(large.price < small.price && large.price > 1_400_000);
+        // The depth is the book, whatever the amount.
+        assert_eq!(large.depth, small.depth);
+        assert!(small.depth > 20_000_000_000);
+    }
+
+    #[test]
+    fn the_depth_counts_only_the_bids_inside_the_band() {
+        let horizon = quiet();
+        let within = |slip| {
+            observe(
+                &horizon,
+                NETWORK,
+                "native",
+                USDC,
+                1_000_000_000,
+                Some((1_469_301, slip)),
+            )
+            .unwrap()
+            .depth
+        };
+        let all = observe(&horizon, NETWORK, "native", USDC, 1_000_000_000, None)
+            .unwrap()
+            .depth;
+        // No deviation: only the best level, 130.2207151 USDC at 2000000/13611907.
+        assert_eq!(within(0), 1_302_207_151 * 13_611_907 / 2_000_000);
+        assert!(within(0) < within(100) && within(100) < within(1_000));
+        assert_eq!(within(10_000), all);
+    }
+
+    #[test]
+    fn an_amount_beyond_the_book_reports_the_depth_that_exists() {
+        let horizon = quiet();
+        let all = observe(&horizon, NETWORK, "native", USDC, 1, None)
+            .unwrap()
+            .depth;
+        let beyond = observe(&horizon, NETWORK, "native", USDC, all + 1, None).unwrap();
+        // The host compares the depth with the amount and denies a thin market.
+        assert_eq!(beyond.depth, all);
+        assert!(beyond.price > 0);
+    }
+
+    #[test]
+    fn a_broken_or_empty_answer_is_no_observation() {
+        let with = |change: fn(&mut Recorded)| {
+            let mut horizon = quiet();
+            change(&mut horizon);
+            observe(&horizon, NETWORK, "native", USDC, 1_000_000_000, None)
+        };
+        assert!(with(|_| {}).is_ok());
+        assert_eq!(
+            with(|h| h.answers[0].1["bids"] = json!([])).unwrap_err(),
+            "The order book of the pair holds no bid"
+        );
+        assert!(with(|h| h.answers[0].1["bids"][0]["amount"] = json!("1.23456789")).is_err());
+        assert!(with(|h| h.answers[0].1["bids"][0]["price_r"]["n"] = json!(0)).is_err());
+        // The second bid pays more than the first: the book is not in price order.
+        assert!(with(|h| h.answers[0].1["bids"][1]["price_r"]["d"] = json!(1)).is_err());
+        assert!(
+            with(|h| h.answers[2].1["history_latest_ledger_closed_at"] = json!("now")).is_err()
+        );
+        assert!(with(|h| h.answers[1].1 = json!({})).is_err());
+        assert!(with(|h| h.answers.clear()).is_err());
+        // The amount and the pair.
+        let horizon = quiet();
+        assert!(observe(&horizon, NETWORK, "native", USDC, 0, None).is_err());
+        assert!(observe(&horizon, NETWORK, "native", "XLM", 1, None).is_err());
+    }
+
+    #[test]
+    fn amounts_are_exact_base_units() {
+        assert_eq!(units("130.2207151").unwrap(), 1_302_207_151);
+        assert_eq!(units("5").unwrap(), 50_000_000);
+        assert_eq!(units("0.1").unwrap(), 1_000_000);
+        for text in ["", ".5", "1.12345678", "-1", "1e3", "1,5"] {
+            assert!(units(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_function_refuses_arguments_before_any_request() {
+        let facts = json!({"network": NETWORK, "now": 1});
+        for args in [
+            json!({"network": "stellar:pubnet", "from": "native", "to": USDC, "amount": "1"}),
+            json!({"network": NETWORK, "from": "native", "to": USDC}),
+            json!({"network": NETWORK, "from": "native", "to": USDC, "amount": 1}),
+            json!({"network": NETWORK, "from": "native", "to": "native", "amount": "1"}),
+            json!({"network": NETWORK, "from": "native", "to": USDC, "amount": "1",
+                "price": "0", "slip": 100}),
+            json!({"network": NETWORK, "from": "native", "to": USDC, "amount": "1",
+                "price": "1", "slip": 10_001}),
+        ] {
+            assert!(price(&args, &facts).is_err(), "{args}");
+        }
+        assert!(
+            price(
+                &json!({"from": "native", "to": USDC, "amount": "1"}),
+                &json!({})
+            )
+            .is_err()
+        );
+        assert!(horizon("stellar:futurenet").is_err());
+    }
+}
