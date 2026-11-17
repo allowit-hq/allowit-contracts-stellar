@@ -316,6 +316,11 @@ async function run({network, ask, sign, journal, key, policyId, agent, amount, o
       const {code} = (object(error) ? error : {}) as {code?: unknown};
       // A new policy wallet needs a fee account: this workflow makes its key, and the deployment creates and
       // funds the account. The agent holds a key and no account.
+      // Boundary: a journal without a saved address names no account. That is the state of a new deployment,
+      // and also of one that an earlier release (or another browser) took past its fee account and not to its
+      // wallet. Neither the journal nor the ledger says which existing account no wallet uses, so this workflow
+      // never adopts one: it makes a new account. An account of such an earlier run stays under the owner's key
+      // alone, and the owner closes it; Horizon lists it under `accounts?signer=<owner>`.
       if (code !== FEE_ACCOUNT_REQUIRED || feeAccount) throw error;
       feeKey = newFeeAccountKey();
       feeAccount = feeKey.publicKey();

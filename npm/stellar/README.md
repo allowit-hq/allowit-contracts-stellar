@@ -43,7 +43,11 @@ signs no message for it. The key is used once and dropped; nothing stores, deriv
 creation sets its weight to 0 and makes the owner a signer that reaches every threshold alone. The journal keeps the
 address of an account whose creation was signed under `<key>:fee-account` until the wallet is installed, so a reload
 names the same account. When the service prepares the creation of a saved account again, its signed creation never
-applied and nothing holds funds: the workflow makes a new key and names its account. The element shows
+applied and nothing holds funds: the workflow makes a new key and names its account. A journal without a saved
+address names no account, so a deployment that another browser or an earlier release took past its fee account and
+not to its wallet continues here with a new account. The earlier account stays under the owner's key alone: the
+owner closes it, and Horizon lists it under `accounts?signer=<owner>`. The workflow adopts no existing account,
+because neither the journal nor the ledger says which one no wallet uses. The element shows
 what a `create_fee_account` step funds: the account and the XLM that it starts with.
 
 With `expected.feeAccount` the owner verifier admits the `create_fee_account` step of exactly that account for the
