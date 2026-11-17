@@ -574,3 +574,413 @@ impl SettlementProvider for Service {
             .unwrap_or_else(|| pending(network, authorization, *transaction)))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support;
+    use std::sync::Mutex;
+
+    const NETWORK: &str = "stellar:testnet";
+    const NOW: u64 = 86_401;
+    const SERVICE: [u8; 32] = [6; 32];
+
+    /// A keypair wallet's signed authorization and the transfer that it pays.
+    fn signed() -> (SignedOperation, Transfer) {
+        let ordinary = test_support::native_signed().prepared;
+        let t = transfer_from_request(&ordinary.config, &ordinary.request).unwrap();
+        let r = seller_settled::request(
+            &ordinary.config,
+            ordinary.request.operation.nonce,
+            &t.recipient,
+            t.amount,
+        )
+        .unwrap();
+        let p = seller_settled::attach(ordinary, &r, NOW).unwrap();
+        let sign = |seed: [u8; 32]| {
+            seller_settled::sign(&p, &account_for_seed(&seed), NOW, |digest| {
+                Ok(test_support::sign_digest(seed, digest))
+            })
+            .unwrap()
+        };
+        let signed = seller_settled::assemble(&p, &[sign([2; 32]), sign([3; 32])], NOW).unwrap();
+        (signed, t)
+    }
+    fn asset(signed: &SignedOperation) -> String {
+        let c = &signed.prepared.config;
+        sac_address(&c.network, &asset_xdr(c).unwrap()).unwrap()
+    }
+    /// The seller's request for `signed`: the payload and the requirements that it accepted.
+    fn request(signed: &SignedOperation, t: &Transfer) -> Value {
+        let requirements = json!({"scheme": SCHEME, "network": NETWORK, "amount": t.amount.to_string(),
+            "asset": asset(signed), "payTo": t.recipient, "maxTimeoutSeconds": 300,
+            "extra": {"areFeesSponsored": true}});
+        json!({"x402Version": 2, "paymentRequirements": requirements,
+            "paymentPayload": {"x402Version": 2, "accepted": requirements,
+                "payload": {"transaction": signed.transaction_xdr}}})
+    }
+    fn service() -> String {
+        account_for_seed(&SERVICE)
+    }
+    fn reason(request: &Value) -> &'static str {
+        match structure(NETWORK, &service(), request) {
+            Ok(_) => "valid",
+            Err(Refusal(reason, _)) => reason,
+        }
+    }
+    /// The payload of `signed` after `change` to its transaction.
+    fn changed(signed: &SignedOperation, t: &Transfer, change: &dyn Fn(&mut Transaction)) -> Value {
+        let TransactionEnvelope::Tx(mut envelope) = read(&signed.transaction_xdr).unwrap() else {
+            panic!("a transaction")
+        };
+        change(&mut envelope.tx);
+        let mut request = request(signed, t);
+        request["paymentPayload"]["payload"]["transaction"] =
+            json!(xdr(&TransactionEnvelope::Tx(envelope)).unwrap());
+        request
+    }
+    fn invocation(tx: &mut Transaction, change: &dyn Fn(&mut InvokeHostFunctionOp)) {
+        let mut operations = tx.operations.to_vec();
+        let OperationBody::InvokeHostFunction(op) = &mut operations[0].body else {
+            panic!("an invocation")
+        };
+        change(op);
+        tx.operations = operations.try_into().unwrap();
+    }
+
+    #[test]
+    fn a_standard_payload_reads_as_one_authorization() {
+        let (signed, t) = signed();
+        let (_, authorization, timeout, _) = structure(NETWORK, &service(), &request(&signed, &t))
+            .ok()
+            .unwrap();
+        assert_eq!(authorization.payer, signed.prepared.config.wallet);
+        assert_eq!(authorization.pay_to, t.recipient);
+        assert_eq!(authorization.units, t.amount);
+        assert_eq!(authorization.asset, asset(&signed));
+        assert_eq!(timeout, 300);
+        // Another signed entry is another authorization.
+        assert_ne!(authorization.id, [0; 32]);
+        let supported = SERVICE_HOOK.supported(NETWORK).unwrap();
+        assert_eq!(supported.signers_key, "stellar:*");
+        assert_eq!(supported.kinds[0]["extra"]["areFeesSponsored"], true);
+        assert_eq!(supported.kinds[0]["network"], NETWORK);
+    }
+    static SERVICE_HOOK: Service = Service;
+
+    #[test]
+    fn the_protocol_fields_of_a_request_are_strict() {
+        let (signed, t) = signed();
+        let with = |change: &dyn Fn(&mut Value)| {
+            let mut request = request(&signed, &t);
+            change(&mut request);
+            reason(&request)
+        };
+        assert_eq!(with(&|_| {}), "valid");
+        assert_eq!(
+            with(&|r| r["paymentPayload"]["x402Version"] = json!(1)),
+            "invalid_x402_version"
+        );
+        assert_eq!(
+            with(&|r| r["paymentRequirements"]["scheme"] = json!("upto")),
+            "unsupported_scheme"
+        );
+        assert_eq!(
+            with(&|r| r["paymentPayload"]["accepted"]["network"] = json!("stellar:pubnet")),
+            "network_mismatch"
+        );
+        assert_eq!(
+            with(&|r| {
+                r["paymentPayload"]["accepted"]["network"] = json!("stellar:pubnet");
+                r["paymentRequirements"]["network"] = json!("stellar:pubnet");
+            }),
+            "invalid_network"
+        );
+        assert_eq!(
+            with(&|r| r["paymentPayload"]["payload"]["transaction"] = json!("AAAA")),
+            "invalid_exact_stellar_payload_malformed"
+        );
+        assert_eq!(
+            with(&|r| r["paymentRequirements"]["asset"] = json!(test_support::vault(3))),
+            "invalid_exact_stellar_payload_wrong_asset"
+        );
+        assert_eq!(
+            with(&|r| r["paymentRequirements"]["payTo"] = json!(account_for_seed(&[9; 32]))),
+            "invalid_exact_stellar_payload_wrong_recipient"
+        );
+        for amount in [json!("1"), json!(t.amount), json!("-5"), json!("")] {
+            assert_eq!(
+                with(&|r| r["paymentRequirements"]["amount"] = amount.clone()),
+                "invalid_exact_stellar_payload_wrong_amount",
+                "{amount}"
+            );
+        }
+        assert_eq!(
+            with(&|r| r["paymentRequirements"]["maxTimeoutSeconds"] = json!(0)),
+            "invalid_payment_requirements"
+        );
+    }
+
+    #[test]
+    fn the_service_is_never_a_party_of_the_payment() {
+        let (signed, t) = signed();
+        let key = account_key(&service()).unwrap();
+        // The service as the source of the payer's transaction or of its operation.
+        let source = changed(&signed, &t, &|tx| {
+            tx.source_account = MuxedAccount::Ed25519(Uint256(key))
+        });
+        assert_eq!(
+            reason(&source),
+            "invalid_exact_stellar_payload_unsafe_tx_or_op_source"
+        );
+        let operation = changed(&signed, &t, &|tx| {
+            let mut operations = tx.operations.to_vec();
+            operations[0].source_account = Some(MuxedAccount::Ed25519(Uint256(key)));
+            tx.operations = operations.try_into().unwrap();
+        });
+        assert_eq!(
+            reason(&operation),
+            "invalid_exact_stellar_payload_unsafe_tx_or_op_source"
+        );
+        // The service as the payer: the wallet of the payload is the service's own account.
+        let request = request(&signed, &t);
+        assert!(matches!(
+            structure(NETWORK, &signed.prepared.config.wallet, &request),
+            Err(Refusal(
+                "invalid_exact_stellar_payload_facilitator_is_payer",
+                _
+            ))
+        ));
+    }
+
+    #[test]
+    fn one_signed_entry_of_the_payer_for_exactly_the_call_is_required() {
+        let (signed, t) = signed();
+        let with = |change: &dyn Fn(&mut InvokeHostFunctionOp)| {
+            reason(&changed(&signed, &t, &|tx| invocation(tx, change)))
+        };
+        assert_eq!(
+            with(&|op| op.auth = VecM::default()),
+            "invalid_exact_stellar_payload_no_auth_entries"
+        );
+        assert_eq!(
+            with(&|op| {
+                let entry = op.auth[0].clone();
+                op.auth = vec![entry.clone(), entry].try_into().unwrap();
+            }),
+            "invalid_exact_stellar_payload_unexpected_auth_entry"
+        );
+        let entry = |change: &dyn Fn(&mut SorobanAuthorizationEntry)| {
+            with(&|op| {
+                let mut entry = op.auth[0].clone();
+                change(&mut entry);
+                op.auth = vec![entry].try_into().unwrap();
+            })
+        };
+        assert_eq!(
+            entry(&|e| e.credentials = SorobanCredentials::SourceAccount),
+            "invalid_exact_stellar_payload_unsupported_credential_type"
+        );
+        assert_eq!(
+            entry(&|e| {
+                let SorobanCredentials::Address(credentials) = &mut e.credentials else {
+                    panic!("an address authorization")
+                };
+                credentials.signature = ScVal::Void;
+            }),
+            "invalid_exact_stellar_payload_missing_payer_signature"
+        );
+        assert_eq!(
+            entry(&|e| {
+                let SorobanCredentials::Address(credentials) = &mut e.credentials else {
+                    panic!("an address authorization")
+                };
+                credentials.address = address(&account_for_seed(&[9; 32])).unwrap();
+            }),
+            "invalid_exact_stellar_payload_missing_payer_signature"
+        );
+        assert_eq!(
+            entry(&|e| {
+                let nested = e.root_invocation.clone();
+                e.root_invocation.sub_invocations = vec![nested].try_into().unwrap();
+            }),
+            "invalid_exact_stellar_payload_has_subinvocations"
+        );
+        // Another function, more arguments, or a second operation is no transfer.
+        assert_eq!(
+            with(&|op| {
+                let HostFunction::InvokeContract(call) = &mut op.host_function else {
+                    panic!("a contract call")
+                };
+                call.function_name = ScSymbol(b"approve".to_vec().try_into().unwrap());
+            }),
+            "invalid_exact_stellar_payload_wrong_function_name"
+        );
+        let two = changed(&signed, &t, &|tx| {
+            let operation = tx.operations[0].clone();
+            tx.operations = vec![operation.clone(), operation].try_into().unwrap();
+        });
+        assert_eq!(
+            reason(&two),
+            "invalid_exact_stellar_payload_wrong_operation"
+        );
+    }
+
+    /// A ledger endpoint with a fixed head and one simulation reply. It counts sends.
+    struct Ledger {
+        latest: u64,
+        simulated: Value,
+        sent: Mutex<u32>,
+    }
+    impl rpc::Rpc for Ledger {
+        fn call(&self, method: &str, _: Value) -> Result<Value> {
+            Ok(match method {
+                "getNetwork" => json!({"passphrase": passphrase(NETWORK).unwrap()}),
+                "getLatestLedger" => json!({"sequence": self.latest}),
+                "simulateTransaction" => self.simulated.clone(),
+                "sendTransaction" => {
+                    *self.sent.lock().unwrap() += 1;
+                    json!({})
+                }
+                other => panic!("unexpected ledger call {other}"),
+            })
+        }
+    }
+    fn transfer_event(contract: &str, from: &str, to: &str, units: i128) -> String {
+        let ScAddress::Contract(id) = address(contract).unwrap() else {
+            panic!("a contract")
+        };
+        xdr(&DiagnosticEvent {
+            in_successful_contract_call: true,
+            event: ContractEvent {
+                ext: ExtensionPoint::V0,
+                contract_id: Some(id),
+                type_: ContractEventType::Contract,
+                body: ContractEventBody::V0(ContractEventV0 {
+                    topics: vec![
+                        value_symbol("transfer").unwrap(),
+                        ScVal::Address(address(from).unwrap()),
+                        ScVal::Address(address(to).unwrap()),
+                    ]
+                    .try_into()
+                    .unwrap(),
+                    data: i128_value(units),
+                }),
+            },
+        })
+        .unwrap()
+    }
+    fn simulation(events: Vec<String>, resource_fee: i64) -> Value {
+        let resources = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: VecM::default(),
+                    read_write: VecM::default(),
+                },
+                instructions: 1,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee,
+        };
+        json!({"transactionData": xdr(&resources).unwrap(), "minResourceFee": resource_fee.to_string(),
+            "events": events})
+    }
+    fn admitted(
+        ledger: &Ledger,
+        request: &Value,
+        max_fee: u128,
+    ) -> std::result::Result<u32, &'static str> {
+        let limits = Limits {
+            max_fee,
+            wait: Duration::ZERO,
+        };
+        match admit(ledger, NETWORK, &service(), request, &limits).unwrap() {
+            Ok(admitted) => Ok(admitted.fee),
+            Err(Refusal(reason, _)) => Err(reason),
+        }
+    }
+
+    #[test]
+    fn the_ledger_must_show_the_one_transfer_under_the_fee_ceiling() {
+        let (signed, t) = signed();
+        let request = request(&signed, &t);
+        let wallet = signed.prepared.config.wallet.clone();
+        let token = asset(&signed);
+        let head = u64::from(signed.prepared.state.ledger);
+        let event = transfer_event(&token, &wallet, &t.recipient, t.amount);
+        let ledger = |events: Vec<String>, fee: i64| Ledger {
+            latest: head,
+            simulated: simulation(events, fee),
+            sent: Mutex::new(0),
+        };
+        // The fee of a settlement is the resource fee and the inclusion fee.
+        assert_eq!(
+            admitted(&ledger(vec![event.clone()], 40_000), &request, 50_000),
+            Ok(40_000 + INCLUSION_FEE)
+        );
+        assert_eq!(
+            admitted(&ledger(vec![event.clone()], 49_901), &request, 50_000),
+            Err("invalid_exact_stellar_payload_fee_exceeds_maximum")
+        );
+        // No transfer, two transfers, and a transfer of another amount, payee, payer or token.
+        assert_eq!(
+            admitted(&ledger(vec![], 100), &request, 50_000),
+            Err("invalid_exact_stellar_payload_no_transfer_events")
+        );
+        assert_eq!(
+            admitted(
+                &ledger(vec![event.clone(), event.clone()], 100),
+                &request,
+                50_000
+            ),
+            Err("invalid_exact_stellar_payload_multiple_transfers")
+        );
+        let other = account_for_seed(&[9; 32]);
+        for (changed, reason) in [
+            (
+                transfer_event(&token, &wallet, &t.recipient, t.amount + 1),
+                "invalid_exact_stellar_payload_event_wrong_amount",
+            ),
+            (
+                transfer_event(&token, &wallet, &other, t.amount),
+                "invalid_exact_stellar_payload_event_wrong_to",
+            ),
+            (
+                transfer_event(&token, &other, &t.recipient, t.amount),
+                "invalid_exact_stellar_payload_event_wrong_from",
+            ),
+            (
+                transfer_event(&test_support::vault(3), &wallet, &t.recipient, t.amount),
+                "invalid_exact_stellar_payload_event_wrong_asset",
+            ),
+        ] {
+            assert_eq!(
+                admitted(&ledger(vec![event.clone(), changed], 100), &request, 50_000),
+                Err(reason)
+            );
+        }
+        // A simulation that the ledger refuses, and an entry that outlives the seller's timeout.
+        let refused = Ledger {
+            latest: head,
+            simulated: json!({"error": "host error"}),
+            sent: Mutex::new(0),
+        };
+        assert_eq!(
+            admitted(&refused, &request, 50_000),
+            Err("invalid_exact_stellar_payload_simulation_failed")
+        );
+        let mut short = request.clone();
+        short["paymentRequirements"]["maxTimeoutSeconds"] = json!(30);
+        short["paymentPayload"]["accepted"]["maxTimeoutSeconds"] = json!(30);
+        assert_eq!(
+            admitted(&ledger(vec![event.clone()], 100), &short, 50_000),
+            Err("invalid_exact_stellar_signature_expiration_too_far")
+        );
+        // Nothing was sent by any check.
+        let checked = ledger(vec![event], 100);
+        admitted(&checked, &request, 50_000).unwrap();
+        assert_eq!(*checked.sent.lock().unwrap(), 0);
+    }
+}
