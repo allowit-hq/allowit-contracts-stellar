@@ -39,6 +39,8 @@ pub const MAX_LEDGERS: u32 = 64;
 pub const LEDGER_SECONDS: u64 = 6;
 /// The fault of a wallet that signs no payment authorization.
 pub const POLICY_WALLET: &str = "A policy wallet signs no payment authorization for a seller's facilitator: its contract checks the agent's signature against its fee account, whose own key signs nothing. It pays a seller that takes the proof of a settled transaction.";
+/// The fault of a payee that a payment authorization cannot pay.
+pub const CONTRACT_PAYEE: &str = "A payment authorization pays an account. The payee of this seller is a contract address, which this wallet does not pay.";
 const EVIDENCE_NAMESPACE: u32 = 402;
 const EVIDENCE_SCHEMA: u16 = 1;
 const DOMAIN: &[u8] = b"allowit-seller-settled-payment-v1";
@@ -112,9 +114,14 @@ fn shaped(c: &WalletConfig, r: &ExecutionRequest) -> Result<ExecutionRequest> {
     Ok(out)
 }
 
-/// The transfer that a request for a payment authorization names.
+/// The transfer that a request for a payment authorization names. Its payee is an account:
+/// the wallet's own payment, which carries the policy decision, pays no contract.
 pub fn transfer(c: &WalletConfig, r: &ExecutionRequest) -> Result<Transfer> {
-    transfer_from_request(c, &shaped(c, r)?)
+    let t = transfer_from_request(c, &shaped(c, r)?)?;
+    if account_key(&t.recipient).is_err() {
+        return Err(CONTRACT_PAYEE.into());
+    }
+    Ok(t)
 }
 
 fn retained_transfer(c: &WalletConfig, r: &ExecutionRequest) -> Result<Transfer> {
@@ -828,6 +835,14 @@ mod tests {
         // The ordinary decoder refuses it, and this decoder refuses an ordinary request.
         assert!(operation_from_request(&ordinary.config, &r).is_err());
         assert!(transfer(&ordinary.config, &ordinary.request).is_err());
+        // A contract payee is refused when the request is built, before anything is signed.
+        let contract = test_support::vault(3);
+        assert_eq!(
+            request(&ordinary.config, [5; 32], &contract, 1_000)
+                .unwrap_err()
+                .to_string(),
+            CONTRACT_PAYEE
+        );
         // Another evidence reference is no marker.
         let mut other = r.clone();
         other.evidence[0].schema += 1;

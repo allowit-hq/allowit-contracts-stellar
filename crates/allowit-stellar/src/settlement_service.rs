@@ -48,6 +48,7 @@ pub struct Service;
 pub static SERVICE: Service = Service;
 
 /// A refusal of the payload: the reason code of the reply and the payer when it is known.
+#[derive(Debug)]
 struct Refusal(&'static str, Option<String>);
 type Checked<T> = std::result::Result<T, Refusal>;
 
@@ -215,21 +216,32 @@ fn structure(
 /// Check the events of the simulation: one transfer of the asset from the payer to the payee
 /// of the amount, and no other contract event.
 fn events(simulated: &Value, a: &Authorization) -> Checked<()> {
-    let refused = |reason| Refusal(reason, Some(a.payer.clone()));
-    let mut transfers = 0;
+    let mut committed = Vec::new();
     for event in simulated["events"].as_array().into_iter().flatten() {
         let event: DiagnosticEvent = event
             .as_str()
             .and_then(|text| read(text).ok())
-            .ok_or_else(|| refused("unexpected_verify_error"))?;
+            .ok_or_else(|| Refusal("unexpected_verify_error", Some(a.payer.clone())))?;
         // A call that failed inside the transfer rolled its events back: the ledger keeps
         // none of them.
-        if event.event.type_ != ContractEventType::Contract || !event.in_successful_contract_call {
+        if event.in_successful_contract_call {
+            committed.push(event.event);
+        }
+    }
+    one_transfer(&committed, a)
+}
+
+/// Check that the contract events in `events` are exactly one transfer of the asset from the
+/// payer to the payee of the amount.
+fn one_transfer(events: &[ContractEvent], a: &Authorization) -> Checked<()> {
+    let refused = |reason| Refusal(reason, Some(a.payer.clone()));
+    let mut transfers = 0;
+    for event in events {
+        if event.type_ != ContractEventType::Contract {
             continue;
         }
-        let ContractEventBody::V0(body) = &event.event.body;
+        let ContractEventBody::V0(body) = &event.body;
         let contract = event
-            .event
             .contract_id
             .as_ref()
             .and_then(|id| address_text(&ScAddress::Contract(id.clone())).ok());
@@ -381,16 +393,20 @@ fn outcome(
     let payer = authorization.as_ref().map(|a| a.payer.as_str());
     let result: TransactionResult = read(&receipt.result_xdr).map_err(rail)?;
     let fee_paid = u128::try_from(result.fee_charged).ok();
-    let success = receipt.status == OperationStatus::Confirmed;
+    // A successful transaction paid the seller only when its committed events are the one
+    // transfer: a token can behave otherwise in the ledger than in the simulation. Without
+    // the authorization or the committed events, the payment is not established.
+    let reason = if receipt.status != OperationStatus::Confirmed {
+        Some("settle_exact_stellar_transaction_failed")
+    } else {
+        let (Some(a), Some(events)) = (&authorization, committed(rpc, &hash)?) else {
+            return Ok(Some(pending(network, authorization, hash)));
+        };
+        one_transfer(&events, a).err().map(|refusal| refusal.0)
+    };
     Ok(Some(Settled {
-        reply: settle_reply(
-            network,
-            success,
-            (!success).then_some("settle_exact_stellar_transaction_failed"),
-            payer,
-            Some(&hash),
-        ),
-        outcome: if success {
+        reply: settle_reply(network, reason.is_none(), reason, payer, Some(&hash)),
+        outcome: if reason.is_none() {
             Outcome::Settled
         } else {
             Outcome::Refused
@@ -399,6 +415,44 @@ fn outcome(
         transaction: Some(hash),
         fee_paid,
     }))
+}
+
+/// The contract events that the transaction `hash` committed, when the ledger returns them.
+fn committed(rpc: &dyn rpc::Rpc, hash: &[u8; 32]) -> HostResult<Option<Vec<ContractEvent>>> {
+    let reply = rpc
+        .call("getTransaction", json!({"hash": hex(hash)}))
+        .map_err(rail)?;
+    // A current endpoint lists the events of each operation.
+    if let Some(operations) = reply["events"]["contractEventsXdr"].as_array() {
+        let mut events = Vec::new();
+        for event in operations
+            .iter()
+            .flat_map(|of| of.as_array().into_iter().flatten())
+        {
+            let Some(event) = event.as_str().and_then(|text| read(text).ok()) else {
+                return Ok(None);
+            };
+            events.push(event);
+        }
+        return Ok(Some(events));
+    }
+    let Some(meta) = reply["resultMetaXdr"].as_str() else {
+        return Ok(None);
+    };
+    Ok(match read::<TransactionMeta>(meta) {
+        Ok(TransactionMeta::V3(meta)) => Some(
+            meta.soroban_meta
+                .map(|soroban| soroban.events.to_vec())
+                .unwrap_or_default(),
+        ),
+        Ok(TransactionMeta::V4(meta)) => Some(
+            meta.operations
+                .iter()
+                .flat_map(|operation| operation.events.to_vec())
+                .collect(),
+        ),
+        _ => None,
+    })
 }
 
 fn pending(network: &str, authorization: Option<Authorization>, hash: [u8; 32]) -> Settled {
@@ -938,6 +992,43 @@ mod tests {
                 50_000
             ),
             Ok(100 + INCLUSION_FEE)
+        );
+        // After the settlement, the committed events decide: a successful transaction that
+        // moved nothing, or something else, paid nobody. Without the events the payment is
+        // not established.
+        let authorization = structure(NETWORK, "", &request).unwrap().1;
+        struct Committed(Value);
+        impl rpc::Rpc for Committed {
+            fn call(&self, method: &str, _: Value) -> Result<Value> {
+                assert_eq!(method, "getTransaction");
+                Ok(self.0.clone())
+            }
+        }
+        let paid: DiagnosticEvent = read(&event).unwrap();
+        let listed = |events: Vec<&ContractEvent>| {
+            let events: Vec<String> = events.into_iter().map(|e| xdr(e).unwrap()).collect();
+            committed(
+                &Committed(json!({"events": {"contractEventsXdr": [events]}})),
+                &[9; 32],
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert!(one_transfer(&listed(vec![&paid.event]), &authorization).is_ok());
+        assert_eq!(
+            one_transfer(&listed(vec![]), &authorization).unwrap_err().0,
+            "invalid_exact_stellar_payload_no_transfer_events"
+        );
+        assert_eq!(
+            one_transfer(&listed(vec![&rolled_back.event]), &authorization)
+                .unwrap_err()
+                .0,
+            "invalid_exact_stellar_payload_event_wrong_amount"
+        );
+        assert!(
+            committed(&Committed(json!({"status": "SUCCESS"})), &[9; 32])
+                .unwrap()
+                .is_none()
         );
         // No transfer, two transfers, and a transfer of another amount, payee, payer or token.
         assert_eq!(

@@ -242,7 +242,8 @@ Another `extra.proof`, and the standard form in version 1, are refused before an
 
 A payment that the seller settles is the ordinary operation with one optional part,
 `PreparedOperation::payment_authorization`. Its request (`seller_settled::request`) names the transfer, carries
-no fee bound and holds the marker `seller_settled::marker()`. Preparation prepares the same transfer as the
+no fee bound and holds the marker `seller_settled::marker()`. Its payee is an account: a contract payee is
+refused when the request is built (`seller_settled::CONTRACT_PAYEE`). Preparation prepares the same transfer as the
 wallet would execute it itself, so the same policy checks decide, and adds the part: the unsigned entry of
 exactly `transfer(wallet, payTo, amount)` on the asset contract, and its host payload as the digest.
 
@@ -289,7 +290,10 @@ anything is submitted:
 fee, the invocation and the entry unchanged), signs it, sends it and reads the receipt within `Limits::wait`.
 The replies have the standard form: `{isValid, invalidReason?, payer?}` and
 `{success, errorReason?, payer?, transaction, network}`. A transaction that is sent and not confirmed in
-time is `settlement_pending` with its hash; `observe` reads it again.
+time is `settlement_pending` with its hash; `observe` reads it again. A successful transaction is a
+settlement only when its committed contract events are that one transfer: a token can act otherwise in the
+ledger than in the simulation. A successful transaction with other events answers `success: false` with the
+reason and its hash. Without the committed events, the answer stays `settlement_pending`.
 
 For a payment that the payer settles, `proof(challenge, receipt)` builds the request header from the outcome
 document of the confirmed operation: `X-PAYMENT` (version 1) or `PAYMENT-SIGNATURE` (version 2), the base64 JSON of
