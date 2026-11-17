@@ -263,13 +263,24 @@ pub fn challenge(network: &str, resource: &str, reply: &SellerReply<'_>) -> Resu
         .as_array()
         .filter(|accepts| !accepts.is_empty() && accepts.len() <= MAX_REQUIREMENTS)
         .ok_or_else(|| Error::usage("The seller's payment challenge lists no requirement."))?;
+    // Every wallet kind pays an offer that the payer settles; only some sign an offer that
+    // the seller settles. The selection knows no wallet, so the first offer that the payer
+    // settles is taken, and the first that the seller settles only when there is no such
+    // offer. A seller that lists both takes both.
     let mut refusal = None;
+    let mut seller_settled = None;
     for accepted in accepts {
         match requirement(network, resource, version, &document, accepted) {
-            Ok(Some(challenge)) => return Ok(challenge),
+            Ok(Some(challenge)) if challenge.settled_by == SettledBy::Payer => {
+                return Ok(challenge);
+            }
+            Ok(Some(challenge)) => seller_settled = seller_settled.or(Some(challenge)),
             Ok(None) => {}
             Err(error) => refusal = refusal.or(Some(error)),
         }
+    }
+    if let Some(challenge) = seller_settled {
+        return Ok(challenge);
     }
     Err(refusal.unwrap_or_else(|| {
         unsupported(format!(
@@ -557,6 +568,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(chosen.pay_to, PAY_TO);
+        // A challenge that lists a standard offer and one that the payer settles is paid by
+        // the second, in either order: every wallet kind can pay it.
+        let mut settled = offer(PAY_TO.into());
+        settled["extra"] = json!({"proof":"settled-transaction"});
+        for accepts in [
+            vec![offer(PAY_TO.into()), settled.clone()],
+            vec![settled.clone(), offer(PAY_TO.into())],
+        ] {
+            let document = json!({"x402Version":2,"resource":{"url":RESOURCE},"accepts":accepts});
+            let headers = vec![(
+                CHALLENGE_HEADER.to_owned(),
+                STANDARD.encode(serde_json::to_vec(&document).unwrap()),
+            )];
+            let chosen = challenge(
+                TESTNET,
+                RESOURCE,
+                &SellerReply {
+                    status: 402,
+                    headers: &headers,
+                    body: b"",
+                },
+            )
+            .unwrap();
+            assert_eq!(chosen.settled_by, SettledBy::Payer);
+        }
     }
 
     #[test]

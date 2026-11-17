@@ -238,6 +238,9 @@ states who settles it (`Challenge::settled_by`):
 - **The payer** (`SettledBy::Payer`): the seller states `extra.proof: "settled-transaction"`. Allowit settles
   the payment itself and presents the settled transaction.
 
+A challenge can list several offers. The first offer that the payer settles is taken, because every wallet
+kind can pay it; the first that the seller settles is taken only when the challenge has no such offer.
+
 Another `extra.proof`, and the standard form in version 1, are refused before any payment.
 
 ### Payment authorizations (`seller_settled`)
