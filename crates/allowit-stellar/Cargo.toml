@@ -27,6 +27,7 @@ zeroize = "1.9.1"
 time = { version = "0.3.55", features = ["parsing", "formatting"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+getrandom = "0.2"
 allowit-core = { git = "https://github.com/allowit-hq/allowit-core.git", rev = "f79c37dc108beccc64b5245b84b2032318bdb6da", version = "0.6", default-features = false, features = ["vendor"] }
 
 [dev-dependencies]

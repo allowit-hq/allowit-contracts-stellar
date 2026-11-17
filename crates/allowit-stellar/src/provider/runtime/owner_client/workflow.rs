@@ -273,7 +273,7 @@ pub fn deployment_policy(
         ))?,
         owner: owner.into(),
         agent: agent.into(),
-        // `with_fee_account` names the account that the owner's key derives.
+        // The deployment workflow makes the fee account and names it here.
         fee_account: None,
         server: server.into(),
         route: WalletRoute::PolicyWallet,
@@ -341,47 +341,22 @@ pub fn native_policy(
     checked(native::validate_config(&config))?;
     Ok(OwnerPolicy { policy, config })
 }
-/// The index of the first fee account of a policy wallet. The derivation message names it.
-pub const FEE_ACCOUNT_INDEX: u32 = 0;
-/// The one-time key of the fee account of a policy wallet: the owner signs the derivation
-/// message, which names the network, the agent and the wallet, and the signature is the seed.
-/// The key signs the creation of its account once and then has no authority.
-fn derive_fee_account_key(
-    signer: &dyn OwnerSigner,
-    c: &WalletConfig,
-) -> Result<native::owner::WalletKey> {
-    let digest = checked(native::owner::fee_account_derivation_digest(
-        &c.network,
-        &c.agent,
-        &c.wallet,
-        FEE_ACCOUNT_INDEX,
-    ))?;
-    let signature = checked(signer.sign_hash(&digest))?;
-    checked(native::signing::verify_digest(
-        signer.account(),
-        &digest,
-        &signature,
-    ))?;
-    Ok(native::owner::WalletKey::from_signature(&signature))
+/// The one-time setup key of a new fee account and the address that it names. The key is
+/// random and lives only in this call: it signs the creation of its account once.
+fn new_fee_account(c: &mut WalletConfig) -> Result<native::owner::WalletKey> {
+    let key = checked(native::owner::WalletKey::random())?;
+    c.fee_account = Some(key.account());
+    checked(native::validate_config(c))?;
+    Ok(key)
 }
-/// The deployment selection with its fee account: the account that the owner's deployment
-/// creates and funds, which sends the agent's operations on the wallet and pays their fees.
-/// The owner's key derives its address, so the same owner computes it again.
-pub fn with_fee_account(
-    mut selection: OwnerPolicy,
-    signer: &dyn OwnerSigner,
-) -> Result<OwnerPolicy> {
-    if selection.config.route != WalletRoute::PolicyWallet
-        || signer.account() != selection.config.owner
-    {
-        return Err(Error::usage(
-            "The owner of a policy wallet derives its fee account",
-        ));
+/// The identity of a workflow: its selection, its work and its fee ceiling. The identity of a
+/// deployment leaves out the fee account, because the workflow itself makes that account.
+fn workflow_identity(selection: &OwnerPolicy, work: &Work, max_fee: u32) -> Result<String> {
+    let mut selection = selection.clone();
+    if matches!(work, Work::Deploy) {
+        selection.config.fee_account = None;
     }
-    selection.config.fee_account =
-        Some(derive_fee_account_key(signer, &selection.config)?.account());
-    checked(native::validate_config(&selection.config))?;
-    Ok(selection)
+    intent_hash(&json!({"selection":selection,"work":work,"maxFeeStroops":max_fee}))
 }
 /// Convert a positive decimal asset amount to exact seven-decimal base units without floating point.
 pub fn amount_units(amount: &str) -> Result<i128> {
@@ -877,18 +852,28 @@ impl OwnerClient {
             ));
         }
         selection.validate()?;
-        let identity =
-            intent_hash(&json!({"selection":selection,"work":work,"maxFeeStroops":max_fee}))?;
+        // A deployment makes the fee account of its wallet. The caller names none.
+        let deploying = matches!(work, Work::Deploy);
+        if deploying && selection.config.fee_account.is_some() {
+            return Err(Error::usage(
+                "A deployment makes the fee account of its policy wallet",
+            ));
+        }
+        let identity = workflow_identity(selection, &work, max_fee)?;
         let mut record = match store.load::<Record>(id)? {
             Some(saved)
                 if saved.version == 1
                     && saved.request_id == id
                     && saved.backend == self.session.backend()
                     && saved.origin == self.session.origin()
-                    && saved.intent_hash == identity
-                    && intent_hash(
-                        &json!({"selection":saved.selection,"work":saved.work,"maxFeeStroops":saved.max_fee_stroops}),
-                    )? == identity =>
+                    && workflow_identity(&saved.selection, &saved.work, saved.max_fee_stroops)?
+                        == identity
+                    // A record of an earlier release keeps the identity that names its fee account.
+                    && (saved.intent_hash == identity
+                        || saved.intent_hash
+                            == intent_hash(
+                                &json!({"selection":saved.selection,"work":saved.work,"maxFeeStroops":saved.max_fee_stroops}),
+                            )?) =>
             {
                 saved
             }
@@ -910,6 +895,30 @@ impl OwnerClient {
                 complete: false,
             },
         };
+        // The fee account of a new policy wallet has a random setup key that lives in this
+        // call only. While no creation is signed, the record holds no account that anything
+        // was signed for: this run makes a new key and names its account. Once a creation is
+        // signed, the retained bytes carry both signatures and nothing needs the key again.
+        let mut setup_key = None;
+        if deploying
+            && !record.steps.iter().any(|s| {
+                s.signed_xdr.is_some()
+                    && matches!(
+                        s.packet.action.as_str(),
+                        native::owner::CREATE_FEE_ACCOUNT | "create_wallet"
+                    )
+            })
+        {
+            if record
+                .steps
+                .last()
+                .is_some_and(|s| s.packet.action == native::owner::CREATE_FEE_ACCOUNT)
+            {
+                record.steps.pop();
+            }
+            setup_key = Some(new_fee_account(&mut record.selection.config)?);
+        }
+        let selection = &record.selection.clone();
         for step in &record.steps {
             if step.signed_xdr.is_some() {
                 verify_retained(&record, step)?;
@@ -955,8 +964,8 @@ impl OwnerClient {
                     step: Option<Step>,
                 }
                 let (path, body) = match &record.work {
-                    // The owner's client names the fee account that its key derives. The
-                    // server adds it to the installation of the new wallet.
+                    // The owner's client names the fee account that it creates. The server
+                    // adds it to the installation of the new wallet.
                     Work::Deploy => (
                         "/api/native/deploy/prepare",
                         match &selection.config.fee_account {
@@ -1103,9 +1112,15 @@ impl OwnerClient {
                     Ok(result)
                 };
                 let signed = if step.packet.action == native::owner::CREATE_FEE_ACCOUNT {
-                    // The new account's own key signs its creation once. The owner's key
-                    // derives it again here; it is never stored.
-                    let key = derive_fee_account_key(signer, &selection.config)?;
+                    // The new account's own key signs its creation once. The key is random,
+                    // lives in this call and is never stored. A creation that was signed
+                    // before keeps its retained bytes; if the network never took them, the
+                    // account does not exist and a new request makes another one.
+                    let Some(key) = setup_key.take() else {
+                        return Err(Error::config(
+                            "The fee account of this request was signed for before and the network did not take it. The account does not exist and holds nothing. Start the deployment again with a new request ID",
+                        ));
+                    };
                     checked(proof.sign_with_wallet_key(clock()?, sign, &key))?
                 } else {
                     checked(proof.sign_with(clock()?, sign))?
@@ -1609,45 +1624,14 @@ struct NativeSetupRecord {
     identity: String,
     setup: native::owner::NativeSetup,
     source: native::AccountState,
-    /// How the wallet account's one-time key was made: `owner-signature` when the owner's
-    /// signer signs the derivation message the same way twice, so the owner can compute the
-    /// address again; `one-time` when it does not.
-    derivation: String,
+    /// A record of an earlier release names how its key was derived. Nothing reads it.
+    #[serde(rename = "derivation", default, skip_serializing)]
+    _derivation: Option<String>,
     created_at: u64,
     signed_xdr: Option<String>,
     signature: Option<Vec<u8>>,
     submitted: bool,
     receipt: Option<rpc::VerifiedReceipt>,
-}
-/// The index of the first wallet of an agent. The derivation message names it.
-pub const WALLET_INDEX: u32 = 0;
-/// The one-time key of the wallet account of `agent`: the owner signs the derivation message,
-/// and the signature is the seed. Ed25519 signatures are deterministic, so the same owner key
-/// derives the same account again. A signer that signs the same message in two ways still
-/// yields a usable one-time key, which the result reports as `one-time`.
-fn derive_wallet_key(
-    signer: &dyn OwnerSigner,
-    network: &str,
-    agent: &str,
-) -> Result<(native::owner::WalletKey, &'static str)> {
-    let digest = checked(native::owner::wallet_derivation_digest(
-        network,
-        agent,
-        WALLET_INDEX,
-    ))?;
-    let first = checked(signer.sign_hash(&digest))?;
-    let second = checked(signer.sign_hash(&digest))?;
-    checked(native::signing::verify_digest(
-        signer.account(),
-        &digest,
-        &first,
-    ))?;
-    let derivation = if first == second {
-        "owner-signature"
-    } else {
-        "one-time"
-    };
-    Ok((native::owner::WalletKey::from_signature(&first), derivation))
 }
 /// The server's first record of a wallet: the account, its roles and a policy that admits
 /// transfers of XLM. The owner's generated policy replaces it at activation.
@@ -1679,7 +1663,6 @@ pub fn bootstrap_configuration(
 fn configured(
     request: &crate::provider::runtime::owner::SetupRequest,
     wallet: &str,
-    derivation: &str,
     transaction: Option<(&str, u32)>,
 ) -> Result<Value> {
     let configuration = bootstrap_configuration(
@@ -1692,7 +1675,6 @@ fn configured(
     Ok(
         json!({"state":"configured","requestId":request.request_id,"network":request.network,"wallet":wallet,"owner":request.owner,"agent":request.agent,"server":request.server,
         "installation":native::hex(&configuration.policy_instance),"configuration":configuration,
-        "derivation":{"method":derivation,"walletIndex":WALLET_INDEX},
         "signers":{"owner":native::owner::OWNER_WEIGHT,"agent":native::owner::AUTOMATED_WEIGHT,"server":native::owner::AUTOMATED_WEIGHT,"walletKey":0},
         "thresholds":{"low":native::owner::PAYMENT_THRESHOLD,"medium":native::owner::PAYMENT_THRESHOLD,"high":native::owner::OWNER_THRESHOLD},
         "reserveStroops":native::owner::wallet_reserve(false).to_string(),
@@ -1705,7 +1687,6 @@ fn prepare_setup(
     request: &crate::provider::runtime::owner::SetupRequest,
     identity: &str,
     wallet: &str,
-    derivation: &str,
     now: u64,
 ) -> Result<NativeSetupRecord> {
     let source = checked(rpc::get_account(runtime.rpc(), &request.owner))?;
@@ -1727,7 +1708,7 @@ fn prepare_setup(
         identity: identity.into(),
         setup,
         source,
-        derivation: derivation.into(),
+        _derivation: None,
         created_at: now,
         signed_xdr: None,
         signature: None,
@@ -1772,13 +1753,15 @@ fn verify_setup_signatures(record: &NativeSetupRecord, signature: &[u8; 64]) -> 
     ))
 }
 /// Create one agent's wallet account with one owner-signed transaction, through SDK Runtime.
-/// The owner's signer derives the new account's one-time key, which co-signs once. Original
-/// unsigned intent and signed bytes are retained before direct native transmission. The
-/// result holds the server's first record of the wallet under `configuration`.
+/// The new account's one-time key is random and lives in this call: it co-signs the creation
+/// once. The transaction sets its weight to 0 and makes the owner a signer that reaches every
+/// threshold alone, so nothing stores or recovers the key. Original unsigned intent and
+/// signed bytes are retained before direct native transmission. The result holds the
+/// server's first record of the wallet under `configuration`.
 ///
-/// A retained request keeps its wallet. Once its transaction is signed, a resume reads the
-/// retained bytes and derives nothing, so a signer that does not sign deterministically still
-/// recovers a lost reply.
+/// Once the transaction of a request is signed, a resume reads the retained bytes and needs
+/// no key. A request that stopped before its signature names a new account on its next run:
+/// nothing was signed for the earlier one.
 pub fn configure_native(
     runtime: &crate::provider::runtime::Runtime,
     store: &Store,
@@ -1795,7 +1778,7 @@ pub fn configure_native(
     let identity = intent_hash(
         &json!({"network":request.network,"owner":request.owner,"agent":request.agent,"server":request.server,"requestId":request.request_id,"fee":request.fee_per_operation}),
     )?;
-    let mut derived = None;
+    let mut made = None;
     let mut record = match store.load::<NativeSetupRecord>(&request.request_id)? {
         Some(record) if record.identity == identity => record,
         Some(_) => {
@@ -1804,45 +1787,25 @@ pub fn configure_native(
             ));
         }
         None => {
-            let (key, derivation) = derive_wallet_key(signer, &request.network, &request.agent)?;
+            let key = checked(native::owner::WalletKey::random())?;
             let wallet = key.account();
-            derived = Some(key);
-            // A wallet account that already exists is this agent's wallet only with the exact
-            // roles. Any other authority on it is refused, and nothing is signed.
-            if let Some(existing) = checked(rpc::find_account(runtime.rpc(), &wallet))? {
-                if existing
-                    .wallet_status(&request.owner, &request.agent, &request.server)
-                    .is_err()
-                {
-                    return Err(Error::config(
-                        "The wallet account of this agent already exists with other signers or thresholds; setup never replaces existing authority",
-                    ));
-                }
-                return configured(request, &wallet, derivation, None);
-            }
-            prepare_setup(runtime, request, &identity, &wallet, derivation, clock()?)?
+            made = Some(key);
+            prepare_setup(runtime, request, &identity, &wallet, clock()?)?
         }
     };
     store.save(&request.request_id, &record)?;
     if record.signed_xdr.is_none() {
-        let key = match derived.take() {
+        let key = match made.take() {
             Some(key) => key,
-            None => derive_wallet_key(signer, &request.network, &request.agent)?.0,
+            None => {
+                // This run resumes a request that stopped before its signature. Its key is
+                // gone and nothing was signed for its account: prepare again for a new key.
+                let key = checked(native::owner::WalletKey::random())?;
+                record = prepare_setup(runtime, request, &identity, &key.account(), clock()?)?;
+                store.save(&request.request_id, &record)?;
+                key
+            }
         };
-        if key.account() != record.setup.wallet {
-            // The owner's signer does not sign deterministically, so this run holds another
-            // one-time key. Nothing was signed for the retained preparation: prepare again
-            // for the key of this run.
-            record = prepare_setup(
-                runtime,
-                request,
-                &identity,
-                &key.account(),
-                "one-time",
-                clock()?,
-            )?;
-            store.save(&request.request_id, &record)?;
-        }
         let expected = expected_setup(request, &record)?;
         let current = checked(rpc::get_account(runtime.rpc(), &request.owner))?;
         if current != record.source || clock()? < record.created_at {
@@ -1946,7 +1909,6 @@ pub fn configure_native(
     configured(
         request,
         &wallet,
-        &record.derivation,
         Some((&record.setup.transaction_hash, receipt.ledger)),
     )
 }

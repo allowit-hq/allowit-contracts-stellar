@@ -234,10 +234,11 @@ fn a_native_wallet_on_testnet_obeys_its_signers_weights_and_thresholds() {
         "faucet: {}",
         owner::fund_testnet_account(&owner_account, None).unwrap()
     );
-    // The wallet key derives from the owner's signature, as the product derives it.
+    // The product makes the setup key at random, signs the creation with it once and drops
+    // it. This test keeps the seed, to show below that the key has no authority after setup.
     let agent_account = key_account(&agent);
-    let derivation = owner::wallet_derivation_digest(NETWORK, &agent_account, 0).unwrap();
-    let wallet_key = owner::WalletKey::from_signature(&owner.sign(&derivation).to_bytes());
+    let wallet_own = fresh_key();
+    let wallet_key = owner::WalletKey::from_seed(&wallet_own.to_bytes());
     let roles = Roles {
         owner: owner_account,
         agent: agent_account,
@@ -313,12 +314,6 @@ fn a_native_wallet_on_testnet_obeys_its_signers_weights_and_thresholds() {
     );
 
     // No automated key pays alone, and the setup key pays never again.
-    let wallet_own = SigningKey::from_bytes(&{
-        // The setup key again, from the same derivation.
-        let mut bytes = b"allowit-stellar-native-wallet-seed-v1".to_vec();
-        bytes.extend_from_slice(&owner.sign(&derivation).to_bytes());
-        hash(&bytes)
-    });
     assert_eq!(key_account(&wallet_own), roles.wallet);
     for (label, keys) in [
         ("payment by the agent alone", vec![&agent]),

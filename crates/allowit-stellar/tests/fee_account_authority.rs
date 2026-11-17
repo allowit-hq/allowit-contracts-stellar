@@ -241,13 +241,12 @@ fn a_fee_account_on_testnet_obeys_its_signers_weights_and_thresholds() {
         "faucet: {}",
         owner::fund_testnet_account(&owner_account, None).unwrap()
     );
-    // The fee account key derives from the owner's signature over a message that names the
-    // network, the agent and the policy wallet, as the product derives it.
+    // The product makes the setup key at random, signs the creation with it once and drops
+    // it. This test keeps the seed, to show below that the key has no authority after setup.
     let agent_account = key_account(&agent);
     let policy_wallet = stellar_strkey::Contract(hash(agent_account.as_bytes())).to_string();
-    let derivation =
-        owner::fee_account_derivation_digest(NETWORK, &agent_account, &policy_wallet, 0).unwrap();
-    let account_key_once = owner::WalletKey::from_signature(&owner.sign(&derivation).to_bytes());
+    let own = fresh_key();
+    let account_key_once = owner::WalletKey::from_seed(&own.to_bytes());
     let roles = Roles {
         owner: owner_account,
         agent: agent_account,
@@ -258,20 +257,6 @@ fn a_fee_account_on_testnet_obeys_its_signers_weights_and_thresholds() {
         "owner {} agent {} server {} fee account {} for policy wallet {}",
         roles.owner, roles.agent, roles.server, roles.wallet, policy_wallet
     );
-    // The same owner derives another account for another agent, wallet or index, and the
-    // wallet account of this agent is another account again.
-    for other in [
-        owner::fee_account_derivation_digest(NETWORK, &roles.server, &policy_wallet, 0).unwrap(),
-        owner::fee_account_derivation_digest(NETWORK, &roles.agent, &policy_wallet, 1).unwrap(),
-        owner::fee_account_derivation_digest("stellar:pubnet", &roles.agent, &policy_wallet, 0)
-            .unwrap(),
-        owner::wallet_derivation_digest(NETWORK, &roles.agent, 0).unwrap(),
-    ] {
-        assert_ne!(
-            owner::WalletKey::from_signature(&owner.sign(&other).to_bytes()).account(),
-            roles.wallet
-        );
-    }
     assert!(
         rpc::find_account(&rpc, &roles.agent).unwrap().is_none(),
         "the agent key has no account"
@@ -363,12 +348,6 @@ fn a_fee_account_on_testnet_obeys_its_signers_weights_and_thresholds() {
     else {
         panic!()
     };
-    let own = SigningKey::from_bytes(&{
-        // The setup key again, from the same derivation.
-        let mut bytes = b"allowit-stellar-native-wallet-seed-v1".to_vec();
-        bytes.extend_from_slice(&owner.sign(&derivation).to_bytes());
-        hash(&bytes)
-    });
     assert_eq!(key_account(&own), roles.wallet);
     let signed = sign(&unsigned.tx, &[&owner, &own]);
     validate_signed_owner_transaction(&packet, &signed).unwrap();

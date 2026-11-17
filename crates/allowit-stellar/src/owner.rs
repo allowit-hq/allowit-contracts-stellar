@@ -39,9 +39,6 @@ pub const FEE_FLOAT_STROOPS: i64 = 5_000_000;
 pub const FEE_ACCOUNT_FLOAT_STROOPS: i64 = 50_000_000;
 const SIGNERS: i64 = 3;
 const MAX_STARTING_BALANCE: i64 = 1_000_000_000_000_000;
-const DERIVATION_TITLE: &str = "Allowit Native wallet key v1";
-const FEE_ACCOUNT_DERIVATION_TITLE: &str = "Allowit fee account key v1";
-const SEED_DOMAIN: &[u8] = b"allowit-stellar-native-wallet-seed-v1";
 
 /// The balance that the network locks in a wallet account: the account, its three signers and
 /// its trustline.
@@ -53,23 +50,6 @@ pub fn default_starting_balance(trustline: bool) -> i64 {
     wallet_reserve(trustline) + FEE_FLOAT_STROOPS
 }
 
-/// The message whose owner signature derives the wallet account's one-time key. It names the
-/// network, the agent and a wallet index, so each agent of one owner gets its own account and
-/// the owner can compute the address again from the same three values.
-pub fn wallet_derivation_message(network: &str, agent: &str, index: u32) -> Result<String> {
-    let network = passphrase(network)?;
-    account_key(agent)?;
-    Ok(format!(
-        "{DERIVATION_TITLE}\nNetwork: {network}\nAgent: {agent}\nWallet index: {index}\n\nThis signature derives the one-time setup key of this agent's wallet account. It does not authorize spending or move funds."
-    ))
-}
-/// The digest that the owner signs for the derivation: the SEP-53 digest of the message, the
-/// one that the owner sign-in signs.
-pub fn wallet_derivation_digest(network: &str, agent: &str, index: u32) -> Result<[u8; 32]> {
-    Ok(signing::signed_message_digest(&wallet_derivation_message(
-        network, agent, index,
-    )?))
-}
 /// The balance that a new fee account starts with: its reserve and the fee float.
 pub fn fee_account_starting_balance() -> i64 {
     wallet_reserve(false) + FEE_ACCOUNT_FLOAT_STROOPS
@@ -79,54 +59,31 @@ pub fn fee_account_starting_balance() -> i64 {
 pub fn fee_account_low(spendable: i64, max_fee_stroops: u32) -> bool {
     spendable < 2 * i64::from(max_fee_stroops)
 }
-/// The message whose owner signature derives the one-time key of a fee account. It names the
-/// network, the agent, the policy wallet that the account pays for and an index, so each
-/// policy wallet of one owner gets its own fee account and the owner can compute the address
-/// again. Its title differs from the title of a wallet account's message, so the two keys
-/// never coincide.
-pub fn fee_account_derivation_message(
-    network: &str,
-    agent: &str,
-    wallet: &str,
-    index: u32,
-) -> Result<String> {
-    let network = passphrase(network)?;
-    account_key(agent)?;
-    if !matches!(address(wallet)?, ScAddress::Contract(_)) {
-        return Err("A fee account pays for a policy wallet contract".into());
-    }
-    Ok(format!(
-        "{FEE_ACCOUNT_DERIVATION_TITLE}\nNetwork: {network}\nAgent: {agent}\nPolicy wallet: {wallet}\nFee account index: {index}\n\nThis signature derives the one-time setup key of the account that pays the network fees of this agent's policy wallet. It does not authorize spending or move funds."
-    ))
-}
-/// The digest that the owner signs for the derivation of a fee account key: the SEP-53 digest
-/// of the message.
-pub fn fee_account_derivation_digest(
-    network: &str,
-    agent: &str,
-    wallet: &str,
-    index: u32,
-) -> Result<[u8; 32]> {
-    Ok(signing::signed_message_digest(
-        &fee_account_derivation_message(network, agent, wallet, index)?,
-    ))
-}
 /// The request identity of the setup of the fee account of one policy wallet.
 pub fn fee_account_request_id(policy_instance: &[u8; 32]) -> String {
     format!("fee-account-{}", hex(&policy_instance[..16]))
 }
-/// The one-time key of a wallet account, from the owner's signature over the derivation
-/// message. It signs the creation of its account once. Setup sets its weight to 0.
+/// The one-time setup key of a new wallet account or fee account. The owner's client makes it
+/// from the operating system's random source, holds it in memory, signs the creation of its
+/// account with it once and drops it. The creation transaction sets its weight to 0 and makes
+/// the owner a signer that reaches every threshold alone, so nothing needs this key again and
+/// nothing stores, derives or recovers it.
 pub struct WalletKey(SigningKey);
 impl WalletKey {
-    pub fn from_signature(signature: &[u8; 64]) -> Self {
-        let mut bytes = SEED_DOMAIN.to_vec();
-        bytes.extend_from_slice(signature);
-        let mut seed = hash(&bytes);
+    /// A new random key. It exists only in the memory of the caller.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn random() -> Result<Self> {
+        let mut seed = [0u8; 32];
+        getrandom::getrandom(&mut seed)
+            .map_err(|_| "The operating system gave no random bytes for the setup key")?;
         let key = SigningKey::from_bytes(&seed);
         zeroize::Zeroize::zeroize(&mut seed);
-        zeroize::Zeroize::zeroize(&mut bytes);
-        Self(key)
+        Ok(Self(key))
+    }
+    /// A key from a seed that the caller holds. The owner's client never uses it: a test keeps
+    /// the seed to show that the key has no authority after setup.
+    pub fn from_seed(seed: &[u8; 32]) -> Self {
+        Self(SigningKey::from_bytes(seed))
     }
     /// The address of the wallet account.
     pub fn account(&self) -> String {
@@ -767,10 +724,9 @@ mod tests {
     fn engine() -> String {
         account_for_seed(&[3; 32])
     }
-    /// The wallet key that the owner of seed 1 derives for `agent`.
+    /// A fixed setup key for `agent`, so the tests name the same wallet account each time.
     fn wallet_key(agent: &str, index: u32) -> WalletKey {
-        let digest = wallet_derivation_digest(NETWORK, agent, index).unwrap();
-        WalletKey::from_signature(&SigningKey::from_bytes(&[1; 32]).sign(&digest).to_bytes())
+        WalletKey::from_seed(&hash(format!("wallet {agent} {index}").as_bytes()))
     }
     fn terms<'a>(wallet: &'a str, agent: &'a str, engine: &'a str) -> SetupTerms<'a> {
         SetupTerms {
@@ -933,25 +889,13 @@ mod tests {
         );
     }
     #[test]
-    fn two_agents_of_one_owner_get_two_accounts_and_the_owner_computes_each_again() {
-        let (first, second) = (agent(2), agent(4));
-        let a = wallet_key(&first, 0).account();
-        let b = wallet_key(&second, 0).account();
-        assert_ne!(a, b);
-        assert_eq!(a, wallet_key(&first, 0).account());
-        assert_ne!(a, wallet_key(&first, 1).account());
-        // Another network or another owner derives another account.
-        let digest = wallet_derivation_digest("stellar:pubnet", &first, 0).unwrap();
-        let other =
-            WalletKey::from_signature(&SigningKey::from_bytes(&[1; 32]).sign(&digest).to_bytes());
-        assert_ne!(a, other.account());
-        let digest = wallet_derivation_digest(NETWORK, &first, 0).unwrap();
-        let stranger =
-            WalletKey::from_signature(&SigningKey::from_bytes(&[9; 32]).sign(&digest).to_bytes());
-        assert_ne!(a, stranger.account());
-        let message = wallet_derivation_message(NETWORK, &first, 0).unwrap();
-        assert!(message.starts_with("Allowit Native wallet key v1\nNetwork: Test SDF Network"));
-        assert!(message.contains(&first) && message.contains("Wallet index: 0"));
+    fn each_setup_key_is_new_and_names_another_account() {
+        let (a, b) = (WalletKey::random().unwrap(), WalletKey::random().unwrap());
+        assert_ne!(a.account(), b.account());
+        // The key signs for its own account and for no other.
+        let digest = [7; 32];
+        signing::verify_digest(&a.account(), &digest, &a.sign_hash(&digest)).unwrap();
+        assert!(signing::verify_digest(&b.account(), &digest, &a.sign_hash(&digest)).is_err());
     }
     #[test]
     fn reused_roles_and_a_shared_owner_account_are_refused() {
@@ -1147,21 +1091,12 @@ mod tests {
     }
 
     // A fee account: the account that sends the agent's operations on one policy wallet.
-    const POLICY_WALLET: [u8; 32] = [4; 32];
-    fn policy_wallet(n: [u8; 32]) -> String {
-        stellar_strkey::Contract(n).to_string()
-    }
-    /// The fee account key that the owner of seed `owner` derives.
-    fn fee_key(owner: u8, network: &str, agent: &str, wallet: &str, index: u32) -> WalletKey {
-        let digest = fee_account_derivation_digest(network, agent, wallet, index).unwrap();
-        WalletKey::from_signature(
-            &SigningKey::from_bytes(&[owner; 32])
-                .sign(&digest)
-                .to_bytes(),
-        )
+    /// A fixed setup key of the fee account for `agent`.
+    fn fee_key(agent: &str) -> WalletKey {
+        WalletKey::from_seed(&hash(format!("fee account {agent}").as_bytes()))
     }
     fn fee_setup(agent: &str) -> NativeSetup {
-        let account = fee_key(1, NETWORK, agent, &policy_wallet(POLICY_WALLET), 0).account();
+        let account = fee_key(agent).account();
         prepare_fee_account_setup(
             &owner_state(),
             &FeeAccountTerms {
@@ -1176,50 +1111,6 @@ mod tests {
         )
         .unwrap()
     }
-    #[test]
-    fn a_fee_account_key_differs_by_network_owner_agent_wallet_and_index() {
-        let (first, second) = (agent(2), agent(4));
-        let wallet = policy_wallet(POLICY_WALLET);
-        let base = fee_key(1, NETWORK, &first, &wallet, 0).account();
-        // The same owner computes the same account again.
-        assert_eq!(base, fee_key(1, NETWORK, &first, &wallet, 0).account());
-        let others = [
-            fee_key(1, "stellar:pubnet", &first, &wallet, 0).account(),
-            fee_key(9, NETWORK, &first, &wallet, 0).account(),
-            fee_key(1, NETWORK, &second, &wallet, 0).account(),
-            fee_key(1, NETWORK, &first, &policy_wallet([5; 32]), 0).account(),
-            fee_key(1, NETWORK, &first, &wallet, 1).account(),
-            // The wallet account of the same owner, network, agent and index is another key.
-            wallet_key(&first, 0).account(),
-        ];
-        let mut all = others.to_vec();
-        all.push(base);
-        all.sort();
-        all.dedup();
-        assert_eq!(all.len(), 7);
-        let message = fee_account_derivation_message(NETWORK, &first, &wallet, 0).unwrap();
-        assert!(message.starts_with("Allowit fee account key v1\nNetwork: Test SDF Network"));
-        assert!(message.contains(&first) && message.contains(&wallet));
-        assert!(message.contains("Fee account index: 0"));
-        // A fee account pays for a policy wallet contract, never for an account.
-        assert!(fee_account_derivation_message(NETWORK, &first, &second, 0).is_err());
-    }
-    /// The fixed vector that the browser package derives too: the same message, the same
-    /// signature and the same account.
-    #[test]
-    fn the_fee_account_derivation_vector_is_stable() {
-        let agent = agent(2);
-        let wallet = policy_wallet(POLICY_WALLET);
-        assert_eq!(
-            fee_account_derivation_message(NETWORK, &agent, &wallet, 0).unwrap(),
-            "Allowit fee account key v1\nNetwork: Test SDF Network ; September 2015\nAgent: GCATS5YOVB6ROX2WUNKGNQ2MP3GMXDMKSG2O4N5CLX3A6W4PZGZZI55U\nPolicy wallet: CACAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAINCW\nFee account index: 0\n\nThis signature derives the one-time setup key of the account that pays the network fees of this agent's policy wallet. It does not authorize spending or move funds."
-        );
-        assert_eq!(
-            fee_key(1, NETWORK, &agent, &wallet, 0).account(),
-            VECTOR_ACCOUNT
-        );
-    }
-    const VECTOR_ACCOUNT: &str = "GD2YKHPRFRN2IO3WBQKAQ3YRDJYD5VH6CVIY6PME5GJ54UA6NP5KI2W7";
     #[test]
     fn a_fee_account_setup_creates_the_exact_roles_with_the_reserve_and_the_float() {
         let agent = agent(2);
@@ -1279,8 +1170,7 @@ mod tests {
     #[test]
     fn a_fee_account_is_set_up_on_every_network_and_a_wallet_account_on_testnet_only() {
         let agent = agent(2);
-        let wallet = policy_wallet(POLICY_WALLET);
-        let account = fee_key(1, "stellar:pubnet", &agent, &wallet, 0).account();
+        let account = fee_key(&agent).account();
         let server = engine();
         let terms = FeeAccountTerms {
             account: &account,

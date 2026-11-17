@@ -802,10 +802,7 @@ fn a_retained_setup_of_an_earlier_release_stays_readable_and_is_never_signed() {
 /// account never co-signs.
 #[test]
 fn native_setup_takes_the_owner_signature_and_the_wallet_key_signature() {
-    let digest = owner::wallet_derivation_digest("stellar:testnet", &account(12), 0).unwrap();
-    let key = || {
-        owner::WalletKey::from_signature(&SigningKey::from_bytes(&OWNER).sign(&digest).to_bytes())
-    };
+    let key = || owner::WalletKey::from_seed(&[21; 32]);
     let state = AccountState {
         address: owner(),
         sequence: 41,
@@ -860,7 +857,7 @@ fn native_setup_takes_the_owner_signature_and_the_wallet_key_signature() {
         by_wallet.signature.as_slice(),
     )
     .unwrap();
-    let stranger = owner::WalletKey::from_signature(&[7; 64]);
+    let stranger = owner::WalletKey::from_seed(&[7; 32]);
     assert!(
         validate_native_setup(&prepared, &expected, NOW)
             .unwrap()
