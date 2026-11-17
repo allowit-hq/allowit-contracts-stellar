@@ -1036,8 +1036,11 @@ impl crate::host::vendors::RuntimeProvider for Provider {
             }
             return self.packet(&p);
         }
+        // A wallet that is no classic account: the rail decides in one place whether its
+        // kind signs a payment authorization.
         if p.payment_authorization.is_some() {
-            return Err(Error::unsupported(native::seller_settled::POLICY_WALLET));
+            native::seller_settled::signs(&p.config)
+                .map_err(|error| Error::unsupported(error.to_string()))?;
         }
         self.packet(&checked(native::authorize_server_using(
             &p,

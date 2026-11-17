@@ -250,7 +250,8 @@ payee is passed over for its next offer. Preparation prepares the same transfer 
 wallet would execute it itself, so the same policy checks decide, and adds the part: the unsigned entry of
 exactly `transfer(wallet, payTo, amount)` on the asset contract, and its host payload as the digest.
 
-- **Who signs.** Only a keypair wallet. The agent and the service each sign the digest (`sign`), and
+- **Who signs.** Only a keypair wallet. `seller_settled::signs` is the one place that decides it by wallet
+  kind, and `signed_entry` is the one function that produces the signature. The agent and the service each sign the digest (`sign`), and
   `seller_settled::authorize` assembles the entry with both account signatures, checks the wallet account
   against the ledger and simulates the payload in enforce mode. Their weights reach the medium threshold only
   together. A policy wallet is refused with `seller_settled::POLICY_WALLET`: its contract checks an

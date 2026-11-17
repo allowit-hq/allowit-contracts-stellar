@@ -113,15 +113,27 @@ pub fn request(
     Ok(request)
 }
 
+/// Whether the wallet of `c` signs a payment authorization. This is the one place that decides
+/// it by wallet kind; every other part of the module asks here.
+///
+/// A keypair wallet signs: its entry carries the account signatures of the agent and the
+/// service ([`signed_entry`]). A policy wallet signs none today, see [`POLICY_WALLET`]. An
+/// authorization form of a policy wallet has two places to fill: this function admits its
+/// kind, and [`signed_entry`] produces the signature that its contract checks.
+pub fn signs(c: &WalletConfig) -> Result<()> {
+    match c.route {
+        WalletRoute::Native => Ok(()),
+        _ => Err(POLICY_WALLET.into()),
+    }
+}
+
 /// The same transfer in the shape of an ordinary request, for decoding alone: the fee bound
 /// names the wallet and pays nothing.
 fn shaped(c: &WalletConfig, r: &ExecutionRequest) -> Result<ExecutionRequest> {
     if !is_request(r) {
         return Err("The request asks for no payment authorization".into());
     }
-    if c.route != WalletRoute::Native {
-        return Err(POLICY_WALLET.into());
-    }
+    signs(c)?;
     let mut out = r.clone();
     out.evidence.clear();
     out.fee_bounds = Some(vec![WorkflowFeeBound {
@@ -246,9 +258,7 @@ fn signature(bytes: &[u8]) -> Result<[u8; 64]> {
 pub fn validate(p: &PreparedOperation) -> Result<()> {
     let a = part(p)?;
     let c = &p.config;
-    if c.route != WalletRoute::Native {
-        return Err(POLICY_WALLET.into());
-    }
+    signs(c)?;
     if !is_request(&a.request)
         || a.request.operation != p.request.operation
         || retained_transfer(c, &shaped(c, &a.request)?)? != retained_transfer(c, &p.request)?
@@ -350,9 +360,7 @@ pub fn attach(
     if p.payment_authorization.is_some() {
         return Err("The operation is already a payment authorization".into());
     }
-    if p.config.route != WalletRoute::Native {
-        return Err(POLICY_WALLET.into());
-    }
+    signs(&p.config)?;
     let entry = entry(&p)?;
     p.payment_authorization = Some(Box::new(PaymentAuthorization {
         request: r.clone(),
@@ -483,6 +491,9 @@ fn role_signatures(
 
 /// The signed entry of `p`: the entry with the account signatures of the agent and the
 /// service, in the order of their public keys.
+///
+/// This is the one function that produces the signature of a payment authorization. The
+/// signature of another wallet kind, which [`signs`] would admit first, is produced here.
 fn signed_entry(
     p: &PreparedOperation,
     a: &PaymentAuthorization,
