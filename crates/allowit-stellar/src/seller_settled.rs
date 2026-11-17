@@ -661,7 +661,8 @@ fn carried_signatures(
 /// of the entry. A successful transaction that carries the wallet's entry of `p`, which the
 /// nonce binds, with the signatures of both roles, settled it. A complete read without such a
 /// transaction, after the expiry ledger, proves the lapse: a settled entry moved the amount
-/// and the token reported it.
+/// and the token reported it. The read is complete only when the ledger also returned the
+/// transaction of every reported transfer.
 pub fn observe(rpc: &dyn rpc::Rpc, p: &PreparedOperation) -> Result<Observed> {
     let a = part(p)?;
     validate_retained_prepared(p)?;
@@ -670,8 +671,11 @@ pub fn observe(rpc: &dyn rpc::Rpc, p: &PreparedOperation) -> Result<Observed> {
     }
     let unsigned: SorobanAuthorizationEntry = read(&a.authorization_xdr)?;
     let found = transfers(rpc, p)?;
+    // A reported transfer whose transaction cannot be read may be the settlement.
+    let mut unread = false;
     for hash in &found.transactions {
         let Some(mut receipt) = rpc::receipt_by_hash(rpc, &p.config.network, hash)? else {
+            unread = true;
             continue;
         };
         if receipt.status != OperationStatus::Confirmed {
@@ -697,7 +701,7 @@ pub fn observe(rpc: &dyn rpc::Rpc, p: &PreparedOperation) -> Result<Observed> {
         validate_settled(&signed, &receipt)?;
         return Ok(Observed::Settled(Box::new(Settlement { signed, receipt })));
     }
-    Ok(if found.complete {
+    Ok(if found.complete && !unread {
         Observed::Lapsed
     } else {
         Observed::Open
@@ -1038,6 +1042,53 @@ mod tests {
         assert!(
             rpc::validate_settled_policy_packet(&test_support::policy_signed(), &receipt).is_err()
         );
+    }
+
+    /// A ledger past the expiry of the entry, with the token's transfer events and one reply
+    /// to every transaction lookup.
+    struct Events {
+        passphrase: String,
+        latest: u64,
+        events: Vec<serde_json::Value>,
+        transaction: serde_json::Value,
+    }
+    impl rpc::Rpc for Events {
+        fn call(&self, method: &str, _: serde_json::Value) -> Result<serde_json::Value> {
+            Ok(match method {
+                "getNetwork" => json!({"passphrase": self.passphrase}),
+                "getEvents" => {
+                    json!({"latestLedger": self.latest, "events": self.events, "cursor": "end"})
+                }
+                "getTransaction" => self.transaction.clone(),
+                other => panic!("unexpected ledger call: {other}"),
+            })
+        }
+    }
+
+    #[test]
+    fn an_unreadable_candidate_transaction_keeps_the_outcome_open() {
+        let p = keypair_wallet();
+        let last = u64::from(expiry_ledger(part(&p).unwrap()).unwrap());
+        let ledger = |events: Vec<serde_json::Value>| Events {
+            passphrase: passphrase(&p.config.network).unwrap().to_owned(),
+            latest: last + 5,
+            events,
+            transaction: json!({
+                "status": "NOT_FOUND",
+                "oldestLedger": 1,
+                "latestLedger": last + 5,
+                "latestLedgerCloseTime": "86800",
+            }),
+        };
+        // No transfer through the expiry ledger: the entry lapsed.
+        assert!(lapsed(&ledger(Vec::new()), &p).unwrap());
+        // A transfer whose transaction the ledger does not return may have settled the entry.
+        let candidate = json!({"ledger": last, "txHash": "09".repeat(32)});
+        assert!(matches!(
+            observe(&ledger(vec![candidate.clone()]), &p).unwrap(),
+            Observed::Open
+        ));
+        assert!(!lapsed(&ledger(vec![candidate]), &p).unwrap());
     }
 
     /// A ledger endpoint that must never be called.
