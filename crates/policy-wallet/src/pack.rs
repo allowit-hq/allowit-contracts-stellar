@@ -4,9 +4,7 @@
 //! decode is `InvalidState`, and an owner value that does not fit is `InvalidParam`.
 use crate::AllowitWalletError as Error;
 use allowit::{AllowitValue, MAX_ITEMS, MAX_TEXT};
-use soroban_sdk::{
-    Address, BytesN, Env, String, Vec, address_payload::AddressPayload, xdr::ToXdr,
-};
+use soroban_sdk::{Address, BytesN, Env, String, Vec, address_payload::AddressPayload, xdr::ToXdr};
 
 /// Appends to a fixed buffer.
 pub(crate) struct Writer<'a> {

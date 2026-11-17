@@ -307,12 +307,7 @@ impl Header {
         self.head[H_FLAGS] & PAUSED != 0
     }
     /// Store the configuration with a new pause flag and version; the rest stays as it is.
-    fn store_with(
-        &self,
-        env: &Env,
-        paused: bool,
-        version: u32,
-    ) -> Result<(), AllowitWalletError> {
+    fn store_with(&self, env: &Env, paused: bool, version: u32) -> Result<(), AllowitWalletError> {
         let mut head = self.head;
         head[H_FLAGS] = (head[H_FLAGS] & !PAUSED) | if paused { PAUSED } else { 0 };
         head[H_VERSION..H_VERSION + 4].copy_from_slice(&version.to_be_bytes());
@@ -396,7 +391,9 @@ impl Config {
             _ => return Err(AllowitWalletError::UnsupportedAsset),
         };
         let owner = match self.owner.to_payload() {
-            Some(AddressPayload::AccountIdPublicKeyEd25519(k) | AddressPayload::ContractIdHash(k)) => k,
+            Some(
+                AddressPayload::AccountIdPublicKeyEd25519(k) | AddressPayload::ContractIdHash(k),
+            ) => k,
             None => return Err(AllowitWalletError::InvalidActor),
         };
         w.byte(CONTRACT_VERSION as u8)?;
@@ -474,7 +471,8 @@ fn read_figures(env: &Env) -> Result<Stored, AllowitWalletError> {
             figures.spent = r.amount()?;
         }
         if mask & CALLS != 0 {
-            figures.calls = u64::try_from(r.uint()?).map_err(|_| AllowitWalletError::InvalidState)?;
+            figures.calls =
+                u64::try_from(r.uint()?).map_err(|_| AllowitWalletError::InvalidState)?;
         }
         if !r.done() {
             return Err(AllowitWalletError::InvalidState);
@@ -589,7 +587,10 @@ fn decoded(list: &Vec<AllowitRule>) -> Result<(), AllowitWalletError> {
     Ok(())
 }
 /// Check an owner configuration and keep, for Standard, only the params of its rules.
-fn validated<P: AllowitPolicy>(env: &Env, mut config: Config) -> Result<Config, AllowitWalletError> {
+fn validated<P: AllowitPolicy>(
+    env: &Env,
+    mut config: Config,
+) -> Result<Config, AllowitWalletError> {
     let wallet = env.current_contract_address();
     if config.owner == wallet || config.agent == config.server {
         return Err(AllowitWalletError::InvalidActor);
@@ -1033,7 +1034,11 @@ impl AllowitPolicy for UpgradeConfig {
 }
 
 /// Pause or resume the agent path; the owner targets the next deployment version.
-pub fn set_pause(env: &Env, paused: bool, deployment_version: u32) -> Result<(), AllowitWalletError> {
+pub fn set_pause(
+    env: &Env,
+    paused: bool,
+    deployment_version: u32,
+) -> Result<(), AllowitWalletError> {
     let header = Header::read(env)?;
     header.owner(env)?.require_auth();
     if next(header.version())? != deployment_version {

@@ -40,14 +40,19 @@ fn main() {
     println!("cargo:rerun-if-changed={}", policy.display());
     println!("cargo:rerun-if-changed={}", owner_source.display());
     let compiled = fs::read_to_string(&policy).unwrap();
-    for forbidden in ["unsafe", "include!", "include_str!", "include_bytes!", "#[path"] {
+    for forbidden in [
+        "unsafe",
+        "include!",
+        "include_str!",
+        "include_bytes!",
+        "#[path",
+    ] {
         assert!(
             !compiled.contains(forbidden),
             "a policy source is one safe file: it must not use `{forbidden}`"
         );
     }
-    let source = if owner_source.exists() && env::var_os("CARGO_FEATURE_TEST_CATCHING").is_none()
-    {
+    let source = if owner_source.exists() && env::var_os("CARGO_FEATURE_TEST_CATCHING").is_none() {
         fs::read(&owner_source).unwrap()
     } else {
         compiled.clone().into_bytes()
@@ -64,6 +69,10 @@ fn main() {
         figures = 15;
     }
     let out = Path::new(&env::var("OUT_DIR").unwrap()).to_path_buf();
-    fs::write(out.join("source_hash.rs"), format!("[{}]", bytes.join(", "))).unwrap();
+    fs::write(
+        out.join("source_hash.rs"),
+        format!("[{}]", bytes.join(", ")),
+    )
+    .unwrap();
     fs::write(out.join("figures.rs"), format!("{figures}")).unwrap();
 }
