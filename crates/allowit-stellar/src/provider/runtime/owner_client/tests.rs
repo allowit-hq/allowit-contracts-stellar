@@ -925,3 +925,19 @@ fn changed_update_packets_and_invalid_updates_never_reach_the_signer() {
     let update = limit_update(&native, 20_000_000);
     assert!(crate::provider::params_update::next_params(&native.config, &update).is_err());
 }
+
+/// A wallet fits the profile of its tier. A Simple or Common wallet has the policy wallet
+/// profile for canonical rules and for a source that the server evaluates in full.
+#[test]
+fn a_wallet_fits_the_profile_of_its_tier() {
+    use super::profile_fits;
+    use crate::PolicyTier;
+    const WALLET: &str = "allowit-policy-wallet-v1";
+    const CUSTOM: &str = "allowit-custom-wallet-v1";
+    for tier in [PolicyTier::Simple, PolicyTier::Common] {
+        assert!(profile_fits(tier, WALLET));
+        assert!(!profile_fits(tier, CUSTOM));
+    }
+    assert!(profile_fits(PolicyTier::Custom, CUSTOM));
+    assert!(!profile_fits(PolicyTier::Custom, WALLET));
+}
