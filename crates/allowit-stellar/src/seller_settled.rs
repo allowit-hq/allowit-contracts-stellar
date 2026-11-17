@@ -496,23 +496,66 @@ pub fn validate_signed(s: &SignedOperation) -> Result<()> {
     retained_entry(s).map(drop)
 }
 
-/// The authorization entries of the one invocation of `receipt`'s transaction.
-fn carried(receipt: &rpc::VerifiedReceipt) -> Result<Vec<SorobanAuthorizationEntry>> {
-    let TransactionEnvelope::Tx(envelope) = read(&receipt.envelope_xdr)? else {
-        return Ok(Vec::new());
+/// The seller's bound on the time from an authorization to its settlement, in seconds, when
+/// its requirement states none. The payer and the settlement service use the same value.
+pub const DEFAULT_SETTLE_WITHIN: u64 = 60;
+
+/// The one invocation of `receipt`'s transaction. A fee bump carries the transaction that it
+/// pays for.
+fn invocation(receipt: &rpc::VerifiedReceipt) -> Result<Option<InvokeHostFunctionOp>> {
+    let operations = match read::<TransactionEnvelope>(&receipt.envelope_xdr)? {
+        TransactionEnvelope::Tx(envelope) => envelope.tx.operations,
+        TransactionEnvelope::TxFeeBump(envelope) => {
+            let FeeBumpTransactionInnerTx::Tx(inner) = envelope.tx.inner_tx;
+            inner.tx.operations
+        }
+        TransactionEnvelope::TxV0(_) => return Ok(None),
     };
-    let [operation] = envelope.tx.operations.as_slice() else {
-        return Ok(Vec::new());
+    let [operation] = operations.as_slice() else {
+        return Ok(None);
     };
     let OperationBody::InvokeHostFunction(op) = &operation.body else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
-    Ok(op.auth.to_vec())
+    Ok(Some(op.clone()))
+}
+
+/// The authorization entries of the one invocation of `receipt`'s transaction.
+fn carried(receipt: &rpc::VerifiedReceipt) -> Result<Vec<SorobanAuthorizationEntry>> {
+    Ok(invocation(receipt)?.map_or_else(Vec::new, |op| op.auth.to_vec()))
+}
+
+/// Whether the transaction of `receipt` executes `entry` when it succeeds. The ledger admits
+/// an entry that no call uses and leaves its nonce unspent, so the presence of the entry
+/// proves nothing. The transaction executes it when its one invocation is the call that the
+/// entry authorizes, and no other entry of the same address can authorize that call: the
+/// token then asks the wallet for exactly this authorization.
+fn executes(receipt: &rpc::VerifiedReceipt, entry: &SorobanAuthorizationEntry) -> Result<bool> {
+    let Some(op) = invocation(receipt)? else {
+        return Ok(false);
+    };
+    let HostFunction::InvokeContract(call) = &op.host_function else {
+        return Ok(false);
+    };
+    let SorobanCredentials::Address(credentials) = &entry.credentials else {
+        return Ok(false);
+    };
+    let of_address = op
+        .auth
+        .iter()
+        .filter(|carried| {
+            matches!(&carried.credentials, SorobanCredentials::Address(other) if other.address == credentials.address)
+        })
+        .count();
+    Ok(of_address == 1
+        && op.auth.contains(entry)
+        && entry.root_invocation.sub_invocations.is_empty()
+        && entry.root_invocation.function == SorobanAuthorizedFunction::ContractFn(call.clone()))
 }
 
 /// Check that `receipt` is the settlement of `s`: a successful transaction, on the network of
-/// the wallet, whose invocation carries the exact signed entry of `s`. The ledger admits that
-/// entry once, so one transaction can carry it and succeed.
+/// the wallet, whose one invocation is the transfer that the exact signed entry of `s`
+/// authorizes. The ledger admits that entry once, so one such transaction can succeed.
 pub fn validate_settled(s: &SignedOperation, receipt: &rpc::VerifiedReceipt) -> Result<()> {
     let entry = retained_entry(s)?;
     rpc::validate_receipt(
@@ -522,7 +565,7 @@ pub fn validate_settled(s: &SignedOperation, receipt: &rpc::VerifiedReceipt) -> 
     )?;
     if receipt.settles != Some(s.prepared.transaction_hash)
         || receipt.status != OperationStatus::Confirmed
-        || !carried(receipt)?.contains(&entry)
+        || !executes(receipt, &entry)?
     {
         return Err("The receipt does not settle this payment authorization".into());
     }
@@ -691,6 +734,11 @@ pub fn observe(rpc: &dyn rpc::Rpc, p: &PreparedOperation) -> Result<Observed> {
         }) else {
             continue;
         };
+        // A transaction that carries the entry in another shape, such as a call of another
+        // contract that moves the amount, may have spent it. Its outcome stays open.
+        if !executes(&receipt, &entry)? {
+            return Ok(Observed::Open);
+        }
         let signed = SignedOperation {
             prepared: p.clone(),
             transaction_xdr: payload_transaction(p, &entry)?,
@@ -1038,6 +1086,32 @@ mod tests {
         op.auth = VecM::default();
         without.tx.operations = operations.try_into().unwrap();
         assert!(validate_settled(&signed, &settling(&without, true)).is_err());
+        // The ledger admits an unused entry: a successful call of another function that
+        // carries the entry spends nothing. A second entry of the wallet leaves open which
+        // one the transfer used.
+        let mut unused = envelope.clone();
+        let mut operations = unused.tx.operations.to_vec();
+        let OperationBody::InvokeHostFunction(op) = &mut operations[0].body else {
+            panic!("an invocation")
+        };
+        let HostFunction::InvokeContract(call) = &mut op.host_function else {
+            panic!("a contract call")
+        };
+        call.function_name = ScSymbol("balance".try_into().unwrap());
+        unused.tx.operations = operations.try_into().unwrap();
+        assert!(validate_settled(&signed, &settling(&unused, true)).is_err());
+        let mut twice = envelope.clone();
+        let mut operations = twice.tx.operations.to_vec();
+        let OperationBody::InvokeHostFunction(op) = &mut operations[0].body else {
+            panic!("an invocation")
+        };
+        let mut second = op.auth[0].clone();
+        if let SorobanCredentials::Address(credentials) = &mut second.credentials {
+            credentials.nonce += 1;
+        }
+        op.auth = vec![op.auth[0].clone(), second].try_into().unwrap();
+        twice.tx.operations = operations.try_into().unwrap();
+        assert!(validate_settled(&signed, &settling(&twice, true)).is_err());
         // The receipt of an authorization settles no ordinary operation.
         assert!(
             rpc::validate_settled_policy_packet(&test_support::policy_signed(), &receipt).is_err()

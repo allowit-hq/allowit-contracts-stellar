@@ -38,7 +38,7 @@ const LEDGER_SECONDS: u64 = 5;
 /// The ledgers that an entry's expiry may exceed the seller's timeout by.
 const EXPIRY_TOLERANCE: u64 = 2;
 /// The seller's timeout when its requirements state none.
-const DEFAULT_TIMEOUT: u64 = 60;
+const DEFAULT_TIMEOUT: u64 = seller_settled::DEFAULT_SETTLE_WITHIN;
 /// The longest timeout that a seller may state.
 const MAX_TIMEOUT: u64 = 86_400;
 /// The longest transaction text that is decoded.
@@ -222,7 +222,9 @@ fn events(simulated: &Value, a: &Authorization) -> Checked<()> {
             .as_str()
             .and_then(|text| read(text).ok())
             .ok_or_else(|| refused("unexpected_verify_error"))?;
-        if event.event.type_ != ContractEventType::Contract {
+        // A call that failed inside the transfer rolled its events back: the ledger keeps
+        // none of them.
+        if event.event.type_ != ContractEventType::Contract || !event.in_successful_contract_call {
             continue;
         }
         let ContractEventBody::V0(body) = &event.event.body;
@@ -923,6 +925,19 @@ mod tests {
         assert_eq!(
             admitted(&ledger(vec![event.clone()], 49_901), &request, 50_000),
             Err("invalid_exact_stellar_payload_fee_exceeds_maximum")
+        );
+        // An event of a call that failed inside the transfer is rolled back and counts as
+        // nothing.
+        let mut rolled_back: DiagnosticEvent =
+            read(&transfer_event(&token, &wallet, &t.recipient, t.amount + 1)).unwrap();
+        rolled_back.in_successful_contract_call = false;
+        assert_eq!(
+            admitted(
+                &ledger(vec![xdr(&rolled_back).unwrap(), event.clone()], 100),
+                &request,
+                50_000
+            ),
+            Ok(100 + INCLUSION_FEE)
         );
         // No transfer, two transfers, and a transfer of another amount, payee, payer or token.
         assert_eq!(

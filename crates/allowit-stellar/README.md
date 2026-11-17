@@ -218,7 +218,8 @@ states who settles it (`Challenge::settled_by`):
 
 - **The seller** (`SettledBy::Seller`): the standard `exact` scheme of version 2. The payer signs one
   authorization entry for exactly the transfer, and the seller's facilitator submits it in its own transaction
-  and pays the network fee. `maxTimeoutSeconds` becomes `Challenge::settle_within`. A requirement with
+  and pays the network fee. `maxTimeoutSeconds` becomes `Challenge::settle_within`; a requirement without
+  it gets 60 seconds, the default of the settlement service. A requirement with
   `extra.areFeesSponsored: false` is refused: the scheme defines no other fee payer.
 - **The payer** (`SettledBy::Payer`): the seller states `extra.proof: "settled-transaction"`. Allowit settles
   the payment itself and presents the settled transaction.
@@ -247,10 +248,13 @@ exactly `transfer(wallet, payTo, amount)` on the asset contract, and its host pa
   `{x402Version, resource, accepted, payload: {transaction}}`.
 - **Outcome.** The service sends nothing. `seller_settled::observe` reads the asset contract's `transfer`
   events from the wallet to the payee, from the ledger of the preparation through the expiry ledger. A
-  successful transaction that carries the exact entry settled it: its receipt has
-  `VerifiedReceipt::settles`, and the operation keeps its own `transaction_hash` as its identity. A complete
-  read without such a transaction after the expiry ledger proves the lapse (`Status::Failed` without a
-  receipt). The wallet paid no fee: the receipt reports none.
+  successful transaction whose one invocation is the transfer that the exact entry authorizes, with no other
+  entry of the wallet, settled it: its receipt has `VerifiedReceipt::settles`, and the operation keeps its
+  own `transaction_hash` as its identity. The ledger admits an entry that no call uses, so a transaction
+  that only carries the entry settles nothing; one that carries it in another shape leaves the outcome open.
+  A complete read without a transaction that carries the entry, after the expiry ledger, proves the lapse
+  (`Status::Failed` without a receipt). A reported transfer whose transaction the ledger does not return
+  keeps the outcome open. The wallet paid no fee: the receipt reports none.
 
 ### Settlement service (`settlement_service`)
 
@@ -266,8 +270,8 @@ anything is submitted:
 - the service's own account is not the transaction source, the operation source, the payer or the
   authorizer;
 - the enforce-mode simulation succeeds, its resource fee plus the 100-stroop inclusion fee is at most
-  `Limits::max_fee`, and its events are exactly one `transfer` of the asset from the payer to the payee of the
-  amount.
+  `Limits::max_fee`, and its committed events are exactly one `transfer` of the asset from the payer to the
+  payee of the amount. An event of a call that failed inside the transfer is rolled back and not counted.
 
 `settle` checks again, builds its own transaction (its account as the source, the simulated resources and
 fee, the invocation and the entry unchanged), signs it, sends it and reads the receipt within `Limits::wait`.

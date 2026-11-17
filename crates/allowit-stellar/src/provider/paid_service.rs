@@ -200,8 +200,10 @@ fn requirement(
         })?),
     };
     // The seller's bound on the time from the authorization to its settlement.
+    // A seller that states none gets the default that a settlement service applies.
     let settle_within = match (&settled_by, &accepted["maxTimeoutSeconds"]) {
-        (SettledBy::Payer, _) | (SettledBy::Seller, Value::Null) => None,
+        (SettledBy::Payer, _) => None,
+        (SettledBy::Seller, Value::Null) => Some(crate::seller_settled::DEFAULT_SETTLE_WITHIN),
         (SettledBy::Seller, value) => Some(
             value
                 .as_u64()
@@ -535,12 +537,16 @@ mod tests {
             (settled.settled_by, settled.settle_within),
             (SettledBy::Payer, None)
         );
-        // A seller that states no timeout leaves the validity to the server.
+        // A seller that states no timeout gets the default of a settlement service, so the
+        // authorization does not outlive what that service admits.
         let open = standard(&|a| {
             a.as_object_mut().unwrap().remove("maxTimeoutSeconds");
         })
         .unwrap();
-        assert_eq!(open.settle_within, None);
+        assert_eq!(
+            open.settle_within,
+            Some(crate::seller_settled::DEFAULT_SETTLE_WITHIN)
+        );
     }
 
     #[test]
