@@ -7,7 +7,7 @@ use serde_json::json;
 /// reads that code as a step that the ledger already shows.
 pub const NOTHING_TO_RETURN: &str = "This wallet holds no funds to return";
 /// The same refusal as `admin::OwnerAdmin::recover_funds` words it for a policy wallet.
-const NOTHING_TO_RECOVER: &str = "Selected token has no recoverable balance";
+pub(crate) const NOTHING_TO_RECOVER: &str = "Selected token has no recoverable balance";
 fn fail(message: impl Into<String>) -> Problem {
     Problem {
         status: 409,
@@ -105,6 +105,21 @@ pub fn denial(message: &str, contract: Option<&ContractFault>, wallet: &str) -> 
     }
     if contract.is_none() && [NOTHING_TO_RETURN, NOTHING_TO_RECOVER].contains(&message) {
         return coded(409, "nothing_to_return", message);
+    }
+    if contract.is_none() {
+        // The refusals of a fee account, each with what its owner does next.
+        if let Some(wallet) = message.strip_prefix(crate::FEE_ACCOUNT_REQUIRED) {
+            return coded(409, "fee_account_required", message)
+                .with_details(json!({"wallet": wallet.trim()}));
+        }
+        if message == crate::FEE_ACCOUNT_DIFFERS {
+            return coded(409, "fee_account_differs", message);
+        }
+        if let Some(account) = message.strip_prefix(crate::FEE_ACCOUNT_EMPTY) {
+            let account = account.trim();
+            return coded(409, "fee_account_empty", message)
+                .with_details(json!({"feeAccount": account}));
+        }
     }
     if contract.is_none() && message == crate::rpc::EXECUTABLE_DIFFERS {
         return coded(
