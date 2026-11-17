@@ -259,6 +259,12 @@ exactly `transfer(wallet, payTo, amount)` on the asset contract, and its host pa
   the one invocation and the signed entry. It has no signature, and `rpc::broadcast` refuses it. The outcome
   document holds it as `paymentAuthorization.transaction`, and `proof` builds the standard payload
   `{x402Version, resource, accepted, payload: {transaction}}`.
+- **Expiry.** The entry expires at a ledger: the ledger of the preparation plus one ledger for each six
+  seconds of the operation's validity, at most 64. The ledger binds an entry to no time, so a ledger that
+  closes late lets the transfer settle after the operation's expiry. The policy is therefore asked twice: for
+  the operation, and for the same operation expiring one day later (`seller_settled::EXPIRY_MARGIN`). A
+  policy whose time limit falls inside that margin signs no authorization (`seller_settled::TIME_LIMIT`). A
+  network that stops for longer than the margin is outside this bound.
 - **Outcome.** The service sends nothing. `seller_settled::observe` reads the asset contract's `transfer`
   events from the wallet to the payee, from the ledger of the preparation through the expiry ledger. A
   successful transaction whose one invocation is the transfer that the exact entry authorizes, with no other

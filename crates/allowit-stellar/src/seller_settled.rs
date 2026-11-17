@@ -39,6 +39,18 @@ pub const MAX_LEDGERS: u32 = 64;
 pub const LEDGER_SECONDS: u64 = 6;
 /// The fault of a wallet that signs no payment authorization.
 pub const POLICY_WALLET: &str = "A policy wallet signs no payment authorization for a seller's facilitator: its contract checks the agent's signature against its fee account, whose own key signs nothing. It pays a seller that takes the proof of a settled transaction.";
+/// The fault of a policy whose decision depends on a time that an authorization can outlive.
+pub const TIME_LIMIT: &str = "This policy allows the payment only until a time that is less than one day after the request expires. A payment authorization expires at a ledger, which can close after that time, so this wallet signs none now. It pays a seller that takes the proof of a settled transaction.";
+/// How far past the expiry of its operation, in seconds, the policy must still allow a
+/// payment authorization.
+///
+/// The ledger binds an authorization entry to an expiry ledger, not to a time. Ledgers that
+/// close more slowly than [`LEDGER_SECONDS`], or a halted network, close that ledger after
+/// the expiry of the operation, and no part of the entry can stop the transfer then. So the
+/// policy is asked again for an operation that expires this much later: a time limit of the
+/// policy that falls inside the margin refuses the authorization. A network that stops for
+/// longer than the margin is outside this bound.
+pub const EXPIRY_MARGIN: u64 = 86_400;
 /// The fault of a payee that a payment authorization cannot pay.
 pub const CONTRACT_PAYEE: &str = "A payment authorization pays an account. The payee of this seller is a contract address, which this wallet does not pay.";
 const EVIDENCE_NAMESPACE: u32 = 402;
@@ -262,6 +274,21 @@ pub fn admit(p: &PreparedOperation, now: u64) -> Result<[u8; 32]> {
         p.expires_at,
         None,
     )?;
+    // The same decision for an operation that expires a margin later: see `EXPIRY_MARGIN`.
+    let later = p
+        .expires_at
+        .checked_add(EXPIRY_MARGIN)
+        .ok_or("Invalid operation validity")?;
+    verify_operation(
+        &p.config,
+        &p.request,
+        &p.terms,
+        &p.state,
+        p.created_at,
+        later,
+        None,
+    )
+    .map_err(|_| TIME_LIMIT)?;
     Ok(a.digest)
 }
 
@@ -1131,6 +1158,38 @@ mod tests {
         assert!(
             rpc::validate_settled_policy_packet(&test_support::policy_signed(), &receipt).is_err()
         );
+    }
+
+    #[test]
+    fn a_policy_time_limit_inside_the_margin_signs_no_authorization() {
+        // A policy that allows payments until `end`.
+        let limited = |end: u64| {
+            let ordinary = test_support::native_signed().prepared;
+            let mut config = ordinary.config;
+            config.policy_source = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::expires_at(ctx, &ctx.params[allowit::EXPIRES_AT])?;\n    Ok(())\n}\n".into();
+            config.source_hash = hash(&config.policy_source);
+            config.params.0.insert(
+                "expires_at".into(),
+                policy::PolicyValue::Int(i128::from(end)),
+            );
+            let mut state = ordinary.state;
+            state.source_hash = config.source_hash;
+            let prepared = crate::prepare(&config, &ordinary.request, &state, NOW, EXPIRES)
+                .expect("the policy allows the wallet's own payment");
+            let r = authorization_request(&prepared);
+            attach(prepared, &r, NOW)
+        };
+        // The wallet's own payment needs the limit at the expiry of the operation. An
+        // authorization needs it one margin later: its ledger can close after the expiry.
+        assert_eq!(
+            limited(EXPIRES + EXPIRY_MARGIN - 1)
+                .unwrap_err()
+                .to_string(),
+            TIME_LIMIT
+        );
+        assert_eq!(limited(EXPIRES).unwrap_err().to_string(), TIME_LIMIT);
+        let admitted = limited(EXPIRES + EXPIRY_MARGIN).unwrap();
+        assert!(admitted.payment_authorization.is_some());
     }
 
     /// A ledger past the expiry of the entry, with the token's transfer events and one reply
