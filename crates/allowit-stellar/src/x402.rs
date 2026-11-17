@@ -111,15 +111,40 @@ fn checked(
             return Err("Priced x402 settlement cannot cross its UTC expense day".into());
         }
     }
-    let execution = policy_wallet_request(
+    let (execution, digest) = execution_digest(
         c,
         &request.request,
         &request.terms,
         state,
-        &StellarOperation::Transfer(transfer.clone()),
+        &transfer,
         request.expires_at,
+        &entry,
     )?;
-    let host_payload = authorization::payload(&c.network, &entry)?;
+    Ok((entry, execution, digest))
+}
+
+/// The execution packet of `transfer` and the digest that the agent and the server sign for
+/// the wallet's authorization `entry`: the hash of the domain, the host payload of the entry
+/// and the packet. The wallet contract computes the same digest in its account check and
+/// verifies both raw signatures against it. This reads no time and grants nothing.
+pub(crate) fn execution_digest(
+    c: &WalletConfig,
+    request: &ExecutionRequest,
+    terms: &ExecutionTerms,
+    state: &TrustedState,
+    transfer: &Transfer,
+    expires_at: u64,
+    entry: &SorobanAuthorizationEntry,
+) -> Result<(ScVal, [u8; 32])> {
+    let execution = policy_wallet_request(
+        c,
+        request,
+        terms,
+        state,
+        &StellarOperation::Transfer(transfer.clone()),
+        expires_at,
+    )?;
+    let host_payload = authorization::payload(&c.network, entry)?;
     let domain = ScVal::Vec(Some(
         vec![
             value_symbol("allowit_wallet_v1")?,
@@ -129,11 +154,22 @@ fn checked(
         .try_into()
         .map_err(err)?,
     ));
-    Ok((
-        entry,
-        execution,
-        hash(domain.to_xdr(limits()).map_err(err)?),
-    ))
+    let digest = hash(domain.to_xdr(limits()).map_err(err)?);
+    Ok((execution, digest))
+}
+
+/// The signature value of the wallet's authorization entry: the execution packet with the
+/// agent's and the server's raw signatures of its digest.
+pub(crate) fn signature_value(
+    execution: ScVal,
+    agent_signature: &[u8; 64],
+    server_signature: &[u8; 64],
+) -> Result<ScVal> {
+    value_map(vec![
+        ("execution", execution),
+        ("agent_signature", value_bytes(agent_signature)?),
+        ("server_signature", value_bytes(server_signature)?),
+    ])
 }
 
 /// The server's approval rule for one raw-key request, then the digest it signs.
@@ -195,10 +231,6 @@ pub fn assemble(
     let SorobanCredentials::Address(credentials) = &mut entry.credentials else {
         unreachable!()
     };
-    credentials.signature = value_map(vec![
-        ("execution", execution),
-        ("agent_signature", value_bytes(agent_signature)?),
-        ("server_signature", value_bytes(server_signature)?),
-    ])?;
+    credentials.signature = signature_value(execution, agent_signature, server_signature)?;
     xdr(&entry)
 }

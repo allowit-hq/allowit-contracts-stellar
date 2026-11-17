@@ -73,15 +73,18 @@ mod tests {
                 request("transfer", &to, "XLM:0.1", None),
             ),
             (usdc.clone(), request("transfer", &to, "USDC:0.1", None)),
-            (
-                usdc.clone(),
-                request("deposit", &vault(1), "USDC:5", Some("4900000")),
-            ),
-            (
-                usdc.clone(),
-                request("redeem", &vault(1), "2000000", Some("USDC:0.19")),
-            ),
         ];
+        // A policy wallet makes no deposit and no redeem: its contract authorizes the payments
+        // of an agent that holds a key and no account. The refusal is typed, and it comes
+        // before the chain is read or anything is signed.
+        for r in [
+            request("deposit", &vault(1), "USDC:5", Some("4900000")),
+            request("redeem", &vault(1), "2000000", Some("USDC:0.19")),
+        ] {
+            let refused = build("policy-1", &usdc, &r, || panic!("no state is read")).unwrap_err();
+            assert_eq!(refused.message, sdk::seller_settled::DEPOSIT_UNSUPPORTED);
+            assert_eq!(refused.code, crate::host::error::Error::unsupported("").code);
+        }
         for (c, r) in cases {
             let typed = build("policy-1", &c, &r, || Ok(state.clone())).unwrap();
             let expected = match r.op.as_str() {
@@ -92,16 +95,7 @@ mod tests {
                     amount: 1_000_000,
                     native: c.route == WalletRoute::Native,
                 }),
-                "deposit" => sdk::StellarOperation::Deposit(sdk::Deposit {
-                    vault: vault(1),
-                    assets: 50_000_000,
-                    min_shares: 4_900_000,
-                }),
-                _ => sdk::StellarOperation::Redeem(sdk::Redeem {
-                    vault: vault(1),
-                    shares: 2_000_000,
-                    min_assets: 1_900_000,
-                }),
+                op => panic!("{op}"),
             };
             assert_eq!(
                 sdk::operation_from_request(&c, &typed.request).unwrap(),
@@ -129,13 +123,14 @@ mod tests {
     #[test]
     fn a_retry_keeps_the_retained_fee_payer() {
         let c = config(WalletRoute::PolicyWallet, true);
-        let r = request("deposit", &vault(1), "USDC:5", Some("4900000"));
+        let to = sdk::account_for_seed(&[6; 32]);
+        let r = request("transfer", &to, "USDC:5", None);
         let mut first = state(&config(WalletRoute::Native, false), None).unwrap();
         first.source.address = sdk::account_for_seed(&[8; 32]);
         let old = build("policy-1", &c, &r, || Ok(first)).unwrap().request;
         // The agent account changed since; the same flags rebuild the same request.
         assert_eq!(rebuild("policy-1", &c, &r, &old).unwrap().request, old);
-        let more = request("deposit", &vault(1), "USDC:6", Some("4900000"));
+        let more = request("transfer", &to, "USDC:6", None);
         assert_ne!(rebuild("policy-1", &c, &more, &old).unwrap().request, old);
     }
     #[test]

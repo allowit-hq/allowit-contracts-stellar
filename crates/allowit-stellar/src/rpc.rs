@@ -1429,12 +1429,31 @@ fn current_wallet_state(
         return Err("policy wallet automation is paused".into());
     }
     verify_custody(c, &state)?;
-    let source = get_account(rpc, &state.agent)?;
+    // A wallet that authorizes token calls itself checks the agent's raw key. That agent holds
+    // a key and no account, and none is read or needed: the state reports the key alone, and
+    // the read-only call below runs from the owner's account. A wallet of an earlier release
+    // needs its agent's account, which sent the wallet's operations.
+    let (source, reader) = match find_account(rpc, &state.agent)? {
+        Some(account) => (account.clone(), account),
+        None if state.x402_enabled => (
+            AccountState {
+                address: state.agent.clone(),
+                sequence: 0,
+                master_weight: 1,
+                low_threshold: 0,
+                medium_threshold: 0,
+                high_threshold: 0,
+                signers: vec![],
+            },
+            get_account(rpc, &state.owner)?,
+        ),
+        None => return Err("The policy wallet's agent account does not exist".into()),
+    };
     source.validate_structure()?;
-    if require_customer_quorum && source.signer_weight(&c.agent)? == 0 {
+    if require_customer_quorum && !state.x402_enabled && source.signer_weight(&c.agent)? == 0 {
         return Err("Customer is not a current policy wallet agent account signer".into());
     }
-    PolicyBinding::from_scval(&readonly_call(rpc, c, &source, "policy_binding")?)?
+    PolicyBinding::from_scval(&readonly_call(rpc, c, &reader, "policy_binding")?)?
         .verify(c, OperationKind::Transfer)?;
     if require_customer_quorum {
         let server = get_account(rpc, &c.server)?;

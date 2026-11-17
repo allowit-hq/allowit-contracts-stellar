@@ -63,6 +63,12 @@ pub fn build(
             r.op
         )));
     }
+    // A policy wallet authorizes each operation through its contract's own check, for an
+    // agent that holds a key and no account. That check admits no deposit, so nothing is
+    // prepared or signed for a deposit or a redeem.
+    if config.route == WalletRoute::PolicyWallet && r.op != "transfer" {
+        return Err(Error::unsupported(sdk::seller_settled::DEPOSIT_UNSUPPORTED));
+    }
     let (amount, min) = match r.op.as_str() {
         "transfer" => (installed_units(config, &r.amount)?, 0),
         "deposit" => (installed_units(config, &r.amount)?, shares(minimum()?)?),

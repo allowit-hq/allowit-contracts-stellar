@@ -909,7 +909,11 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         };
         let accounting = accounting(a);
         let request: native::workflow::ExecutionRequest = decode_packet(&r.0)?;
-        if native::seller_settled::is_request(&request) {
+        // A payment authorization: the seller settles a request with the marker, and the
+        // service settles every transfer of a policy wallet.
+        if native::seller_settled::is_request(&request)
+            || native::seller_settled::service_settled(&c)
+        {
             return self.packet(&checked(native::seller_settled::prepare(
                 self.rpc(),
                 &c,
@@ -943,6 +947,12 @@ impl crate::host::vendors::RuntimeProvider for Provider {
             return Err(Error::config(
                 "Authorization differs from selected installation",
             ));
+        }
+        // A policy wallet's transfer is its own authorization, which the service settles. The
+        // service approves it here with its evaluator and signs the digest at execution.
+        if native::seller_settled::service_settled(&c) {
+            checked(native::seller_settled::admit_service(&p, now, e))?;
+            return self.packet(&p);
         }
         // A classic account has no server authorization entry: the server admits the
         // operation here, with its evaluator, and signs the transaction at execution.
@@ -1198,7 +1208,9 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 }
             }
             OwnerAction::Create { wasm } => {
-                let config = checked(native::admin::PolicyConfig::for_policy(&c, false))?;
+                // A new wallet authorizes its agent's payments itself: the agent holds a key
+                // and no account, and the service's account sends each payment.
+                let config = checked(native::admin::PolicyConfig::for_policy(&c, true))?;
                 let p = checked(d.create_wallet(
                     &config,
                     &wasm,
