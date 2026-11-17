@@ -941,3 +941,56 @@ fn a_wallet_fits_the_profile_of_its_tier() {
     assert!(profile_fits(PolicyTier::Custom, CUSTOM));
     assert!(!profile_fits(PolicyTier::Custom, WALLET));
 }
+
+/// A classic account stores no policy state. The owner client takes a returned draft for an
+/// owner wallet whose source the server evaluates, and refuses the same draft when its source
+/// writes state.
+#[test]
+fn a_returned_owner_wallet_policy_that_writes_state_is_refused() {
+    use super::{GenerateRequest, GeneratedPolicy, Target, validate_generated};
+    const HEAD: &str = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::payment_limit(ctx, &ctx.params[allowit::PAYMENT_LIMIT])?;\n";
+    let asks = format!(
+        "{HEAD}    allowit::decision(ctx, &allowit::AllowitDecision {{\n        id: \"purpose\",\n        query: \"Is this payment for research data?\",\n        deny_below: 3000,\n        allow_above: 8000,\n    }})?;\n    Ok(())\n}}\n"
+    );
+    let writes = format!("{HEAD}    allowit::set_state(ctx, \"seen\", 1)?;\n    Ok(())\n}}\n");
+    // The fixture draft, as a server returns it for the installed owner wallet `id`.
+    let returned = |code: &str| {
+        let mut policy: GeneratedPolicy =
+            serde_json::from_value(wire::fixture()["policy"].clone()).unwrap();
+        let shape = crate::policy::classic_shape(code).unwrap();
+        policy.code = code.into();
+        policy.source_hash = allowit_core::digest(code.as_bytes());
+        policy.runtime.wallet.kind = "owner-wallet".into();
+        let b = &mut policy.runtime.instance_binding;
+        let d = &mut b.portable;
+        d.source_hash = policy.source_hash.clone();
+        d.tier = "custom".into();
+        d.rules = Vec::new();
+        d.build.prefix = shape.prefix;
+        d.build.writes_state = shape.writes_state;
+        b.module_digest = crate::host::authoring::portable_identity(
+            &d.language,
+            &d.tier,
+            &d.rules,
+            &d.source_hash,
+            &d.params_hash,
+        )
+        .unwrap();
+        b.route = "native".into();
+        b.tier = None;
+        b.template = None;
+        b.wallet = account(12);
+        b.max_fee_stroops = 100_000;
+        let request = GenerateRequest {
+            prompt: policy.original_intent.clone(),
+            network: "stellar:testnet".into(),
+            profile: policy.runtime.wallet.profile.clone(),
+            target: Target::Installation(b.deployment_id.clone()),
+            wallet_kind: None,
+        };
+        validate_generated(&policy, &request, "stellar:testnet", "owner-wallet")
+    };
+    returned(&asks).map_err(|e| e.message).unwrap();
+    let refused = returned(&writes).unwrap_err();
+    assert_eq!(refused.message, "Returned native policy identity differs");
+}
