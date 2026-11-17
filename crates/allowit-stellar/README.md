@@ -258,7 +258,8 @@ exactly `transfer(wallet, payTo, amount)` on the asset contract, and its host pa
   `seller_settled::authorize` assembles the entry with both account signatures, checks the wallet account
   against the ledger and simulates the payload in enforce mode. Their weights reach the medium threshold only
   together. A policy wallet is refused with `seller_settled::POLICY_WALLET`: its contract checks an
-  authorization against the raw key of its agent address, which is its fee account.
+  authorization against the raw key of its agent address, which is its fee account. The refusal
+  names the fix: a Native wallet pays such a seller.
 - **What the entry admits.** One transfer of the amount of the asset from the wallet to the payee, once: the
   ledger consumes the nonce, which derives from the operation id. It expires at
   `ledger + (expires_at - created_at) / 6`, at most 64 ledgers.
