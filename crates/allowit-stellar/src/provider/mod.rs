@@ -26,15 +26,19 @@ pub const OWNER_STORE_NAMESPACE: &str = "stellar-owner-workflows";
 
 /// The exit code of a call that got no answer, in the shared CLI exit table.
 pub(crate) const NETWORK_UNAVAILABLE: i32 = 7;
-/// The checked shape of a policy's source for its wallet. The server evaluates the source of
-/// a classic account, so that source is server policy source: it can read owner text for a
-/// server function. A contract compiles the source of a policy wallet, which stays portable.
+/// The checked shape of a policy's source for its wallet. The server evaluates the whole
+/// source of a classic account and of a Custom wallet, so that source is server policy source:
+/// it can read owner text for a server function. The contract of a Custom wallet compiles the
+/// on-chain part of its source. A Simple or Standard wallet holds portable source.
 pub(crate) fn source_shape(
     classic: bool,
+    custom: bool,
     source: &str,
 ) -> crate::host::error::Result<crate::policy::SourceShape> {
     if classic {
         crate::policy::classic_shape(source).map_err(Error::usage)
+    } else if custom {
+        crate::policy::custom_shape(source).map_err(Error::usage)
     } else {
         crate::host::authoring::check(source)
     }

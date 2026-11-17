@@ -14,7 +14,7 @@ test-support = []
 browser-owner-verifier = []
 
 [dependencies]
-allowit-core = { git = "https://github.com/allowit-hq/allowit-core.git", rev = "f79c37dc108beccc64b5245b84b2032318bdb6da", version = "0.6", default-features = false, features = ["std", "client", "policy-source"] }
+allowit-core = { git = "https://github.com/allowit-hq/allowit-core.git", rev = "a54b18eb6c8cdcad5c6904fe02c99e141e3fa2f7", version = "0.6", default-features = false, features = ["std", "client", "policy-source"] }
 base64 = "0.22"
 ed25519-dalek = "2.2"
 serde = { version = "1", features = ["derive"] }
@@ -27,7 +27,7 @@ zeroize = "1.9.1"
 time = { version = "0.3.55", features = ["parsing", "formatting"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-allowit-core = { git = "https://github.com/allowit-hq/allowit-core.git", rev = "f79c37dc108beccc64b5245b84b2032318bdb6da", version = "0.6", default-features = false, features = ["vendor"] }
+allowit-core = { git = "https://github.com/allowit-hq/allowit-core.git", rev = "a54b18eb6c8cdcad5c6904fe02c99e141e3fa2f7", version = "0.6", default-features = false, features = ["vendor"] }
 
 [dev-dependencies]
 tempfile = "3.27"

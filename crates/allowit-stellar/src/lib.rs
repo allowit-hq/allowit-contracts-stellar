@@ -927,7 +927,7 @@ fn validate_portable_install(c: &WalletConfig) -> Result<()> {
     if c.language != PolicyLanguage::Portable {
         return Err("Policy wallets of layout 4 run portable policy source".into());
     }
-    let shape = policy::source_shape(&c.policy_source)?;
+    let shape = policy::tier_shape(tier, &c.policy_source)?;
     let expected = if tier == PolicyTier::Common {
         shape.prefix.clone()
     } else {
@@ -1188,9 +1188,10 @@ pub fn verify_policy(
 /// Retired source languages cannot authorize execution. Portable installs check the tier
 /// binding, owner params, execution args and expense bounds, run the Common prefix as the
 /// contract does and evaluate the full policy on the host when the source is canonical-only or
-/// `evaluator` compiles it. `Evaluation::Prefix` means only the onchain part ran: a Custom wallet
-/// runs the rest in native preflight, and the server evaluates the rest of a Simple or Common
-/// policy with `authorize_server_with`.
+/// `evaluator` compiles it. `Evaluation::Prefix` means only the onchain part ran. A Custom wallet
+/// whose source is its own on-chain part runs the rest in native preflight. The server evaluates
+/// the rest of a Simple or Common policy, and of a Custom policy with server functions, with
+/// `authorize_server_with`.
 pub fn verify_operation(
     c: &WalletConfig,
     r: &ExecutionRequest,
@@ -1378,7 +1379,7 @@ fn verify_wallet_portable(
     if let Some(expense) = &terms.expense {
         validate_expense(c, expense, operation, state, now)?;
     }
-    let shape = policy::source_shape(&c.policy_source)?;
+    let shape = policy::tier_shape(tier, &c.policy_source)?;
     let request = policy::RuleRequest::new(
         operation,
         &c.asset,

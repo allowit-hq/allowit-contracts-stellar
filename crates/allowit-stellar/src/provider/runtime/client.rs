@@ -115,6 +115,7 @@ fn validate_portable_profile(bundle: &Bundle) -> Result<()> {
     };
     let shape = crate::provider::source_shape(
         bundle.config.route == WalletRoute::Native,
+        bundle.config.tier == Some(crate::PolicyTier::Custom),
         &bundle.config.policy_source,
     )?;
     let params_hash = crate::host::authoring::canonical_digest(&portable.params)?;

@@ -1,10 +1,10 @@
 #![no_std]
-//! Bespoke policy compiled verbatim from `policy/policy.rs` into the shared custody mixins.
+//! The on-chain part of the owner's policy, compiled verbatim from `policy/policy.rs`. See `build.rs`.
 use allowit::{AllowitContext, AllowitOperation, AllowitRule};
 use allowit_policy_wallet::{AllowitPolicy, AllowitWalletError};
 use soroban_sdk::{BytesN, Env, Vec};
 
-/// Authored policy source, compiled unchanged as a module. The offchain server compiles the same file.
+/// The on-chain part of the authored policy, compiled unchanged. The server evaluates the whole source.
 #[cfg(not(feature = "test-catching"))]
 #[path = "../policy/policy.rs"]
 mod policy;
@@ -13,7 +13,7 @@ mod policy;
 #[path = "catching_policy.rs"]
 mod policy;
 
-/// SHA-256 of the exact bytes of the compiled policy source, computed by `build.rs`.
+/// SHA-256 of the exact bytes of the owner's policy source, computed by `build.rs`.
 pub const SOURCE_HASH: [u8; 32] = include!(concat!(env!("OUT_DIR"), "/source_hash.rs"));
 
 /// The bespoke policy tier: its compiled source decides every operation.
@@ -27,7 +27,7 @@ impl AllowitPolicy for AllowitCustom {
         AllowitOperation::swap,
         AllowitOperation::redeem,
     ];
-    /// The digest of the compiled policy source.
+    /// The digest of the owner's policy source.
     fn source_digest(env: &Env) -> Option<BytesN<32>> {
         Some(BytesN::from_array(env, &SOURCE_HASH))
     }

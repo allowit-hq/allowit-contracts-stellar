@@ -1607,3 +1607,6 @@ mod swap_redeem_tests;
 
 #[cfg(test)]
 mod core_vectors_tests;
+
+#[cfg(test)]
+mod derived_tests;

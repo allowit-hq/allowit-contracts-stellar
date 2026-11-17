@@ -3070,6 +3070,69 @@ fn simple_service_authorization_evaluates_the_full_policy() {
     assert_eq!(seeded, external);
 }
 
+/// One source with a server function for a Custom wallet. The contract compiles its on-chain
+/// part, the `destinations` rule. The decision is a server function.
+const SERVED: &str = "use allowit::prelude::*;\nuse allowit::AllowitDecision;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::destinations(ctx, &ctx.params[allowit::DESTINATIONS])?;\n    allowit::decision(ctx, &AllowitDecision { id: \"purchase\", query: \"Does this payment buy research data?\", deny_below: 3000, allow_above: 8000 })?;\n    Ok(())\n}\n";
+
+/// The contract of a Custom wallet compiles only the on-chain part of a source with server
+/// functions. The service signs such an operation only after it evaluated the whole source:
+/// without its evaluator it refuses, and a denying evaluation never reaches the signer. A
+/// Custom wallet whose source is its own on-chain part needs no evaluator, as before.
+#[test]
+fn custom_service_authorization_evaluates_the_whole_source_of_a_policy_with_server_functions() {
+    let (mut c, r, s) = fixture(WalletRoute::PolicyWallet, true);
+    let recipient = account_for_seed(&[6; 32]);
+    install(
+        &mut c,
+        PolicyTier::Custom,
+        SERVED,
+        json!({"destinations": [recipient]}),
+    );
+    assert_eq!(c.source_digest, hash(SERVED));
+    assert!(policy::server_evaluates(PolicyTier::Custom, SERVED).unwrap());
+    let rpc = preflight_rpc(&c, &r, &s);
+    let prepared = rpc::prepare(&rpc, &c, &r, None, 86401, 86700).unwrap();
+    assert!(
+        authorize_server(&prepared, &[3; 32], 86401, None)
+            .unwrap_err()
+            .contains("compiled evaluator")
+    );
+    assert!(
+        authorize_server_using(&prepared, &c.server, 86401, None, |_| {
+            panic!("An operation that the service did not evaluate must not reach its signer")
+        })
+        .is_err()
+    );
+    // The server function denies: the whole source denies, and the service does not sign.
+    let denies = |ctx: &allowit_core::AllowitContext| -> allowit_core::Result {
+        allowit_core::destinations(ctx, &ctx.params[allowit_core::DESTINATIONS])?;
+        Err(allowit_core::AllowitError::Unsupported)
+    };
+    assert!(
+        authorize_server_using(&prepared, &c.server, 86401, Some(&denies), |_| {
+            panic!("A denied whole source must not reach the service signer")
+        })
+        .is_err()
+    );
+    let allows = |ctx: &allowit_core::AllowitContext| -> allowit_core::Result {
+        allowit_core::destinations(ctx, &ctx.params[allowit_core::DESTINATIONS])?;
+        Ok(())
+    };
+    authorize_server_with(&prepared, &[3; 32], 86401, &allows).unwrap();
+
+    // A source with no server function is its own on-chain part: the contract runs all of it.
+    install(
+        &mut c,
+        PolicyTier::Custom,
+        SUFFIXED,
+        json!({"destinations": [recipient], "payment_limit": 100_000_000}),
+    );
+    assert!(!policy::server_evaluates(PolicyTier::Custom, SUFFIXED).unwrap());
+    let rpc = preflight_rpc(&c, &r, &s);
+    let prepared = rpc::prepare(&rpc, &c, &r, None, 86401, 86700).unwrap();
+    authorize_server(&prepared, &[3; 32], 86401, None).unwrap();
+}
+
 #[test]
 fn selected_implementations_bind_constructor_and_both_authorities() {
     use allowit_stellar::admin::PolicyConfig;
@@ -3556,6 +3619,50 @@ fn x402_server_approval_runs_the_full_simple_policy() {
             assert_eq!(verdict.unwrap(), digest);
         } else {
             assert!(verdict.unwrap_err().contains("PaymentLimitExceeded"));
+        }
+    }
+    // A Custom wallet compiles the on-chain part of a source with server functions, so the
+    // server approves its payment authorization only after it evaluated the whole source. A
+    // Custom wallet whose source is its own on-chain part needs no evaluator.
+    for (source, evaluated) in [(SERVED, true), (SUFFIXED, false)] {
+        install(
+            &mut c,
+            PolicyTier::Custom,
+            source,
+            json!({"destinations": [recipient], "payment_limit": 100_000_000}),
+        );
+        let mut custody = state.clone();
+        custody.source_hash = c.source_hash;
+        custody.policy_state = Some(PolicyStateSnapshot {
+            params: c.params.clone(),
+            state: PolicyParams::default(),
+            rules: c.rules.clone(),
+            source_digest: c.source_digest,
+            x402_enabled: true,
+        });
+        let request = x402::SigningRequest {
+            config: c.clone(),
+            request: r.clone(),
+            state: x402::WalletState {
+                custody,
+                tier: PolicyTier::Custom,
+                x402_enabled: true,
+                paused: false,
+            },
+            expires_at: 86700,
+            terms: ExecutionTerms::default(),
+            authorization_xdr: entry.to_xdr_base64(Limits::none()).unwrap(),
+        };
+        let digest = x402::signing_digest(&request, 86401).unwrap();
+        let unevaluated = x402::verify_server(&request, 86401, None);
+        if evaluated {
+            assert!(unevaluated.unwrap_err().contains("compiled evaluator"));
+            assert_eq!(
+                x402::verify_server(&request, 86401, Some(&compiled)).unwrap(),
+                digest
+            );
+        } else {
+            assert_eq!(unevaluated.unwrap(), digest);
         }
     }
 }

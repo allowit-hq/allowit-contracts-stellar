@@ -158,9 +158,11 @@ pub fn verify_server(
         request.expires_at,
         evaluator,
     )?;
-    if request.state.tier.standard() && evaluation == policy::Evaluation::Prefix {
+    if policy::server_evaluates(request.state.tier, &request.config.policy_source)?
+        && evaluation == policy::Evaluation::Prefix
+    {
         return Err(
-            "The server must evaluate the full Simple or Common policy; supply its compiled evaluator"
+            "The server must evaluate the whole policy that the contract does not run in full; supply its compiled evaluator"
                 .into(),
         );
     }

@@ -635,9 +635,43 @@ const SERVER_FUNCTIONS: &[(&str, &str)] = &[
 pub fn classic_shape(source: &str) -> Result<SourceShape> {
     allowit_core::policy_source::source_shape_with_host_calls(source, SERVER_FUNCTIONS)
 }
+/// The on-chain part of a policy source: what the contract of a Custom wallet compiles.
+pub use allowit_core::policy_source::{Cause, Derived, ServerOnly};
+/// Derive the on-chain part of the source of a Custom wallet. The owner writes and signs one
+/// source, and the server evaluates all of it. The contract compiles the statements that the
+/// chain can check by itself; the statements that depend on a server function leave. A source
+/// that names no server function derives to itself.
+pub fn onchain_part(source: &str) -> Result<Derived> {
+    allowit_core::policy_source::derive(source)
+}
+/// The checked shape of the source of a Custom wallet. The server evaluates the whole source,
+/// so it is server policy source, like that of a classic account. Its on-chain part must
+/// derive: a source in which a step that depends on a server function writes policy state is
+/// refused, because the chain could not store that write.
+pub fn custom_shape(source: &str) -> Result<SourceShape> {
+    let shape = classic_shape(source)?;
+    onchain_part(source)?;
+    Ok(shape)
+}
+/// Whether the server must evaluate the whole `source` of a policy wallet of `tier` before
+/// it signs, because the contract does not: a Simple or Common wallet runs at most the
+/// canonical prefix, and a Custom wallet compiles the on-chain part of a source with server
+/// functions. A Custom wallet whose source is its own on-chain part runs all of it on chain.
+pub fn server_evaluates(tier: PolicyTier, source: &str) -> Result<bool> {
+    Ok(tier.standard() || onchain_part(source)?.source != source)
+}
+/// The checked shape of the source of a policy wallet of `tier`. A Simple or Common wallet
+/// holds portable source: its contract runs the canonical prefix.
+pub fn tier_shape(tier: PolicyTier, source: &str) -> Result<SourceShape> {
+    if tier == PolicyTier::Custom {
+        custom_shape(source)
+    } else {
+        source_shape(source)
+    }
+}
 /// The rules a tier installs for `source`: the standard prefix for Common, none otherwise.
 pub fn tier_rules(tier: PolicyTier, source: &str) -> Result<Vec<String>> {
-    let shape = source_shape(source)?;
+    let shape = tier_shape(tier, source)?;
     Ok(if tier == PolicyTier::Common {
         shape.prefix
     } else {
@@ -652,7 +686,8 @@ pub struct PolicyCheck {
 }
 /// Bind an owner packet to its authored source: `scripts/contract_admin.py` `policy_rules`.
 /// Common binds the source's standard prefix; Simple and Custom bind none. Custom also binds
-/// the source bytes. Simple and Common cannot store `allowit::set_state` writes.
+/// the bytes of the owner's source, whose on-chain part its contract compiles. Simple and
+/// Common cannot store `allowit::set_state` writes.
 pub fn policy_rules(
     tier: PolicyTier,
     source: &str,
@@ -660,7 +695,7 @@ pub fn policy_rules(
     source_digest: &[u8; 32],
     params: &PolicyParams,
 ) -> Result<PolicyCheck> {
-    let shape = source_shape(source)?;
+    let shape = tier_shape(tier, source)?;
     let expected = if tier == PolicyTier::Common {
         shape.prefix.clone()
     } else {
@@ -858,6 +893,60 @@ pub fn evaluate(
 mod tests {
     use super::*;
     const SOURCE: &str = include_str!("../../../contracts/allowit-custom-policy/policy/policy.rs");
+
+    /// The sample mandate with its server functions, and the on-chain part that Core derives.
+    const MANDATE: &str = include_str!("../tests/fixtures/sample-mandate.rs");
+    const MANDATE_ONCHAIN: &str = include_str!("../tests/fixtures/sample-mandate.onchain.rs");
+
+    /// One source for a Custom wallet: the server evaluates all of it, so it can read owner
+    /// text for a server function, and the contract compiles its on-chain part. The wallet
+    /// binds the hash of the owner's source. A Simple or Common wallet holds portable source.
+    #[test]
+    fn a_custom_wallet_takes_one_source_with_server_functions_and_binds_its_hash() {
+        assert!(MANDATE.contains(".as_str()") && MANDATE.contains("allowit::decision("));
+        let shape = tier_shape(PolicyTier::Custom, MANDATE).unwrap();
+        assert!(!shape.canonical_only && !shape.writes_state);
+        assert_eq!(tier_rules(PolicyTier::Custom, MANDATE).unwrap(), [""; 0]);
+        for tier in [PolicyTier::Simple, PolicyTier::Common] {
+            let error = tier_shape(tier, MANDATE).unwrap_err();
+            assert!(error.contains("as_str"), "{error}");
+        }
+        // The committed fixture that the contract tests compile is what Core derives.
+        let derived = onchain_part(MANDATE).unwrap();
+        assert_eq!(derived.source, MANDATE_ONCHAIN);
+        assert!(derived.server_only.is_empty());
+        assert!(source_shape(&derived.source).is_ok());
+        assert!(!derived.source.contains("as_str") && !derived.source.contains("decision"));
+        // A source without a server function is its own on-chain part.
+        assert_eq!(onchain_part(SOURCE).unwrap().source, SOURCE);
+
+        let params = PolicyParams::default();
+        let owner = hash(MANDATE.as_bytes());
+        assert!(policy_rules(PolicyTier::Custom, MANDATE, &[], &owner, &params).is_ok());
+        let part = hash(MANDATE_ONCHAIN.as_bytes());
+        assert!(policy_rules(PolicyTier::Custom, MANDATE, &[], &part, &params).is_err());
+        assert_eq!(
+            installed_source_digest(PolicyTier::Custom, &[0; 32], "", &[], MANDATE).unwrap(),
+            owner
+        );
+    }
+    /// The chain could not store a state write that depends on a server function, so a Custom
+    /// wallet refuses that source. A classic account stores no policy state at all.
+    #[test]
+    fn a_custom_source_whose_server_step_writes_state_is_refused() {
+        let source = "use allowit::prelude::*;\nuse allowit::AllowitDecision;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    let score = allowit::decision(ctx, &AllowitDecision { id: \"a\", query: \"Is this research?\", deny_below: 1, allow_above: 2 })?;\n    allowit::set_state(ctx, \"score\", score)?;\n    Ok(())\n}\n";
+        assert!(classic_shape(source).unwrap().writes_state);
+        let error = custom_shape(source).unwrap_err();
+        assert!(error.contains("cannot write policy state"), "{error}");
+        assert!(tier_rules(PolicyTier::Custom, source).is_err());
+        // The same write before the server call stays on chain.
+        let moved = source.replace("score)?;", "true)?;").replace(
+            "    let score",
+            "    allowit::set_state(ctx, \"seen\", true)?;\n    let score",
+        );
+        let moved = moved.replacen("    allowit::set_state(ctx, \"score\", true)?;\n", "", 1);
+        assert!(custom_shape(&moved).unwrap().writes_state);
+    }
 
     #[test]
     fn canonical_source_has_the_full_prefix_and_is_canonical_only() {

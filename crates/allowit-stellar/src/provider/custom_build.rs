@@ -3,9 +3,20 @@
 //! build statements as SEP-53 wallet messages.
 //!
 //! The build tree is the contract workspace of this release, embedded in the crate, with the
-//! policy source in place of `contracts/allowit-custom-policy/policy/policy.rs`. It compiles the
-//! same files as `scripts/build-custom-policy.sh` does from a checkout of this revision, so the
-//! same source, toolchain and Stellar CLI give the same Wasm.
+//! on-chain part of the policy source in place of
+//! `contracts/allowit-custom-policy/policy/policy.rs`. It compiles the same files as
+//! `scripts/build-custom-policy.sh` does from a checkout of this revision, so the same source,
+//! toolchain and Stellar CLI give the same Wasm.
+//!
+//! The owner writes and signs one source, and the server evaluates all of it. A contract cannot
+//! call a server function, so the contract compiles the on-chain part that
+//! [`crate::policy::onchain_part`] derives from that source: the statements that the chain can
+//! check by itself. The derivation is a pure function of the source, so anyone can derive the
+//! part again, build it and compare the code hash. The contract binds the hash of the owner's
+//! source: when the on-chain part differs from the source, the tree also holds the source as
+//! `contracts/allowit-custom-policy/policy/source.rs`, which the contract hashes and does not
+//! compile. A source that names no server function is its own on-chain part, and its tree and
+//! its Wasm are those of earlier releases.
 use crate::host::{
     Signer,
     error::{Error, Result},
@@ -24,8 +35,12 @@ pub static CUSTOM_BUILD: CustomBuild = CustomBuild;
 pub const STELLAR_CLI_VERSION: &str = "28.1.0";
 /// The environment variable that names the Stellar CLI binary. The default is `stellar` on `PATH`.
 pub const STELLAR_BIN: &str = "STELLAR_BIN";
-/// The policy source file of the Custom wallet contract in the build tree.
+/// The file of the build tree that the Custom wallet contract compiles: the on-chain part of
+/// the policy source.
 const POLICY_SOURCE: &str = "contracts/allowit-custom-policy/policy/policy.rs";
+/// The owner's policy source in the build tree, when its on-chain part differs from it. The
+/// contract binds the hash of this file.
+const OWNER_SOURCE: &str = "contracts/allowit-custom-policy/policy/source.rs";
 /// The largest policy source that the build compiles.
 const MAX_SOURCE_BYTES: usize = 262_144;
 
@@ -134,8 +149,9 @@ fn write(path: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::write(path, bytes).map_err(|_| failed())
 }
 
-/// Write the build tree of `source` under `tree`, which must not exist.
-fn write_tree(tree: &Path, source: &str) -> Result<()> {
+/// Write the build tree of `source` under `tree`, which must not exist: the contract workspace
+/// with `onchain`, the on-chain part of `source`, as the compiled policy.
+fn write_tree(tree: &Path, source: &str, onchain: &str) -> Result<()> {
     for (path, bytes) in TREE {
         write(&tree.join(path), bytes)?;
     }
@@ -144,7 +160,10 @@ fn write_tree(tree: &Path, source: &str) -> Result<()> {
         write(&manifest, bytes)?;
         write(&manifest.with_file_name("src").join("lib.rs"), b"")?;
     }
-    write(&tree.join(POLICY_SOURCE), source.as_bytes())
+    if onchain != source {
+        write(&tree.join(OWNER_SOURCE), source.as_bytes())?;
+    }
+    write(&tree.join(POLICY_SOURCE), onchain.as_bytes())
 }
 
 /// Build the Custom wallet Wasm of `source` with the Stellar CLI binary `stellar`.
@@ -154,13 +173,16 @@ pub(crate) fn build_with(stellar: &Path, source: &str, work: &Path) -> Result<Wa
             "The policy source exceeds the custom wallet build limit",
         ));
     }
-    // The contract compiles the source as a module. Only source that passes the portable policy
-    // gate is compiled: it cannot include a local file or run code at compile time.
-    crate::policy::tier_rules(crate::PolicyTier::Custom, source).map_err(|reason| {
+    // The contract compiles the on-chain part of the source as a module. Only a source that
+    // passes the policy source gate is derived, and its on-chain part passes the portable gate:
+    // it cannot include a local file or run code at compile time.
+    let gate = |reason: String| {
         build_failed(format!(
             "The policy source does not pass the policy source gate: {reason}. Draft the policy again."
         ))
-    })?;
+    };
+    crate::policy::custom_shape(source).map_err(gate)?;
+    let onchain = crate::policy::onchain_part(source).map_err(gate)?.source;
     let unusable = || Error::config("Cannot prepare the custom wallet build folder");
     std::fs::create_dir_all(work).map_err(|_| unusable())?;
     let work = work.canonicalize().map_err(|_| unusable())?;
@@ -170,7 +192,7 @@ pub(crate) fn build_with(stellar: &Path, source: &str, work: &Path) -> Result<Wa
             std::fs::remove_dir_all(stale).map_err(|_| unusable())?;
         }
     }
-    write_tree(&tree, source)?;
+    write_tree(&tree, source, &onchain)?;
     let cli = version_line(stellar, &tree).ok_or_else(|| {
         toolchain_missing(format!(
             "The Stellar CLI is missing. Install Stellar CLI {STELLAR_CLI_VERSION} (https://developers.stellar.org/docs/tools/cli/install-cli, or `cargo install --locked stellar-cli@{STELLAR_CLI_VERSION}`), or name its binary in {STELLAR_BIN}. Then run the build again."
@@ -500,6 +522,45 @@ mod tests {
             crate::hash(&code)
         );
         assert!(CUSTOM_BUILD.code_hash(NETWORK, b"not wasm").is_err());
+    }
+
+    /// The contract compiles the on-chain part of a policy with server functions and hashes
+    /// the owner's source beside it. A policy without a server function is its own on-chain
+    /// part: its tree holds one policy file, as before.
+    #[test]
+    fn the_build_tree_holds_the_on_chain_part_and_the_owners_source() {
+        const MANDATE: &str = include_str!("../../tests/fixtures/sample-mandate.rs");
+        const ONCHAIN: &str = include_str!("../../tests/fixtures/sample-mandate.onchain.rs");
+        let work = tempfile::tempdir().unwrap();
+        let read = |tree: &Path, path: &str| std::fs::read_to_string(tree.join(path)).ok();
+
+        let derived = crate::policy::onchain_part(MANDATE).unwrap().source;
+        assert_eq!(derived, ONCHAIN);
+        let tree = work.path().join("mandate");
+        write_tree(&tree, MANDATE, &derived).unwrap();
+        assert_eq!(read(&tree, POLICY_SOURCE).as_deref(), Some(ONCHAIN));
+        assert_eq!(read(&tree, OWNER_SOURCE).as_deref(), Some(MANDATE));
+
+        let plain = crate::policy::onchain_part(SOURCE).unwrap().source;
+        let tree = work.path().join("plain");
+        write_tree(&tree, SOURCE, &plain).unwrap();
+        assert_eq!(read(&tree, POLICY_SOURCE).as_deref(), Some(SOURCE));
+        assert_eq!(read(&tree, OWNER_SOURCE), None);
+    }
+
+    /// A source in which a step that depends on a server function writes state is not built.
+    #[test]
+    fn a_source_whose_on_chain_part_does_not_derive_is_not_compiled() {
+        let work = tempfile::tempdir().unwrap();
+        let source = "use allowit::prelude::*;\nuse allowit::AllowitDecision;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    let score = allowit::decision(ctx, &AllowitDecision { id: \"a\", query: \"Is this research?\", deny_below: 1, allow_above: 2 })?;\n    allowit::set_state(ctx, \"score\", score)?;\n    Ok(())\n}\n";
+        let error = build_with(Path::new("/nonexistent/stellar"), source, work.path()).unwrap_err();
+        assert!(
+            error.message.contains("cannot write policy state"),
+            "{}",
+            error.message
+        );
+        assert_eq!(refused(error), code::BUILD_FAILED);
+        assert!(!work.path().join("tree").exists());
     }
 
     /// The embedded tree lists every file that the Custom wallet contract compiles from.

@@ -26,6 +26,14 @@ pub(super) const CUSTOM: &[u8] =
 /// `AllowitCustomPolicy` built with `test-catching` by `scripts/build-contracts.sh`.
 pub(super) const CATCHING: &[u8] =
     include_bytes!("../../../target/test-fixtures/custom_catching.wasm");
+/// `AllowitCustomPolicy` of a policy with server functions, built by
+/// `scripts/build-contracts.sh`: it compiles the on-chain part of the sample mandate and binds
+/// the hash of the owner's source.
+pub(super) const DERIVED: &[u8] =
+    include_bytes!("../../../target/test-fixtures/custom_derived.wasm");
+/// The owner's source of [`DERIVED`], with its server functions.
+pub(super) const DERIVED_SOURCE: &[u8] =
+    include_bytes!("../../allowit-stellar/tests/fixtures/sample-mandate.rs");
 
 /// A `List` of `Addr` values.
 pub(super) fn addresses(env: &Env, items: &[&Address]) -> AllowitValue {
@@ -64,7 +72,7 @@ pub(super) fn denial<T>(
     wasm: &[u8],
     rule: allowit::AllowitError,
 ) -> Result<T, Result<AllowitWalletError, soroban_sdk::InvokeError>> {
-    if wasm == CUSTOM || wasm == CATCHING {
+    if wasm == CUSTOM || wasm == CATCHING || wasm == DERIVED {
         Err(Err(soroban_sdk::InvokeError::Contract(rule as u32)))
     } else {
         Err(Ok(AllowitWalletError::PolicyDenied))
@@ -189,6 +197,40 @@ impl Fixture {
         ] {
             params.set(Symbol::new(&env, key), value);
         }
+        if wasm == DERIVED {
+            // The params of the sample mandate: its limits, and the owner's text and
+            // thresholds, which only server functions read.
+            params = Map::new(&env);
+            let text = |value: &str| AllowitValue::Str(String::from_str(&env, value));
+            for (key, value) in [
+                (OPERATIONS, op_names(&env, &["transfer", "redeem"])),
+                (TOKENS, addresses(&env, &[&asset])),
+                (EXPIRES_AT, AllowitValue::Int(1_000_000)),
+                (LIFETIME_SPENDING_LIMIT, AllowitValue::Int(250)),
+                (DAILY_SPENDING_LIMIT, AllowitValue::Int(150)),
+                (DAILY_VOLUME_LIMIT, AllowitValue::Int(150)),
+                ("evidence_sellers", addresses(&env, &[&recipient])),
+                ("report_limit", AllowitValue::Int(100)),
+                ("swap_venues", addresses(&env, &[])),
+                ("swap_token", AllowitValue::Addr(asset.clone())),
+                ("swap_limit", AllowitValue::Int(0)),
+                ("reserved_volume", AllowitValue::Int(0)),
+                ("swap_output_floor", AllowitValue::Int(1)),
+                ("vaults", addresses(&env, &[])),
+                ("share_limit", AllowitValue::Int(0)),
+                ("redeem_output_floor", AllowitValue::Int(0)),
+                ("catalog_query", text("vault risk reports")),
+                ("report_url", text("https://reports.example/vault")),
+                ("report_key", text("GREPORTKEY")),
+                ("web_query", text("vault incident news")),
+                ("report_purchase", text("Does this report cover my vault?")),
+                ("position_review", text("Does the report call for an exit?")),
+                ("deny_below", AllowitValue::Int(3_000)),
+                ("allow_above", AllowitValue::Int(8_000)),
+            ] {
+                params.set(Symbol::new(&env, key), value);
+            }
+        }
         let mut rules = Vec::new(&env);
         if wasm == COMMON {
             for rule in [
@@ -204,9 +246,11 @@ impl Fixture {
                 rules.push_back(rule);
             }
         }
-        let source_digest = if wasm == CUSTOM || wasm == CATCHING {
+        let source_digest = if wasm == CUSTOM || wasm == CATCHING || wasm == DERIVED {
             let source: &[u8] = if wasm == CUSTOM {
                 include_bytes!("../../../contracts/allowit-custom-policy/policy/policy.rs")
+            } else if wasm == DERIVED {
+                DERIVED_SOURCE
             } else {
                 include_bytes!("../../../contracts/allowit-custom-policy/src/catching_policy.rs")
             };

@@ -24,6 +24,22 @@ CARGO_TARGET_DIR="$fixtures" "$stellar_bin" contract build --locked --package al
 cp "$fixtures/wasm32v1-none/release/allowit_wallet_engine.wasm" target/test-fixtures/engine_deny.wasm
 CARGO_TARGET_DIR="$fixtures" "$stellar_bin" contract build --locked --package allowit-custom-policy --features test-catching
 cp "$fixtures/wasm32v1-none/release/allowit_custom_policy.wasm" target/test-fixtures/custom_catching.wasm
+# The Custom wallet of a policy with server functions: the contract compiles the on-chain part of
+# the policy and binds the hash of the owner's source. The build takes the two files in a copy of
+# the workspace, as the server's build does, so the checkout stays unchanged.
+derived="$cargo_target/test-fixture-derived"
+rm -rf "$derived"
+mkdir -p "$derived"
+git ls-files -z Cargo.toml Cargo.lock rust-toolchain.toml contracts crates/policy crates/policy-wallet crates/protocol crates/test-vault |
+  while IFS= read -r -d '' file; do
+    mkdir -p "$derived/$(dirname "$file")"
+    cp "$file" "$derived/$file"
+  done
+cp crates/allowit-stellar/tests/fixtures/sample-mandate.onchain.rs "$derived/contracts/allowit-custom-policy/policy/policy.rs"
+cp crates/allowit-stellar/tests/fixtures/sample-mandate.rs "$derived/contracts/allowit-custom-policy/policy/source.rs"
+(cd "$derived" && CARGO_TARGET_DIR="$fixtures" "$stellar_bin" contract build --locked --package allowit-custom-policy)
+cp "$fixtures/wasm32v1-none/release/allowit_custom_policy.wasm" target/test-fixtures/custom_derived.wasm
+rm -rf "$derived"
 # The Stellar CLI truncates a Wasm that it copies onto itself, so copy only from another directory.
 if [ "$cargo_target" -ef target ]; then
   "$stellar_bin" contract build --locked

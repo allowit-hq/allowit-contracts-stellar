@@ -116,7 +116,7 @@ Three wallet implementations share one custody core (`crates/policy-wallet`) and
 | --- | --- | --- |
 | `AllowitSimplePolicyEngine` | Agent and server | Offchain. The server checks the authored policy before it signs. The contract enforces custody invariants only. |
 | `AllowitCommonPolicyEngine` | Agent and server | Onchain, from the standard prefix: the leading canonical rule calls of the authored policy, which the owner approves as `rules`. |
-| `AllowitCustomPolicy` | Agent and server | Onchain, compiled. The complete authored policy file compiles verbatim into its own contract, on the same custody mixins. |
+| `AllowitCustomPolicy` | Agent and server | Onchain, compiled. The on-chain part of the authored policy compiles verbatim into its own contract, on the same custody mixins. A policy without server functions is its own on-chain part. For a policy with server functions, Core derives the part: the steps that the chain can check by itself. The server evaluates the whole policy before it signs. |
 
 Pick **Simple** when your server already runs the whole policy and you want the lightest contract. Pick **Common** when you want standard limits enforced by the ledger itself. Pick **Custom** when the policy needs logic the canonical rules do not cover.
 

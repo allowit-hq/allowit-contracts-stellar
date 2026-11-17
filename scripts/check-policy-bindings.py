@@ -2,7 +2,8 @@
 """Check that the custom policy binds its exact source and report the source digest.
 
 The contract compiles policy/policy.rs verbatim as a module. build.rs derives SOURCE_HASH from the same
-bytes, so the file must be the whole policy: it must not read other files, the environment or crates
+bytes, or from policy/source.rs when a build holds the owner's source beside its on-chain part. The
+committed tree holds no policy/source.rs, so the file must be the whole policy: it must not read other files, the environment or crates
 other than `allowit` and `core`, and it must bind `allowit` only to the canonical crate. Each authored
 source must also pass the std-only compile that the offchain server uses. The host portability test
 includes the file, which rejects inner attributes and doc comments."""
@@ -20,6 +21,8 @@ POLICY_MODULE = ('#[cfg(not(feature = "test-catching"))]\n#[path = "../policy/po
                  '#[cfg(feature = "test-catching")]\n#[path = "catching_policy.rs"]\nmod policy;\n')
 if contract.count("mod policy;") != 2 or POLICY_MODULE not in contract or "/source_hash.rs" not in contract:
     raise SystemExit("Custom policy must compile and hash its authored source verbatim")
+if (ROOT / "contracts/allowit-custom-policy/policy/source.rs").exists():
+    raise SystemExit("The committed Custom policy is its own source: remove policy/source.rs")
 for path in ("contracts/allowit-custom-policy/policy/policy.rs", "contracts/allowit-custom-policy/src/branch_policy.rs",
              "contracts/allowit-custom-policy/src/catching_policy.rs"):
     try:

@@ -69,8 +69,14 @@ Policy source names `allowit` only as the path root `allowit::`. Any other occur
 identifier, such as `mod allowit`, `use core as allowit`, `extern crate`, `macro_rules! allowit` or
 `fn allowit`, could rebind the crate that prefix calls name, so the tooling rejects it.
 
-`AllowitCustomPolicy` compiles the file as a module with `#[path]`, and `SOURCE_HASH` covers only that file.
-The file must therefore be the whole policy: it must not use `include!`, `include_str!`,
+`AllowitCustomPolicy` compiles the file as a module with `#[path]`. The file is the on-chain part
+of the owner's policy source. A source that names no server function is its own on-chain part, and
+`SOURCE_HASH` covers that file. For a source with server functions, Core derives the part
+(`allowit_core::policy_source::derive`): the statements that the chain can check by itself stay, and
+the statements that depend on a server function leave. The build then holds the owner's source as
+`policy/source.rs`, and `SOURCE_HASH` covers that file, so the wallet binds the one source that the
+owner signed. The server evaluates the whole source before it signs.
+The compiled file must be the whole on-chain policy: it must not use `include!`, `include_str!`,
 `include_bytes!`, `env!`, `option_env!`, `#[path]`, `cfg_attr` or an out-of-line `mod name;`. The
 names of those macros may appear only as the bare context field read `ctx.env`: after a single `.`
 and not followed by `.`, `(` or `!`. So `ctx.env.storage()` and a value's Soroban `env()` method
@@ -347,7 +353,7 @@ So no write outlives its evaluation, also when the server reuses an `AllowitEnv`
 wallet runs `post_flight` after its own policy check, and a denied transaction rolls the temporary
 buffer back.
 
-`AllowitTier` selects what a wallet stores. Custom compiles its whole policy, so its
+`AllowitTier` selects what a wallet stores. Custom compiles every state write of its policy, so its
 `AllowitTier::Custom` post-flight applies every write. Simple and Common run only the standard
 prefix onchain, which never writes, so they never add or change a policy key. Policy keys left by
 earlier Custom code stay unchanged and still count toward the bounds. Their
@@ -420,7 +426,7 @@ rejecting the packet. The preflight runner propagates the first rule error. Repe
 read the same current state and only `post_flight` charges, so a rule cannot charge twice.
 
 On Simple and Common, rule denials, including `OperationNotAllowed`, map to `PolicyDenied`.
-`AllowitCustomPolicy` compiles the whole policy, so it fails the call with the denying rule's own
+`AllowitCustomPolicy` compiles the policy's own rule calls, so it fails the call with the denying rule's own
 `AllowitError` code, for example `PaymentLimitExceeded` (102). These codes start at 101 and never
 share a number with a wallet error. The server names the canonical rule of such a code only when
 the simulation's diagnostic events show that the wallet itself raised it. A returned `MissingParam` or
