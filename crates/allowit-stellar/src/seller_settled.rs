@@ -675,8 +675,8 @@ struct Transfers {
     /// The transactions in which the token reported a transfer from the wallet to the payee,
     /// from the ledger of the preparation through the expiry ledger of the entry.
     transactions: Vec<[u8; 32]>,
-    /// The events cover every ledger through the expiry ledger: the ledger passed it, and the
-    /// read reached the end of the events or an event after it.
+    /// The events cover every ledger through the expiry ledger: the read reached an event
+    /// after it, or an empty page whose cursor is at that ledger or after it.
     complete: bool,
 }
 
@@ -696,7 +696,7 @@ fn transfers(rpc: &dyn rpc::Rpc, p: &PreparedOperation) -> Result<Transfers> {
     let token = sac_address(&c.network, &asset_xdr(c)?)?;
     let mut transactions = Vec::new();
     let mut cursor: Option<String> = None;
-    for _ in 0..8 {
+    for _ in 0..16 {
         let mut params = json!({
             "filters": [{"type": "contract", "contractIds": [token], "topics": [prefix, with_asset]}],
             "pagination": {"limit": 200},
@@ -706,9 +706,6 @@ fn transfers(rpc: &dyn rpc::Rpc, p: &PreparedOperation) -> Result<Transfers> {
             None => params["startLedger"] = json!(p.state.ledger),
         }
         let reply = rpc.call("getEvents", params)?;
-        let latest = reply["latestLedger"]
-            .as_u64()
-            .ok_or("Missing latest ledger of the events")?;
         let events = reply["events"].as_array().ok_or("Missing ledger events")?;
         for event in events {
             let ledger = event["ledger"].as_u64().ok_or("Invalid event ledger")?;
@@ -728,15 +725,34 @@ fn transfers(rpc: &dyn rpc::Rpc, p: &PreparedOperation) -> Result<Transfers> {
             }
         }
         let next = reply["cursor"].as_str().map(str::to_owned);
-        if events.len() < 200 || next.is_none() || next == cursor {
+        // A page can end before the endpoint's limit, so only an empty page ends the read. Its
+        // cursor names the last ledger that the endpoint scanned: the read is complete when
+        // that ledger is the expiry ledger or a later one. The head of the endpoint says
+        // nothing about how far a page scanned.
+        if events.is_empty() {
+            let scanned = next.as_deref().and_then(cursor_ledger);
             return Ok(Transfers {
                 transactions,
-                complete: latest > last,
+                complete: scanned.is_some_and(|ledger| ledger >= last),
+            });
+        }
+        // A page with events and no way forward leaves the rest unread.
+        if next.is_none() || next == cursor {
+            return Ok(Transfers {
+                transactions,
+                complete: false,
             });
         }
         cursor = next;
     }
     Err("The token reported too many transfers to read this settlement".into())
+}
+
+/// The ledger of an event cursor: `<id>-<index>`, where the id holds the ledger in its high
+/// 32 bits.
+fn cursor_ledger(cursor: &str) -> Option<u64> {
+    let (id, _) = cursor.split_once('-')?;
+    Some(id.parse::<u64>().ok()? >> 32)
 }
 
 /// A settlement that the ledger shows: the signed entry and the receipt of its transaction.
@@ -1313,15 +1329,30 @@ mod tests {
     struct Events {
         passphrase: String,
         latest: u64,
-        events: Vec<serde_json::Value>,
+        /// The pages of events, in order. A page past the last one is empty.
+        pages: Vec<Vec<serde_json::Value>>,
+        /// The last ledger that the endpoint scanned when it returns an empty page.
+        scanned: u64,
         transaction: serde_json::Value,
     }
     impl rpc::Rpc for Events {
-        fn call(&self, method: &str, _: serde_json::Value) -> Result<serde_json::Value> {
+        fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
             Ok(match method {
                 "getNetwork" => json!({"passphrase": self.passphrase}),
                 "getEvents" => {
-                    json!({"latestLedger": self.latest, "events": self.events, "cursor": "end"})
+                    // The cursor of a page with events is `page-<number>`; that of an empty
+                    // page names the scanned ledger, as the network's endpoint does.
+                    let page = params["pagination"]["cursor"]
+                        .as_str()
+                        .and_then(|cursor| cursor.strip_prefix("page-")?.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let events = self.pages.get(page).cloned().unwrap_or_default();
+                    let cursor = if events.is_empty() {
+                        format!("{}-4294967295", (self.scanned << 32) | 0xffff_ffff)
+                    } else {
+                        format!("page-{}", page + 1)
+                    };
+                    json!({"latestLedger": self.latest, "events": events, "cursor": cursor})
                 }
                 "getTransaction" => self.transaction.clone(),
                 other => panic!("unexpected ledger call: {other}"),
@@ -1333,10 +1364,11 @@ mod tests {
     fn an_unreadable_candidate_transaction_keeps_the_outcome_open() {
         let p = keypair_wallet();
         let last = u64::from(expiry_ledger(part(&p).unwrap()).unwrap());
-        let ledger = |events: Vec<serde_json::Value>| Events {
+        let read = |pages: Vec<Vec<serde_json::Value>>, scanned: u64| Events {
             passphrase: passphrase(&p.config.network).unwrap().to_owned(),
             latest: last + 5,
-            events,
+            pages,
+            scanned,
             transaction: json!({
                 "status": "NOT_FOUND",
                 "oldestLedger": 1,
@@ -1345,14 +1377,32 @@ mod tests {
             }),
         };
         // No transfer through the expiry ledger: the entry lapsed.
-        assert!(lapsed(&ledger(Vec::new()), &p).unwrap());
-        // A transfer whose transaction the ledger does not return may have settled the entry.
+        assert!(lapsed(&read(Vec::new(), last), &p).unwrap());
+        // The head of the endpoint is past the expiry ledger, and its scan stopped before
+        // it: the rest is unread, so nothing is proven.
+        assert!(!lapsed(&read(Vec::new(), last - 1), &p).unwrap());
+        // A page can end early. A transfer on a later page is found, and a transfer whose
+        // transaction the ledger does not return may have settled the entry.
         let candidate = json!({"ledger": last, "txHash": "09".repeat(32)});
-        assert!(matches!(
-            observe(&ledger(vec![candidate.clone()]), &p).unwrap(),
-            Observed::Open
-        ));
-        assert!(!lapsed(&ledger(vec![candidate]), &p).unwrap());
+        let earlier = json!({"ledger": last - 1, "txHash": "08".repeat(32)});
+        for pages in [
+            vec![vec![candidate.clone()]],
+            vec![vec![earlier.clone()], vec![candidate.clone()]],
+        ] {
+            assert!(matches!(
+                observe(&read(pages.clone(), last + 5), &p).unwrap(),
+                Observed::Open
+            ));
+            assert!(!lapsed(&read(pages, last + 5), &p).unwrap());
+        }
+        // An event after the expiry ledger ends the read: everything before it was returned.
+        let after = json!({"ledger": last + 1, "txHash": "07".repeat(32)});
+        assert!(lapsed(&read(vec![vec![after]], last - 1), &p).unwrap());
+        assert_eq!(
+            cursor_ledger("0024835489475330047-4294967295"),
+            Some(5_782_462)
+        );
+        assert_eq!(cursor_ledger("end"), None);
     }
 
     /// A ledger endpoint that must never be called.

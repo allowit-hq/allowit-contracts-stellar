@@ -282,7 +282,9 @@ exactly `transfer(wallet, payTo, amount)` on the asset contract, and its host pa
   entry as its only authorization, settled it: its receipt has `VerifiedReceipt::settles`, and the operation keeps its
   own `transaction_hash` as its identity. The ledger admits an entry that no call uses, so a transaction
   that only carries the entry settles nothing; one that carries it in another shape leaves the outcome open.
-  A complete read without a transaction that carries the entry, after the expiry ledger, proves the lapse
+  The read follows the event cursor to an empty page, whose cursor names the last ledger that the endpoint
+  scanned: it is complete when that ledger is the expiry ledger or a later one, or when an event after the
+  expiry ledger was reached. A complete read without a transaction that carries the entry proves the lapse
   (`Status::Failed` without a receipt). A reported transfer whose transaction the ledger does not return
   keeps the outcome open. The wallet paid no fee: the receipt reports none.
 
