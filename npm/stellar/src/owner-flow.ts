@@ -4,7 +4,7 @@
  * The host supplies its authenticated transport, the signing of one step and a journal. This module holds the rules
  * for a saved signed step and for the typed replies of the service.
  */
-import type {Keypair} from '@stellar/stellar-sdk/base';
+import {Keypair} from '@stellar/stellar-sdk/base';
 import {canonicalNetwork} from './plugin.js';
 import {expiredRecord as chainExpiredRecord, horizonGet} from './chain-record.js';
 import {countersignCreation, CREATE_FEE_ACCOUNT, FEE_ACCOUNT_REQUIRED, newFeeAccountKey} from './fee-account.js';
@@ -653,7 +653,10 @@ async function runUpdate({network, ask, sign, journal, key, policyId, params, ex
       throw new OwnerFlowError('The approval names another policy or other values than this change. Nothing was signed.', null, false);
     const signer = await walletOwner(network, fields.wallet, 'Nothing was signed; try again.');
     onStep('Sign the approval of the new values in your wallet…');
-    const signature = signatureBytes(await sign(approvalStep(message)));
+    const step = approvalStep(message), signature = signatureBytes(await sign(step));
+    // Only the owner's own signature is kept: another account's signature would be refused and resent forever.
+    if (!Keypair.fromPublicKey(signer).verify(Uint8Array.from(step.hash.match(/../g) ?? [], byte => parseInt(byte, 16)), Uint8Array.from(signature)))
+      throw new OwnerFlowError('Your wallet signed with another account than the owner. Nothing was saved; sign with the owner account.', null, false);
     // The signed approval is saved before it leaves: a lost reply is settled from it, never signed again.
     const approval: SavedApproval = {...identity, message, signer, signature};
     journal.set(approvalKey, JSON.stringify(approval));

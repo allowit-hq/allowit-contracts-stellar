@@ -401,6 +401,17 @@ fn resumes(saved: &Record, identity: &str) -> Result<bool> {
                 &json!({"selection":saved.selection,"work":saved.work,"maxFeeStroops":saved.max_fee_stroops}),
             )?)
 }
+/// Whether a saved record still has the identity that it was saved under: the identity of this
+/// release, which leaves out a deployment's fee account, or the hash of its whole content, which
+/// an earlier release saved.
+fn identity_holds(record: &Record) -> Result<bool> {
+    Ok(record.intent_hash
+        == workflow_identity(&record.selection, &record.work, record.max_fee_stroops)?
+        || record.intent_hash
+            == intent_hash(
+                &json!({"selection":record.selection,"work":record.work,"maxFeeStroops":record.max_fee_stroops}),
+            )?)
+}
 /// The identity of a workflow: its selection, its work and its fee ceiling. The identity of a
 /// deployment leaves out the fee account, because the workflow itself makes that account.
 fn workflow_identity(selection: &OwnerPolicy, work: &Work, max_fee: u32) -> Result<String> {
@@ -2014,13 +2025,7 @@ pub fn status(
     let (network_name, packets, completed) = if value.get("selection").is_some() {
         let mut record: Record = serde_json::from_value(value)
             .map_err(|_| Error::config("Invalid retained owner workflow"))?;
-        if record.version != 1
-            || record.request_id != id
-            || record.intent_hash
-                != intent_hash(
-                    &json!({"selection":record.selection,"work":record.work,"maxFeeStroops":record.max_fee_stroops}),
-                )?
-        {
+        if record.version != 1 || record.request_id != id || !identity_holds(&record)? {
             return Err(Error::config("Retained owner workflow identity changed"));
         }
         let network_name = record.selection.config.network.clone();
@@ -2238,6 +2243,38 @@ mod submit_refusal_tests {
             steps: vec![],
             complete: false,
         }
+    }
+    /// A status read accepts the record of a deployment that names its fee account, under the
+    /// identity of this release and under the whole-content hash of an earlier one, and refuses
+    /// a record whose content changed.
+    #[test]
+    fn a_status_read_accepts_a_saved_deployment_with_its_fee_account() {
+        let mut record = record_defaults();
+        record.intent_hash = workflow_identity(&record.selection, &record.work, 100).unwrap();
+        record.selection.config.fee_account = Some(crate::test_support::owner::account(77));
+        // The whole-content hash, which the status read alone accepted before, differs.
+        assert_ne!(
+            record.intent_hash,
+            intent_hash(
+                &json!({"selection":record.selection,"work":record.work,"maxFeeStroops":record.max_fee_stroops}),
+            )
+            .unwrap()
+        );
+        assert!(identity_holds(&record).unwrap());
+        let legacy = Record {
+            intent_hash: intent_hash(
+                &json!({"selection":record.selection,"work":record.work,"maxFeeStroops":record.max_fee_stroops}),
+            )
+            .unwrap(),
+            ..record_defaults()
+        };
+        assert!(!identity_holds(&legacy).unwrap());
+        let mut legacy = legacy;
+        legacy.selection.config.fee_account = Some(crate::test_support::owner::account(77));
+        assert!(identity_holds(&legacy).unwrap());
+        let mut changed = record;
+        changed.max_fee_stroops = 101;
+        assert!(!identity_holds(&changed).unwrap());
     }
     /// A deployment's fee account across runs. The setup key is never in the record.
     #[test]

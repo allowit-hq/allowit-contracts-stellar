@@ -526,3 +526,18 @@ test('a Native change signs only the reviewed policy with the requested value: n
   const done = await attempt(approval({wallet: setup.wallet}).message);
   assert.deepEqual([done.done, signed.length], [true, 1]);
 });
+
+test('a Native change signed by another account is refused before it is saved, and the owner can sign again', async () => {
+  const {fetch} = ledger(), signed = [];
+  globalThis.fetch = fetch;
+  const setup = await setUpNativeWallet({network, ...roles, amount: '0', sign: ownerSigns([]), onStep() {}, journal: journalOf(), key: 'k', fetch});
+  const {message} = approval({wallet: setup.wallet}), journal = journalOf(), submitted = [];
+  const ask = async (path, body) => path === 'native/owner/prepare' ? {policyId: 'policy-1', approval: {message}}
+    : (submitted.push(body), {policyId: 'policy-1', action: 'update_params', status: 'confirmed'});
+  const stranger = Keypair.random();
+  const input = {network, historyPauseMs: 0, journal, key: 'w', policyId: 'policy-1', params: {payment_limit: {Int: '5'}}, installed: installedOf(setup.wallet), onStep() {}, ask};
+  await assert.rejects(updateParams({...input, sign: async step => Buffer.from(stranger.sign(Buffer.from(step.hash, 'hex'))).toString('base64')}), /another account than the owner/);
+  assert.deepEqual([journal.map.size, submitted.length], [0, 0]);
+  const done = await updateParams({...input, sign: ownerSigns(signed)});
+  assert.deepEqual([done.done, signed.length, submitted.length], [true, 1, 1]);
+});
