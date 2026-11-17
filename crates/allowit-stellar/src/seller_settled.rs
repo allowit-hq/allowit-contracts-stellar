@@ -288,7 +288,19 @@ pub fn admit(p: &PreparedOperation, now: u64) -> Result<[u8; 32]> {
     if p.expires_at.saturating_add(DAY_MARGIN) > day_end {
         return Err(DAY_END.into());
     }
-    // The same decision for an operation that expires a margin later: see `EXPIRY_MARGIN`.
+    admit_later(p, None)?;
+    Ok(a.digest)
+}
+
+/// The decision of the policy for the operation of `p` expiring a margin later: see
+/// [`EXPIRY_MARGIN`]. `evaluator` is the compiled evaluator of a source that the server
+/// evaluates; without it only the part that the rail evaluates itself decides, as in the
+/// admission of the operation.
+pub fn admit_later(
+    p: &PreparedOperation,
+    evaluator: Option<policy::PortableEvaluator>,
+) -> Result<()> {
+    part(p)?;
     let later = p
         .expires_at
         .checked_add(EXPIRY_MARGIN)
@@ -300,10 +312,10 @@ pub fn admit(p: &PreparedOperation, now: u64) -> Result<[u8; 32]> {
         &p.state,
         p.created_at,
         later,
-        None,
+        evaluator,
     )
     .map_err(|_| TIME_LIMIT)?;
-    Ok(a.digest)
+    Ok(())
 }
 
 /// Prepare the payment authorization of `r`. The same transfer is first prepared as the

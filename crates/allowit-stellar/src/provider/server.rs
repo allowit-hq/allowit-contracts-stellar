@@ -1025,6 +1025,17 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 "Authorization differs from selected installation",
             ));
         }
+        // A classic account has no server authorization entry: the server admits the
+        // operation here, with its evaluator, and signs the transaction at execution.
+        if c.route == WalletRoute::Native {
+            checked(native::admit_classic(&p, s.identity(), now, e))?;
+            // A payment authorization can settle after its operation expires, so the whole
+            // policy must still allow the payment a margin later.
+            if p.payment_authorization.is_some() {
+                checked(native::seller_settled::admit_later(&p, e))?;
+            }
+            return self.packet(&p);
+        }
         if p.payment_authorization.is_some() {
             return Err(Error::unsupported(native::seller_settled::POLICY_WALLET));
         }

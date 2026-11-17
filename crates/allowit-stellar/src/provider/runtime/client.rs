@@ -113,7 +113,10 @@ fn validate_portable_profile(bundle: &Bundle) -> Result<()> {
             "The portable Stellar profile is missing its source binding",
         ));
     };
-    let shape = crate::host::authoring::check(&bundle.config.policy_source)?;
+    let shape = crate::provider::source_shape(
+        bundle.config.route == WalletRoute::Native,
+        &bundle.config.policy_source,
+    )?;
     let params_hash = crate::host::authoring::canonical_digest(&portable.params)?;
     if bundle.language.as_deref() != Some("allowit-portable-v1")
         || portable.language != "allowit-portable-v1"

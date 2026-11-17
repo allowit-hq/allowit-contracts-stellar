@@ -287,8 +287,8 @@ impl OwnerProvider for Owner {
         {
             return Err(Error::config("The policy belongs to another network"));
         }
-        let shape = crate::host::authoring::check(&policy.code)?;
         let binding = &policy.runtime.instance_binding;
+        let shape = crate::provider::source_shape(binding.route == "native", &policy.code)?;
         let kind = policy
             .wallet_kind
             .or(match (binding.route.as_str(), binding.tier) {
