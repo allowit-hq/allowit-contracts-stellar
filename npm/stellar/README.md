@@ -14,10 +14,11 @@
 | `wallet-sign-in` | `allowit-stellar-wallet-sign-in` | `{network, message}` | `allowit-signed-in {address, signature}`, `allowit-error` |
 | `owner-sign` | `allowit-stellar-owner-sign` | `{network, step, summary, owner?, expected?}` | `allowit-signed {signedPayload, hash}`, `allowit-cancel`, `allowit-error` |
 | `build-attest` | `allowit-stellar-build-attest` | `{network, message, summary?}` | `allowit-signed {signature, codeHash}`, `allowit-cancel`, `allowit-error` |
+| `owner-answer` | `allowit-stellar-owner-answer` | `{network, owner, message}` | `allowit-signed {signature, answer, snapshot}`, `allowit-cancel`, `allowit-error` |
 | `receipt` | `allowit-stellar-receipt` | `{network, receipt}` | none |
 | `binding-review` | `allowit-stellar-binding-review` | `{network, installation}` | `allowit-verified {ok, detail}` |
 
-`owner-sign` signs only a transaction whose hash equals the reviewed `step.hash`, and only before `step.expiresAt`. With `expected`, it also runs the owner verifier Wasm on the step. `wallet-sign-in` signs only a CAIP-122 message whose first line names the current site and whose second line is the wallet account. `build-attest` signs only a custom build attestation message of the element's network whose `owner` is the wallet account; `signature` is the SEP-53 message signature as lowercase hexadecimal. The wallet API loads on the first signing click.
+`owner-sign` signs only a transaction whose hash equals the reviewed `step.hash`, and only before `step.expiresAt`. With `expected`, it also runs the owner verifier Wasm on the step. `wallet-sign-in` signs only a CAIP-122 message whose first line names the current site and whose second line is the wallet account. `build-attest` signs only a custom build attestation message of the element's network whose `owner` is the wallet account; `signature` is the SEP-53 message signature as lowercase hexadecimal. `owner-answer` signs only an owner review answer message of the element's network, with the account `owner`, and shows the fields of that message: the decision question with its score, or the lookup that failed; `signature` is the SEP-53 message signature as base64. The wallet API loads on the first signing click.
 
 The plugin also supplies `walletKinds(network)`, `walletKind(document)`, `nativeAsset(network)` and
 `assetDisplay(network, asset)`. `walletKind` reads the route and tier of a policy, draft, profile or installation and

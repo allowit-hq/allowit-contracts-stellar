@@ -8,7 +8,7 @@ import { defineElements } from './elements/index.js';
 import { adkParamLines, parseReviewLink, reviewAgentPrompt } from './adk-owner-link.js';
 import { installAndFund, updateParams } from './owner-flow.js';
 import { feeAccount, refillFees } from './fee-account.js';
-export type ElementKind = 'address' | 'explorer-link' | 'amount' | 'wallet-sign-in' | 'owner-sign' | 'build-attest' | 'receipt' | 'binding-review';
+export type ElementKind = 'address' | 'explorer-link' | 'amount' | 'wallet-sign-in' | 'owner-sign' | 'build-attest' | 'owner-answer' | 'receipt' | 'binding-review';
 export type Feature = 'transfer' | 'swap' | 'deposit' | 'redeem' | 'owner-setup' | 'deploy' | 'fund' | 'activate' | 'binding-review' | 'explorer-links';
 export interface RailNetwork {
     id: string;
@@ -69,6 +69,7 @@ declare const plugin: Readonly<{
         readonly 'wallet-sign-in': "allowit-stellar-wallet-sign-in";
         readonly 'owner-sign': "allowit-stellar-owner-sign";
         readonly 'build-attest': "allowit-stellar-build-attest";
+        readonly 'owner-answer': "allowit-stellar-owner-answer";
         readonly receipt: "allowit-stellar-receipt";
         readonly 'binding-review': "allowit-stellar-binding-review";
     }>;

@@ -11,7 +11,7 @@ import {ADK_OWNER_FRAGMENT, adkParamLines, parseReviewLink, reviewAgentPrompt} f
 import {installAndFund, updateParams} from './owner-flow.js';
 import {feeAccount, refillFees} from './fee-account.js';
 
-export type ElementKind = 'address'|'explorer-link'|'amount'|'wallet-sign-in'|'owner-sign'|'build-attest'|'receipt'|'binding-review';
+export type ElementKind = 'address'|'explorer-link'|'amount'|'wallet-sign-in'|'owner-sign'|'build-attest'|'owner-answer'|'receipt'|'binding-review';
 export type Feature = 'transfer'|'swap'|'deposit'|'redeem'|'owner-setup'|'deploy'|'fund'|'activate'|'binding-review'|'explorer-links';
 export interface RailNetwork {id: string; label: string; testnet: boolean; aliases: readonly string[]}
 export interface AssetInfo {network: string; id: string; symbol: string; decimals: number; stablecoin: boolean; label: string}
