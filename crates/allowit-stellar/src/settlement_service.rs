@@ -542,9 +542,22 @@ impl SettlementProvider for Service {
                     .checked_add(1)
                     .ok_or_else(|| Error::config("The service account sequence overflowed"))?,
             ),
-            cond: Preconditions::Time(TimeBounds {
-                min_time: TimePoint(0),
-                max_time: TimePoint(now().saturating_add(admitted.timeout)),
+            // The transaction is valid for the seller's timeout and no longer than the entry
+            // that it carries: after the ledger bound the network takes it in no form, so a
+            // hash that the ledger does not know then is never included.
+            cond: Preconditions::V2(PreconditionsV2 {
+                time_bounds: Some(TimeBounds {
+                    min_time: TimePoint(0),
+                    max_time: TimePoint(now().saturating_add(admitted.timeout)),
+                }),
+                ledger_bounds: Some(LedgerBounds {
+                    min_ledger: 0,
+                    max_ledger: last_ledger(&admitted.authorization)?,
+                }),
+                min_seq_num: None,
+                min_seq_age: stellar_xdr::Duration(0),
+                min_seq_ledger_gap: 0,
+                extra_signers: VecM::default(),
             }),
             memo: Memo::None,
             operations: vec![Operation {
@@ -654,11 +667,22 @@ impl SettlementProvider for Service {
     }
 }
 
+/// The ledger bound of the settlement transaction of `a`: one ledger after the expiry ledger
+/// of its entry. The network reads the bound as the last valid ledger or as the first invalid
+/// one; with this value the entry is valid in every ledger that takes the transaction, and
+/// no ledger after it takes the transaction, even as a failed one.
+fn last_ledger(a: &Authorization) -> HostResult<u32> {
+    a.expires_height
+        .checked_add(1)
+        .and_then(|ledger| u32::try_from(ledger).ok())
+        .ok_or_else(|| Error::config("The expiry ledger of the authorization overflows"))
+}
+
 /// Whether the transaction `hash`, which carries the entry of `a`, is not in the ledger and
-/// can never be. The ledger admits the entry through its expiry ledger. The service sent the
-/// transaction no earlier than the ledger at which that expiry was inside the bound of
-/// `timeout`. So an endpoint whose history covers that span, past the expiry ledger, proves
-/// the absence when it does not know the hash.
+/// can never be. Its ledger bound ends one ledger after the expiry ledger of the entry
+/// ([`last_ledger`]). The service sent it no earlier than the ledger at which that expiry was
+/// inside the bound of `timeout`. So an endpoint whose history covers that span, past the
+/// ledger bound, proves the absence when it does not know the hash.
 fn never_included(
     rpc: &dyn rpc::Rpc,
     a: &Authorization,
@@ -677,7 +701,7 @@ fn never_included(
     let earliest = a
         .expires_height
         .saturating_sub(timeout.div_ceil(LEDGER_SECONDS) + EXPIRY_TOLERANCE);
-    Ok(reply["status"] == "NOT_FOUND" && latest > a.expires_height && oldest <= earliest)
+    Ok(reply["status"] == "NOT_FOUND" && latest > u64::from(last_ledger(a)?) && oldest <= earliest)
 }
 
 #[cfg(test)]
@@ -1095,12 +1119,12 @@ mod tests {
             .unwrap()
         };
         let earliest = expires - (60 + EXPIRY_TOLERANCE);
-        assert!(absent("NOT_FOUND", earliest, expires + 1));
-        // Before the expiry ledger passed, with a shorter history, or when the ledger knows
-        // the hash, nothing is proven.
-        assert!(!absent("NOT_FOUND", earliest, expires));
-        assert!(!absent("NOT_FOUND", earliest + 1, expires + 1));
-        assert!(!absent("SUCCESS", earliest, expires + 1));
+        assert!(absent("NOT_FOUND", earliest, expires + 2));
+        // Before the ledger bound of the transaction passed, with a shorter history, or when
+        // the ledger knows the hash, nothing is proven.
+        assert!(!absent("NOT_FOUND", earliest, expires + 1));
+        assert!(!absent("NOT_FOUND", earliest + 1, expires + 2));
+        assert!(!absent("SUCCESS", earliest, expires + 2));
         // No transfer, two transfers, and a transfer of another amount, payee, payer or token.
         assert_eq!(
             admitted(&ledger(vec![], 100), &request, 50_000),

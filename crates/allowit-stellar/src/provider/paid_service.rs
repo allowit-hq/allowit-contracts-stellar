@@ -146,6 +146,15 @@ fn requirement(
     } else {
         SettledBy::Seller
     };
+    // A payment authorization pays an account. An offer to a contract payee is refused here,
+    // so another offer of the same challenge can be chosen.
+    if settled_by == SettledBy::Seller
+        && accepted["payTo"].as_str().is_some_and(|payee| {
+            crate::address(payee).is_ok() && crate::account_key(payee).is_err()
+        })
+    {
+        return Err(unsupported(crate::seller_settled::CONTRACT_PAYEE));
+    }
     // The seller may name the resource. It must be the one that the client asked for.
     let named_resource = if version >= 2 {
         document["resource"]["url"].as_str()
@@ -516,6 +525,38 @@ mod tests {
                 body: b"",
             },
         )
+    }
+
+    #[test]
+    fn an_offer_to_a_contract_payee_is_passed_over_for_one_to_an_account() {
+        // A payment authorization pays an account. The token contract stands for any contract
+        // address here.
+        let contract = standard(&|a| a["payTo"] = json!(native_contract())).unwrap_err();
+        assert_eq!(contract.code, 3);
+        assert_eq!(contract.message, crate::seller_settled::CONTRACT_PAYEE);
+        // A challenge that lists such an offer before one to an account is paid by the second.
+        let offer = |payee: String| {
+            json!({"scheme":"exact","network":TESTNET,"amount":"2500000","payTo":payee,
+                "asset":native_contract(),"maxTimeoutSeconds":300,
+                "extra":{"areFeesSponsored":true}})
+        };
+        let document = json!({"x402Version":2,"resource":{"url":RESOURCE},
+            "accepts":[offer(native_contract()), offer(PAY_TO.into())]});
+        let headers = vec![(
+            CHALLENGE_HEADER.to_owned(),
+            STANDARD.encode(serde_json::to_vec(&document).unwrap()),
+        )];
+        let chosen = challenge(
+            TESTNET,
+            RESOURCE,
+            &SellerReply {
+                status: 402,
+                headers: &headers,
+                body: b"",
+            },
+        )
+        .unwrap();
+        assert_eq!(chosen.pay_to, PAY_TO);
     }
 
     #[test]

@@ -243,7 +243,8 @@ Another `extra.proof`, and the standard form in version 1, are refused before an
 A payment that the seller settles is the ordinary operation with one optional part,
 `PreparedOperation::payment_authorization`. Its request (`seller_settled::request`) names the transfer, carries
 no fee bound and holds the marker `seller_settled::marker()`. Its payee is an account: a contract payee is
-refused when the request is built (`seller_settled::CONTRACT_PAYEE`). Preparation prepares the same transfer as the
+refused when the request is built (`seller_settled::CONTRACT_PAYEE`), and a challenge's offer to a contract
+payee is passed over for its next offer. Preparation prepares the same transfer as the
 wallet would execute it itself, so the same policy checks decide, and adds the part: the unsigned entry of
 exactly `transfer(wallet, payTo, amount)` on the asset contract, and its host payload as the digest.
 
@@ -306,7 +307,9 @@ ledger than in the simulation. A successful transaction with other events answer
 reason and its hash. Without the committed events, the answer stays `settlement_pending`. A transaction that
 the network did not take is `settle_exact_stellar_transaction_submission_failed`: nothing was sent. `observe`
 answers `settle_exact_stellar_transaction_not_included` when the ledger does not know the hash after the
-expiry ledger of the entry and the endpoint's history covers the span in which the service can have sent it.
+ledger bound of the transaction and the endpoint's history covers the span in which the service can have
+sent it. The transaction carries that bound: one ledger after the expiry ledger of the entry, so no later
+ledger takes it, even as a failed one.
 The service signs the hash of its transaction: a caller that keeps what it signed has the hash before the
 transaction is sent.
 

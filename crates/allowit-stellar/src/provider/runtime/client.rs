@@ -1129,7 +1129,14 @@ pub fn exec_paid(
             if wait.is_zero() {
                 return Err(uncertain(error));
             }
-            let start = Some(Err(error.clone()));
+            // A payment authorization cannot settle before the caller presents it, and it
+            // expires: one status read tells whether the engine signed it. Any other
+            // operation is polled until it settles or the wait ends.
+            let (wait, start) = if seller_settles {
+                (Duration::ZERO, None)
+            } else {
+                (wait, Some(Err(error.clone())))
+            };
             let outcome = poll(c, &id, Some(record), journal, &name, wait, start)?;
             // Still only prepared: the engine did not accept the signature, and `error` says why.
             return if outcome.status == OperationStatus::Prepared {
