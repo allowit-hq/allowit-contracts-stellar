@@ -8,7 +8,7 @@ import { Keypair } from '@stellar/stellar-sdk/base';
 import { canonicalNetwork } from './plugin.js';
 import { expiredRecord as chainExpiredRecord, horizonGet } from './chain-record.js';
 import { countersignCreation, CREATE_FEE_ACCOUNT, FEE_ACCOUNT_REQUIRED, newFeeAccountKey } from './fee-account.js';
-import { APPROVE_POLICY, SET_UP_WALLET, WALLET_SETUP_REQUIRED, WalletSetupPendingError, approvalStep, nativeSetupOf, policyApproval, setUpNativeWallet } from './native-wallet.js';
+import { APPROVE_POLICY, SET_UP_WALLET, WALLET_SETUP_REQUIRED, WalletSetupPendingError, approvalStep, nativeApprovalHolds, nativeSetupOf, policyApproval, setUpNativeWallet } from './native-wallet.js';
 /** Typed codes of a refused `native/owner/submit`. The reply body is `{error, code, details}`. */
 export const OWNER_TRANSACTION_EXPIRED = 'owner_transaction_expired';
 export const OWNER_TRANSACTION_PENDING = 'owner_transaction_pending';
@@ -134,6 +134,10 @@ async function walletOwner(network, account, then) {
     if (owners.length !== 1)
         throw new OwnerFlowError(`The owner of the wallet account could not be read from the network. ${then}`, null, true);
     return owners[0].key;
+}
+/** Whether `signature` is the signature of `signer` over the hexadecimal digest of an approval step. */
+function ownerSigned(signer, hash, signature) {
+    return Keypair.fromPublicKey(signer).verify(Uint8Array.from(hash.match(/../g) ?? [], byte => parseInt(byte, 16)), Uint8Array.from(signature));
 }
 /** Workflows that run in this page, by journal key. */
 const running = new Set();
@@ -342,7 +346,7 @@ function savedFeeAccount(journal, key, identity) {
         throw changed({ ...identity, amount: '' });
     return { account: value.feeAccount, created: value.created === true };
 }
-async function run({ network, ask, sign, journal, key, policyId, agent, amount, onStep, historyPauseMs = 1_500 }) {
+async function run({ network, ask, sign, journal, key, policyId, agent, amount, reviewed, onStep, historyPauseMs = 1_500 }) {
     if (!canonicalNetwork(network))
         throw new OwnerFlowError('Select a supported Stellar network.', null, false);
     const fundedKey = `${key}:funded`, feeAccountKey = `${key}:fee-account`;
@@ -405,12 +409,16 @@ async function run({ network, ask, sign, journal, key, policyId, agent, amount, 
         if (!object(approval) || approval.required !== true)
             return;
         const fields = policyApproval(approval.message, network);
-        if (!fields || fields.policyId !== policyId || fields.wallet !== account)
-            throw new OwnerFlowError('The approval differs from this policy and its wallet account. Nothing was signed.', null, false);
+        if (!reviewed)
+            throw new OwnerFlowError('The policy that you reviewed is missing. Nothing was signed.', null, false);
+        if (!fields || fields.policyId !== policyId || fields.wallet !== account || !nativeApprovalHolds(fields, account, reviewed))
+            throw new OwnerFlowError('The approval differs from the policy that you reviewed or from its wallet account. Nothing was signed.', null, false);
         const signer = await walletOwner(network, account, 'Resume to read it again.');
         onStep('Sign the approval of the policy in your wallet…');
-        const signature = await sign(approvalStep(approval.message));
-        await ask('micro/allocation/confirm', { id: policyId, revision: fields.revision, sourceApproval: [{ signer, signature: signatureBytes(signature) }] });
+        const step = approvalStep(approval.message), signature = signatureBytes(await sign(step));
+        if (!ownerSigned(signer, step.hash, signature))
+            throw new OwnerFlowError('Your wallet signed with another account than the owner. Nothing was sent; sign with the owner account.', null, false);
+        await ask('micro/allocation/confirm', { id: policyId, revision: fields.revision, sourceApproval: [{ signer, signature }] });
         receipts.push({ policyId, action: APPROVE_POLICY, status: 'confirmed', transactionHash: '' });
     };
     // A deployment takes at most the fee account, the code upload, the wallet creation and a lifetime renewal.
@@ -644,14 +652,13 @@ async function runUpdate({ network, ask, sign, journal, key, policyId, params, e
         // param at exactly its requested value, and every other value as it is installed.
         if (!installed || !object(installed.params))
             throw new OwnerFlowError('The installed policy that you reviewed is missing. Nothing was signed.', null, false);
-        if (fields.wallet !== installed.wallet || fields.source !== installed.source || canonical(fields.rules) !== canonical(installed.rules)
-            || canonical(fields.params) !== canonical({ ...installed.params, ...params }))
+        if (!nativeApprovalHolds(fields, installed.wallet, { source: installed.source, rules: installed.rules, params: { ...installed.params, ...params }, tier: installed.tier }))
             throw new OwnerFlowError('The approval names another policy or other values than this change. Nothing was signed.', null, false);
         const signer = await walletOwner(network, fields.wallet, 'Nothing was signed; try again.');
         onStep('Sign the approval of the new values in your wallet…');
         const step = approvalStep(message), signature = signatureBytes(await sign(step));
         // Only the owner's own signature is kept: another account's signature would be refused and resent forever.
-        if (!Keypair.fromPublicKey(signer).verify(Uint8Array.from(step.hash.match(/../g) ?? [], byte => parseInt(byte, 16)), Uint8Array.from(signature)))
+        if (!ownerSigned(signer, step.hash, signature))
             throw new OwnerFlowError('Your wallet signed with another account than the owner. Nothing was saved; sign with the owner account.', null, false);
         // The signed approval is saved before it leaves: a lost reply is settled from it, never signed again.
         const approval = { ...identity, message, signer, signature };

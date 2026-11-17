@@ -1,3 +1,4 @@
+import { type ReviewedPolicy } from './native-wallet.js';
 /** Rail-neutral owner step. `payload` is opaque text that only this package signs and reads. */
 export interface OwnerStep {
     action: string;
@@ -35,6 +36,11 @@ export interface InstallAndFundInput {
     agent: string;
     amount: string;
     onStep: (text: string) => void;
+    /**
+     * The policy that the owner reviewed: its exact source, ordered rules, every value and its tier. A Native policy's
+     * approval is signed only when it states exactly this policy for the agent's wallet account. Required for Native.
+     */
+    reviewed?: ReviewedPolicy;
 }
 /** Typed codes of a refused `native/owner/submit`. The reply body is `{error, code, details}`. */
 export declare const OWNER_TRANSACTION_EXPIRED = "owner_transaction_expired";
@@ -108,6 +114,7 @@ export interface UpdateParamsInput {
         source: string;
         rules: unknown;
         params: Record<string, unknown>;
+        tier?: unknown;
     };
     onStep: (text: string) => void;
 }

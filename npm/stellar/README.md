@@ -98,14 +98,18 @@ the roles `{owner, agent, server}`. The workflow then:
    a message, never a transaction. The payload is the base64 UTF-8 text of the message, and the hash its SEP-53 digest.
    The element signs only the exact approval message of its network, shows the wallet account and the hashes of the
    source and the values, and compares them with `data.expected` when the host passes `{policyId, wallet, sourceHash,
-   paramsHash}`. The workflow confirms the approval with `micro/allocation/confirm`.
+   paramsHash}`. The host passes `reviewed: {source, rules, params, tier}`, the policy that the owner reviewed. The
+   workflow signs only an approval that states exactly that policy and the wallet account's own configuration (its
+   network, route, policy instance, asset and fee ceiling); only the server's digests `irHash` and `moduleDigest` are
+   left to the server, and a Native wallet enforces neither. It keeps the signature only when the owner's account
+   made it, and confirms the approval with `micro/allocation/confirm`.
 
 So a Native deployment takes two owner signatures: the setup, which also funds the wallet, and the approval. No
 funding step follows. `updateParams` on a Native wallet is one `approve_policy` signature and no transaction: the
 account holds no values, so the service answers the change with the approval message of the new values. The host
-passes `installed: {wallet, source, rules, params}`, the policy that the owner reviewed. The workflow signs only an
-approval of that policy with the changed params replaced; any other wallet, source, rule or value is refused before
-a signature.
+passes `installed: {wallet, source, rules, params, tier}`, the policy that the owner reviewed. The workflow signs
+only an approval of that policy with the changed params replaced, checked as for the deployment's approval; any
+other field or value is refused before a signature.
 
 ## Build and test
 

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import test from 'node:test';
-import {Keypair, Networks, Operation, TransactionBuilder, Account} from '@stellar/stellar-sdk/base';
+import {Asset, Keypair, Networks, Operation, TransactionBuilder, Account} from '@stellar/stellar-sdk/base';
 import {
   APPROVE_POLICY, SET_UP_WALLET, WALLET_FEE_FLOAT, WALLET_RESERVE, WalletSetupPendingError, approvalMessage, approvalStep, messageDigest,
   nativeSetupOf, nativeSetupTransaction, nativeWalletConfiguration, policyApproval, setUpNativeWallet, walletStartingBalance,
@@ -198,23 +198,28 @@ test('a retained setup names the same wallet again until its caller drops it', a
 
 const canonicalJson = value => Array.isArray(value) ? `[${value.map(canonicalJson).join(',')}]`
   : value && typeof value === 'object' ? `{${Object.keys(value).sort().map(k => `${JSON.stringify(k)}:${canonicalJson(value[k])}`).join(',')}}` : JSON.stringify(value);
+const nativeXlm = Asset.native().contractId(Networks.TESTNET);
 const approval = (extra = {}) => {
   const source = 'use allowit::prelude::*;\n// "5 € per day"\n';
-  const payload = {asset: 'C', assetIssuer: null, assetSymbol: 'XLM', irHash: '', language: 'portable', maxFeeStroops: 100000, moduleDigest: '00', network,
-    params: {payment_limit: {Int: '5'}}, policyId: 'policy-1', policyInstance: '07'.repeat(32), revision: 2, route: 'native',
-    rules: ['payment_limit'], source, sourceHash: hex(sha(source)), tier: 'standard', version: 1, wallet: Keypair.random().publicKey(), ...extra};
+  const wallet = extra.wallet ?? Keypair.random().publicKey();
+  // A Native wallet's configuration: its policy instance, asset and fee ceiling follow from the wallet and the network.
+  const payload = {asset: nativeXlm, assetIssuer: null, assetSymbol: 'XLM', irHash: '', language: 'allowit-portable-v1', maxFeeStroops: 100000, moduleDigest: '00', network,
+    params: {payment_limit: {Int: '5'}}, policyId: 'policy-1', policyInstance: hex(sha(`allowit-stellar-native-wallet-v1:${network}:${wallet}`)), revision: 2, route: 'native',
+    rules: ['payment_limit'], source, sourceHash: hex(sha(source)), tier: 'standard', version: 1, wallet, ...extra};
   // The values' hash is the SHA-256 of their canonical JSON, unless a test states another one.
   if (!('paramsHash' in extra) && payload.params && typeof payload.params === 'object') payload.paramsHash = hex(sha(canonicalJson(payload.params)));
   const sorted = Object.fromEntries(Object.keys(payload).sort().map(key => [key, payload[key]]));
   return {payload, message: `AllowIt Native policy approval v1\n${JSON.stringify(sorted)}`};
 };
+/** The policy that the owner reviewed before the deployment's approval: the approval's own source, rules and values. */
+const reviewedOf = () => ({source: approval().payload.source, rules: ['payment_limit'], params: {payment_limit: {Int: '5'}}});
 
 /** What the owner reviewed of the installed policy of `wallet`: the approval's source and rules, the old value. */
 const installedOf = wallet => ({wallet, source: approval().payload.source, rules: ['payment_limit'], params: {payment_limit: {Int: '1'}}});
 
 test('only the exact approval message of this network is read, and its step carries the message unchanged', () => {
   const {payload, message} = approval();
-  assert.deepEqual(policyApproval(message, network), {policyId: 'policy-1', revision: 2, network, wallet: payload.wallet, source: payload.source, sourceHash: payload.sourceHash, paramsHash: payload.paramsHash, params: payload.params, rules: payload.rules});
+  assert.deepEqual(policyApproval(message, network), {policyId: 'policy-1', revision: 2, network, wallet: payload.wallet, source: payload.source, sourceHash: payload.sourceHash, paramsHash: payload.paramsHash, params: payload.params, rules: payload.rules, fields: payload});
   const step = approvalStep(message, 1_000_000);
   assert.deepEqual([step.action, step.hash, step.expiresAt], [APPROVE_POLICY, messageDigest(message), 1300]);
   assert.equal(approvalMessage(step), message);
@@ -263,7 +268,7 @@ test('a Native policy deploys with two owner signatures: the wallet setup and th
   const {state: chain, fetch} = ledger(), signed = [], journal = journalOf();
   globalThis.fetch = fetch;
   const {ask, calls, state} = nativeService();
-  const input = {network, historyPauseMs: 0, ask, sign: ownerSigns(signed), journal, key: 'flow', policyId: 'policy-1', agent: roles.agent, amount: '5', onStep() {}};
+  const input = {network, historyPauseMs: 0, ask, sign: ownerSigns(signed), journal, key: 'flow', policyId: 'policy-1', agent: roles.agent, amount: '5', reviewed: reviewedOf(), onStep() {}};
   const result = await installAndFund(input);
   assert.deepEqual(signed, [SET_UP_WALLET, APPROVE_POLICY]);
   assert.equal(result.wallet, state.wallet);
@@ -289,7 +294,7 @@ test('a registration that fails keeps the signed setup: the next run registers t
   const {state: chain, fetch} = ledger(), signed = [], journal = journalOf();
   globalThis.fetch = fetch;
   const {ask, state} = nativeService({registerFails: 1});
-  const input = {network, historyPauseMs: 0, ask, sign: ownerSigns(signed), journal, key: 'flow', policyId: 'policy-1', agent: roles.agent, amount: '5', onStep() {}};
+  const input = {network, historyPauseMs: 0, ask, sign: ownerSigns(signed), journal, key: 'flow', policyId: 'policy-1', agent: roles.agent, amount: '5', reviewed: reviewedOf(), onStep() {}};
   await assert.rejects(installAndFund(input), /could not be reached/);
   const created = nativeSetupOf(JSON.parse(journal.get('flow:wallet-setup')).signedPayload, network).wallet;
   const result = await installAndFund(input);
@@ -424,7 +429,7 @@ test('a registration whose reply is lost funds nothing again: the retained setup
     if (path === 'native/register' && lose) {lose = false; throw new Error('The reply was lost.');}
     return reply;
   };
-  const input = {network, historyPauseMs: 0, ask, sign: ownerSigns(signed), journal, key: 'flow', policyId: 'policy-1', agent: roles.agent, amount: '5', onStep() {}};
+  const input = {network, historyPauseMs: 0, ask, sign: ownerSigns(signed), journal, key: 'flow', policyId: 'policy-1', agent: roles.agent, amount: '5', reviewed: reviewedOf(), onStep() {}};
   await assert.rejects(installAndFund(input), /reply was lost/);
   assert.ok(journal.get('flow:wallet-setup'));
   const result = await installAndFund(input);
@@ -446,7 +451,7 @@ test('a retained setup of other inputs is refused and kept: a changed amount fun
     if (path === 'native/register' && lose) {lose = false; throw new Error('The reply was lost.');}
     return reply;
   };
-  const input = {network, historyPauseMs: 0, ask, sign: ownerSigns(signed), journal, key: 'flow', policyId: 'policy-1', agent: roles.agent, amount: '5', onStep() {}};
+  const input = {network, historyPauseMs: 0, ask, sign: ownerSigns(signed), journal, key: 'flow', policyId: 'policy-1', agent: roles.agent, amount: '5', reviewed: reviewedOf(), onStep() {}};
   await assert.rejects(installAndFund(input), /reply was lost/);
   const retained = journal.get('flow:wallet-setup');
   await assert.rejects(installAndFund({...input, amount: '6'}), error => error instanceof OwnerFlowError && /original wallet setup/.test(error.message));
@@ -540,4 +545,38 @@ test('a Native change signed by another account is refused before it is saved, a
   assert.deepEqual([journal.map.size, submitted.length], [0, 0]);
   const done = await updateParams({...input, sign: ownerSigns(signed)});
   assert.deepEqual([done.done, signed.length, submitted.length], [true, 1, 1]);
+});
+
+test('a deployment signs the approval only of the reviewed policy for the new wallet account', async () => {
+  const unconditional = 'use allowit::prelude::*;\npub fn execute(_: &AllowitContext) -> allowit::Result { Ok(()) }\n';
+  for (const [name, change, reviewed] of [
+    ['another source', {source: unconditional, sourceHash: hex(sha(unconditional))}, reviewedOf()],
+    ['a raised limit', {params: {payment_limit: {Int: '500'}}}, reviewedOf()],
+    ['nothing reviewed', {}, undefined],
+  ]) {
+    const {fetch} = ledger(), signed = [];
+    globalThis.fetch = fetch;
+    const {ask: service, state} = nativeService();
+    const ask = async (path, body) => path === 'native/approval' ? {required: true, message: approval({wallet: state.wallet, ...change}).message} : service(path, body);
+    await assert.rejects(installAndFund({network, historyPauseMs: 0, ask, sign: ownerSigns(signed), journal: journalOf(), key: 'flow', policyId: 'policy-1', agent: roles.agent, amount: '5', reviewed, onStep() {}}),
+      /reviewed/, name);
+    assert.deepEqual(signed, [SET_UP_WALLET], name);
+  }
+});
+
+test('a Native change refuses an approval that changes the wallet configuration or adds a field', async () => {
+  const {fetch} = ledger(), signed = [];
+  globalThis.fetch = fetch;
+  const setup = await setUpNativeWallet({network, ...roles, amount: '0', sign: ownerSigns([]), onStep() {}, journal: journalOf(), key: 'k', fetch});
+  for (const [name, change] of Object.entries({
+    'a raised fee ceiling': {maxFeeStroops: 10_000_000},
+    'another asset': {asset: Asset.native().contractId(Networks.PUBLIC)},
+    'another policy instance': {policyInstance: 'ab'.repeat(32)},
+    'an added field': {zfeePayer: 'server'},
+  })) {
+    const {message} = approval({wallet: setup.wallet, ...change});
+    await assert.rejects(updateParams({network, historyPauseMs: 0, sign: ownerSigns(signed), journal: journalOf(), key: 'z', policyId: 'policy-1', params: {payment_limit: {Int: '5'}},
+      installed: installedOf(setup.wallet), onStep() {}, ask: async () => ({policyId: 'policy-1', approval: {message}})}), /another policy or other values/, name);
+  }
+  assert.equal(signed.length, 0);
 });

@@ -139,6 +139,8 @@ export interface PolicyApproval {
     params: Record<string, unknown>;
     /** The ordered rules of the policy, as the message states them. */
     rules: unknown;
+    /** Every field of the message, as the owner's wallet signs it. */
+    fields: Record<string, unknown>;
 }
 /**
  * Reads the exact text of a policy approval of `network`: its title line, then the canonical JSON of the approval.
@@ -146,6 +148,21 @@ export interface PolicyApproval {
  * network or route, or a source or values whose hash differs from the hash that the message states.
  */
 export declare function policyApproval(message: unknown, network: string): PolicyApproval | null;
+/** The policy that the owner reviewed before an approval: its exact source, its ordered rules, every value and its tier. */
+export interface ReviewedPolicy {
+    source: string;
+    rules: unknown;
+    params: Record<string, unknown>;
+    tier?: unknown;
+}
+/**
+ * Whether a policy approval of `wallet` is exactly what the owner reviewed. Every field that the wallet signs is
+ * checked: the policy and its revision come from the service; the source, rules, values and tier must be the
+ * reviewed ones; the network, wallet, route, policy instance, asset and fee ceiling must be the wallet account's
+ * own configuration, as its setup made it. Only the server's digests of the source are left to the server. Any
+ * other field, or any other value, is refused.
+ */
+export declare function nativeApprovalHolds(approval: PolicyApproval, wallet: string, reviewed: ReviewedPolicy): boolean;
 /** The step that asks the owner's wallet to approve a policy. It signs the message and moves nothing. */
 export declare function approvalStep(message: string, now?: number): {
     action: string;

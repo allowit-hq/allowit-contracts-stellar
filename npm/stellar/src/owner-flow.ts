@@ -8,7 +8,7 @@ import {Keypair} from '@stellar/stellar-sdk/base';
 import {canonicalNetwork} from './plugin.js';
 import {expiredRecord as chainExpiredRecord, horizonGet} from './chain-record.js';
 import {countersignCreation, CREATE_FEE_ACCOUNT, FEE_ACCOUNT_REQUIRED, newFeeAccountKey} from './fee-account.js';
-import {APPROVE_POLICY, SET_UP_WALLET, WALLET_SETUP_REQUIRED, WalletSetupPendingError, approvalStep, nativeSetupOf, policyApproval, setUpNativeWallet} from './native-wallet.js';
+import {APPROVE_POLICY, SET_UP_WALLET, WALLET_SETUP_REQUIRED, WalletSetupPendingError, approvalStep, nativeApprovalHolds, nativeSetupOf, policyApproval, setUpNativeWallet, type ReviewedPolicy} from './native-wallet.js';
 
 /** Rail-neutral owner step. `payload` is opaque text that only this package signs and reads. */
 export interface OwnerStep {action: string; payload: string; hash: string; expiresAt: number; explorer?: string | null}
@@ -25,6 +25,11 @@ export interface InstallAndFundInput {
   historyPauseMs?: number;
   ask: Ask; sign: SignStep; journal: OwnerJournal; key: string; policyId: string;
   agent: string; amount: string; onStep: (text: string) => void;
+  /**
+   * The policy that the owner reviewed: its exact source, ordered rules, every value and its tier. A Native policy's
+   * approval is signed only when it states exactly this policy for the agent's wallet account. Required for Native.
+   */
+  reviewed?: ReviewedPolicy;
 }
 
 /** Typed codes of a refused `native/owner/submit`. The reply body is `{error, code, details}`. */
@@ -158,6 +163,11 @@ async function walletOwner(network: string, account: string, then: string): Prom
   const owners = (object(body) && Array.isArray(body.signers) ? body.signers : []).filter(s => object(s) && s.weight === 3 && s.type === 'ed25519_public_key' && typeof s.key === 'string');
   if (owners.length !== 1) throw new OwnerFlowError(`The owner of the wallet account could not be read from the network. ${then}`, null, true);
   return (owners[0] as {key: string}).key;
+}
+
+/** Whether `signature` is the signature of `signer` over the hexadecimal digest of an approval step. */
+function ownerSigned(signer: string, hash: string, signature: number[]): boolean {
+  return Keypair.fromPublicKey(signer).verify(Uint8Array.from(hash.match(/../g) ?? [], byte => parseInt(byte, 16)), Uint8Array.from(signature));
 }
 
 /** Workflows that run in this page, by journal key. */
@@ -361,7 +371,7 @@ function savedFeeAccount(journal: OwnerJournal, key: string, identity: {policyId
   return {account: value.feeAccount, created: value.created === true};
 }
 
-async function run({network, ask, sign, journal, key, policyId, agent, amount, onStep, historyPauseMs = 1_500}: InstallAndFundInput): Promise<{wallet: string; receipts: OwnerReceipt[]}> {
+async function run({network, ask, sign, journal, key, policyId, agent, amount, reviewed, onStep, historyPauseMs = 1_500}: InstallAndFundInput): Promise<{wallet: string; receipts: OwnerReceipt[]}> {
   if (!canonicalNetwork(network)) throw new OwnerFlowError('Select a supported Stellar network.', null, false);
   const fundedKey = `${key}:funded`, feeAccountKey = `${key}:fee-account`;
   const identity: Identity = {policyId, agent, amount};
@@ -418,12 +428,15 @@ async function run({network, ask, sign, journal, key, policyId, agent, amount, o
     const approval = await ask<{required?: unknown; message?: unknown}>('native/approval', {policyId});
     if (!object(approval) || approval.required !== true) return;
     const fields = policyApproval(approval.message, network);
-    if (!fields || fields.policyId !== policyId || fields.wallet !== account)
-      throw new OwnerFlowError('The approval differs from this policy and its wallet account. Nothing was signed.', null, false);
+    if (!reviewed) throw new OwnerFlowError('The policy that you reviewed is missing. Nothing was signed.', null, false);
+    if (!fields || fields.policyId !== policyId || fields.wallet !== account || !nativeApprovalHolds(fields, account, reviewed))
+      throw new OwnerFlowError('The approval differs from the policy that you reviewed or from its wallet account. Nothing was signed.', null, false);
     const signer = await walletOwner(network, account, 'Resume to read it again.');
     onStep('Sign the approval of the policy in your wallet…');
-    const signature = await sign(approvalStep(approval.message as string));
-    await ask('micro/allocation/confirm', {id: policyId, revision: fields.revision, sourceApproval: [{signer, signature: signatureBytes(signature)}]});
+    const step = approvalStep(approval.message as string), signature = signatureBytes(await sign(step));
+    if (!ownerSigned(signer, step.hash, signature))
+      throw new OwnerFlowError('Your wallet signed with another account than the owner. Nothing was sent; sign with the owner account.', null, false);
+    await ask('micro/allocation/confirm', {id: policyId, revision: fields.revision, sourceApproval: [{signer, signature}]});
     receipts.push({policyId, action: APPROVE_POLICY, status: 'confirmed', transactionHash: ''});
   };
 
@@ -536,7 +549,7 @@ export interface UpdateParamsInput {
    * A Native wallet's change is an approval of the whole policy, so the owner signs it only when it is exactly this
    * policy with the changed params replaced. Required for a Native wallet.
    */
-  installed?: {wallet: string; source: string; rules: unknown; params: Record<string, unknown>};
+  installed?: {wallet: string; source: string; rules: unknown; params: Record<string, unknown>; tier?: unknown};
   onStep: (text: string) => void;
 }
 
@@ -648,14 +661,13 @@ async function runUpdate({network, ask, sign, journal, key, policyId, params, ex
     // param at exactly its requested value, and every other value as it is installed.
     if (!installed || !object(installed.params))
       throw new OwnerFlowError('The installed policy that you reviewed is missing. Nothing was signed.', null, false);
-    if (fields.wallet !== installed.wallet || fields.source !== installed.source || canonical(fields.rules) !== canonical(installed.rules)
-      || canonical(fields.params) !== canonical({...installed.params, ...params}))
+    if (!nativeApprovalHolds(fields, installed.wallet, {source: installed.source, rules: installed.rules, params: {...installed.params, ...params}, tier: installed.tier}))
       throw new OwnerFlowError('The approval names another policy or other values than this change. Nothing was signed.', null, false);
     const signer = await walletOwner(network, fields.wallet, 'Nothing was signed; try again.');
     onStep('Sign the approval of the new values in your wallet…');
     const step = approvalStep(message), signature = signatureBytes(await sign(step));
     // Only the owner's own signature is kept: another account's signature would be refused and resent forever.
-    if (!Keypair.fromPublicKey(signer).verify(Uint8Array.from(step.hash.match(/../g) ?? [], byte => parseInt(byte, 16)), Uint8Array.from(signature)))
+    if (!ownerSigned(signer, step.hash, signature))
       throw new OwnerFlowError('Your wallet signed with another account than the owner. Nothing was saved; sign with the owner account.', null, false);
     // The signed approval is saved before it leaves: a lost reply is settled from it, never signed again.
     const approval: SavedApproval = {...identity, message, signer, signature};

@@ -73,13 +73,20 @@ export function nativeWalletConfiguration(network, wallet, owner, agent, server)
     if (!id)
         throw new Error('Select a supported Stellar network.');
     roles(owner, wallet, agent, server);
-    const asset = stellarAssetContract('XLM', null, networkPassphrase(id));
+    const facts = walletFacts(id, wallet);
     return {
-        network: id, policyInstance: Array.from(digest(`allowit-stellar-native-wallet-v1:${id}:${wallet}`)), wallet, owner, agent, server,
+        network: id, policyInstance: Array.from(facts.policyInstance), wallet, owner, agent, server,
         route: 'native', language: 'portable',
-        params: { operations: { List: [{ Str: 'transfer' }] }, tokens: { List: [{ Addr: asset }] } },
-        asset, assetSymbol: 'XLM', assetIssuer: null, policySource: BOOTSTRAP_SOURCE, sourceHash: Array.from(digest(BOOTSTRAP_SOURCE)),
-        moduleDigest: Array.from(new Uint8Array(32)), maxFeeStroops: 100_000,
+        params: { operations: { List: [{ Str: 'transfer' }] }, tokens: { List: [{ Addr: facts.asset }] } },
+        asset: facts.asset, assetSymbol: facts.assetSymbol, assetIssuer: facts.assetIssuer, policySource: BOOTSTRAP_SOURCE,
+        sourceHash: Array.from(digest(BOOTSTRAP_SOURCE)), moduleDigest: Array.from(new Uint8Array(32)), maxFeeStroops: facts.maxFeeStroops,
+    };
+}
+/** What a wallet account's configuration states of itself: its policy instance, its asset and its fee ceiling. */
+function walletFacts(network, wallet) {
+    return {
+        policyInstance: digest(`allowit-stellar-native-wallet-v1:${network}:${wallet}`),
+        asset: stellarAssetContract('XLM', null, networkPassphrase(network)), assetSymbol: 'XLM', assetIssuer: null, maxFeeStroops: 100_000,
     };
 }
 /**
@@ -357,7 +364,30 @@ export function policyApproval(message, network) {
         || typeof source !== 'string' || typeof sourceHash !== 'string' || hex(digest(source)) !== sourceHash
         || typeof paramsHash !== 'string' || !object(params) || hex(digest(canonical(params))) !== paramsHash)
         return null;
-    return { policyId, revision: revision, network: id, wallet, source, sourceHash, paramsHash, params, rules };
+    return { policyId, revision: revision, network: id, wallet, source, sourceHash, paramsHash, params, rules, fields: value };
+}
+/** The fields of an approval that the server derives for its own records. A Native wallet enforces none of them. */
+const SERVER_DIGESTS = new Set(['irHash', 'moduleDigest']);
+/**
+ * Whether a policy approval of `wallet` is exactly what the owner reviewed. Every field that the wallet signs is
+ * checked: the policy and its revision come from the service; the source, rules, values and tier must be the
+ * reviewed ones; the network, wallet, route, policy instance, asset and fee ceiling must be the wallet account's
+ * own configuration, as its setup made it. Only the server's digests of the source are left to the server. Any
+ * other field, or any other value, is refused.
+ */
+export function nativeApprovalHolds(approval, wallet, reviewed) {
+    const own = walletFacts(approval.network, wallet);
+    const expected = {
+        version: 1, policyId: approval.policyId, revision: approval.revision, network: approval.network, wallet, route: 'native',
+        policyInstance: hex(own.policyInstance), asset: own.asset, assetSymbol: own.assetSymbol, assetIssuer: own.assetIssuer,
+        maxFeeStroops: own.maxFeeStroops,
+        source: reviewed.source, sourceHash: hex(digest(reviewed.source)), rules: reviewed.rules, params: reviewed.params,
+        paramsHash: hex(digest(canonical(reviewed.params))), language: approval.fields.language,
+        tier: reviewed.tier === undefined ? approval.fields.tier : reviewed.tier,
+    };
+    const keys = Object.keys(approval.fields).filter(key => !SERVER_DIGESTS.has(key));
+    return keys.length === Object.keys(expected).length && keys.every(key => key in expected && canonical(approval.fields[key]) === canonical(expected[key]))
+        && typeof approval.fields.language === 'string' && /^[a-z0-9-]{1,64}$/.test(approval.fields.language);
 }
 /** The step that asks the owner's wallet to approve a policy. It signs the message and moves nothing. */
 export function approvalStep(message, now = Date.now()) {
