@@ -454,6 +454,48 @@ mod tests {
         )
     }
 
+    /// The same pair at ledger 5736249, after an account of the Testnet proof sold 10 XLM into
+    /// the best bid three times, 15 to 35 seconds before that ledger.
+    fn traded() -> Recorded {
+        Recorded::new(
+            include_str!("price_fixtures/own/root.json"),
+            include_str!("price_fixtures/own/order_book.json"),
+            include_str!("price_fixtures/own/trades.json"),
+        )
+    }
+
+    /// A market with recent trades gives what a host admits: a price and a trade average
+    /// inside a 2% band, three trades of the last hour and enough depth inside the band.
+    #[test]
+    fn recent_trades_give_a_trade_average_beside_the_book_price() {
+        let observed = observe(
+            &traded(),
+            NETWORK,
+            "native",
+            USDC,
+            2_500_000,
+            Some((1_469_302, 200)),
+        )
+        .unwrap();
+        // Each trade sold 9.9999998 XLM for 1.4693018 USDC, at the best bid of 2000000/13611907.
+        assert_eq!((observed.trades, observed.trade_average), (3, 1_469_301));
+        // 0.25 XLM pays 367325 base units of USDC, rounded down.
+        assert_eq!(observed.price, 1_469_300);
+        assert_eq!(observed.observed_at, 1_794_704_890);
+        assert_eq!(
+            observed.source,
+            "horizon-testnet.stellar.org ledger 5736249"
+        );
+        // The five best bids are inside the band; the sixth pays less than 98% of the price.
+        assert!(observed.depth > 2_500_000);
+        assert!(
+            observed.depth
+                < observe(&traded(), NETWORK, "native", USDC, 1, None)
+                    .unwrap()
+                    .depth
+        );
+    }
+
     #[test]
     fn an_asset_is_named_by_its_identity_a_listed_code_or_its_contract() {
         let usdc = Classic {

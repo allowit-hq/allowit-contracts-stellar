@@ -70,12 +70,17 @@ impl OwnerProvider for Owner {
                 "Selected wallet executable exceeds its native limit",
             ));
         }
-        let p = workflow::deployment_policy(
-            policy,
-            cx.signer.address(),
-            r.agent,
-            r.server,
-            r.executable,
+        // The deployment creates and funds the account that sends the agent's operations.
+        // The agent holds a key and no account.
+        let p = workflow::with_fee_account(
+            workflow::deployment_policy(
+                policy,
+                cx.signer.address(),
+                r.agent,
+                r.server,
+                r.executable,
+            )?,
+            &super::OwnerSignerRef(cx.signer),
         )?;
         check(cx, &p)?;
         let runtime = runtime(cx.rpc_url)?;

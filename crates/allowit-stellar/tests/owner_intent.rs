@@ -211,6 +211,7 @@ fn config(tier: PolicyTier, salt: &[u8; 32]) -> WalletConfig {
         wallet: admin::wallet_address("stellar:testnet", &owner(), salt).unwrap(),
         owner: owner(),
         agent: account(12),
+        fee_account: None,
         server: account(13),
         route: WalletRoute::PolicyWallet,
         tier: Some(tier),

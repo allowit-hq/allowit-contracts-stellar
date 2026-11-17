@@ -1,6 +1,6 @@
 export interface AdkOwnerStep {
   network: string;
-  action: 'upload_wasm' | 'create_wallet' | 'extend' | 'fund' | 'update_params';
+  action: 'create_fee_account' | 'upload_wasm' | 'create_wallet' | 'extend' | 'fund' | 'update_params';
   transactionXdr: string;
   transactionHash: string;
   expiresAt: number;
@@ -16,6 +16,12 @@ export interface AdkOwnerSelection {
   params: Record<string, unknown>;
   wasmHash: string;
   wallet?: string;
+  /**
+   * The fee account that the owner's key derived for this wallet. With it the verifier admits the
+   * `create_fee_account` step of exactly that account, and reconstructs the creation and every update with the fee
+   * account as the wallet's agent address.
+   */
+  feeAccount?: string;
   asset: string;
   maxFeeStroops: number;
   policyMaxFeeStroops: number;
@@ -38,7 +44,7 @@ type Verifier = {
 };
 
 const inputLimit = 512 * 1024;
-const verifierHash = '85be7b8f8293b46cede7eb2f7984639523f1624741ca09f1725fe82f7ef00214';
+const verifierHash = '3a6605bdfc4c777e684787c8ea3963ac9f914f2dc33e350cc1a6b0b559cb9730';
 let verifier: Promise<Verifier> | undefined;
 
 async function loadVerifier(): Promise<Verifier> {

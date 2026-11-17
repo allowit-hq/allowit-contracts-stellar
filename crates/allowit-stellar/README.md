@@ -63,9 +63,45 @@ flowchart TB
 
 ## Request profile and custody
 
-This crate maps the canonical `ExecutionRequest` to one admitted native operation: a SEP-41 transfer, or a SEP-56 deposit into or redeem from a vault for a policy wallet. A Stellar call is identified by its contract, its function (`transfer`, `deposit` or `redeem`) and its typed arguments; the request's `schema_digest` names no contract schema and is not read. The wallet is the receiver, holder and operator of each SEP-56 call. The one effect bound is the debit: the wallet asset to the recipient or vault, or for a redeem the vault's own shares. `request::transfer`, `request::deposit` and `request::redeem` build these requests from the wallet configuration, the trusted state, an operation ID and typed amounts, and return only a request that decodes. A policy wallet's fee payer is its current agent account from the trusted state, which can differ from the configured customer signer. Native classic custody checks the current account weights and applicable transaction and payment thresholds. The 3/1/1 weights and 2/2/3 thresholds are deployment templates, not admission requirements. Classic custody admits only a transfer.
+This crate maps the canonical `ExecutionRequest` to one admitted native operation: a SEP-41 transfer, or a SEP-56 deposit into or redeem from a vault for a policy wallet. A Stellar call is identified by its contract, its function (`transfer`, `deposit` or `redeem`) and its typed arguments; the request's `schema_digest` names no contract schema and is not read. The wallet is the receiver, holder and operator of each SEP-56 call. The one effect bound is the debit: the wallet asset to the recipient or vault, or for a redeem the vault's own shares. `request::transfer`, `request::deposit` and `request::redeem` build these requests from the wallet configuration, the trusted state, an operation ID and typed amounts, and return only a request that decodes. A policy wallet's transaction source and fee payer is the agent address that the wallet holds on the ledger: its fee account ([Fee account](#fee-account)), or for a wallet of an earlier release the agent key's own account. Native classic custody checks the current account weights and applicable transaction and payment thresholds. The 3/1/1 weights and 2/2/3 thresholds are deployment templates, not admission requirements. Classic custody admits only a transfer.
 
 Policy wallet custody calls the layout 4 `execute` entrypoint (`CONTRACT_VERSION` 4). The execute request carries the typed native operation (`AllowitStellarOperation`: `Transfer { token, to, amount }`, `Deposit { vault, assets, min_shares }` or `Redeem { vault, shares, min_assets }`; the wallet is every source, owner, receiver and operator), the installed executable (`module_digest`), `source_hash`, the server-attested `expense` (`Unpriced`, or `Priced` with `AllowitExpenseBounds`, gas in the wallet asset) and the agent's bounded `args` (`Map<Symbol, AllowitValue>`). `ExecutionTerms` holds `args` and `expense`; agent and server sign them with the request. The wallet's `policy_binding` lists the general operations its code runs; preparation of a deposit or redeem checks that list. Rules read a redeem with the vault as recipient, its shares as `token_in` and `amount_in`, the asset as `token_out`, and `min_assets` as both `amount` and `min_out`.
+
+## Fee account
+
+The owner's deployment creates and funds the account that sends the agent's operations on a policy wallet and pays
+their network fees. The agent holds a key and no account.
+
+- **Structure.** A fee account has the signers and thresholds of a wallet account: owner weight 3, agent 1, server 1,
+  its own key 0, thresholds 2/2/3. The agent key and the server sign from it only together. The owner alone refills
+  it, withdraws from it and closes it. The wallet contract names the fee account as its agent address, so the
+  contract's agent authorization is the source-account authorization of the fee account. The contract is unchanged.
+- **Configuration.** `WalletConfig::fee_account` (`feeAccount`) names it. `agent_account()` is the agent address of
+  the wallet on the ledger. A wallet with a fee account takes no x402 authorization: the contract verifies that against
+  the raw key of its agent address, and the key of a fee account signs nothing after setup.
+- **Derivation.** `owner::fee_account_derivation_message(network, agent, wallet, index)` is the message whose owner
+  signature derives the account's one-time key (`WalletKey::from_signature`). It names the network, the agent, the
+  policy wallet and an index, and its title differs from the title of a wallet account's message.
+- **Setup.** `owner::prepare_fee_account_setup` prepares one transaction from the owner's account: the creation with
+  the reserve and the fee float (`fee_account_starting_balance`: 2.5 XLM and 5 XLM) and the three signer operations.
+  The owner signs it and the account's own key signs it once. Its owner step has the action `create_fee_account`.
+  `RuntimeProvider::prepare_owner` with `OwnerAction::Create` returns that step while the ledger holds no fee account,
+  and the wallet creation once the ledger holds it with exactly its roles. An installation without a fee account is
+  refused with `fee_account_required` (`details.wallet`), and a fee account with other signers with
+  `fee_account_differs`. `owner_intent::OwnerAction::FeeAccountSetup` reconstructs the step from the owner's own
+  values; `validate_signed_owner_transaction` takes the owner's signature, then the new account's own.
+- **Operations.** The agent key and the server each sign the transaction hash (`sign`); `authorize` assembles both.
+  The server signs only after its own authorization of the exact operation, and the rail signs no other bytes.
+  `rpc::prepare_with` refuses an operation whose fee account holds less than the declared fee above its reserve, with
+  `fee_account_empty` and `details.feeAccount`.
+- **Return.** `OwnerAction::Recover` without an amount and a recipient returns the wallet's balance, and when the
+  wallet holds nothing, the float of its fee account: one payment from the fee account to the owner, with the action
+  `return_fees`. The account stays with its reserve.
+- **Earlier wallets.** A configuration without `feeAccount` stands for a wallet whose agent address is the agent
+  key's own account. It never stands for a wallet whose agent address is a fee account of the same roles.
+
+`tests/fee_account_authority.rs` submits the setup and each kind of transaction on Testnet under each set of signers
+(`ALLOWIT_LIVE_TESTNET=1`, ignored by default).
 
 ## Policy tiers and source
 
@@ -268,7 +304,7 @@ The service evaluates the installed policy on the host before it signs. A Custom
 
 Use `rpc::trusted_state_for_discovery` for public network, account and policy wallet binding discovery without requiring a formerly configured customer signer. Its `DiscoveredState` reports both live authority and whether a policy wallet is paused. Discovery does not authorize an operation. `rpc::trusted_state` checks the presented customer key against current authority. Classic custody accounting must come from the durable policy coordinator; a policy wallet reads its standard accounting from the wallet.
 
-The current policy wallet agent account can have multiple signers. The customer signing key is `config.agent`; the policy wallet transaction source and fee payer are the current agent account in `state.source.address`. Additional Ed25519, hash, preauthorized and signed-payload keys do not lock out a sufficient current customer quorum.
+The agent key signs from the wallet's agent account. The customer signing key is `config.agent`; the policy wallet transaction source and fee payer are the current agent account in `state.source.address`: the fee account, where the server's signature is needed too. Additional Ed25519, hash, preauthorized and signed-payload keys do not lock out a sufficient current customer quorum.
 
 Classic authorization verifies both customer and server role proofs. `SignedOperation.role_signatures` keeps both proofs, and `validate_signed` and a new `rpc::broadcast` require them, even when the customer weight alone meets the account thresholds. A retained record without role proofs stays valid for status and recovery only. Exact quorum checks include matching transaction preauthorizations; policy wallet checks use the final hash after resource simulation. The transaction envelope contains only the signatures needed by current chain thresholds, including any matching preauthorization, so unused signatures cannot invalidate it. High-threshold administration and owner weights are reported from live state rather than imposed by this transfer profile.
 
