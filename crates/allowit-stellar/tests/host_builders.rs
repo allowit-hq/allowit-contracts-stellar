@@ -1162,6 +1162,30 @@ fn current_rpc_not_found_zero_ledger_is_no_receipt() {
 }
 
 #[test]
+fn a_reported_fee_bump_hash_reads_the_receipt_of_its_inner_transaction() {
+    let c = config();
+    let mut chain = Chain::new(&c);
+    let packet = deployer(&chain).fund(&c, 500).unwrap();
+    let signed = sign_owner_transaction(NETWORK, &packet.transaction_xdr, &[11; 32]).unwrap();
+    let x::TransactionEnvelope::Tx(inner) = read(&signed).unwrap() else {
+        panic!()
+    };
+    // An event names the wrapper. The receipt is the inner transaction's, under its hash.
+    chain.receipt = fee_bump_reply(&inner, true);
+    let outer = unhex(chain.receipt["txHash"].as_str().unwrap()).unwrap();
+    assert!(rpc::receipt_by_hash(&chain, NETWORK, &outer).is_err());
+    let receipt = rpc::receipt_by_reported_hash(&chain, NETWORK, &outer)
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.transaction_hash, packet.transaction_hash);
+    assert_eq!(receipt.envelope_xdr, signed);
+    assert_eq!(receipt.status, OperationStatus::Confirmed);
+    rpc::validate_receipt(&receipt, NETWORK, &packet.transaction_hash).unwrap();
+    // Another reported hash does not read this wrapper.
+    assert!(rpc::receipt_by_reported_hash(&chain, NETWORK, &[13; 32]).is_err());
+}
+
+#[test]
 fn fee_bumped_owner_receipt_binds_outer_inner_result_and_status() {
     let c = config();
     let mut chain = Chain::new(&c);

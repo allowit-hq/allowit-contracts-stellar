@@ -7,6 +7,7 @@ use crate::host::{
     error::{Error, Result},
     execution::Request as ExecRequest,
     input::asset::{Amount, Asset},
+    paid_service::SettledBy,
     typed_request::operation_nonce,
 };
 use crate::workflow::{AccountKind, ExecutionRequest};
@@ -72,8 +73,35 @@ pub fn build(
             )));
         }
     };
-    let state = state()?;
     let id = operation_nonce(policy_id, &r.request_id);
+    // A seller that settles the payment itself takes a payment authorization: the request names
+    // the transfer and no fee payer, so it reads no chain state.
+    if r.paid_service
+        .as_ref()
+        .is_some_and(|context| context.settled_by == SettledBy::Seller)
+    {
+        if r.op != "transfer" {
+            return Err(Error::usage("only a transfer pays a seller's challenge"));
+        }
+        // A wallet kind that signs no payment authorization, and a payee that an authorization
+        // cannot pay, are refusals of the offer, as for an offer that the rail cannot read:
+        // the caller did nothing wrong. Nothing is signed.
+        let request = sdk::seller_settled::request(config, id, &r.to, amount).map_err(|e| {
+            let reason = e.to_string();
+            if [
+                sdk::seller_settled::POLICY_WALLET,
+                sdk::seller_settled::CONTRACT_PAYEE,
+            ]
+            .contains(&reason.as_str())
+            {
+                Error::unsupported(reason)
+            } else {
+                Error::usage(format!("the payment does not fit this wallet: {reason}"))
+            }
+        })?;
+        return TypedRequest::new(policy_id, &r.request_id, request);
+    }
+    let state = state()?;
     let request = match r.op.as_str() {
         "transfer" => sdk::request::transfer(config, &state, id, &r.to, amount),
         "deposit" => sdk::request::deposit(config, &state, id, &r.to, amount, min),
@@ -240,5 +268,50 @@ mod tests {
         };
         let error = build("policy-1", &c, &request, || unreachable!()).unwrap_err();
         assert_eq!(error.code, 3, "{}", error.message);
+    }
+
+    #[test]
+    fn a_wallet_that_signs_no_authorization_refuses_the_offer_before_anything_is_signed() {
+        let payee = sdk::account_for_seed(&[21; 32]);
+        let offer = |config: &WalletConfig, to: &str| {
+            let request = ExecRequest {
+                op: "transfer".into(),
+                to: to.into(),
+                amount: Amount {
+                    asset: Asset::Installed,
+                    quantity: 2_500_000,
+                    decimals: None,
+                    text: "2500000".into(),
+                },
+                token_out: None,
+                args: None,
+                request_id: "request-0001".into(),
+                wait: std::time::Duration::ZERO,
+                build_only: true,
+                wallet: None,
+                paid_service: Some(crate::host::paid_service::PaidService {
+                    resource: "https://seller.example/report".into(),
+                    challenge_id: None,
+                    pay_to: to.into(),
+                    amount: "2500000".into(),
+                    asset: config.asset.clone(),
+                    settled_by: SettledBy::Seller,
+                    settle_within: Some(300),
+                }),
+            };
+            // The ledger is never read: the request of an authorization names no fee payer.
+            build("policy-1", config, &request, || unreachable!())
+        };
+        // A policy wallet meets a standard offer: the refusal is of the offer, with the reason.
+        let wallet = crate::test_support::policy_signed().prepared.config;
+        let refused = offer(&wallet, &payee).unwrap_err();
+        assert_eq!(refused.code, 3, "{}", refused.message);
+        assert_eq!(refused.message, sdk::seller_settled::POLICY_WALLET);
+        // A keypair wallet builds the request, and refuses an offer to a contract payee.
+        let keypair = crate::test_support::native_signed().prepared.config;
+        offer(&keypair, &payee).unwrap();
+        let contract = offer(&keypair, &keypair.asset.clone()).unwrap_err();
+        assert_eq!(contract.code, 3, "{}", contract.message);
+        assert_eq!(contract.message, sdk::seller_settled::CONTRACT_PAYEE);
     }
 }

@@ -182,6 +182,11 @@ fn render(out: ExecutionOutcome) -> Outcome {
         // The context names no network: the wallet's network binds the payment to one.
         document[NETWORK_KEY] = out.network.into();
     }
+    if let Some(transaction) = out.authorization {
+        // What the client presents to a seller that settles the payment itself.
+        document[super::paid_service::AUTHORIZATION_KEY] =
+            serde_json::json!({ "transaction": transaction });
+    }
     Outcome { document, status }
 }
 /// The counted and the per-payment limits of the profile's wallet, from the engine. See
@@ -246,6 +251,7 @@ mod storage_boundary_tests {
             explorer: None,
             paid_service: None,
             network: "stellar:testnet".into(),
+            authorization: None,
         };
         let settled = render(outcome(Some((5_661_578, 123_456)))).document;
         let settlement = Settlement::of(&settled).unwrap();
@@ -292,8 +298,11 @@ mod storage_boundary_tests {
                 pay_to: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into(),
                 amount: "10000000".into(),
                 asset: "USDC".into(),
+                settled_by: Default::default(),
+                settle_within: None,
             }),
             network: "stellar:testnet".into(),
+            authorization: None,
         })
         .document;
         let settlement = Settlement::of(&document).unwrap();

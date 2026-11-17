@@ -219,21 +219,113 @@ requirement of the selected network that this rail can settle. Validation is str
 
 - `network` is the selected network or one of its aliases. A requirement of another network is skipped.
 - `scheme` is `exact`.
-- `asset` is the Stellar Asset Contract id of a listed token, or `native`. Another contract is refused.
+- `asset` is the Stellar Asset Contract id of a listed token. A seller that takes the proof of a settled
+  transaction may also write `native`. Another contract is refused.
 - `payTo` is a canonical G or C address.
 - The amount (`amount`, or `maxAmountRequired` in version 1) is a positive integer of base units.
 - A named resource equals the requested URL.
 - `extra.challengeId` or `extra.nonce` is the challenge id. `extra.expiresAt` is a Unix time.
 - The accepted terms are at most 4096 bytes of JSON. The proof echoes them, so larger terms are refused.
 
-Allowit settles the payment itself. The agent's transfer goes through the policy and the engine like
-any other operation. The standard `exact` scheme on Stellar has the seller's facilitator submit a
-transaction that the payer signed; Allowit signs no such transaction. A requirement is accepted only
-when the seller states `extra.proof: "settled-transaction"`. Every other requirement is refused before
-any payment.
+The agent's transfer goes through the policy and the engine like any other operation. A requirement
+states who settles it (`Challenge::settled_by`):
 
-`proof(challenge, receipt)` builds the request header from the outcome document of the confirmed
-operation: `X-PAYMENT` (version 1) or `PAYMENT-SIGNATURE` (version 2), the base64 JSON of
+- **The seller** (`SettledBy::Seller`): the standard `exact` scheme of version 2. The payer signs one
+  authorization entry for exactly the transfer, and the seller's facilitator submits it in its own transaction
+  and pays the network fee. `maxTimeoutSeconds` becomes `Challenge::settle_within`; a requirement without
+  it gets 60 seconds, the default of the settlement service. A requirement with
+  `extra.areFeesSponsored: false` is refused: the scheme defines no other fee payer.
+- **The payer** (`SettledBy::Payer`): the seller states `extra.proof: "settled-transaction"`. Allowit settles
+  the payment itself and presents the settled transaction.
+
+A challenge can list several offers. The first offer that the payer settles is taken, because every wallet
+kind can pay it; the first that the seller settles is taken only when the challenge has no such offer.
+
+Another `extra.proof`, and the standard form in version 1, are refused before any payment.
+
+### Payment authorizations (`seller_settled`)
+
+A payment that the seller settles is the ordinary operation with one optional part,
+`PreparedOperation::payment_authorization`. Its request (`seller_settled::request`) names the transfer, carries
+no fee bound and holds the marker `seller_settled::marker()`. Its payee is an account: a contract payee is
+refused when the request is built (`seller_settled::CONTRACT_PAYEE`), and a challenge's offer to a contract
+payee is passed over for its next offer. Preparation prepares the same transfer as the
+wallet would execute it itself, so the same policy checks decide, and adds the part: the unsigned entry of
+exactly `transfer(wallet, payTo, amount)` on the asset contract, and its host payload as the digest.
+
+- **Who signs.** Only a keypair wallet. `seller_settled::signs` is the one place that decides it by wallet
+  kind, and `signed_entry` is the one function that produces the signature. The agent and the service each sign the digest (`sign`), and
+  `seller_settled::authorize` assembles the entry with both account signatures, checks the wallet account
+  against the ledger and simulates the payload in enforce mode. Their weights reach the medium threshold only
+  together. A policy wallet is refused with `seller_settled::POLICY_WALLET`: its contract checks an
+  authorization against the raw key of its agent address, which is its fee account.
+- **What the entry admits.** One transfer of the amount of the asset from the wallet to the payee, once: the
+  ledger consumes the nonce, which derives from the operation id. It expires at
+  `ledger + (expires_at - created_at) / 6`, at most 64 ledgers.
+- **What is presented.** `SignedOperation::transaction_xdr` is a transaction from a placeholder source with
+  the one invocation and the signed entry. It has no signature, and `rpc::broadcast` refuses it. The outcome
+  document holds it as `paymentAuthorization.transaction`, and `proof` builds the standard payload
+  `{x402Version, resource, accepted, payload: {transaction}}`.
+- **Ledger of the preparation.** The expiry ledger counts from the ledger that the preparation names. Each
+  signer checks that ledger against its own endpoint first (`seller_settled::current_ledger`): a ledger more
+  than five ahead of the signer's read is refused, so no party gets an entry that outlives its operation.
+- **Day.** The limits count a payment in the UTC day of its preparation. The operation of an authorization
+  expires at least ten minutes before the end of that day (`seller_settled::DAY_MARGIN`), so its ledger
+  closes inside the day while ledgers close within that margin. Later in the day no authorization is signed
+  (`seller_settled::DAY_END`).
+- **Expiry.** The entry expires at a ledger: the ledger of the preparation plus one ledger for each six
+  seconds of the operation's validity, at most 64. The ledger binds an entry to no time, so a ledger that
+  closes late lets the transfer settle after the operation's expiry. The policy is therefore asked twice: for
+  the operation, and for the same operation expiring one day later (`seller_settled::EXPIRY_MARGIN`). A
+  policy whose time limit falls inside that margin signs no authorization (`seller_settled::TIME_LIMIT`). A
+  network that stops for longer than the margin is outside this bound.
+- **Outcome.** The service sends nothing. `seller_settled::observe` reads the asset contract's `transfer`
+  events from the wallet to the payee, from the ledger of the preparation through the expiry ledger. A
+  successful transaction whose one invocation is the transfer that the exact entry authorizes, with that
+  entry as its only authorization, settled it: its receipt has `VerifiedReceipt::settles`, and the operation keeps its
+  own `transaction_hash` as its identity. The ledger admits an entry that no call uses, so a transaction
+  that only carries the entry settles nothing; one that carries it in another shape leaves the outcome open.
+  The read follows the event cursor to an empty page, whose cursor names the last ledger that the endpoint
+  scanned: it is complete when that ledger is the expiry ledger or a later one, or when an event after the
+  expiry ledger was reached. A complete read without a transaction that carries the entry proves the lapse
+  (`Status::Failed` without a receipt). A reported transfer whose transaction the ledger does not return
+  keeps the outcome open. The wallet paid no fee: the receipt reports none.
+
+### Settlement service (`settlement_service`)
+
+`settlement_service::SERVICE` implements the Core settlement-service hook: the checks and the submission of a
+facilitator of the `exact` scheme. `verify` reads `{paymentPayload, paymentRequirements}` and checks, before
+anything is submitted:
+
+- version 2, scheme `exact`, the served network, and the payload's accepted network;
+- one `invokeHostFunction` operation that calls `transfer(from, payTo, amount)` on `asset`, with exactly the
+  required payee and amount;
+- exactly one authorization entry: address credentials of `from`, signed, for exactly that call, with no
+  sub-invocation, expiring within `maxTimeoutSeconds / 5` ledgers plus two;
+- the service's own account is not the transaction source, the operation source, the payer or the
+  authorizer;
+- the enforce-mode simulation succeeds, its resource fee plus the 100-stroop inclusion fee is at most
+  `Limits::max_fee`, and its committed events are exactly one `transfer` of the asset from the payer to the
+  payee of the amount. An event of a call that failed inside the transfer is rolled back and not counted.
+
+`settle` checks again, builds its own transaction (its account as the source, the simulated resources and
+fee, the invocation and the entry unchanged), signs it, sends it and reads the receipt within `Limits::wait`.
+The replies have the standard form: `{isValid, invalidReason?, payer?}` and
+`{success, errorReason?, payer?, transaction, network}`. A transaction that is sent and not confirmed in
+time is `settlement_pending` with its hash; `observe` reads it again. A successful transaction is a
+settlement only when its committed contract events are that one transfer: a token can act otherwise in the
+ledger than in the simulation. A successful transaction with other events answers `success: false` with the
+reason and its hash. Without the committed events, the answer stays `settlement_pending`. A transaction that
+the network did not take is `settle_exact_stellar_transaction_submission_failed`: nothing was sent. `observe`
+answers `settle_exact_stellar_transaction_not_included` when the ledger does not know the hash after the
+ledger bound of the transaction and the endpoint's history covers the span in which the service can have
+sent it. The transaction carries that bound: one ledger after the expiry ledger of the entry, so no later
+ledger takes it, even as a failed one.
+The service signs the hash of its transaction: a caller that keeps what it signed has the hash before the
+transaction is sent.
+
+For a payment that the payer settles, `proof(challenge, receipt)` builds the request header from the outcome
+document of the confirmed operation: `X-PAYMENT` (version 1) or `PAYMENT-SIGNATURE` (version 2), the base64 JSON of
 `{x402Version, scheme, network, payload: {transaction, settled: true, challengeId?}}`. Version 2 also
 echoes `accepted` and `resource`. The receipt must be confirmed, its `network` must be the network of the
 challenge, and its recorded `paidService` context must equal the challenge: the resource, the recipient, the
@@ -250,6 +342,8 @@ A seller that accepts this proof verifies it on its own:
 `exec_paid` sends the `paidService` context with the preparation of the transfer. The engine checks it
 against the operation and records it with the request ID. The journal keeps it with the original intent:
 a retry or a recovery of the same request ID with another context is refused before anything is signed.
+The journal also keeps the ledger endpoint of the client. A recovery of the record reads the ledger through
+it, so a status read of a retained request can prove that a payment authorization lapsed.
 The outcome document of a paid operation shows the recorded context under `paidService` and the wallet's
 network under `network`.
 

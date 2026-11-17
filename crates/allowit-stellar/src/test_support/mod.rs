@@ -129,6 +129,7 @@ pub fn confirmed_payment_receipt(
         ledger,
         envelope_xdr: signed.transaction_xdr.clone(),
         result_xdr: result.to_xdr_base64(x::Limits::none()).unwrap(),
+        settles: None,
     }
 }
 

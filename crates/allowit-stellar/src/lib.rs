@@ -44,6 +44,9 @@ pub use authorization::{
 pub use contract::{CONTRACT_VERSION, DepositReceipt, RedeemReceipt, TransferReceipt};
 pub use policy::{PolicyEngine, PolicyLanguage, PolicyParams, PolicyTier, PolicyValue};
 pub mod rpc;
+pub mod seller_settled;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod settlement_service;
 pub mod signing;
 pub mod x402;
 pub type Result<T> = std::result::Result<T, String>;
@@ -696,6 +699,11 @@ pub struct PreparedOperation {
     pub simulation_data: Option<String>,
     pub created_at: u64,
     pub expires_at: u64,
+    /// Set when the seller settles the payment: the operation is a payment authorization for
+    /// the seller's facilitator, and nobody signs or sends `transaction_xdr`. See
+    /// [`seller_settled`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payment_authorization: Option<Box<seller_settled::PaymentAuthorization>>,
     #[serde(skip)]
     pub native_preflight: Option<NativePreflight>,
 }
@@ -713,6 +721,7 @@ impl PartialEq for PreparedOperation {
             && self.simulation_data == other.simulation_data
             && self.created_at == other.created_at
             && self.expires_at == other.expires_at
+            && self.payment_authorization == other.payment_authorization
     }
 }
 impl Eq for PreparedOperation {}
@@ -1759,6 +1768,7 @@ fn prepare_with_bounds(
         simulation_data: None,
         created_at: now,
         expires_at,
+        payment_authorization: None,
         native_preflight: None,
     })
 }
@@ -1838,6 +1848,10 @@ pub fn validate_prepared(p: &PreparedOperation, now: u64) -> Result<()> {
     if p.version != 1 || p.created_at > now || now >= p.expires_at {
         return Err("Prepared operation is stale".into());
     }
+    if p.payment_authorization.is_some() {
+        // A payment authorization is admitted on the terms that its signers sign.
+        return seller_settled::admit(p, now).map(drop);
+    }
     validate_signing_policy(p, p.created_at)?;
     validate_retained_prepared(p)
 }
@@ -1863,6 +1877,10 @@ pub fn validate_retained_prepared(p: &PreparedOperation) -> Result<()> {
             PacketUse::Retained
         },
     )?;
+    // The authorization part is checked against the operation around it, not rebuilt here.
+    expected
+        .payment_authorization
+        .clone_from(&p.payment_authorization);
     if p.config.route == WalletRoute::PolicyWallet {
         expected = authorization::attach(&expected, authorization::server_signature(p, false)?)?;
     }
@@ -1877,6 +1895,9 @@ pub fn validate_retained_prepared(p: &PreparedOperation) -> Result<()> {
     }
     if &expected != p {
         return Err("Prepared operation changed".into());
+    }
+    if p.payment_authorization.is_some() {
+        seller_settled::validate(p)?;
     }
     Ok(())
 }
@@ -1966,6 +1987,9 @@ pub fn sign_with(
     now: u64,
     sign_hash: impl FnOnce(&[u8; 32]) -> Result<[u8; 64]>,
 ) -> Result<DetachedSignature> {
+    if p.payment_authorization.is_some() {
+        return seller_settled::sign(p, signer, now, sign_hash);
+    }
     validate_prepared(p, now)?;
     current_authorization_bounds(p)?;
     validate_signing_policy(p, now)?;
@@ -2053,6 +2077,10 @@ pub fn authorize(
     signatures: &[DetachedSignature],
     now: u64,
 ) -> Result<SignedOperation> {
+    if p.payment_authorization.is_some() {
+        // The assembly of a payment authorization checks it against the ledger.
+        return Err("Assemble a payment authorization with seller_settled::authorize".into());
+    }
     validate_prepared(p, now)?;
     current_authorization_bounds(p)?;
     if p.config.route == WalletRoute::PolicyWallet {
@@ -2170,6 +2198,10 @@ fn validate_role_signatures(s: &SignedOperation, required: bool) -> Result<()> {
     Ok(())
 }
 pub fn validate_signed(s: &SignedOperation, now: u64) -> Result<()> {
+    if s.prepared.payment_authorization.is_some() {
+        seller_settled::admit(&s.prepared, now)?;
+        return seller_settled::validate_signed(s);
+    }
     operation_from_request(&s.prepared.config, &s.prepared.request)?;
     if s.prepared.state.contract_version == Some(CONTRACT_VERSION)
         && needs_native_preflight(&s.prepared.config)?
@@ -2187,6 +2219,9 @@ pub fn validate_signed(s: &SignedOperation, now: u64) -> Result<()> {
 /// Verify an original signed packet without reauthorizing retired policy source.
 /// Callers must compare their durable original identity and use it only for status/recovery.
 pub fn validate_retained_signed(s: &SignedOperation) -> Result<()> {
+    if s.prepared.payment_authorization.is_some() {
+        return seller_settled::validate_signed(s);
+    }
     validate_retained_prepared(&s.prepared)?;
     if s.prepared.config.route == WalletRoute::PolicyWallet {
         authorization::server_signature(&s.prepared, true)?;

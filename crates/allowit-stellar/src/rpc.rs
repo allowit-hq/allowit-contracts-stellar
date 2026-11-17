@@ -664,6 +664,9 @@ pub enum Broadcast {
 }
 /// Validate a new signed operation and send its exact bytes once.
 pub fn broadcast(rpc: &dyn Rpc, signed: &SignedOperation, now: u64) -> Result<Broadcast> {
+    if signed.prepared.payment_authorization.is_some() {
+        return Err("The payer never sends a payment authorization: the seller settles it".into());
+    }
     validate_signed(signed, now)?;
     send_transaction(
         rpc,
@@ -914,6 +917,11 @@ pub struct VerifiedReceipt {
     pub ledger: u32,
     pub envelope_xdr: String,
     pub result_xdr: String,
+    /// Set when this transaction, which another party submitted, settles a payment
+    /// authorization: the transaction hash of the operation that prepared it. See
+    /// [`crate::seller_settled`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settles: Option<[u8; 32]>,
 }
 /// Recheck a retained receipt before projecting it through another interface.
 pub fn validate_receipt(
@@ -936,6 +944,19 @@ pub fn validate_receipt(
     }
     Ok(())
 }
+/// Check the receipt of an operation that its own transaction settled. Only the receipt of a
+/// payment authorization names what it settles: the mark on any other receipt is refused, so
+/// it cannot change how the receipt is read.
+pub fn validate_own_receipt(
+    receipt: &VerifiedReceipt,
+    network: &str,
+    expected_hash: &[u8; 32],
+) -> Result<()> {
+    if receipt.settles.is_some() {
+        return Err("The receipt settles a payment authorization, not this operation".into());
+    }
+    validate_receipt(receipt, network, expected_hash)
+}
 /// Verify an exact policy-wallet envelope using its chain receipt after key rotation.
 /// This checks native identity and the retained server authorization, without current signing admission.
 /// A failed enclosing transaction does not revoke its reusable address authorization.
@@ -943,6 +964,12 @@ pub fn validate_settled_policy_packet(
     signed: &SignedOperation,
     receipt: &VerifiedReceipt,
 ) -> Result<()> {
+    if signed.prepared.payment_authorization.is_some() {
+        return crate::seller_settled::validate_settled(signed, receipt);
+    }
+    if receipt.settles.is_some() {
+        return Err("The receipt settles a payment authorization, not this operation".into());
+    }
     let prepared = &signed.prepared;
     if prepared.config.route != WalletRoute::PolicyWallet {
         return Err("Chain-only recovery requires a policy wallet packet".into());
@@ -1024,6 +1051,36 @@ pub fn receipt_by_hash(
     let v = rpc.call("getTransaction", json!({"hash":hex(transaction_hash)}))?;
     receipt_from_response(&v, network, transaction_hash)
 }
+/// Read the verified terminal receipt of the transaction that the ledger reports under `reported`,
+/// as an event does: the transaction itself, or the fee bump that carries it. A fee bump is
+/// verified as a wrapper, and the receipt is that of its inner transaction, under the inner
+/// hash. Absence remains unknown.
+pub fn receipt_by_reported_hash(
+    rpc: &dyn Rpc,
+    network: &str,
+    reported: &[u8; 32],
+) -> Result<Option<VerifiedReceipt>> {
+    let v = rpc.call("getTransaction", json!({"hash":hex(reported)}))?;
+    let envelope = v["envelopeXdr"]
+        .as_str()
+        .map(read::<TransactionEnvelope>)
+        .transpose()?;
+    let Some(TransactionEnvelope::TxFeeBump(outer)) = envelope else {
+        return receipt_from_response(&v, network, reported);
+    };
+    let payload = TransactionSignaturePayload {
+        network_id: Hash(network_id(network)?),
+        tagged_transaction: TransactionSignaturePayloadTaggedTransaction::TxFeeBump(
+            outer.tx.clone(),
+        ),
+    };
+    // The wrapper is the transaction that the ledger reported, and no other.
+    if hash(payload.to_xdr(limits()).map_err(err)?) != *reported {
+        return Err("The reported transaction differs from its fee bump".into());
+    }
+    let FeeBumpTransactionInnerTx::Tx(inner) = &outer.tx.inner_tx;
+    receipt_from_response(&v, network, &transaction_hash_for(network, &inner.tx)?)
+}
 fn receipt_from_response(
     v: &Value,
     network: &str,
@@ -1052,6 +1109,7 @@ fn receipt_from_response(
             .as_str()
             .ok_or("Settlement result is required")?
             .into(),
+        settles: None,
     }))
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
