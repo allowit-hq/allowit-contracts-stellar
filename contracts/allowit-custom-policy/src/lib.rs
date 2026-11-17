@@ -13,21 +13,24 @@ mod policy;
 #[path = "catching_policy.rs"]
 mod policy;
 
-/// SHA-256 of the exact bytes of the compiled policy source, computed by `build.rs`.
+/// SHA-256 of the owner's full policy source, computed by `build.rs`.
 pub const SOURCE_HASH: [u8; 32] = include!(concat!(env!("OUT_DIR"), "/source_hash.rs"));
+/// The figures that the compiled policy's checks read, found by `build.rs`.
+pub const FIGURES: u8 = include!(concat!(env!("OUT_DIR"), "/figures.rs"));
 
 /// The bespoke policy tier: its compiled source decides every operation.
 pub struct AllowitCustom;
 impl AllowitPolicy for AllowitCustom {
     const KIND: &'static str = "custom_policy";
-    /// Transfers, router swaps and SEP-56 redeems; no deposits. The compiled policy's `operations`
-    /// rule selects among them.
+    /// Every native operation. The compiled policy's `operations` rule selects among them.
     const OPERATIONS: &'static [AllowitOperation] = &[
         AllowitOperation::transfer,
         AllowitOperation::swap,
+        AllowitOperation::deposit,
         AllowitOperation::redeem,
     ];
-    /// The digest of the compiled policy source.
+    const FIGURES: Option<u8> = Some(FIGURES);
+    /// The hash of the owner's full policy source.
     fn source_digest(env: &Env) -> Option<BytesN<32>> {
         Some(BytesN::from_array(env, &SOURCE_HASH))
     }

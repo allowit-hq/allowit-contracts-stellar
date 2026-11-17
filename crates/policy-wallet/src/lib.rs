@@ -1,109 +1,159 @@
 #![no_std]
-//! Owner-controlled custody mixins shared by fixed and bespoke policy wallets.
+//! The policy wallet kernel shared by the Simple, Standard (Common) and Custom wallets.
+//!
+//! One agent path: `execute(request)` is sent by any account, usually the server's. Its first step
+//! requires the wallet's own authorization; the ledger calls this contract's `__check_auth`, which
+//! verifies the agent's and the server's raw Ed25519 signatures of the ledger's payload. The
+//! payload binds the request, a ledger nonce and an expiration ledger. The wallet then checks the
+//! request and its policy, acts with its own authority, repays the signed gas to the request's
+//! payee and emits one event.
+//!
+//! Storage holds only what the network cannot give more cheaply:
+//! - the instance: one packed configuration value (`c`);
+//! - `d`, temporary: the daily figures and the ledger at which their day ends;
+//! - `t`, persistent: the total figures.
+//!
+//! A figure exists only when an installed check reads it. A wallet whose policy has no such check
+//! writes nothing for a payment.
 use allowit::{
     AllowitArgs, AllowitContext, AllowitOperation, AllowitParams, AllowitRequest, AllowitRule,
-    AllowitTier, AllowitValue,
+    AllowitStandardState, AllowitTier, AllowitValue, DAY, RULES,
 };
 use allowit_wallet_protocol::{
-    AllowitDepositArgs, AllowitExecutionRequest, AllowitExpenseBounds, AllowitPolicyBinding,
-    AllowitRedeemArgs, AllowitSep56DepositEvent, AllowitSep56DepositReceipt,
-    AllowitSep56RedeemEvent, AllowitSep56RedeemReceipt, AllowitStellarOperation, AllowitSwapArgs,
-    AllowitSwapEvent, AllowitSwapReceipt, AllowitTransferReceipt, MAX_SWAP_PATH,
+    AllowitCosignatures, AllowitExecuted, AllowitExecutionRequest, AllowitStellarOperation,
 };
 use soroban_sdk::{
-    Address, Bytes, BytesN, Env, Executable, IntoVal, Map, String, Symbol, TryFromVal, Val, Vec,
+    Address, Bytes, BytesN, Env, Executable, IntoVal, Map, Symbol, Val, Vec,
     address_payload::AddressPayload,
-    auth::{Context, ContractContext, InvokerContractAuthEntry, SubContractInvocation},
+    auth::{Context, InvokerContractAuthEntry},
     contracterror, contracttype,
     crypto::Hash,
-    token,
-    xdr::ToXdr,
+    symbol_short, token,
 };
-mod persistent;
-/// Instance-storage key of the custody State.
-const STATE_KEY: u32 = 0;
-/// Version 4: owner `params` and `policy_state` are key => `AllowitValue` maps. Version 3 stored the
-/// canonical params as a typed struct and a policy state of raw values, version 2 a typed accounting
-/// history struct and version 1 a text-keyed params map. No layout migrates implicitly: the owner
-/// recovers funds.
-pub const CONTRACT_VERSION: u32 = 4;
-// Wasm metadata equal to CONTRACT_VERSION. Release tooling refuses a code change to Wasm that
-// declares another custody layout, or none (version 1), because that code cannot read State.
-soroban_sdk::contractmeta!(key = "allowit_custody_layout", val = "4");
+mod ops;
+mod pack;
+use ops::*;
+use pack::{Reader, Writer};
 
-/// Initial owner-signed configuration. Asset and policy_instance stay fixed after creation.
+/// Custody layout of this code: the packed configuration, `d` and `t`. Release tooling refuses a
+/// code change to Wasm that declares another layout.
+pub const CONTRACT_VERSION: u32 = 5;
+soroban_sdk::contractmeta!(key = "allowit_custody_layout", val = "5");
+
+/// Ledgers of a daily window: the Mainnet minimum lifetime of a temporary entry, about one day.
+pub const DAY_LEDGERS: u32 = 17_280;
+/// Ledgers that `t` and the instance live from their creation: the Mainnet minimum lifetime of a
+/// persistent entry, about 120 days.
+pub const TOTAL_LEDGERS: u32 = 2_073_600;
+
+/// Instance key of the packed configuration.
+const CONFIG: Symbol = symbol_short!("c");
+/// Temporary key of the daily figures.
+const DAILY: Symbol = symbol_short!("d");
+/// Persistent key of the total figures.
+const TOTAL: Symbol = symbol_short!("t");
+
+/// Figures. Each is stored only when an installed check reads it.
+pub const SPENT: u8 = 1;
+pub const CALLS: u8 = 2;
+pub const DAY_SPENT: u8 = 4;
+pub const DAY_TOTAL: u8 = 8;
+const TOTALS: u8 = SPENT | CALLS;
+const DAILIES: u8 = DAY_SPENT | DAY_TOTAL;
+const ALL: u8 = TOTALS | DAILIES;
+
+// Fixed header of the packed configuration. Every layout keeps these offsets, so an owner call
+// reads the owner and the asset whatever the rest holds.
+const H_LAYOUT: usize = 0;
+const H_FLAGS: usize = 1;
+const H_VERSION: usize = 2;
+const H_OWNER: usize = 6;
+const H_AGENT: usize = 38;
+const H_SERVER: usize = 70;
+const H_ASSET: usize = 102;
+const H_SOURCE: usize = 134;
+const HEADER: usize = 166;
+const PAUSED: u8 = 1;
+const OWNER_CONTRACT: u8 = 2;
+/// Largest packed configuration. Core bounds params to 16 KiB of its encoded-size estimate, and
+/// every packed value is smaller than its estimate.
+const MAX_CONFIG: usize = 16_896;
+
+/// Owner-signed configuration of a new wallet. The asset stays fixed after creation.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AllowitPolicyConfig {
     pub owner: Address,
-    pub agent: Address,
-    /// Independent service signer, never a parent-controlled checker address.
-    pub server: Address,
+    /// The agent's Ed25519 key. The agent needs no account.
+    pub agent: BytesN<32>,
+    /// The server's Ed25519 signing key.
+    pub server: BytesN<32>,
+    /// The Stellar Asset Contract whose units the limits count.
     pub asset: Address,
-    pub policy_instance: BytesN<32>,
-    /// Fixed standard prefix digest; Custom uses its complete compiled source digest.
-    pub source_digest: BytesN<32>,
-    /// Ordered owner-approved standard prefix. Simple and Custom use an empty list.
+    /// SHA-256 of the owner's full policy source, which the owner's policy signature binds.
+    pub source_hash: BytesN<32>,
+    /// Largest gas repayment of one request, in XLM stroops. Zero: the wallet repays nothing.
+    pub gas_cap: i128,
+    /// Ordered on-chain rules. Only Standard admits a nonempty list.
     pub rules: Vec<AllowitRule>,
-    /// Owner constructor params, key => value. Standard tiers admit only the canonical keys.
+    /// Owner params, key => value. Standard keeps the params of its rules only.
     pub params: Map<Symbol, AllowitValue>,
-    pub x402_enabled: bool,
 }
 
-/// Complete owner update. It preserves asset, logical identity, nonce, pause and policy state.
+/// Complete owner update at the next deployment version. The asset, the pause and the figures
+/// carry over.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AllowitPolicyDeployment {
-    pub deployment_version: u64,
+pub struct AllowitPolicyUpdate {
+    pub deployment_version: u32,
     pub owner: Address,
-    pub agent: Address,
-    pub server: Address,
-    /// Fixed standard prefix digest; Custom uses its complete compiled source digest.
-    pub source_digest: BytesN<32>,
+    pub agent: BytesN<32>,
+    pub server: BytesN<32>,
+    pub source_hash: BytesN<32>,
+    pub gas_cap: i128,
     pub rules: Vec<AllowitRule>,
-    /// Replacement owner params, key => value; changing only them needs no code redeployment.
     pub params: Map<Symbol, AllowitValue>,
-    pub x402_enabled: bool,
+    /// New wallet code, or none.
     pub wasm_hash: Option<BytesN<32>>,
 }
 
-/// Stored custody State: owner configuration, policy state, nonce and pause.
+/// The cumulated figures and the ledger at which the daily ones end. Read-only view.
+#[contracttype]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AllowitFigures {
+    pub calls: u64,
+    pub spent: i128,
+    pub unpriced: bool,
+    pub day_spent: i128,
+    pub day_total: i128,
+    pub day_unpriced: bool,
+    /// Last ledger of the current daily window; zero when no window is open.
+    pub day_ends: u32,
+}
+
+/// Read-only view of the stored wallet.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AllowitState {
-    /// Free-form policy state after the last operation: standard and policy-defined keys.
-    pub policy_state: Map<Symbol, AllowitValue>,
     pub contract_version: u32,
     pub owner: Address,
-    pub agent: Address,
-    pub server: Address,
+    pub agent: BytesN<32>,
+    pub server: BytesN<32>,
     pub asset: Address,
-    pub policy_instance: BytesN<32>,
-    /// Fixed standard prefix digest; Custom uses its complete compiled source digest.
-    pub source_digest: BytesN<32>,
-    pub rules: Vec<AllowitRule>,
-    /// Owner constructor params, key => value.
-    pub params: Map<Symbol, AllowitValue>,
-    pub x402_enabled: bool,
-    /// Authenticated SAC label cached before any active-token authorization callback.
-    pub token: String,
-    pub deployment_version: u64,
-    pub nonce: u64,
+    pub deployment_version: u32,
     pub paused: bool,
+    pub source_hash: BytesN<32>,
+    pub gas_cap: i128,
+    pub rules: Vec<AllowitRule>,
+    pub params: Map<Symbol, AllowitValue>,
+    /// The figures that this wallet keeps, as a bit set of `SPENT`, `CALLS`, `DAY_SPENT` and
+    /// `DAY_TOTAL`.
+    pub kept: u32,
+    pub figures: AllowitFigures,
 }
 
-/// Custom-account signature of an intercepted transfer, swap or redeem: the signed execution
-/// request and the agent and server signatures over it and the host payload.
-#[contracttype]
-#[derive(Clone)]
-pub struct AllowitPolicyAuthorization {
-    pub execution: AllowitExecutionRequest,
-    pub agent_signature: BytesN<64>,
-    pub server_signature: BytesN<64>,
-}
-
-/// Wallet error codes, all below 100; `AllowitError` codes start at 101. Rule denials collapse to
-/// `PolicyDenied`.
+/// Wallet error codes, all below 100; `AllowitError` codes start at 101. Standard rule denials
+/// collapse to `PolicyDenied`.
 #[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -124,34 +174,27 @@ pub enum AllowitWalletError {
     UnsupportedOperation = 16,
     InvalidInvocation = 17,
     PolicyDenied = 18,
-    Replay = 19,
-}
-
-/// Persistent keys: the replay marker of an operation and the output receipt of an `execute`
-/// deposit, swap or redeem.
-#[contracttype]
-#[derive(Clone)]
-enum Key {
-    Operation(BytesN<32>),
-    Deposit(BytesN<32>),
-    Swap(BytesN<32>),
-    Redeem(BytesN<32>),
+    /// The request's gas repayment exceeds the owner-signed gas cap.
+    GasAboveCap = 20,
 }
 
 /// Compile-time policy mixin. No runtime fallback or system-controlled executable reference exists.
 pub trait AllowitPolicy {
-    /// Implementation kind in bindings and the standard prefix digest.
+    /// Implementation kind.
     const KIND: &'static str;
-    /// Fixed standard implementations bind only their owner-approved initial preflight prefix.
+    /// Simple and Standard run the owner's on-chain rules; Custom runs its compiled source.
     const STANDARD_PREFIX: bool = false;
     /// The general operations that this implementation runs; transfers only unless it selects
     /// more. The owner's `operations` param selects among them.
     const OPERATIONS: &'static [AllowitOperation] = &[AllowitOperation::transfer];
-    /// A bespoke implementation binds its compiled source. Fixed tiers use the owner's source digest.
+    /// The figures that a compiled source's checks read, from its build. The standard tiers derive
+    /// them from their rules.
+    const FIGURES: Option<u8> = None;
+    /// A bespoke implementation binds the owner's source hash. Fixed tiers take the owner's.
     fn source_digest(_env: &Env) -> Option<BytesN<32>> {
         None
     }
-    /// Check the owner-approved standard prefix. Only Common admits a nonempty list.
+    /// Check the owner's on-chain rules. Only Standard admits a nonempty list.
     fn validate(rules: &Vec<AllowitRule>) -> Result<(), AllowitWalletError> {
         if rules.is_empty() {
             Ok(())
@@ -160,12 +203,9 @@ pub trait AllowitPolicy {
         }
     }
     /// Evaluate the compiled checks on the kernel-built rule input. Pass values are discarded.
-    /// Custom runs its own `execute`; the standard tiers run the owner's prefix.
     fn check(ctx: &AllowitContext, rules: &Vec<AllowitRule>) -> Result<(), AllowitWalletError>;
 }
 
-/// The params a tier admits and the policy state it stores. Simple and Common run only the
-/// canonical prefix onchain; Custom runs its whole compiled policy.
 fn tier<P: AllowitPolicy>() -> AllowitTier {
     if P::STANDARD_PREFIX {
         AllowitTier::Standard
@@ -173,502 +213,530 @@ fn tier<P: AllowitPolicy>() -> AllowitTier {
         AllowitTier::Custom
     }
 }
-/// Check owner params for the tier of `P`.
-fn checked_params<P: AllowitPolicy>(
-    params: &Map<Symbol, AllowitValue>,
-) -> Result<(), AllowitWalletError> {
-    allowit::check_params(params, tier::<P>()).map_err(|_| AllowitWalletError::InvalidParam)
-}
 /// A checked arithmetic result, or `Overflow`.
-fn checked<T>(value: Option<T>) -> Result<T, AllowitWalletError> {
+pub(crate) fn checked<T>(value: Option<T>) -> Result<T, AllowitWalletError> {
     value.ok_or(AllowitWalletError::Overflow)
 }
-/// Read initialized state and maintain its instance and code lifetime. Constructor initialization is explicit.
-fn load(env: &Env, initial: Option<AllowitState>) -> Result<AllowitState, AllowitWalletError> {
-    if let Some(state) = initial {
-        store(env, &state);
-    }
-    let raw = stored(env)?;
-    let state =
-        AllowitState::try_from_val(env, &raw).map_err(|_| AllowitWalletError::InvalidState)?;
-    // Struct decoding ignores extra keys and reads absent Option keys as None. Only the exact
-    // canonical encoding of this layout is accepted, including the params map.
-    if state.contract_version != CONTRACT_VERSION || state.clone().to_xdr(env) != raw.to_xdr(env) {
-        return Err(AllowitWalletError::InvalidState);
-    }
-    extend(env);
-    Ok(state)
-}
-/// Renew the instance and code lifetime of this wallet.
-fn extend(env: &Env) {
-    let ttl = env.storage().max_ttl();
-    env.deployer()
-        .extend_ttl(env.current_contract_address(), ttl / 2, ttl);
-}
-/// Write the custody State. Params and policy state share this one instance entry; the core
-/// byte budgets keep it far below the 64 KiB contract data entry limit of current settings.
-fn store(env: &Env, state: &AllowitState) {
-    env.storage().instance().set(&STATE_KEY, state);
-}
-/// Stored fields that owner entrypoints keep. Struct decoding ignores the other State keys, so
-/// stored params or a rule list that no longer decodes never block recovery, passthrough or their
-/// replacement by an owner packet. Policy state is read separately, only where it is carried over.
-#[contracttype]
-struct KeptState {
-    contract_version: u32,
-    owner: Address,
-    asset: Address,
-    policy_instance: BytesN<32>,
-    token: String,
-    deployment_version: u64,
-    nonce: u64,
-    paused: bool,
-}
-/// Read the kept fields. Callers require the owner's authorization.
-fn kept(env: &Env) -> Result<KeptState, AllowitWalletError> {
-    let kept = KeptState::try_from_val(env, &stored(env)?)
-        .map_err(|_| AllowitWalletError::InvalidState)?;
-    // A later layout may change the meaning of kept fields.
-    if kept.contract_version == 0 || kept.contract_version > CONTRACT_VERSION {
-        return Err(AllowitWalletError::InvalidState);
-    }
-    extend(env);
-    Ok(kept)
-}
-/// Policy state carried into a new State. Earlier layouts store none, or store other values, so
-/// they do not migrate.
-fn kept_policy_state(
-    env: &Env,
-    kept: &KeptState,
-) -> Result<Map<Symbol, AllowitValue>, AllowitWalletError> {
-    if kept.contract_version != CONTRACT_VERSION {
-        return Err(AllowitWalletError::InvalidState);
-    }
-    let fields = Map::<Symbol, Val>::try_from_val(env, &stored(env)?)
-        .map_err(|_| AllowitWalletError::InvalidState)?;
-    let raw = fields
-        .get(Symbol::new(env, "policy_state"))
-        .ok_or(AllowitWalletError::InvalidState)?;
-    Map::try_from_val(env, &raw).map_err(|_| AllowitWalletError::InvalidState)
-}
-/// The raw stored State, before layout decoding.
-fn stored(env: &Env) -> Result<Val, AllowitWalletError> {
-    env.storage()
-        .instance()
-        .get(&STATE_KEY)
-        .ok_or(AllowitWalletError::InvalidState)
-}
-/// The ed25519 master key of a G-account address; any other address is `InvalidActor`. The
-/// wallet's agent and server sign with their master keys.
-fn public_key(address: &Address) -> Result<BytesN<32>, AllowitWalletError> {
+/// The Ed25519 key of a G-account address; any other address is `InvalidActor`.
+pub(crate) fn public_key(address: &Address) -> Result<BytesN<32>, AllowitWalletError> {
     match address.to_payload() {
         Some(AddressPayload::AccountIdPublicKeyEd25519(key)) => Ok(key),
         _ => Err(AllowitWalletError::InvalidActor),
     }
 }
-/// Pure standard-prefix binding: SHA-256 of the canonical XDR of the domain `allowit_std_prefix`,
-/// the implementation kind, the module hash, the asset and the ordered rules. The module hash fixes
-/// the operations that the code runs. Param values and the owner-signed offchain suffix are
-/// excluded.
-pub fn standard_prefix_digest(
-    env: &Env,
-    kind: &Symbol,
-    module: &BytesN<32>,
-    asset: &Address,
-    rules: &Vec<AllowitRule>,
-) -> BytesN<32> {
-    env.crypto()
-        .sha256(
-            &(
-                Symbol::new(env, "allowit_std_prefix"),
-                kind.clone(),
-                module.clone(),
-                asset.clone(),
-                rules.clone(),
-            )
-                .to_xdr(env),
-        )
-        .to_bytes()
+/// The figure that a canonical rule reads, if any.
+fn figure_of(rule: AllowitRule) -> u8 {
+    match rule {
+        AllowitRule::lifetime_spending_limit => SPENT,
+        AllowitRule::call_limit => CALLS,
+        AllowitRule::daily_spending_limit => DAY_SPENT,
+        AllowitRule::daily_volume_limit => DAY_TOTAL,
+        _ => 0,
+    }
 }
-/// The standard prefix digest of this executable, asset and rules.
-fn checked_prefix<P: AllowitPolicy>(
-    env: &Env,
-    asset: &Address,
-    rules: &Vec<AllowitRule>,
-) -> Result<BytesN<32>, AllowitWalletError> {
-    let Some(Executable::Wasm(module)) = env.current_contract_address().executable() else {
-        return Err(AllowitWalletError::InvalidState);
-    };
-    Ok(standard_prefix_digest(
-        env,
-        &Symbol::new(env, P::KIND),
-        &module,
-        asset,
-        rules,
-    ))
-}
-/// Check owner configuration: distinct roles, identities, source binding, params, rules and x402 keys.
-fn validate<P: AllowitPolicy>(
-    env: &Env,
-    config: &AllowitPolicyConfig,
-) -> Result<(), AllowitWalletError> {
-    let roles = [&config.owner, &config.agent, &config.server];
-    for (i, role) in roles.iter().enumerate() {
-        if **role == env.current_contract_address() || roles[..i].contains(role) {
-            return Err(AllowitWalletError::InvalidActor);
+/// The figures that the installed policy reads. A standard rule runs only when its param is set.
+fn kept<P: AllowitPolicy>(rules: &Vec<AllowitRule>, params: &Map<Symbol, AllowitValue>) -> u8 {
+    if let Some(figures) = P::FIGURES {
+        return figures & ALL;
+    }
+    let mut kept = 0;
+    for rule in rules.iter() {
+        if params.contains_key(Symbol::new(params.env(), rule.key())) {
+            kept |= figure_of(rule);
         }
     }
-    if config.policy_instance == BytesN::from_array(env, &[0; 32]) {
-        return Err(AllowitWalletError::InvalidState);
+    kept
+}
+
+/// The decoded configuration.
+#[derive(Clone)]
+struct Config {
+    paused: bool,
+    owner: Address,
+    agent: BytesN<32>,
+    server: BytesN<32>,
+    asset: Address,
+    version: u32,
+    source_hash: BytesN<32>,
+    gas_cap: i128,
+    rules: Vec<AllowitRule>,
+    params: Map<Symbol, AllowitValue>,
+}
+
+/// The raw configuration value and its fixed header.
+struct Header {
+    raw: Bytes,
+    head: [u8; HEADER],
+}
+impl Header {
+    fn read(env: &Env) -> Result<Self, AllowitWalletError> {
+        let raw: Bytes = env
+            .storage()
+            .instance()
+            .get(&CONFIG)
+            .ok_or(AllowitWalletError::InvalidState)?;
+        if (raw.len() as usize) < HEADER {
+            return Err(AllowitWalletError::InvalidState);
+        }
+        let mut head = [0u8; HEADER];
+        raw.slice(0..HEADER as u32).copy_into_slice(&mut head);
+        Ok(Self { raw, head })
     }
-    if P::source_digest(env).is_some_and(|digest| digest != config.source_digest) {
-        return Err(AllowitWalletError::InvalidState);
+    fn key(&self, at: usize) -> [u8; 32] {
+        let mut key = [0; 32];
+        key.copy_from_slice(&self.head[at..at + 32]);
+        key
     }
-    checked_params::<P>(&config.params)?;
-    decoded(&config.rules)?;
-    P::validate(&config.rules)?;
-    if P::STANDARD_PREFIX
-        && config.source_digest != checked_prefix::<P>(env, &config.asset, &config.rules)?
-    {
-        return Err(AllowitWalletError::InvalidState);
+    fn owner(&self, env: &Env) -> Result<Address, AllowitWalletError> {
+        let kind = if self.head[H_FLAGS] & OWNER_CONTRACT != 0 {
+            5
+        } else {
+            4
+        };
+        pack::address(env, kind, &self.key(H_OWNER))
     }
-    if config.x402_enabled {
-        public_key(&config.agent)?;
-        public_key(&config.server)?;
+    fn asset(&self, env: &Env) -> Result<Address, AllowitWalletError> {
+        pack::address(env, 5, &self.key(H_ASSET))
+    }
+    fn version(&self) -> u32 {
+        let mut v = [0; 4];
+        v.copy_from_slice(&self.head[H_VERSION..H_VERSION + 4]);
+        u32::from_be_bytes(v)
+    }
+    fn paused(&self) -> bool {
+        self.head[H_FLAGS] & PAUSED != 0
+    }
+    /// Store the configuration with a new pause flag and version; the rest stays as it is.
+    fn store_with(
+        &self,
+        env: &Env,
+        paused: bool,
+        version: u32,
+    ) -> Result<(), AllowitWalletError> {
+        let mut head = self.head;
+        head[H_FLAGS] = (head[H_FLAGS] & !PAUSED) | if paused { PAUSED } else { 0 };
+        head[H_VERSION..H_VERSION + 4].copy_from_slice(&version.to_be_bytes());
+        let mut raw = Bytes::from_slice(env, &head);
+        raw.append(&self.raw.slice(HEADER as u32..));
+        env.storage().instance().set(&CONFIG, &raw);
+        Ok(())
+    }
+}
+
+/// The next deployment version after `version`.
+fn next(version: u32) -> Result<u32, AllowitWalletError> {
+    checked(version.checked_add(1))
+}
+
+impl Config {
+    /// Decode the whole configuration of this layout.
+    fn load(env: &Env) -> Result<Self, AllowitWalletError> {
+        let header = Header::read(env)?;
+        let len = header.raw.len() as usize;
+        if header.head[H_LAYOUT] != CONTRACT_VERSION as u8 || len > MAX_CONFIG {
+            return Err(AllowitWalletError::InvalidState);
+        }
+        let mut buf = [0u8; MAX_CONFIG];
+        header.raw.copy_into_slice(&mut buf[..len]);
+        let mut r = Reader::new(&buf[HEADER..len]);
+        let gas_cap = r.amount()?;
+        let mut rules = Vec::new(env);
+        for _ in 0..r.byte()? {
+            let rule = RULES
+                .get(r.byte()? as usize)
+                .ok_or(AllowitWalletError::InvalidState)?;
+            rules.push_back(*rule);
+        }
+        let mut params = Map::new(env);
+        for _ in 0..r.uint()? {
+            let key = match r.byte()? {
+                0xff => {
+                    let n = r.byte()? as usize;
+                    let text = core::str::from_utf8(r.take(n)?)
+                        .map_err(|_| AllowitWalletError::InvalidState)?;
+                    Symbol::new(env, text)
+                }
+                index => Symbol::new(
+                    env,
+                    RULES
+                        .get(index as usize)
+                        .ok_or(AllowitWalletError::InvalidState)?
+                        .key(),
+                ),
+            };
+            params.set(key, pack::get_value(env, &mut r)?);
+        }
+        if !r.done() {
+            return Err(AllowitWalletError::InvalidState);
+        }
+        Ok(Self {
+            paused: header.paused(),
+            owner: header.owner(env)?,
+            agent: BytesN::from_array(env, &header.key(H_AGENT)),
+            server: BytesN::from_array(env, &header.key(H_SERVER)),
+            asset: header.asset(env)?,
+            version: header.version(),
+            source_hash: BytesN::from_array(env, &header.key(H_SOURCE)),
+            gas_cap,
+            rules,
+            params,
+        })
+    }
+    /// Pack and store the configuration.
+    fn store(&self, env: &Env) -> Result<(), AllowitWalletError> {
+        let mut buf = [0u8; MAX_CONFIG];
+        let mut w = Writer::new(&mut buf);
+        let owner_kind = match self.owner.to_payload() {
+            Some(AddressPayload::AccountIdPublicKeyEd25519(_)) => 0,
+            Some(AddressPayload::ContractIdHash(_)) => OWNER_CONTRACT,
+            None => return Err(AllowitWalletError::InvalidActor),
+        };
+        let asset = match self.asset.to_payload() {
+            Some(AddressPayload::ContractIdHash(hash)) => hash,
+            _ => return Err(AllowitWalletError::UnsupportedAsset),
+        };
+        let owner = match self.owner.to_payload() {
+            Some(AddressPayload::AccountIdPublicKeyEd25519(k) | AddressPayload::ContractIdHash(k)) => k,
+            None => return Err(AllowitWalletError::InvalidActor),
+        };
+        w.byte(CONTRACT_VERSION as u8)?;
+        w.byte(owner_kind | if self.paused { PAUSED } else { 0 })?;
+        w.put(&self.version.to_be_bytes())?;
+        w.put(&owner.to_array())?;
+        w.put(&self.agent.to_array())?;
+        w.put(&self.server.to_array())?;
+        w.put(&asset.to_array())?;
+        w.put(&self.source_hash.to_array())?;
+        w.amount(self.gas_cap)
+            .map_err(|_| AllowitWalletError::InvalidParam)?;
+        w.byte(u8::try_from(self.rules.len()).map_err(|_| AllowitWalletError::InvalidParam)?)?;
+        for rule in self.rules.iter() {
+            let index = RULES.iter().position(|r| *r == rule);
+            w.byte(index.ok_or(AllowitWalletError::InvalidParam)? as u8)?;
+        }
+        w.uint(u128::from(self.params.len()))?;
+        for (key, value) in self.params.iter() {
+            match RULES
+                .iter()
+                .position(|rule| key == Symbol::new(env, rule.key()))
+            {
+                Some(index) => w.byte(index as u8)?,
+                None => {
+                    let mut text = [0u8; 32];
+                    let n = pack::symbol_text(env, &key, &mut text)?;
+                    w.byte(0xff)?;
+                    w.byte(n as u8)?;
+                    w.put(&text[..n])?;
+                }
+            }
+            pack::put_value(&mut w, &value)?;
+        }
+        env.storage()
+            .instance()
+            .set(&CONFIG, &Bytes::from_slice(env, w.bytes()));
+        Ok(())
+    }
+}
+
+/// Standard figures kept by the wallet.
+#[derive(Clone, Default, PartialEq)]
+struct Figures {
+    calls: u64,
+    spent: i128,
+    unpriced: bool,
+    day_spent: i128,
+    day_total: i128,
+    day_unpriced: bool,
+}
+/// The stored figures and what is stored.
+struct Stored {
+    figures: Figures,
+    /// The end ledger of an open daily window.
+    day_ends: Option<u32>,
+    total_exists: bool,
+}
+/// Read `t` and an open `d`. A window whose end ledger has passed is closed even if someone paid
+/// to keep the entry alive.
+fn read_figures(env: &Env) -> Result<Stored, AllowitWalletError> {
+    let mut figures = Figures::default();
+    let total: Option<Bytes> = env.storage().persistent().get(&TOTAL);
+    if let Some(raw) = &total {
+        let mut buf = [0u8; 64];
+        let len = raw.len() as usize;
+        if len > buf.len() {
+            return Err(AllowitWalletError::InvalidState);
+        }
+        raw.copy_into_slice(&mut buf[..len]);
+        let mut r = Reader::new(&buf[..len]);
+        let mask = r.byte()?;
+        figures.unpriced = r.byte()? & 1 != 0;
+        if mask & SPENT != 0 {
+            figures.spent = r.amount()?;
+        }
+        if mask & CALLS != 0 {
+            figures.calls = u64::try_from(r.uint()?).map_err(|_| AllowitWalletError::InvalidState)?;
+        }
+        if !r.done() {
+            return Err(AllowitWalletError::InvalidState);
+        }
+    }
+    let mut day_ends = None;
+    let daily: Option<Bytes> = env.storage().temporary().get(&DAILY);
+    if let Some(raw) = daily {
+        let mut buf = [0u8; 64];
+        let len = raw.len() as usize;
+        if len > buf.len() {
+            return Err(AllowitWalletError::InvalidState);
+        }
+        raw.copy_into_slice(&mut buf[..len]);
+        let mut r = Reader::new(&buf[..len]);
+        let mut end = [0; 4];
+        end.copy_from_slice(r.take(4)?);
+        let end = u32::from_be_bytes(end);
+        if env.ledger().sequence() <= end {
+            day_ends = Some(end);
+            let mask = r.byte()?;
+            figures.day_unpriced = r.byte()? & 1 != 0;
+            if mask & DAY_SPENT != 0 {
+                figures.day_spent = r.amount()?;
+            }
+            if mask & DAY_TOTAL != 0 {
+                figures.day_total = r.amount()?;
+            }
+            if !r.done() {
+                return Err(AllowitWalletError::InvalidState);
+            }
+        }
+    }
+    Ok(Stored {
+        figures,
+        day_ends,
+        total_exists: total.is_some(),
+    })
+}
+/// Write `t` with the kept total figures; a new `t` lives `TOTAL_LEDGERS`.
+fn write_total(env: &Env, kept: u8, f: &Figures, exists: bool) -> Result<(), AllowitWalletError> {
+    let mut buf = [0u8; 64];
+    let mut w = Writer::new(&mut buf);
+    w.byte(kept & TOTALS)?;
+    w.byte(u8::from(f.unpriced))?;
+    if kept & SPENT != 0 {
+        w.amount(f.spent)?;
+    }
+    if kept & CALLS != 0 {
+        w.uint(u128::from(f.calls))?;
+    }
+    let storage = env.storage().persistent();
+    storage.set(&TOTAL, &Bytes::from_slice(env, w.bytes()));
+    if !exists {
+        storage.extend_ttl(&TOTAL, TOTAL_LEDGERS - 1, TOTAL_LEDGERS - 1);
     }
     Ok(())
 }
-/// Soroban decodes vector elements when read. Owner configuration decodes each rule before storing
-/// it, so an element that later fails to decode cannot be stored. An unknown `AllowitRule` symbol
-/// aborts. `allowit::check_params` decodes every param value the same way.
-fn decoded<T: IntoVal<Env, Val> + TryFromVal<Env, Val>>(
-    list: &Vec<T>,
+/// Write `d` with the kept daily figures. A new window ends `DAY_LEDGERS - 1` ledgers from now,
+/// and the entry lives at least that long; the wallet never extends it later.
+fn write_daily(
+    env: &Env,
+    kept: u8,
+    f: &Figures,
+    day_ends: Option<u32>,
 ) -> Result<(), AllowitWalletError> {
+    let seq = env.ledger().sequence();
+    let end = match day_ends {
+        Some(end) => end,
+        None => checked(seq.checked_add(DAY_LEDGERS - 1))?,
+    };
+    let mut buf = [0u8; 64];
+    let mut w = Writer::new(&mut buf);
+    w.put(&end.to_be_bytes())?;
+    w.byte(kept & DAILIES)?;
+    w.byte(u8::from(f.day_unpriced))?;
+    if kept & DAY_SPENT != 0 {
+        w.amount(f.day_spent)?;
+    }
+    if kept & DAY_TOTAL != 0 {
+        w.amount(f.day_total)?;
+    }
+    let storage = env.storage().temporary();
+    storage.set(&DAILY, &Bytes::from_slice(env, w.bytes()));
+    if day_ends.is_none() {
+        // Also covers an entry that someone kept alive past its own end ledger.
+        storage.extend_ttl(&DAILY, DAY_LEDGERS - 1, DAY_LEDGERS - 1);
+    }
+    Ok(())
+}
+/// Make `t` match the figures that a new configuration keeps: rewrite it for a new set, create it
+/// at zero for a set that gains totals, remove it for one that keeps none.
+fn reshape_total(env: &Env, kept: u8) -> Result<(), AllowitWalletError> {
+    let stored = read_figures(env)?;
+    if kept & TOTALS != 0 {
+        write_total(env, kept, &stored.figures, stored.total_exists)
+    } else {
+        if stored.total_exists {
+            env.storage().persistent().remove(&TOTAL);
+        }
+        Ok(())
+    }
+}
+
+/// Soroban decodes vector elements when read. Owner configuration decodes each rule before storing
+/// it, so an element that later fails to decode cannot be stored.
+fn decoded(list: &Vec<AllowitRule>) -> Result<(), AllowitWalletError> {
     for i in 0..list.len() {
         list.try_get(i)
             .map_err(|_| AllowitWalletError::InvalidParam)?;
     }
     Ok(())
 }
-/// The installed binding: executable, source binding and the operations that this code runs.
-fn binding<P: AllowitPolicy>(
-    env: &Env,
-    state: &AllowitState,
-) -> Result<AllowitPolicyBinding, AllowitWalletError> {
-    let Some(Executable::Wasm(module_digest)) = env.current_contract_address().executable() else {
-        return Err(AllowitWalletError::InvalidState);
-    };
-    if P::source_digest(env).is_some_and(|digest| digest != state.source_digest) {
-        return Err(AllowitWalletError::InvalidState);
+/// Check an owner configuration and keep, for Standard, only the params of its rules.
+fn validated<P: AllowitPolicy>(env: &Env, mut config: Config) -> Result<Config, AllowitWalletError> {
+    let wallet = env.current_contract_address();
+    if config.owner == wallet || config.agent == config.server {
+        return Err(AllowitWalletError::InvalidActor);
     }
-    if P::STANDARD_PREFIX
-        && state.source_digest != checked_prefix::<P>(env, &state.asset, &state.rules)?
+    if let Ok(owner) = public_key(&config.owner)
+        && (owner == config.agent || owner == config.server)
+    {
+        return Err(AllowitWalletError::InvalidActor);
+    }
+    if config.source_hash == BytesN::from_array(env, &[0; 32])
+        || P::source_digest(env).is_some_and(|digest| digest != config.source_hash)
     {
         return Err(AllowitWalletError::InvalidState);
     }
-    let mut operations = Vec::new(env);
-    for operation in P::OPERATIONS {
-        operations.push_back(operation.clone());
+    if config.gas_cap < 0 {
+        return Err(AllowitWalletError::InvalidParam);
     }
-    Ok(AllowitPolicyBinding {
-        engine_kind: Symbol::new(env, P::KIND),
+    allowit::check_params(&config.params, tier::<P>())
+        .map_err(|_| AllowitWalletError::InvalidParam)?;
+    decoded(&config.rules)?;
+    P::validate(&config.rules)?;
+    if P::STANDARD_PREFIX {
+        let mut kept = Map::new(env);
+        for rule in config.rules.iter() {
+            let key = Symbol::new(env, rule.key());
+            if let Some(value) = config.params.get(key.clone()) {
+                kept.set(key, value);
+            }
+        }
+        config.params = kept;
+    }
+    Ok(config)
+}
+
+/// Initialize custody from an owner-signed configuration. The instance and `t` live
+/// `TOTAL_LEDGERS`, paid by this transaction.
+pub fn construct<P: AllowitPolicy>(
+    env: &Env,
+    config: AllowitPolicyConfig,
+) -> Result<(), AllowitWalletError> {
+    // Decoding ignores extra keys. The owner signs the canonical encoding of the decoded packet,
+    // so a packet whose meaning differs fails auth.
+    config
+        .owner
+        .require_auth_for_args((config.clone(),).into_val(env));
+    if config.asset.executable() != Some(Executable::StellarAsset) {
+        return Err(AllowitWalletError::UnsupportedAsset);
+    }
+    let config = validated::<P>(
+        env,
+        Config {
+            paused: false,
+            owner: config.owner,
+            agent: config.agent,
+            server: config.server,
+            asset: config.asset,
+            version: 0,
+            source_hash: config.source_hash,
+            gas_cap: config.gas_cap,
+            rules: config.rules,
+            params: config.params,
+        },
+    )?;
+    config.store(env)?;
+    let kept = kept::<P>(&config.rules, &config.params);
+    if kept & TOTALS != 0 {
+        write_total(env, kept, &Figures::default(), false)?;
+    }
+    env.deployer().extend_ttl_for_contract_instance(
+        env.current_contract_address(),
+        TOTAL_LEDGERS - 1,
+        TOTAL_LEDGERS - 1,
+    );
+    Ok(())
+}
+
+/// Read the stored wallet.
+pub fn state<P: AllowitPolicy>(env: &Env) -> Result<AllowitState, AllowitWalletError> {
+    let config = Config::load(env)?;
+    let stored = read_figures(env)?;
+    let f = stored.figures;
+    Ok(AllowitState {
         contract_version: CONTRACT_VERSION,
-        policy_instance: state.policy_instance.clone(),
-        module_digest,
-        source_digest: state.source_digest.clone(),
-        operations,
+        owner: config.owner,
+        agent: config.agent,
+        server: config.server,
+        asset: config.asset,
+        deployment_version: config.version,
+        paused: config.paused,
+        source_hash: config.source_hash,
+        gas_cap: config.gas_cap,
+        kept: u32::from(kept::<P>(&config.rules, &config.params)),
+        rules: config.rules,
+        params: config.params,
+        figures: AllowitFigures {
+            calls: f.calls,
+            spent: f.spent,
+            unpriced: f.unpriced,
+            day_spent: f.day_spent,
+            day_total: f.day_total,
+            day_unpriced: f.day_unpriced,
+            day_ends: stored.day_ends.unwrap_or(0),
+        },
     })
 }
 
-/// The one debit of an operation: `amount` of `token` leaves the wallet toward `to`. Deposits move
-/// `assets` to the vault, swaps move `amount_in` of the first path token toward the router, and
-/// redeems burn `shares` of the vault's share token.
-struct Debit {
-    token: Address,
-    to: Address,
-    amount: i128,
-}
-/// The debit of `operation` on a wallet of `asset`.
-fn debit(operation: &AllowitStellarOperation, asset: &Address) -> Debit {
-    match operation {
-        AllowitStellarOperation::Transfer(args) => Debit {
-            token: args.token.clone(),
-            to: args.to.clone(),
-            amount: args.amount,
-        },
-        AllowitStellarOperation::Swap(args) => Debit {
-            token: args.path.get_unchecked(0),
-            to: args.router.clone(),
-            amount: args.amount_in,
-        },
-        AllowitStellarOperation::Deposit(args) => Debit {
-            token: asset.clone(),
-            to: args.vault.clone(),
-            amount: args.assets,
-        },
-        AllowitStellarOperation::Redeem(args) => Debit {
-            token: args.vault.clone(),
-            to: args.vault.clone(),
-            amount: args.shares,
-        },
-    }
-}
-/// Request facts of one native operation, which rules read.
-struct Facts {
-    recipient: Address,
-    amount: i128,
-    token_in: Address,
-    amount_in: i128,
-    token_out: Option<Address>,
-    min_out: i128,
-}
-/// The request facts of `operation`. A forward swap counts its asset input as the gross amount; a
-/// reverse swap and a redeem count their minimum asset output, a floor.
-fn facts(operation: &AllowitStellarOperation, asset: &Address) -> Facts {
-    let debit = debit(operation, asset);
-    let (recipient, amount, token_out, min_out) = match operation {
-        AllowitStellarOperation::Transfer(args) => (args.to.clone(), args.amount, None, 0),
-        AllowitStellarOperation::Swap(args) => {
-            let last = args.path.get_unchecked(args.path.len() - 1);
-            let amount = if debit.token == *asset {
-                args.amount_in
-            } else {
-                args.amount_out_min
-            };
-            let router = args.router.clone();
-            (router, amount, Some(last), args.amount_out_min)
-        }
-        AllowitStellarOperation::Deposit(args) => (
-            args.vault.clone(),
-            args.assets,
-            Some(args.vault.clone()),
-            args.min_shares,
-        ),
-        AllowitStellarOperation::Redeem(args) => (
-            args.vault.clone(),
-            args.min_assets,
-            Some(asset.clone()),
-            args.min_assets,
-        ),
-    };
-    Facts {
-        recipient,
-        amount,
-        token_in: debit.token,
-        amount_in: debit.amount,
-        token_out,
-        min_out,
-    }
-}
-/// Whether `address` is a contract, not an account. A contract address never burns a classic asset.
-fn is_contract(address: &Address) -> bool {
-    matches!(
-        address.to_payload(),
-        Some(AddressPayload::ContractIdHash(_))
-    )
-}
-/// Check the native operation of a request: a transfer moves a positive amount of the installed
-/// asset to neither the wallet nor the asset's classic issuer, a vault or router is neither the
-/// wallet nor the asset, and amounts are positive. The wallet supplies itself as every source,
-/// owner, receiver and operator.
-fn validate_operation(
-    env: &Env,
-    execution: &AllowitExecutionRequest,
-    state: &AllowitState,
-) -> Result<(), AllowitWalletError> {
-    let wallet = env.current_contract_address();
-    let (vault, amount, minimum) = match &execution.operation {
-        AllowitStellarOperation::Transfer(args) => {
-            if args.token != state.asset {
-                return Err(AllowitWalletError::InvalidInvocation);
-            }
-            if args.amount <= 0 {
-                return Err(AllowitWalletError::InvalidAmount);
-            }
-            if args.to == wallet || issuer_destination(env, &state.token, &state.asset, &args.to)? {
-                return Err(AllowitWalletError::InvalidRecipient);
-            }
-            return Ok(());
-        }
-        AllowitStellarOperation::Swap(args) => return validate_swap(env, execution, state, args),
-        AllowitStellarOperation::Deposit(args) => (&args.vault, args.assets, args.min_shares),
-        AllowitStellarOperation::Redeem(args) => (&args.vault, args.shares, args.min_assets),
-    };
-    if *vault == wallet || *vault == state.asset {
-        return Err(AllowitWalletError::InvalidInvocation);
-    }
-    if amount <= 0 || minimum <= 0 {
-        return Err(AllowitWalletError::InvalidAmount);
-    }
-    Ok(())
-}
-/// Check a router swap: the path holds two to `MAX_SWAP_PATH` tokens without the wallet, exactly
-/// one endpoint is the asset, both endpoints are Stellar Asset Contracts, and the router deadline
-/// falls within the request expiry.
-fn validate_swap(
-    env: &Env,
-    execution: &AllowitExecutionRequest,
-    state: &AllowitState,
-    args: &AllowitSwapArgs,
-) -> Result<(), AllowitWalletError> {
-    let wallet = env.current_contract_address();
-    let n = args.path.len();
-    if args.router == wallet
-        || args.router == state.asset
-        || !(2..=MAX_SWAP_PATH).contains(&n)
-        || args.deadline > execution.expires_at
-    {
-        return Err(AllowitWalletError::InvalidInvocation);
-    }
-    // Soroban decodes vector elements when read: check every element before any use.
-    for i in 0..n {
-        let token = args
-            .path
-            .try_get(i)
-            .map_err(|_| AllowitWalletError::InvalidInvocation)?;
-        if token.as_ref() == Some(&wallet) {
-            return Err(AllowitWalletError::InvalidInvocation);
-        }
-    }
-    let first = args.path.get_unchecked(0);
-    let last = args.path.get_unchecked(n - 1);
-    if (first == state.asset) == (last == state.asset) {
-        return Err(AllowitWalletError::InvalidInvocation);
-    }
-    // A host lookup of the executable, not a contract call.
-    let other = if first == state.asset { last } else { first };
-    if other.executable() != Some(Executable::StellarAsset) {
-        return Err(AllowitWalletError::UnsupportedAsset);
-    }
-    if args.amount_in <= 0 || args.amount_out_min <= 0 {
-        return Err(AllowitWalletError::InvalidAmount);
-    }
-    Ok(())
-}
-
-/// The native XLM Stellar Asset Contract address.
-fn native_asset(env: &Env) -> Address {
-    env.deployer()
-        .with_stellar_asset(Bytes::from_array(env, &[0; 4]))
-        .deployed_address()
-}
-/// The SAC symbol of the asset, cached at construction for issuer checks.
-fn token_label(env: &Env, asset: &Address) -> String {
-    if *asset == native_asset(env) {
-        String::from_str(env, "XLM")
-    } else {
-        token::Client::new(env, asset).symbol()
-    }
-}
-// A transfer to a classic issuer burns its asset. Derive the immutable SAC identity
-// from the cached symbol and candidate issuer without reentering the active SAC.
-/// Whether `to` is the classic issuer of the asset, where a transfer burns it.
-fn issuer_destination(
-    env: &Env,
-    token: &String,
-    asset: &Address,
-    to: &Address,
-) -> Result<bool, AllowitWalletError> {
-    let len = token.len() as usize;
-    if len == 0 || len > 48 {
-        return Err(AllowitWalletError::InvalidState);
-    }
-    let mut encoded = [0u8; 48];
-    token.copy_into_slice(&mut encoded[..len]);
-    let mut code = [0u8; 12];
-    let mut cursor = 0;
-    let mut size = 0;
-    while cursor < len {
-        if size == 12 {
-            return Err(AllowitWalletError::InvalidState);
-        }
-        code[size] = if encoded[cursor] == b'\\' {
-            if cursor + 3 >= len || encoded[cursor + 1] != b'x' {
-                return Err(AllowitWalletError::InvalidState);
-            }
-            let hex = |b| match b {
-                b'0'..=b'9' => Some(b - b'0'),
-                b'a'..=b'f' => Some(b - b'a' + 10),
-                _ => None,
-            };
-            let (Some(high), Some(low)) = (hex(encoded[cursor + 2]), hex(encoded[cursor + 3]))
-            else {
-                return Err(AllowitWalletError::InvalidState);
-            };
-            cursor += 4;
-            high * 16 + low
-        } else {
-            let b = encoded[cursor];
-            cursor += 1;
-            b
-        };
-        size += 1;
-    }
-    // SEP-11 keeps at least five bytes for AlphaNum12, including escaped zeros.
-    let (kind, width) = if size <= 4 { (1u32, 4) } else { (2u32, 12) };
-    let Ok(issuer) = public_key(to) else {
-        return Ok(false);
-    };
-    let mut preimage = Bytes::from_array(env, &kind.to_be_bytes());
-    preimage.append(&Bytes::from_slice(env, &code[..width]));
-    preimage.append(&Bytes::from_array(env, &[0; 4]));
-    preimage.append(&issuer.into());
-    Ok(env
-        .deployer()
-        .with_stellar_asset(preimage)
-        .deployed_address()
-        == *asset)
-}
-/// Transfer `amount` from this wallet and check both exact balance effects.
-fn move_tokens(
-    env: &Env,
-    asset: &Address,
-    to: &Address,
-    amount: i128,
-) -> Result<(), AllowitWalletError> {
-    let client = token::Client::new(env, asset);
-    let from = env.current_contract_address();
-    let before = client.balance(&from);
-    if before < amount {
-        return Err(AllowitWalletError::InsufficientFunds);
-    }
-    let after_from = checked(before.checked_sub(amount))?;
-    let after_to = checked(client.balance(to).checked_add(amount))?;
-    client.transfer(&from, to, &amount);
-    if client.balance(&from) != after_from || client.balance(to) != after_to {
-        return Err(AllowitWalletError::InvalidEffects);
-    }
-    Ok(())
-}
-/// Check operation class and conservative signed cost identities. External facts remain server-attested.
+/// Check the request's expense bounds and gas repayment against its operation and the owner's
+/// gas cap. External facts remain server-attested.
 fn validate_expense(
     env: &Env,
-    state: &AllowitState,
-    expense: Option<&AllowitExpenseBounds>,
-    operation: &AllowitStellarOperation,
+    config: &Config,
+    execution: &AllowitExecutionRequest,
 ) -> Result<(), AllowitWalletError> {
-    let Some(expense) = expense else {
-        return Ok(());
+    let gas = execution.gas_stroops;
+    if gas < 0 {
+        return Err(AllowitWalletError::InvalidAmount);
+    }
+    if gas > config.gas_cap {
+        return Err(AllowitWalletError::GasAboveCap);
+    }
+    if gas > 0 && execution.gas_payee == env.current_contract_address() {
+        return Err(AllowitWalletError::InvalidRecipient);
+    }
+    let Some(expense) = execution.expense.bounds() else {
+        // An unpriced request counts no gas, so it repays none.
+        return if gas == 0 {
+            Ok(())
+        } else {
+            Err(AllowitWalletError::InvalidInvocation)
+        };
     };
     if expense.gas_units < 0
         || expense.conversion_units < 0
         || expense.spent_units < 0
         || expense.observed_ledger == 0
         || expense.observed_ledger > env.ledger().sequence()
-        || expense.day != env.ledger().timestamp() / allowit::DAY
     {
         return Err(AllowitWalletError::InvalidInvocation);
     }
-    // Both authenticated actors attest normalized gas for non-XLM accounting assets.
-    // The kernel cannot verify a cross-asset price. XLM remains exact stroop identity.
-    if (expense.max_fee_stroops == 0 && expense.gas_units != 0)
-        || (expense.max_fee_stroops > 0 && expense.gas_units <= 0)
-        || (state.asset == native_asset(env)
-            && expense.gas_units != i128::from(expense.max_fee_stroops))
+    // The repaid gas is what the limits count. An XLM wallet counts the repaid stroops exactly;
+    // for another asset the agent and server attest the conversion.
+    if (gas == 0) != (expense.gas_units == 0)
+        || (config.asset == native_asset(env) && expense.gas_units != gas)
     {
         return Err(AllowitWalletError::InvalidInvocation);
     }
-    let principal = match operation {
+    let principal = match &execution.operation {
         AllowitStellarOperation::Transfer(args) => {
             if expense.conversion_units != 0 {
                 return Err(AllowitWalletError::InvalidInvocation);
@@ -683,7 +751,7 @@ fn validate_expense(
         }
         // A forward swap pays the asset: its loss cannot exceed the input.
         AllowitStellarOperation::Swap(args) => {
-            if args.path.get_unchecked(0) == state.asset
+            if args.path.get_unchecked(0) == config.asset
                 && expense.conversion_units > args.amount_in
             {
                 return Err(AllowitWalletError::InvalidInvocation);
@@ -698,221 +766,43 @@ fn validate_expense(
     Ok(())
 }
 
-/// Deposit into a SEP-56 vault with exactly one delegated transfer, then check share and asset effects.
-fn deposit_tokens(
-    env: &Env,
-    asset: &Address,
-    args: &AllowitDepositArgs,
-    expense: Option<&AllowitExpenseBounds>,
-) -> Result<i128, AllowitWalletError> {
-    use soroban_sdk::IntoVal;
-    let underlying: Address =
-        env.invoke_contract(&args.vault, &Symbol::new(env, "query_asset"), Vec::new(env));
-    if underlying != *asset {
-        return Err(AllowitWalletError::UnsupportedAsset);
-    }
-    let wallet = env.current_contract_address();
-    let asset_client = token::Client::new(env, asset);
-    let shares_client = token::Client::new(env, &args.vault);
-    let before_assets = asset_client.balance(&wallet);
-    let before_shares = shares_client.balance(&wallet);
-    if before_assets < args.assets {
-        return Err(AllowitWalletError::InsufficientFunds);
-    }
-    // The direct vault call is authorized by this invoking contract. Only this exact deeper transfer is delegated.
-    env.authorize_as_current_contract(soroban_sdk::vec![
-        env,
-        InvokerContractAuthEntry::Contract(SubContractInvocation {
-            context: ContractContext {
-                contract: asset.clone(),
-                fn_name: Symbol::new(env, "transfer"),
-                args: (wallet.clone(), args.vault.clone(), args.assets).into_val(env),
-            },
-            sub_invocations: Vec::new(env),
-        })
-    ]);
-    // SEP-56 `deposit(assets, receiver, from, operator)`: the wallet is all three parties.
-    let shares: i128 = env.invoke_contract(
-        &args.vault,
-        &Symbol::new(env, "deposit"),
-        (args.assets, wallet.clone(), wallet.clone(), wallet.clone()).into_val(env),
-    );
-    if let Some(expense) = expense {
-        // The selected vault supplies this valuation. It is not a proof of future redemption or economic honesty.
-        let redeemable: i128 = env.invoke_contract(
-            &args.vault,
-            &Symbol::new(env, "preview_redeem"),
-            (shares,).into_val(env),
-        );
-        // An overflowing loss saturates above the bound, which never exceeds the assets.
-        if args.assets.saturating_sub(args.assets.min(redeemable)) > expense.conversion_units {
-            return Err(AllowitWalletError::InvalidEffects);
-        }
-    }
-    let expected_assets = checked(before_assets.checked_sub(args.assets))?;
-    let expected_shares = checked(before_shares.checked_add(shares))?;
-    let after_shares = shares_client.balance(&wallet);
-    // The immutable SAC read is last: no untrusted vault code runs after these final observations.
-    let after_assets = asset_client.balance(&wallet);
-    // `min_shares` is positive, so this also rejects a nonpositive mint.
-    if shares < args.min_shares
-        || after_assets != expected_assets
-        || after_shares != expected_shares
-    {
-        return Err(AllowitWalletError::InvalidEffects);
-    }
-    Ok(shares)
-}
-/// Swap through the router with exactly one delegated transfer of `amount_in` to the router's
-/// first pair, then check both endpoint balances. Returns the observed output.
-fn swap_tokens(env: &Env, args: &AllowitSwapArgs) -> Result<i128, AllowitWalletError> {
-    let wallet = env.current_contract_address();
-    let n = args.path.len();
-    let token_in = args.path.get_unchecked(0);
-    let token_out = args.path.get_unchecked(n - 1);
-    let pair: Address = env.invoke_contract(
-        &args.router,
-        &Symbol::new(env, "router_pair_for"),
-        (token_in.clone(), args.path.get_unchecked(1)).into_val(env),
-    );
-    if pair == wallet || pair == args.router || !is_contract(&pair) {
-        return Err(AllowitWalletError::InvalidEffects);
-    }
-    let in_client = token::Client::new(env, &token_in);
-    let out_client = token::Client::new(env, &token_out);
-    let before_in = in_client.balance(&wallet);
-    let before_out = out_client.balance(&wallet);
-    if before_in < args.amount_in {
-        return Err(AllowitWalletError::InsufficientFunds);
-    }
-    // The router call itself is authorized by this invoking contract. Only this exact deeper
-    // transfer to the pair is delegated.
-    env.authorize_as_current_contract(soroban_sdk::vec![
-        env,
-        InvokerContractAuthEntry::Contract(SubContractInvocation {
-            context: ContractContext {
-                contract: token_in.clone(),
-                fn_name: Symbol::new(env, "transfer"),
-                args: (wallet.clone(), pair, args.amount_in).into_val(env),
-            },
-            sub_invocations: Vec::new(env),
-        })
-    ]);
-    let amounts: Vec<i128> = env.invoke_contract(
-        &args.router,
-        &Symbol::new(env, "swap_exact_tokens_for_tokens"),
-        (
-            args.amount_in,
-            args.amount_out_min,
-            args.path.clone(),
-            wallet.clone(),
-            args.deadline,
-        )
-            .into_val(env),
-    );
-    let reported = |i| amounts.try_get(i).ok().flatten();
-    let (Some(first), Some(out)) = (reported(0), reported(n - 1)) else {
-        return Err(AllowitWalletError::InvalidEffects);
-    };
-    let expected_in = checked(before_in.checked_sub(args.amount_in))?;
-    let expected_out = checked(before_out.checked_add(out))?;
-    // Both endpoints are Stellar Asset Contracts: no untrusted code runs after the router returns.
-    let after_out = out_client.balance(&wallet);
-    let after_in = in_client.balance(&wallet);
-    if amounts.len() != n
-        || first != args.amount_in
-        || out < args.amount_out_min
-        || after_in != expected_in
-        || after_out != expected_out
-    {
-        return Err(AllowitWalletError::InvalidEffects);
-    }
-    Ok(out)
-}
-/// Redeem vault shares for the asset, then check the share debit, the asset credit and the
-/// conversion loss against the vault's own preview. The vault authorizes against this invoking
-/// contract; the wallet delegates no token authorization.
-fn redeem_shares(
-    env: &Env,
-    asset: &Address,
-    args: &AllowitRedeemArgs,
-    expense: Option<&AllowitExpenseBounds>,
-) -> Result<i128, AllowitWalletError> {
-    let underlying: Address =
-        env.invoke_contract(&args.vault, &Symbol::new(env, "query_asset"), Vec::new(env));
-    if underlying != *asset {
-        return Err(AllowitWalletError::UnsupportedAsset);
-    }
-    // The selected vault values the shares before it acts. As for a deposit, this bounds the loss
-    // against the vault's own valuation; it is not a proof of economic honesty.
-    // A nonpositive preview bounds no loss, as the vault can always report zero.
-    let previewed: Option<i128> = expense.map(|_| {
-        env.invoke_contract(
-            &args.vault,
-            &Symbol::new(env, "preview_redeem"),
-            (args.shares,).into_val(env),
-        )
-    });
-    let wallet = env.current_contract_address();
-    let asset_client = token::Client::new(env, asset);
-    let shares_client = token::Client::new(env, &args.vault);
-    let before_assets = asset_client.balance(&wallet);
-    let before_shares = shares_client.balance(&wallet);
-    if before_shares < args.shares {
-        return Err(AllowitWalletError::InsufficientFunds);
-    }
-    // SEP-56 `redeem(shares, receiver, owner, operator)`: the wallet is all three parties.
-    let assets: i128 = env.invoke_contract(
-        &args.vault,
-        &Symbol::new(env, "redeem"),
-        (args.shares, wallet.clone(), wallet.clone(), wallet.clone()).into_val(env),
-    );
-    let expected_shares = checked(before_shares.checked_sub(args.shares))?;
-    let expected_assets = checked(before_assets.checked_add(assets))?;
-    let after_shares = shares_client.balance(&wallet);
-    // The immutable SAC read is last: no untrusted vault code runs after these final observations.
-    let after_assets = asset_client.balance(&wallet);
-    let loss_exceeded = match (previewed, expense) {
-        (Some(value), Some(expense)) => {
-            value.saturating_sub(value.min(assets)) > expense.conversion_units
-        }
-        _ => false,
-    };
-    // `min_assets` is positive, so this also rejects a nonpositive payout.
-    if assets < args.min_assets
-        || loss_exceeded
-        || after_shares != expected_shares
-        || after_assets != expected_assets
-    {
-        return Err(AllowitWalletError::InvalidEffects);
-    }
-    Ok(assets)
-}
-/// Rule input: contract environment, owner params, current policy state, authenticated request
-/// facts and the agent's execution params. Deposits and redeems name their vault, and swaps their
-/// router, as the recipient. A request without expense bounds is unpriced. The params decode once
-/// here; stored params that do not decode are `InvalidParam`.
+/// Rule input: owner params, the kept figures as the standard state on the request's day, the
+/// authenticated request facts and the agent's execution params.
 fn rule_input(
     env: &Env,
-    state: &AllowitState,
+    config: &Config,
     execution: &AllowitExecutionRequest,
+    f: &Figures,
 ) -> Result<AllowitContext, AllowitWalletError> {
-    let facts = facts(&execution.operation, &state.asset);
+    let facts = facts(&execution.operation, &config.asset);
     let expense = execution.expense.bounds();
+    let now = env.ledger().timestamp();
+    // The daily window is the life of `d`: the figures of an open window are today's.
+    let mut state = Map::new(env);
+    AllowitStandardState {
+        calls: f.calls,
+        spent: f.spent,
+        unpriced: f.unpriced,
+        day: now / DAY,
+        day_spent: f.day_spent,
+        day_total: f.day_total,
+        day_unpriced: f.day_unpriced,
+    }
+    .write(&mut state)?;
     Ok(AllowitContext {
         env: env.clone(),
-        params: AllowitParams::new(env, state.params.clone())?,
-        state: state.policy_state.clone(),
+        params: AllowitParams::new(env, config.params.clone())?,
+        state,
         request: AllowitRequest {
             operation: execution.operation.to_core(),
-            asset: state.asset.clone(),
+            asset: config.asset.clone(),
             recipient: facts.recipient,
             amount: facts.amount,
             token_in: facts.token_in,
             amount_in: facts.amount_in,
             token_out: facts.token_out,
             min_out: facts.min_out,
-            now: env.ledger().timestamp(),
+            now,
             expires_at: execution.expires_at,
             spent_units: expense.map_or(0, |e| e.spent_units),
             gas_units: expense.map_or(0, |e| e.gas_units),
@@ -921,301 +811,210 @@ fn rule_input(
         },
     })
 }
-/// Admit one delegated operation: check bindings, replay, pause, nonce and expense, run the
-/// policy, then write post-flight state, nonce and replay marker before any external call.
+
+/// Run the policy and update the kept figures before any external call. A later failure in this
+/// transaction rolls the writes back.
 fn admit<P: AllowitPolicy>(
     env: &Env,
+    config: &Config,
     execution: &AllowitExecutionRequest,
-    mut state: AllowitState,
-) -> Result<AllowitTransferReceipt, AllowitWalletError> {
-    if !P::OPERATIONS.contains(&execution.operation.to_core()) {
-        return Err(AllowitWalletError::UnsupportedOperation);
+) -> Result<(), AllowitWalletError> {
+    let kept = kept::<P>(&config.rules, &config.params);
+    // Simple, and Standard with no rules: no rule runs and nothing is stored.
+    if P::STANDARD_PREFIX && config.rules.is_empty() {
+        return Ok(());
     }
-    let installed = binding::<P>(env, &state)?;
-    if execution.policy_instance != installed.policy_instance
-        || (!P::STANDARD_PREFIX && execution.source_hash != installed.source_digest)
+    // Code changes defer tier validation of the kept rules and params to this admission.
+    P::validate(&config.rules)?;
+    if P::STANDARD_PREFIX {
+        allowit::check_params(&config.params, AllowitTier::Standard)?;
+    }
+    let stored = if kept == 0 {
+        Stored {
+            figures: Figures::default(),
+            day_ends: None,
+            total_exists: false,
+        }
+    } else {
+        read_figures(env)?
+    };
+    let ctx = rule_input(env, config, execution, &stored.figures)?;
+    P::check(&ctx, &config.rules)?;
+    // A Standard policy writes nothing but figures. Custom runs the shared post-flight even with
+    // none, so a source write fails as `Unsupported` instead of being stored.
+    if kept == 0 && P::STANDARD_PREFIX {
+        return Ok(());
+    }
+    let state = allowit::post_flight(&ctx, AllowitTier::Standard)?;
+    if kept == 0 {
+        return Ok(());
+    }
+    let s = AllowitStandardState::read(&state)?;
+    let after = Figures {
+        calls: s.calls,
+        spent: s.spent,
+        unpriced: s.unpriced,
+        day_spent: s.day_spent,
+        day_total: s.day_total,
+        day_unpriced: s.day_unpriced,
+    };
+    let before = &stored.figures;
+    if kept & TOTALS != 0
+        && (!stored.total_exists
+            || (after.calls, after.spent, after.unpriced)
+                != (before.calls, before.spent, before.unpriced))
+    {
+        write_total(env, kept, &after, stored.total_exists)?;
+    }
+    if kept & DAILIES != 0
+        && (after.day_spent, after.day_total, after.day_unpriced)
+            != (before.day_spent, before.day_total, before.day_unpriced)
+    {
+        write_daily(env, kept, &after, stored.day_ends)?;
+    }
+    Ok(())
+}
+
+/// Run one agent- and server-authorized operation under the installed policy, repay the signed
+/// gas and emit one event.
+pub fn execute<P: AllowitPolicy>(
+    env: &Env,
+    execution: AllowitExecutionRequest,
+) -> Result<(), AllowitWalletError> {
+    let wallet = env.current_contract_address();
+    // The ledger calls `__check_auth`: the agent and the server signed this exact call.
+    wallet.require_auth();
+    let config = Config::load(env)?;
+    if config.paused {
+        return Err(AllowitWalletError::Paused);
+    }
+    if execution.deployment_version != config.version {
+        return Err(AllowitWalletError::StaleRequest);
+    }
+    if execution.expires_at <= env.ledger().timestamp() {
+        return Err(AllowitWalletError::Expired);
+    }
+    let Some(Executable::Wasm(module)) = wallet.executable() else {
+        return Err(AllowitWalletError::InvalidState);
+    };
+    if P::source_digest(env).is_some_and(|digest| digest != config.source_hash) {
+        return Err(AllowitWalletError::InvalidState);
+    }
+    if execution.module_digest != module
+        || execution.source_hash != config.source_hash
         || execution.operation_id == BytesN::from_array(env, &[0; 32])
-        || execution.module_digest != installed.module_digest
         || allowit::check_args(&execution.args).is_err()
     {
         return Err(AllowitWalletError::InvalidInvocation);
     }
+    if !P::OPERATIONS.contains(&execution.operation.to_core()) {
+        return Err(AllowitWalletError::UnsupportedOperation);
+    }
+    validate_operation(env, &execution, &config.asset)?;
+    validate_expense(env, &config, &execution)?;
+    admit::<P>(env, &config, &execution)?;
     let expense = execution.expense.bounds();
-    let args = debit(&execution.operation, &state.asset);
-    let replay_key = Key::Operation(execution.operation_id.clone());
-    if env.storage().persistent().has(&replay_key) {
-        return Err(AllowitWalletError::Replay);
-    }
-    if state.paused {
-        return Err(AllowitWalletError::Paused);
-    }
-    if execution.nonce != state.nonce || execution.deployment_version != state.deployment_version {
-        return Err(AllowitWalletError::StaleRequest);
-    }
-    let now = env.ledger().timestamp();
-    if execution.expires_at <= now {
-        return Err(AllowitWalletError::Expired);
-    }
-    validate_expense(env, &state, expense, &execution.operation)?;
-    let nonce = checked(state.nonce.checked_add(1))?;
-    // Code changes defer tier validation of the kept rules and params to this admission.
-    P::validate(&state.rules)?;
-    if P::STANDARD_PREFIX {
-        checked_params::<P>(&state.params)?;
-    }
-    let ctx = rule_input(env, &state, execution)?;
-    P::check(&ctx, &state.rules)?;
-    // The shared post-flight, then storage, precede token, router and vault calls. A later
-    // failure in this transaction rolls all of it back.
-    state.policy_state = allowit::post_flight(&ctx, tier::<P>())?;
-    state.nonce = nonce;
-    store(env, &state);
-    let receipt = AllowitTransferReceipt {
-        operation_id: execution.operation_id.clone(),
-        token: args.token,
-        from: env.current_contract_address(),
-        to: args.to,
-        amount: args.amount,
-        nonce: execution.nonce,
-        deployment_version: execution.deployment_version,
+    let output = match &execution.operation {
+        AllowitStellarOperation::Transfer(args) => {
+            move_tokens(env, &args.token, &args.to, args.amount)?;
+            args.amount
+        }
+        AllowitStellarOperation::Swap(args) => swap_tokens(env, args)?,
+        AllowitStellarOperation::Deposit(args) => {
+            deposit_tokens(env, &config.asset, args, expense)?
+        }
+        AllowitStellarOperation::Redeem(args) => redeem_shares(env, &config.asset, args, expense)?,
     };
-    Ok(persistent::load(env, &replay_key, Some(&receipt)).unwrap())
-}
-
-/// Initialize custody from an owner-signed configuration.
-pub fn construct<P: AllowitPolicy>(
-    env: &Env,
-    config: AllowitPolicyConfig,
-) -> Result<(), AllowitWalletError> {
-    // Decoding ignores extra keys and reads absent Option keys as None. The owner signs the
-    // canonical encoding of the decoded packet, so a packet whose meaning differs fails auth.
-    config
-        .owner
-        .require_auth_for_args((config.clone(),).into_val(env));
-    validate::<P>(env, &config)?;
-    if config.asset.executable() != Some(Executable::StellarAsset) {
-        return Err(AllowitWalletError::UnsupportedAsset);
+    if execution.gas_stroops > 0 {
+        token::Client::new(env, &native_asset(env)).transfer(
+            &wallet,
+            &execution.gas_payee,
+            &execution.gas_stroops,
+        );
     }
-    let token = token_label(env, &config.asset);
-    load(
-        env,
-        Some(AllowitState {
-            policy_state: Map::new(env),
-            contract_version: CONTRACT_VERSION,
-            owner: config.owner,
-            agent: config.agent,
-            server: config.server,
-            asset: config.asset,
-            policy_instance: config.policy_instance,
-            source_digest: config.source_digest,
-            rules: config.rules,
-            params: config.params,
-            x402_enabled: config.x402_enabled,
-            token,
-            deployment_version: 0,
-            nonce: 0,
-            paused: false,
-        }),
-    )?;
+    AllowitExecuted {
+        operation_id: execution.operation_id,
+        output,
+    }
+    .publish(env);
     Ok(())
 }
-/// Read the custody State.
-pub fn state(env: &Env) -> Result<AllowitState, AllowitWalletError> {
-    load(env, None)
-}
-/// Read the current free-form policy state: standard and policy-defined keys.
-pub fn policy_state(env: &Env) -> Result<Map<Symbol, AllowitValue>, AllowitWalletError> {
-    Ok(load(env, None)?.policy_state)
-}
-/// Read the installed binding: executable, source binding and the operations that this code runs.
-pub fn policy_binding<P: AllowitPolicy>(
+
+/// The wallet's own authorization: only its `execute`, signed by the agent's and the server's
+/// stored keys over the ledger's payload. The payload binds the network, this wallet, the call
+/// and its arguments, the ledger nonce and the expiration ledger.
+pub fn check_auth(
     env: &Env,
-) -> Result<AllowitPolicyBinding, AllowitWalletError> {
-    binding::<P>(env, &load(env, None)?)
-}
-/// Read the atomically retained actual share credit for a successful deposit operation.
-pub fn deposit_receipt(
-    env: &Env,
-    operation_id: BytesN<32>,
-) -> Result<Option<AllowitSep56DepositReceipt>, AllowitWalletError> {
-    load(env, None)?;
-    Ok(persistent::load(env, &Key::Deposit(operation_id), None))
-}
-/// Read the atomically retained observed output of a successful `execute` swap.
-pub fn swap_receipt(
-    env: &Env,
-    operation_id: BytesN<32>,
-) -> Result<Option<AllowitSwapReceipt>, AllowitWalletError> {
-    load(env, None)?;
-    Ok(persistent::load(env, &Key::Swap(operation_id), None))
-}
-/// Read the atomically retained observed output of a successful `execute` redeem.
-pub fn redeem_receipt(
-    env: &Env,
-    operation_id: BytesN<32>,
-) -> Result<Option<AllowitSep56RedeemReceipt>, AllowitWalletError> {
-    load(env, None)?;
-    Ok(persistent::load(env, &Key::Redeem(operation_id), None))
-}
-/// Run one agent- and server-authorized native operation under the installed policy.
-pub fn execute<P: AllowitPolicy>(
-    env: &Env,
-    execution: AllowitExecutionRequest,
-) -> Result<AllowitTransferReceipt, AllowitWalletError> {
-    let state = load(env, None)?;
-    // Decoding ignores extra keys. Agent and server sign the canonical encoding of the decoded
-    // request, so a request whose meaning differs from what they signed fails auth.
-    let signed: Vec<Val> = (execution.clone(),).into_val(env);
-    state.agent.require_auth_for_args(signed.clone());
-    state.server.require_auth_for_args(signed);
-    validate_operation(env, &execution, &state)?;
-    let asset = state.asset.clone();
-    let receipt = admit::<P>(env, &execution, state)?;
-    let expense = execution.expense.bounds();
-    let wallet = env.current_contract_address();
-    match execution.operation {
-        AllowitStellarOperation::Swap(args) => {
-            let amount_out = swap_tokens(env, &args)?;
-            let swapped = AllowitSwapReceipt {
-                operation_id: receipt.operation_id.clone(),
-                router: args.router,
-                token_in: args.path.get_unchecked(0),
-                token_out: args.path.get_unchecked(args.path.len() - 1),
-                amount_in: args.amount_in,
-                amount_out,
-                nonce: receipt.nonce,
-                deployment_version: receipt.deployment_version,
-            };
-            persistent::load(
-                env,
-                &Key::Swap(receipt.operation_id.clone()),
-                Some(&swapped),
-            );
-            AllowitSwapEvent {
-                operation_id: receipt.operation_id.clone(),
-                router: swapped.router,
-                amount_in: swapped.amount_in,
-                amount_out,
-            }
-            .publish(env);
-        }
-        AllowitStellarOperation::Redeem(args) => {
-            let assets = redeem_shares(env, &asset, &args, expense)?;
-            let redeemed = AllowitSep56RedeemReceipt {
-                operation_id: receipt.operation_id.clone(),
-                vault: args.vault,
-                asset,
-                owner: wallet.clone(),
-                receiver: wallet.clone(),
-                operator: wallet,
-                shares: args.shares,
-                assets,
-                nonce: receipt.nonce,
-                deployment_version: receipt.deployment_version,
-            };
-            persistent::load(
-                env,
-                &Key::Redeem(receipt.operation_id.clone()),
-                Some(&redeemed),
-            );
-            AllowitSep56RedeemEvent {
-                operation_id: receipt.operation_id.clone(),
-                vault: redeemed.vault,
-                shares: redeemed.shares,
-                assets,
-            }
-            .publish(env);
-        }
-        AllowitStellarOperation::Transfer(_) => {
-            move_tokens(env, &receipt.token, &receipt.to, receipt.amount)?
-        }
-        AllowitStellarOperation::Deposit(args) => {
-            let shares = deposit_tokens(env, &receipt.token, &args, expense)?;
-            let deposited = AllowitSep56DepositReceipt {
-                operation_id: receipt.operation_id.clone(),
-                vault: args.vault,
-                asset: receipt.token.clone(),
-                from: wallet.clone(),
-                receiver: wallet.clone(),
-                operator: wallet,
-                assets: args.assets,
-                shares,
-                nonce: receipt.nonce,
-                deployment_version: receipt.deployment_version,
-            };
-            persistent::load(
-                env,
-                &Key::Deposit(receipt.operation_id.clone()),
-                Some(&deposited),
-            );
-            AllowitSep56DepositEvent {
-                operation_id: receipt.operation_id.clone(),
-                vault: deposited.vault,
-                assets: deposited.assets,
-                shares: deposited.shares,
-            }
-            .publish(env);
-        }
+    payload: Hash<32>,
+    signatures: AllowitCosignatures,
+    contexts: Vec<Context>,
+) -> Result<(), AllowitWalletError> {
+    if contexts.len() != 1 {
+        return Err(AllowitWalletError::InvalidInvocation);
     }
-    Ok(receipt)
+    match contexts.get(0) {
+        Some(Context::Contract(call))
+            if call.contract == env.current_contract_address()
+                && call.fn_name == Symbol::new(env, "execute") => {}
+        _ => return Err(AllowitWalletError::UnsupportedOperation),
+    }
+    let header = Header::read(env)?;
+    let message: Bytes = payload.to_bytes().into();
+    env.crypto().ed25519_verify(
+        &BytesN::from_array(env, &header.key(H_AGENT)),
+        &message,
+        &signatures.agent,
+    );
+    env.crypto().ed25519_verify(
+        &BytesN::from_array(env, &header.key(H_SERVER)),
+        &message,
+        &signatures.server,
+    );
+    Ok(())
 }
-/// Apply a complete owner update; kept fields and policy state carry over.
+
+/// Apply a complete owner update; the asset, the pause and the figures carry over.
 pub fn deploy_policy<P: AllowitPolicy>(
     env: &Env,
-    deployment: AllowitPolicyDeployment,
+    update: AllowitPolicyUpdate,
 ) -> Result<(), AllowitWalletError> {
-    let kept = kept(env)?;
+    let header = Header::read(env)?;
+    let owner = header.owner(env)?;
     // The current and any new owner sign the canonical encoding of the decoded packet.
-    let signed: Vec<Val> = (deployment.clone(),).into_val(env);
-    kept.owner.require_auth_for_args(signed.clone());
-    if checked(kept.deployment_version.checked_add(1))? != deployment.deployment_version {
+    let signed: Vec<Val> = (update.clone(),).into_val(env);
+    owner.require_auth_for_args(signed.clone());
+    if next(header.version())? != update.deployment_version {
         return Err(AllowitWalletError::StaleRequest);
     }
-    let policy_state = kept_policy_state(env, &kept)?;
-    let config = AllowitPolicyConfig {
-        owner: deployment.owner,
-        agent: deployment.agent,
-        server: deployment.server,
-        asset: kept.asset,
-        policy_instance: kept.policy_instance,
-        source_digest: deployment.source_digest,
-        rules: deployment.rules,
-        params: deployment.params,
-        x402_enabled: deployment.x402_enabled,
+    let config = Config {
+        paused: header.paused(),
+        owner: update.owner,
+        agent: update.agent,
+        server: update.server,
+        asset: header.asset(env)?,
+        version: update.deployment_version,
+        source_hash: update.source_hash,
+        gas_cap: update.gas_cap,
+        rules: update.rules,
+        params: update.params,
     };
-    // A new bespoke executable validates its source on its next call. The owner binds its exact hash.
-    if deployment.wasm_hash.as_ref().is_none_or(|hash| {
-        env.current_contract_address().executable() == Some(Executable::Wasm(hash.clone()))
-    }) {
-        validate::<P>(env, &config)?;
+    // New code validates its own rules and figures on its first call; the owner binds its hash.
+    let upgrade = update.wasm_hash.as_ref().is_some_and(|hash| {
+        env.current_contract_address().executable() != Some(Executable::Wasm(hash.clone()))
+    });
+    let config = if upgrade {
+        validated::<UpgradeConfig>(env, config)?
     } else {
-        validate::<UpgradeConfig>(env, &config)?;
-    }
-    if config.owner != kept.owner {
+        validated::<P>(env, config)?
+    };
+    if config.owner != owner {
         config.owner.require_auth_for_args(signed);
     }
-    // Kept fields carry over. The packet replaces the rest and writes the current layout.
-    store(
-        env,
-        &AllowitState {
-            policy_state,
-            contract_version: CONTRACT_VERSION,
-            owner: config.owner,
-            agent: config.agent,
-            server: config.server,
-            asset: config.asset,
-            policy_instance: config.policy_instance,
-            source_digest: config.source_digest,
-            rules: config.rules,
-            params: config.params,
-            x402_enabled: config.x402_enabled,
-            token: kept.token,
-            deployment_version: deployment.deployment_version,
-            nonce: kept.nonce,
-            paused: kept.paused,
-        },
-    );
-    if let Some(hash) = deployment.wasm_hash {
+    config.store(env)?;
+    if !upgrade {
+        reshape_total(env, kept::<P>(&config.rules, &config.params))?;
+    }
+    if let Some(hash) = update.wasm_hash {
         env.deployer()
             .update_current_contract(soroban_sdk::ContractExecutable::Wasm(hash));
     }
@@ -1225,44 +1024,66 @@ pub fn deploy_policy<P: AllowitPolicy>(
 struct UpgradeConfig;
 impl AllowitPolicy for UpgradeConfig {
     const KIND: &'static str = "upgrade";
-    /// The new code validates its rules itself.
     fn validate(_rules: &Vec<AllowitRule>) -> Result<(), AllowitWalletError> {
         Ok(())
     }
-    /// Never used to execute.
     fn check(_ctx: &AllowitContext, _rules: &Vec<AllowitRule>) -> Result<(), AllowitWalletError> {
         Err(AllowitWalletError::PolicyDenied)
     }
 }
-/// Pause or resume delegated execution; the owner targets the next deployment version.
-pub fn set_pause(
-    env: &Env,
-    paused: bool,
-    deployment_version: u64,
-) -> Result<(), AllowitWalletError> {
-    let mut state = load(env, None)?;
-    state.owner.require_auth();
-    if checked(state.deployment_version.checked_add(1))? != deployment_version {
+
+/// Pause or resume the agent path; the owner targets the next deployment version.
+pub fn set_pause(env: &Env, paused: bool, deployment_version: u32) -> Result<(), AllowitWalletError> {
+    let header = Header::read(env)?;
+    header.owner(env)?.require_auth();
+    if next(header.version())? != deployment_version {
         return Err(AllowitWalletError::StaleRequest);
     }
-    state.paused = paused;
-    state.deployment_version = deployment_version;
-    store(env, &state);
+    header.store_with(env, paused, deployment_version)
+}
+/// The owner's stop: pause at the next deployment version and return the whole balance of the
+/// asset and of XLM to the owner, in one call.
+pub fn stop(env: &Env, deployment_version: u32) -> Result<(), AllowitWalletError> {
+    let header = Header::read(env)?;
+    let owner = header.owner(env)?;
+    owner.require_auth();
+    if next(header.version())? != deployment_version {
+        return Err(AllowitWalletError::StaleRequest);
+    }
+    header.store_with(env, true, deployment_version)?;
+    let wallet = env.current_contract_address();
+    let asset = header.asset(env)?;
+    let native = native_asset(env);
+    let return_all = |token: &Address| {
+        let client = token::Client::new(env, token);
+        let balance = client.balance(&wallet);
+        if balance > 0 {
+            client.transfer(&wallet, &owner, &balance);
+        }
+    };
+    return_all(&asset);
+    if asset != native {
+        return_all(&native);
+    }
     Ok(())
 }
-/// Owner recovery of funds under any readable layout.
-pub fn recover(env: &Env, recipient: Address, amount: i128) -> Result<(), AllowitWalletError> {
-    let kept = kept(env)?;
-    kept.owner.require_auth();
+/// Owner transfer of any token the wallet holds.
+pub fn recover(
+    env: &Env,
+    token: Address,
+    recipient: Address,
+    amount: i128,
+) -> Result<(), AllowitWalletError> {
+    Header::read(env)?.owner(env)?.require_auth();
     if amount <= 0 {
         return Err(AllowitWalletError::InvalidAmount);
     }
-    if recipient == env.current_contract_address()
-        || issuer_destination(env, &kept.token, &kept.asset, &recipient)?
-    {
+    let wallet = env.current_contract_address();
+    if recipient == wallet {
         return Err(AllowitWalletError::InvalidRecipient);
     }
-    move_tokens(env, &kept.asset, &recipient, amount)
+    token::Client::new(env, &token).transfer(&wallet, &recipient, &amount);
+    Ok(())
 }
 /// Owner-signed passthrough. Native authorization binds target, arguments and every nested scope.
 pub fn invoke(
@@ -1272,149 +1093,9 @@ pub fn invoke(
     args: Vec<Val>,
     auth: Vec<InvokerContractAuthEntry>,
 ) -> Result<Val, AllowitWalletError> {
-    kept(env)?.owner.require_auth();
+    Header::read(env)?.owner(env)?.require_auth();
     env.authorize_as_current_contract(auth);
     Ok(env.invoke_contract(&contract, &function, args))
-}
-/// The contract context of an authorization context; any other context is `UnsupportedOperation`.
-fn contract_context(
-    contexts: &Vec<Context>,
-    index: u32,
-) -> Result<ContractContext, AllowitWalletError> {
-    match contexts.get(index) {
-        Some(Context::Contract(context)) => Ok(context),
-        Some(_) => Err(AllowitWalletError::UnsupportedOperation),
-        None => Err(AllowitWalletError::InvalidInvocation),
-    }
-}
-/// Require a context of `function` on `contract`; another call is `UnsupportedOperation`.
-fn require_call(
-    env: &Env,
-    context: &ContractContext,
-    contract: &Address,
-    function: &str,
-) -> Result<(), AllowitWalletError> {
-    if context.contract != *contract || context.fn_name != Symbol::new(env, function) {
-        return Err(AllowitWalletError::UnsupportedOperation);
-    }
-    Ok(())
-}
-/// Require that the signed authorization tree, in host preorder, is exactly the native call of
-/// `operation` as a plain wallet would sign it: a token `transfer`; a router
-/// `swap_exact_tokens_for_tokens` with its one `transfer` of the first path token to a pair; or a
-/// vault `redeem`. Deposits have no intercepted form.
-fn match_contexts(
-    env: &Env,
-    state: &AllowitState,
-    operation: &AllowitStellarOperation,
-    contexts: &Vec<Context>,
-) -> Result<(), AllowitWalletError> {
-    let wallet = env.current_contract_address();
-    let nodes = match operation {
-        AllowitStellarOperation::Swap(_) => 2,
-        _ => 1,
-    };
-    if contexts.len() != nodes {
-        return Err(AllowitWalletError::InvalidInvocation);
-    }
-    let root = contract_context(contexts, 0)?;
-    let args: Vec<Val> = match operation {
-        AllowitStellarOperation::Deposit(_) => {
-            return Err(AllowitWalletError::UnsupportedOperation);
-        }
-        AllowitStellarOperation::Transfer(a) => {
-            require_call(env, &root, &state.asset, "transfer")?;
-            (wallet.clone(), a.to.clone(), a.amount).into_val(env)
-        }
-        AllowitStellarOperation::Redeem(a) => {
-            require_call(env, &root, &a.vault, "redeem")?;
-            (a.shares, wallet.clone(), wallet.clone(), wallet.clone()).into_val(env)
-        }
-        AllowitStellarOperation::Swap(a) => {
-            require_call(env, &root, &a.router, "swap_exact_tokens_for_tokens")?;
-            let debit = contract_context(contexts, 1)?;
-            require_call(env, &debit, &a.path.get_unchecked(0), "transfer")?;
-            // The router pays its own pair; the signed tree names it. It is a contract other
-            // than the wallet and the router, so the debit never burns a classic asset.
-            let pair = debit
-                .args
-                .get(1)
-                .and_then(|raw| Address::try_from_val(env, &raw).ok())
-                .ok_or(AllowitWalletError::InvalidInvocation)?;
-            let paid: Vec<Val> = (wallet.clone(), pair.clone(), a.amount_in).into_val(env);
-            if pair == wallet || pair == a.router || !is_contract(&pair) || debit.args != paid {
-                return Err(AllowitWalletError::InvalidInvocation);
-            }
-            let path = a.path.clone();
-            (
-                a.amount_in,
-                a.amount_out_min,
-                path,
-                wallet.clone(),
-                a.deadline,
-            )
-                .into_val(env)
-        }
-    };
-    if root.args != args {
-        return Err(AllowitWalletError::InvalidInvocation);
-    }
-    Ok(())
-}
-/// Verify the agent's and the server's raw ed25519 signatures over the host payload and the
-/// execution request. A bad signature aborts.
-fn verify_cosigners(
-    env: &Env,
-    state: &AllowitState,
-    payload: &Hash<32>,
-    authorization: &AllowitPolicyAuthorization,
-) -> Result<(), AllowitWalletError> {
-    let digest = env
-        .crypto()
-        .sha256(
-            &(
-                Symbol::new(env, "allowit_wallet_v1"),
-                payload.to_bytes(),
-                authorization.execution.clone(),
-            )
-                .to_xdr(env),
-        )
-        .to_bytes();
-    env.crypto().ed25519_verify(
-        &public_key(&state.agent)?,
-        &digest.clone().into(),
-        &authorization.agent_signature,
-    );
-    env.crypto().ed25519_verify(
-        &public_key(&state.server)?,
-        &digest.into(),
-        &authorization.server_signature,
-    );
-    Ok(())
-}
-/// Custom-account authorization: admit one transfer, swap or redeem that a plain wallet would
-/// sign, intercepted here, with the agent's and server's signatures, as `execute` does. The host
-/// calls this while the token, router or vault, not the wallet, is on the call stack, and it
-/// makes no contract call.
-pub fn check_auth<P: AllowitPolicy>(
-    env: &Env,
-    payload: Hash<32>,
-    authorization: AllowitPolicyAuthorization,
-    contexts: Vec<Context>,
-) -> Result<(), AllowitWalletError> {
-    let state = load(env, None)?;
-    if !state.x402_enabled {
-        return Err(AllowitWalletError::UnsupportedOperation);
-    }
-    // The same typed operation checks and admission as execute. With no contract call, it cannot
-    // check a vault's underlying asset or the router's or vault's output: these rest on the agent
-    // and server signatures and on the called contract.
-    let execution = &authorization.execution;
-    validate_operation(env, execution, &state)?;
-    match_contexts(env, &state, &execution.operation, &contexts)?;
-    verify_cosigners(env, &state, &payload, &authorization)?;
-    admit::<P>(env, execution, state)?;
-    Ok(())
 }
 
 /// Every native operation: the SEP-41 transfer, the router swap and the SEP-56 deposit and redeem.
@@ -1424,29 +1105,27 @@ pub const NATIVE_OPERATIONS: &[AllowitOperation] = &[
     AllowitOperation::deposit,
     AllowitOperation::redeem,
 ];
-/// Fixed minimal policy: server approval is mandatory, with no onchain business predicates.
+/// Simple: no rule on chain. The server keeps the account of its limits.
 pub struct AllowitSimple;
 impl AllowitPolicy for AllowitSimple {
     const KIND: &'static str = "simple_policy_engine";
     const STANDARD_PREFIX: bool = true;
     const OPERATIONS: &'static [AllowitOperation] = NATIVE_OPERATIONS;
-    /// No onchain rules: the kernel and the shared post-flight only.
     fn check(_ctx: &AllowitContext, _rules: &Vec<AllowitRule>) -> Result<(), AllowitWalletError> {
         Ok(())
     }
 }
-/// Fixed canonical rule set. The owner chooses every enforced rule explicitly.
+/// Standard: the owner's ordered canonical rules.
 pub struct AllowitCommon;
 impl AllowitPolicy for AllowitCommon {
     const KIND: &'static str = "common_policy_engine";
     const STANDARD_PREFIX: bool = true;
     const OPERATIONS: &'static [AllowitOperation] = NATIVE_OPERATIONS;
-    /// Any ordered list of typed rules. The kernel decodes each element before storing it.
     fn validate(_rules: &Vec<AllowitRule>) -> Result<(), AllowitWalletError> {
         Ok(())
     }
-    /// Run each prefix call `allowit::<rule>(ctx, &ctx.params[allowit::<RULE>])?;` in owner
-    /// order. An absent param skips its rule here only; the full offchain policy denies it.
+    /// Run each rule `allowit::<rule>(ctx, &ctx.params[allowit::<RULE>])?;` in owner order. An
+    /// absent param skips its rule here only; the server's full policy denies it.
     fn check(ctx: &AllowitContext, rules: &Vec<AllowitRule>) -> Result<(), AllowitWalletError> {
         for rule in rules.iter() {
             allowit::preflight(ctx, rule)?;
@@ -1469,7 +1148,7 @@ impl From<allowit::AllowitError> for AllowitWalletError {
     }
 }
 
-/// Attach the complete owner and delegated-execution interface to a policy implementation.
+/// Attach the complete owner and agent interface to a policy implementation.
 #[macro_export]
 macro_rules! policy_wallet {
     ($name:ident, $policy:ty) => {
@@ -1482,88 +1161,49 @@ macro_rules! policy_wallet {
             pub fn __constructor(env: soroban_sdk::Env, config: $crate::AllowitPolicyConfig) {
                 $crate::construct::<$policy>(&env, config).unwrap();
             }
-            /// Read the custody State.
+            /// Read the stored wallet.
             pub fn state(
                 env: soroban_sdk::Env,
             ) -> Result<$crate::AllowitState, $crate::AllowitWalletError> {
-                $crate::state(&env)
+                $crate::state::<$policy>(&env)
             }
-            /// Read the current free-form policy state: standard and policy-defined keys.
-            pub fn policy_state(
-                env: soroban_sdk::Env,
-            ) -> Result<
-                soroban_sdk::Map<soroban_sdk::Symbol, allowit_wallet_protocol::AllowitValue>,
-                $crate::AllowitWalletError,
-            > {
-                $crate::policy_state(&env)
-            }
-            /// Read the installed binding: executable, source binding and the operations it runs.
-            pub fn policy_binding(
-                env: soroban_sdk::Env,
-            ) -> Result<allowit_wallet_protocol::AllowitPolicyBinding, $crate::AllowitWalletError>
-            {
-                $crate::policy_binding::<$policy>(&env)
-            }
-            /// Read the retained share credit of a successful deposit operation.
-            pub fn deposit_receipt(
-                env: soroban_sdk::Env,
-                operation_id: soroban_sdk::BytesN<32>,
-            ) -> Result<
-                Option<allowit_wallet_protocol::AllowitSep56DepositReceipt>,
-                $crate::AllowitWalletError,
-            > {
-                $crate::deposit_receipt(&env, operation_id)
-            }
-            /// Read the retained observed output of a successful `execute` swap.
-            pub fn swap_receipt(
-                env: soroban_sdk::Env,
-                operation_id: soroban_sdk::BytesN<32>,
-            ) -> Result<
-                Option<allowit_wallet_protocol::AllowitSwapReceipt>,
-                $crate::AllowitWalletError,
-            > {
-                $crate::swap_receipt(&env, operation_id)
-            }
-            /// Read the retained observed output of a successful `execute` redeem.
-            pub fn redeem_receipt(
-                env: soroban_sdk::Env,
-                operation_id: soroban_sdk::BytesN<32>,
-            ) -> Result<
-                Option<allowit_wallet_protocol::AllowitSep56RedeemReceipt>,
-                $crate::AllowitWalletError,
-            > {
-                $crate::redeem_receipt(&env, operation_id)
-            }
-            /// Run one agent- and server-authorized native operation under the installed policy.
+            /// Run one operation that the agent and the server signed, under the installed policy.
             pub fn execute(
                 env: soroban_sdk::Env,
                 execution: allowit_wallet_protocol::AllowitExecutionRequest,
-            ) -> Result<allowit_wallet_protocol::AllowitTransferReceipt, $crate::AllowitWalletError>
-            {
+            ) -> Result<(), $crate::AllowitWalletError> {
                 $crate::execute::<$policy>(&env, execution)
             }
             /// Apply a complete owner update at the next deployment version.
             pub fn deploy_policy(
                 env: soroban_sdk::Env,
-                deployment: $crate::AllowitPolicyDeployment,
+                update: $crate::AllowitPolicyUpdate,
             ) -> Result<(), $crate::AllowitWalletError> {
-                $crate::deploy_policy::<$policy>(&env, deployment)
+                $crate::deploy_policy::<$policy>(&env, update)
             }
-            /// Pause or resume delegated execution at the next deployment version.
+            /// Pause or resume the agent path at the next deployment version.
             pub fn set_pause(
                 env: soroban_sdk::Env,
                 paused: bool,
-                deployment_version: u64,
+                deployment_version: u32,
             ) -> Result<(), $crate::AllowitWalletError> {
                 $crate::set_pause(&env, paused, deployment_version)
             }
-            /// Owner recovery of funds under any readable layout.
+            /// Pause and return the asset and XLM to the owner.
+            pub fn stop(
+                env: soroban_sdk::Env,
+                deployment_version: u32,
+            ) -> Result<(), $crate::AllowitWalletError> {
+                $crate::stop(&env, deployment_version)
+            }
+            /// Owner transfer of any token the wallet holds.
             pub fn recover(
                 env: soroban_sdk::Env,
+                token: soroban_sdk::Address,
                 recipient: soroban_sdk::Address,
                 amount: i128,
             ) -> Result<(), $crate::AllowitWalletError> {
-                $crate::recover(&env, recipient, amount)
+                $crate::recover(&env, token, recipient, amount)
             }
             /// Owner-signed passthrough call with explicit nested authorization.
             pub fn invoke(
@@ -1578,16 +1218,16 @@ macro_rules! policy_wallet {
         }
         #[soroban_sdk::contractimpl]
         impl soroban_sdk::auth::CustomAccountInterface for $name {
-            type Signature = $crate::AllowitPolicyAuthorization;
+            type Signature = allowit_wallet_protocol::AllowitCosignatures;
             type Error = $crate::AllowitWalletError;
-            /// Admit one intercepted transfer, swap or redeem that the agent and server signed.
+            /// Authorize this wallet's own `execute` with the agent's and the server's signatures.
             fn __check_auth(
                 env: soroban_sdk::Env,
                 signature_payload: soroban_sdk::crypto::Hash<32>,
-                authorization: $crate::AllowitPolicyAuthorization,
+                signatures: allowit_wallet_protocol::AllowitCosignatures,
                 contexts: soroban_sdk::Vec<soroban_sdk::auth::Context>,
             ) -> Result<(), $crate::AllowitWalletError> {
-                $crate::check_auth::<$policy>(&env, signature_payload, authorization, contexts)
+                $crate::check_auth(&env, signature_payload, signatures, contexts)
             }
         }
     };
@@ -1595,15 +1235,3 @@ macro_rules! policy_wallet {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod sep56_tests;
-
-#[cfg(test)]
-mod portability_tests;
-
-#[cfg(test)]
-mod swap_redeem_tests;
-
-#[cfg(test)]
-mod core_vectors_tests;
