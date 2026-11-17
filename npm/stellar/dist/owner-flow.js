@@ -1,6 +1,7 @@
 import { canonicalNetwork } from './plugin.js';
 import { expiredRecord as chainExpiredRecord, horizonGet } from './chain-record.js';
 import { countersignCreation, CREATE_FEE_ACCOUNT, FEE_ACCOUNT_REQUIRED, newFeeAccountKey } from './fee-account.js';
+import { APPROVE_POLICY, SET_UP_WALLET, WALLET_SETUP_REQUIRED, WalletSetupPendingError, approvalStep, policyApproval, setUpNativeWallet } from './native-wallet.js';
 /** Typed codes of a refused `native/owner/submit`. The reply body is `{error, code, details}`. */
 export const OWNER_TRANSACTION_EXPIRED = 'owner_transaction_expired';
 export const OWNER_TRANSACTION_PENDING = 'owner_transaction_pending';
@@ -71,6 +72,17 @@ const unchecked = () => new OwnerFlowError('The expired signed step could not be
  * never apply. `chain-record.ts` holds the rule. A chain that cannot be read keeps the step saved.
  */
 const expiredRecord = (network, step, signedPayload) => chainExpiredRecord(network, step.hash, signedPayload).catch(() => { throw unchecked(); });
+/** The 64 bytes of a wallet's message signature, which the wallet returns as base64 text. */
+function signatureBytes(signature) {
+    let bytes = [];
+    try {
+        bytes = typeof signature === 'string' ? Array.from(atob(signature), c => c.charCodeAt(0)) : [];
+    }
+    catch { /* refused below */ }
+    if (bytes.length !== 64)
+        throw new OwnerFlowError('Your wallet did not return a message signature.', null, false);
+    return bytes;
+}
 /** Workflows that run in this page, by journal key. */
 const running = new Set();
 const busy = () => new OwnerFlowError('This wallet setup is already running in this or another tab.', null, true);
@@ -307,6 +319,58 @@ async function run({ network, ask, sign, journal, key, policyId, agent, amount, 
     // True once this journal saw the creation confirmed on the network.
     let created = named?.created ?? false;
     let replaced = false;
+    // True once this run set up the wallet account of a Native policy: the deployment then names the wallet.
+    let nativeSetUp = false;
+    const walletSetupKey = `${key}:wallet-setup`;
+    /** Creates and funds the agent's wallet account with one owner signature, and registers it for this policy. */
+    const setUpWallet = async (details) => {
+        const roles = object(details) ? details : {};
+        if (typeof roles.owner !== 'string' || typeof roles.server !== 'string' || roles.agent !== agent || roles.policyId !== policyId)
+            throw new OwnerFlowError('The service named no roles for the wallet account of this policy.', null, false);
+        let setup;
+        try {
+            // The signed setup stays in the journal until the server has registered the wallet, so a run that
+            // stops in between finds the same account again.
+            setup = await setUpNativeWallet({ network, owner: roles.owner, agent, server: roles.server, amount, sign, onStep, journal, key: walletSetupKey, retain: true });
+        }
+        catch (cause) {
+            if (cause instanceof OwnerFlowError)
+                throw cause;
+            throw new OwnerFlowError(cause instanceof Error ? cause.message : 'The wallet account could not be set up.', null, cause instanceof WalletSetupPendingError, cause);
+        }
+        receipts.push({ policyId, action: SET_UP_WALLET, status: 'confirmed', transactionHash: setup.transactionHash, ledger: setup.ledger });
+        onStep('Registering the wallet…');
+        const registered = await ask('native/register', { configuration: setup.configuration, policyId });
+        if (!object(registered) || registered.registered !== true || registered.wallet !== setup.wallet || registered.policyId !== policyId)
+            throw new OwnerFlowError('The service did not register the wallet account for this policy. Resume to register it; nothing is signed again.', null, true);
+        // The setup funded the wallet: no funding step follows.
+        journal.set(fundedKey, JSON.stringify(identity));
+    };
+    /** The owner's approval of the policy of a Native wallet: one message signature, and no transaction. */
+    const approvePolicy = async (account) => {
+        onStep('Preparing the approval…');
+        const approval = await ask('native/approval', { policyId });
+        if (!object(approval) || approval.required !== true)
+            return;
+        const fields = policyApproval(approval.message, network);
+        if (!fields || fields.policyId !== policyId || fields.wallet !== account)
+            throw new OwnerFlowError('The approval differs from this policy and its wallet account. Nothing was signed.', null, false);
+        const signer = await ownerOf(account);
+        onStep('Sign the approval of the policy in your wallet…');
+        const signature = await sign(approvalStep(approval.message));
+        await ask('micro/allocation/confirm', { id: policyId, revision: fields.revision, sourceApproval: [{ signer, signature: signatureBytes(signature) }] });
+        receipts.push({ policyId, action: APPROVE_POLICY, status: 'confirmed', transactionHash: '' });
+    };
+    /** The owner of a wallet account: its signer of the owner's weight, read from the public ledger history. */
+    const ownerOf = async (account) => {
+        const response = await horizonGet(network, `/accounts/${account}`);
+        const body = response?.ok ? await response.json().catch(() => null) : null;
+        const signers = object(body) && Array.isArray(body.signers) ? body.signers : [];
+        const owners = signers.filter(s => object(s) && s.weight === 3 && s.type === 'ed25519_public_key' && typeof s.key === 'string');
+        if (owners.length !== 1)
+            throw new OwnerFlowError('The owner of the wallet account could not be read from the network. Resume to read it again.', null, true);
+        return owners[0].key;
+    };
     // A deployment takes at most the fee account, the code upload, the wallet creation and a lifetime renewal.
     for (let i = 0; i < 5 && !wallet; i++) {
         onStep('Preparing the wallet…');
@@ -315,7 +379,15 @@ async function run({ network, ask, sign, journal, key, policyId, agent, amount, 
             reply = await ask('native/deploy/prepare', { policyId, agent, ...(feeAccount ? { setup: { feeAccount } } : {}) });
         }
         catch (error) {
-            const { code } = (object(error) ? error : {});
+            const { code, details } = (object(error) ? error : {});
+            // A Native policy needs the wallet account of its agent. This workflow sets the account up from the
+            // owner's own account, the server registers it, and the deployment then answers with the wallet.
+            if (code === WALLET_SETUP_REQUIRED && !nativeSetUp) {
+                await setUpWallet(details);
+                nativeSetUp = true;
+                i--;
+                continue;
+            }
             // A new policy wallet needs a fee account: this workflow makes its key, and the deployment creates and
             // funds the account. The agent holds a key and no account.
             // Boundary: a journal without a saved address names no account. That is the state of a new deployment,
@@ -333,6 +405,14 @@ async function run({ network, ask, sign, journal, key, policyId, agent, amount, 
         if (!object(reply) || reply.policyId !== policyId)
             throw new OwnerFlowError('The deployment reply names a different policy.', null, false);
         wallet = installedWallet(reply);
+        if (wallet && reply.walletKind === 'native') {
+            // The setup created and funded the wallet account. What remains is the owner's approval of the policy.
+            journal.remove(walletSetupKey);
+            if (reply.approved !== true)
+                await approvePolicy(wallet);
+            journal.remove(feeAccountKey);
+            return { wallet, receipts };
+        }
         if (wallet)
             break;
         const step = stepOf(reply.step);
@@ -461,6 +541,30 @@ async function runUpdate({ network, ask, sign, journal, key, policyId, params, e
         // The service's reason and typed code reach the owner unchanged.
         const code = object(error) && typeof error.code === 'string' ? error.code : null;
         throw new OwnerFlowError(error instanceof Error && error.message ? error.message : 'The change could not be prepared.', code, code === NETWORK_UNAVAILABLE, error);
+    }
+    // A Native wallet holds no values on chain: its change is a new approval of the policy, with no transaction.
+    if (object(prepared) && prepared.policyId === policyId && object(prepared.approval) && !prepared.step) {
+        const message = prepared.approval.message, fields = policyApproval(message, network);
+        if (!fields || fields.policyId !== policyId)
+            throw new OwnerFlowError('The approval differs from this change. Nothing was signed.', null, false);
+        onStep('Sign the approval of the new values in your wallet…');
+        const signature = await sign(approvalStep(message));
+        const response = await horizonGet(network, `/accounts/${fields.wallet}`);
+        const body = response?.ok ? await response.json().catch(() => null) : null;
+        const owners = (object(body) && Array.isArray(body.signers) ? body.signers : []).filter(s => object(s) && s.weight === 3 && s.type === 'ed25519_public_key' && typeof s.key === 'string');
+        if (owners.length !== 1)
+            throw new OwnerFlowError('The owner of the wallet account could not be read from the network. Nothing was saved; try again.', null, true);
+        let receipt;
+        try {
+            receipt = await ask('native/owner/submit', { policyId, payload: message, sourceApproval: [{ signer: owners[0].key, signature: signatureBytes(signature) }] });
+        }
+        catch (error) {
+            const code = object(error) && typeof error.code === 'string' ? error.code : null;
+            throw new OwnerFlowError(error instanceof Error && error.message ? error.message : 'The change could not be saved.', code, code === NETWORK_UNAVAILABLE, error);
+        }
+        journal.set(updatedKey, JSON.stringify(identity));
+        receipts.push({ policyId, action: UPDATE_PARAMS, status: 'confirmed', transactionHash: object(receipt) && typeof receipt.transactionHash === 'string' ? receipt.transactionHash : '' });
+        return { receipts, done: true };
     }
     const step = stepOf(prepared?.step);
     if (!object(prepared) || prepared.policyId !== policyId || !step || step.action !== UPDATE_PARAMS)

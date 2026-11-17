@@ -2,6 +2,9 @@ import { canonicalNetwork, networkPassphrase, strkey } from '../plugin.js';
 import { base, emit, expiry, h } from './base.js';
 import { link } from './display.js';
 import { CREATE_FEE_ACCOUNT } from '../fee-account.js';
+import { APPROVE_POLICY, SET_UP_WALLET, WALLET_FEE_FLOAT, WALLET_RESERVE, approvalMessage, nativeSetupOf, policyApproval } from '../native-wallet.js';
+/** XLM text of stroops, without trailing zeros. */
+const xlm = (units) => `${units / 10000000n}${units % 10000000n ? `.${(units % 10000000n).toString().padStart(7, '0').replace(/0+$/, '')}` : ''} XLM`;
 /**
  * What the creation of a fee account does, read from the transaction itself: the new account and the XLM that the
  * owner's account sends to it. Null when the first operation creates no account.
@@ -119,6 +122,59 @@ export function ownerSignElement() {
             }
             const rows = summary.flatMap(row => [h('dt', {}, String(row.label ?? '')), h('dd', {}, String(row.value ?? ''))]);
             const cancel = button('Cancel', () => emit(this, 'allowit-cancel'));
+            if (step.action === APPROVE_POLICY) {
+                // This step signs a message, never a transaction: the owner's approval of the exact source and values of
+                // one policy on one wallet account. Only an approval message of this network is signed, and the owner
+                // reads what it names. `data.expected` binds it to the policy that the page reviewed.
+                const message = approvalMessage(step), fields = policyApproval(message, id);
+                const expected = data.expected && typeof data.expected === 'object' ? data.expected : null;
+                const differs = (key) => expected?.[key] !== undefined && expected[key] !== fields?.[key];
+                if (message === null || !fields || differs('policyId') || differs('sourceHash') || differs('paramsHash') || differs('wallet')) {
+                    this.replaceChildren(h('p', { class: 'invalid' }, 'This owner step is invalid.'));
+                    return;
+                }
+                rows.push(h('dt', {}, 'Wallet account'), h('dd', {}, link(id, 'address', fields.wallet, fields.wallet)));
+                rows.push(h('dt', {}, 'Policy source hash'), h('dd', { class: 'mono' }, fields.sourceHash));
+                rows.push(h('dt', {}, 'Values hash'), h('dd', { class: 'mono' }, fields.paramsHash));
+                rows.push(h('dt', {}, 'What you sign'), h('dd', {}, 'A message that approves this policy for the wallet account. The server then checks every payment of your agent against it. It moves no funds.'));
+                const status = h('p', { class: 'status', role: 'status' });
+                const sign = button('Sign the approval', async () => {
+                    sign.disabled = true;
+                    status.textContent = 'Waiting for the wallet…';
+                    try {
+                        if (step.expiresAt <= Date.now() / 1000)
+                            throw Object.assign(new Error('This owner step expired. Prepare it again.'), { code: 'expired' });
+                        const { connectWallet, signWalletMessage } = await import('./wallet.js');
+                        const owner = typeof data.owner === 'string' && strkey(data.owner) ? data.owner : await connectWallet(id);
+                        const signedPayload = await signWalletMessage(message, owner, id);
+                        status.textContent = 'Signed.';
+                        emit(this, 'allowit-signed', { signedPayload, hash: step.hash });
+                    }
+                    catch (error) {
+                        status.textContent = error instanceof Error ? error.message : String(error);
+                        emit(this, 'allowit-error', failure(error, 'sign'));
+                    }
+                    finally {
+                        sign.disabled = false;
+                    }
+                });
+                this.replaceChildren(h('dl', { class: 'owner-step' }, ...rows), h('div', { class: 'actions' }, sign, cancel), status);
+                return;
+            }
+            if (step.action === SET_UP_WALLET) {
+                // The owner reads what this step creates before the wallet opens: the agent's wallet account, its
+                // signers and the XLM that it starts with. Any other transaction under this action is refused.
+                const setup = nativeSetupOf(step.payload, id);
+                if (!setup || (typeof data.owner === 'string' && data.owner !== setup.owner)) {
+                    this.replaceChildren(h('p', { class: 'invalid' }, 'This owner step is invalid.'));
+                    return;
+                }
+                const funding = setup.startingBalance - WALLET_RESERVE - WALLET_FEE_FLOAT;
+                rows.push(h('dt', {}, 'Wallet account'), h('dd', {}, link(id, 'address', setup.wallet, setup.wallet)));
+                rows.push(h('dt', {}, 'Agent'), h('dd', {}, link(id, 'address', setup.agent, setup.agent)));
+                rows.push(h('dt', {}, 'You fund it with'), h('dd', {}, `${xlm(setup.startingBalance)}: ${funding > 0n ? `${xlm(funding)} for your agent's payments, ` : ''}${xlm(WALLET_RESERVE)} that the network locks in the account and ${xlm(WALLET_FEE_FLOAT)} for the fees of your own steps. Only you can take it back.`));
+                rows.push(h('dt', {}, 'Who can pay'), h('dd', {}, 'Your agent and the server, only together. You can do everything alone.'));
+            }
             rows.push(h('dt', {}, 'Transaction'), h('dd', {}, link(id, 'tx', step.hash, `${step.hash.slice(0, 8)}…`)));
             rows.push(h('dt', {}, 'Expires'), h('dd', {}, expiry(step.expiresAt)));
             const list = h('dl', { class: 'owner-step' }, ...rows);

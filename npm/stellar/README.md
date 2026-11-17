@@ -76,6 +76,34 @@ The `owner-sign` element checks an `update_params` step of a Standard wallet aga
 step: the selection holds the complete new params and `update: {deploymentVersion, x402Enabled}`. The verifier
 reconstructs the exact policy packet, so a step with another value, revision, wallet or code is not signed.
 
+### Native wallet
+
+A Native policy needs the wallet account of its agent: a new classic account, one for each agent. `installAndFund`
+deploys it without a server step. The service answers the deployment of such a draft with `wallet_setup_required` and
+the roles `{owner, agent, server}`. The workflow then:
+
+1. Builds the setup from the owner's own sequence (`native-wallet.ts`): one transaction that creates the account with
+   its starting balance, adds the owner signer (weight 3), the agent signer (1) and the server signer (1), sets the
+   thresholds 2, 2 and 3 and gives the account's own key weight 0. The starting balance is the reserve of the account
+   (2.5 XLM), 0.5 XLM for the fees of the owner's own steps and the owner's funding amount.
+2. Has the host's `sign` sign it as the step `set_up_wallet`. The account's own key is random, lives in that call only
+   and signs the creation once beside the owner. The `owner-sign` element reads the step from its bytes: it shows the
+   wallet account, the agent and the funding, and it refuses any transaction that is not exactly this setup.
+3. Sends the signed bytes to Horizon itself. They stay in the journal under `<key>:wallet-setup` until the service has
+   registered the wallet, so a run that stops in between names the same account again and signs no second setup. A
+   result that is unknown is settled as a refill is: done when Horizon holds it as successful, sent again while its
+   time bound lasts, and replaced only when Horizon holds it as failed or has read past its time bound without it.
+4. Registers the account for the policy (`native/register` with the installation document and the `policyId`).
+5. Asks for the owner's approval of the policy (`native/approval`) and has `sign` sign it as the step `approve_policy`:
+   a message, never a transaction. The payload is the base64 UTF-8 text of the message, and the hash its SEP-53 digest.
+   The element signs only the exact approval message of its network, shows the wallet account and the hashes of the
+   source and the values, and compares them with `data.expected` when the host passes `{policyId, wallet, sourceHash,
+   paramsHash}`. The workflow confirms the approval with `micro/allocation/confirm`.
+
+So a Native deployment takes two owner signatures: the setup, which also funds the wallet, and the approval. No
+funding step follows. `updateParams` on a Native wallet is one `approve_policy` signature and no transaction: the
+account holds no values, so the service answers the change with the approval message of the new values.
+
 ## Build and test
 
 The package exports JavaScript modules and TypeScript declarations. StrKey decoding, asset contract IDs and network passphrases come from `@stellar/stellar-sdk`. `test:browser` reads the Common Wasm that `scripts/build-contracts.sh` builds. Run these commands from `npm/stellar/`:
