@@ -14,13 +14,6 @@
 use crate::*;
 
 pub const OWNER_PROFILE: &str = "allowit-stellar-owner-v2";
-/// The profile of the setup of a fee account: the same account structure as a wallet account,
-/// for the account that sends the operations of one policy wallet and pays their fees.
-pub const FEE_ACCOUNT_PROFILE: &str = "allowit-stellar-fee-account-v1";
-/// The action name of the owner step that creates a fee account.
-pub const CREATE_FEE_ACCOUNT: &str = "create_fee_account";
-/// The action name of the owner step that returns the fee float of a fee account.
-pub const RETURN_FEES: &str = "return_fees";
 /// The weight of the owner signer: every threshold, alone.
 pub const OWNER_WEIGHT: u32 = 3;
 /// The weight of the agent signer and of the server signer.
@@ -34,9 +27,6 @@ pub const OWNER_THRESHOLD: u32 = 3;
 pub const BASE_RESERVE_STROOPS: i64 = 5_000_000;
 /// The XLM that a new wallet holds above its reserve to pay the network fees of its payments.
 pub const FEE_FLOAT_STROOPS: i64 = 5_000_000;
-/// The XLM that a new fee account holds above its reserve: the float that pays the network
-/// fees of the agent's operations on the policy wallet. The owner refills it.
-pub const FEE_ACCOUNT_FLOAT_STROOPS: i64 = 50_000_000;
 const SIGNERS: i64 = 3;
 /// The most that one setup sends to a new account, in stroops.
 pub const MAX_STARTING_BALANCE: i64 = 1_000_000_000_000_000;
@@ -51,24 +41,11 @@ pub const fn default_starting_balance(trustline: bool) -> i64 {
     wallet_reserve(trustline) + FEE_FLOAT_STROOPS
 }
 
-/// The balance that a new fee account starts with: its reserve and the fee float.
-pub fn fee_account_starting_balance() -> i64 {
-    wallet_reserve(false) + FEE_ACCOUNT_FLOAT_STROOPS
-}
-/// Whether a fee account holds too little to see its owner through: less than two operations
-/// at the fee ceiling of its policy wallet. `spendable` is its XLM above the reserve.
-pub fn fee_account_low(spendable: i64, max_fee_stroops: u32) -> bool {
-    spendable < 2 * i64::from(max_fee_stroops)
-}
-/// The request identity of the setup of the fee account of one policy wallet.
-pub fn fee_account_request_id(policy_instance: &[u8; 32]) -> String {
-    format!("fee-account-{}", hex(&policy_instance[..16]))
-}
-/// The one-time setup key of a new wallet account or fee account. The owner's client makes it
-/// from the operating system's random source, holds it in memory, signs the creation of its
-/// account with it once and drops it. The creation transaction sets its weight to 0 and makes
-/// the owner a signer that reaches every threshold alone, so nothing needs this key again and
-/// nothing stores, derives or recovers it.
+/// The one-time setup key of a new wallet account. The owner's client makes it from the operating
+/// system's random source, holds it in memory, signs the creation of its account with it once and
+/// drops it. The creation transaction sets its weight to 0 and makes the owner a signer that
+/// reaches every threshold alone, so nothing needs this key again and nothing stores, derives or
+/// recovers it.
 pub struct WalletKey(SigningKey);
 impl WalletKey {
     /// A new random key. It exists only in the memory of the caller.
@@ -181,23 +158,9 @@ fn operation_count(v: &NativeSetup) -> u32 {
 }
 
 fn transaction(v: &NativeSetup) -> Result<Transaction> {
-    match v.profile.as_str() {
-        OWNER_PROFILE => {
             if v.network != "stellar:testnet" {
                 return Err("Native wallet setup supports Stellar Testnet only".into());
             }
-        }
-        // A fee account holds XLM only, and starts with exactly its reserve and the float.
-        FEE_ACCOUNT_PROFILE => {
-            passphrase(&v.network)?;
-            if v.trustline.is_some()
-                || v.starting_balance != fee_account_starting_balance().to_string()
-            {
-                return Err("A fee account holds its reserve and the fee float in XLM".into());
-            }
-        }
-        _ => return Err("Invalid native setup identity or fee".into()),
-    }
     let owner = account_key(&v.owner)?;
     let wallet = account_key(&v.wallet)?;
     let agent = account_key(&v.agent)?;
@@ -213,6 +176,7 @@ fn transaction(v: &NativeSetup) -> Result<Transaction> {
     }
     let count = operation_count(v);
     if v.version != 2
+        || v.profile != OWNER_PROFILE
         || !(8..=100).contains(&v.request_id.len())
         || !v
             .request_id
@@ -296,7 +260,7 @@ fn change_trust_asset(asset: &Asset) -> Result<ChangeTrustAsset> {
 pub fn intent_digest(v: &NativeSetup) -> Result<String> {
     Ok(hex(&hash(
         serde_json::to_vec(&serde_json::json!([
-            v.profile,
+            OWNER_PROFILE,
             v.request_id,
             v.network,
             v.owner,
@@ -321,71 +285,11 @@ pub fn prepare_native_setup(
     terms: &SetupTerms<'_>,
     now: u64,
 ) -> Result<NativeSetup> {
-    prepare_setup(OWNER_PROFILE, state, terms, now)
-}
-/// The owner's choices for the setup of one fee account.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FeeAccountTerms<'a> {
-    /// The new fee account.
-    pub account: &'a str,
-    pub agent: &'a str,
-    pub engine: &'a str,
-    pub request_id: &'a str,
-    pub network: &'a str,
-    pub fee_per_operation: u32,
-}
-/// Prepare the one transaction that creates the fee account of one policy wallet: the account
-/// that sends the agent's operations on that wallet and pays their network fees. It has the
-/// signers and thresholds of a wallet account, so the agent and the server pay from it only
-/// together and its owner refills, withdraws from and closes it alone. It starts with its
-/// reserve and the fee float. `state` is the owner's account, which pays both and the fee.
-pub fn prepare_fee_account_setup(
-    state: &AccountState,
-    terms: &FeeAccountTerms<'_>,
-    now: u64,
-) -> Result<NativeSetup> {
-    prepare_setup(
-        FEE_ACCOUNT_PROFILE,
-        state,
-        &SetupTerms {
-            wallet: terms.account,
-            agent: terms.agent,
-            engine: terms.engine,
-            request_id: terms.request_id,
-            network: terms.network,
-            fee_per_operation: terms.fee_per_operation,
-            starting_balance: Some(fee_account_starting_balance()),
-            trustline: None,
-        },
-        now,
-    )
-}
-/// The owner step of a setup: its unsigned transaction under the action name of its profile.
-pub fn setup_transaction(v: &NativeSetup) -> Result<owner_intent::OwnerTransaction> {
-    validate_native_setup(v)?;
-    Ok(owner_intent::OwnerTransaction {
-        network: v.network.clone(),
-        action: match v.profile.as_str() {
-            FEE_ACCOUNT_PROFILE => CREATE_FEE_ACCOUNT,
-            _ => "native_setup",
-        }
-        .into(),
-        transaction_xdr: v.transaction_xdr.clone(),
-        transaction_hash: unhex(&v.transaction_hash)?,
-        expires_at: v.expires_at,
-    })
-}
-fn prepare_setup(
-    profile: &str,
-    state: &AccountState,
-    terms: &SetupTerms<'_>,
-    now: u64,
-) -> Result<NativeSetup> {
     check_owner_source(state)?;
     let trustline = terms.trustline.is_some();
     let mut v = NativeSetup {
         version: 2,
-        profile: profile.into(),
+        profile: OWNER_PROFILE.into(),
         request_id: terms.request_id.into(),
         network: terms.network.into(),
         owner: state.address.clone(),
@@ -464,8 +368,6 @@ pub enum WalletAction {
     /// Remove every signer and merge the account into the owner's account. `token_balance`
     /// is the wallet's balance of its issued asset, which returns to the owner first.
     Close { token_balance: i64 },
-    /// Send the fee float of a fee account back to the owner. The account stays.
-    ReturnFees { units: i64 },
 }
 impl WalletAction {
     /// The action name of the owner step.
@@ -476,7 +378,6 @@ impl WalletAction {
             Self::Resume => "resume",
             Self::Withdraw { .. } => "withdraw",
             Self::Close { .. } => "close",
-            Self::ReturnFees { .. } => RETURN_FEES,
         }
     }
 }
@@ -554,14 +455,6 @@ pub fn prepare_wallet_action(
                 }),
             }]
         }
-        WalletAction::ReturnFees { units } => vec![Operation {
-            source_account: wallet.clone(),
-            body: OperationBody::Payment(PaymentOp {
-                destination: muxed(roles.owner)?,
-                asset: Asset::Native,
-                amount: positive(*units)?,
-            }),
-        }],
         WalletAction::Close { token_balance } => {
             let mut operations = Vec::new();
             if *asset != Asset::Native {
@@ -1137,83 +1030,6 @@ mod tests {
         }
     }
 
-    // A fee account: the account that sends the agent's operations on one policy wallet.
-    /// A fixed setup key of the fee account for `agent`.
-    fn fee_key(agent: &str) -> WalletKey {
-        WalletKey::from_seed(&hash(format!("fee account {agent}").as_bytes()))
-    }
-    fn fee_setup(agent: &str) -> NativeSetup {
-        let account = fee_key(agent).account();
-        prepare_fee_account_setup(
-            &owner_state(),
-            &FeeAccountTerms {
-                account: &account,
-                agent,
-                engine: &engine(),
-                request_id: &fee_account_request_id(&[7; 32]),
-                network: NETWORK,
-                fee_per_operation: 100,
-            },
-            1_800_000_000,
-        )
-        .unwrap()
-    }
-    #[test]
-    fn a_fee_account_setup_creates_the_exact_roles_with_the_reserve_and_the_float() {
-        let agent = agent(2);
-        let v = fee_setup(&agent);
-        validate_native_setup(&v).unwrap();
-        assert_eq!(v.profile, FEE_ACCOUNT_PROFILE);
-        let packet = setup_transaction(&v).unwrap();
-        assert_eq!(packet.action, CREATE_FEE_ACCOUNT);
-        owner_intent::validate_retained_owner_transaction(&packet).unwrap();
-        let TransactionEnvelope::Tx(tx) = read(&v.transaction_xdr).unwrap() else {
-            panic!()
-        };
-        // One transaction from the owner's account: the creation and three signer operations.
-        assert_eq!(tx.tx.operations.len(), 4);
-        assert_eq!(tx.tx.source_account, muxed(&v.owner).unwrap());
-        let OperationBody::CreateAccount(create) = &tx.tx.operations[0].body else {
-            panic!()
-        };
-        assert_eq!(create.starting_balance, 75_000_000);
-        assert_eq!(
-            fee_account_starting_balance(),
-            wallet_reserve(false) + FEE_ACCOUNT_FLOAT_STROOPS
-        );
-        let state = created(&v);
-        let server = engine();
-        state.validate_roles(&v.owner, &agent, &server).unwrap();
-        // The account's own key has no authority. The agent alone and the server alone reach
-        // no threshold; together they reach the payment threshold and never the high one,
-        // which a signer change, a threshold change and a merge need. The owner reaches all.
-        assert_eq!(state.master_weight, 0);
-        assert!(weight_of(&state, &[&v.wallet]) < state.low_threshold);
-        assert!(weight_of(&state, &[&agent]) < state.low_threshold);
-        assert!(weight_of(&state, &[&server]) < state.low_threshold);
-        assert!(weight_of(&state, &[&agent, &server]) >= state.medium_threshold);
-        assert!(weight_of(&state, &[&agent, &server]) < state.high_threshold);
-        assert!(weight_of(&state, &[&v.owner]) >= state.high_threshold);
-        // Another balance, a trustline, another role or another network is another setup.
-        for change in [
-            |v: &mut NativeSetup| v.starting_balance = "75000001".into(),
-            |v: &mut NativeSetup| v.starting_balance = "30000000".into(),
-            |v: &mut NativeSetup| {
-                v.trustline = Some(Trustline {
-                    code: "USDC".into(),
-                    issuer: account_for_seed(&[7; 32]),
-                })
-            },
-            |v: &mut NativeSetup| v.agent = account_for_seed(&[5; 32]),
-            |v: &mut NativeSetup| v.engine = account_for_seed(&[5; 32]),
-            |v: &mut NativeSetup| v.profile = OWNER_PROFILE.into(),
-            |v: &mut NativeSetup| v.profile = "other".into(),
-        ] {
-            let mut changed = v.clone();
-            change(&mut changed);
-            assert!(validate_native_setup(&changed).is_err());
-        }
-    }
     /// The creation, the signers, the thresholds and the setup key's weight 0 are one
     /// transaction, and the ledger applies a transaction whole or not at all. The owner's
     /// client signs no other shape: a transaction that lacks any one operation of the setup is
@@ -1223,7 +1039,7 @@ mod tests {
     #[test]
     fn a_setup_that_lacks_any_one_operation_is_refused_before_a_signature() {
         let agent = agent(2);
-        for v in [fee_setup(&agent), setup(&agent)] {
+        for v in [setup(&agent)] {
             let TransactionEnvelope::Tx(envelope) = read(&v.transaction_xdr).unwrap() else {
                 panic!()
             };
@@ -1259,86 +1075,5 @@ mod tests {
             }
             assert!(under_the_setup_key > 0);
         }
-    }
-    #[test]
-    fn a_fee_account_is_set_up_on_every_network_and_a_wallet_account_on_testnet_only() {
-        let agent = agent(2);
-        let account = fee_key(&agent).account();
-        let server = engine();
-        let terms = FeeAccountTerms {
-            account: &account,
-            agent: &agent,
-            engine: &server,
-            request_id: "fee-account-0001",
-            network: "stellar:pubnet",
-            fee_per_operation: 100,
-        };
-        prepare_fee_account_setup(&owner_state(), &terms, 1).unwrap();
-        let mut native = self::terms(&account, &agent, &server);
-        native.network = "stellar:pubnet";
-        assert!(prepare_native_setup(&owner_state(), &native, 1).is_err());
-    }
-    #[test]
-    fn the_owner_alone_refills_withdraws_from_and_closes_a_fee_account() {
-        let agent = agent(2);
-        let v = fee_setup(&agent);
-        let server = engine();
-        let roles = WalletRoles {
-            wallet: &v.wallet,
-            owner: &v.owner,
-            agent: &agent,
-            engine: &server,
-        };
-        let owner = owner_state();
-        let mut state = created(&v);
-        let run = |state: &AccountState, action: WalletAction| {
-            prepare_wallet_action(
-                &owner,
-                state,
-                roles,
-                &action,
-                &Asset::Native,
-                NETWORK,
-                100,
-                5,
-            )
-        };
-        let operations = |packet: &owner_intent::OwnerTransaction| {
-            let TransactionEnvelope::Tx(envelope) = read(&packet.transaction_xdr).unwrap() else {
-                panic!()
-            };
-            // The owner's account is the source and pays; one owner signature authorizes it.
-            assert_eq!(envelope.tx.source_account, muxed(&v.owner).unwrap());
-            assert!(envelope.signatures.is_empty());
-            owner_intent::validate_retained_owner_transaction(packet).unwrap();
-            envelope.tx.operations.to_vec()
-        };
-        let refill = run(&state, WalletAction::Fund { units: 9 }).unwrap();
-        let [payment] = operations(&refill).try_into().unwrap();
-        let OperationBody::Payment(body) = &payment.body else {
-            panic!()
-        };
-        assert_eq!(payment.source_account, None);
-        assert_eq!(body.destination, muxed(&v.wallet).unwrap());
-        let returned = run(&state, WalletAction::ReturnFees { units: 7 }).unwrap();
-        assert_eq!(returned.action, RETURN_FEES);
-        let [payment] = operations(&returned).try_into().unwrap();
-        let OperationBody::Payment(body) = &payment.body else {
-            panic!()
-        };
-        assert_eq!(payment.source_account, Some(muxed(&v.wallet).unwrap()));
-        assert_eq!(body.destination, muxed(&v.owner).unwrap());
-        assert_eq!((body.amount, &body.asset), (7, &Asset::Native));
-        assert!(run(&state, WalletAction::ReturnFees { units: 0 }).is_err());
-        let close = run(&state, WalletAction::Close { token_balance: 0 }).unwrap();
-        let closing = operations(&close);
-        for operation in &closing {
-            apply(&mut state, operation);
-        }
-        assert!(state.signers.is_empty());
-        let OperationBody::AccountMerge(destination) = &closing.last().unwrap().body else {
-            panic!()
-        };
-        assert_eq!(*destination, muxed(&v.owner).unwrap());
     }
 }

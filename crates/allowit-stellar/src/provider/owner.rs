@@ -70,8 +70,6 @@ impl OwnerProvider for Owner {
                 "Selected wallet executable exceeds its native limit",
             ));
         }
-        // The deployment creates and funds the account that sends the agent's operations.
-        // The agent holds a key and no account. The workflow makes that account.
         let p = workflow::deployment_policy(
             policy,
             cx.signer.address(),

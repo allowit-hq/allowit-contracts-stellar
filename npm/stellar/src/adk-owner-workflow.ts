@@ -271,12 +271,7 @@ export async function deployAdkOwnerDraft({
     let installed: string | undefined;
     // Upload, creation and a lifetime renewal each take one step before the installation reply.
     for (let index = 0; index < 4; index++) {
-      const reply = await ask<Reply>('native/deploy/prepare', {policyId, agent}).catch(error => {
-        // A new policy wallet needs a fee account, which the owner's client makes. This workflow makes none.
-        if ((error as {code?: unknown})?.code === 'fee_account_required')
-          throw new Error('This wallet needs a fee account, which this workflow does not create. Deploy it with the owner workflow of the app or with the allowit CLI.', {cause: error});
-        throw error;
-      });
+      const reply = await ask<Reply>('native/deploy/prepare', {policyId, agent});
       if (reply.policyId !== policyId) throw new Error('The deployment reply names a different policy.');
       if (reply.installed === true && reply.installation?.wallet === expectedWallet) {
         installed = expectedWallet;

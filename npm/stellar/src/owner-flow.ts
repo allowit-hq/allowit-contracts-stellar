@@ -7,7 +7,6 @@
 import {Keypair} from '@stellar/stellar-sdk/base';
 import {canonicalNetwork} from './plugin.js';
 import {expiredRecord as chainExpiredRecord, horizonGet} from './chain-record.js';
-import {countersignCreation, CREATE_FEE_ACCOUNT, FEE_ACCOUNT_REQUIRED, newFeeAccountKey} from './fee-account.js';
 import {APPROVE_POLICY, SET_UP_WALLET, WALLET_SETUP_REQUIRED, WalletSetupPendingError, approvalStep, nativeApprovalHolds, nativeSetupOf, policyApproval, setUpNativeWallet, type ReviewedPolicy} from './native-wallet.js';
 
 /** Rail-neutral owner step. `payload` is opaque text that only this package signs and reads. */
@@ -353,51 +352,20 @@ async function accountOnLedger(network: string, account: string): Promise<boolea
   }
 }
 
-/**
- * The fee account whose creation this journal signed for this policy and agent, and whether the journal saw that
- * creation confirmed, or undefined. The account can hold
- * the owner's XLM, so a marker is never dropped for other inputs: another funding amount keeps the account, and a
- * marker of another policy or agent, or one that cannot be read, is refused before anything is prepared.
- */
-function savedFeeAccount(journal: OwnerJournal, key: string, identity: {policyId: string; agent: string}): {account: string; created: boolean} | undefined {
-  const raw = journal.get(key);
-  if (raw === null) return undefined;
-  let value: unknown;
-  try {
-    value = JSON.parse(raw);
-  } catch { /* refused below */ }
-  // The server and the rail check the address.
-  if (!object(value) || typeof value.feeAccount !== 'string' || !/^G[A-Z2-7]{55}$/.test(value.feeAccount)
-    || value.policyId !== identity.policyId || value.agent !== identity.agent) throw changed({...identity, amount: ''});
-  return {account: value.feeAccount, created: value.created === true};
-}
-
 async function run({network, ask, sign, journal, key, policyId, agent, amount, reviewed, onStep, historyPauseMs = 1_500}: InstallAndFundInput): Promise<{wallet: string; receipts: OwnerReceipt[]}> {
   if (!canonicalNetwork(network)) throw new OwnerFlowError('Select a supported Stellar network.', null, false);
-  const fundedKey = `${key}:funded`, feeAccountKey = `${key}:fee-account`;
+  const fundedKey = `${key}:funded`;
   const identity: Identity = {policyId, agent, amount};
   const {receipts, settleSaved, signAndSubmit} = stepper({network, historyPauseMs, ask, sign, journal, key, policyId, onStep, identity,
-    // A confirmed funding is recorded before its signed bytes leave the journal. So is a confirmed creation of
-    // the fee account: from then on the account exists, and nothing ever replaces it.
+    // A confirmed funding is recorded before its signed bytes leave the journal.
     confirmed: step => {
       if (step.action === 'fund') journal.set(fundedKey, JSON.stringify(identity));
-      const named = step.action === CREATE_FEE_ACCOUNT ? savedFeeAccount(journal, feeAccountKey, {policyId, agent}) : undefined;
-      if (named) journal.set(feeAccountKey, JSON.stringify({feeAccount: named.account, policyId, agent, created: true}));
     }});
   // A saved step or a funded marker of other inputs is refused before anything is sent.
   saved(journal, key, identity);
   funded(journal, fundedKey, identity);
   await settleSaved();
   let wallet: string | undefined;
-  // The setup key of the fee account is random and lives in this call only. It signs the creation once. The
-  // journal keeps the address of an account whose creation was signed, never a key: after a reload the saved
-  // signed step settles first, and the workflow names that account again.
-  let feeKey: Keypair | undefined;
-  const named = savedFeeAccount(journal, feeAccountKey, {policyId, agent});
-  let feeAccount = named?.account;
-  // True once this journal saw the creation confirmed on the network.
-  let created = named?.created ?? false;
-  let replaced = false;
   // True once this run set up the wallet account of a Native policy: the deployment then names the wallet.
   let nativeSetUp = false;
   const walletSetupKey = `${key}:wallet-setup`;
@@ -441,12 +409,12 @@ async function run({network, ask, sign, journal, key, policyId, agent, amount, r
     receipts.push({policyId, action: APPROVE_POLICY, status: 'confirmed', transactionHash: ''});
   };
 
-  // A deployment takes at most the fee account, the code upload, the wallet creation and a lifetime renewal.
-  for (let i = 0; i < 5 && !wallet; i++) {
+  // A deployment takes at most the code upload, the wallet creation and a lifetime renewal.
+  for (let i = 0; i < 4 && !wallet; i++) {
     onStep('Preparing the wallet…');
     let reply: Prepared;
     try {
-      reply = await ask<Prepared>('native/deploy/prepare', {policyId, agent, ...(feeAccount ? {setup: {feeAccount}} : {})});
+      reply = await ask<Prepared>('native/deploy/prepare', {policyId, agent});
     } catch (error) {
       const {code, details} = (object(error) ? error : {}) as {code?: unknown; details?: unknown};
       // A Native policy needs the wallet account of its agent. This workflow sets the account up from the
@@ -457,18 +425,7 @@ async function run({network, ask, sign, journal, key, policyId, agent, amount, r
         i--;
         continue;
       }
-      // A new policy wallet needs a fee account: this workflow makes its key, and the deployment creates and
-      // funds the account. The agent holds a key and no account.
-      // Boundary: a journal without a saved address names no account. That is the state of a new deployment,
-      // and also of one that an earlier release (or another browser) took past its fee account and not to its
-      // wallet. Neither the journal nor the ledger says which existing account no wallet uses, so this workflow
-      // never adopts one: it makes a new account. An account of such an earlier run stays under the owner's key
-      // alone, and the owner closes it; Horizon lists it under `accounts?signer=<owner>`.
-      if (code !== FEE_ACCOUNT_REQUIRED || feeAccount) throw error;
-      feeKey = newFeeAccountKey();
-      feeAccount = feeKey.publicKey();
-      i--;
-      continue;
+      throw error;
     }
     if (!object(reply) || reply.policyId !== policyId) throw new OwnerFlowError('The deployment reply names a different policy.', null, false);
     wallet = installedWallet(reply);
@@ -485,43 +442,8 @@ async function run({network, ask, sign, journal, key, policyId, agent, amount, r
     if (wallet) break;
     const step = stepOf(reply.step);
     if (!step) throw new OwnerFlowError('The service did not prepare an owner step for this policy.', null, false);
-    if (step.action === CREATE_FEE_ACCOUNT) {
-      const setupKey = feeKey;
-      if (!setupKey || setupKey.publicKey() !== feeAccount) {
-        // This page holds no key for the account of this step. The ledger decides what that means. A saved
-        // account that the ledger holds is created already: the service's step is stale, and the account stays.
-        // Only an account that the ledger does not hold is replaced: its signed creation never applied, or
-        // none was signed, so nothing holds funds. The workflow then makes a new key and names its account.
-        if (replaced) throw new OwnerFlowError('The service prepared a fee account that this workflow did not name.', null, false);
-        if (feeAccount) {
-          const held = created ? true : await accountOnLedger(network, feeAccount);
-          if (held === true) throw new OwnerFlowError('The service prepared the creation of a fee account that the network already holds. Nothing was signed; resume in a moment.', null, true);
-          if (held === null) throw new OwnerFlowError('The fee account of this deployment could not be checked on the network. Nothing was signed; resume to check again.', null, true);
-        }
-        replaced = true;
-        journal.remove(feeAccountKey);
-        feeKey = newFeeAccountKey();
-        feeAccount = feeKey.publicKey();
-        i--;
-        continue;
-      }
-      const account = feeAccount;
-      // The new account's own key signs its creation once, beside the owner. The address enters the journal with
-      // the signed bytes; the key is dropped.
-      feeKey = undefined;
-      await signAndSubmit(step, signedPayload => {
-        try {
-          const signed = countersignCreation(network, step, signedPayload, setupKey);
-          journal.set(feeAccountKey, JSON.stringify({feeAccount: account, policyId, agent}));
-          return signed;
-        } catch (cause) {
-          throw new OwnerFlowError(cause instanceof Error ? cause.message : 'The fee account step could not be signed.', null, false, cause);
-        }
-      });
-      created = true;
-    } else await signAndSubmit(step);
+    await signAndSubmit(step);
   }
-  if (wallet) journal.remove(feeAccountKey);
   if (!wallet) throw new OwnerFlowError('The wallet installation could not be confirmed.', null, true);
   // A confirmed funding is never prepared or signed again, including after a reload or a failed export.
   if (!funded(journal, fundedKey, identity)) {

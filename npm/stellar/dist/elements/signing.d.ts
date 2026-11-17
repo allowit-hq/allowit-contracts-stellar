@@ -1,12 +1,4 @@
 import { type Data } from './base.js';
-/**
- * What the creation of a fee account does, read from the transaction itself: the new account and the XLM that the
- * owner's account sends to it. Null when the first operation creates no account.
- */
-export declare function feeAccountCreation(payload: string, network: string): Promise<{
-    account: string;
-    funding: string;
-} | null>;
 /** The owner step that the server prepared. `payload` is a base64 transaction envelope; `hash` is its transaction hash. */
 export interface OwnerStep {
     action: string;

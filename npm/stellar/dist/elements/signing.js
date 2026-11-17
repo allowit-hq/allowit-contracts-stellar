@@ -1,25 +1,9 @@
 import { canonicalNetwork, networkPassphrase, strkey } from '../plugin.js';
 import { base, emit, expiry, h } from './base.js';
 import { link } from './display.js';
-import { CREATE_FEE_ACCOUNT } from '../fee-account.js';
 import { APPROVE_POLICY, SET_UP_WALLET, WALLET_FEE_FLOAT, WALLET_RESERVE, approvalMessage, nativeSetupOf, policyApproval } from '../native-wallet.js';
 /** XLM text of stroops, without trailing zeros. */
 const xlm = (units) => `${units / 10000000n}${units % 10000000n ? `.${(units % 10000000n).toString().padStart(7, '0').replace(/0+$/, '')}` : ''} XLM`;
-/**
- * What the creation of a fee account does, read from the transaction itself: the new account and the XLM that the
- * owner's account sends to it. Null when the first operation creates no account.
- */
-export async function feeAccountCreation(payload, network) {
-    try {
-        const { TransactionBuilder } = await import('@stellar/stellar-sdk/base');
-        const tx = TransactionBuilder.fromXDR(payload, networkPassphrase(network));
-        const first = 'innerTransaction' in tx ? undefined : tx.operations[0];
-        return first?.type === 'createAccount' ? { account: first.destination, funding: `${first.startingBalance.replace(/\.?0+$/, '')} XLM` } : null;
-    }
-    catch {
-        return null;
-    }
-}
 const failure = (error, code) => ({ code: String(error?.code ?? code), message: error instanceof Error ? error.message : String(error) });
 const hex = (bytes) => Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
 export function ownerStep(value) {
@@ -178,15 +162,6 @@ export function ownerSignElement() {
             rows.push(h('dt', {}, 'Transaction'), h('dd', {}, link(id, 'tx', step.hash, `${step.hash.slice(0, 8)}…`)));
             rows.push(h('dt', {}, 'Expires'), h('dd', {}, expiry(step.expiresAt)));
             const list = h('dl', { class: 'owner-step' }, ...rows);
-            if (step.action === CREATE_FEE_ACCOUNT) {
-                // The owner reads what this step funds before the wallet opens: the account that pays the agent's
-                // network fees, and the XLM that it starts with.
-                void feeAccountCreation(step.payload, id).then(created => {
-                    if (!created || !list.isConnected)
-                        return;
-                    list.append(h('dt', {}, 'Fee account'), h('dd', {}, link(id, 'address', created.account, created.account)), h('dt', {}, 'You fund it with'), h('dd', {}, `${created.funding}: its reserve and the float that pays your agent's network fees. Only you can take it back.`));
-                });
-            }
             const status = h('p', { class: 'status', role: 'status' });
             const sign = button('Sign in wallet', async () => {
                 sign.disabled = true;
