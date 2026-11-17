@@ -102,7 +102,10 @@ the roles `{owner, agent, server}`. The workflow then:
 
 So a Native deployment takes two owner signatures: the setup, which also funds the wallet, and the approval. No
 funding step follows. `updateParams` on a Native wallet is one `approve_policy` signature and no transaction: the
-account holds no values, so the service answers the change with the approval message of the new values.
+account holds no values, so the service answers the change with the approval message of the new values. The host
+passes `installed: {wallet, source, rules, params}`, the policy that the owner reviewed. The workflow signs only an
+approval of that policy with the changed params replaced; any other wallet, source, rule or value is refused before
+a signature.
 
 ## Build and test
 

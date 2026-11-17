@@ -209,9 +209,12 @@ const approval = (extra = {}) => {
   return {payload, message: `AllowIt Native policy approval v1\n${JSON.stringify(sorted)}`};
 };
 
+/** What the owner reviewed of the installed policy of `wallet`: the approval's source and rules, the old value. */
+const installedOf = wallet => ({wallet, source: approval().payload.source, rules: ['payment_limit'], params: {payment_limit: {Int: '1'}}});
+
 test('only the exact approval message of this network is read, and its step carries the message unchanged', () => {
   const {payload, message} = approval();
-  assert.deepEqual(policyApproval(message, network), {policyId: 'policy-1', revision: 2, network, wallet: payload.wallet, source: payload.source, sourceHash: payload.sourceHash, paramsHash: payload.paramsHash, params: payload.params});
+  assert.deepEqual(policyApproval(message, network), {policyId: 'policy-1', revision: 2, network, wallet: payload.wallet, source: payload.source, sourceHash: payload.sourceHash, paramsHash: payload.paramsHash, params: payload.params, rules: payload.rules});
   const step = approvalStep(message, 1_000_000);
   assert.deepEqual([step.action, step.hash, step.expiresAt], [APPROVE_POLICY, messageDigest(message), 1300]);
   assert.equal(approvalMessage(step), message);
@@ -317,7 +320,7 @@ test('a value change of a Native wallet is one approval signature and no transac
     if (path === 'native/owner/submit') return {policyId: 'policy-1', action: 'update_params', status: 'confirmed'};
     throw new Error(path);
   };
-  const input = {network, historyPauseMs: 0, ask, sign: ownerSigns(signed), journal, key: 'change', policyId: 'policy-1', params: {payment_limit: {Int: '5'}}, onStep() {}};
+  const input = {network, historyPauseMs: 0, ask, sign: ownerSigns(signed), journal, key: 'change', policyId: 'policy-1', params: {payment_limit: {Int: '5'}}, installed: installedOf(setup.wallet), onStep() {}};
   const result = await updateParams(input);
   assert.deepEqual([result.done, result.receipts.map(r => r.action), signed], [true, ['update_params'], [APPROVE_POLICY]]);
   assert.equal(chain.posted.length, 1);
@@ -379,7 +382,7 @@ test('a Native value change signs only the requested values, keeps its signed ap
   globalThis.fetch = fetch;
   const setup = await setUpNativeWallet({network, ...roles, amount: '0', sign: ownerSigns([]), onStep() {}, journal: journalOf(), key: 'k', fetch});
   const params = {payment_limit: {Int: '5'}};
-  const base = {network, historyPauseMs: 0, sign: ownerSigns(signed), policyId: 'policy-1', params, onStep() {}};
+  const base = {network, historyPauseMs: 0, sign: ownerSigns(signed), policyId: 'policy-1', params, installed: installedOf(setup.wallet), onStep() {}};
   // Other values than the requested ones are never signed.
   const other = approval({wallet: setup.wallet, params: {payment_limit: {Int: '999'}}}).message;
   await assert.rejects(updateParams({...base, journal: journalOf(), key: 'a', ask: async path => path === 'native/owner/prepare' ? {policyId: 'policy-1', approval: {message: other}} : {}}),
@@ -466,7 +469,7 @@ test('a saved approval that the service no longer holds is prepared again and se
     if (path === 'native/owner/submit') {submitted.push(body); return answers.shift()();}
     throw new Error(path);
   };
-  const base = {network, historyPauseMs: 0, sign: ownerSigns(signed), policyId: 'policy-1', params: {payment_limit: {Int: '5'}}, onStep() {}, journal, key: 'u', ask};
+  const base = {network, historyPauseMs: 0, sign: ownerSigns(signed), policyId: 'policy-1', params: {payment_limit: {Int: '5'}}, installed: installedOf(setup.wallet), onStep() {}, journal, key: 'u', ask};
   await assert.rejects(updateParams(base), /reply lost/);
   const done = await updateParams(base);
   assert.deepEqual([done.done, prepares, signed.length, submitted.length], [true, 2, 1, 3]);
@@ -501,4 +504,25 @@ test('a setup signed by another account than the owner is refused before it is s
   const setup = await setUpNativeWallet({network, ...roles, amount: '5', sign: ownerSigns([]), onStep() {}, journal, key: 'k', fetch});
   assert.equal(chain.posted.length, 1);
   assert.ok(setup.wallet);
+});
+
+test('a Native change signs only the reviewed policy with the requested value: no other source, value or rule', async () => {
+  const {fetch} = ledger(), signed = [];
+  globalThis.fetch = fetch;
+  const setup = await setUpNativeWallet({network, ...roles, amount: '0', sign: ownerSigns([]), onStep() {}, journal: journalOf(), key: 'k', fetch});
+  const params = {payment_limit: {Int: '5'}}, installed = installedOf(setup.wallet);
+  const attempt = (message, extra = {}) => updateParams({network, historyPauseMs: 0, sign: ownerSigns(signed), journal: journalOf(), key: 'x', policyId: 'policy-1', params, installed, onStep() {},
+    ask: async path => path === 'native/owner/prepare' ? {policyId: 'policy-1', approval: {message}} : {policyId: 'policy-1', action: 'update_params', status: 'confirmed'}, ...extra});
+  const unconditional = 'use allowit::prelude::*;\npub fn execute(_: &AllowitContext) -> allowit::Result { Ok(()) }\n';
+  for (const [name, message] of Object.entries({
+    'another source': approval({wallet: setup.wallet, source: unconditional, sourceHash: hex(sha(unconditional))}).message,
+    'another value beside the requested one': approval({wallet: setup.wallet, params: {daily_spending_limit: {Int: '999999999'}, payment_limit: {Int: '5'}}}).message,
+    'other rules': approval({wallet: setup.wallet, rules: []}).message,
+    'another wallet': approval({wallet: Keypair.random().publicKey()}).message,
+  })) await assert.rejects(attempt(message), /another policy or other values/, name);
+  await assert.rejects(attempt(approval({wallet: setup.wallet}).message, {installed: undefined}), /reviewed is missing/);
+  assert.equal(signed.length, 0);
+  // The reviewed policy with exactly the requested value is signed once.
+  const done = await attempt(approval({wallet: setup.wallet}).message);
+  assert.deepEqual([done.done, signed.length], [true, 1]);
 });

@@ -551,7 +551,7 @@ export async function updateParams(input) {
         running.delete(name);
     }
 }
-async function runUpdate({ network, ask, sign, journal, key, policyId, params, expectedRevision, onStep, historyPauseMs = 1_500 }) {
+async function runUpdate({ network, ask, sign, journal, key, policyId, params, expectedRevision, installed, onStep, historyPauseMs = 1_500 }) {
     if (!canonicalNetwork(network))
         throw new OwnerFlowError('Select a supported Stellar network.', null, false);
     if (!object(params) || Object.keys(params).length === 0 || Object.keys(params).length > 32)
@@ -633,9 +633,13 @@ async function runUpdate({ network, ask, sign, journal, key, policyId, params, e
         const fields = policyApproval(message, network);
         if (!fields || fields.policyId !== policyId)
             throw new OwnerFlowError('The approval differs from this change. Nothing was signed.', null, false);
-        // The owner signs only the values of this change: each changed param holds exactly its requested value.
-        if (Object.entries(params).some(([name, value]) => !(name in fields.params) || canonical(fields.params[name]) !== canonical(value)))
-            throw new OwnerFlowError('The approval names other values than this change. Nothing was signed.', null, false);
+        // The owner signs only the reviewed policy with this change: the same wallet, source and rules, each changed
+        // param at exactly its requested value, and every other value as it is installed.
+        if (!installed || !object(installed.params))
+            throw new OwnerFlowError('The installed policy that you reviewed is missing. Nothing was signed.', null, false);
+        if (fields.wallet !== installed.wallet || fields.source !== installed.source || canonical(fields.rules) !== canonical(installed.rules)
+            || canonical(fields.params) !== canonical({ ...installed.params, ...params }))
+            throw new OwnerFlowError('The approval names another policy or other values than this change. Nothing was signed.', null, false);
         const signer = await walletOwner(network, fields.wallet, 'Nothing was signed; try again.');
         onStep('Sign the approval of the new values in your wallet…');
         const signature = signatureBytes(await sign(approvalStep(message)));

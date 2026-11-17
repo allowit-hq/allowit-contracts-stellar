@@ -351,13 +351,13 @@ export function policyApproval(message, network) {
     }
     if (!object(value) || canonical(value) !== text)
         return null;
-    const { policyId, revision, wallet, source, sourceHash, paramsHash, params } = value;
+    const { policyId, revision, wallet, source, sourceHash, paramsHash, params, rules } = value;
     if (value.version !== 1 || value.route !== 'native' || value.network !== id || typeof policyId !== 'string' || !policyId || policyId.length > 128
         || !Number.isSafeInteger(revision) || revision <= 0 || typeof wallet !== 'string' || !StrKey.isValidEd25519PublicKey(wallet)
         || typeof source !== 'string' || typeof sourceHash !== 'string' || hex(digest(source)) !== sourceHash
         || typeof paramsHash !== 'string' || !object(params) || hex(digest(canonical(params))) !== paramsHash)
         return null;
-    return { policyId, revision: revision, network: id, wallet, source, sourceHash, paramsHash, params };
+    return { policyId, revision: revision, network: id, wallet, source, sourceHash, paramsHash, params, rules };
 }
 /** The step that asks the owner's wallet to approve a policy. It signs the message and moves nothing. */
 export function approvalStep(message, now = Date.now()) {

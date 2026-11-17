@@ -98,6 +98,17 @@ export interface UpdateParamsInput {
     params: Record<string, unknown>;
     /** The configuration revision that the owner reviewed, when the host shows one. */
     expectedRevision?: number;
+    /**
+     * What the owner reviewed of the installed policy: its wallet, its exact source, its ordered rules and every value.
+     * A Native wallet's change is an approval of the whole policy, so the owner signs it only when it is exactly this
+     * policy with the changed params replaced. Required for a Native wallet.
+     */
+    installed?: {
+        wallet: string;
+        source: string;
+        rules: unknown;
+        params: Record<string, unknown>;
+    };
     onStep: (text: string) => void;
 }
 /**
