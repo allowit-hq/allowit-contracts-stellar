@@ -151,6 +151,35 @@ fn a_funded_setup_is_one_owner_transaction_and_binds_its_amount() {
     );
     assert_eq!(signer.calls.load(Ordering::SeqCst), again);
     assert!(request(0).validate().is_err());
+    // The ceiling of a request is the most that the setup transaction can carry.
+    use crate::provider::runtime::owner::MAX_SETUP_FUNDING;
+    assert!(request(MAX_SETUP_FUNDING).validate().is_ok());
+    assert!(request(MAX_SETUP_FUNDING + 1).validate().is_err());
+    let at_ceiling = crate::owner::prepare_native_setup(
+        &crate::AccountState {
+            address: c.owner.clone(),
+            sequence: 41,
+            master_weight: 1,
+            low_threshold: 0,
+            medium_threshold: 0,
+            high_threshold: 0,
+            signers: vec![],
+        },
+        &crate::owner::SetupTerms {
+            wallet: &crate::account_for_seed(&[21; 32]),
+            agent: &c.agent,
+            engine: &c.server,
+            request_id: "setup-ceiling-001",
+            network: &c.network,
+            fee_per_operation: 100,
+            starting_balance: Some(
+                crate::owner::default_starting_balance(false) + MAX_SETUP_FUNDING,
+            ),
+            trustline: None,
+        },
+        now,
+    );
+    assert!(at_ceiling.is_ok(), "{at_ceiling:?}");
 }
 /// The setup key of a wallet account is random and lives in one run. A request that settled
 /// reports its wallet again and signs nothing. A request that stopped before its signature

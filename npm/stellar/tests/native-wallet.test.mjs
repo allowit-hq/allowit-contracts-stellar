@@ -196,11 +196,15 @@ test('a retained setup names the same wallet again until its caller drops it', a
   assert.equal(nativeSetupOf(state.posted[0], network).startingBalance, WALLET_RESERVE + WALLET_FEE_FLOAT);
 });
 
+const canonicalJson = value => Array.isArray(value) ? `[${value.map(canonicalJson).join(',')}]`
+  : value && typeof value === 'object' ? `{${Object.keys(value).sort().map(k => `${JSON.stringify(k)}:${canonicalJson(value[k])}`).join(',')}}` : JSON.stringify(value);
 const approval = (extra = {}) => {
   const source = 'use allowit::prelude::*;\n// "5 € per day"\n';
   const payload = {asset: 'C', assetIssuer: null, assetSymbol: 'XLM', irHash: '', language: 'portable', maxFeeStroops: 100000, moduleDigest: '00', network,
-    params: {payment_limit: {Int: '5'}}, paramsHash: 'ab'.repeat(32), policyId: 'policy-1', policyInstance: '07'.repeat(32), revision: 2, route: 'native',
+    params: {payment_limit: {Int: '5'}}, policyId: 'policy-1', policyInstance: '07'.repeat(32), revision: 2, route: 'native',
     rules: ['payment_limit'], source, sourceHash: hex(sha(source)), tier: 'standard', version: 1, wallet: Keypair.random().publicKey(), ...extra};
+  // The values' hash is the SHA-256 of their canonical JSON, unless a test states another one.
+  if (!('paramsHash' in extra) && payload.params && typeof payload.params === 'object') payload.paramsHash = hex(sha(canonicalJson(payload.params)));
   const sorted = Object.fromEntries(Object.keys(payload).sort().map(key => [key, payload[key]]));
   return {payload, message: `AllowIt Native policy approval v1\n${JSON.stringify(sorted)}`};
 };
@@ -224,6 +228,7 @@ test('only the exact approval message of this network is read, and its step carr
     'a wallet that is no account': approval({wallet: 'CWALLET'}).message,
     'no JSON': 'AllowIt Native policy approval v1\nhello',
     'no params': approval({params: null}).message,
+    'values whose hash differs from the stated hash': approval({params: {payment_limit: {Int: '999'}}, paramsHash: approval().payload.paramsHash}).message,
   })) assert.equal(policyApproval(text, network), null, name);
   assert.equal(policyApproval(message, 'stellar:other'), null);
   assert.equal(policyApproval(null, network), null);

@@ -328,7 +328,7 @@ const APPROVAL_TITLE = 'AllowIt Native policy approval v1';
 /**
  * Reads the exact text of a policy approval of `network`: its title line, then the canonical JSON of the approval.
  * Any other text is null: another title, a text that is not the canonical form of its own content, another
- * network or route, or a source whose hash differs from the hash that the message states.
+ * network or route, or a source or values whose hash differs from the hash that the message states.
  */
 export function policyApproval(message, network) {
     const id = canonicalNetwork(network);
@@ -351,7 +351,7 @@ export function policyApproval(message, network) {
     if (value.version !== 1 || value.route !== 'native' || value.network !== id || typeof policyId !== 'string' || !policyId || policyId.length > 128
         || !Number.isSafeInteger(revision) || revision <= 0 || typeof wallet !== 'string' || !StrKey.isValidEd25519PublicKey(wallet)
         || typeof source !== 'string' || typeof sourceHash !== 'string' || hex(digest(source)) !== sourceHash
-        || typeof paramsHash !== 'string' || !/^[0-9a-f]{64}$/.test(paramsHash) || !object(params))
+        || typeof paramsHash !== 'string' || !object(params) || hex(digest(canonical(params))) !== paramsHash)
         return null;
     return { policyId, revision: revision, network: id, wallet, source, sourceHash, paramsHash, params };
 }

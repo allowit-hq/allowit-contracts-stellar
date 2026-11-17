@@ -38,15 +38,16 @@ pub const FEE_FLOAT_STROOPS: i64 = 5_000_000;
 /// fees of the agent's operations on the policy wallet. The owner refills it.
 pub const FEE_ACCOUNT_FLOAT_STROOPS: i64 = 50_000_000;
 const SIGNERS: i64 = 3;
-const MAX_STARTING_BALANCE: i64 = 1_000_000_000_000_000;
+/// The most that one setup sends to a new account, in stroops.
+pub const MAX_STARTING_BALANCE: i64 = 1_000_000_000_000_000;
 
 /// The balance that the network locks in a wallet account: the account, its three signers and
 /// its trustline.
-pub fn wallet_reserve(trustline: bool) -> i64 {
-    (2 + SIGNERS + i64::from(trustline)) * BASE_RESERVE_STROOPS
+pub const fn wallet_reserve(trustline: bool) -> i64 {
+    (2 + SIGNERS + trustline as i64) * BASE_RESERVE_STROOPS
 }
 /// The starting balance of a wallet when the owner names none: the reserve and the fee float.
-pub fn default_starting_balance(trustline: bool) -> i64 {
+pub const fn default_starting_balance(trustline: bool) -> i64 {
     wallet_reserve(trustline) + FEE_FLOAT_STROOPS
 }
 

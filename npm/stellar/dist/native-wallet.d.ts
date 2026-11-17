@@ -141,7 +141,7 @@ export interface PolicyApproval {
 /**
  * Reads the exact text of a policy approval of `network`: its title line, then the canonical JSON of the approval.
  * Any other text is null: another title, a text that is not the canonical form of its own content, another
- * network or route, or a source whose hash differs from the hash that the message states.
+ * network or route, or a source or values whose hash differs from the hash that the message states.
  */
 export declare function policyApproval(message: unknown, network: string): PolicyApproval | null;
 /** The step that asks the owner's wallet to approve a policy. It signs the message and moves nothing. */

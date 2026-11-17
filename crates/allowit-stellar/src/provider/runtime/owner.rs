@@ -14,8 +14,10 @@ pub struct SetupRequest {
     /// transaction. `None` funds the reserve and the float only.
     pub funding: Option<i64>,
 }
-/// The most that one setup funds, in stroops.
-pub const MAX_SETUP_FUNDING: i64 = 100_000_000_000_000_000;
+/// The most that one setup funds, in stroops: the transaction's ceiling on the starting balance,
+/// less the reserve and the fee float that the starting balance also holds.
+pub const MAX_SETUP_FUNDING: i64 =
+    native::owner::MAX_STARTING_BALANCE - native::owner::default_starting_balance(false);
 impl SetupRequest {
     pub fn validate(&self) -> Result<()> {
         if self.network != "stellar:testnet" {
