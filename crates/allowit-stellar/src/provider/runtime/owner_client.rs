@@ -715,11 +715,7 @@ fn validate_generated(
             &d.source_hash,
             &d.params_hash,
         )?;
-        if b.route != "native"
-            || b.tier.is_some()
-            || !shape.canonical_only
-            || b.module_digest != identity
-        {
+        if b.route != "native" || b.tier.is_some() || b.module_digest != identity {
             return Err(Error::uncertain("Returned native policy identity differs"));
         }
     } else {

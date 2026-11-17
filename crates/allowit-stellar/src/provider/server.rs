@@ -988,6 +988,12 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 "Authorization differs from selected installation",
             ));
         }
+        // A classic account has no server authorization entry: the server admits the
+        // operation here, with its evaluator, and signs the transaction at execution.
+        if c.route == WalletRoute::Native {
+            checked(native::admit_classic(&p, s.identity(), now, e))?;
+            return self.packet(&p);
+        }
         self.packet(&checked(native::authorize_server_using(
             &p,
             s.identity(),
