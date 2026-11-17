@@ -366,27 +366,29 @@ export function policyApproval(message, network) {
         return null;
     return { policyId, revision: revision, network: id, wallet, source, sourceHash, paramsHash, params, rules, fields: value };
 }
-/** The fields of an approval that the server derives for its own records. A Native wallet enforces none of them. */
-const SERVER_DIGESTS = new Set(['irHash', 'moduleDigest']);
+/**
+ * The fields of an approval that the server derives for its own records: its digests of the source and the name of
+ * its installation. A Native wallet enforces none of them.
+ */
+const SERVER_FIELDS = new Set(['irHash', 'moduleDigest', 'policyInstance']);
 /**
  * Whether a policy approval of `wallet` is exactly what the owner reviewed. Every field that the wallet signs is
  * checked: the policy and its revision come from the service; the source, rules, values and tier must be the
- * reviewed ones; the network, wallet, route, policy instance, asset and fee ceiling must be the wallet account's
- * own configuration, as its setup made it. Only the server's digests of the source are left to the server. Any
- * other field, or any other value, is refused.
+ * reviewed ones; the network, wallet, route, asset and fee ceiling must be the wallet account's own configuration,
+ * as its setup made it. The server's digests of the source and the name of its installation are left to the server.
+ * Any other field, or any other value, is refused.
  */
 export function nativeApprovalHolds(approval, wallet, reviewed) {
     const own = walletFacts(approval.network, wallet);
     const expected = {
         version: 1, policyId: approval.policyId, revision: approval.revision, network: approval.network, wallet, route: 'native',
-        policyInstance: hex(own.policyInstance), asset: own.asset, assetSymbol: own.assetSymbol, assetIssuer: own.assetIssuer,
-        maxFeeStroops: own.maxFeeStroops,
+        asset: own.asset, assetSymbol: own.assetSymbol, assetIssuer: own.assetIssuer, maxFeeStroops: own.maxFeeStroops,
         source: reviewed.source, sourceHash: hex(digest(reviewed.source)), params: reviewed.params,
         rules: reviewed.rules === undefined ? approval.fields.rules : reviewed.rules,
         paramsHash: hex(digest(canonical(reviewed.params))), language: approval.fields.language,
         tier: reviewed.tier === undefined ? approval.fields.tier : reviewed.tier,
     };
-    const keys = Object.keys(approval.fields).filter(key => !SERVER_DIGESTS.has(key));
+    const keys = Object.keys(approval.fields).filter(key => !SERVER_FIELDS.has(key));
     return keys.length === Object.keys(expected).length && keys.every(key => key in expected && canonical(approval.fields[key]) === canonical(expected[key]))
         && typeof approval.fields.language === 'string' && /^[a-z0-9-]{1,64}$/.test(approval.fields.language);
 }

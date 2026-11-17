@@ -571,7 +571,6 @@ test('a Native change refuses an approval that changes the wallet configuration 
   for (const [name, change] of Object.entries({
     'a raised fee ceiling': {maxFeeStroops: 10_000_000},
     'another asset': {asset: Asset.native().contractId(Networks.PUBLIC)},
-    'another policy instance': {policyInstance: 'ab'.repeat(32)},
     'an added field': {zfeePayer: 'server'},
   })) {
     const {message} = approval({wallet: setup.wallet, ...change});

@@ -161,9 +161,9 @@ export interface ReviewedPolicy {
 /**
  * Whether a policy approval of `wallet` is exactly what the owner reviewed. Every field that the wallet signs is
  * checked: the policy and its revision come from the service; the source, rules, values and tier must be the
- * reviewed ones; the network, wallet, route, policy instance, asset and fee ceiling must be the wallet account's
- * own configuration, as its setup made it. Only the server's digests of the source are left to the server. Any
- * other field, or any other value, is refused.
+ * reviewed ones; the network, wallet, route, asset and fee ceiling must be the wallet account's own configuration,
+ * as its setup made it. The server's digests of the source and the name of its installation are left to the server.
+ * Any other field, or any other value, is refused.
  */
 export declare function nativeApprovalHolds(approval: PolicyApproval, wallet: string, reviewed: ReviewedPolicy): boolean;
 /** The step that asks the owner's wallet to approve a policy. It signs the message and moves nothing. */

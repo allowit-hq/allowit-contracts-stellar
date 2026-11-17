@@ -100,8 +100,8 @@ the roles `{owner, agent, server}`. The workflow then:
    source and the values, and compares them with `data.expected` when the host passes `{policyId, wallet, sourceHash,
    paramsHash}`. The host passes `reviewed: {source, params}`, and `rules` and `tier` when it shows them: the policy that the owner reviewed. The
    workflow signs only an approval that states exactly that policy and the wallet account's own configuration (its
-   network, route, policy instance, asset and fee ceiling); only the server's digests `irHash` and `moduleDigest` are
-   left to the server, and a Native wallet enforces neither. It keeps the signature only when the owner's account
+   network, route, asset and fee ceiling). The server's digests `irHash` and `moduleDigest` and the name of its
+   installation, `policyInstance`, are left to the server; a Native wallet enforces none of them. It keeps the signature only when the owner's account
    made it, and confirms the approval with `micro/allocation/confirm`.
 
 So a Native deployment takes two owner signatures: the setup, which also funds the wallet, and the approval. No
