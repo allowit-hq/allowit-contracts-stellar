@@ -1647,7 +1647,6 @@ mod public_bundle_tests {
             wallet: f["intent"]["owner"].as_str().unwrap().into(),
             owner: f["intent"]["owner"].as_str().unwrap().into(),
             agent: sdk::account_for_seed(&[2; 32]),
-            fee_account: None,
             server: sdk::account_for_seed(&[3; 32]),
             route: WalletRoute::Native,
             tier: None,
@@ -1913,7 +1912,7 @@ impl Bundle {
             let live = checked(sdk::rpc::trusted_state_for_discovery(rpc, c, None))?;
             if live.paused
                 || live.state.owner != c.owner
-                || live.state.agent != c.agent_account()
+                || live.state.agent != c.agent
                 || live.state.server != c.server
                 || live.state.policy_instance != c.policy_instance
                 || live.state.module_digest != c.module_digest

@@ -312,7 +312,7 @@ impl OwnerLedger {
                     policy_state,
                     contract_version: native::CONTRACT_VERSION,
                     owner: c.owner.clone(),
-                    agent: c.agent_account().into(),
+                    agent: c.agent.clone(),
                     server: c.server.clone(),
                     asset: c.asset.clone(),
                     policy_instance: c.policy_instance,

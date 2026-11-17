@@ -4,10 +4,8 @@
  * The host supplies its authenticated transport, the signing of one step and a journal. This module holds the rules
  * for a saved signed step and for the typed replies of the service.
  */
-import type {Keypair} from '@stellar/stellar-sdk/base';
-import {canonicalNetwork} from './plugin.js';
-import {expiredRecord as chainExpiredRecord, horizonGet} from './chain-record.js';
-import {countersignCreation, CREATE_FEE_ACCOUNT, derivationStep, FEE_ACCOUNT_REQUIRED, feeAccountKey} from './fee-account.js';
+import {TransactionBuilder} from '@stellar/stellar-sdk/base';
+import {canonicalNetwork, networkPassphrase} from './plugin.js';
 
 /** Rail-neutral owner step. `payload` is opaque text that only this package signs and reads. */
 export interface OwnerStep {action: string; payload: string; hash: string; expiresAt: number; explorer?: string | null}
@@ -75,6 +73,22 @@ export function ownerArchiveKey(key: string, hash: string): string {
   return `${key}:expired:${hash}`;
 }
 
+const HORIZON: Readonly<Record<string, string>> = {
+  'stellar:testnet': 'https://horizon-testnet.stellar.org',
+  'stellar:pubnet': 'https://horizon.stellar.org',
+};
+/** Every Horizon read ends after this time, so a stalled read never holds the workflow lock. */
+const HORIZON_TIMEOUT_MS = 15_000;
+/** A read of the public ledger history. A failed or stalled read is null. */
+async function horizonGet(network: string, path: string): Promise<Response | null> {
+  const base = HORIZON[canonicalNetwork(network) ?? ''];
+  if (!base) return null;
+  try {
+    return await fetch(`${base}${path}`, {headers: {Accept: 'application/json'}, signal: AbortSignal.timeout(HORIZON_TIMEOUT_MS)});
+  } catch {
+    return null;
+  }
+}
 const unverified = () => new OwnerFlowError('The network record of the signed step could not be checked. It stays saved; resume to check it again.', null, true);
 /**
  * The ledger in which the chain holds this transaction as successful. The service's word alone never clears a
@@ -96,10 +110,53 @@ const unchecked = () => new OwnerFlowError('The expired signed step could not be
 
 /**
  * What the chain holds for a signed step past its time bound: its ledger when it applied, or null when it can
- * never apply. `chain-record.ts` holds the rule. A chain that cannot be read keeps the step saved.
+ * never apply. Expiry stops a later application, not an earlier one, so an expiry reply alone proves nothing.
+ * The time bound is the maximum time of the signed transaction itself; a transaction without one never expires.
+ * The step never applied only when Horizon has read past the time bound and either holds the failed transaction or
+ * holds none while the source account sequence is still below the transaction's sequence. Anything else throws.
  */
-const expiredRecord = (network: string, step: OwnerStep, signedPayload: string): Promise<{ledger: number} | null> =>
-  chainExpiredRecord(network, step.hash, signedPayload).catch(() => {throw unchecked();});
+async function expiredRecord(network: string, step: OwnerStep, signedPayload: string): Promise<{ledger: number} | null> {
+  let source: string, sequence: bigint, validUntil: number;
+  try {
+    const envelope = TransactionBuilder.fromXDR(signedPayload, networkPassphrase(network));
+    const transaction = 'innerTransaction' in envelope ? envelope.innerTransaction : envelope;
+    if (Array.from(transaction.hash(), byte => byte.toString(16).padStart(2, '0')).join('') !== step.hash) throw new Error();
+    source = transaction.source;
+    sequence = BigInt(transaction.sequence);
+    // The signed bytes decide when the transaction can no longer apply. The step metadata is unsigned.
+    const maxTime = transaction.timeBounds?.maxTime;
+    if (typeof maxTime !== 'string' || !/^[1-9][0-9]{0,11}$/.test(maxTime)) throw new Error();
+    validUntil = Number(maxTime);
+  } catch {
+    throw unchecked();
+  }
+  const read = async (path: string) => {
+    const response = await horizonGet(network, path);
+    if (!response) throw unchecked();
+    return response;
+  };
+  const json = async (response: Response): Promise<Record<string, unknown>> => {
+    const value: unknown = await response.json().catch(() => null);
+    if (!response.ok || !object(value)) throw unchecked();
+    return value;
+  };
+  const root = await json(await read('/'));
+  const closedAt = typeof root.history_latest_ledger_closed_at === 'string' ? Date.parse(root.history_latest_ledger_closed_at) / 1000 : NaN;
+  // Every ledger that can include the transaction closes at or before its signed time bound. The clock and Horizon
+  // must both be past it.
+  if (!(Date.now() / 1000 > validUntil) || !(closedAt > validUntil)) throw unchecked();
+  const found = await read(`/transactions/${step.hash}`);
+  if (found.status !== 404) {
+    const chain = await json(found);
+    if (chain.hash !== step.hash || typeof chain.successful !== 'boolean' || !Number.isSafeInteger(chain.ledger) || (chain.ledger as number) <= 0) throw unchecked();
+    return chain.successful ? {ledger: chain.ledger as number} : null;
+  }
+  // A missing record alone proves nothing. A source sequence below the transaction's sequence proves it never applied.
+  const account = await json(await read(`/accounts/${source}`));
+  if (account.account_id !== source || typeof account.sequence !== 'string' || !/^[0-9]{1,19}$/.test(account.sequence)
+    || BigInt(account.sequence) >= sequence) throw unchecked();
+  return null;
+}
 
 /** Workflows that run in this page, by journal key. */
 const running = new Set<string>();
@@ -255,13 +312,11 @@ function stepper({network, historyPauseMs, ask, sign, journal, key, policyId, on
       if (!await submit(pending.step, pending.signedPayload)) onStep('The saved step can never apply. Preparing a new one…');
     }
   };
-  /** `complete` adds what the step needs beside the owner's signature, before the bytes enter the journal. */
-  const signAndSubmit = async (step: OwnerStep, complete?: (signedPayload: string) => string) => {
+  const signAndSubmit = async (step: OwnerStep) => {
     if (step.expiresAt <= Math.floor(Date.now() / 1000)) throw new OwnerFlowError('The prepared owner step already expired. Resume to prepare a new one.', null, true);
     onStep(`Sign ${step.action.replace(/_/g, ' ')} in your wallet…`);
-    const ownerSigned = await sign(step);
-    if (typeof ownerSigned !== 'string' || !ownerSigned) throw new OwnerFlowError('Your wallet did not return the signed step.', null, false);
-    const signedPayload = complete ? complete(ownerSigned) : ownerSigned;
+    const signedPayload = await sign(step);
+    if (typeof signedPayload !== 'string' || !signedPayload) throw new OwnerFlowError('Your wallet did not return the signed step.', null, false);
     journal.set(key, JSON.stringify({step, signedPayload, ...identity}));
     onStep('Waiting for the network to confirm…');
     if (!await submit(step, signedPayload)) throw new OwnerFlowError('The network did not take the signed step. Resume to prepare a new one.', null, true);
@@ -281,49 +336,15 @@ async function run({network, ask, sign, journal, key, policyId, agent, amount, o
   funded(journal, fundedKey, identity);
   await settleSaved();
   let wallet: string | undefined;
-  // The one-time key of the fee account. It lives in this call only and is never stored: after a reload the
-  // owner's wallet signs the same message again and derives the same key.
-  let feeKey: Keypair | undefined;
-  // A deployment takes at most the fee account, the code upload, the wallet creation and a lifetime renewal.
-  for (let i = 0; i < 5 && !wallet; i++) {
+  for (let i = 0; i < 4 && !wallet; i++) {
     onStep('Preparing the wallet…');
-    let reply: Prepared;
-    try {
-      reply = await ask<Prepared>('native/deploy/prepare', {policyId, agent, ...(feeKey ? {setup: {feeAccount: feeKey.publicKey()}} : {})});
-    } catch (error) {
-      const {code, details} = (object(error) ? error : {}) as {code?: unknown; details?: unknown};
-      const policyWallet = object(details) ? details.wallet : undefined;
-      // A new policy wallet needs a fee account: the owner's key derives it for that wallet, and the
-      // deployment creates and funds it. The agent holds a key and no account.
-      if (code !== FEE_ACCOUNT_REQUIRED || feeKey || typeof policyWallet !== 'string') throw error;
-      onStep('Sign the fee account key message in your wallet…');
-      let signature: Uint8Array;
-      try {
-        signature = Uint8Array.from(atob(await sign(derivationStep(network, agent, policyWallet))), c => c.charCodeAt(0));
-        feeKey = feeAccountKey(signature);
-      } catch (cause) {
-        throw new OwnerFlowError(cause instanceof Error && cause.message ? cause.message : 'The fee account key could not be derived.', null, true, cause);
-      }
-      i--;
-      continue;
-    }
+    const reply = await ask<Prepared>('native/deploy/prepare', {policyId, agent});
     if (!object(reply) || reply.policyId !== policyId) throw new OwnerFlowError('The deployment reply names a different policy.', null, false);
     wallet = installedWallet(reply);
     if (wallet) break;
     const step = stepOf(reply.step);
     if (!step) throw new OwnerFlowError('The service did not prepare an owner step for this policy.', null, false);
-    if (step.action === CREATE_FEE_ACCOUNT) {
-      // The new account's own key signs its creation once, beside the owner.
-      const key = feeKey;
-      if (!key) throw new OwnerFlowError('The service prepared a fee account that this owner did not derive.', null, false);
-      await signAndSubmit(step, signedPayload => {
-        try {
-          return countersignCreation(network, step, signedPayload, key);
-        } catch (cause) {
-          throw new OwnerFlowError(cause instanceof Error ? cause.message : 'The fee account step could not be signed.', null, false, cause);
-        }
-      });
-    } else await signAndSubmit(step);
+    await signAndSubmit(step);
   }
   if (!wallet) throw new OwnerFlowError('The wallet installation could not be confirmed.', null, true);
   // A confirmed funding is never prepared or signed again, including after a reload or a failed export.

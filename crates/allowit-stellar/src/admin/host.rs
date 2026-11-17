@@ -36,8 +36,6 @@ impl PolicyInstallation {
             )?,
             owner: self.owner.clone(),
             agent: self.agent.clone(),
-            // The owner's client derives the fee account and names it before the creation.
-            fee_account: None,
             server: self.server.clone(),
             route: WalletRoute::PolicyWallet,
             tier: Some(self.tier),

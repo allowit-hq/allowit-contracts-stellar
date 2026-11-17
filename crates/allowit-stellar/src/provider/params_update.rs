@@ -135,7 +135,7 @@ pub fn installed(rpc: &dyn rpc::Rpc, c: &WalletConfig, update: &ParamsUpdate) ->
         || state.source_digest != c.source_digest
         || state.rules != c.rules
         || state.owner != c.owner
-        || state.agent != c.agent_account()
+        || state.agent != c.agent
         || state.server != c.server
         || state.asset != c.asset
         || state.policy_instance != c.policy_instance
@@ -303,8 +303,7 @@ pub fn verify(rpc: &dyn rpc::Rpc, policy_id: &str, c: &WalletConfig) -> Result<V
             json!(bound.then_some(kind).flatten()),
         ),
         Comparison::new("owner", json!(c.owner), json!(state.owner)),
-        // The wallet's agent address: the fee account of the installation when it has one.
-        Comparison::new("agent", json!(c.agent_account()), json!(state.agent)),
+        Comparison::new("agent", json!(c.agent), json!(state.agent)),
         Comparison::new("server", json!(c.server), json!(state.server)),
         Comparison::new("asset", json!(c.asset), json!(state.asset)),
         Comparison::new(

@@ -273,8 +273,6 @@ pub fn deployment_policy(
         ))?,
         owner: owner.into(),
         agent: agent.into(),
-        // `with_fee_account` names the account that the owner's key derives.
-        fee_account: None,
         server: server.into(),
         route: WalletRoute::PolicyWallet,
         tier: Some(tier),
@@ -322,7 +320,6 @@ pub fn native_policy(
         wallet: b.wallet.clone(),
         owner: owner.into(),
         agent: agent.into(),
-        fee_account: None,
         server: server.into(),
         route: WalletRoute::Native,
         tier: None,
@@ -340,48 +337,6 @@ pub fn native_policy(
     };
     checked(native::validate_config(&config))?;
     Ok(OwnerPolicy { policy, config })
-}
-/// The index of the first fee account of a policy wallet. The derivation message names it.
-pub const FEE_ACCOUNT_INDEX: u32 = 0;
-/// The one-time key of the fee account of a policy wallet: the owner signs the derivation
-/// message, which names the network, the agent and the wallet, and the signature is the seed.
-/// The key signs the creation of its account once and then has no authority.
-fn derive_fee_account_key(
-    signer: &dyn OwnerSigner,
-    c: &WalletConfig,
-) -> Result<native::owner::WalletKey> {
-    let digest = checked(native::owner::fee_account_derivation_digest(
-        &c.network,
-        &c.agent,
-        &c.wallet,
-        FEE_ACCOUNT_INDEX,
-    ))?;
-    let signature = checked(signer.sign_hash(&digest))?;
-    checked(native::signing::verify_digest(
-        signer.account(),
-        &digest,
-        &signature,
-    ))?;
-    Ok(native::owner::WalletKey::from_signature(&signature))
-}
-/// The deployment selection with its fee account: the account that the owner's deployment
-/// creates and funds, which sends the agent's operations on the wallet and pays their fees.
-/// The owner's key derives its address, so the same owner computes it again.
-pub fn with_fee_account(
-    mut selection: OwnerPolicy,
-    signer: &dyn OwnerSigner,
-) -> Result<OwnerPolicy> {
-    if selection.config.route != WalletRoute::PolicyWallet
-        || signer.account() != selection.config.owner
-    {
-        return Err(Error::usage(
-            "The owner of a policy wallet derives its fee account",
-        ));
-    }
-    selection.config.fee_account =
-        Some(derive_fee_account_key(signer, &selection.config)?.account());
-    checked(native::validate_config(&selection.config))?;
-    Ok(selection)
 }
 /// Convert a positive decimal asset amount to exact seven-decimal base units without floating point.
 pub fn amount_units(amount: &str) -> Result<i128> {
@@ -428,16 +383,6 @@ fn expected(record: &Record, step: &RetainedStep) -> Result<ExpectedOwnerIntent>
     let action = match (&record.work, step.packet.action.as_str()) {
         (Work::Deploy, "upload_wasm") => OwnerAction::UploadWasm {
             wasm_hash: c.module_digest,
-        },
-        (Work::Deploy, native::owner::CREATE_FEE_ACCOUNT) => OwnerAction::FeeAccountSetup {
-            state: step.source.clone(),
-            account: c
-                .fee_account
-                .clone()
-                .ok_or_else(|| Error::config("This deployment selects no fee account to create"))?,
-            agent: c.agent.clone(),
-            engine: c.server.clone(),
-            request_id: native::owner::fee_account_request_id(&c.policy_instance),
         },
         (Work::Deploy, "create_wallet") => OwnerAction::CreateWallet {
             config: Box::new(c.clone()),
@@ -539,31 +484,6 @@ fn verify_retained(record: &Record, step: &RetainedStep) -> Result<()> {
         &expected(record, step)?,
         step.validated_at,
     ))?;
-    if step.packet.action == native::owner::CREATE_FEE_ACCOUNT {
-        // The creation of a fee account carries two signatures: the owner's, which is
-        // retained, and the one signature of the new account's own key.
-        checked(owner_intent::validate_signed_owner_transaction(
-            &packet(&step.packet)?,
-            signed,
-        ))?;
-        let owner_only = checked(proof.sign_with(step.validated_at, |_| Ok(signature)))?;
-        let (
-            stellar_xdr::TransactionEnvelope::Tx(owner_only),
-            stellar_xdr::TransactionEnvelope::Tx(both),
-        ) = (
-            checked(native::read::<stellar_xdr::TransactionEnvelope>(
-                &owner_only,
-            ))?,
-            checked(native::read::<stellar_xdr::TransactionEnvelope>(signed))?,
-        )
-        else {
-            return Err(Error::config("Retained signed owner bytes changed"));
-        };
-        if both.signatures.first() != owner_only.signatures.first() {
-            return Err(Error::config("Retained signed owner bytes changed"));
-        }
-        return Ok(());
-    }
     let exact = checked(proof.sign_with(step.validated_at, |_| Ok(signature)))?;
     if exact != *signed {
         return Err(Error::config("Retained signed owner bytes changed"));
@@ -931,9 +851,7 @@ impl OwnerClient {
         }
         store.save(id, &record)?;
         network(rpc, &selection.config.network)?;
-        // A deployment takes at most the fee account, the code upload, the wallet creation and
-        // a lifetime renewal, then the read that shows the installed wallet.
-        for _ in 0..5 {
+        for _ in 0..4 {
             if record.complete {
                 break;
             }
@@ -955,18 +873,9 @@ impl OwnerClient {
                     step: Option<Step>,
                 }
                 let (path, body) = match &record.work {
-                    // The owner's client names the fee account that its key derives. The
-                    // server adds it to the installation of the new wallet.
                     Work::Deploy => (
                         "/api/native/deploy/prepare",
-                        match &selection.config.fee_account {
-                            Some(fee_account) => json!({"policyId":selection.policy.id,
-                                "agent":selection.config.agent,
-                                "setup":{"feeAccount":fee_account}}),
-                            None => {
-                                json!({"policyId":selection.policy.id,"agent":selection.config.agent})
-                            }
-                        },
+                        json!({"policyId":selection.policy.id,"agent":selection.config.agent}),
                     ),
                     Work::Fund { amount, .. } => (
                         "/api/native/owner/prepare",
@@ -1097,19 +1006,11 @@ impl OwnerClient {
                     now,
                 ))?;
                 let mut signature = None;
-                let sign = |digest: &[u8; 32]| {
+                let signed = checked(proof.sign_with(clock()?, |digest| {
                     let result = signer.sign_hash(digest)?;
                     signature = Some(result.to_vec());
                     Ok(result)
-                };
-                let signed = if step.packet.action == native::owner::CREATE_FEE_ACCOUNT {
-                    // The new account's own key signs its creation once. The owner's key
-                    // derives it again here; it is never stored.
-                    let key = derive_fee_account_key(signer, &selection.config)?;
-                    checked(proof.sign_with_wallet_key(clock()?, sign, &key))?
-                } else {
-                    checked(proof.sign_with(clock()?, sign))?
-                };
+                }))?;
                 record.steps[index].signed_xdr = Some(signed);
                 record.steps[index].signature = signature;
                 store.save(id, &record)?;
@@ -1301,18 +1202,9 @@ impl OwnerClient {
             return Ok(());
         }
         let live = checked(rpc::trusted_state_for_discovery(rpc, c, None))?;
-        // The wallet's agent address is the fee account of the selection, and that account
-        // holds exactly its roles, with or without the agent signer.
-        if c.fee_account.is_some() {
-            checked(
-                live.state
-                    .source
-                    .wallet_status(&c.owner, &c.agent, &c.server),
-            )?;
-        }
         if live.paused
             || live.state.owner != c.owner
-            || live.state.agent != c.agent_account()
+            || live.state.agent != c.agent
             || live.state.server != c.server
             || live.state.policy_instance != c.policy_instance
             || live.state.module_digest != c.module_digest

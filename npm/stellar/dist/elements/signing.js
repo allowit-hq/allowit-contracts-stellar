@@ -1,22 +1,6 @@
 import { canonicalNetwork, networkPassphrase, strkey } from '../plugin.js';
 import { base, emit, expiry, h } from './base.js';
 import { link } from './display.js';
-import { CREATE_FEE_ACCOUNT, DERIVE_FEE_ACCOUNT_KEY, feeAccountDerivation, messageDigest } from '../fee-account.js';
-/**
- * What the creation of a fee account does, read from the transaction itself: the new account and the XLM that the
- * owner's account sends to it. Null when the first operation creates no account.
- */
-export async function feeAccountCreation(payload, network) {
-    try {
-        const { TransactionBuilder } = await import('@stellar/stellar-sdk/base');
-        const tx = TransactionBuilder.fromXDR(payload, networkPassphrase(network));
-        const first = 'innerTransaction' in tx ? undefined : tx.operations[0];
-        return first?.type === 'createAccount' ? { account: first.destination, funding: `${first.startingBalance.replace(/\.?0+$/, '')} XLM` } : null;
-    }
-    catch {
-        return null;
-    }
-}
 const failure = (error, code) => ({ code: String(error?.code ?? code), message: error instanceof Error ? error.message : String(error) });
 const hex = (bytes) => Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
 export function ownerStep(value) {
@@ -118,60 +102,8 @@ export function ownerSignElement() {
                 return;
             }
             const rows = summary.flatMap(row => [h('dt', {}, String(row.label ?? '')), h('dd', {}, String(row.value ?? ''))]);
-            const cancel = button('Cancel', () => emit(this, 'allowit-cancel'));
-            if (step.action === DERIVE_FEE_ACCOUNT_KEY) {
-                // This step signs a message, never a transaction: the signature derives the one-time key of the fee
-                // account. Only the exact derivation message of this network is signed, and the owner reads what it names.
-                let message = null;
-                try {
-                    message = atob(step.payload);
-                }
-                catch { /* invalid below */ }
-                const fields = feeAccountDerivation(message, id);
-                if (message === null || !fields || messageDigest(message) !== step.hash) {
-                    this.replaceChildren(h('p', { class: 'invalid' }, 'This owner step is invalid.'));
-                    return;
-                }
-                const text = message;
-                rows.push(h('dt', {}, 'Fee account for agent'), h('dd', {}, link(id, 'address', fields.agent, fields.agent)));
-                rows.push(h('dt', {}, 'Fee account for wallet'), h('dd', {}, link(id, 'contract', fields.wallet, fields.wallet)));
-                rows.push(h('dt', {}, 'What you sign'), h('dd', {}, 'A message that derives the setup key of the fee account. It moves no funds.'));
-                const status = h('p', { class: 'status', role: 'status' });
-                const sign = button('Sign the message', async () => {
-                    sign.disabled = true;
-                    status.textContent = 'Waiting for the wallet…';
-                    try {
-                        if (step.expiresAt <= Date.now() / 1000)
-                            throw Object.assign(new Error('This owner step expired. Prepare it again.'), { code: 'expired' });
-                        const { connectWallet, signWalletMessage } = await import('./wallet.js');
-                        const owner = typeof data.owner === 'string' && strkey(data.owner) ? data.owner : await connectWallet(id);
-                        const signedPayload = await signWalletMessage(text, owner, id);
-                        status.textContent = 'Signed.';
-                        emit(this, 'allowit-signed', { signedPayload, hash: step.hash });
-                    }
-                    catch (error) {
-                        status.textContent = error instanceof Error ? error.message : String(error);
-                        emit(this, 'allowit-error', failure(error, 'sign'));
-                    }
-                    finally {
-                        sign.disabled = false;
-                    }
-                });
-                this.replaceChildren(h('dl', { class: 'owner-step' }, ...rows), h('div', { class: 'actions' }, sign, cancel), status);
-                return;
-            }
             rows.push(h('dt', {}, 'Transaction'), h('dd', {}, link(id, 'tx', step.hash, `${step.hash.slice(0, 8)}…`)));
             rows.push(h('dt', {}, 'Expires'), h('dd', {}, expiry(step.expiresAt)));
-            const list = h('dl', { class: 'owner-step' }, ...rows);
-            if (step.action === CREATE_FEE_ACCOUNT) {
-                // The owner reads what this step funds before the wallet opens: the account that pays the agent's
-                // network fees, and the XLM that it starts with.
-                void feeAccountCreation(step.payload, id).then(created => {
-                    if (!created || !list.isConnected)
-                        return;
-                    list.append(h('dt', {}, 'Fee account'), h('dd', {}, link(id, 'address', created.account, created.account)), h('dt', {}, 'You fund it with'), h('dd', {}, `${created.funding}: its reserve and the float that pays your agent's network fees. Only you can take it back.`));
-                });
-            }
             const status = h('p', { class: 'status', role: 'status' });
             const sign = button('Sign in wallet', async () => {
                 sign.disabled = true;
@@ -203,7 +135,8 @@ export function ownerSignElement() {
                     sign.disabled = false;
                 }
             });
-            this.replaceChildren(list, h('div', { class: 'actions' }, sign, cancel), status);
+            const cancel = button('Cancel', () => emit(this, 'allowit-cancel'));
+            this.replaceChildren(h('dl', { class: 'owner-step' }, ...rows), h('div', { class: 'actions' }, sign, cancel), status);
         }
     };
 }
