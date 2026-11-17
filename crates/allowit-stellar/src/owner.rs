@@ -1167,6 +1167,52 @@ mod tests {
             assert!(validate_native_setup(&changed).is_err());
         }
     }
+    /// The creation, the signers, the thresholds and the setup key's weight 0 are one
+    /// transaction, and the ledger applies a transaction whole or not at all. The owner's
+    /// client signs no other shape: a transaction that lacks any one operation of the setup is
+    /// refused before a signature. So no signed transaction creates a funded account whose
+    /// authority is still its setup key. The model below shows what each such transaction
+    /// would leave, which is why it is never signed.
+    #[test]
+    fn a_setup_that_lacks_any_one_operation_is_refused_before_a_signature() {
+        let agent = agent(2);
+        for v in [fee_setup(&agent), setup(&agent)] {
+            let TransactionEnvelope::Tx(envelope) = read(&v.transaction_xdr).unwrap() else {
+                panic!()
+            };
+            let whole = created(&v);
+            assert_eq!(whole.master_weight, 0);
+            assert!(weight_of(&whole, &[&v.owner]) >= whole.high_threshold);
+            assert!(weight_of(&whole, &[&v.wallet]) < whole.low_threshold);
+            let mut under_the_setup_key = 0;
+            for missing in 0..envelope.tx.operations.len() {
+                let mut tx = envelope.tx.clone();
+                let mut operations = tx.operations.to_vec();
+                operations.remove(missing);
+                tx.operations = operations.try_into().unwrap();
+                let mut changed = v.clone();
+                changed.transaction_hash = hex(&transaction_hash(NETWORK, &tx).unwrap());
+                changed.transaction_xdr = xdr(&TransactionEnvelope::Tx(TransactionV1Envelope {
+                    tx,
+                    signatures: Vec::new().try_into().unwrap(),
+                }))
+                .unwrap();
+                assert!(
+                    validate_native_setup(&changed).is_err(),
+                    "operation {missing}"
+                );
+                // What that transaction would leave: an account that its setup key still
+                // controls, or one that the owner does not fully control.
+                let partial = created(&changed);
+                if partial.master_weight > 0
+                    || weight_of(&partial, &[&v.owner]) < partial.high_threshold.max(1)
+                {
+                    under_the_setup_key += 1;
+                }
+            }
+            assert!(under_the_setup_key > 0);
+        }
+    }
     #[test]
     fn a_fee_account_is_set_up_on_every_network_and_a_wallet_account_on_testnet_only() {
         let agent = agent(2);

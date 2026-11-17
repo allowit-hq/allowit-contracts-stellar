@@ -324,6 +324,60 @@ fn a_fee_account_on_testnet_obeys_its_signers_weights_and_thresholds() {
     };
     assert!(code.contains("OpBadAuth"), "{code}");
     assert!(rpc::find_account(&rpc, &roles.wallet).unwrap().is_none());
+    // A setup that fails at any one of its operations leaves no account: the ledger applies a
+    // transaction whole or not at all. Each case carries both signatures and one operation
+    // that the ledger refuses. The owner pays the fee and holds everything else.
+    for failing in 0..4usize {
+        let owner_state = rpc::get_account(&rpc, &roles.owner).unwrap();
+        let before = balance(&rpc, &roles.owner);
+        let setup = owner::prepare_fee_account_setup(
+            &owner_state,
+            &owner::FeeAccountTerms {
+                account: &roles.wallet,
+                agent: &roles.agent,
+                engine: &roles.server,
+                request_id: &owner::fee_account_request_id(&hash(policy_wallet.as_bytes())),
+                network: NETWORK,
+                fee_per_operation: 100,
+            },
+            clock(),
+        )
+        .unwrap();
+        let x::TransactionEnvelope::Tx(envelope) = x::TransactionEnvelope::from_xdr_base64(
+            &owner::setup_transaction(&setup).unwrap().transaction_xdr,
+            x::Limits::none(),
+        )
+        .unwrap() else {
+            panic!()
+        };
+        let mut tx = envelope.tx;
+        let mut operations = tx.operations.to_vec();
+        assert_eq!(operations.len(), 4);
+        match &mut operations[failing].body {
+            // A starting balance below the reserve of an account.
+            x::OperationBody::CreateAccount(create) => create.starting_balance = 1,
+            // A signer that is the account's own key.
+            x::OperationBody::SetOptions(options) => {
+                options.signer = Some(x::Signer {
+                    key: x::SignerKey::Ed25519(x::Uint256(own.verifying_key().to_bytes())),
+                    weight: 1,
+                })
+            }
+            _ => panic!(),
+        }
+        tx.operations = operations.try_into().unwrap();
+        let label = format!("setup that fails at operation {} of 4", failing + 1);
+        let Outcome::Refused(code) = settle(&rpc, &label, &sign(&tx, &[&owner, &own])) else {
+            panic!("{label} must fail")
+        };
+        assert!(code.starts_with("TxFailed"), "{code}");
+        assert!(rpc::find_account(&rpc, &roles.wallet).unwrap().is_none());
+        let paid = before - balance(&rpc, &roles.owner);
+        assert!((0..=400).contains(&paid), "{paid}");
+        println!(
+            "  after it: no fee account exists; the owner paid {paid} stroops of fee and holds the rest"
+        );
+    }
     // The refused transaction used the owner's sequence, so the setup is prepared again.
     let owner_state = rpc::get_account(&rpc, &roles.owner).unwrap();
     let now = clock();
