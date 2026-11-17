@@ -3,26 +3,19 @@
  * network fees. The owner's deployment creates and funds it. It has the signers of a wallet account: the owner alone
  * reaches every threshold, and the agent key and the server pay from it only together. The agent holds no account.
  *
- * This module derives the account's one-time key from the owner's signature, reads the account from the public
- * ledger history and prepares the owner's refill. The server takes no part in the read or the refill.
+ * This module adds the one signature of the account's random setup key to its creation, reads the account from
+ * the public ledger history and prepares the owner's refill. The server takes no part in the read or the refill.
  */
 import { Account, Asset, Keypair, Operation, StrKey, TransactionBuilder } from '@stellar/stellar-sdk/base';
 import { sha256 } from '@noble/hashes/sha256';
-import { canonicalNetwork, networkPassphrase } from './plugin.js';
+import { networkPassphrase } from './plugin.js';
 import { expiredRecord, horizonGet, horizonOrigin } from './chain-record.js';
-/** The action of the step that signs the derivation message. Its payload is the base64 text of the message. */
-export const DERIVE_FEE_ACCOUNT_KEY = 'derive_fee_account_key';
 /** The action of the owner step that creates the fee account. */
 export const CREATE_FEE_ACCOUNT = 'create_fee_account';
 /** The action of the owner step that refills the fee account. */
 export const REFILL_FEES = 'refill_fees';
 /** The typed refusal of a wallet creation that names no fee account. `details.wallet` is the policy wallet. */
 export const FEE_ACCOUNT_REQUIRED = 'fee_account_required';
-/** The index of the first fee account of a policy wallet. */
-export const FEE_ACCOUNT_INDEX = 0;
-const TITLE = 'Allowit fee account key v1';
-const PURPOSE = "This signature derives the one-time setup key of the account that pays the network fees of this agent's policy wallet. It does not authorize spending or move funds.";
-const SEED_DOMAIN = new TextEncoder().encode('allowit-stellar-native-wallet-seed-v1');
 const BASE_RESERVE = 5000000n;
 /** The float of a new fee account, in stroops: what the owner's deployment funds above the reserve. */
 const FEE_FLOAT = 50000000n;
@@ -33,51 +26,11 @@ export function messageDigest(message) {
     return hex(sha256(new TextEncoder().encode(`Stellar Signed Message:\n${message}`)));
 }
 /**
- * The message whose owner signature derives the one-time key of a fee account. It names the network, the agent,
- * the policy wallet and an index, so each policy wallet of one owner gets its own account and the owner can
- * compute the address again.
+ * The setup key of a new fee account: random, held in memory by the caller and used once. Nothing stores, derives
+ * or recovers it. The creation sets its weight to 0 and makes the owner a signer that reaches every threshold alone.
  */
-export function feeAccountDerivationMessage(network, agent, wallet, index = FEE_ACCOUNT_INDEX) {
-    if (!StrKey.isValidEd25519PublicKey(agent))
-        throw new Error('The agent public key is invalid.');
-    if (!StrKey.isValidContract(wallet))
-        throw new Error('A fee account pays for a policy wallet contract.');
-    if (!Number.isSafeInteger(index) || index < 0 || index > 0xffff_ffff)
-        throw new Error('The fee account index is invalid.');
-    return `${TITLE}\nNetwork: ${networkPassphrase(network)}\nAgent: ${agent}\nPolicy wallet: ${wallet}\nFee account index: ${index}\n\n${PURPOSE}`;
-}
-/** The fields of a derivation message of `network`, or null for any other text. */
-export function feeAccountDerivation(message, network) {
-    if (typeof message !== 'string' || !canonicalNetwork(network))
-        return null;
-    const lines = message.split('\n');
-    if (lines.length !== 7 || lines[0] !== TITLE || lines[5] !== '' || lines[6] !== PURPOSE)
-        return null;
-    const value = (line, key) => line.startsWith(`${key}: `) ? line.slice(key.length + 2) : null;
-    const agent = value(lines[2], 'Agent'), wallet = value(lines[3], 'Policy wallet'), index = value(lines[4], 'Fee account index');
-    if (value(lines[1], 'Network') !== networkPassphrase(network) || agent === null || wallet === null || index === null
-        || !/^(0|[1-9][0-9]{0,9})$/.test(index))
-        return null;
-    try {
-        return feeAccountDerivationMessage(network, agent, wallet, Number(index)) === message ? { agent, wallet, index: Number(index) } : null;
-    }
-    catch {
-        return null;
-    }
-}
-/** The step that asks the owner's wallet for the derivation signature. It signs a message and moves nothing. */
-export function derivationStep(network, agent, wallet, now = Date.now()) {
-    const message = feeAccountDerivationMessage(network, agent, wallet);
-    return { action: DERIVE_FEE_ACCOUNT_KEY, payload: btoa(message), hash: messageDigest(message), expiresAt: Math.floor(now / 1000) + 300 };
-}
-/** The one-time key of a fee account, from the owner's 64-byte signature over the derivation message. */
-export function feeAccountKey(signature) {
-    if (signature.length !== 64)
-        throw new Error('The wallet did not return a message signature.');
-    const seed = new Uint8Array(SEED_DOMAIN.length + 64);
-    seed.set(SEED_DOMAIN);
-    seed.set(signature, SEED_DOMAIN.length);
-    return Keypair.fromRawEd25519Seed(sha256(seed));
+export function newFeeAccountKey() {
+    return Keypair.random();
 }
 /**
  * Adds the one signature of the new account's own key to the owner-signed creation of a fee account. The signed

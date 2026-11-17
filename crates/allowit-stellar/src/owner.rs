@@ -876,7 +876,7 @@ mod tests {
             .unwrap();
     }
     #[test]
-    fn the_derived_key_has_no_authority_after_setup() {
+    fn the_setup_key_has_no_authority_after_setup() {
         let agent = agent(2);
         let v = setup(&agent);
         let state = created(&v);

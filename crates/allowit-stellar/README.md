@@ -79,9 +79,11 @@ their network fees. The agent holds a key and no account.
 - **Configuration.** `WalletConfig::fee_account` (`feeAccount`) names it. `agent_account()` is the agent address of
   the wallet on the ledger. A wallet with a fee account takes no x402 authorization: the contract verifies that against
   the raw key of its agent address, and the key of a fee account signs nothing after setup.
-- **Derivation.** `owner::fee_account_derivation_message(network, agent, wallet, index)` is the message whose owner
-  signature derives the account's one-time key (`WalletKey::from_signature`). It names the network, the agent, the
-  policy wallet and an index, and its title differs from the title of a wallet account's message.
+- **Setup key.** `owner::WalletKey::random()` makes the account's one-time key in the memory of the owner's client.
+  The key signs the creation once and is dropped. Nothing stores, derives or recovers it: the creation transaction
+  sets its weight to 0 and makes the owner a signer that reaches every threshold alone. The deployment workflow
+  makes the key and names the account; a deployment that stopped before the creation was signed names a new account
+  on its next run, and one that signed it keeps the account from its retained bytes.
 - **Setup.** `owner::prepare_fee_account_setup` prepares one transaction from the owner's account: the creation with
   the reserve and the fee float (`fee_account_starting_balance`: 2.5 XLM and 5 XLM) and the three signer operations.
   The owner signs it and the account's own key signs it once. Its owner step has the action `create_fee_account`.

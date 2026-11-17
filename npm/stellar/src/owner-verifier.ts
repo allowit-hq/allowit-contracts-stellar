@@ -17,7 +17,7 @@ export interface AdkOwnerSelection {
   wasmHash: string;
   wallet?: string;
   /**
-   * The fee account that the owner's key derived for this wallet. With it the verifier admits the
+   * The fee account that the owner's client made for this wallet. With it the verifier admits the
    * `create_fee_account` step of exactly that account, and reconstructs the creation and every update with the fee
    * account as the wallet's agent address.
    */
@@ -44,7 +44,7 @@ type Verifier = {
 };
 
 const inputLimit = 512 * 1024;
-const verifierHash = '8dcf19e55a23a93eb27e2a4b8cb683d27249039df989e9fe643a5b9295186288';
+const verifierHash = '40a198602afe67ee499ef41efd9a009023a2f34d47e3ad224e9f38fae775193c';
 let verifier: Promise<Verifier> | undefined;
 
 async function loadVerifier(): Promise<Verifier> {

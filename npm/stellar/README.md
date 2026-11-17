@@ -36,12 +36,14 @@ and `network_unavailable` keep the step for a retry (`OwnerFlowError.retry`). A 
 the policy, agent key and amount; a resume with other inputs is refused.
 
 A new policy wallet has a fee account: the account that sends the agent's operations and pays their network fees.
-The server refuses a creation without one with `fee_account_required` and `details.wallet`. `installAndFund` then asks
-the host's `sign` for one message signature with the step action `derive_fee_account_key`: the `owner-sign` element
-shows the agent and the wallet, signs only the exact derivation message of the network and resolves with the
-signature. The workflow derives the account's one-time key from it, names the account to the server as
-`setup.feeAccount`, and adds the key's one signature to the owner-signed `create_fee_account` step before the bytes
-enter the journal. The key is never stored: after a reload the owner signs the same message again. The element shows
+The server refuses a creation without one with `fee_account_required`. `installAndFund` then makes the account's
+setup key at random in memory (`newFeeAccountKey`), names the account to the server as `setup.feeAccount`, and adds
+the key's one signature to the owner-signed `create_fee_account` step before the bytes enter the journal. The owner
+signs no message for it. The key is used once and dropped; nothing stores, derives or recovers it, because the
+creation sets its weight to 0 and makes the owner a signer that reaches every threshold alone. The journal keeps the
+address of an account whose creation was signed under `<key>:fee-account` until the wallet is installed, so a reload
+names the same account. When the service prepares the creation of a saved account again, its signed creation never
+applied and nothing holds funds: the workflow makes a new key and names its account. The element shows
 what a `create_fee_account` step funds: the account and the XLM that it starts with.
 
 With `expected.feeAccount` the owner verifier admits the `create_fee_account` step of exactly that account for the

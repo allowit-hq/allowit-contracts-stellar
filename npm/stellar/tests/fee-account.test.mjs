@@ -1,58 +1,25 @@
 import assert from 'node:assert/strict';
 import test, {beforeEach} from 'node:test';
-import {ed25519} from '@noble/curves/ed25519';
 import {Account, Asset, Keypair, Networks, Operation, StrKey, TransactionBuilder} from '@stellar/stellar-sdk/base';
+import * as feeAccountModule from '../dist/fee-account.js';
 import {
-  countersignCreation, CREATE_FEE_ACCOUNT, DERIVE_FEE_ACCOUNT_KEY, derivationStep, feeAccount, feeAccountDerivation,
-  feeAccountDerivationMessage, feeAccountKey, feeAccountOf, messageDigest, REFILL_FEES, refillFees, stroops, xlmText,
+  countersignCreation, CREATE_FEE_ACCOUNT, feeAccount, feeAccountOf, newFeeAccountKey, REFILL_FEES, refillFees, stroops, xlmText,
 } from '../dist/fee-account.js';
 import {installAndFund as flow, OwnerFlowError} from '../dist/owner-flow.js';
 
 const network = 'stellar:testnet';
-const hexBytes = text => Uint8Array.from(text.match(/../g), b => parseInt(b, 16));
-// The vector of the rail crate: the owner of seed 01…01, the agent of seed 02…02, the wallet contract 04…04.
 const OWNER_SEED = new Uint8Array(32).fill(1);
 const AGENT = 'GCATS5YOVB6ROX2WUNKGNQ2MP3GMXDMKSG2O4N5CLX3A6W4PZGZZI55U';
 const WALLET = 'CACAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAINCW';
-const MESSAGE = "Allowit fee account key v1\nNetwork: Test SDF Network ; September 2015\nAgent: GCATS5YOVB6ROX2WUNKGNQ2MP3GMXDMKSG2O4N5CLX3A6W4PZGZZI55U\nPolicy wallet: CACAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAINCW\nFee account index: 0\n\nThis signature derives the one-time setup key of the account that pays the network fees of this agent's policy wallet. It does not authorize spending or move funds.";
 const ACCOUNT = 'GD2YKHPRFRN2IO3WBQKAQ3YRDJYD5VH6CVIY6PME5GJ54UA6NP5KI2W7';
-const ownerSignature = message => ed25519.sign(hexBytes(messageDigest(message)), OWNER_SEED);
 /** The bytes of a decorated signature. XDR opaque values wrap their bytes in `value`. */
 const sig = s => { const v = typeof s.signature === 'function' ? s.signature() : s.signature; return Buffer.from(v instanceof Uint8Array ? v : v.value); };
 
-test('the derivation is the one of the rail crate: the same message, signature and account', () => {
-  assert.equal(feeAccountDerivationMessage(network, AGENT, WALLET), MESSAGE);
-  assert.equal(feeAccountKey(ownerSignature(MESSAGE)).publicKey(), ACCOUNT);
-  // Another network, agent, wallet, index or owner derives another account.
-  const other = Keypair.random().publicKey(), contract = StrKey.encodeContract(Buffer.alloc(32, 5));
-  const accounts = [
-    feeAccountDerivationMessage('stellar:pubnet', AGENT, WALLET),
-    feeAccountDerivationMessage(network, other, WALLET),
-    feeAccountDerivationMessage(network, AGENT, contract),
-    feeAccountDerivationMessage(network, AGENT, WALLET, 1),
-  ].map(message => feeAccountKey(ownerSignature(message)).publicKey());
-  accounts.push(feeAccountKey(ed25519.sign(hexBytes(messageDigest(MESSAGE)), new Uint8Array(32).fill(9))).publicKey());
-  assert.equal(new Set([...accounts, ACCOUNT]).size, 6);
-  // A fee account pays for a policy wallet contract, and its key needs a whole signature.
-  assert.throws(() => feeAccountDerivationMessage(network, AGENT, other));
-  assert.throws(() => feeAccountDerivationMessage(network, WALLET, WALLET));
-  assert.throws(() => feeAccountKey(new Uint8Array(63)));
-});
-
-test('only the exact derivation message of the network is a derivation message', () => {
-  assert.deepEqual(feeAccountDerivation(MESSAGE, network), {agent: AGENT, wallet: WALLET, index: 0});
-  for (const changed of [
-    MESSAGE.replace('It does not authorize spending or move funds.', 'It authorizes a transfer.'),
-    `${MESSAGE}\nextra`,
-    MESSAGE.replace('index: 0', 'index: 00'),
-    MESSAGE.replace('Allowit fee account key v1', 'Allowit Native wallet key v1'),
-    MESSAGE.replace(AGENT, WALLET),
-    '', null, 7,
-  ]) assert.equal(feeAccountDerivation(changed, network), null);
-  // The message of another network is no message of this one.
-  assert.equal(feeAccountDerivation(MESSAGE, 'stellar:pubnet'), null);
-  const step = derivationStep(network, AGENT, WALLET, 1_800_000_000_000);
-  assert.deepEqual(step, {action: DERIVE_FEE_ACCOUNT_KEY, payload: btoa(MESSAGE), hash: messageDigest(MESSAGE), expiresAt: 1_800_000_300});
+test('each setup key is new, and the package holds no way to derive or recover one', () => {
+  const a = newFeeAccountKey(), b = newFeeAccountKey();
+  assert.notEqual(a.publicKey(), b.publicKey());
+  assert.ok(StrKey.isValidEd25519PublicKey(a.publicKey()));
+  for (const name of Object.keys(feeAccountModule)) assert.ok(!/deriv|seed|recover/i.test(name), name);
 });
 
 /** The owner-signed creation of the fee account of `key`, as the wallet returns it. */
@@ -67,7 +34,7 @@ function creation(owner, key, sign = true) {
 }
 
 test('the new account signs its own creation once, and nothing else', () => {
-  const owner = Keypair.random(), key = feeAccountKey(ownerSignature(MESSAGE));
+  const owner = Keypair.random(), key = newFeeAccountKey();
   const {hash, payload} = creation(owner, key);
   const both = TransactionBuilder.fromXDR(countersignCreation(network, {hash}, payload, key), Networks.TESTNET);
   assert.equal(both.signatures.length, 2);
@@ -365,47 +332,92 @@ function service(owner) {
   return {ask, calls, state};
 }
 
-test('a deployment derives the fee account, creates and funds it, then creates and funds the wallet', async () => {
+/** The owner's wallet: it signs the creation of the fee account, and marks every other step. */
+const walletOf = (owner, signed = []) => async step => {
+  signed.push(step.action);
+  if (step.action !== CREATE_FEE_ACCOUNT) return `signed-${step.action}`;
+  const tx = TransactionBuilder.fromXDR(step.payload, Networks.TESTNET);
+  tx.sign(owner);
+  return tx.toXDR();
+};
+/** A journal that also keeps everything that was ever written to it. */
+function recordingJournal() {
+  const journal = journalOf(), written = [];
+  return {...journal, written, set: (k, v) => { written.push(String(v)); journal.set(k, v); }};
+}
+const SECRET = /S[A-Z2-7]{55}/;
+
+test('a deployment takes three owner signatures: the fee account, the wallet and the funding', async () => {
   const owner = Keypair.fromRawEd25519Seed(Buffer.from(OWNER_SEED));
   const {ask, calls, state} = service(owner);
-  const signed = [], journal = journalOf();
-  const sign = async step => {
-    signed.push(step.action);
-    if (step.action === DERIVE_FEE_ACCOUNT_KEY) {
-      // The owner's wallet signs the exact derivation message of this agent and wallet.
-      assert.deepEqual(feeAccountDerivation(atob(step.payload), network), {agent: AGENT, wallet: WALLET, index: 0});
-      return Buffer.from(ownerSignature(atob(step.payload))).toString('base64');
-    }
-    if (step.action === CREATE_FEE_ACCOUNT) {
-      const tx = TransactionBuilder.fromXDR(step.payload, Networks.TESTNET);
-      tx.sign(owner);
-      return tx.toXDR();
-    }
-    return `signed-${step.action}`;
-  };
-  const result = await flow({network, historyPauseMs: 0, ask, sign, journal, key, policyId, agent: AGENT, amount, onStep() {}});
+  const signed = [], journal = recordingJournal();
+  const result = await flow({network, historyPauseMs: 0, ask, sign: walletOf(owner, signed), journal, key, policyId, agent: AGENT, amount, onStep() {}});
   assert.equal(result.wallet, WALLET);
-  assert.deepEqual(signed, [DERIVE_FEE_ACCOUNT_KEY, CREATE_FEE_ACCOUNT, 'create_wallet', 'fund']);
+  // No message is signed: the setup key of the fee account is random and lives in the workflow.
+  assert.deepEqual(signed, [CREATE_FEE_ACCOUNT, 'create_wallet', 'fund']);
   assert.deepEqual(result.receipts.map(r => r.action), [CREATE_FEE_ACCOUNT, 'create_wallet', 'fund']);
-  // The fee account is the one that the owner's key derives, and every later preparation names it.
-  assert.equal(state.feeAccount, ACCOUNT);
+  // Every preparation after the refusal names the one account that the workflow made.
+  assert.ok(StrKey.isValidEd25519PublicKey(state.feeAccount));
   const prepares = calls.filter(([path]) => path === 'native/deploy/prepare').map(([, body]) => body.setup?.feeAccount ?? null);
-  assert.deepEqual(prepares, [null, ACCOUNT, ACCOUNT, ACCOUNT]);
-  // The journal held the bytes with both signatures before they were sent, and holds no key.
+  assert.deepEqual(prepares, [null, state.feeAccount, state.feeAccount, state.feeAccount]);
+  // The journal held the bytes with both signatures before they were sent. It never held a key, and it keeps
+  // nothing of the fee account once the wallet is installed.
   assert.equal(journal.get(key), null);
-  assert.ok(![...journal.map.values()].some(value => String(value).includes(owner.secret())));
+  assert.equal(journal.get(`${key}:fee-account`), null);
+  assert.ok(journal.written.some(value => value.includes(state.feeAccount)));
+  assert.ok(!journal.written.some(value => SECRET.test(value)));
 });
 
-test('a fee account that this owner did not derive, or another transaction, is never countersigned', async () => {
+test('a reload after the signed creation names the same account again and signs no second creation', async () => {
   const owner = Keypair.fromRawEd25519Seed(Buffer.from(OWNER_SEED));
-  const sign = async step => {
-    if (step.action === DERIVE_FEE_ACCOUNT_KEY) return Buffer.from(ownerSignature(atob(step.payload))).toString('base64');
-    const tx = TransactionBuilder.fromXDR(step.payload, Networks.TESTNET);
-    tx.sign(owner);
-    return tx.toXDR();
+  const {ask, state} = service(owner);
+  const journal = recordingJournal(), input = {network, historyPauseMs: 0, ask, journal, key, policyId, agent: AGENT, amount, onStep() {}};
+  // The owner signs the creation and closes the page at the wallet creation.
+  const first = [];
+  const closing = async step => {
+    if (step.action === 'create_wallet') throw new Error('The page closed.');
+    return walletOf(owner, first)(step);
   };
+  await assert.rejects(flow({...input, sign: closing}), /The page closed/);
+  assert.deepEqual(first, [CREATE_FEE_ACCOUNT]);
+  const account = state.feeAccount;
+  assert.equal(JSON.parse(journal.get(`${key}:fee-account`)).feeAccount, account);
+  // The new page holds no key. It names the saved account, and the owner signs the wallet and the funding.
+  const second = [];
+  const result = await flow({...input, sign: walletOf(owner, second)});
+  assert.equal(result.wallet, WALLET);
+  assert.deepEqual(second, ['create_wallet', 'fund']);
+  assert.equal(state.feeAccount, account);
+  assert.ok(!journal.written.some(value => SECRET.test(value)));
+});
+
+test('a saved account whose creation never applied is replaced: nothing holds funds, and a new key signs', async () => {
+  const owner = Keypair.fromRawEd25519Seed(Buffer.from(OWNER_SEED));
+  const {ask, calls, state} = service(owner);
+  const journal = recordingJournal(), lost = Keypair.random().publicKey();
+  // The journal names an account, the ledger holds none, and no page holds its key.
+  journal.set(`${key}:fee-account`, JSON.stringify({feeAccount: lost, policyId, agent: AGENT, amount}));
+  const signed = [];
+  const result = await flow({network, historyPauseMs: 0, ask, sign: walletOf(owner, signed), journal, key, policyId, agent: AGENT, amount, onStep() {}});
+  assert.equal(result.wallet, WALLET);
+  assert.deepEqual(signed, [CREATE_FEE_ACCOUNT, 'create_wallet', 'fund']);
+  assert.notEqual(state.feeAccount, lost);
+  // The creation of the lost account was prepared and never signed.
+  const prepares = calls.filter(([path]) => path === 'native/deploy/prepare').map(([, body]) => body.setup?.feeAccount ?? null);
+  assert.deepEqual(prepares, [lost, state.feeAccount, state.feeAccount, state.feeAccount]);
+  // A marker of another policy, agent or amount names no account.
+  const other = recordingJournal();
+  other.set(`${key}:fee-account`, JSON.stringify({feeAccount: lost, policyId: 'policy-2', agent: AGENT, amount}));
+  const fresh = service(owner);
+  await flow({network, historyPauseMs: 0, ask: fresh.ask, sign: walletOf(owner), journal: other, key, policyId, agent: AGENT, amount, onStep() {}});
+  assert.equal(fresh.calls.find(([path]) => path === 'native/deploy/prepare')[1].setup, undefined);
+});
+
+test('a fee account that this workflow did not name, or another transaction, is never countersigned', async () => {
+  const owner = Keypair.fromRawEd25519Seed(Buffer.from(OWNER_SEED));
+  const sign = walletOf(owner);
   const input = {network, historyPauseMs: 0, sign, key, policyId, agent: AGENT, amount, onStep() {}};
-  // The service prepares the creation of another account than the derived one.
+  // The service prepares the creation of another account than the named one.
   const stranger = creation(owner, Keypair.random(), false);
   const foreign = async (path, body) => {
     if (path !== 'native/deploy/prepare') throw new Error('nothing may be submitted');
@@ -415,14 +427,15 @@ test('a fee account that this owner did not derive, or another transaction, is n
   const journal = journalOf();
   await assert.rejects(flow({...input, ask: foreign, journal}), error => error instanceof OwnerFlowError && /does not create the account/.test(error.message));
   assert.equal(journal.get(key), null);
-  // The service prepares a fee account step although the owner derived no key.
+  assert.equal(journal.get(`${key}:fee-account`), null);
+  // The service prepares a fee account step although the workflow named none. The workflow names its own
+  // account once; the service's step still creates another one, and nothing is signed.
   const unasked = async path => {
     if (path !== 'native/deploy/prepare') throw new Error('nothing may be submitted');
     return {policyId, step: {action: CREATE_FEE_ACCOUNT, payload: stranger.payload, transactionHash: stranger.hash, expiresAt: Math.floor(Date.now() / 1000) + 300}};
   };
-  await assert.rejects(flow({...input, ask: unasked, journal: journalOf()}), /did not derive/);
-  // A refusal without the wallet, or a second refusal after the derivation, ends the workflow.
-  await assert.rejects(flow({...input, ask: async () => { throw refusal('fee_account_required', {}); }, journal: journalOf()}), /fee_account_required/);
+  await assert.rejects(flow({...input, ask: unasked, journal: journalOf()}), /does not create the account/);
+  // A second refusal after the workflow named its account ends the workflow.
   let asked = 0;
   await assert.rejects(flow({...input, ask: async () => { asked++; throw refusal('fee_account_required', {wallet: WALLET}); }, journal: journalOf()}), /fee_account_required/);
   assert.equal(asked, 2);
