@@ -37,8 +37,9 @@ pub const MAX_LEDGERS: u32 = 64;
 /// at most the seller's timeout divided by its own estimate of the ledger time, which is 5 or
 /// 6 seconds. The longer time gives the earlier ledger, which both estimates admit.
 pub const LEDGER_SECONDS: u64 = 6;
-/// The fault of a wallet that signs no payment authorization.
-pub const POLICY_WALLET: &str = "A policy wallet signs no payment authorization for a seller's facilitator: its contract checks the agent's signature against its fee account, whose own key signs nothing. It pays a seller that takes the proof of a settled transaction.";
+/// The fault of a wallet that signs no payment authorization. It names the fix: the wallet
+/// kind that signs one.
+pub const POLICY_WALLET: &str = "A policy wallet signs no payment authorization for a seller's facilitator: its contract checks the agent's signature against its fee account, whose own key signs nothing. Use a Native wallet to pay this seller: it signs the authorization, and the seller's facilitator pays the network fee. A policy wallet pays a seller that takes the proof of a settled transaction.";
 /// The fault of a policy whose decision depends on a time that an authorization can outlive.
 pub const TIME_LIMIT: &str = "This policy allows the payment only until a time that is less than one day after the request expires. A payment authorization expires at a ledger, which can close after that time, so this wallet signs none now. It pays a seller that takes the proof of a settled transaction.";
 /// How far past the expiry of its operation, in seconds, the policy must still allow a
