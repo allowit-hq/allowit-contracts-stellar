@@ -335,7 +335,9 @@ function canonical(value: unknown): string {
 
 const APPROVAL_TITLE = 'AllowIt Native policy approval v1';
 /** What a policy approval message approves: the policy and its revision, the wallet account, the source and the values. */
-export interface PolicyApproval {policyId: string; revision: number; network: string; wallet: string; source: string; sourceHash: string; paramsHash: string}
+export interface PolicyApproval {policyId: string; revision: number; network: string; wallet: string; source: string; sourceHash: string; paramsHash: string;
+  /** Every value that the owner approves, by param. */
+  params: Record<string, unknown>}
 /**
  * Reads the exact text of a policy approval of `network`: its title line, then the canonical JSON of the approval.
  * Any other text is null: another title, a text that is not the canonical form of its own content, another
@@ -350,12 +352,12 @@ export function policyApproval(message: unknown, network: string): PolicyApprova
   let value: unknown;
   try {value = JSON.parse(text);} catch {return null;}
   if (!object(value) || canonical(value) !== text) return null;
-  const {policyId, revision, wallet, source, sourceHash, paramsHash} = value;
+  const {policyId, revision, wallet, source, sourceHash, paramsHash, params} = value;
   if (value.version !== 1 || value.route !== 'native' || value.network !== id || typeof policyId !== 'string' || !policyId || policyId.length > 128
     || !Number.isSafeInteger(revision) || (revision as number) <= 0 || typeof wallet !== 'string' || !StrKey.isValidEd25519PublicKey(wallet)
     || typeof source !== 'string' || typeof sourceHash !== 'string' || hex(digest(source)) !== sourceHash
-    || typeof paramsHash !== 'string' || !/^[0-9a-f]{64}$/.test(paramsHash)) return null;
-  return {policyId, revision: revision as number, network: id, wallet, source, sourceHash, paramsHash};
+    || typeof paramsHash !== 'string' || !/^[0-9a-f]{64}$/.test(paramsHash) || !object(params)) return null;
+  return {policyId, revision: revision as number, network: id, wallet, source, sourceHash, paramsHash, params};
 }
 
 /** The step that asks the owner's wallet to approve a policy. It signs the message and moves nothing. */

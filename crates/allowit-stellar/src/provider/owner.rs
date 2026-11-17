@@ -163,6 +163,13 @@ impl OwnerProvider for Owner {
         Ok(raw)
     }
     fn setup(&self, cx: &Context<'_>, r: owner::Setup<'_>) -> Result<serde_json::Value> {
+        /// The XLM amount of a setup, in stroops. A Native wallet holds XLM.
+        fn setup_funding(amount: &str) -> Result<i64> {
+            i64::try_from(workflow::amount_units(amount)?)
+                .ok()
+                .filter(|units| *units > 0)
+                .ok_or_else(|| Error::usage("The setup funding amount is out of range"))
+        }
         if r.server != cx.authority.public_key() {
             return Err(Error::usage(
                 "Setup server differs from independently configured authority",
@@ -180,6 +187,7 @@ impl OwnerProvider for Owner {
             server: r.server.into(),
             request_id: r.request_id.into(),
             fee_per_operation: fee(r.fee_per_operation)?,
+            funding: r.amount.map(setup_funding).transpose()?,
         };
         request.validate()?;
         let mut configured = workflow::configure_native(

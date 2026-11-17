@@ -845,6 +845,52 @@ mod tests {
             assert!(validate_native_setup(&changed).is_err());
         }
     }
+    /// The owner's account pays every part of a setup: the fee, the starting balance with the
+    /// funding, and every reserve, a trustline's included. The server's account is the source
+    /// of nothing; it only becomes a signer. Nothing is sponsored.
+    #[test]
+    fn the_owner_funds_the_setup_and_the_server_account_pays_nothing() {
+        let agent = agent(2);
+        let server = engine();
+        let wallet = wallet_key(&agent, 0).account();
+        let trustline = Trustline {
+            code: "USDC".into(),
+            issuer: account_for_seed(&[8; 32]),
+        };
+        for line in [None, Some(&trustline)] {
+            let funding = 50_000_000;
+            let mut terms = terms(&wallet, &agent, &server);
+            terms.starting_balance = Some(default_starting_balance(line.is_some()) + funding);
+            terms.trustline = line;
+            let v = prepare_native_setup(&owner_state(), &terms, 1_800_000_000).unwrap();
+            validate_native_setup(&v).unwrap();
+            let TransactionEnvelope::Tx(tx) = read(&v.transaction_xdr).unwrap() else {
+                panic!()
+            };
+            assert_eq!(tx.tx.source_account, muxed(&v.owner).unwrap());
+            let server_account = muxed(&server).unwrap();
+            let wallet_account = muxed(&wallet).unwrap();
+            for (index, operation) in tx.tx.operations.iter().enumerate() {
+                assert_ne!(operation.source_account.as_ref(), Some(&server_account));
+                match &operation.body {
+                    // The owner's account, the transaction source, sends the starting balance.
+                    OperationBody::CreateAccount(create) => {
+                        assert_eq!(index, 0);
+                        assert_eq!(operation.source_account, None);
+                        assert_eq!(
+                            create.starting_balance,
+                            wallet_reserve(line.is_some()) + FEE_FLOAT_STROOPS + funding
+                        );
+                    }
+                    // The new account's own operations move no XLM.
+                    OperationBody::SetOptions(_) | OperationBody::ChangeTrust(_) => {
+                        assert_eq!(operation.source_account.as_ref(), Some(&wallet_account));
+                    }
+                    other => panic!("a setup holds no {other:?}"),
+                }
+            }
+        }
+    }
     #[test]
     fn agent_and_server_pay_only_together_and_the_owner_does_everything_alone() {
         let agent = agent(2);

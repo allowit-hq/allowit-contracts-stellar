@@ -207,7 +207,7 @@ const approval = (extra = {}) => {
 
 test('only the exact approval message of this network is read, and its step carries the message unchanged', () => {
   const {payload, message} = approval();
-  assert.deepEqual(policyApproval(message, network), {policyId: 'policy-1', revision: 2, network, wallet: payload.wallet, source: payload.source, sourceHash: payload.sourceHash, paramsHash: payload.paramsHash});
+  assert.deepEqual(policyApproval(message, network), {policyId: 'policy-1', revision: 2, network, wallet: payload.wallet, source: payload.source, sourceHash: payload.sourceHash, paramsHash: payload.paramsHash, params: payload.params});
   const step = approvalStep(message, 1_000_000);
   assert.deepEqual([step.action, step.hash, step.expiresAt], [APPROVE_POLICY, messageDigest(message), 1300]);
   assert.equal(approvalMessage(step), message);
@@ -223,6 +223,7 @@ test('only the exact approval message of this network is read, and its step carr
     'no revision': approval({revision: 0}).message,
     'a wallet that is no account': approval({wallet: 'CWALLET'}).message,
     'no JSON': 'AllowIt Native policy approval v1\nhello',
+    'no params': approval({params: null}).message,
   })) assert.equal(policyApproval(text, network), null, name);
   assert.equal(policyApproval(message, 'stellar:other'), null);
   assert.equal(policyApproval(null, network), null);
@@ -324,4 +325,82 @@ test('a value change of a Native wallet is one approval signature and no transac
   const foreign = async path => path === 'native/owner/prepare' ? {policyId: 'policy-1', approval: {message: approval({policyId: 'policy-2', wallet: setup.wallet}).message}} : {};
   await assert.rejects(updateParams({...input, ask: foreign, journal: journalOf(), key: 'other'}), /differs from this change/);
   assert.equal(signed.length, 1);
+});
+
+test('the owner pays every part of a setup: the server\'s account is no source, pays nothing and only becomes a signer', () => {
+  const wallet = Keypair.random().publicKey();
+  const tx = nativeSetupTransaction(terms(wallet));
+  // The owner's account is the source of the transaction: it pays the fee and every operation without a source of its own.
+  assert.equal(tx.source, roles.owner);
+  const [create, ...rest] = tx.operations;
+  // The creation has no source of its own: the owner's account sends the starting balance, which holds every reserve.
+  assert.deepEqual([create.type, create.source, create.destination], ['createAccount', undefined, wallet]);
+  assert.equal(BigInt(Math.round(Number(create.startingBalance) * 1e7)), walletStartingBalance(50_000_000n));
+  assert.ok(walletStartingBalance(0n) >= WALLET_RESERVE + WALLET_FEE_FLOAT);
+  // Every other operation is the new account's own: it only names its signers and thresholds and moves no XLM.
+  for (const op of rest) assert.deepEqual([op.type, op.source], ['setOptions', wallet]);
+  const named = [tx.source, ...tx.operations.map(op => op.source).filter(Boolean)];
+  assert.ok(!named.includes(roles.server), 'the server account is the source of nothing');
+  assert.equal(tx.operations.filter(op => ['payment', 'createAccount', 'beginSponsoringFutureReserves', 'accountMerge'].includes(op.type)).length, 1);
+  assert.equal(rest.at(-1).signer.ed25519PublicKey, roles.server);
+});
+
+test('an installed Native wallet that this workflow did not fund is funded by the owner', async () => {
+  const signed = [], wallet = Keypair.random().publicKey(), calls = [];
+  const fund = new TransactionBuilder(new Account(roles.owner, '41'), {fee: '100', networkPassphrase: Networks.TESTNET})
+    .addOperation(Operation.payment({destination: wallet, asset: (await import('@stellar/stellar-sdk/base')).Asset.native(), amount: '5'})).setTimeout(300).build();
+  const step = {action: 'fund', payload: fund.toXDR(), hash: hex(fund.hash()), expiresAt: Math.floor(Date.now() / 1000) + 300};
+  const {state: chain, fetch} = ledger();
+  globalThis.fetch = fetch;
+  // The service sends the owner's signed funding; the ledger then holds it.
+  chain.held.set(step.hash, {hash: step.hash, successful: true, ledger: 9, signed: fund.toXDR()});
+  const ask = async (path, body) => {
+    calls.push([path, body]);
+    if (path === 'native/deploy/prepare') return {policyId: 'policy-1', installed: true, approved: true, walletKind: 'native', wallet, installation: {wallet}};
+    if (path === 'native/owner/prepare') return {policyId: 'policy-1', step};
+    if (path === 'native/owner/submit') return {policyId: 'policy-1', action: 'fund', status: 'confirmed', transactionHash: step.hash, ledger: 9};
+    throw new Error(path);
+  };
+  const result = await installAndFund({network, historyPauseMs: 0, ask, sign: ownerSigns(signed), journal: journalOf(), key: 'existing', policyId: 'policy-1', agent: roles.agent, amount: '5', onStep() {}});
+  assert.equal(result.wallet, wallet);
+  // The funding is prepared and signed by the owner; nothing returns before it.
+  assert.ok(calls.some(([path, body]) => path === 'native/owner/prepare' && body.action === 'fund' && body.amount === '5'));
+  assert.deepEqual(signed, ['fund']);
+  assert.deepEqual(result.receipts.map(r => r.action), ['fund']);
+});
+
+test('a Native value change signs only the requested values, keeps its signed approval until a confirmed reply, and sends it again', async () => {
+  const {fetch} = ledger(), signed = [];
+  globalThis.fetch = fetch;
+  const setup = await setUpNativeWallet({network, ...roles, amount: '0', sign: ownerSigns([]), onStep() {}, journal: journalOf(), key: 'k', fetch});
+  const params = {payment_limit: {Int: '5'}};
+  const base = {network, historyPauseMs: 0, sign: ownerSigns(signed), policyId: 'policy-1', params, onStep() {}};
+  // Other values than the requested ones are never signed.
+  const other = approval({wallet: setup.wallet, params: {payment_limit: {Int: '999'}}}).message;
+  await assert.rejects(updateParams({...base, journal: journalOf(), key: 'a', ask: async path => path === 'native/owner/prepare' ? {policyId: 'policy-1', approval: {message: other}} : {}}),
+    /other values than this change/);
+  assert.equal(signed.length, 0);
+  // A reply that is lost, then a pending one: the signed approval stays saved and nothing is signed again.
+  const {message} = approval({wallet: setup.wallet});
+  const journal = journalOf(), submitted = [];
+  let answers = [() => {throw new Error('reply lost');}, () => ({status: 'pending'}), () => ({policyId: 'policy-1', action: 'update_params', status: 'confirmed'})];
+  let prepares = 0;
+  const ask = async (path, body) => {
+    if (path === 'native/owner/prepare') {prepares++; return {policyId: 'policy-1', approval: {message}};}
+    if (path === 'native/owner/submit') {submitted.push(body); return answers.shift()();}
+    throw new Error(path);
+  };
+  await assert.rejects(updateParams({...base, journal, key: 'b', ask}), /reply lost/);
+  assert.ok(journal.get('b:approval'));
+  await assert.rejects(updateParams({...base, journal, key: 'b', ask}), /did not confirm/);
+  assert.equal(journal.get('b:updated'), null);
+  const done = await updateParams({...base, journal, key: 'b', ask});
+  assert.deepEqual([done.done, prepares, signed.length, submitted.length], [true, 1, 1, 3]);
+  assert.ok(submitted.every(body => body.payload === message && JSON.stringify(body.sourceApproval) === JSON.stringify(submitted[0].sourceApproval)));
+  assert.equal(journal.get('b:approval'), null);
+  // A change with other values is refused while a signed approval of this change is saved.
+  const held = journalOf();
+  answers = [() => {throw new Error('reply lost');}];
+  await assert.rejects(updateParams({...base, journal: held, key: 'c', ask}), /reply lost/);
+  await assert.rejects(updateParams({...base, journal: held, key: 'c', ask, params: {payment_limit: {Int: '6'}}}), /another change/);
 });

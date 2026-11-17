@@ -83,6 +83,31 @@ function signatureBytes(signature) {
         throw new OwnerFlowError('Your wallet did not return a message signature.', null, false);
     return bytes;
 }
+function savedApproval(journal, key, identity) {
+    const raw = journal.get(key);
+    if (raw === null)
+        return null;
+    let value;
+    try {
+        value = JSON.parse(raw);
+    }
+    catch { /* refused below */ }
+    if (!object(value) || typeof value.message !== 'string' || typeof value.signer !== 'string' || !Array.isArray(value.signature)
+        || value.signature.length !== 64 || !value.signature.every(b => Number.isInteger(b) && b >= 0 && b <= 255))
+        throw new OwnerFlowError('The saved signed approval is unreadable. It stays saved; contact support before signing again.', null, false);
+    if (!sameInputs(value, identity))
+        throw changed(identity);
+    return value;
+}
+/** The owner of a wallet account: its one signer of the owner's weight, read from the public ledger. */
+async function walletOwner(network, account, then) {
+    const response = await horizonGet(network, `/accounts/${account}`);
+    const body = response?.ok ? await response.json().catch(() => null) : null;
+    const owners = (object(body) && Array.isArray(body.signers) ? body.signers : []).filter(s => object(s) && s.weight === 3 && s.type === 'ed25519_public_key' && typeof s.key === 'string');
+    if (owners.length !== 1)
+        throw new OwnerFlowError(`The owner of the wallet account could not be read from the network. ${then}`, null, true);
+    return owners[0].key;
+}
 /** Workflows that run in this page, by journal key. */
 const running = new Set();
 const busy = () => new OwnerFlowError('This wallet setup is already running in this or another tab.', null, true);
@@ -355,21 +380,11 @@ async function run({ network, ask, sign, journal, key, policyId, agent, amount, 
         const fields = policyApproval(approval.message, network);
         if (!fields || fields.policyId !== policyId || fields.wallet !== account)
             throw new OwnerFlowError('The approval differs from this policy and its wallet account. Nothing was signed.', null, false);
-        const signer = await ownerOf(account);
+        const signer = await walletOwner(network, account, 'Resume to read it again.');
         onStep('Sign the approval of the policy in your wallet…');
         const signature = await sign(approvalStep(approval.message));
         await ask('micro/allocation/confirm', { id: policyId, revision: fields.revision, sourceApproval: [{ signer, signature: signatureBytes(signature) }] });
         receipts.push({ policyId, action: APPROVE_POLICY, status: 'confirmed', transactionHash: '' });
-    };
-    /** The owner of a wallet account: its signer of the owner's weight, read from the public ledger history. */
-    const ownerOf = async (account) => {
-        const response = await horizonGet(network, `/accounts/${account}`);
-        const body = response?.ok ? await response.json().catch(() => null) : null;
-        const signers = object(body) && Array.isArray(body.signers) ? body.signers : [];
-        const owners = signers.filter(s => object(s) && s.weight === 3 && s.type === 'ed25519_public_key' && typeof s.key === 'string');
-        if (owners.length !== 1)
-            throw new OwnerFlowError('The owner of the wallet account could not be read from the network. Resume to read it again.', null, true);
-        return owners[0].key;
     };
     // A deployment takes at most the fee account, the code upload, the wallet creation and a lifetime renewal.
     for (let i = 0; i < 5 && !wallet; i++) {
@@ -406,12 +421,12 @@ async function run({ network, ask, sign, journal, key, policyId, agent, amount, 
             throw new OwnerFlowError('The deployment reply names a different policy.', null, false);
         wallet = installedWallet(reply);
         if (wallet && reply.walletKind === 'native') {
-            // The setup created and funded the wallet account. What remains is the owner's approval of the policy.
+            // A setup of this run created and funded the wallet account, and recorded that funding. What remains is the
+            // owner's approval of the policy. A wallet account that this workflow did not fund is funded below.
             journal.remove(walletSetupKey);
             if (reply.approved !== true)
                 await approvePolicy(wallet);
-            journal.remove(feeAccountKey);
-            return { wallet, receipts };
+            break;
         }
         if (wallet)
             break;
@@ -532,6 +547,33 @@ async function runUpdate({ network, ask, sign, journal, key, policyId, params, e
     await settleSaved();
     if (funded(journal, updatedKey, identity))
         return { receipts, done: true };
+    const approvalKey = `${key}:approval`;
+    /**
+     * Sends a signed approval of a Native wallet's values. Only a confirmed reply for this policy and change ends
+     * the change. Any other answer keeps the signed approval saved, and the next call sends the same bytes again:
+     * the service answers a settled approval with the same confirmation.
+     */
+    const submitApproval = async ({ message, signer, signature }) => {
+        onStep('Saving the change…');
+        let reply;
+        try {
+            reply = await ask('native/owner/submit', { policyId, payload: message, sourceApproval: [{ signer, signature }] });
+        }
+        catch (error) {
+            const code = object(error) && typeof error.code === 'string' ? error.code : null;
+            throw new OwnerFlowError(error instanceof Error && error.message ? error.message : 'The change could not be saved.', code, true, error);
+        }
+        if (!object(reply) || reply.policyId !== policyId || reply.action !== UPDATE_PARAMS || reply.status !== 'confirmed')
+            throw new OwnerFlowError('The service did not confirm the change. The signed approval stays saved: resume to send it again.', null, true);
+        journal.set(updatedKey, JSON.stringify(identity));
+        journal.remove(approvalKey);
+        receipts.push({ policyId, action: UPDATE_PARAMS, status: 'confirmed', transactionHash: '' });
+        return { receipts, done: true };
+    };
+    // A signed approval that a lost reply left saved is sent again before anything new is prepared or signed.
+    const pendingApproval = savedApproval(journal, approvalKey, identity);
+    if (pendingApproval)
+        return submitApproval(pendingApproval);
     onStep('Preparing the change…');
     let prepared;
     try {
@@ -547,24 +589,16 @@ async function runUpdate({ network, ask, sign, journal, key, policyId, params, e
         const message = prepared.approval.message, fields = policyApproval(message, network);
         if (!fields || fields.policyId !== policyId)
             throw new OwnerFlowError('The approval differs from this change. Nothing was signed.', null, false);
+        // The owner signs only the values of this change: each changed param holds exactly its requested value.
+        if (Object.entries(params).some(([name, value]) => !(name in fields.params) || canonical(fields.params[name]) !== canonical(value)))
+            throw new OwnerFlowError('The approval names other values than this change. Nothing was signed.', null, false);
+        const signer = await walletOwner(network, fields.wallet, 'Nothing was signed; try again.');
         onStep('Sign the approval of the new values in your wallet…');
-        const signature = await sign(approvalStep(message));
-        const response = await horizonGet(network, `/accounts/${fields.wallet}`);
-        const body = response?.ok ? await response.json().catch(() => null) : null;
-        const owners = (object(body) && Array.isArray(body.signers) ? body.signers : []).filter(s => object(s) && s.weight === 3 && s.type === 'ed25519_public_key' && typeof s.key === 'string');
-        if (owners.length !== 1)
-            throw new OwnerFlowError('The owner of the wallet account could not be read from the network. Nothing was saved; try again.', null, true);
-        let receipt;
-        try {
-            receipt = await ask('native/owner/submit', { policyId, payload: message, sourceApproval: [{ signer: owners[0].key, signature: signatureBytes(signature) }] });
-        }
-        catch (error) {
-            const code = object(error) && typeof error.code === 'string' ? error.code : null;
-            throw new OwnerFlowError(error instanceof Error && error.message ? error.message : 'The change could not be saved.', code, code === NETWORK_UNAVAILABLE, error);
-        }
-        journal.set(updatedKey, JSON.stringify(identity));
-        receipts.push({ policyId, action: UPDATE_PARAMS, status: 'confirmed', transactionHash: object(receipt) && typeof receipt.transactionHash === 'string' ? receipt.transactionHash : '' });
-        return { receipts, done: true };
+        const signature = signatureBytes(await sign(approvalStep(message)));
+        // The signed approval is saved before it leaves: a lost reply is settled from it, never signed again.
+        const approval = { ...identity, message: message, signer, signature };
+        journal.set(approvalKey, JSON.stringify(approval));
+        return submitApproval(approval);
     }
     const step = stepOf(prepared?.step);
     if (!object(prepared) || prepared.policyId !== policyId || !step || step.action !== UPDATE_PARAMS)

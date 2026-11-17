@@ -135,6 +135,8 @@ export interface PolicyApproval {
     source: string;
     sourceHash: string;
     paramsHash: string;
+    /** Every value that the owner approves, by param. */
+    params: Record<string, unknown>;
 }
 /**
  * Reads the exact text of a policy approval of `network`: its title line, then the canonical JSON of the approval.

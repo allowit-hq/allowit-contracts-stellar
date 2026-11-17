@@ -43,6 +43,7 @@ fn native_setup_retains_before_sign_and_recovers_lost_reply_without_another_sign
         server: c.server.clone(),
         request_id: "setup-test-001".into(),
         fee_per_operation: 100,
+        funding: None,
     };
     let clock = Cell::new(wire::now());
     let before = || {
@@ -95,6 +96,62 @@ fn native_setup_retains_before_sign_and_recovers_lost_reply_without_another_sign
         1
     );
 }
+/// The CLI's setup funds the wallet in its one owner transaction: the starting balance holds the
+/// reserve, the float and the owner's amount, and the owner's account is its source. The request
+/// binds the amount, so the same request ID with another amount signs nothing.
+#[test]
+fn a_funded_setup_is_one_owner_transaction_and_binds_its_amount() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().canonicalize().unwrap().join("proof")).unwrap();
+    let c = selection().config;
+    let chain = Arc::new(Chain::new(c.clone()));
+    let runtime = Runtime::from_rpc(chain.clone());
+    let request = |funding: i64| SetupRequest {
+        network: c.network.clone(),
+        owner: c.owner.clone(),
+        agent: c.agent.clone(),
+        server: c.server.clone(),
+        request_id: "setup-funded-001".into(),
+        fee_per_operation: 100,
+        funding: Some(funding),
+    };
+    let now = wire::now();
+    let signer = key();
+    let out = workflow::configure_native(&runtime, &store, &request(200_000_000), &signer, &|| {
+        Ok(now)
+    })
+    .unwrap();
+    assert_eq!(out["state"], "configured");
+    assert_eq!(signer.calls.load(Ordering::SeqCst), 1);
+    let sent = chain.direct_signed.lock().unwrap().clone().unwrap();
+    let stellar_xdr::TransactionEnvelope::Tx(envelope) = crate::read(&sent).unwrap() else {
+        panic!()
+    };
+    assert_eq!(
+        envelope.tx.source_account,
+        stellar_xdr::MuxedAccount::Ed25519(stellar_xdr::Uint256(
+            crate::account_key(&c.owner).unwrap()
+        ))
+    );
+    let stellar_xdr::OperationBody::CreateAccount(create) = &envelope.tx.operations[0].body else {
+        panic!()
+    };
+    assert_eq!(envelope.tx.operations[0].source_account, None);
+    assert_eq!(
+        create.starting_balance,
+        crate::owner::default_starting_balance(false) + 200_000_000
+    );
+    let again = signer.calls.load(Ordering::SeqCst);
+    let refused = workflow::configure_native(&runtime, &store, &request(1), &signer, &|| Ok(now))
+        .unwrap_err();
+    assert!(
+        refused.message.contains("another intent"),
+        "{}",
+        refused.message
+    );
+    assert_eq!(signer.calls.load(Ordering::SeqCst), again);
+    assert!(request(0).validate().is_err());
+}
 /// The setup key of a wallet account is random and lives in one run. A request that settled
 /// reports its wallet again and signs nothing. A request that stopped before its signature
 /// holds no key and nothing signed: its next run prepares another account with a new key.
@@ -112,6 +169,7 @@ fn a_settled_setup_signs_nothing_again_and_an_unsigned_one_takes_a_new_key() {
         server: c.server.clone(),
         request_id: id.into(),
         fee_per_operation: 100,
+        funding: None,
     };
     let now = wire::now();
     let sends = || {
@@ -349,6 +407,7 @@ fn failed_signed_retention_prevents_native_transmission() {
         server: c.server,
         request_id: "native-retain-001".into(),
         fee_per_operation: 100,
+        funding: None,
     };
     let fail_retention =
         || std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();

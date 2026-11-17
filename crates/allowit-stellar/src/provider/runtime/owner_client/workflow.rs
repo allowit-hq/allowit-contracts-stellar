@@ -1714,6 +1714,29 @@ fn configured(
     )
 }
 /// Prepare the setup of the wallet account `wallet` from the owner's current account.
+/// What one setup request binds. A funded setup also binds its amount; an unfunded one keeps the
+/// identity of earlier releases, so their retained requests resume.
+fn setup_identity(request: &crate::provider::runtime::owner::SetupRequest) -> Value {
+    let mut identity = json!({"network":request.network,"owner":request.owner,"agent":request.agent,"server":request.server,"requestId":request.request_id,"fee":request.fee_per_operation});
+    if let Some(funding) = request.funding {
+        identity["funding"] = json!(funding.to_string());
+    }
+    identity
+}
+/// The starting balance of a setup: the reserve and the float, and the owner's funding on top.
+/// The owner's account sends all of it in the setup transaction.
+fn setup_starting_balance(
+    request: &crate::provider::runtime::owner::SetupRequest,
+) -> Result<Option<i64>> {
+    request
+        .funding
+        .map(|funding| {
+            native::owner::default_starting_balance(false)
+                .checked_add(funding)
+                .ok_or_else(|| Error::usage("The setup funding amount is out of range"))
+        })
+        .transpose()
+}
 fn prepare_setup(
     runtime: &crate::provider::runtime::Runtime,
     request: &crate::provider::runtime::owner::SetupRequest,
@@ -1731,7 +1754,7 @@ fn prepare_setup(
             request_id: &request.request_id,
             network: &request.network,
             fee_per_operation: request.fee_per_operation,
-            starting_balance: None,
+            starting_balance: setup_starting_balance(request)?,
             trustline: None,
         },
         now,
@@ -1807,9 +1830,7 @@ pub fn configure_native(
         return Err(Error::config("Native setup owner signer differs"));
     }
     network(runtime.rpc(), &request.network)?;
-    let identity = intent_hash(
-        &json!({"network":request.network,"owner":request.owner,"agent":request.agent,"server":request.server,"requestId":request.request_id,"fee":request.fee_per_operation}),
-    )?;
+    let identity = intent_hash(&setup_identity(request))?;
     let mut made = None;
     let mut record = match store.load::<NativeSetupRecord>(&request.request_id)? {
         Some(record) if record.identity == identity => record,
@@ -1969,7 +1990,7 @@ fn expected_setup(
             engine: request.server.clone(),
             request_id: request.request_id.clone(),
             fee_per_operation: request.fee_per_operation,
-            starting_balance: None,
+            starting_balance: setup_starting_balance(request)?,
             trustline: None,
             created_at: record.created_at,
         },
