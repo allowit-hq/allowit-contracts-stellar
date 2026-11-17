@@ -397,6 +397,8 @@ test('a saved account whose creation never applied is replaced: nothing holds fu
   const journal = recordingJournal(), lost = Keypair.random().publicKey();
   // The journal names an account, the ledger holds none, and no page holds its key.
   journal.set(`${key}:fee-account`, JSON.stringify({feeAccount: lost, policyId, agent: AGENT}));
+  const settled = globalThis.fetch;
+  globalThis.fetch = async url => new URL(url).pathname === `/accounts/${lost}` ? new Response('{}', {status: 404}) : settled(url);
   const signed = [];
   const result = await flow({network, historyPauseMs: 0, ask, sign: walletOf(owner, signed), journal, key, policyId, agent: AGENT, amount, onStep() {}});
   assert.equal(result.wallet, WALLET);
@@ -405,6 +407,37 @@ test('a saved account whose creation never applied is replaced: nothing holds fu
   // The creation of the lost account was prepared and never signed.
   const prepares = calls.filter(([path]) => path === 'native/deploy/prepare').map(([, body]) => body.setup?.feeAccount ?? null);
   assert.deepEqual(prepares, [lost, state.feeAccount, state.feeAccount, state.feeAccount]);
+});
+
+test('a saved account that the ledger holds is never replaced, whatever the service prepares', async () => {
+  const owner = Keypair.fromRawEd25519Seed(Buffer.from(OWNER_SEED));
+  const created = Keypair.random().publicKey();
+  const stale = creation(owner, Keypair.fromPublicKey(created), false);
+  // The service answers with the creation of the saved account again, although the ledger holds it.
+  const asked = [];
+  const ask = async (path, body) => {
+    asked.push([path, body.setup?.feeAccount ?? null]);
+    if (path !== 'native/deploy/prepare') throw new Error('nothing may be submitted');
+    return {policyId, wallet: WALLET, step: {action: CREATE_FEE_ACCOUNT, payload: stale.payload, transactionHash: stale.hash, expiresAt: Math.floor(Date.now() / 1000) + 300}};
+  };
+  const marker = JSON.stringify({feeAccount: created, policyId, agent: AGENT});
+  const input = {network, historyPauseMs: 0, ask, key, policyId, agent: AGENT, amount, onStep() {}};
+  for (const [reply, message] of [
+    [() => new Response(JSON.stringify({account_id: created}), {status: 200}), /already holds/],
+    // An unreadable ledger proves nothing: the account stays saved.
+    [() => new Response('unavailable', {status: 503}), /could not be checked/],
+    [() => { throw new Error('offline'); }, /could not be checked/],
+    [() => new Response(JSON.stringify({account_id: 'another'}), {status: 200}), /could not be checked/],
+  ]) {
+    const journal = recordingJournal(), signed = [];
+    journal.set(`${key}:fee-account`, marker);
+    globalThis.fetch = async url => { assert.equal(new URL(url).pathname, `/accounts/${created}`); return reply(); };
+    await assert.rejects(flow({...input, journal, sign: walletOf(owner, signed)}), error => error instanceof OwnerFlowError && error.retry === true && message.test(error.message));
+    assert.deepEqual(signed, []);
+    assert.equal(journal.get(`${key}:fee-account`), marker);
+  }
+  // Every preparation named the saved account, and no other account was ever named.
+  assert.ok(asked.every(([, named]) => named === created));
 });
 
 test('a saved fee account stays with its policy and agent: another amount keeps it, other inputs are refused', async () => {

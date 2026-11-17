@@ -269,6 +269,20 @@ function stepper({network, historyPauseMs, ask, sign, journal, key, policyId, on
   return {receipts, settleSaved, signAndSubmit};
 }
 
+/** Whether the ledger holds `account`: true or false, or null when Horizon gives no clear answer. */
+async function accountOnLedger(network: string, account: string): Promise<boolean | null> {
+  const response = await horizonGet(network, `/accounts/${account}`);
+  if (!response) return null;
+  if (response.status === 404) return false;
+  if (!response.ok) return null;
+  try {
+    const body: unknown = await response.json();
+    return object(body) && body.account_id === account ? true : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * The fee account whose creation this journal signed for this policy and agent, or undefined. The account can hold
  * the owner's XLM, so a marker is never dropped for other inputs: another funding amount keeps the account, and a
@@ -335,9 +349,16 @@ async function run({network, ask, sign, journal, key, policyId, agent, amount, o
     if (step.action === CREATE_FEE_ACCOUNT) {
       const setupKey = feeKey;
       if (!setupKey || setupKey.publicKey() !== feeAccount) {
-        // The ledger holds no such account, and this page holds no key for it: its signed creation never
-        // applied, or none was signed. Nothing holds funds. The workflow makes a new key and names its account.
+        // This page holds no key for the account of this step. The ledger decides what that means. A saved
+        // account that the ledger holds is created already: the service's step is stale, and the account stays.
+        // Only an account that the ledger does not hold is replaced: its signed creation never applied, or
+        // none was signed, so nothing holds funds. The workflow then makes a new key and names its account.
         if (replaced) throw new OwnerFlowError('The service prepared a fee account that this workflow did not name.', null, false);
+        if (feeAccount) {
+          const held = await accountOnLedger(network, feeAccount);
+          if (held === true) throw new OwnerFlowError('The service prepared the creation of a fee account that the network already holds. Nothing was signed; resume in a moment.', null, true);
+          if (held === null) throw new OwnerFlowError('The fee account of this deployment could not be checked on the network. Nothing was signed; resume to check again.', null, true);
+        }
         replaced = true;
         journal.remove(feeAccountKey);
         feeKey = newFeeAccountKey();
