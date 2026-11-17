@@ -26,6 +26,19 @@ pub const OWNER_STORE_NAMESPACE: &str = "stellar-owner-workflows";
 
 /// The exit code of a call that got no answer, in the shared CLI exit table.
 pub(crate) const NETWORK_UNAVAILABLE: i32 = 7;
+/// The checked shape of a policy's source for its wallet. The server evaluates the source of
+/// a classic account, so that source is server policy source: it can read owner text for a
+/// server function. A contract compiles the source of a policy wallet, which stays portable.
+pub(crate) fn source_shape(
+    classic: bool,
+    source: &str,
+) -> crate::host::error::Result<crate::policy::SourceShape> {
+    if classic {
+        crate::policy::classic_shape(source).map_err(Error::usage)
+    } else {
+        crate::host::authoring::check(source)
+    }
+}
 /// Convert a native failure to a client error. A Stellar RPC call that got no answer keeps the
 /// network-unavailable code, and an answer with an unknown outcome stays uncertain, so callers
 /// retry both with the same request ID.

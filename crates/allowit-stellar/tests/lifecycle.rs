@@ -3840,26 +3840,111 @@ fn owner_deployment_binds_common_rules_to_a_target_source() {
     assert!(error.contains("new code"), "{error}");
 }
 
+/// A classic account enforces nothing onchain. A canonical-only source runs in full on every
+/// path, over canonical params. Any other source runs only in the server's admission, with
+/// the server's compiled evaluator: the agent's client prepares and signs without it, and the
+/// server admits the exact prepared operation before it signs.
 #[test]
-fn portable_classic_custody_accepts_only_canonical_only_sources() {
-    let (mut c, _, _) = fixture(WalletRoute::Native, false);
+fn portable_classic_custody_runs_another_source_only_with_the_servers_evaluator() {
+    let (mut c, request, state) = fixture(WalletRoute::Native, false);
     c.language = PolicyLanguage::Portable;
     c.policy_source = PORTABLE.into();
     c.source_hash = hash(PORTABLE);
     validate_config(&c).unwrap();
-    // A helper item makes the file more than its prefix: the host cannot run it without a
-    // compiled evaluator, which no classic prepare or sign path takes.
-    let helper = format!("{PORTABLE}fn helper() -> bool {{ true }}\n");
-    let mut other = c.clone();
-    other.policy_source = helper.clone();
-    other.source_hash = hash(&helper);
-    let error = validate_config(&other).unwrap_err();
-    assert!(error.contains("canonical-only"), "{error}");
+    // A canonical-only source keeps canonical params.
+    let other_param = |c: &WalletConfig| {
+        let mut params = c.params.clone();
+        params.0.insert(
+            "question".into(),
+            PolicyValue::Str("Is it research data?".into()),
+        );
+        params
+    };
     let mut custom = c.clone();
-    custom.params =
-        policy::params_from_json(&json!({"supplier_limit": 5}), Some(PolicyTier::Custom)).unwrap();
+    custom.params = other_param(&c);
     let error = validate_config(&custom).unwrap_err();
     assert!(error.contains("canonical params"), "{error}");
+    // Its admission needs no evaluator: the rail runs it in full.
+    let canonical = prepare(&c, &request, &state, 86401, 86700).unwrap();
+    admit_classic(&canonical, &c.server, 86401, None).unwrap();
+
+    // A helper item makes the file more than its prefix. The account takes it, with a param
+    // that is no canonical one, such as the owner's text for a server function.
+    let helper = format!("{PORTABLE}fn helper() -> bool {{ true }}\n");
+    let mut hosted = c.clone();
+    hosted.policy_source = helper.clone();
+    hosted.source_hash = hash(&helper);
+    hosted.params = other_param(&c);
+    validate_config(&hosted).unwrap();
+    // The agent's client prepares and signs: it has no evaluator, and its signature alone
+    // moves nothing.
+    let mut observed = state.clone();
+    observed.source_hash = hosted.source_hash;
+    let prepared = prepare(&hosted, &request, &observed, 86401, 86700).unwrap();
+    sign(&prepared, &[2; 32], 86401).unwrap();
+    // The server's admission requires the evaluator.
+    let error = admit_classic(&prepared, &hosted.server, 86401, None).unwrap_err();
+    assert!(error.contains("supply its compiled evaluator"), "{error}");
+    // The evaluator gets the policy context of the exact operation, with the owner's params.
+    let seen = std::cell::Cell::new(0);
+    let transfer = transfer_from_request(&hosted, &request).unwrap();
+    let admits = |ctx: &allowit_core::AllowitContext| -> allowit_core::Result {
+        seen.set(seen.get() + 1);
+        assert_eq!(ctx.request.amount, transfer.amount);
+        // The owner's text param is in the context, for a server function to read.
+        let _question: allowit_core::String = allowit_core::param(ctx, "question");
+        Ok(())
+    };
+    admit_classic(&prepared, &hosted.server, 86401, Some(&admits)).unwrap();
+    assert_eq!(seen.get(), 1);
+    // An evaluator that denies stops the admission.
+    let denies = |_: &allowit_core::AllowitContext| -> allowit_core::Result {
+        Err(allowit_core::AllowitError::PaymentLimitExceeded)
+    };
+    assert!(admit_classic(&prepared, &hosted.server, 86401, Some(&denies)).is_err());
+    // Only the server of the installation admits, and only an operation of a classic account.
+    for signer in [&hosted.agent, &hosted.owner] {
+        assert!(admit_classic(&prepared, signer, 86401, Some(&admits)).is_err());
+    }
+    let (wallet, wallet_request, wallet_state) = fixture(WalletRoute::PolicyWallet, false);
+    if let Ok(packet) = prepare(&wallet, &wallet_request, &wallet_state, 86401, 86700) {
+        assert!(admit_classic(&packet, &wallet.server, 86401, Some(&admits)).is_err());
+    }
+    assert_eq!(seen.get(), 1);
+    // The source of a classic account is server policy source: a server function reads the
+    // owner's text with `as_str()`. No contract compiles such a source.
+    let asks = PORTABLE.replace(
+        "    Ok(())\n",
+        "    let question: String = allowit::param(ctx, \"question\");\n    allowit::decision(ctx, &allowit::AllowitDecision {\n        id: \"purpose\",\n        query: question.as_str(),\n        deny_below: 3000,\n        allow_above: 8000,\n    })?;\n    Ok(())\n",
+    );
+    assert_ne!(asks, PORTABLE);
+    let error = policy::source_shape(&asks).unwrap_err();
+    assert!(error.contains("the method `as_str`"), "{error}");
+    let mut asking = hosted.clone();
+    asking.policy_source = asks.clone();
+    asking.source_hash = hash(&asks);
+    validate_config(&asking).unwrap();
+    observed.source_hash = asking.source_hash;
+    let prepared = prepare(&asking, &request, &observed, 86401, 86700).unwrap();
+    assert!(admit_classic(&prepared, &asking.server, 86401, None).is_err());
+    admit_classic(&prepared, &asking.server, 86401, Some(&admits)).unwrap();
+    assert_eq!(seen.get(), 2);
+    // The text of the agent's own arguments stays outside: only a param call gives a `String`
+    // here, and a policy wallet takes no such source.
+    let mut wallet_asking = wallet.clone();
+    wallet_asking.policy_source = asks.clone();
+    wallet_asking.source_hash = hash(&asks);
+    assert!(validate_config(&wallet_asking).is_err());
+    // A source that writes state stays refused: a classic account stores none.
+    let writes = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::set_state(ctx, \"seen\", 1)?;\n    Ok(())\n}\n";
+    let mut stateful = hosted.clone();
+    stateful.policy_source = writes.into();
+    stateful.source_hash = hash(writes);
+    let error = validate_config(&stateful).unwrap_err();
+    assert!(error.contains("set_state"), "{error}");
+    observed.source_hash = stateful.source_hash;
+    let error = prepare(&stateful, &request, &observed, 86401, 86700).unwrap_err();
+    assert!(error.contains("set_state"), "{error}");
 }
 
 #[test]

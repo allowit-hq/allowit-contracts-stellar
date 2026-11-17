@@ -881,16 +881,35 @@ fn validate_config_for(c: &WalletConfig, admit_source: bool) -> Result<()> {
     }
     Ok(())
 }
-/// Classic custody enforces nothing onchain and its prepare and sign paths take no compiled
-/// evaluator, so the host must run the whole portable policy itself. Only a canonical-only
-/// source allows that: one `execute` of canonical rule calls over canonical params.
+/// Classic custody enforces nothing onchain, so the host runs the whole portable policy. A
+/// canonical-only source is one `execute` of canonical rule calls over canonical params: every
+/// prepare and sign path runs it in full. Any other source needs the compiled evaluator of
+/// the server, which admits each operation of it with [`admit_classic`] before it signs. Such
+/// a source takes the bounded params of a Custom policy, so it can read owner text.
 fn validate_classic_portable_install(c: &WalletConfig) -> Result<()> {
-    if !policy::source_shape(&c.policy_source)?.canonical_only {
-        return Err("Portable classic custody supports only canonical-only sources: `use allowit::...;` items and one execute of canonical rule calls followed by Ok(()). Use a policy wallet for other sources".into());
+    let shape = policy::classic_shape(&c.policy_source)?;
+    if shape.writes_state {
+        return Err(CLASSIC_WRITES_STATE.into());
     }
-    c.params
-        .check(PolicyTier::Simple)
-        .map_err(|e| format!("Portable classic custody reads only canonical params: {e}"))
+    let tier = classic_tier(&shape);
+    c.params.check(tier).map_err(|e| {
+        if tier == PolicyTier::Simple {
+            format!("Portable classic custody reads only canonical params for a canonical-only source: {e}")
+        } else {
+            e
+        }
+    })
+}
+/// A classic account stores no policy state, so no source of it writes any.
+const CLASSIC_WRITES_STATE: &str = "Classic custody cannot store allowit::set_state writes";
+/// The param and evaluation rules of a classic account's source: those of a Simple policy for
+/// a canonical-only source, and those of a Custom policy for any other.
+fn classic_tier(shape: &policy::SourceShape) -> PolicyTier {
+    if shape.canonical_only {
+        PolicyTier::Simple
+    } else {
+        PolicyTier::Custom
+    }
 }
 /// Bind a layout 4 policy wallet installation to its portable source: tier rules, binding
 /// digest, owner params and standard-state writes.
@@ -1190,6 +1209,11 @@ pub fn verify_operation(
     }
 }
 /// Classic custody enforces nothing onchain, so the full portable policy must run on the host.
+/// A canonical-only source runs in full here. Any other source runs in full only with
+/// `evaluator`. Without one the result is `Evaluation::Prefix`: the execution terms are
+/// checked and nothing of the policy ran. The agent's client prepares and signs so, because it
+/// has no evaluator and its signature alone moves nothing. The server admits the operation
+/// with [`admit_classic`], which requires the full evaluation.
 /// Params come from the owner-approved installation and standard state from the durable
 /// coordinator's accounting. The payment principal is the exact spend; classic fees are paid in
 /// XLM by the account and bounded separately by the fee ceiling.
@@ -1205,9 +1229,9 @@ fn verify_classic_portable(
     if terms.expense.is_some() {
         return Err("Classic custody derives its expense from the exact payment".into());
     }
-    let shape = policy::source_shape(&c.policy_source)?;
+    let shape = policy::classic_shape(&c.policy_source)?;
     if shape.writes_state {
-        return Err("Classic custody cannot store allowit::set_state writes".into());
+        return Err(CLASSIC_WRITES_STATE.into());
     }
     let mut standard = PolicyParams::default();
     for (key, value) in [
@@ -1234,21 +1258,47 @@ fn verify_classic_portable(
         }),
         terms.args.clone(),
     );
-    let evaluation = policy::evaluate(
-        PolicyTier::Simple,
+    policy::evaluate(
+        classic_tier(&shape),
         &shape,
         &[],
         &c.params,
         &standard,
         &request,
         evaluator,
+    )
+}
+/// The server's admission of one prepared operation of a classic account: the whole installed
+/// policy on the policy context of that exact operation. A source that is not canonical-only
+/// needs `evaluator`, the compiled evaluator that the server's policy build gate made from
+/// `config.policy_source`. The server calls this before it stores the operation, and it signs
+/// only an operation that it stored: [`sign_with`] cannot tell whether this ran.
+pub fn admit_classic(
+    p: &PreparedOperation,
+    signer_account: &str,
+    now: u64,
+    evaluator: Option<policy::PortableEvaluator>,
+) -> Result<()> {
+    if p.config.route != WalletRoute::Native || signer_account != p.config.server {
+        return Err("Configured classic account server signer required".into());
+    }
+    validate_prepared(p, now)?;
+    let evaluation = verify_operation(
+        &p.config,
+        &p.request,
+        &p.terms,
+        &p.state,
+        now,
+        p.expires_at,
+        evaluator,
     )?;
     if evaluation == policy::Evaluation::Prefix {
         return Err(
-            "Classic custody needs full host evaluation: supply a compiled evaluator".into(),
+            "The server must evaluate the full policy of a classic account; supply its compiled evaluator"
+                .into(),
         );
     }
-    Ok(evaluation)
+    Ok(())
 }
 /// Check expense bounds as the kernel does, from the signer's trusted observations.
 fn validate_expense(
