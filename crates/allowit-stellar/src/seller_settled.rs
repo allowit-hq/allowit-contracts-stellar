@@ -51,6 +51,15 @@ pub const TIME_LIMIT: &str = "This policy allows the payment only until a time t
 /// policy that falls inside the margin refuses the authorization. A network that stops for
 /// longer than the margin is outside this bound.
 pub const EXPIRY_MARGIN: u64 = 86_400;
+/// The fault of an authorization that could settle on the day after its limits count it.
+pub const DAY_END: &str = "A payment authorization is not signed in the last minutes of the UTC day: it expires at a ledger, which can close on the next day, and the daily limits count it today. Retry after 00:00 UTC, or pay a seller that takes the proof of a settled transaction.";
+/// How long before the end of the UTC day, in seconds, the operation of a payment
+/// authorization must expire. The limits count a payment in the day of its preparation, and
+/// the wallet's own transaction cannot be included after that day. An authorization entry
+/// has no such bound: its expiry ledger can close late. This margin keeps the entry inside
+/// the day while ledgers close within it. A network that stops for longer is outside this
+/// bound, like [`EXPIRY_MARGIN`]; the harm is then one payment counted in the day before.
+pub const DAY_MARGIN: u64 = 600;
 /// The fault of a payee that a payment authorization cannot pay.
 pub const CONTRACT_PAYEE: &str = "A payment authorization pays an account. The payee of this seller is a contract address, which this wallet does not pay.";
 const EVIDENCE_NAMESPACE: u32 = 402;
@@ -274,6 +283,11 @@ pub fn admit(p: &PreparedOperation, now: u64) -> Result<[u8; 32]> {
         p.expires_at,
         None,
     )?;
+    // The entry stays inside the UTC day that the limits count it in: see `DAY_MARGIN`.
+    let day_end = (p.created_at / allowit_core::DAY + 1) * allowit_core::DAY;
+    if p.expires_at.saturating_add(DAY_MARGIN) > day_end {
+        return Err(DAY_END.into());
+    }
     // The same decision for an operation that expires a margin later: see `EXPIRY_MARGIN`.
     let later = p
         .expires_at
@@ -1164,6 +1178,36 @@ mod tests {
         // The receipt of an authorization settles no ordinary operation.
         assert!(
             rpc::validate_settled_policy_packet(&test_support::policy_signed(), &receipt).is_err()
+        );
+    }
+
+    #[test]
+    fn no_authorization_is_signed_at_the_end_of_the_utc_day() {
+        // The same wallet, prepared `before` seconds before the end of its UTC day, valid
+        // for 100 seconds.
+        let at = |before: u64| {
+            let ordinary = test_support::native_signed().prepared;
+            let now = 2 * allowit_core::DAY - before;
+            let prepared = crate::prepare(
+                &ordinary.config,
+                &ordinary.request,
+                &ordinary.state,
+                now,
+                now + 100,
+            )
+            .expect("the wallet's own payment ends inside the day");
+            let r = authorization_request(&prepared);
+            attach(prepared, &r, now)
+        };
+        // The wallet's own payment may expire at the last second of the day. An
+        // authorization must expire a margin earlier: its ledger can close late.
+        assert_eq!(at(100).unwrap_err().to_string(), DAY_END);
+        assert_eq!(at(100 + DAY_MARGIN - 1).unwrap_err().to_string(), DAY_END);
+        assert!(
+            at(100 + DAY_MARGIN)
+                .unwrap()
+                .payment_authorization
+                .is_some()
         );
     }
 

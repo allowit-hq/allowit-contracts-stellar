@@ -624,12 +624,60 @@ impl SettlementProvider for Service {
     ) -> HostResult<Settled> {
         let rpc = rpc::HttpRpc::new(endpoint).map_err(rail)?;
         // The request names the payer of the reply; the ledger decides the outcome.
-        let authorization = structure(network, "", request)
-            .ok()
-            .map(|(_, authorization, ..)| authorization);
-        Ok(outcome(&rpc, network, authorization.clone(), *transaction)?
-            .unwrap_or_else(|| pending(network, authorization, *transaction)))
+        let read = structure(network, "", request).ok();
+        let authorization = read
+            .as_ref()
+            .map(|(_, authorization, ..)| authorization.clone());
+        if let Some(settled) = outcome(&rpc, network, authorization.clone(), *transaction)? {
+            return Ok(settled);
+        }
+        // A transaction that the ledger never took, and can never take, settles nothing: the
+        // caller may settle the authorization again while it is valid.
+        if let Some((_, a, timeout, _)) = &read
+            && never_included(&rpc, a, *timeout, transaction)?
+        {
+            return Ok(Settled {
+                reply: settle_reply(
+                    network,
+                    false,
+                    Some("settle_exact_stellar_transaction_not_included"),
+                    Some(&a.payer),
+                    None,
+                ),
+                outcome: Outcome::Refused,
+                authorization,
+                transaction: None,
+                fee_paid: None,
+            });
+        }
+        Ok(pending(network, authorization, *transaction))
     }
+}
+
+/// Whether the transaction `hash`, which carries the entry of `a`, is not in the ledger and
+/// can never be. The ledger admits the entry through its expiry ledger. The service sent the
+/// transaction no earlier than the ledger at which that expiry was inside the bound of
+/// `timeout`. So an endpoint whose history covers that span, past the expiry ledger, proves
+/// the absence when it does not know the hash.
+fn never_included(
+    rpc: &dyn rpc::Rpc,
+    a: &Authorization,
+    timeout: u64,
+    hash: &[u8; 32],
+) -> HostResult<bool> {
+    let reply = rpc
+        .call("getTransaction", json!({"hash": hex(hash)}))
+        .map_err(rail)?;
+    let (Some(oldest), Some(latest)) = (
+        reply["oldestLedger"].as_u64(),
+        reply["latestLedger"].as_u64(),
+    ) else {
+        return Ok(false);
+    };
+    let earliest = a
+        .expires_height
+        .saturating_sub(timeout.div_ceil(LEDGER_SECONDS) + EXPIRY_TOLERANCE);
+    Ok(reply["status"] == "NOT_FOUND" && latest > a.expires_height && oldest <= earliest)
 }
 
 #[cfg(test)]
@@ -1031,6 +1079,28 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        // A transaction that the ledger does not know after the expiry ledger of its entry
+        // was never included, when the endpoint's history covers the span in which the
+        // service can have sent it.
+        let expires = authorization.expires_height;
+        let absent = |status: &str, oldest: u64, latest: u64| {
+            never_included(
+                &Committed(
+                    json!({"status": status, "oldestLedger": oldest, "latestLedger": latest}),
+                ),
+                &authorization,
+                300,
+                &[9; 32],
+            )
+            .unwrap()
+        };
+        let earliest = expires - (60 + EXPIRY_TOLERANCE);
+        assert!(absent("NOT_FOUND", earliest, expires + 1));
+        // Before the expiry ledger passed, with a shorter history, or when the ledger knows
+        // the hash, nothing is proven.
+        assert!(!absent("NOT_FOUND", earliest, expires));
+        assert!(!absent("NOT_FOUND", earliest + 1, expires + 1));
+        assert!(!absent("SUCCESS", earliest, expires + 1));
         // No transfer, two transfers, and a transfer of another amount, payee, payer or token.
         assert_eq!(
             admitted(&ledger(vec![], 100), &request, 50_000),

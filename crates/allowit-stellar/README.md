@@ -259,6 +259,10 @@ exactly `transfer(wallet, payTo, amount)` on the asset contract, and its host pa
   the one invocation and the signed entry. It has no signature, and `rpc::broadcast` refuses it. The outcome
   document holds it as `paymentAuthorization.transaction`, and `proof` builds the standard payload
   `{x402Version, resource, accepted, payload: {transaction}}`.
+- **Day.** The limits count a payment in the UTC day of its preparation. The operation of an authorization
+  expires at least ten minutes before the end of that day (`seller_settled::DAY_MARGIN`), so its ledger
+  closes inside the day while ledgers close within that margin. Later in the day no authorization is signed
+  (`seller_settled::DAY_END`).
 - **Expiry.** The entry expires at a ledger: the ledger of the preparation plus one ledger for each six
   seconds of the operation's validity, at most 64. The ledger binds an entry to no time, so a ledger that
   closes late lets the transfer settle after the operation's expiry. The policy is therefore asked twice: for
@@ -299,7 +303,12 @@ The replies have the standard form: `{isValid, invalidReason?, payer?}` and
 time is `settlement_pending` with its hash; `observe` reads it again. A successful transaction is a
 settlement only when its committed contract events are that one transfer: a token can act otherwise in the
 ledger than in the simulation. A successful transaction with other events answers `success: false` with the
-reason and its hash. Without the committed events, the answer stays `settlement_pending`.
+reason and its hash. Without the committed events, the answer stays `settlement_pending`. A transaction that
+the network did not take is `settle_exact_stellar_transaction_submission_failed`: nothing was sent. `observe`
+answers `settle_exact_stellar_transaction_not_included` when the ledger does not know the hash after the
+expiry ledger of the entry and the endpoint's history covers the span in which the service can have sent it.
+The service signs the hash of its transaction: a caller that keeps what it signed has the hash before the
+transaction is sent.
 
 For a payment that the payer settles, `proof(challenge, receipt)` builds the request header from the outcome
 document of the confirmed operation: `X-PAYMENT` (version 1) or `PAYMENT-SIGNATURE` (version 2), the base64 JSON of

@@ -1275,7 +1275,9 @@ fn journaled(c: &Client, id: &str, record: Option<Record>, r: &Response) -> Reco
             policy_id: c.bundle.policy_id.clone(),
             request_id: id.into(),
             config: c.bundle.config.clone(),
-            request: r.prepared.request.clone(),
+            // The request as the agent sent it: for a payment authorization that is its
+            // intent, not the transfer that the operation around it prepares.
+            request: sdk::seller_settled::intent(&r.prepared).clone(),
             prepared: Some(r.prepared.clone()),
             agent_signature: None,
             status: None,
