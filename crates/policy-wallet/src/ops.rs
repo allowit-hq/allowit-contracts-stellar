@@ -2,8 +2,8 @@
 //! deposits and redeems. The wallet is every source, owner, receiver and operator.
 use crate::{AllowitWalletError, checked, public_key};
 use allowit_wallet_protocol::{
-    AllowitDepositArgs, AllowitExecutionRequest, AllowitExpenseBounds, AllowitRedeemArgs,
-    AllowitStellarOperation, AllowitSwapArgs, MAX_SWAP_PATH,
+    AllowitDepositArgs, AllowitExpenseBounds, AllowitOperationArgs, AllowitRedeemArgs,
+    AllowitSwapArgs, MAX_SWAP_PATH,
 };
 use soroban_sdk::{
     Address, Bytes, Env, Executable, IntoVal, Symbol, Vec,
@@ -20,21 +20,21 @@ pub(crate) struct Debit {
     pub(crate) amount: i128,
 }
 /// The debit of `operation` on a wallet of `asset`.
-pub(crate) fn debit(operation: &AllowitStellarOperation, asset: &Address) -> Debit {
+pub(crate) fn debit(operation: &AllowitOperationArgs, asset: &Address) -> Debit {
     match operation {
-        AllowitStellarOperation::Transfer(args) => Debit {
+        AllowitOperationArgs::Transfer(args) => Debit {
             token: args.token.clone(),
             amount: args.amount,
         },
-        AllowitStellarOperation::Swap(args) => Debit {
+        AllowitOperationArgs::Swap(args) => Debit {
             token: args.path.get_unchecked(0),
             amount: args.amount_in,
         },
-        AllowitStellarOperation::Deposit(args) => Debit {
+        AllowitOperationArgs::Deposit(args) => Debit {
             token: asset.clone(),
             amount: args.assets,
         },
-        AllowitStellarOperation::Redeem(args) => Debit {
+        AllowitOperationArgs::Redeem(args) => Debit {
             token: args.vault.clone(),
             amount: args.shares,
         },
@@ -51,11 +51,11 @@ pub(crate) struct Facts {
 }
 /// The request facts of `operation`. A forward swap counts its asset input as the gross amount; a
 /// reverse swap and a redeem count their minimum asset output, a floor.
-pub(crate) fn facts(operation: &AllowitStellarOperation, asset: &Address) -> Facts {
+pub(crate) fn facts(operation: &AllowitOperationArgs, asset: &Address) -> Facts {
     let debit = debit(operation, asset);
     let (recipient, amount, token_out, min_out) = match operation {
-        AllowitStellarOperation::Transfer(args) => (args.to.clone(), args.amount, None, 0),
-        AllowitStellarOperation::Swap(args) => {
+        AllowitOperationArgs::Transfer(args) => (args.to.clone(), args.amount, None, 0),
+        AllowitOperationArgs::Swap(args) => {
             let last = args.path.get_unchecked(args.path.len() - 1);
             let amount = if debit.token == *asset {
                 args.amount_in
@@ -65,13 +65,13 @@ pub(crate) fn facts(operation: &AllowitStellarOperation, asset: &Address) -> Fac
             let router = args.router.clone();
             (router, amount, Some(last), args.amount_out_min)
         }
-        AllowitStellarOperation::Deposit(args) => (
+        AllowitOperationArgs::Deposit(args) => (
             args.vault.clone(),
             args.assets,
             Some(args.vault.clone()),
             args.min_shares,
         ),
-        AllowitStellarOperation::Redeem(args) => (
+        AllowitOperationArgs::Redeem(args) => (
             args.vault.clone(),
             args.min_assets,
             Some(asset.clone()),
@@ -100,12 +100,13 @@ pub(crate) fn is_contract(address: &Address) -> bool {
 /// owner, receiver and operator.
 pub(crate) fn validate_operation(
     env: &Env,
-    execution: &AllowitExecutionRequest,
+    operation: &AllowitOperationArgs,
+    expires_at: u64,
     asset: &Address,
 ) -> Result<(), AllowitWalletError> {
     let wallet = env.current_contract_address();
-    let (vault, amount, minimum) = match &execution.operation {
-        AllowitStellarOperation::Transfer(args) => {
+    let (vault, amount, minimum) = match operation {
+        AllowitOperationArgs::Transfer(args) => {
             if args.token != *asset {
                 return Err(AllowitWalletError::InvalidInvocation);
             }
@@ -117,9 +118,9 @@ pub(crate) fn validate_operation(
             }
             return Ok(());
         }
-        AllowitStellarOperation::Swap(args) => return validate_swap(env, execution, asset, args),
-        AllowitStellarOperation::Deposit(args) => (&args.vault, args.assets, args.min_shares),
-        AllowitStellarOperation::Redeem(args) => (&args.vault, args.shares, args.min_assets),
+        AllowitOperationArgs::Swap(args) => return validate_swap(env, expires_at, asset, args),
+        AllowitOperationArgs::Deposit(args) => (&args.vault, args.assets, args.min_shares),
+        AllowitOperationArgs::Redeem(args) => (&args.vault, args.shares, args.min_assets),
     };
     if *vault == wallet || vault == asset {
         return Err(AllowitWalletError::InvalidInvocation);
@@ -134,7 +135,7 @@ pub(crate) fn validate_operation(
 /// falls within the request expiry.
 fn validate_swap(
     env: &Env,
-    execution: &AllowitExecutionRequest,
+    expires_at: u64,
     asset: &Address,
     args: &AllowitSwapArgs,
 ) -> Result<(), AllowitWalletError> {
@@ -143,7 +144,7 @@ fn validate_swap(
     if args.router == wallet
         || args.router == *asset
         || !(2..=MAX_SWAP_PATH).contains(&n)
-        || args.deadline > execution.expires_at
+        || args.deadline > expires_at
     {
         return Err(AllowitWalletError::InvalidInvocation);
     }

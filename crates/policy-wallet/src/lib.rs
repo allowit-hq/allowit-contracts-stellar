@@ -20,7 +20,7 @@ use allowit::{
     AllowitStandardState, AllowitTier, AllowitValue, DAY, RULES,
 };
 use allowit_wallet_protocol::{
-    AllowitCosignatures, AllowitExecuted, AllowitExecutionRequest, AllowitStellarOperation,
+    AllowitCosignatures, AllowitExecuted, AllowitExecutionRequest, AllowitOperationArgs,
 };
 use soroban_sdk::{
     Address, Bytes, BytesN, Env, Executable, IntoVal, Map, Symbol, Val, Vec,
@@ -452,11 +452,15 @@ struct Stored {
     day_ends: Option<u32>,
     total_exists: bool,
 }
-/// Read `t` and an open `d`. A window whose end ledger has passed is closed even if someone paid
-/// to keep the entry alive.
-fn read_figures(env: &Env) -> Result<Stored, AllowitWalletError> {
+/// Read `t` and an open `d`, each only when `kept` names one of its figures. A window whose end
+/// ledger has passed is closed even if someone paid to keep the entry alive.
+fn read_figures(env: &Env, kept: u8) -> Result<Stored, AllowitWalletError> {
     let mut figures = Figures::default();
-    let total: Option<Bytes> = env.storage().persistent().get(&TOTAL);
+    let total: Option<Bytes> = if kept & TOTALS != 0 {
+        env.storage().persistent().get(&TOTAL)
+    } else {
+        None
+    };
     if let Some(raw) = &total {
         let mut buf = [0u8; 64];
         let len = raw.len() as usize;
@@ -479,7 +483,11 @@ fn read_figures(env: &Env) -> Result<Stored, AllowitWalletError> {
         }
     }
     let mut day_ends = None;
-    let daily: Option<Bytes> = env.storage().temporary().get(&DAILY);
+    let daily: Option<Bytes> = if kept & DAILIES != 0 {
+        env.storage().temporary().get(&DAILY)
+    } else {
+        None
+    };
     if let Some(raw) = daily {
         let mut buf = [0u8; 64];
         let len = raw.len() as usize;
@@ -566,7 +574,7 @@ fn write_daily(
 /// Make `t` match the figures that a new configuration keeps: rewrite it for a new set, create it
 /// at zero for a set that gains totals, remove it for one that keeps none.
 fn reshape_total(env: &Env, kept: u8) -> Result<(), AllowitWalletError> {
-    let stored = read_figures(env)?;
+    let stored = read_figures(env, TOTALS)?;
     if kept & TOTALS != 0 {
         write_total(env, kept, &stored.figures, stored.total_exists)
     } else {
@@ -670,7 +678,7 @@ pub fn construct<P: AllowitPolicy>(
 /// Read the stored wallet.
 pub fn state<P: AllowitPolicy>(env: &Env) -> Result<AllowitState, AllowitWalletError> {
     let config = Config::load(env)?;
-    let stored = read_figures(env)?;
+    let stored = read_figures(env, ALL)?;
     let f = stored.figures;
     Ok(AllowitState {
         contract_version: CONTRACT_VERSION,
@@ -703,18 +711,19 @@ fn validate_expense(
     env: &Env,
     config: &Config,
     execution: &AllowitExecutionRequest,
+    operation: &AllowitOperationArgs,
 ) -> Result<(), AllowitWalletError> {
-    let gas = execution.gas_stroops;
+    let gas = execution.gas_stroops();
     if gas < 0 {
         return Err(AllowitWalletError::InvalidAmount);
     }
     if gas > config.gas_cap {
         return Err(AllowitWalletError::GasAboveCap);
     }
-    if gas > 0 && execution.gas_payee == env.current_contract_address() {
+    if gas > 0 && *execution.gas_payee() == env.current_contract_address() {
         return Err(AllowitWalletError::InvalidRecipient);
     }
-    let Some(expense) = execution.expense.bounds() else {
+    let Some(expense) = execution.expense() else {
         // An unpriced request counts no gas, so it repays none.
         return if gas == 0 {
             Ok(())
@@ -722,9 +731,14 @@ fn validate_expense(
             Err(AllowitWalletError::InvalidInvocation)
         };
     };
-    if expense.gas_units < 0
-        || expense.conversion_units < 0
-        || expense.spent_units < 0
+    let (gas_units, conversion, spent) = (
+        expense.gas_units,
+        expense.conversion_units,
+        expense.spent_units,
+    );
+    if gas_units < 0
+        || conversion < 0
+        || spent < 0
         || expense.observed_ledger == 0
         || expense.observed_ledger > env.ledger().sequence()
     {
@@ -732,36 +746,32 @@ fn validate_expense(
     }
     // The repaid gas is what the limits count. An XLM wallet counts the repaid stroops exactly;
     // for another asset the agent and server attest the conversion.
-    if (gas == 0) != (expense.gas_units == 0)
-        || (config.asset == native_asset(env) && expense.gas_units != gas)
-    {
+    if (gas == 0) != (gas_units == 0) || (config.asset == native_asset(env) && gas_units != gas) {
         return Err(AllowitWalletError::InvalidInvocation);
     }
-    let principal = match &execution.operation {
-        AllowitStellarOperation::Transfer(args) => {
-            if expense.conversion_units != 0 {
+    let principal = match operation {
+        AllowitOperationArgs::Transfer(args) => {
+            if conversion != 0 {
                 return Err(AllowitWalletError::InvalidInvocation);
             }
             args.amount
         }
-        AllowitStellarOperation::Deposit(args) => {
-            if expense.conversion_units > args.assets {
+        AllowitOperationArgs::Deposit(args) => {
+            if conversion > args.assets {
                 return Err(AllowitWalletError::InvalidInvocation);
             }
-            expense.conversion_units
+            conversion
         }
         // A forward swap pays the asset: its loss cannot exceed the input.
-        AllowitStellarOperation::Swap(args) => {
-            if args.path.get_unchecked(0) == config.asset
-                && expense.conversion_units > args.amount_in
-            {
+        AllowitOperationArgs::Swap(args) => {
+            if args.path.get_unchecked(0) == config.asset && conversion > args.amount_in {
                 return Err(AllowitWalletError::InvalidInvocation);
             }
-            expense.conversion_units
+            conversion
         }
-        AllowitStellarOperation::Redeem(_) => expense.conversion_units,
+        AllowitOperationArgs::Redeem(_) => conversion,
     };
-    if expense.spent_units != checked(principal.checked_add(expense.gas_units))? {
+    if spent != checked(principal.checked_add(gas_units))? {
         return Err(AllowitWalletError::InvalidInvocation);
     }
     Ok(())
@@ -773,10 +783,11 @@ fn rule_input(
     env: &Env,
     config: &Config,
     execution: &AllowitExecutionRequest,
+    operation: &AllowitOperationArgs,
     f: &Figures,
 ) -> Result<AllowitContext, AllowitWalletError> {
-    let facts = facts(&execution.operation, &config.asset);
-    let expense = execution.expense.bounds();
+    let facts = facts(operation, &config.asset);
+    let expense = execution.expense();
     let now = env.ledger().timestamp();
     // The daily window is the life of `d`: the figures of an open window are today's.
     let mut state = Map::new(env);
@@ -795,7 +806,7 @@ fn rule_input(
         params: AllowitParams::new(env, config.params.clone())?,
         state,
         request: AllowitRequest {
-            operation: execution.operation.to_core(),
+            operation: execution.operation().to_core(),
             asset: config.asset.clone(),
             recipient: facts.recipient,
             amount: facts.amount,
@@ -804,11 +815,11 @@ fn rule_input(
             token_out: facts.token_out,
             min_out: facts.min_out,
             now,
-            expires_at: execution.expires_at,
+            expires_at: execution.expires_at(),
             spent_units: expense.map_or(0, |e| e.spent_units),
             gas_units: expense.map_or(0, |e| e.gas_units),
             unpriced: expense.is_none(),
-            args: AllowitArgs(execution.args.clone()),
+            args: AllowitArgs(execution.args().clone()),
         },
     })
 }
@@ -819,6 +830,7 @@ fn admit<P: AllowitPolicy>(
     env: &Env,
     config: &Config,
     execution: &AllowitExecutionRequest,
+    operation: &AllowitOperationArgs,
 ) -> Result<(), AllowitWalletError> {
     let kept = kept::<P>(&config.rules, &config.params);
     // Simple, and Standard with no rules: no rule runs and nothing is stored.
@@ -837,9 +849,9 @@ fn admit<P: AllowitPolicy>(
             total_exists: false,
         }
     } else {
-        read_figures(env)?
+        read_figures(env, kept)?
     };
-    let ctx = rule_input(env, config, execution, &stored.figures)?;
+    let ctx = rule_input(env, config, execution, operation, &stored.figures)?;
     P::check(&ctx, &config.rules)?;
     // A Standard policy writes nothing but figures. Custom runs the shared post-flight even with
     // none, so a source write fails as `Unsupported` instead of being stored.
@@ -889,52 +901,47 @@ pub fn execute<P: AllowitPolicy>(
     if config.paused {
         return Err(AllowitWalletError::Paused);
     }
-    if execution.deployment_version != config.version {
+    if execution.deployment_version() != config.version {
         return Err(AllowitWalletError::StaleRequest);
     }
-    if execution.expires_at <= env.ledger().timestamp() {
+    if execution.expires_at() <= env.ledger().timestamp() {
         return Err(AllowitWalletError::Expired);
     }
-    let Some(Executable::Wasm(module)) = wallet.executable() else {
-        return Err(AllowitWalletError::InvalidState);
-    };
     if P::source_digest(env).is_some_and(|digest| digest != config.source_hash) {
         return Err(AllowitWalletError::InvalidState);
     }
-    if execution.module_digest != module
-        || execution.source_hash != config.source_hash
-        || execution.operation_id == BytesN::from_array(env, &[0; 32])
-        || allowit::check_args(&execution.args).is_err()
+    if *execution.operation_id() == BytesN::from_array(env, &[0; 32])
+        || allowit::check_args(execution.args()).is_err()
     {
         return Err(AllowitWalletError::InvalidInvocation);
     }
-    if !P::OPERATIONS.contains(&execution.operation.to_core()) {
+    if !P::OPERATIONS.contains(&execution.operation().to_core()) {
         return Err(AllowitWalletError::UnsupportedOperation);
     }
-    validate_operation(env, &execution, &config.asset)?;
-    validate_expense(env, &config, &execution)?;
-    admit::<P>(env, &config, &execution)?;
-    let expense = execution.expense.bounds();
-    let output = match &execution.operation {
-        AllowitStellarOperation::Transfer(args) => {
+    let operation = execution.operation().args();
+    validate_operation(env, &operation, execution.expires_at(), &config.asset)?;
+    validate_expense(env, &config, &execution, &operation)?;
+    admit::<P>(env, &config, &execution, &operation)?;
+    let expense = execution.expense();
+    let output = match &operation {
+        AllowitOperationArgs::Transfer(args) => {
             move_tokens(env, &args.token, &args.to, args.amount)?;
             args.amount
         }
-        AllowitStellarOperation::Swap(args) => swap_tokens(env, args)?,
-        AllowitStellarOperation::Deposit(args) => {
-            deposit_tokens(env, &config.asset, args, expense)?
+        AllowitOperationArgs::Swap(args) => swap_tokens(env, args)?,
+        AllowitOperationArgs::Deposit(args) => {
+            deposit_tokens(env, &config.asset, args, expense.as_ref())?
         }
-        AllowitStellarOperation::Redeem(args) => redeem_shares(env, &config.asset, args, expense)?,
+        AllowitOperationArgs::Redeem(args) => {
+            redeem_shares(env, &config.asset, args, expense.as_ref())?
+        }
     };
-    if execution.gas_stroops > 0 {
-        token::Client::new(env, &native_asset(env)).transfer(
-            &wallet,
-            &execution.gas_payee,
-            &execution.gas_stroops,
-        );
+    let gas = execution.gas_stroops();
+    if gas > 0 {
+        token::Client::new(env, &native_asset(env)).transfer(&wallet, execution.gas_payee(), &gas);
     }
     AllowitExecuted {
-        operation_id: execution.operation_id,
+        operation_id: execution.operation_id().clone(),
         output,
     }
     .publish(env);
@@ -964,12 +971,12 @@ pub fn check_auth(
     env.crypto().ed25519_verify(
         &BytesN::from_array(env, &header.key(H_AGENT)),
         &message,
-        &signatures.agent,
+        &signatures.0,
     );
     env.crypto().ed25519_verify(
         &BytesN::from_array(env, &header.key(H_SERVER)),
         &message,
-        &signatures.server,
+        &signatures.1,
     );
     Ok(())
 }

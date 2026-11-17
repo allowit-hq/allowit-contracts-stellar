@@ -6,10 +6,7 @@ use allowit::{
     LIFETIME_SPENDING_LIMIT, OPERATIONS, PAYMENT_LIMIT, TOKENS,
 };
 use allowit_sep56_test_vault::AllowitSep56TestVaultClient;
-use allowit_wallet_protocol::{
-    AllowitDepositArgs, AllowitExpense, AllowitExpenseBounds, AllowitRedeemArgs, AllowitSwapArgs,
-    AllowitTransferArgs,
-};
+use allowit_wallet_protocol::{AllowitExpense, AllowitStellarOperation};
 use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
     Bytes, InvokeError, TryFromVal, TryIntoVal, contract, contractimpl,
@@ -109,7 +106,6 @@ fn hash(env: &Env, bytes: &[u8]) -> BytesN<32> {
 
 pub(super) struct Fixture {
     env: Env,
-    wasm: &'static [u8],
     wallet: Address,
     owner: Address,
     /// The wallet's asset: XLM unless the fixture says otherwise.
@@ -222,7 +218,6 @@ impl Fixture {
         env.set_auths(&[]);
         Self {
             env,
-            wasm,
             wallet,
             owner,
             asset,
@@ -238,9 +233,6 @@ impl Fixture {
     fn client(&self) -> Client<'_> {
         Client::new(&self.env, &self.wallet)
     }
-    fn module(&self) -> BytesN<32> {
-        hash(&self.env, self.wasm)
-    }
     fn balance(&self, token: &Address, holder: &Address) -> i128 {
         token::Client::new(&self.env, token).balance(holder)
     }
@@ -255,27 +247,21 @@ impl Fixture {
         } else {
             gas * 2
         };
-        AllowitExecutionRequest {
-            operation_id: BytesN::from_array(&self.env, &id),
-            deployment_version: self.client().state().deployment_version,
-            source_hash: self.source.clone(),
-            module_digest: self.module(),
-            expires_at: self.env.ledger().timestamp() + 100,
-            operation: AllowitStellarOperation::Transfer(AllowitTransferArgs {
-                token: self.asset.clone(),
-                to: self.recipient.clone(),
-                amount,
-            }),
-            expense: AllowitExpense::Priced(AllowitExpenseBounds {
+        AllowitExecutionRequest(
+            BytesN::from_array(&self.env, &id),
+            self.client().state().deployment_version,
+            self.env.ledger().timestamp() + 100,
+            AllowitStellarOperation::Transfer(self.asset.clone(), self.recipient.clone(), amount),
+            AllowitExpense::Priced(
                 gas_units,
-                conversion_units: 0,
-                spent_units: amount + gas_units,
-                observed_ledger: self.env.ledger().sequence(),
-            }),
-            gas_stroops: gas,
-            gas_payee: self.payee.clone(),
-            args: Map::new(&self.env),
-        }
+                0,
+                amount + gas_units,
+                self.env.ledger().sequence(),
+            ),
+            gas,
+            self.payee.clone(),
+            Map::new(&self.env),
+        )
     }
     /// Run `e` under the wallet's own authorization, signed by the agent and the server with a
     /// fresh ledger nonce.
@@ -321,10 +307,10 @@ impl Fixture {
                 invocation: invocation.clone(),
             });
         let payload = hash(&self.env, &preimage.to_xdr(xdr::Limits::none()).unwrap());
-        let signatures = AllowitCosignatures {
-            agent: BytesN::from_array(&self.env, &agent.sign(&payload.to_array()).to_bytes()),
-            server: BytesN::from_array(&self.env, &server.sign(&payload.to_array()).to_bytes()),
-        };
+        let signatures = AllowitCosignatures(
+            BytesN::from_array(&self.env, &agent.sign(&payload.to_array()).to_bytes()),
+            BytesN::from_array(&self.env, &server.sign(&payload.to_array()).to_bytes()),
+        );
         let signature: Val = signatures.into_val(&self.env);
         xdr::SorobanAuthorizationEntry {
             credentials: xdr::SorobanCredentials::Address(xdr::SorobanAddressCredentials {
@@ -470,6 +456,7 @@ fn denied(wasm: &[u8], rule: AllowitError) -> Result<(), Result<AllowitWalletErr
 fn a_payment_needs_the_wallets_own_authorization_signed_by_agent_and_server() {
     for wasm in [SIMPLE, COMMON, CUSTOM] {
         let f = Fixture::new(wasm);
+        assert_eq!(f.client().state().source_hash, f.source);
         let e = f.transfer(10, 5);
         let stranger = SigningKey::from_bytes(&[99; 32]);
         // Each key alone, a stranger in either place, and the two keys swapped are refused.
@@ -512,7 +499,7 @@ fn a_signature_of_changed_arguments_is_refused() {
     let e = f.transfer(10, 0);
     let entry = f.signed(&e, &f.akey, &f.skey, 1, 150);
     let mut changed = e.clone();
-    changed.gas_stroops = 20;
+    changed.5 = 20;
     assert!(!f.run_signed(&changed, entry));
 }
 
@@ -521,10 +508,7 @@ fn check_auth_authorizes_only_this_wallets_execute() {
     let f = Fixture::new(SIMPLE);
     let payload = BytesN::from_array(&f.env, &[5; 32]);
     let sign = |key: &SigningKey| BytesN::from_array(&f.env, &key.sign(&[5; 32]).to_bytes());
-    let signatures = AllowitCosignatures {
-        agent: sign(&f.akey),
-        server: sign(&f.skey),
-    };
+    let signatures = AllowitCosignatures(sign(&f.akey), sign(&f.skey));
     let call = |contract: &Address, name: &str| {
         Context::Contract(soroban_sdk::auth::ContractContext {
             contract: contract.clone(),
@@ -566,10 +550,10 @@ fn check_auth_authorizes_only_this_wallets_execute() {
         Err(Ok(AllowitWalletError::InvalidInvocation))
     );
     // A signature of another payload.
-    let other = AllowitCosignatures {
-        agent: BytesN::from_array(&f.env, &f.akey.sign(&[6; 32]).to_bytes()),
-        server: signatures.server.clone(),
-    };
+    let other = AllowitCosignatures(
+        BytesN::from_array(&f.env, &f.akey.sign(&[6; 32]).to_bytes()),
+        signatures.1.clone(),
+    );
     let mut list = Vec::new(&f.env);
     list.push_back(call(&f.wallet, "execute"));
     assert!(
@@ -598,55 +582,45 @@ type ConfigCase = (&'static str, fn(&Env, &mut AllowitPolicyConfig));
 #[test]
 fn request_bindings_and_gas_are_checked() {
     let f = Fixture::new(SIMPLE);
-    let cases: [RequestCase; 10] = [
+    let cases: [RequestCase; 8] = [
         (
             "stale version",
-            |_, e| e.deployment_version = 1,
+            |_, e| e.1 = 1,
             AllowitWalletError::StaleRequest,
         ),
         (
             "expired",
-            |f, e| e.expires_at = f.env.ledger().timestamp(),
+            |f, e| e.2 = f.env.ledger().timestamp(),
             AllowitWalletError::Expired,
         ),
         (
-            "other code",
-            |f, e| e.module_digest = BytesN::from_array(&f.env, &[1; 32]),
-            AllowitWalletError::InvalidInvocation,
-        ),
-        (
-            "other source",
-            |f, e| e.source_hash = BytesN::from_array(&f.env, &[1; 32]),
-            AllowitWalletError::InvalidInvocation,
-        ),
-        (
             "zero operation id",
-            |f, e| e.operation_id = BytesN::from_array(&f.env, &[0; 32]),
+            |f, e| e.0 = BytesN::from_array(&f.env, &[0; 32]),
             AllowitWalletError::InvalidInvocation,
         ),
         (
             "gas above the cap",
             |_, e| {
-                e.gas_stroops = 21;
-                if let AllowitExpense::Priced(b) = &mut e.expense {
-                    b.gas_units = 21;
-                    b.spent_units = 31;
+                e.5 = 21;
+                if let AllowitExpense::Priced(gas_units, _, spent, _) = &mut e.4 {
+                    *gas_units = 21;
+                    *spent = 31;
                 }
             },
             AllowitWalletError::GasAboveCap,
         ),
         (
             "negative gas",
-            |_, e| e.gas_stroops = -1,
+            |_, e| e.5 = -1,
             AllowitWalletError::InvalidAmount,
         ),
         (
             "XLM gas counted as another amount",
             |_, e| {
-                e.gas_stroops = 5;
-                if let AllowitExpense::Priced(b) = &mut e.expense {
-                    b.gas_units = 4;
-                    b.spent_units = 14;
+                e.5 = 5;
+                if let AllowitExpense::Priced(gas_units, _, spent, _) = &mut e.4 {
+                    *gas_units = 4;
+                    *spent = 14;
                 }
             },
             AllowitWalletError::InvalidInvocation,
@@ -654,14 +628,14 @@ fn request_bindings_and_gas_are_checked() {
         (
             "gas repaid to the wallet itself",
             |f, e| {
-                e.gas_payee = f.wallet.clone();
+                e.6 = f.wallet.clone();
             },
             AllowitWalletError::InvalidRecipient,
         ),
         (
             "gas repaid on an unpriced request",
             |_, e| {
-                e.expense = AllowitExpense::Unpriced;
+                e.4 = AllowitExpense::Unpriced;
             },
             AllowitWalletError::InvalidInvocation,
         ),
@@ -673,12 +647,12 @@ fn request_bindings_and_gas_are_checked() {
     }
     // A transfer to the wallet itself; an unpriced request without gas runs.
     let mut e = f.transfer(10, 0);
-    if let AllowitStellarOperation::Transfer(a) = &mut e.operation {
-        a.to = f.wallet.clone();
+    if let AllowitStellarOperation::Transfer(_, to, _) = &mut e.3 {
+        *to = f.wallet.clone();
     }
     assert_eq!(f.run(&e), Err(Ok(AllowitWalletError::InvalidRecipient)));
     let mut e = f.transfer(10, 0);
-    e.expense = AllowitExpense::Unpriced;
+    e.4 = AllowitExpense::Unpriced;
     assert_eq!(f.run(&e), Ok(()));
     assert_eq!(f.balance(&f.asset, &f.recipient), 10);
 }
@@ -695,9 +669,9 @@ fn a_wallet_of_another_asset_repays_gas_in_xlm_and_counts_its_attested_units() {
     assert_eq!(f.figures().spent, 18);
     // Gas without units, or units without gas, is refused.
     let mut e = f.transfer(10, 4);
-    if let AllowitExpense::Priced(b) = &mut e.expense {
-        b.gas_units = 0;
-        b.spent_units = 10;
+    if let AllowitExpense::Priced(gas_units, _, spent, _) = &mut e.4 {
+        *gas_units = 0;
+        *spent = 10;
     }
     assert_eq!(f.run(&e), Err(Ok(AllowitWalletError::InvalidInvocation)));
     // A USDC-only wallet gets a signed repayment of zero.
@@ -819,7 +793,7 @@ fn total_figures_are_created_at_deployment_and_kept_for_their_checks() {
     assert_eq!((figures.spent, figures.calls), (250, 3));
     // The call limit of 4 counts the next one, then denies.
     let mut e = f.transfer(1, 0);
-    e.expense = AllowitExpense::Unpriced;
+    e.4 = AllowitExpense::Unpriced;
     assert_eq!(
         f.run(&e),
         denied(COMMON, AllowitError::LifetimeSpendingLimitExceeded)
@@ -874,7 +848,7 @@ fn an_owner_update_reshapes_the_kept_figures() {
     assert_eq!(f.entries().len(), 1);
     // A request signed before the update is stale.
     let mut e = f.transfer(1, 0);
-    e.deployment_version = 0;
+    e.1 = 0;
     assert_eq!(f.run(&e), Err(Ok(AllowitWalletError::StaleRequest)));
 }
 
@@ -951,8 +925,8 @@ fn standard_and_custom_rules_deny_on_chain_and_simple_runs_none() {
             denied(wasm, AllowitError::PaymentLimitExceeded)
         );
         let mut e = f.transfer(10, 0);
-        if let AllowitStellarOperation::Transfer(a) = &mut e.operation {
-            a.to = Address::generate(&f.env);
+        if let AllowitStellarOperation::Transfer(_, to, _) = &mut e.3 {
+            *to = Address::generate(&f.env);
         }
         assert_eq!(f.run(&e), denied(wasm, AllowitError::DestinationNotAllowed));
         // 100 + 5 gas, then 50 + 5: the daily volume of 160 holds 160 but not 161; the daily
@@ -1005,7 +979,7 @@ fn one_event_names_the_operation_and_its_output() {
         topics,
         &std::vec![
             xdr::ScVal::Symbol("allowit".try_into().unwrap()),
-            xdr::ScVal::Bytes(e.operation_id.to_array().to_vec().try_into().unwrap()),
+            xdr::ScVal::Bytes(e.0.to_array().to_vec().try_into().unwrap()),
         ]
     );
     assert_eq!(data, &xdr::ScVal::I128(xdr::Int128Parts { hi: 0, lo: 10 }));
@@ -1059,12 +1033,7 @@ impl MockRouter {
 
 /// Price a swap, deposit or redeem: its spent units are the conversion loss plus gas.
 fn priced(f: &Fixture, e: &mut AllowitExecutionRequest, conversion: i128) {
-    e.expense = AllowitExpense::Priced(AllowitExpenseBounds {
-        gas_units: e.gas_stroops,
-        conversion_units: conversion,
-        spent_units: conversion + e.gas_stroops,
-        observed_ledger: f.env.ledger().sequence(),
-    });
+    e.4 = AllowitExpense::Priced(e.5, conversion, conversion + e.5, f.env.ledger().sequence());
 }
 
 #[test]
@@ -1087,13 +1056,13 @@ fn swap_deposit_and_redeem_run_through_execute_with_effect_checks() {
         let router = f.env.register(MockRouter, (pair.clone(), 95i128));
         f.env.set_auths(&[]);
         let mut e = f.transfer(1, 0);
-        e.operation = AllowitStellarOperation::Swap(AllowitSwapArgs {
-            router: router.clone(),
-            amount_in: 50,
-            amount_out_min: 47,
-            path: Vec::from_array(&f.env, [f.asset.clone(), other.clone()]),
-            deadline: e.expires_at,
-        });
+        e.3 = AllowitStellarOperation::Swap(
+            router.clone(),
+            50,
+            47,
+            Vec::from_array(&f.env, [f.asset.clone(), other.clone()]),
+            e.2,
+        );
         priced(&f, &mut e, 3);
         assert_eq!(f.run(&e), Ok(()));
         assert_eq!(
@@ -1107,23 +1076,15 @@ fn swap_deposit_and_redeem_run_through_execute_with_effect_checks() {
         // Deposit 40 into a vault and redeem 30 shares.
         let vault = f.env.register(VAULT, (f.asset.clone(), 0u32));
         let mut e = f.transfer(1, 0);
-        e.operation_id = BytesN::from_array(&f.env, &[2; 32]);
-        e.operation = AllowitStellarOperation::Deposit(AllowitDepositArgs {
-            vault: vault.clone(),
-            assets: 40,
-            min_shares: 40,
-        });
+        e.0 = BytesN::from_array(&f.env, &[2; 32]);
+        e.3 = AllowitStellarOperation::Deposit(vault.clone(), 40, 40);
         priced(&f, &mut e, 0);
         assert_eq!(f.run(&e), Ok(()));
         let vault_client = AllowitSep56TestVaultClient::new(&f.env, &vault);
         assert_eq!(vault_client.balance(&f.wallet), 40);
         let mut e = f.transfer(1, 0);
-        e.operation_id = BytesN::from_array(&f.env, &[3; 32]);
-        e.operation = AllowitStellarOperation::Redeem(AllowitRedeemArgs {
-            vault: vault.clone(),
-            shares: 30,
-            min_assets: 30,
-        });
+        e.0 = BytesN::from_array(&f.env, &[3; 32]);
+        e.3 = AllowitStellarOperation::Redeem(vault.clone(), 30, 30);
         priced(&f, &mut e, 0);
         assert_eq!(f.run(&e), Ok(()));
         assert_eq!(
@@ -1136,12 +1097,8 @@ fn swap_deposit_and_redeem_run_through_execute_with_effect_checks() {
         // A deposit into a vault of another asset is refused.
         let wrong = f.env.register(VAULT, (other.clone(), 0u32));
         let mut e = f.transfer(1, 0);
-        e.operation_id = BytesN::from_array(&f.env, &[4; 32]);
-        e.operation = AllowitStellarOperation::Deposit(AllowitDepositArgs {
-            vault: wrong,
-            assets: 10,
-            min_shares: 10,
-        });
+        e.0 = BytesN::from_array(&f.env, &[4; 32]);
+        e.3 = AllowitStellarOperation::Deposit(wrong, 10, 10);
         priced(&f, &mut e, 0);
         assert_eq!(f.run(&e), Err(Ok(AllowitWalletError::UnsupportedAsset)));
     }
@@ -1166,21 +1123,13 @@ fn a_custom_wallet_deposits_within_its_policy() {
         Ok(())
     );
     let mut e = f.transfer(1, 0);
-    e.operation = AllowitStellarOperation::Deposit(AllowitDepositArgs {
-        vault: vault.clone(),
-        assets: 40,
-        min_shares: 40,
-    });
+    e.3 = AllowitStellarOperation::Deposit(vault.clone(), 40, 40);
     priced(&f, &mut e, 0);
     assert_eq!(f.run(&e), Ok(()));
     // The sample source limits each payment to 100: a deposit of 101 is denied.
     let mut e = f.transfer(1, 0);
-    e.operation_id = BytesN::from_array(&f.env, &[2; 32]);
-    e.operation = AllowitStellarOperation::Deposit(AllowitDepositArgs {
-        vault,
-        assets: 101,
-        min_shares: 101,
-    });
+    e.0 = BytesN::from_array(&f.env, &[2; 32]);
+    e.3 = AllowitStellarOperation::Deposit(vault, 101, 101);
     priced(&f, &mut e, 0);
     assert_eq!(
         f.run(&e),
