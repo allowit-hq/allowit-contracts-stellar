@@ -1051,6 +1051,36 @@ pub fn receipt_by_hash(
     let v = rpc.call("getTransaction", json!({"hash":hex(transaction_hash)}))?;
     receipt_from_response(&v, network, transaction_hash)
 }
+/// Read the verified terminal receipt of the transaction that the ledger reports under `reported`,
+/// as an event does: the transaction itself, or the fee bump that carries it. A fee bump is
+/// verified as a wrapper, and the receipt is that of its inner transaction, under the inner
+/// hash. Absence remains unknown.
+pub fn receipt_by_reported_hash(
+    rpc: &dyn Rpc,
+    network: &str,
+    reported: &[u8; 32],
+) -> Result<Option<VerifiedReceipt>> {
+    let v = rpc.call("getTransaction", json!({"hash":hex(reported)}))?;
+    let envelope = v["envelopeXdr"]
+        .as_str()
+        .map(read::<TransactionEnvelope>)
+        .transpose()?;
+    let Some(TransactionEnvelope::TxFeeBump(outer)) = envelope else {
+        return receipt_from_response(&v, network, reported);
+    };
+    let payload = TransactionSignaturePayload {
+        network_id: Hash(network_id(network)?),
+        tagged_transaction: TransactionSignaturePayloadTaggedTransaction::TxFeeBump(
+            outer.tx.clone(),
+        ),
+    };
+    // The wrapper is the transaction that the ledger reported, and no other.
+    if hash(payload.to_xdr(limits()).map_err(err)?) != *reported {
+        return Err("The reported transaction differs from its fee bump".into());
+    }
+    let FeeBumpTransactionInnerTx::Tx(inner) = &outer.tx.inner_tx;
+    receipt_from_response(&v, network, &transaction_hash_for(network, &inner.tx)?)
+}
 fn receipt_from_response(
     v: &Value,
     network: &str,

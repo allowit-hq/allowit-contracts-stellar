@@ -783,7 +783,9 @@ pub fn observe(rpc: &dyn rpc::Rpc, p: &PreparedOperation) -> Result<Observed> {
     // A reported transfer whose transaction cannot be read may be the settlement.
     let mut unread = false;
     for hash in &found.transactions {
-        let Some(mut receipt) = rpc::receipt_by_hash(rpc, &p.config.network, hash)? else {
+        // An event names the transaction that the ledger applied: for a payment that a fee
+        // bump carries, that is the wrapper.
+        let Some(mut receipt) = rpc::receipt_by_reported_hash(rpc, &p.config.network, hash)? else {
             unread = true;
             continue;
         };
