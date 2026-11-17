@@ -37,8 +37,9 @@ export interface InstallAndFundInput {
     amount: string;
     onStep: (text: string) => void;
     /**
-     * The policy that the owner reviewed: its exact source, ordered rules, every value and its tier. A Native policy's
-     * approval is signed only when it states exactly this policy for the agent's wallet account. Required for Native.
+     * The policy that the owner reviewed: its exact source and every value, and its ordered rules and tier when the
+     * host shows them. A Native policy's approval is signed only when it states exactly this policy for the agent's
+     * wallet account. Required for Native.
      */
     reviewed?: ReviewedPolicy;
 }

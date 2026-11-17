@@ -148,11 +148,14 @@ export interface PolicyApproval {
  * network or route, or a source or values whose hash differs from the hash that the message states.
  */
 export declare function policyApproval(message: unknown, network: string): PolicyApproval | null;
-/** The policy that the owner reviewed before an approval: its exact source, its ordered rules, every value and its tier. */
+/**
+ * The policy that the owner reviewed before an approval: its exact source and every value. Its ordered rules and its
+ * tier, which the service derives from the source, are checked too when the host states them.
+ */
 export interface ReviewedPolicy {
     source: string;
-    rules: unknown;
     params: Record<string, unknown>;
+    rules?: unknown;
     tier?: unknown;
 }
 /**

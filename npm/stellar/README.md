@@ -98,7 +98,7 @@ the roles `{owner, agent, server}`. The workflow then:
    a message, never a transaction. The payload is the base64 UTF-8 text of the message, and the hash its SEP-53 digest.
    The element signs only the exact approval message of its network, shows the wallet account and the hashes of the
    source and the values, and compares them with `data.expected` when the host passes `{policyId, wallet, sourceHash,
-   paramsHash}`. The host passes `reviewed: {source, rules, params, tier}`, the policy that the owner reviewed. The
+   paramsHash}`. The host passes `reviewed: {source, params}`, and `rules` and `tier` when it shows them: the policy that the owner reviewed. The
    workflow signs only an approval that states exactly that policy and the wallet account's own configuration (its
    network, route, policy instance, asset and fee ceiling); only the server's digests `irHash` and `moduleDigest` are
    left to the server, and a Native wallet enforces neither. It keeps the signature only when the owner's account

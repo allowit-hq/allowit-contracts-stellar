@@ -580,3 +580,16 @@ test('a Native change refuses an approval that changes the wallet configuration 
   }
   assert.equal(signed.length, 0);
 });
+
+test('the rules of a reviewed policy are checked when the host states them', async () => {
+  const {fetch} = ledger(), signed = [];
+  globalThis.fetch = fetch;
+  const {ask: service, state} = nativeService();
+  const ask = async (path, body) => path === 'native/approval' ? {required: true, message: approval({wallet: state.wallet}).message} : service(path, body);
+  const input = {network, historyPauseMs: 0, ask, sign: ownerSigns(signed), journal: journalOf(), key: 'r', policyId: 'policy-1', agent: roles.agent, amount: '5', onStep() {}};
+  await assert.rejects(installAndFund({...input, reviewed: {...reviewedOf(), rules: []}}), /reviewed/);
+  const {source, params} = reviewedOf();
+  const result = await installAndFund({...input, reviewed: {source, params}});
+  assert.equal(result.wallet, state.wallet);
+  assert.deepEqual(signed, [SET_UP_WALLET, APPROVE_POLICY]);
+});

@@ -376,8 +376,11 @@ export function policyApproval(message: unknown, network: string): PolicyApprova
   return {policyId, revision: revision as number, network: id, wallet, source, sourceHash, paramsHash, params, rules, fields: value};
 }
 
-/** The policy that the owner reviewed before an approval: its exact source, its ordered rules, every value and its tier. */
-export interface ReviewedPolicy {source: string; rules: unknown; params: Record<string, unknown>; tier?: unknown}
+/**
+ * The policy that the owner reviewed before an approval: its exact source and every value. Its ordered rules and its
+ * tier, which the service derives from the source, are checked too when the host states them.
+ */
+export interface ReviewedPolicy {source: string; params: Record<string, unknown>; rules?: unknown; tier?: unknown}
 /** The fields of an approval that the server derives for its own records. A Native wallet enforces none of them. */
 const SERVER_DIGESTS = new Set(['irHash', 'moduleDigest']);
 /**
@@ -393,7 +396,8 @@ export function nativeApprovalHolds(approval: PolicyApproval, wallet: string, re
     version: 1, policyId: approval.policyId, revision: approval.revision, network: approval.network, wallet, route: 'native',
     policyInstance: hex(own.policyInstance), asset: own.asset, assetSymbol: own.assetSymbol, assetIssuer: own.assetIssuer,
     maxFeeStroops: own.maxFeeStroops,
-    source: reviewed.source, sourceHash: hex(digest(reviewed.source)), rules: reviewed.rules, params: reviewed.params,
+    source: reviewed.source, sourceHash: hex(digest(reviewed.source)), params: reviewed.params,
+    rules: reviewed.rules === undefined ? approval.fields.rules : reviewed.rules,
     paramsHash: hex(digest(canonical(reviewed.params))), language: approval.fields.language,
     tier: reviewed.tier === undefined ? approval.fields.tier : reviewed.tier,
   };

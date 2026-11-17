@@ -381,7 +381,8 @@ export function nativeApprovalHolds(approval, wallet, reviewed) {
         version: 1, policyId: approval.policyId, revision: approval.revision, network: approval.network, wallet, route: 'native',
         policyInstance: hex(own.policyInstance), asset: own.asset, assetSymbol: own.assetSymbol, assetIssuer: own.assetIssuer,
         maxFeeStroops: own.maxFeeStroops,
-        source: reviewed.source, sourceHash: hex(digest(reviewed.source)), rules: reviewed.rules, params: reviewed.params,
+        source: reviewed.source, sourceHash: hex(digest(reviewed.source)), params: reviewed.params,
+        rules: reviewed.rules === undefined ? approval.fields.rules : reviewed.rules,
         paramsHash: hex(digest(canonical(reviewed.params))), language: approval.fields.language,
         tier: reviewed.tier === undefined ? approval.fields.tier : reviewed.tier,
     };
