@@ -84,22 +84,24 @@ function signatureBytes(signature) {
     return bytes;
 }
 /**
- * True when a retained signed setup created `wallet` for `agent` with the funding `amount`. The server registers a
- * wallet only after the network confirmed its setup, so such a setup of an installed wallet has funded it.
+ * Reads a retained signed setup when the service reports the Native wallet installed. True when the setup created
+ * `wallet` for this agent with this funding amount: the server registers a wallet only after the network confirmed its
+ * setup, so that setup funded it. False when nothing is retained. Any other retained setup stays saved and is
+ * refused: it names other inputs, and funding again under them could move the owner's funds twice.
  */
-function setupFunded(raw, network, wallet, agent, amount) {
+function retainedSetup(raw, network, wallet, identity) {
     if (raw === null)
         return false;
+    let value;
     try {
-        const value = JSON.parse(raw);
-        if (!object(value) || typeof value.signedPayload !== 'string' || value.agent !== agent || value.amount !== amount)
-            return false;
-        const setup = nativeSetupOf(value.signedPayload, network);
-        return setup !== null && setup.wallet === wallet && setup.agent === agent;
+        value = JSON.parse(raw);
     }
-    catch {
-        return false;
-    }
+    catch { /* refused below */ }
+    const setup = object(value) && typeof value.signedPayload === 'string' ? nativeSetupOf(value.signedPayload, network) : null;
+    const inputs = identity;
+    if (!object(value) || !setup || setup.wallet !== wallet || value.agent !== inputs.agent || setup.agent !== inputs.agent || value.amount !== inputs.amount)
+        throw changed(identity);
+    return true;
 }
 function savedApproval(journal, key, identity) {
     const raw = journal.get(key);
@@ -443,7 +445,7 @@ async function run({ network, ask, sign, journal, key, policyId, agent, amount, 
             // and before its reply kept the signed setup: when it names this wallet, agent and amount, the setup funded
             // it, and that funding is recorded before the setup leaves the journal. What remains is the owner's approval
             // of the policy. A wallet account that this workflow did not fund is funded below.
-            if (setupFunded(journal.get(walletSetupKey), network, wallet, agent, amount))
+            if (retainedSetup(journal.get(walletSetupKey), network, wallet, identity))
                 journal.set(fundedKey, JSON.stringify(identity));
             journal.remove(walletSetupKey);
             if (reply.approved !== true)
@@ -570,10 +572,24 @@ async function runUpdate({ network, ask, sign, journal, key, policyId, params, e
     if (funded(journal, updatedKey, identity))
         return { receipts, done: true };
     const approvalKey = `${key}:approval`;
+    const prepare = async () => {
+        onStep('Preparing the change…');
+        try {
+            return await ask('native/owner/prepare', { policyId, action: UPDATE_PARAMS, params, ...(expectedRevision === undefined ? {} : { expectedRevision }) });
+        }
+        catch (error) {
+            // The service's reason and typed code reach the owner unchanged.
+            const code = object(error) && typeof error.code === 'string' ? error.code : null;
+            throw new OwnerFlowError(error instanceof Error && error.message ? error.message : 'The change could not be prepared.', code, code === NETWORK_UNAVAILABLE, error);
+        }
+    };
+    /** The approval message of a Native wallet's change, or null for a reply that prepares a transaction. */
+    const approvalOf = (prepared) => object(prepared) && prepared.policyId === policyId && object(prepared.approval) && !prepared.step ? prepared.approval.message : null;
     /**
-     * Sends a signed approval of a Native wallet's values. Only a confirmed reply for this policy and change ends
-     * the change. Any other answer keeps the signed approval saved, and the next call sends the same bytes again:
-     * the service answers a settled approval with the same confirmation.
+     * Sends a signed approval of a Native wallet's values. Only a confirmed reply for this policy and change ends the
+     * change. Null means that the service no longer holds the preparation of this approval (it expired, or another
+     * instance prepared it): the approval never applied, because the service answers a settled approval as confirmed.
+     * Any other answer keeps the signed approval saved, and the next call sends the same bytes again.
      */
     const submitApproval = async ({ message, signer, signature }) => {
         onStep('Saving the change…');
@@ -583,6 +599,8 @@ async function runUpdate({ network, ask, sign, journal, key, policyId, params, e
         }
         catch (error) {
             const code = object(error) && typeof error.code === 'string' ? error.code : null;
+            if (code === OWNER_TRANSACTION_EXPIRED || (object(error) && error.status === 404))
+                return null;
             throw new OwnerFlowError(error instanceof Error && error.message ? error.message : 'The change could not be saved.', code, true, error);
         }
         if (!object(reply) || reply.policyId !== policyId || reply.action !== UPDATE_PARAMS || reply.status !== 'confirmed')
@@ -592,23 +610,27 @@ async function runUpdate({ network, ask, sign, journal, key, policyId, params, e
         receipts.push({ policyId, action: UPDATE_PARAMS, status: 'confirmed', transactionHash: '' });
         return { receipts, done: true };
     };
-    // A signed approval that a lost reply left saved is sent again before anything new is prepared or signed.
-    const pendingApproval = savedApproval(journal, approvalKey, identity);
-    if (pendingApproval)
-        return submitApproval(pendingApproval);
-    onStep('Preparing the change…');
+    const lapsed = () => new OwnerFlowError('The approval lapsed before the service took it. Resume to prepare the same change again.', OWNER_TRANSACTION_EXPIRED, true);
     let prepared;
-    try {
-        prepared = await ask('native/owner/prepare', { policyId, action: UPDATE_PARAMS, params, ...(expectedRevision === undefined ? {} : { expectedRevision }) });
+    // A signed approval that a lost reply left saved is sent again before anything new is signed. When the service no
+    // longer holds its preparation, the same change is prepared again: the same values give the same message, and the
+    // saved signature applies. A message that differs needs the owner's signature again.
+    const pendingApproval = savedApproval(journal, approvalKey, identity);
+    if (pendingApproval) {
+        const settled = await submitApproval(pendingApproval);
+        if (settled)
+            return settled;
+        prepared = await prepare();
+        if (approvalOf(prepared) === pendingApproval.message)
+            return (await submitApproval(pendingApproval)) ?? Promise.reject(lapsed());
+        journal.remove(approvalKey);
     }
-    catch (error) {
-        // The service's reason and typed code reach the owner unchanged.
-        const code = object(error) && typeof error.code === 'string' ? error.code : null;
-        throw new OwnerFlowError(error instanceof Error && error.message ? error.message : 'The change could not be prepared.', code, code === NETWORK_UNAVAILABLE, error);
-    }
+    else
+        prepared = await prepare();
     // A Native wallet holds no values on chain: its change is a new approval of the policy, with no transaction.
-    if (object(prepared) && prepared.policyId === policyId && object(prepared.approval) && !prepared.step) {
-        const message = prepared.approval.message, fields = policyApproval(message, network);
+    const message = approvalOf(prepared);
+    if (message !== null) {
+        const fields = policyApproval(message, network);
         if (!fields || fields.policyId !== policyId)
             throw new OwnerFlowError('The approval differs from this change. Nothing was signed.', null, false);
         // The owner signs only the values of this change: each changed param holds exactly its requested value.
@@ -618,9 +640,9 @@ async function runUpdate({ network, ask, sign, journal, key, policyId, params, e
         onStep('Sign the approval of the new values in your wallet…');
         const signature = signatureBytes(await sign(approvalStep(message)));
         // The signed approval is saved before it leaves: a lost reply is settled from it, never signed again.
-        const approval = { ...identity, message: message, signer, signature };
+        const approval = { ...identity, message, signer, signature };
         journal.set(approvalKey, JSON.stringify(approval));
-        return submitApproval(approval);
+        return (await submitApproval(approval)) ?? Promise.reject(lapsed());
     }
     const step = stepOf(prepared?.step);
     if (!object(prepared) || prepared.policyId !== policyId || !step || step.action !== UPDATE_PARAMS)

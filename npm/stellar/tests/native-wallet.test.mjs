@@ -427,3 +427,56 @@ test('a registration whose reply is lost funds nothing again: the retained setup
   assert.deepEqual(JSON.parse(journal.get('flow:funded')), {policyId: 'policy-1', agent: roles.agent, amount: '5'});
   assert.equal(journal.get('flow:wallet-setup'), null);
 });
+
+test('a retained setup of other inputs is refused and kept: a changed amount funds nothing twice', async () => {
+  const {state: chain, fetch} = ledger(), signed = [], journal = journalOf();
+  globalThis.fetch = fetch;
+  const {ask: service, calls} = nativeService();
+  let lose = true;
+  const ask = async (path, body) => {
+    const reply = await service(path, body);
+    if (path === 'native/register' && lose) {lose = false; throw new Error('The reply was lost.');}
+    return reply;
+  };
+  const input = {network, historyPauseMs: 0, ask, sign: ownerSigns(signed), journal, key: 'flow', policyId: 'policy-1', agent: roles.agent, amount: '5', onStep() {}};
+  await assert.rejects(installAndFund(input), /reply was lost/);
+  const retained = journal.get('flow:wallet-setup');
+  await assert.rejects(installAndFund({...input, amount: '6'}), error => error instanceof OwnerFlowError && /original wallet setup/.test(error.message));
+  assert.equal(journal.get('flow:wallet-setup'), retained);
+  assert.deepEqual([signed, chain.posted.length], [[SET_UP_WALLET], 1]);
+  assert.ok(!calls.some(([path, body]) => path === 'native/owner/prepare' && body?.action === 'fund'));
+});
+
+test('a saved approval that the service no longer holds is prepared again and sent with the same signature', async () => {
+  const {fetch} = ledger(), signed = [];
+  globalThis.fetch = fetch;
+  const setup = await setUpNativeWallet({network, ...roles, amount: '0', sign: ownerSigns([]), onStep() {}, journal: journalOf(), key: 'k', fetch});
+  const {message} = approval({wallet: setup.wallet});
+  const expired = () => Object.assign(new Error('The approval expired.'), {status: 409, code: 'owner_transaction_expired'});
+  const journal = journalOf(), submitted = [];
+  let prepares = 0;
+  let answers = [() => {throw new Error('reply lost');}, () => {throw expired();}, () => ({policyId: 'policy-1', action: 'update_params', status: 'confirmed'})];
+  const ask = async (path, body) => {
+    if (path === 'native/owner/prepare') {prepares++; return {policyId: 'policy-1', approval: {message}};}
+    if (path === 'native/owner/submit') {submitted.push(body); return answers.shift()();}
+    throw new Error(path);
+  };
+  const base = {network, historyPauseMs: 0, sign: ownerSigns(signed), policyId: 'policy-1', params: {payment_limit: {Int: '5'}}, onStep() {}, journal, key: 'u', ask};
+  await assert.rejects(updateParams(base), /reply lost/);
+  const done = await updateParams(base);
+  assert.deepEqual([done.done, prepares, signed.length, submitted.length], [true, 2, 1, 3]);
+  assert.ok(submitted.every(body => JSON.stringify(body) === JSON.stringify(submitted[0])));
+  // A preparation whose message differs needs the owner's signature again; the lapsed one is dropped.
+  const other = journalOf();
+  const changed = approval({wallet: setup.wallet, revision: 3}).message;
+  let first = true;
+  answers = [() => {throw new Error('reply lost');}, () => {throw expired();}, () => ({policyId: 'policy-1', action: 'update_params', status: 'confirmed'})];
+  const ask2 = async (path, body) => {
+    if (path === 'native/owner/prepare') {const m = first ? message : changed; first = false; return {policyId: 'policy-1', approval: {message: m}};}
+    if (path === 'native/owner/submit') {submitted.push(body); return answers.shift()();}
+    throw new Error(path);
+  };
+  await assert.rejects(updateParams({...base, journal: other, key: 'v', ask: ask2}), /reply lost/);
+  const again = await updateParams({...base, journal: other, key: 'v', ask: ask2});
+  assert.deepEqual([again.done, signed.length, submitted.at(-1).payload], [true, 3, changed]);
+});
