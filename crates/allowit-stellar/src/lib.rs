@@ -887,7 +887,11 @@ fn validate_config_for(c: &WalletConfig, admit_source: bool) -> Result<()> {
 /// the server, which admits each operation of it with [`admit_classic`] before it signs. Such
 /// a source takes the bounded params of a Custom policy, so it can read owner text.
 fn validate_classic_portable_install(c: &WalletConfig) -> Result<()> {
-    let tier = classic_tier(&policy::classic_shape(&c.policy_source)?);
+    let shape = policy::classic_shape(&c.policy_source)?;
+    if shape.writes_state {
+        return Err(CLASSIC_WRITES_STATE.into());
+    }
+    let tier = classic_tier(&shape);
     c.params.check(tier).map_err(|e| {
         if tier == PolicyTier::Simple {
             format!("Portable classic custody reads only canonical params for a canonical-only source: {e}")
@@ -896,6 +900,8 @@ fn validate_classic_portable_install(c: &WalletConfig) -> Result<()> {
         }
     })
 }
+/// A classic account stores no policy state, so no source of it writes any.
+const CLASSIC_WRITES_STATE: &str = "Classic custody cannot store allowit::set_state writes";
 /// The param and evaluation rules of a classic account's source: those of a Simple policy for
 /// a canonical-only source, and those of a Custom policy for any other.
 fn classic_tier(shape: &policy::SourceShape) -> PolicyTier {
@@ -1225,7 +1231,7 @@ fn verify_classic_portable(
     }
     let shape = policy::classic_shape(&c.policy_source)?;
     if shape.writes_state {
-        return Err("Classic custody cannot store allowit::set_state writes".into());
+        return Err(CLASSIC_WRITES_STATE.into());
     }
     let mut standard = PolicyParams::default();
     for (key, value) in [

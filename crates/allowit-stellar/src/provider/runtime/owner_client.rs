@@ -716,7 +716,12 @@ fn validate_generated(
             &d.source_hash,
             &d.params_hash,
         )?;
-        if b.route != "native" || b.tier.is_some() || b.module_digest != identity {
+        // A classic account stores no policy state.
+        if b.route != "native"
+            || b.tier.is_some()
+            || b.module_digest != identity
+            || shape.writes_state
+        {
             return Err(Error::uncertain("Returned native policy identity differs"));
         }
     } else {

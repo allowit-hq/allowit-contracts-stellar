@@ -3940,6 +3940,8 @@ fn portable_classic_custody_runs_another_source_only_with_the_servers_evaluator(
     let mut stateful = hosted.clone();
     stateful.policy_source = writes.into();
     stateful.source_hash = hash(writes);
+    let error = validate_config(&stateful).unwrap_err();
+    assert!(error.contains("set_state"), "{error}");
     observed.source_hash = stateful.source_hash;
     let error = prepare(&stateful, &request, &observed, 86401, 86700).unwrap_err();
     assert!(error.contains("set_state"), "{error}");
