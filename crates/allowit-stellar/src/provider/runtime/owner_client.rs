@@ -610,6 +610,18 @@ impl OwnerClient {
         )
     }
 }
+/// Whether a wallet of `tier` fits the wallet profile that the owner asked for. A Custom wallet
+/// compiles its whole source and has its own profile. A Simple or Common wallet has the policy
+/// wallet profile, whatever the analysis of the source says: the contract runs the standard
+/// prefix or no rule, and the server evaluates the whole source before it co-signs. For a source
+/// that is more than canonical rules it does so with its compiled evaluator, which
+/// `authorize_server_with` requires.
+fn profile_fits(tier: PolicyTier, profile: &str) -> bool {
+    match tier {
+        PolicyTier::Custom => profile == "allowit-custom-wallet-v1",
+        _ => profile == "allowit-policy-wallet-v1",
+    }
+}
 fn validate_generated(
     policy: &GeneratedPolicy,
     request: &GenerateRequest,
@@ -714,12 +726,8 @@ fn validate_generated(
         let tier = b
             .tier
             .ok_or_else(|| Error::uncertain("Missing returned contract policy tier"))?;
-        let profile_fits = match tier {
-            PolicyTier::Custom => request.profile == "allowit-custom-wallet-v1",
-            _ => request.profile == "allowit-policy-wallet-v1" && d.tier == "standard",
-        };
         if b.route != "policyWallet"
-            || !profile_fits
+            || !profile_fits(tier, &request.profile)
             || b.deployment_id != b.policy_instance
             || (tier.standard() && shape.writes_state)
         {

@@ -1,5 +1,5 @@
 import { addressElement, amountElement, explorerLinkElement, receiptElement } from './display.js';
-import { bindingReviewElement, buildAttestElement, ownerSignElement, walletSignInElement } from './signing.js';
+import { bindingReviewElement, buildAttestElement, ownerAnswerElement, ownerSignElement, walletSignInElement } from './signing.js';
 /** Element tags by kind. Every tag has the `allowit-stellar-` prefix. */
 export const ELEMENTS = Object.freeze({
     address: 'allowit-stellar-address',
@@ -8,6 +8,7 @@ export const ELEMENTS = Object.freeze({
     'wallet-sign-in': 'allowit-stellar-wallet-sign-in',
     'owner-sign': 'allowit-stellar-owner-sign',
     'build-attest': 'allowit-stellar-build-attest',
+    'owner-answer': 'allowit-stellar-owner-answer',
     receipt: 'allowit-stellar-receipt',
     'binding-review': 'allowit-stellar-binding-review',
 });
@@ -18,6 +19,7 @@ const FACTORIES = {
     'wallet-sign-in': walletSignInElement,
     'owner-sign': ownerSignElement,
     'build-attest': buildAttestElement,
+    'owner-answer': ownerAnswerElement,
     receipt: receiptElement,
     'binding-review': bindingReviewElement,
 };

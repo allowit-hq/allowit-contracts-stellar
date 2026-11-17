@@ -1,0 +1,717 @@
+{
+  "_links": {
+    "self": {
+      "href": "https://horizon-testnet.stellar.org/trades?base_asset_type=native\u0026counter_asset_code=USDC\u0026counter_asset_issuer=GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5\u0026counter_asset_type=credit_alphanum4\u0026cursor=\u0026limit=20\u0026order=desc\u0026trade_type=orderbook"
+    },
+    "next": {
+      "href": "https://horizon-testnet.stellar.org/trades?base_asset_type=native\u0026counter_asset_code=USDC\u0026counter_asset_issuer=GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5\u0026counter_asset_type=credit_alphanum4\u0026cursor=24592042139070465-0\u0026limit=20\u0026order=desc\u0026trade_type=orderbook"
+    },
+    "prev": {
+      "href": "https://horizon-testnet.stellar.org/trades?base_asset_type=native\u0026counter_asset_code=USDC\u0026counter_asset_issuer=GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5\u0026counter_asset_type=credit_alphanum4\u0026cursor=24636988971835393-0\u0026limit=20\u0026order=asc\u0026trade_type=orderbook"
+    }
+  },
+  "_embedded": {
+    "records": [
+      {
+        "_links": {
+          "self": {
+            "href": ""
+          },
+          "base": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GBBQYUNAVV6BV2JBBUYSUCPZNTYHOWL5BUMK4U3MTYYFAHA35YNABLTE"
+          },
+          "counter": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2"
+          },
+          "operation": {
+            "href": "https://horizon-testnet.stellar.org/operations/24636988971835393"
+          }
+        },
+        "id": "24636988971835393-0",
+        "paging_token": "24636988971835393-0",
+        "ledger_close_time": "2026-11-15T01:07:55Z",
+        "trade_type": "orderbook",
+        "base_offer_id": "4636323007399223297",
+        "base_account": "GBBQYUNAVV6BV2JBBUYSUCPZNTYHOWL5BUMK4U3MTYYFAHA35YNABLTE",
+        "base_amount": "9.9999998",
+        "base_asset_type": "native",
+        "counter_offer_id": "973057",
+        "counter_account": "GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2",
+        "counter_amount": "1.4693018",
+        "counter_asset_type": "credit_alphanum4",
+        "counter_asset_code": "USDC",
+        "counter_asset_issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "base_is_seller": false,
+        "price": {
+          "n": "2000000",
+          "d": "13611907"
+        }
+      },
+      {
+        "_links": {
+          "self": {
+            "href": ""
+          },
+          "base": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GBBQYUNAVV6BV2JBBUYSUCPZNTYHOWL5BUMK4U3MTYYFAHA35YNABLTE"
+          },
+          "counter": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2"
+          },
+          "operation": {
+            "href": "https://horizon-testnet.stellar.org/operations/24636980381884417"
+          }
+        },
+        "id": "24636980381884417-0",
+        "paging_token": "24636980381884417-0",
+        "ledger_close_time": "2026-11-15T01:07:45Z",
+        "trade_type": "orderbook",
+        "base_offer_id": "4636322998809272321",
+        "base_account": "GBBQYUNAVV6BV2JBBUYSUCPZNTYHOWL5BUMK4U3MTYYFAHA35YNABLTE",
+        "base_amount": "9.9999998",
+        "base_asset_type": "native",
+        "counter_offer_id": "973057",
+        "counter_account": "GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2",
+        "counter_amount": "1.4693018",
+        "counter_asset_type": "credit_alphanum4",
+        "counter_asset_code": "USDC",
+        "counter_asset_issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "base_is_seller": false,
+        "price": {
+          "n": "2000000",
+          "d": "13611907"
+        }
+      },
+      {
+        "_links": {
+          "self": {
+            "href": ""
+          },
+          "base": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GBBQYUNAVV6BV2JBBUYSUCPZNTYHOWL5BUMK4U3MTYYFAHA35YNABLTE"
+          },
+          "counter": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2"
+          },
+          "operation": {
+            "href": "https://horizon-testnet.stellar.org/operations/24636971791962113"
+          }
+        },
+        "id": "24636971791962113-0",
+        "paging_token": "24636971791962113-0",
+        "ledger_close_time": "2026-11-15T01:07:35Z",
+        "trade_type": "orderbook",
+        "base_offer_id": "4636322990219350017",
+        "base_account": "GBBQYUNAVV6BV2JBBUYSUCPZNTYHOWL5BUMK4U3MTYYFAHA35YNABLTE",
+        "base_amount": "9.9999998",
+        "base_asset_type": "native",
+        "counter_offer_id": "973057",
+        "counter_account": "GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2",
+        "counter_amount": "1.4693018",
+        "counter_asset_type": "credit_alphanum4",
+        "counter_asset_code": "USDC",
+        "counter_asset_issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "base_is_seller": false,
+        "price": {
+          "n": "2000000",
+          "d": "13611907"
+        }
+      },
+      {
+        "_links": {
+          "self": {
+            "href": ""
+          },
+          "base": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GC4GEYMCM6YDIUX3PEJCDJ4RRXEALZ7TV53MN3JMFOQJS5NZ7LBCRMID"
+          },
+          "counter": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2"
+          },
+          "operation": {
+            "href": "https://horizon-testnet.stellar.org/operations/24615844847828993"
+          }
+        },
+        "id": "24615844847828993-0",
+        "paging_token": "24615844847828993-0",
+        "ledger_close_time": "2026-11-14T18:17:40Z",
+        "trade_type": "orderbook",
+        "base_offer_id": "4636301863275216897",
+        "base_account": "GC4GEYMCM6YDIUX3PEJCDJ4RRXEALZ7TV53MN3JMFOQJS5NZ7LBCRMID",
+        "base_amount": "34.0297675",
+        "base_asset_type": "native",
+        "counter_offer_id": "973057",
+        "counter_account": "GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2",
+        "counter_amount": "5.0000000",
+        "counter_asset_type": "credit_alphanum4",
+        "counter_asset_code": "USDC",
+        "counter_asset_issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "base_is_seller": false,
+        "price": {
+          "n": "2000000",
+          "d": "13611907"
+        }
+      },
+      {
+        "_links": {
+          "self": {
+            "href": ""
+          },
+          "base": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GAN66LPFSIB3DRCP64JGD63D5MD26G7G6UZ4VE5GNI4IQUPJE6A6B7U3"
+          },
+          "counter": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2"
+          },
+          "operation": {
+            "href": "https://horizon-testnet.stellar.org/operations/24615655869259777"
+          }
+        },
+        "id": "24615655869259777-0",
+        "paging_token": "24615655869259777-0",
+        "ledger_close_time": "2026-11-14T18:14:00Z",
+        "trade_type": "orderbook",
+        "base_offer_id": "4636301674296647681",
+        "base_account": "GAN66LPFSIB3DRCP64JGD63D5MD26G7G6UZ4VE5GNI4IQUPJE6A6B7U3",
+        "base_amount": "34.0297675",
+        "base_asset_type": "native",
+        "counter_offer_id": "973057",
+        "counter_account": "GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2",
+        "counter_amount": "5.0000000",
+        "counter_asset_type": "credit_alphanum4",
+        "counter_asset_code": "USDC",
+        "counter_asset_issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "base_is_seller": false,
+        "price": {
+          "n": "2000000",
+          "d": "13611907"
+        }
+      },
+      {
+        "_links": {
+          "self": {
+            "href": ""
+          },
+          "base": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GDP66DC4CUICWWNFZHQZHIF3NVBNRAQRLAOXEIAIXWBGH7U4WKD4WXZB"
+          },
+          "counter": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2"
+          },
+          "operation": {
+            "href": "https://horizon-testnet.stellar.org/operations/24615333746724865"
+          }
+        },
+        "id": "24615333746724865-0",
+        "paging_token": "24615333746724865-0",
+        "ledger_close_time": "2026-11-14T18:07:45Z",
+        "trade_type": "orderbook",
+        "base_offer_id": "4636301352174112769",
+        "base_account": "GDP66DC4CUICWWNFZHQZHIF3NVBNRAQRLAOXEIAIXWBGH7U4WKD4WXZB",
+        "base_amount": "34.0297675",
+        "base_asset_type": "native",
+        "counter_offer_id": "973057",
+        "counter_account": "GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2",
+        "counter_amount": "5.0000000",
+        "counter_asset_type": "credit_alphanum4",
+        "counter_asset_code": "USDC",
+        "counter_asset_issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "base_is_seller": false,
+        "price": {
+          "n": "2000000",
+          "d": "13611907"
+        }
+      },
+      {
+        "_links": {
+          "self": {
+            "href": ""
+          },
+          "base": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GCGLUZWWJJ5353ERJIT6KM4WK6POXI62UR4XSHL3IMGWXA7YPFBPUAWO"
+          },
+          "counter": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2"
+          },
+          "operation": {
+            "href": "https://horizon-testnet.stellar.org/operations/24615204897689601"
+          }
+        },
+        "id": "24615204897689601-1",
+        "paging_token": "24615204897689601-1",
+        "ledger_close_time": "2026-11-14T18:05:15Z",
+        "trade_type": "orderbook",
+        "base_offer_id": "4636301223325077505",
+        "base_account": "GCGLUZWWJJ5353ERJIT6KM4WK6POXI62UR4XSHL3IMGWXA7YPFBPUAWO",
+        "base_amount": "32.5275908",
+        "base_asset_type": "native",
+        "counter_offer_id": "973057",
+        "counter_account": "GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2",
+        "counter_amount": "4.7792849",
+        "counter_asset_type": "credit_alphanum4",
+        "counter_asset_code": "USDC",
+        "counter_asset_issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "base_is_seller": false,
+        "price": {
+          "n": "2000000",
+          "d": "13611907"
+        }
+      },
+      {
+        "_links": {
+          "self": {
+            "href": ""
+          },
+          "base": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GCGLUZWWJJ5353ERJIT6KM4WK6POXI62UR4XSHL3IMGWXA7YPFBPUAWO"
+          },
+          "counter": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2"
+          },
+          "operation": {
+            "href": "https://horizon-testnet.stellar.org/operations/24615204897689601"
+          }
+        },
+        "id": "24615204897689601-0",
+        "paging_token": "24615204897689601-0",
+        "ledger_close_time": "2026-11-14T18:05:15Z",
+        "trade_type": "orderbook",
+        "base_offer_id": "4636301223325077505",
+        "base_account": "GCGLUZWWJJ5353ERJIT6KM4WK6POXI62UR4XSHL3IMGWXA7YPFBPUAWO",
+        "base_amount": "1.4915766",
+        "base_asset_type": "native",
+        "counter_offer_id": "973055",
+        "counter_account": "GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2",
+        "counter_amount": "0.2207151",
+        "counter_asset_type": "credit_alphanum4",
+        "counter_asset_code": "USDC",
+        "counter_asset_issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "base_is_seller": false,
+        "price": {
+          "n": "2500000",
+          "d": "16894819"
+        }
+      },
+      {
+        "_links": {
+          "self": {
+            "href": ""
+          },
+          "base": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GBXFMIEF3O5ZKELINZU2BSKMEGEBE5NF6S7XFSACOHTOMJ5652K733QR"
+          },
+          "counter": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2"
+          },
+          "operation": {
+            "href": "https://horizon-testnet.stellar.org/operations/24612520543137793"
+          }
+        },
+        "id": "24612520543137793-0",
+        "paging_token": "24612520543137793-0",
+        "ledger_close_time": "2026-11-14T17:13:09Z",
+        "trade_type": "orderbook",
+        "base_offer_id": "4636298538970525697",
+        "base_account": "GBXFMIEF3O5ZKELINZU2BSKMEGEBE5NF6S7XFSACOHTOMJ5652K733QR",
+        "base_amount": "33.7896380",
+        "base_asset_type": "native",
+        "counter_offer_id": "973055",
+        "counter_account": "GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2",
+        "counter_amount": "5.0000000",
+        "counter_asset_type": "credit_alphanum4",
+        "counter_asset_code": "USDC",
+        "counter_asset_issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "base_is_seller": false,
+        "price": {
+          "n": "2500000",
+          "d": "16894819"
+        }
+      },
+      {
+        "_links": {
+          "self": {
+            "href": ""
+          },
+          "base": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GBL6DQE4PGNZEGEFO656AYQOAAZ76OKABIK22QHC6Y4VOHKDWYPBXI2X"
+          },
+          "counter": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2"
+          },
+          "operation": {
+            "href": "https://horizon-testnet.stellar.org/operations/24612447528693761"
+          }
+        },
+        "id": "24612447528693761-0",
+        "paging_token": "24612447528693761-0",
+        "ledger_close_time": "2026-11-14T17:11:44Z",
+        "trade_type": "orderbook",
+        "base_offer_id": "4636298465956081665",
+        "base_account": "GBL6DQE4PGNZEGEFO656AYQOAAZ76OKABIK22QHC6Y4VOHKDWYPBXI2X",
+        "base_amount": "33.7896380",
+        "base_asset_type": "native",
+        "counter_offer_id": "973055",
+        "counter_account": "GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2",
+        "counter_amount": "5.0000000",
+        "counter_asset_type": "credit_alphanum4",
+        "counter_asset_code": "USDC",
+        "counter_asset_issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "base_is_seller": false,
+        "price": {
+          "n": "2500000",
+          "d": "16894819"
+        }
+      },
+      {
+        "_links": {
+          "self": {
+            "href": ""
+          },
+          "base": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GC5Q44HHC7YEE4CLYCIKYUAOIZC43JQ2YZK76AVOIUYU2RAY6S5DRKRA"
+          },
+          "counter": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2"
+          },
+          "operation": {
+            "href": "https://horizon-testnet.stellar.org/operations/24612271435026433"
+          }
+        },
+        "id": "24612271435026433-0",
+        "paging_token": "24612271435026433-0",
+        "ledger_close_time": "2026-11-14T17:08:19Z",
+        "trade_type": "orderbook",
+        "base_offer_id": "4636298289862414337",
+        "base_account": "GC5Q44HHC7YEE4CLYCIKYUAOIZC43JQ2YZK76AVOIUYU2RAY6S5DRKRA",
+        "base_amount": "33.7896380",
+        "base_asset_type": "native",
+        "counter_offer_id": "973055",
+        "counter_account": "GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2",
+        "counter_amount": "5.0000000",
+        "counter_asset_type": "credit_alphanum4",
+        "counter_asset_code": "USDC",
+        "counter_asset_issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "base_is_seller": false,
+        "price": {
+          "n": "2500000",
+          "d": "16894819"
+        }
+      },
+      {
+        "_links": {
+          "self": {
+            "href": ""
+          },
+          "base": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GD35HUCDA6UCQEVDUTNIP26DX7WN7HW4QWJPVJG6IWTS675AUY5HV452"
+          },
+          "counter": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2"
+          },
+          "operation": {
+            "href": "https://horizon-testnet.stellar.org/operations/24611962197401601"
+          }
+        },
+        "id": "24611962197401601-0",
+        "paging_token": "24611962197401601-0",
+        "ledger_close_time": "2026-11-14T17:02:19Z",
+        "trade_type": "orderbook",
+        "base_offer_id": "4636297980624789505",
+        "base_account": "GD35HUCDA6UCQEVDUTNIP26DX7WN7HW4QWJPVJG6IWTS675AUY5HV452",
+        "base_amount": "33.7896380",
+        "base_asset_type": "native",
+        "counter_offer_id": "973055",
+        "counter_account": "GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2",
+        "counter_amount": "5.0000000",
+        "counter_asset_type": "credit_alphanum4",
+        "counter_asset_code": "USDC",
+        "counter_asset_issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "base_is_seller": false,
+        "price": {
+          "n": "2500000",
+          "d": "16894819"
+        }
+      },
+      {
+        "_links": {
+          "self": {
+            "href": ""
+          },
+          "base": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GB3NC7VTIBFLYFCQEWJXD54C4LKD763SBXEETXRSNIA5HSQABEGCFLF6"
+          },
+          "counter": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2"
+          },
+          "operation": {
+            "href": "https://horizon-testnet.stellar.org/operations/24611897772871681"
+          }
+        },
+        "id": "24611897772871681-0",
+        "paging_token": "24611897772871681-0",
+        "ledger_close_time": "2026-11-14T17:01:04Z",
+        "trade_type": "orderbook",
+        "base_offer_id": "4636297916200259585",
+        "base_account": "GB3NC7VTIBFLYFCQEWJXD54C4LKD763SBXEETXRSNIA5HSQABEGCFLF6",
+        "base_amount": "33.7896380",
+        "base_asset_type": "native",
+        "counter_offer_id": "973055",
+        "counter_account": "GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2",
+        "counter_amount": "5.0000000",
+        "counter_asset_type": "credit_alphanum4",
+        "counter_asset_code": "USDC",
+        "counter_asset_issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "base_is_seller": false,
+        "price": {
+          "n": "2500000",
+          "d": "16894819"
+        }
+      },
+      {
+        "_links": {
+          "self": {
+            "href": ""
+          },
+          "base": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GB5KKM7Y5ZEHOIAI54MOEQKF7Q65Y2LQ7KFNMLFT2TRMRQXXJT7ZQ3Q4"
+          },
+          "counter": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2"
+          },
+          "operation": {
+            "href": "https://horizon-testnet.stellar.org/operations/24611837643354113"
+          }
+        },
+        "id": "24611837643354113-0",
+        "paging_token": "24611837643354113-0",
+        "ledger_close_time": "2026-11-14T16:59:54Z",
+        "trade_type": "orderbook",
+        "base_offer_id": "4636297856070742017",
+        "base_account": "GB5KKM7Y5ZEHOIAI54MOEQKF7Q65Y2LQ7KFNMLFT2TRMRQXXJT7ZQ3Q4",
+        "base_amount": "33.7896380",
+        "base_asset_type": "native",
+        "counter_offer_id": "973055",
+        "counter_account": "GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2",
+        "counter_amount": "5.0000000",
+        "counter_asset_type": "credit_alphanum4",
+        "counter_asset_code": "USDC",
+        "counter_asset_issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "base_is_seller": false,
+        "price": {
+          "n": "2500000",
+          "d": "16894819"
+        }
+      },
+      {
+        "_links": {
+          "self": {
+            "href": ""
+          },
+          "base": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GACMQ4YSC2C5SSXAIFPHKP7SCDW5SXXPHEYEFVP7SYP2GPOF6FPLKGX4"
+          },
+          "counter": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2"
+          },
+          "operation": {
+            "href": "https://horizon-testnet.stellar.org/operations/24603483931947009"
+          }
+        },
+        "id": "24603483931947009-0",
+        "paging_token": "24603483931947009-0",
+        "ledger_close_time": "2026-11-14T14:17:49Z",
+        "trade_type": "orderbook",
+        "base_offer_id": "4636289502359334913",
+        "base_account": "GACMQ4YSC2C5SSXAIFPHKP7SCDW5SXXPHEYEFVP7SYP2GPOF6FPLKGX4",
+        "base_amount": "33.7896380",
+        "base_asset_type": "native",
+        "counter_offer_id": "973055",
+        "counter_account": "GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2",
+        "counter_amount": "5.0000000",
+        "counter_asset_type": "credit_alphanum4",
+        "counter_asset_code": "USDC",
+        "counter_asset_issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "base_is_seller": false,
+        "price": {
+          "n": "2500000",
+          "d": "16894819"
+        }
+      },
+      {
+        "_links": {
+          "self": {
+            "href": ""
+          },
+          "base": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GB6OHHSD2EPOPI2OFDXTEY7NHF3MIPZ2KH3YHTWAEJ5AUGJ57ERMDLI4"
+          },
+          "counter": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2"
+          },
+          "operation": {
+            "href": "https://horizon-testnet.stellar.org/operations/24603290658418689"
+          }
+        },
+        "id": "24603290658418689-0",
+        "paging_token": "24603290658418689-0",
+        "ledger_close_time": "2026-11-14T14:14:04Z",
+        "trade_type": "orderbook",
+        "base_offer_id": "4636289309085806593",
+        "base_account": "GB6OHHSD2EPOPI2OFDXTEY7NHF3MIPZ2KH3YHTWAEJ5AUGJ57ERMDLI4",
+        "base_amount": "33.7896380",
+        "base_asset_type": "native",
+        "counter_offer_id": "973055",
+        "counter_account": "GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2",
+        "counter_amount": "5.0000000",
+        "counter_asset_type": "credit_alphanum4",
+        "counter_asset_code": "USDC",
+        "counter_asset_issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "base_is_seller": false,
+        "price": {
+          "n": "2500000",
+          "d": "16894819"
+        }
+      },
+      {
+        "_links": {
+          "self": {
+            "href": ""
+          },
+          "base": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GD2RDDV7OINIXPO47KFU2KCJGSEPW7X5UTZ3U7VPSUEP7YVMAVYKB5TO"
+          },
+          "counter": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2"
+          },
+          "operation": {
+            "href": "https://horizon-testnet.stellar.org/operations/24603067320123393"
+          }
+        },
+        "id": "24603067320123393-0",
+        "paging_token": "24603067320123393-0",
+        "ledger_close_time": "2026-11-14T14:09:44Z",
+        "trade_type": "orderbook",
+        "base_offer_id": "4636289085747511297",
+        "base_account": "GD2RDDV7OINIXPO47KFU2KCJGSEPW7X5UTZ3U7VPSUEP7YVMAVYKB5TO",
+        "base_amount": "33.7896380",
+        "base_asset_type": "native",
+        "counter_offer_id": "973055",
+        "counter_account": "GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2",
+        "counter_amount": "5.0000000",
+        "counter_asset_type": "credit_alphanum4",
+        "counter_asset_code": "USDC",
+        "counter_asset_issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "base_is_seller": false,
+        "price": {
+          "n": "2500000",
+          "d": "16894819"
+        }
+      },
+      {
+        "_links": {
+          "self": {
+            "href": ""
+          },
+          "base": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GC6DSILR3OEP6OVMKFXDJV2PXWI4PKWQKHFUCQHRTOTR3VBR6JYGZFFU"
+          },
+          "counter": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2"
+          },
+          "operation": {
+            "href": "https://horizon-testnet.stellar.org/operations/24602809622077441"
+          }
+        },
+        "id": "24602809622077441-0",
+        "paging_token": "24602809622077441-0",
+        "ledger_close_time": "2026-11-14T14:04:44Z",
+        "trade_type": "orderbook",
+        "base_offer_id": "4636288828049465345",
+        "base_account": "GC6DSILR3OEP6OVMKFXDJV2PXWI4PKWQKHFUCQHRTOTR3VBR6JYGZFFU",
+        "base_amount": "33.7896380",
+        "base_asset_type": "native",
+        "counter_offer_id": "973055",
+        "counter_account": "GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2",
+        "counter_amount": "5.0000000",
+        "counter_asset_type": "credit_alphanum4",
+        "counter_asset_code": "USDC",
+        "counter_asset_issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "base_is_seller": false,
+        "price": {
+          "n": "2500000",
+          "d": "16894819"
+        }
+      },
+      {
+        "_links": {
+          "self": {
+            "href": ""
+          },
+          "base": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GAYT7JN6FZH6PBRR3TDL7QQWNTU2K2AXID2DIOXFHXCVSTUOL7DYXURE"
+          },
+          "counter": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2"
+          },
+          "operation": {
+            "href": "https://horizon-testnet.stellar.org/operations/24602663593205761"
+          }
+        },
+        "id": "24602663593205761-0",
+        "paging_token": "24602663593205761-0",
+        "ledger_close_time": "2026-11-14T14:01:54Z",
+        "trade_type": "orderbook",
+        "base_offer_id": "4636288682020593665",
+        "base_account": "GAYT7JN6FZH6PBRR3TDL7QQWNTU2K2AXID2DIOXFHXCVSTUOL7DYXURE",
+        "base_amount": "33.7896380",
+        "base_asset_type": "native",
+        "counter_offer_id": "973055",
+        "counter_account": "GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2",
+        "counter_amount": "5.0000000",
+        "counter_asset_type": "credit_alphanum4",
+        "counter_asset_code": "USDC",
+        "counter_asset_issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "base_is_seller": false,
+        "price": {
+          "n": "2500000",
+          "d": "16894819"
+        }
+      },
+      {
+        "_links": {
+          "self": {
+            "href": ""
+          },
+          "base": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GCNIQ7EQEZJRB7OJ3Z4MHHRPSK5TBBGMTY3PWNOML2LCOUK4K27RJ5R7"
+          },
+          "counter": {
+            "href": "https://horizon-testnet.stellar.org/accounts/GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2"
+          },
+          "operation": {
+            "href": "https://horizon-testnet.stellar.org/operations/24592042139070465"
+          }
+        },
+        "id": "24592042139070465-0",
+        "paging_token": "24592042139070465-0",
+        "ledger_close_time": "2026-11-14T10:35:49Z",
+        "trade_type": "orderbook",
+        "base_offer_id": "4636278060566458369",
+        "base_account": "GCNIQ7EQEZJRB7OJ3Z4MHHRPSK5TBBGMTY3PWNOML2LCOUK4K27RJ5R7",
+        "base_amount": "33.7896380",
+        "base_asset_type": "native",
+        "counter_offer_id": "973055",
+        "counter_account": "GDOTPDCFWWK5QJ4DJP2PQTY6D3YFJV5QRIDYKQZEAMJ7ZTHQW3NZM3O2",
+        "counter_amount": "5.0000000",
+        "counter_asset_type": "credit_alphanum4",
+        "counter_asset_code": "USDC",
+        "counter_asset_issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        "base_is_seller": false,
+        "price": {
+          "n": "2500000",
+          "d": "16894819"
+        }
+      }
+    ]
+  }
+}

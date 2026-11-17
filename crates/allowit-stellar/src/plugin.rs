@@ -186,6 +186,12 @@ impl RailPlugin for Plugin {
     ) -> Option<&'static dyn allowit_core::vendor::custom_build::CustomWalletBuild> {
         Some(&provider::custom_build::CUSTOM_BUILD)
     }
+    /// The price observation of a server policy: [`provider::price`].
+    fn policy_functions(
+        &self,
+    ) -> &'static [(&'static str, allowit_core::vendor::plugin::PolicyFunction)] {
+        &[(provider::price::FUNCTION, provider::price::price)]
+    }
     fn draft_params(
         &self,
         network: &str,
