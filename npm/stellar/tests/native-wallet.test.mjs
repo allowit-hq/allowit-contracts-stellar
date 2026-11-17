@@ -404,3 +404,26 @@ test('a Native value change signs only the requested values, keeps its signed ap
   await assert.rejects(updateParams({...base, journal: held, key: 'c', ask}), /reply lost/);
   await assert.rejects(updateParams({...base, journal: held, key: 'c', ask, params: {payment_limit: {Int: '6'}}}), /another change/);
 });
+
+test('a registration whose reply is lost funds nothing again: the retained setup records its funding', async () => {
+  const {state: chain, fetch} = ledger(), signed = [], journal = journalOf();
+  globalThis.fetch = fetch;
+  const {ask: service, calls, state} = nativeService();
+  let lose = true;
+  // The service registers the wallet, and its reply is lost once.
+  const ask = async (path, body) => {
+    const reply = await service(path, body);
+    if (path === 'native/register' && lose) {lose = false; throw new Error('The reply was lost.');}
+    return reply;
+  };
+  const input = {network, historyPauseMs: 0, ask, sign: ownerSigns(signed), journal, key: 'flow', policyId: 'policy-1', agent: roles.agent, amount: '5', onStep() {}};
+  await assert.rejects(installAndFund(input), /reply was lost/);
+  assert.ok(journal.get('flow:wallet-setup'));
+  const result = await installAndFund(input);
+  assert.equal(result.wallet, state.wallet);
+  assert.deepEqual(signed, [SET_UP_WALLET, APPROVE_POLICY]);
+  assert.equal(chain.posted.length, 1);
+  assert.ok(!calls.some(([path, body]) => path === 'native/owner/prepare' && body?.action === 'fund'));
+  assert.deepEqual(JSON.parse(journal.get('flow:funded')), {policyId: 'policy-1', agent: roles.agent, amount: '5'});
+  assert.equal(journal.get('flow:wallet-setup'), null);
+});

@@ -1,7 +1,7 @@
 import { canonicalNetwork } from './plugin.js';
 import { expiredRecord as chainExpiredRecord, horizonGet } from './chain-record.js';
 import { countersignCreation, CREATE_FEE_ACCOUNT, FEE_ACCOUNT_REQUIRED, newFeeAccountKey } from './fee-account.js';
-import { APPROVE_POLICY, SET_UP_WALLET, WALLET_SETUP_REQUIRED, WalletSetupPendingError, approvalStep, policyApproval, setUpNativeWallet } from './native-wallet.js';
+import { APPROVE_POLICY, SET_UP_WALLET, WALLET_SETUP_REQUIRED, WalletSetupPendingError, approvalStep, nativeSetupOf, policyApproval, setUpNativeWallet } from './native-wallet.js';
 /** Typed codes of a refused `native/owner/submit`. The reply body is `{error, code, details}`. */
 export const OWNER_TRANSACTION_EXPIRED = 'owner_transaction_expired';
 export const OWNER_TRANSACTION_PENDING = 'owner_transaction_pending';
@@ -82,6 +82,24 @@ function signatureBytes(signature) {
     if (bytes.length !== 64)
         throw new OwnerFlowError('Your wallet did not return a message signature.', null, false);
     return bytes;
+}
+/**
+ * True when a retained signed setup created `wallet` for `agent` with the funding `amount`. The server registers a
+ * wallet only after the network confirmed its setup, so such a setup of an installed wallet has funded it.
+ */
+function setupFunded(raw, network, wallet, agent, amount) {
+    if (raw === null)
+        return false;
+    try {
+        const value = JSON.parse(raw);
+        if (!object(value) || typeof value.signedPayload !== 'string' || value.agent !== agent || value.amount !== amount)
+            return false;
+        const setup = nativeSetupOf(value.signedPayload, network);
+        return setup !== null && setup.wallet === wallet && setup.agent === agent;
+    }
+    catch {
+        return false;
+    }
 }
 function savedApproval(journal, key, identity) {
     const raw = journal.get(key);
@@ -421,8 +439,12 @@ async function run({ network, ask, sign, journal, key, policyId, agent, amount, 
             throw new OwnerFlowError('The deployment reply names a different policy.', null, false);
         wallet = installedWallet(reply);
         if (wallet && reply.walletKind === 'native') {
-            // A setup of this run created and funded the wallet account, and recorded that funding. What remains is the
-            // owner's approval of the policy. A wallet account that this workflow did not fund is funded below.
+            // A setup of this workflow created and funded the wallet account. A run that stopped after the registration
+            // and before its reply kept the signed setup: when it names this wallet, agent and amount, the setup funded
+            // it, and that funding is recorded before the setup leaves the journal. What remains is the owner's approval
+            // of the policy. A wallet account that this workflow did not fund is funded below.
+            if (setupFunded(journal.get(walletSetupKey), network, wallet, agent, amount))
+                journal.set(fundedKey, JSON.stringify(identity));
             journal.remove(walletSetupKey);
             if (reply.approved !== true)
                 await approvePolicy(wallet);
