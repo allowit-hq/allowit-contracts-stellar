@@ -309,6 +309,10 @@ async function setUp({network, owner, agent, server, amount, sign, onStep, journ
   const ownerSigned = await sign({action: SET_UP_WALLET, payload: tx.toXDR(), hash, expiresAt});
   const signed = TransactionBuilder.fromXDR(ownerSigned, passphrase);
   if ('innerTransaction' in signed || hex(signed.hash()) !== hash || signed.signatures.length !== 1) throw new Error('The wallet returned another transaction. Nothing was sent.');
+  // The one signature must be the owner's: the transaction hash leaves signatures out, so another key's signature
+  // would pass the check above and the network would refuse the setup.
+  if (!Keypair.fromPublicKey(owner).verify(signed.hash(), signed.signatures[0].signature.value))
+    throw new Error('The wallet signed with another account than the owner. Nothing was saved or sent; sign with the owner account.');
   // The new account's own key signs its creation once, beside the owner. Then the key is dropped.
   signed.sign(setupKey);
   const signedPayload = signed.toXDR();

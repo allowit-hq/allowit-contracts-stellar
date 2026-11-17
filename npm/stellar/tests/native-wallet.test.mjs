@@ -485,3 +485,20 @@ test('a saved approval that the service no longer holds is prepared again and se
   const again = await updateParams({...base, journal: other, key: 'v', ask: ask2});
   assert.deepEqual([again.done, signed.length, submitted.at(-1).payload], [true, 3, changed]);
 });
+
+test('a setup signed by another account than the owner is refused before it is saved or sent', async () => {
+  const {state: chain, fetch} = ledger(), journal = journalOf();
+  globalThis.fetch = fetch;
+  const stranger = Keypair.random();
+  const strangerSigns = async step => {
+    const tx = TransactionBuilder.fromXDR(step.payload, Networks.TESTNET);
+    tx.sign(stranger);
+    return tx.toXDR();
+  };
+  await assert.rejects(setUpNativeWallet({network, ...roles, amount: '5', sign: strangerSigns, onStep() {}, journal, key: 'k', fetch}), /another account than the owner/);
+  assert.deepEqual([journal.map.size, chain.posted.length], [0, 0]);
+  // The owner then signs, and the setup goes through.
+  const setup = await setUpNativeWallet({network, ...roles, amount: '5', sign: ownerSigns([]), onStep() {}, journal, key: 'k', fetch});
+  assert.equal(chain.posted.length, 1);
+  assert.ok(setup.wallet);
+});
