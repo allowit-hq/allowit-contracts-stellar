@@ -3,43 +3,23 @@
  * network fees. The owner's deployment creates and funds it. It has the signers of a wallet account: the owner alone
  * reaches every threshold, and the agent key and the server pay from it only together. The agent holds no account.
  *
- * This module derives the account's one-time key from the owner's signature, reads the account from the public
- * ledger history and prepares the owner's refill. The server takes no part in the read or the refill.
+ * This module adds the one signature of the account's random setup key to its creation, reads the account from
+ * the public ledger history and prepares the owner's refill. The server takes no part in the read or the refill.
  */
 import { Keypair } from '@stellar/stellar-sdk/base';
-/** The action of the step that signs the derivation message. Its payload is the base64 text of the message. */
-export declare const DERIVE_FEE_ACCOUNT_KEY = "derive_fee_account_key";
 /** The action of the owner step that creates the fee account. */
 export declare const CREATE_FEE_ACCOUNT = "create_fee_account";
 /** The action of the owner step that refills the fee account. */
 export declare const REFILL_FEES = "refill_fees";
 /** The typed refusal of a wallet creation that names no fee account. `details.wallet` is the policy wallet. */
 export declare const FEE_ACCOUNT_REQUIRED = "fee_account_required";
-/** The index of the first fee account of a policy wallet. */
-export declare const FEE_ACCOUNT_INDEX = 0;
 /** The SEP-53 digest of a wallet message, as lowercase hexadecimal. */
 export declare function messageDigest(message: string): string;
 /**
- * The message whose owner signature derives the one-time key of a fee account. It names the network, the agent,
- * the policy wallet and an index, so each policy wallet of one owner gets its own account and the owner can
- * compute the address again.
+ * The setup key of a new fee account: random, held in memory by the caller and used once. Nothing stores, derives
+ * or recovers it. The creation sets its weight to 0 and makes the owner a signer that reaches every threshold alone.
  */
-export declare function feeAccountDerivationMessage(network: string, agent: string, wallet: string, index?: number): string;
-/** The fields of a derivation message of `network`, or null for any other text. */
-export declare function feeAccountDerivation(message: unknown, network: string): {
-    agent: string;
-    wallet: string;
-    index: number;
-} | null;
-/** The step that asks the owner's wallet for the derivation signature. It signs a message and moves nothing. */
-export declare function derivationStep(network: string, agent: string, wallet: string, now?: number): {
-    action: string;
-    payload: string;
-    hash: string;
-    expiresAt: number;
-};
-/** The one-time key of a fee account, from the owner's 64-byte signature over the derivation message. */
-export declare function feeAccountKey(signature: Uint8Array): Keypair;
+export declare function newFeeAccountKey(): Keypair;
 /**
  * Adds the one signature of the new account's own key to the owner-signed creation of a fee account. The signed
  * bytes must be the reviewed step, and its first operation must create exactly the account of `key`.

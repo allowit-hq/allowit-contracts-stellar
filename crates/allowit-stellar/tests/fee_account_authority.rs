@@ -241,13 +241,12 @@ fn a_fee_account_on_testnet_obeys_its_signers_weights_and_thresholds() {
         "faucet: {}",
         owner::fund_testnet_account(&owner_account, None).unwrap()
     );
-    // The fee account key derives from the owner's signature over a message that names the
-    // network, the agent and the policy wallet, as the product derives it.
+    // The product makes the setup key at random, signs the creation with it once and drops
+    // it. This test keeps the seed, to show below that the key has no authority after setup.
     let agent_account = key_account(&agent);
     let policy_wallet = stellar_strkey::Contract(hash(agent_account.as_bytes())).to_string();
-    let derivation =
-        owner::fee_account_derivation_digest(NETWORK, &agent_account, &policy_wallet, 0).unwrap();
-    let account_key_once = owner::WalletKey::from_signature(&owner.sign(&derivation).to_bytes());
+    let own = fresh_key();
+    let account_key_once = owner::WalletKey::from_seed(&own.to_bytes());
     let roles = Roles {
         owner: owner_account,
         agent: agent_account,
@@ -258,20 +257,6 @@ fn a_fee_account_on_testnet_obeys_its_signers_weights_and_thresholds() {
         "owner {} agent {} server {} fee account {} for policy wallet {}",
         roles.owner, roles.agent, roles.server, roles.wallet, policy_wallet
     );
-    // The same owner derives another account for another agent, wallet or index, and the
-    // wallet account of this agent is another account again.
-    for other in [
-        owner::fee_account_derivation_digest(NETWORK, &roles.server, &policy_wallet, 0).unwrap(),
-        owner::fee_account_derivation_digest(NETWORK, &roles.agent, &policy_wallet, 1).unwrap(),
-        owner::fee_account_derivation_digest("stellar:pubnet", &roles.agent, &policy_wallet, 0)
-            .unwrap(),
-        owner::wallet_derivation_digest(NETWORK, &roles.agent, 0).unwrap(),
-    ] {
-        assert_ne!(
-            owner::WalletKey::from_signature(&owner.sign(&other).to_bytes()).account(),
-            roles.wallet
-        );
-    }
     assert!(
         rpc::find_account(&rpc, &roles.agent).unwrap().is_none(),
         "the agent key has no account"
@@ -339,6 +324,60 @@ fn a_fee_account_on_testnet_obeys_its_signers_weights_and_thresholds() {
     };
     assert!(code.contains("OpBadAuth"), "{code}");
     assert!(rpc::find_account(&rpc, &roles.wallet).unwrap().is_none());
+    // A setup that fails at any one of its operations leaves no account: the ledger applies a
+    // transaction whole or not at all. Each case carries both signatures and one operation
+    // that the ledger refuses. The owner pays the fee and holds everything else.
+    for failing in 0..4usize {
+        let owner_state = rpc::get_account(&rpc, &roles.owner).unwrap();
+        let before = balance(&rpc, &roles.owner);
+        let setup = owner::prepare_fee_account_setup(
+            &owner_state,
+            &owner::FeeAccountTerms {
+                account: &roles.wallet,
+                agent: &roles.agent,
+                engine: &roles.server,
+                request_id: &owner::fee_account_request_id(&hash(policy_wallet.as_bytes())),
+                network: NETWORK,
+                fee_per_operation: 100,
+            },
+            clock(),
+        )
+        .unwrap();
+        let x::TransactionEnvelope::Tx(envelope) = x::TransactionEnvelope::from_xdr_base64(
+            &owner::setup_transaction(&setup).unwrap().transaction_xdr,
+            x::Limits::none(),
+        )
+        .unwrap() else {
+            panic!()
+        };
+        let mut tx = envelope.tx;
+        let mut operations = tx.operations.to_vec();
+        assert_eq!(operations.len(), 4);
+        match &mut operations[failing].body {
+            // A starting balance below the reserve of an account.
+            x::OperationBody::CreateAccount(create) => create.starting_balance = 1,
+            // A signer that is the account's own key.
+            x::OperationBody::SetOptions(options) => {
+                options.signer = Some(x::Signer {
+                    key: x::SignerKey::Ed25519(x::Uint256(own.verifying_key().to_bytes())),
+                    weight: 1,
+                })
+            }
+            _ => panic!(),
+        }
+        tx.operations = operations.try_into().unwrap();
+        let label = format!("setup that fails at operation {} of 4", failing + 1);
+        let Outcome::Refused(code) = settle(&rpc, &label, &sign(&tx, &[&owner, &own])) else {
+            panic!("{label} must fail")
+        };
+        assert!(code.starts_with("TxFailed"), "{code}");
+        assert!(rpc::find_account(&rpc, &roles.wallet).unwrap().is_none());
+        let paid = before - balance(&rpc, &roles.owner);
+        assert!((0..=400).contains(&paid), "{paid}");
+        println!(
+            "  after it: no fee account exists; the owner paid {paid} stroops of fee and holds the rest"
+        );
+    }
     // The refused transaction used the owner's sequence, so the setup is prepared again.
     let owner_state = rpc::get_account(&rpc, &roles.owner).unwrap();
     let now = clock();
@@ -363,12 +402,6 @@ fn a_fee_account_on_testnet_obeys_its_signers_weights_and_thresholds() {
     else {
         panic!()
     };
-    let own = SigningKey::from_bytes(&{
-        // The setup key again, from the same derivation.
-        let mut bytes = b"allowit-stellar-native-wallet-seed-v1".to_vec();
-        bytes.extend_from_slice(&owner.sign(&derivation).to_bytes());
-        hash(&bytes)
-    });
     assert_eq!(key_account(&own), roles.wallet);
     let signed = sign(&unsigned.tx, &[&owner, &own]);
     validate_signed_owner_transaction(&packet, &signed).unwrap();

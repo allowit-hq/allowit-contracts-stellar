@@ -1330,6 +1330,46 @@ pub fn trusted_state_for_discovery(
 ) -> Result<DiscoveredState> {
     trusted_state_inner(rpc, c, accounting, false)
 }
+/// The agent address that the policy wallet of `c` names on the ledger, or `None` while the
+/// ledger holds no such wallet. For a wallet with a fee account that address is the fee
+/// account. The read reports; it authorizes nothing, and a caller verifies the wallet's whole
+/// binding before it relies on the address.
+pub fn installed_agent_address(rpc: &dyn Rpc, c: &WalletConfig) -> Result<Option<String>> {
+    if c.route != WalletRoute::PolicyWallet {
+        return Ok(None);
+    }
+    let contract = address(&c.wallet)?;
+    let key = LedgerKey::ContractData(LedgerKeyContractData {
+        contract: contract.clone(),
+        key: ScVal::LedgerKeyContractInstance,
+        durability: ContractDataDurability::Persistent,
+    });
+    let entries = rpc.call("getLedgerEntries", json!({"keys":[xdr(&key)?]}))?;
+    let list = entries["entries"]
+        .as_array()
+        .ok_or("Missing policy wallet ledger entry")?;
+    let Some(entry) = list.first() else {
+        return Ok(None);
+    };
+    let entry: LedgerEntryData = read(entry["xdr"].as_str().ok_or("Missing instance XDR")?)?;
+    let LedgerEntryData::ContractData(data) = entry else {
+        return Err("Unexpected policy wallet ledger entry".into());
+    };
+    if list.len() != 1 || data.contract != contract || data.key != ScVal::LedgerKeyContractInstance
+    {
+        return Err("policy wallet instance ledger key differs".into());
+    }
+    let ScVal::ContractInstance(instance) = data.val else {
+        return Err("Missing policy wallet instance state".into());
+    };
+    let storage = instance.storage.ok_or("Missing policy wallet storage")?;
+    let state = storage
+        .iter()
+        .find(|e| e.key == ScVal::U32(0))
+        .map(|e| &e.val)
+        .ok_or("Missing policy wallet custody state")?;
+    Ok(Some(CustodyState::from_scval(state)?.agent))
+}
 /// The fault of a wallet whose code on the ledger differs from the code of its configuration.
 pub const EXECUTABLE_DIFFERS: &str = "policy wallet executable differs from installed code";
 fn trusted_state_inner(

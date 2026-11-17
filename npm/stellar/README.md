@@ -36,12 +36,21 @@ and `network_unavailable` keep the step for a retry (`OwnerFlowError.retry`). A 
 the policy, agent key and amount; a resume with other inputs is refused.
 
 A new policy wallet has a fee account: the account that sends the agent's operations and pays their network fees.
-The server refuses a creation without one with `fee_account_required` and `details.wallet`. `installAndFund` then asks
-the host's `sign` for one message signature with the step action `derive_fee_account_key`: the `owner-sign` element
-shows the agent and the wallet, signs only the exact derivation message of the network and resolves with the
-signature. The workflow derives the account's one-time key from it, names the account to the server as
-`setup.feeAccount`, and adds the key's one signature to the owner-signed `create_fee_account` step before the bytes
-enter the journal. The key is never stored: after a reload the owner signs the same message again. The element shows
+The server refuses a creation without one with `fee_account_required`. `installAndFund` then makes the account's
+setup key at random in memory (`newFeeAccountKey`), names the account to the server as `setup.feeAccount`, and adds
+the key's one signature to the owner-signed `create_fee_account` step before the bytes enter the journal. The owner
+signs no message for it. The key is used once and dropped; nothing stores, derives or recovers it, because the
+creation sets its weight to 0 and makes the owner a signer that reaches every threshold alone. The journal keeps the
+address of an account whose creation was signed under `<key>:fee-account` until the wallet is installed, so a reload
+names the same account. The entry also records that the creation was confirmed; a confirmed account is never
+replaced. When the service prepares the creation of a saved, unconfirmed account again, Horizon decides: an account
+that the ledger holds stays and the step is refused as stale (`OwnerFlowError.retry`), an unreadable ledger keeps
+the account too, and only an account that the ledger does not hold is replaced. Its signed creation never applied,
+so nothing holds funds: the workflow makes a new key and names its account. A journal without a saved
+address names no account, so a deployment that another browser or an earlier release took past its fee account and
+not to its wallet continues here with a new account. The earlier account stays under the owner's key alone: the
+owner closes it, and Horizon lists it under `accounts?signer=<owner>`. The workflow adopts no existing account,
+because neither the journal nor the ledger says which one no wallet uses. The element shows
 what a `create_fee_account` step funds: the account and the XLM that it starts with.
 
 With `expected.feeAccount` the owner verifier admits the `create_fee_account` step of exactly that account for the
@@ -66,6 +75,41 @@ A refusal keeps the typed code of the service in `OwnerFlowError.code`: `param_i
 The `owner-sign` element checks an `update_params` step of a Standard wallet against `data.expected` like an install
 step: the selection holds the complete new params and `update: {deploymentVersion, x402Enabled}`. The verifier
 reconstructs the exact policy packet, so a step with another value, revision, wallet or code is not signed.
+
+### Native wallet
+
+A Native policy needs the wallet account of its agent: a new classic account, one for each agent. `installAndFund`
+deploys it without a server step. The service answers the deployment of such a draft with `wallet_setup_required` and
+the roles `{owner, agent, server}`. The workflow then:
+
+1. Builds the setup from the owner's own sequence (`native-wallet.ts`): one transaction that creates the account with
+   its starting balance, adds the owner signer (weight 3), the agent signer (1) and the server signer (1), sets the
+   thresholds 2, 2 and 3 and gives the account's own key weight 0. The starting balance is the reserve of the account
+   (2.5 XLM), 0.5 XLM for the fees of the owner's own steps and the owner's funding amount.
+2. Has the host's `sign` sign it as the step `set_up_wallet`. The account's own key is random, lives in that call only
+   and signs the creation once beside the owner. The `owner-sign` element reads the step from its bytes: it shows the
+   wallet account, the agent and the funding, and it refuses any transaction that is not exactly this setup.
+3. Sends the signed bytes to Horizon itself. They stay in the journal under `<key>:wallet-setup` until the service has
+   registered the wallet, so a run that stops in between names the same account again and signs no second setup. A
+   result that is unknown is settled as a refill is: done when Horizon holds it as successful, sent again while its
+   time bound lasts, and replaced only when Horizon holds it as failed or has read past its time bound without it.
+4. Registers the account for the policy (`native/register` with the installation document and the `policyId`).
+5. Asks for the owner's approval of the policy (`native/approval`) and has `sign` sign it as the step `approve_policy`:
+   a message, never a transaction. The payload is the base64 UTF-8 text of the message, and the hash its SEP-53 digest.
+   The element signs only the exact approval message of its network, shows the wallet account and the hashes of the
+   source and the values, and compares them with `data.expected` when the host passes `{policyId, wallet, sourceHash,
+   paramsHash}`. The host passes `reviewed: {source, params}`, and `rules` and `tier` when it shows them: the policy that the owner reviewed. The
+   workflow signs only an approval that states exactly that policy and the wallet account's own configuration (its
+   network, route, policy instance, asset and fee ceiling); only the server's digests `irHash` and `moduleDigest` are
+   left to the server, and a Native wallet enforces neither. It keeps the signature only when the owner's account
+   made it, and confirms the approval with `micro/allocation/confirm`.
+
+So a Native deployment takes two owner signatures: the setup, which also funds the wallet, and the approval. No
+funding step follows. `updateParams` on a Native wallet is one `approve_policy` signature and no transaction: the
+account holds no values, so the service answers the change with the approval message of the new values. The host
+passes `installed: {wallet, source, rules, params, tier}`, the policy that the owner reviewed. The workflow signs
+only an approval of that policy with the changed params replaced, checked as for the deployment's approval; any
+other field or value is refused before a signature.
 
 ## Build and test
 

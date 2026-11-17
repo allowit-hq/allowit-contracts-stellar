@@ -36,7 +36,7 @@ struct Selection {
     params: PolicyParams,
     wasm_hash: String,
     wallet: Option<String>,
-    /// The fee account that the owner's key derived for this wallet: the account that sends
+    /// The fee account that the owner's client made for this wallet: the account that sends
     /// the agent's operations. The creation and every update name it as the agent address.
     #[serde(default)]
     fee_account: Option<String>,

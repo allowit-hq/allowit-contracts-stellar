@@ -273,7 +273,7 @@ pub fn deployment_policy(
         ))?,
         owner: owner.into(),
         agent: agent.into(),
-        // `with_fee_account` names the account that the owner's key derives.
+        // The deployment workflow makes the fee account and names it here.
         fee_account: None,
         server: server.into(),
         route: WalletRoute::PolicyWallet,
@@ -341,47 +341,85 @@ pub fn native_policy(
     checked(native::validate_config(&config))?;
     Ok(OwnerPolicy { policy, config })
 }
-/// The index of the first fee account of a policy wallet. The derivation message names it.
-pub const FEE_ACCOUNT_INDEX: u32 = 0;
-/// The one-time key of the fee account of a policy wallet: the owner signs the derivation
-/// message, which names the network, the agent and the wallet, and the signature is the seed.
-/// The key signs the creation of its account once and then has no authority.
-fn derive_fee_account_key(
-    signer: &dyn OwnerSigner,
-    c: &WalletConfig,
-) -> Result<native::owner::WalletKey> {
-    let digest = checked(native::owner::fee_account_derivation_digest(
-        &c.network,
-        &c.agent,
-        &c.wallet,
-        FEE_ACCOUNT_INDEX,
-    ))?;
-    let signature = checked(signer.sign_hash(&digest))?;
-    checked(native::signing::verify_digest(
-        signer.account(),
-        &digest,
-        &signature,
-    ))?;
-    Ok(native::owner::WalletKey::from_signature(&signature))
+/// The one-time setup key of a new fee account and the address that it names. The key is
+/// random and lives only in this call: it signs the creation of its account once.
+fn new_fee_account(c: &mut WalletConfig) -> Result<native::owner::WalletKey> {
+    let key = checked(native::owner::WalletKey::random())?;
+    c.fee_account = Some(key.account());
+    checked(native::validate_config(c))?;
+    Ok(key)
 }
-/// The deployment selection with its fee account: the account that the owner's deployment
-/// creates and funds, which sends the agent's operations on the wallet and pays their fees.
-/// The owner's key derives its address, so the same owner computes it again.
-pub fn with_fee_account(
-    mut selection: OwnerPolicy,
-    signer: &dyn OwnerSigner,
-) -> Result<OwnerPolicy> {
-    if selection.config.route != WalletRoute::PolicyWallet
-        || signer.account() != selection.config.owner
-    {
-        return Err(Error::usage(
-            "The owner of a policy wallet derives its fee account",
-        ));
+/// The fee account of a deployment and, when this run creates it, its setup key. The ledger and
+/// the retained bytes decide, in this order:
+///
+/// 1. A creation of the fee account or of the wallet is signed in this record: the retained
+///    bytes carry every signature. The record keeps its account and nothing needs a key.
+/// 2. The ledger holds the wallet: the wallet names its agent address, which is its fee
+///    account. The deployment creates nothing, and the final verification checks that address
+///    and its signers against the selection.
+/// 3. Otherwise no account of this record has a signature: this run drops a prepared, unsigned
+///    creation, makes a new random key and names its account. The key lives in this call only.
+fn deployment_fee_account(
+    record: &mut Record,
+    rpc: &dyn rpc::Rpc,
+) -> Result<Option<native::owner::WalletKey>> {
+    if record.steps.iter().any(|s| {
+        s.signed_xdr.is_some()
+            && matches!(
+                s.packet.action.as_str(),
+                native::owner::CREATE_FEE_ACCOUNT | "create_wallet"
+            )
+    }) {
+        return Ok(None);
     }
-    selection.config.fee_account =
-        Some(derive_fee_account_key(signer, &selection.config)?.account());
-    checked(native::validate_config(&selection.config))?;
-    Ok(selection)
+    if record
+        .steps
+        .last()
+        .is_some_and(|s| s.packet.action == native::owner::CREATE_FEE_ACCOUNT)
+    {
+        record.steps.pop();
+    }
+    let c = &mut record.selection.config;
+    if let Some(agent_address) = checked(rpc::installed_agent_address(rpc, c))? {
+        // A wallet of an earlier release names the agent key's own account.
+        c.fee_account = (agent_address != c.agent).then_some(agent_address);
+        checked(native::validate_config(c))?;
+        return Ok(None);
+    }
+    new_fee_account(c).map(Some)
+}
+/// Whether a saved record is the workflow of `identity`. A record of an earlier release names
+/// its fee account in its saved identity; it is the same workflow when its content has the
+/// identity and its saved hash is the one that the earlier release computed.
+fn resumes(saved: &Record, identity: &str) -> Result<bool> {
+    if workflow_identity(&saved.selection, &saved.work, saved.max_fee_stroops)? != identity {
+        return Ok(false);
+    }
+    Ok(saved.intent_hash == identity
+        || saved.intent_hash
+            == intent_hash(
+                &json!({"selection":saved.selection,"work":saved.work,"maxFeeStroops":saved.max_fee_stroops}),
+            )?)
+}
+/// Whether a saved record still has the identity that it was saved under: the identity of this
+/// release, which leaves out a deployment's fee account, or the hash of its whole content, which
+/// an earlier release saved.
+fn identity_holds(record: &Record) -> Result<bool> {
+    Ok(record.intent_hash
+        == workflow_identity(&record.selection, &record.work, record.max_fee_stroops)?
+        || record.intent_hash
+            == intent_hash(
+                &json!({"selection":record.selection,"work":record.work,"maxFeeStroops":record.max_fee_stroops}),
+            )?)
+}
+/// The identity of a workflow: its selection, its work and its fee ceiling. The identity of a
+/// deployment leaves out the fee account, because the workflow itself makes that account.
+fn workflow_identity(selection: &OwnerPolicy, work: &Work, max_fee: u32) -> Result<String> {
+    let mut selection = selection.clone();
+    if matches!(work, Work::Deploy) {
+        selection.config.fee_account = None;
+    }
+    intent_hash(&json!({"selection":selection,"work":work,"maxFeeStroops":max_fee}))
 }
 /// Convert a positive decimal asset amount to exact seven-decimal base units without floating point.
 pub fn amount_units(amount: &str) -> Result<i128> {
@@ -877,20 +915,28 @@ impl OwnerClient {
             ));
         }
         selection.validate()?;
-        let identity =
-            intent_hash(&json!({"selection":selection,"work":work,"maxFeeStroops":max_fee}))?;
+        // A deployment makes the fee account of its wallet. The caller names none.
+        let deploying = matches!(work, Work::Deploy);
+        if deploying && selection.config.fee_account.is_some() {
+            return Err(Error::usage(
+                "A deployment makes the fee account of its policy wallet",
+            ));
+        }
+        let identity = workflow_identity(selection, &work, max_fee)?;
         let mut record = match store.load::<Record>(id)? {
             Some(saved)
                 if saved.version == 1
                     && saved.request_id == id
                     && saved.backend == self.session.backend()
                     && saved.origin == self.session.origin()
-                    && saved.intent_hash == identity
-                    && intent_hash(
-                        &json!({"selection":saved.selection,"work":saved.work,"maxFeeStroops":saved.max_fee_stroops}),
-                    )? == identity =>
+                    && resumes(&saved, &identity)? =>
             {
-                saved
+                // A record of an earlier release takes the identity of this one, so it still
+                // resumes after this run replaces or keeps its fee account.
+                Record {
+                    intent_hash: identity,
+                    ..saved
+                }
             }
             Some(_) => {
                 return Err(Error::config(
@@ -910,6 +956,12 @@ impl OwnerClient {
                 complete: false,
             },
         };
+        let mut setup_key = if deploying {
+            deployment_fee_account(&mut record, rpc)?
+        } else {
+            None
+        };
+        let selection = &record.selection.clone();
         for step in &record.steps {
             if step.signed_xdr.is_some() {
                 verify_retained(&record, step)?;
@@ -955,8 +1007,8 @@ impl OwnerClient {
                     step: Option<Step>,
                 }
                 let (path, body) = match &record.work {
-                    // The owner's client names the fee account that its key derives. The
-                    // server adds it to the installation of the new wallet.
+                    // The owner's client names the fee account that it creates. The server
+                    // adds it to the installation of the new wallet.
                     Work::Deploy => (
                         "/api/native/deploy/prepare",
                         match &selection.config.fee_account {
@@ -1103,9 +1155,15 @@ impl OwnerClient {
                     Ok(result)
                 };
                 let signed = if step.packet.action == native::owner::CREATE_FEE_ACCOUNT {
-                    // The new account's own key signs its creation once. The owner's key
-                    // derives it again here; it is never stored.
-                    let key = derive_fee_account_key(signer, &selection.config)?;
+                    // The new account's own key signs its creation once. The key is random,
+                    // lives in this call and is never stored. A creation that was signed
+                    // before keeps its retained bytes; if the network never took them, the
+                    // account does not exist and a new request makes another one.
+                    let Some(key) = setup_key.take() else {
+                        return Err(Error::config(
+                            "The fee account of this request was signed for before and the network did not take it. The account does not exist and holds nothing. Start the deployment again with a new request ID",
+                        ));
+                    };
                     checked(proof.sign_with_wallet_key(clock()?, sign, &key))?
                 } else {
                     checked(proof.sign_with(clock()?, sign))?
@@ -1609,45 +1667,14 @@ struct NativeSetupRecord {
     identity: String,
     setup: native::owner::NativeSetup,
     source: native::AccountState,
-    /// How the wallet account's one-time key was made: `owner-signature` when the owner's
-    /// signer signs the derivation message the same way twice, so the owner can compute the
-    /// address again; `one-time` when it does not.
-    derivation: String,
+    /// A record of an earlier release names how its key was derived. Nothing reads it.
+    #[serde(rename = "derivation", default, skip_serializing)]
+    _derivation: Option<String>,
     created_at: u64,
     signed_xdr: Option<String>,
     signature: Option<Vec<u8>>,
     submitted: bool,
     receipt: Option<rpc::VerifiedReceipt>,
-}
-/// The index of the first wallet of an agent. The derivation message names it.
-pub const WALLET_INDEX: u32 = 0;
-/// The one-time key of the wallet account of `agent`: the owner signs the derivation message,
-/// and the signature is the seed. Ed25519 signatures are deterministic, so the same owner key
-/// derives the same account again. A signer that signs the same message in two ways still
-/// yields a usable one-time key, which the result reports as `one-time`.
-fn derive_wallet_key(
-    signer: &dyn OwnerSigner,
-    network: &str,
-    agent: &str,
-) -> Result<(native::owner::WalletKey, &'static str)> {
-    let digest = checked(native::owner::wallet_derivation_digest(
-        network,
-        agent,
-        WALLET_INDEX,
-    ))?;
-    let first = checked(signer.sign_hash(&digest))?;
-    let second = checked(signer.sign_hash(&digest))?;
-    checked(native::signing::verify_digest(
-        signer.account(),
-        &digest,
-        &first,
-    ))?;
-    let derivation = if first == second {
-        "owner-signature"
-    } else {
-        "one-time"
-    };
-    Ok((native::owner::WalletKey::from_signature(&first), derivation))
 }
 /// The server's first record of a wallet: the account, its roles and a policy that admits
 /// transfers of XLM. The owner's generated policy replaces it at activation.
@@ -1679,7 +1706,6 @@ pub fn bootstrap_configuration(
 fn configured(
     request: &crate::provider::runtime::owner::SetupRequest,
     wallet: &str,
-    derivation: &str,
     transaction: Option<(&str, u32)>,
 ) -> Result<Value> {
     let configuration = bootstrap_configuration(
@@ -1692,7 +1718,6 @@ fn configured(
     Ok(
         json!({"state":"configured","requestId":request.request_id,"network":request.network,"wallet":wallet,"owner":request.owner,"agent":request.agent,"server":request.server,
         "installation":native::hex(&configuration.policy_instance),"configuration":configuration,
-        "derivation":{"method":derivation,"walletIndex":WALLET_INDEX},
         "signers":{"owner":native::owner::OWNER_WEIGHT,"agent":native::owner::AUTOMATED_WEIGHT,"server":native::owner::AUTOMATED_WEIGHT,"walletKey":0},
         "thresholds":{"low":native::owner::PAYMENT_THRESHOLD,"medium":native::owner::PAYMENT_THRESHOLD,"high":native::owner::OWNER_THRESHOLD},
         "reserveStroops":native::owner::wallet_reserve(false).to_string(),
@@ -1700,12 +1725,34 @@ fn configured(
     )
 }
 /// Prepare the setup of the wallet account `wallet` from the owner's current account.
+/// What one setup request binds. A funded setup also binds its amount; an unfunded one keeps the
+/// identity of earlier releases, so their retained requests resume.
+fn setup_identity(request: &crate::provider::runtime::owner::SetupRequest) -> Value {
+    let mut identity = json!({"network":request.network,"owner":request.owner,"agent":request.agent,"server":request.server,"requestId":request.request_id,"fee":request.fee_per_operation});
+    if let Some(funding) = request.funding {
+        identity["funding"] = json!(funding.to_string());
+    }
+    identity
+}
+/// The starting balance of a setup: the reserve and the float, and the owner's funding on top.
+/// The owner's account sends all of it in the setup transaction.
+fn setup_starting_balance(
+    request: &crate::provider::runtime::owner::SetupRequest,
+) -> Result<Option<i64>> {
+    request
+        .funding
+        .map(|funding| {
+            native::owner::default_starting_balance(false)
+                .checked_add(funding)
+                .ok_or_else(|| Error::usage("The setup funding amount is out of range"))
+        })
+        .transpose()
+}
 fn prepare_setup(
     runtime: &crate::provider::runtime::Runtime,
     request: &crate::provider::runtime::owner::SetupRequest,
     identity: &str,
     wallet: &str,
-    derivation: &str,
     now: u64,
 ) -> Result<NativeSetupRecord> {
     let source = checked(rpc::get_account(runtime.rpc(), &request.owner))?;
@@ -1718,7 +1765,7 @@ fn prepare_setup(
             request_id: &request.request_id,
             network: &request.network,
             fee_per_operation: request.fee_per_operation,
-            starting_balance: None,
+            starting_balance: setup_starting_balance(request)?,
             trustline: None,
         },
         now,
@@ -1727,7 +1774,7 @@ fn prepare_setup(
         identity: identity.into(),
         setup,
         source,
-        derivation: derivation.into(),
+        _derivation: None,
         created_at: now,
         signed_xdr: None,
         signature: None,
@@ -1772,13 +1819,15 @@ fn verify_setup_signatures(record: &NativeSetupRecord, signature: &[u8; 64]) -> 
     ))
 }
 /// Create one agent's wallet account with one owner-signed transaction, through SDK Runtime.
-/// The owner's signer derives the new account's one-time key, which co-signs once. Original
-/// unsigned intent and signed bytes are retained before direct native transmission. The
-/// result holds the server's first record of the wallet under `configuration`.
+/// The new account's one-time key is random and lives in this call: it co-signs the creation
+/// once. The transaction sets its weight to 0 and makes the owner a signer that reaches every
+/// threshold alone, so nothing stores or recovers the key. Original unsigned intent and
+/// signed bytes are retained before direct native transmission. The result holds the
+/// server's first record of the wallet under `configuration`.
 ///
-/// A retained request keeps its wallet. Once its transaction is signed, a resume reads the
-/// retained bytes and derives nothing, so a signer that does not sign deterministically still
-/// recovers a lost reply.
+/// Once the transaction of a request is signed, a resume reads the retained bytes and needs
+/// no key. A request that stopped before its signature names a new account on its next run:
+/// nothing was signed for the earlier one.
 pub fn configure_native(
     runtime: &crate::provider::runtime::Runtime,
     store: &Store,
@@ -1792,10 +1841,8 @@ pub fn configure_native(
         return Err(Error::config("Native setup owner signer differs"));
     }
     network(runtime.rpc(), &request.network)?;
-    let identity = intent_hash(
-        &json!({"network":request.network,"owner":request.owner,"agent":request.agent,"server":request.server,"requestId":request.request_id,"fee":request.fee_per_operation}),
-    )?;
-    let mut derived = None;
+    let identity = intent_hash(&setup_identity(request))?;
+    let mut made = None;
     let mut record = match store.load::<NativeSetupRecord>(&request.request_id)? {
         Some(record) if record.identity == identity => record,
         Some(_) => {
@@ -1804,45 +1851,25 @@ pub fn configure_native(
             ));
         }
         None => {
-            let (key, derivation) = derive_wallet_key(signer, &request.network, &request.agent)?;
+            let key = checked(native::owner::WalletKey::random())?;
             let wallet = key.account();
-            derived = Some(key);
-            // A wallet account that already exists is this agent's wallet only with the exact
-            // roles. Any other authority on it is refused, and nothing is signed.
-            if let Some(existing) = checked(rpc::find_account(runtime.rpc(), &wallet))? {
-                if existing
-                    .wallet_status(&request.owner, &request.agent, &request.server)
-                    .is_err()
-                {
-                    return Err(Error::config(
-                        "The wallet account of this agent already exists with other signers or thresholds; setup never replaces existing authority",
-                    ));
-                }
-                return configured(request, &wallet, derivation, None);
-            }
-            prepare_setup(runtime, request, &identity, &wallet, derivation, clock()?)?
+            made = Some(key);
+            prepare_setup(runtime, request, &identity, &wallet, clock()?)?
         }
     };
     store.save(&request.request_id, &record)?;
     if record.signed_xdr.is_none() {
-        let key = match derived.take() {
+        let key = match made.take() {
             Some(key) => key,
-            None => derive_wallet_key(signer, &request.network, &request.agent)?.0,
+            None => {
+                // This run resumes a request that stopped before its signature. Its key is
+                // gone and nothing was signed for its account: prepare again for a new key.
+                let key = checked(native::owner::WalletKey::random())?;
+                record = prepare_setup(runtime, request, &identity, &key.account(), clock()?)?;
+                store.save(&request.request_id, &record)?;
+                key
+            }
         };
-        if key.account() != record.setup.wallet {
-            // The owner's signer does not sign deterministically, so this run holds another
-            // one-time key. Nothing was signed for the retained preparation: prepare again
-            // for the key of this run.
-            record = prepare_setup(
-                runtime,
-                request,
-                &identity,
-                &key.account(),
-                "one-time",
-                clock()?,
-            )?;
-            store.save(&request.request_id, &record)?;
-        }
         let expected = expected_setup(request, &record)?;
         let current = checked(rpc::get_account(runtime.rpc(), &request.owner))?;
         if current != record.source || clock()? < record.created_at {
@@ -1946,7 +1973,6 @@ pub fn configure_native(
     configured(
         request,
         &wallet,
-        &record.derivation,
         Some((&record.setup.transaction_hash, receipt.ledger)),
     )
 }
@@ -1975,7 +2001,7 @@ fn expected_setup(
             engine: request.server.clone(),
             request_id: request.request_id.clone(),
             fee_per_operation: request.fee_per_operation,
-            starting_balance: None,
+            starting_balance: setup_starting_balance(request)?,
             trustline: None,
             created_at: record.created_at,
         },
@@ -1999,13 +2025,7 @@ pub fn status(
     let (network_name, packets, completed) = if value.get("selection").is_some() {
         let mut record: Record = serde_json::from_value(value)
             .map_err(|_| Error::config("Invalid retained owner workflow"))?;
-        if record.version != 1
-            || record.request_id != id
-            || record.intent_hash
-                != intent_hash(
-                    &json!({"selection":record.selection,"work":record.work,"maxFeeStroops":record.max_fee_stroops}),
-                )?
-        {
+        if record.version != 1 || record.request_id != id || !identity_holds(&record)? {
             return Err(Error::config("Retained owner workflow identity changed"));
         }
         let network_name = record.selection.config.network.clone();
@@ -2163,6 +2183,220 @@ mod submit_refusal_tests {
         ));
         assert_eq!(unsent.code, crate::provider::NETWORK_UNAVAILABLE);
         assert_eq!(unsent.api_code.as_deref(), Some("network_unavailable"));
+    }
+    /// A ledger that holds no policy wallet.
+    struct NoWallet;
+    impl rpc::Rpc for NoWallet {
+        fn call(&self, method: &str, _: Value) -> native::Result<Value> {
+            assert_eq!(method, "getLedgerEntries");
+            Ok(json!({"entries":[]}))
+        }
+    }
+    /// The ledger of the owner fixture: it holds the wallet of its configuration.
+    struct Installed(crate::test_support::owner::OwnerLedger);
+    impl rpc::Rpc for Installed {
+        fn call(&self, method: &str, params: Value) -> native::Result<Value> {
+            self.0.call(method, params, &[])
+        }
+    }
+    /// The ledger holds the wallet: its agent address is the fee account of every deployment
+    /// of that policy, under any request ID, and no run makes a key or a second account.
+    #[test]
+    fn a_deployment_of_an_installed_wallet_takes_the_fee_account_that_the_wallet_names() {
+        let fee_account = crate::test_support::owner::account(77);
+        let mut installed = crate::test_support::owner::selection().config;
+        installed.fee_account = Some(fee_account.clone());
+        let ledger = Installed(crate::test_support::owner::OwnerLedger::new(installed));
+        let mut record = record_defaults();
+        assert_eq!(record.selection.config.fee_account, None);
+        assert!(
+            deployment_fee_account(&mut record, &ledger)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            record.selection.config.fee_account.as_deref(),
+            Some(fee_account.as_str())
+        );
+        // A wallet of an earlier release names the agent key's own account: no fee account.
+        let ledger = Installed(crate::test_support::owner::OwnerLedger::new(
+            crate::test_support::owner::selection().config,
+        ));
+        let mut record = record_defaults();
+        assert!(
+            deployment_fee_account(&mut record, &ledger)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(record.selection.config.fee_account, None);
+    }
+    fn record_defaults() -> Record {
+        Record {
+            version: 1,
+            request_id: "deploy-001".into(),
+            backend: String::new(),
+            origin: String::new(),
+            intent_hash: String::new(),
+            selection: crate::test_support::owner::selection(),
+            work: Work::Deploy,
+            max_fee_stroops: 100,
+            steps: vec![],
+            complete: false,
+        }
+    }
+    /// A status read accepts the record of a deployment that names its fee account, under the
+    /// identity of this release and under the whole-content hash of an earlier one, and refuses
+    /// a record whose content changed.
+    #[test]
+    fn a_status_read_accepts_a_saved_deployment_with_its_fee_account() {
+        let mut record = record_defaults();
+        record.intent_hash = workflow_identity(&record.selection, &record.work, 100).unwrap();
+        record.selection.config.fee_account = Some(crate::test_support::owner::account(77));
+        // The whole-content hash, which the status read alone accepted before, differs.
+        assert_ne!(
+            record.intent_hash,
+            intent_hash(
+                &json!({"selection":record.selection,"work":record.work,"maxFeeStroops":record.max_fee_stroops}),
+            )
+            .unwrap()
+        );
+        assert!(identity_holds(&record).unwrap());
+        let legacy = Record {
+            intent_hash: intent_hash(
+                &json!({"selection":record.selection,"work":record.work,"maxFeeStroops":record.max_fee_stroops}),
+            )
+            .unwrap(),
+            ..record_defaults()
+        };
+        assert!(!identity_holds(&legacy).unwrap());
+        let mut legacy = legacy;
+        legacy.selection.config.fee_account = Some(crate::test_support::owner::account(77));
+        assert!(identity_holds(&legacy).unwrap());
+        let mut changed = record;
+        changed.max_fee_stroops = 101;
+        assert!(!identity_holds(&changed).unwrap());
+    }
+    /// A deployment's fee account across runs. The setup key is never in the record.
+    #[test]
+    fn a_resumed_deployment_keeps_a_signed_fee_account_and_replaces_an_unsigned_one() {
+        let selection = crate::test_support::owner::selection();
+        assert_eq!(selection.config.route, WalletRoute::PolicyWallet);
+        assert_eq!(selection.config.fee_account, None);
+        let identity = workflow_identity(&selection, &Work::Deploy, 100).unwrap();
+        let mut record = Record {
+            version: 1,
+            request_id: "deploy-001".into(),
+            backend: String::new(),
+            origin: String::new(),
+            intent_hash: identity.clone(),
+            selection,
+            work: Work::Deploy,
+            max_fee_stroops: 100,
+            steps: vec![],
+            complete: false,
+        };
+        assert!(resumes(&record, &identity).unwrap());
+        // A record of an earlier release: its identity names a fee account that its owner's
+        // key derived, and no creation is signed. It is this workflow. This run replaces the
+        // account, and with the identity of this release the next run resumes it again.
+        {
+            let mut legacy = record_defaults();
+            legacy.selection.config.fee_account = Some(crate::test_support::owner::account(77));
+            legacy.intent_hash = intent_hash(
+                &json!({"selection":legacy.selection,"work":legacy.work,"maxFeeStroops":legacy.max_fee_stroops}),
+            )
+            .unwrap();
+            assert_ne!(legacy.intent_hash, identity);
+            assert!(resumes(&legacy, &identity).unwrap());
+            let mut resumed = Record {
+                intent_hash: identity.clone(),
+                ..legacy
+            };
+            deployment_fee_account(&mut resumed, &NoWallet)
+                .unwrap()
+                .unwrap();
+            let again: Record =
+                serde_json::from_str(&serde_json::to_string(&resumed).unwrap()).unwrap();
+            assert!(resumes(&again, &identity).unwrap());
+            // Another fee ceiling under the same request ID is another workflow.
+            let mut other = again;
+            other.max_fee_stroops = 101;
+            assert!(!resumes(&other, &identity).unwrap());
+        }
+        // A new deployment: a new key, and the record names its account.
+        let key = deployment_fee_account(&mut record, &NoWallet)
+            .unwrap()
+            .unwrap();
+        let first = record.selection.config.fee_account.clone().unwrap();
+        assert_eq!(first, key.account());
+        // The identity of the workflow does not move with the fee account.
+        assert_eq!(
+            workflow_identity(&record.selection, &record.work, 100).unwrap(),
+            identity
+        );
+        // The record holds the address and no part of the key.
+        let saved = serde_json::to_string(&record).unwrap();
+        assert!(saved.contains(&first));
+        drop(key);
+
+        // The run stopped after the creation was prepared and before it was signed. The key
+        // is gone and nothing was signed: the next run drops that step and names a new account.
+        let owner = crate::test_support::owner::account(11);
+        let step = |action: &str, signed: bool| RetainedStep {
+            wallet: None,
+            packet: Step {
+                network: "stellar:testnet".into(),
+                action: action.into(),
+                transaction_xdr: String::new(),
+                transaction_hash: "ab".repeat(32),
+                expires_at: 1,
+                _explorer: None,
+            },
+            source: crate::test_support::owner::fresh(&owner),
+            validated_at: 1,
+            extend_to: None,
+            signed_xdr: signed.then(|| "signed".into()),
+            signature: None,
+            submitted: false,
+            receipt: None,
+        };
+        record.steps = vec![
+            step("upload_wasm", true),
+            step(native::owner::CREATE_FEE_ACCOUNT, false),
+        ];
+        let key = deployment_fee_account(&mut record, &NoWallet)
+            .unwrap()
+            .unwrap();
+        let second = record.selection.config.fee_account.clone().unwrap();
+        assert_ne!(second, first);
+        assert_eq!(second, key.account());
+        assert_eq!(record.steps.len(), 1);
+        assert_eq!(record.steps[0].packet.action, "upload_wasm");
+
+        // The creation is signed: the retained bytes carry both signatures. A later run
+        // makes no key and keeps the account, whether or not the wallet follows.
+        record
+            .steps
+            .push(step(native::owner::CREATE_FEE_ACCOUNT, true));
+        assert!(
+            deployment_fee_account(&mut record, &NoWallet)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            record.selection.config.fee_account.as_deref(),
+            Some(second.as_str())
+        );
+        record.steps.push(step("create_wallet", true));
+        assert!(
+            deployment_fee_account(&mut record, &NoWallet)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            record.selection.config.fee_account.as_deref(),
+            Some(second.as_str())
+        );
     }
     #[test]
     fn an_outcome_reports_each_verified_receipt_and_stays_a_selection_document() {

@@ -4,8 +4,8 @@ version = 4
 
 [[package]]
 name = "allowit-core"
-version = "0.6.0"
-source = "git+https://github.com/allowit-hq/allowit-core.git?rev=f79c37dc108beccc64b5245b84b2032318bdb6da#f79c37dc108beccc64b5245b84b2032318bdb6da"
+version = "0.7.0"
+source = "git+https://github.com/allowit-hq/allowit-core.git?rev=534e2230f67108e310b6552875dce88666f0b988#534e2230f67108e310b6552875dce88666f0b988"
 dependencies = [
  "libc",
  "reqwest",
@@ -25,6 +25,7 @@ dependencies = [
  "allowit-core",
  "base64 0.22.1",
  "ed25519-dalek",
+ "getrandom 0.2.17",
  "serde",
  "serde_json",
  "serde_json_canonicalizer",

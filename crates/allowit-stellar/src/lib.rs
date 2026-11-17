@@ -53,9 +53,9 @@ pub type Result<T> = std::result::Result<T, String>;
 
 pub const PROFILE: &str = "allowit-wallet-v1";
 /// The refusal of a wallet creation whose installation names no fee account, followed by the
-/// address of the wallet. Its code is `fee_account_required`: the owner's client derives the
+/// address of the wallet. Its code is `fee_account_required`: the owner's client makes the
 /// account for that wallet and names it.
-pub const FEE_ACCOUNT_REQUIRED: &str = "A new policy wallet needs a fee account, which the owner's deployment creates and funds. The owner's client derives it for the policy wallet";
+pub const FEE_ACCOUNT_REQUIRED: &str = "A new policy wallet needs a fee account, which the owner's deployment creates and funds. The owner's client names it for the policy wallet";
 /// The refusal of a policy wallet whose agent address on the ledger is not the one of its
 /// installation: its fee account, or the agent key's own account for a wallet of an earlier
 /// release. Also the refusal of a fee account whose signers differ from its roles. Its code

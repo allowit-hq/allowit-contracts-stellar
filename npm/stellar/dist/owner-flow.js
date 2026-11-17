@@ -1,6 +1,14 @@
+/**
+ * The owner workflows that the SDK exposes through the rail plugin: install the reviewed policy wallet and fund it,
+ * and change installed params on an active wallet.
+ * The host supplies its authenticated transport, the signing of one step and a journal. This module holds the rules
+ * for a saved signed step and for the typed replies of the service.
+ */
+import { Keypair } from '@stellar/stellar-sdk/base';
 import { canonicalNetwork } from './plugin.js';
 import { expiredRecord as chainExpiredRecord, horizonGet } from './chain-record.js';
-import { countersignCreation, CREATE_FEE_ACCOUNT, derivationStep, FEE_ACCOUNT_REQUIRED, feeAccountKey } from './fee-account.js';
+import { countersignCreation, CREATE_FEE_ACCOUNT, FEE_ACCOUNT_REQUIRED, newFeeAccountKey } from './fee-account.js';
+import { APPROVE_POLICY, SET_UP_WALLET, WALLET_SETUP_REQUIRED, WalletSetupPendingError, approvalStep, nativeApprovalHolds, nativeSetupOf, policyApproval, setUpNativeWallet } from './native-wallet.js';
 /** Typed codes of a refused `native/owner/submit`. The reply body is `{error, code, details}`. */
 export const OWNER_TRANSACTION_EXPIRED = 'owner_transaction_expired';
 export const OWNER_TRANSACTION_PENDING = 'owner_transaction_pending';
@@ -71,6 +79,66 @@ const unchecked = () => new OwnerFlowError('The expired signed step could not be
  * never apply. `chain-record.ts` holds the rule. A chain that cannot be read keeps the step saved.
  */
 const expiredRecord = (network, step, signedPayload) => chainExpiredRecord(network, step.hash, signedPayload).catch(() => { throw unchecked(); });
+/** The 64 bytes of a wallet's message signature, which the wallet returns as base64 text. */
+function signatureBytes(signature) {
+    let bytes = [];
+    try {
+        bytes = typeof signature === 'string' ? Array.from(atob(signature), c => c.charCodeAt(0)) : [];
+    }
+    catch { /* refused below */ }
+    if (bytes.length !== 64)
+        throw new OwnerFlowError('Your wallet did not return a message signature.', null, false);
+    return bytes;
+}
+/**
+ * Reads a retained signed setup when the service reports the Native wallet installed. True when the setup created
+ * `wallet` for this agent with this funding amount: the server registers a wallet only after the network confirmed its
+ * setup, so that setup funded it. False when nothing is retained. Any other retained setup stays saved and is
+ * refused: it names other inputs, and funding again under them could move the owner's funds twice.
+ */
+function retainedSetup(raw, network, wallet, identity) {
+    if (raw === null)
+        return false;
+    let value;
+    try {
+        value = JSON.parse(raw);
+    }
+    catch { /* refused below */ }
+    const setup = object(value) && typeof value.signedPayload === 'string' ? nativeSetupOf(value.signedPayload, network) : null;
+    const inputs = identity;
+    if (!object(value) || !setup || setup.wallet !== wallet || value.agent !== inputs.agent || setup.agent !== inputs.agent || value.amount !== inputs.amount)
+        throw changed(identity);
+    return true;
+}
+function savedApproval(journal, key, identity) {
+    const raw = journal.get(key);
+    if (raw === null)
+        return null;
+    let value;
+    try {
+        value = JSON.parse(raw);
+    }
+    catch { /* refused below */ }
+    if (!object(value) || typeof value.message !== 'string' || typeof value.signer !== 'string' || !Array.isArray(value.signature)
+        || value.signature.length !== 64 || !value.signature.every(b => Number.isInteger(b) && b >= 0 && b <= 255))
+        throw new OwnerFlowError('The saved signed approval is unreadable. It stays saved; contact support before signing again.', null, false);
+    if (!sameInputs(value, identity))
+        throw changed(identity);
+    return value;
+}
+/** The owner of a wallet account: its one signer of the owner's weight, read from the public ledger. */
+async function walletOwner(network, account, then) {
+    const response = await horizonGet(network, `/accounts/${account}`);
+    const body = response?.ok ? await response.json().catch(() => null) : null;
+    const owners = (object(body) && Array.isArray(body.signers) ? body.signers : []).filter(s => object(s) && s.weight === 3 && s.type === 'ed25519_public_key' && typeof s.key === 'string');
+    if (owners.length !== 1)
+        throw new OwnerFlowError(`The owner of the wallet account could not be read from the network. ${then}`, null, true);
+    return owners[0].key;
+}
+/** Whether `signature` is the signature of `signer` over the hexadecimal digest of an approval step. */
+function ownerSigned(signer, hash, signature) {
+    return Keypair.fromPublicKey(signer).verify(Uint8Array.from(hash.match(/../g) ?? [], byte => parseInt(byte, 16)), Uint8Array.from(signature));
+}
 /** Workflows that run in this page, by journal key. */
 const running = new Set();
 const busy = () => new OwnerFlowError('This wallet setup is already running in this or another tab.', null, true);
@@ -240,74 +308,214 @@ function stepper({ network, historyPauseMs, ask, sign, journal, key, policyId, o
     };
     return { receipts, settleSaved, signAndSubmit };
 }
-async function run({ network, ask, sign, journal, key, policyId, agent, amount, onStep, historyPauseMs = 1_500 }) {
+/** Whether the ledger holds `account`: true or false, or null when Horizon gives no clear answer. */
+async function accountOnLedger(network, account) {
+    const response = await horizonGet(network, `/accounts/${account}`);
+    if (!response)
+        return null;
+    if (response.status === 404)
+        return false;
+    if (!response.ok)
+        return null;
+    try {
+        const body = await response.json();
+        return object(body) && body.account_id === account ? true : null;
+    }
+    catch {
+        return null;
+    }
+}
+/**
+ * The fee account whose creation this journal signed for this policy and agent, and whether the journal saw that
+ * creation confirmed, or undefined. The account can hold
+ * the owner's XLM, so a marker is never dropped for other inputs: another funding amount keeps the account, and a
+ * marker of another policy or agent, or one that cannot be read, is refused before anything is prepared.
+ */
+function savedFeeAccount(journal, key, identity) {
+    const raw = journal.get(key);
+    if (raw === null)
+        return undefined;
+    let value;
+    try {
+        value = JSON.parse(raw);
+    }
+    catch { /* refused below */ }
+    // The server and the rail check the address.
+    if (!object(value) || typeof value.feeAccount !== 'string' || !/^G[A-Z2-7]{55}$/.test(value.feeAccount)
+        || value.policyId !== identity.policyId || value.agent !== identity.agent)
+        throw changed({ ...identity, amount: '' });
+    return { account: value.feeAccount, created: value.created === true };
+}
+async function run({ network, ask, sign, journal, key, policyId, agent, amount, reviewed, onStep, historyPauseMs = 1_500 }) {
     if (!canonicalNetwork(network))
         throw new OwnerFlowError('Select a supported Stellar network.', null, false);
-    const fundedKey = `${key}:funded`;
+    const fundedKey = `${key}:funded`, feeAccountKey = `${key}:fee-account`;
     const identity = { policyId, agent, amount };
     const { receipts, settleSaved, signAndSubmit } = stepper({ network, historyPauseMs, ask, sign, journal, key, policyId, onStep, identity,
-        // A confirmed funding is recorded before its signed bytes leave the journal.
-        confirmed: step => { if (step.action === 'fund')
-            journal.set(fundedKey, JSON.stringify(identity)); } });
+        // A confirmed funding is recorded before its signed bytes leave the journal. So is a confirmed creation of
+        // the fee account: from then on the account exists, and nothing ever replaces it.
+        confirmed: step => {
+            if (step.action === 'fund')
+                journal.set(fundedKey, JSON.stringify(identity));
+            const named = step.action === CREATE_FEE_ACCOUNT ? savedFeeAccount(journal, feeAccountKey, { policyId, agent }) : undefined;
+            if (named)
+                journal.set(feeAccountKey, JSON.stringify({ feeAccount: named.account, policyId, agent, created: true }));
+        } });
     // A saved step or a funded marker of other inputs is refused before anything is sent.
     saved(journal, key, identity);
     funded(journal, fundedKey, identity);
     await settleSaved();
     let wallet;
-    // The one-time key of the fee account. It lives in this call only and is never stored: after a reload the
-    // owner's wallet signs the same message again and derives the same key.
+    // The setup key of the fee account is random and lives in this call only. It signs the creation once. The
+    // journal keeps the address of an account whose creation was signed, never a key: after a reload the saved
+    // signed step settles first, and the workflow names that account again.
     let feeKey;
+    const named = savedFeeAccount(journal, feeAccountKey, { policyId, agent });
+    let feeAccount = named?.account;
+    // True once this journal saw the creation confirmed on the network.
+    let created = named?.created ?? false;
+    let replaced = false;
+    // True once this run set up the wallet account of a Native policy: the deployment then names the wallet.
+    let nativeSetUp = false;
+    const walletSetupKey = `${key}:wallet-setup`;
+    /** Creates and funds the agent's wallet account with one owner signature, and registers it for this policy. */
+    const setUpWallet = async (details) => {
+        const roles = object(details) ? details : {};
+        if (typeof roles.owner !== 'string' || typeof roles.server !== 'string' || roles.agent !== agent || roles.policyId !== policyId)
+            throw new OwnerFlowError('The service named no roles for the wallet account of this policy.', null, false);
+        let setup;
+        try {
+            // The signed setup stays in the journal until the server has registered the wallet, so a run that
+            // stops in between finds the same account again.
+            setup = await setUpNativeWallet({ network, owner: roles.owner, agent, server: roles.server, amount, sign, onStep, journal, key: walletSetupKey, retain: true });
+        }
+        catch (cause) {
+            if (cause instanceof OwnerFlowError)
+                throw cause;
+            throw new OwnerFlowError(cause instanceof Error ? cause.message : 'The wallet account could not be set up.', null, cause instanceof WalletSetupPendingError, cause);
+        }
+        receipts.push({ policyId, action: SET_UP_WALLET, status: 'confirmed', transactionHash: setup.transactionHash, ledger: setup.ledger });
+        onStep('Registering the wallet…');
+        const registered = await ask('native/register', { configuration: setup.configuration, policyId });
+        if (!object(registered) || registered.registered !== true || registered.wallet !== setup.wallet || registered.policyId !== policyId)
+            throw new OwnerFlowError('The service did not register the wallet account for this policy. Resume to register it; nothing is signed again.', null, true);
+        // The setup funded the wallet: no funding step follows.
+        journal.set(fundedKey, JSON.stringify(identity));
+    };
+    /** The owner's approval of the policy of a Native wallet: one message signature, and no transaction. */
+    const approvePolicy = async (account) => {
+        onStep('Preparing the approval…');
+        const approval = await ask('native/approval', { policyId });
+        if (!object(approval) || approval.required !== true)
+            return;
+        const fields = policyApproval(approval.message, network);
+        if (!reviewed)
+            throw new OwnerFlowError('The policy that you reviewed is missing. Nothing was signed.', null, false);
+        if (!fields || fields.policyId !== policyId || fields.wallet !== account || !nativeApprovalHolds(fields, account, reviewed))
+            throw new OwnerFlowError('The approval differs from the policy that you reviewed or from its wallet account. Nothing was signed.', null, false);
+        const signer = await walletOwner(network, account, 'Resume to read it again.');
+        onStep('Sign the approval of the policy in your wallet…');
+        const step = approvalStep(approval.message), signature = signatureBytes(await sign(step));
+        if (!ownerSigned(signer, step.hash, signature))
+            throw new OwnerFlowError('Your wallet signed with another account than the owner. Nothing was sent; sign with the owner account.', null, false);
+        await ask('micro/allocation/confirm', { id: policyId, revision: fields.revision, sourceApproval: [{ signer, signature }] });
+        receipts.push({ policyId, action: APPROVE_POLICY, status: 'confirmed', transactionHash: '' });
+    };
     // A deployment takes at most the fee account, the code upload, the wallet creation and a lifetime renewal.
     for (let i = 0; i < 5 && !wallet; i++) {
         onStep('Preparing the wallet…');
         let reply;
         try {
-            reply = await ask('native/deploy/prepare', { policyId, agent, ...(feeKey ? { setup: { feeAccount: feeKey.publicKey() } } : {}) });
+            reply = await ask('native/deploy/prepare', { policyId, agent, ...(feeAccount ? { setup: { feeAccount } } : {}) });
         }
         catch (error) {
             const { code, details } = (object(error) ? error : {});
-            const policyWallet = object(details) ? details.wallet : undefined;
-            // A new policy wallet needs a fee account: the owner's key derives it for that wallet, and the
-            // deployment creates and funds it. The agent holds a key and no account.
-            if (code !== FEE_ACCOUNT_REQUIRED || feeKey || typeof policyWallet !== 'string')
+            // A Native policy needs the wallet account of its agent. This workflow sets the account up from the
+            // owner's own account, the server registers it, and the deployment then answers with the wallet.
+            if (code === WALLET_SETUP_REQUIRED && !nativeSetUp) {
+                await setUpWallet(details);
+                nativeSetUp = true;
+                i--;
+                continue;
+            }
+            // A new policy wallet needs a fee account: this workflow makes its key, and the deployment creates and
+            // funds the account. The agent holds a key and no account.
+            // Boundary: a journal without a saved address names no account. That is the state of a new deployment,
+            // and also of one that an earlier release (or another browser) took past its fee account and not to its
+            // wallet. Neither the journal nor the ledger says which existing account no wallet uses, so this workflow
+            // never adopts one: it makes a new account. An account of such an earlier run stays under the owner's key
+            // alone, and the owner closes it; Horizon lists it under `accounts?signer=<owner>`.
+            if (code !== FEE_ACCOUNT_REQUIRED || feeAccount)
                 throw error;
-            onStep('Sign the fee account key message in your wallet…');
-            let signature;
-            try {
-                signature = Uint8Array.from(atob(await sign(derivationStep(network, agent, policyWallet))), c => c.charCodeAt(0));
-                feeKey = feeAccountKey(signature);
-            }
-            catch (cause) {
-                throw new OwnerFlowError(cause instanceof Error && cause.message ? cause.message : 'The fee account key could not be derived.', null, true, cause);
-            }
+            feeKey = newFeeAccountKey();
+            feeAccount = feeKey.publicKey();
             i--;
             continue;
         }
         if (!object(reply) || reply.policyId !== policyId)
             throw new OwnerFlowError('The deployment reply names a different policy.', null, false);
         wallet = installedWallet(reply);
+        if (wallet && reply.walletKind === 'native') {
+            // A setup of this workflow created and funded the wallet account. A run that stopped after the registration
+            // and before its reply kept the signed setup: when it names this wallet, agent and amount, the setup funded
+            // it, and that funding is recorded before the setup leaves the journal. What remains is the owner's approval
+            // of the policy. A wallet account that this workflow did not fund is funded below.
+            if (retainedSetup(journal.get(walletSetupKey), network, wallet, identity))
+                journal.set(fundedKey, JSON.stringify(identity));
+            journal.remove(walletSetupKey);
+            if (reply.approved !== true)
+                await approvePolicy(wallet);
+            break;
+        }
         if (wallet)
             break;
         const step = stepOf(reply.step);
         if (!step)
             throw new OwnerFlowError('The service did not prepare an owner step for this policy.', null, false);
         if (step.action === CREATE_FEE_ACCOUNT) {
-            // The new account's own key signs its creation once, beside the owner.
-            const key = feeKey;
-            if (!key)
-                throw new OwnerFlowError('The service prepared a fee account that this owner did not derive.', null, false);
+            const setupKey = feeKey;
+            if (!setupKey || setupKey.publicKey() !== feeAccount) {
+                // This page holds no key for the account of this step. The ledger decides what that means. A saved
+                // account that the ledger holds is created already: the service's step is stale, and the account stays.
+                // Only an account that the ledger does not hold is replaced: its signed creation never applied, or
+                // none was signed, so nothing holds funds. The workflow then makes a new key and names its account.
+                if (replaced)
+                    throw new OwnerFlowError('The service prepared a fee account that this workflow did not name.', null, false);
+                if (feeAccount) {
+                    const held = created ? true : await accountOnLedger(network, feeAccount);
+                    if (held === true)
+                        throw new OwnerFlowError('The service prepared the creation of a fee account that the network already holds. Nothing was signed; resume in a moment.', null, true);
+                    if (held === null)
+                        throw new OwnerFlowError('The fee account of this deployment could not be checked on the network. Nothing was signed; resume to check again.', null, true);
+                }
+                replaced = true;
+                journal.remove(feeAccountKey);
+                feeKey = newFeeAccountKey();
+                feeAccount = feeKey.publicKey();
+                i--;
+                continue;
+            }
+            const account = feeAccount;
+            // The new account's own key signs its creation once, beside the owner. The address enters the journal with
+            // the signed bytes; the key is dropped.
+            feeKey = undefined;
             await signAndSubmit(step, signedPayload => {
                 try {
-                    return countersignCreation(network, step, signedPayload, key);
+                    const signed = countersignCreation(network, step, signedPayload, setupKey);
+                    journal.set(feeAccountKey, JSON.stringify({ feeAccount: account, policyId, agent }));
+                    return signed;
                 }
                 catch (cause) {
                     throw new OwnerFlowError(cause instanceof Error ? cause.message : 'The fee account step could not be signed.', null, false, cause);
                 }
             });
+            created = true;
         }
         else
             await signAndSubmit(step);
     }
+    if (wallet)
+        journal.remove(feeAccountKey);
     if (!wallet)
         throw new OwnerFlowError('The wallet installation could not be confirmed.', null, true);
     // A confirmed funding is never prepared or signed again, including after a reload or a failed export.
@@ -358,7 +566,7 @@ export async function updateParams(input) {
         running.delete(name);
     }
 }
-async function runUpdate({ network, ask, sign, journal, key, policyId, params, expectedRevision, onStep, historyPauseMs = 1_500 }) {
+async function runUpdate({ network, ask, sign, journal, key, policyId, params, expectedRevision, installed, onStep, historyPauseMs = 1_500 }) {
     if (!canonicalNetwork(network))
         throw new OwnerFlowError('Select a supported Stellar network.', null, false);
     if (!object(params) || Object.keys(params).length === 0 || Object.keys(params).length > 32)
@@ -378,15 +586,84 @@ async function runUpdate({ network, ask, sign, journal, key, policyId, params, e
     await settleSaved();
     if (funded(journal, updatedKey, identity))
         return { receipts, done: true };
-    onStep('Preparing the change…');
+    const approvalKey = `${key}:approval`;
+    const prepare = async () => {
+        onStep('Preparing the change…');
+        try {
+            return await ask('native/owner/prepare', { policyId, action: UPDATE_PARAMS, params, ...(expectedRevision === undefined ? {} : { expectedRevision }) });
+        }
+        catch (error) {
+            // The service's reason and typed code reach the owner unchanged.
+            const code = object(error) && typeof error.code === 'string' ? error.code : null;
+            throw new OwnerFlowError(error instanceof Error && error.message ? error.message : 'The change could not be prepared.', code, code === NETWORK_UNAVAILABLE, error);
+        }
+    };
+    /** The approval message of a Native wallet's change, or null for a reply that prepares a transaction. */
+    const approvalOf = (prepared) => object(prepared) && prepared.policyId === policyId && object(prepared.approval) && !prepared.step ? prepared.approval.message : null;
+    /**
+     * Sends a signed approval of a Native wallet's values. Only a confirmed reply for this policy and change ends the
+     * change. Null means that the service no longer holds the preparation of this approval (it expired, or another
+     * instance prepared it): the approval never applied, because the service answers a settled approval as confirmed.
+     * Any other answer keeps the signed approval saved, and the next call sends the same bytes again.
+     */
+    const submitApproval = async ({ message, signer, signature }) => {
+        onStep('Saving the change…');
+        let reply;
+        try {
+            reply = await ask('native/owner/submit', { policyId, payload: message, sourceApproval: [{ signer, signature }] });
+        }
+        catch (error) {
+            const code = object(error) && typeof error.code === 'string' ? error.code : null;
+            if (code === OWNER_TRANSACTION_EXPIRED || (object(error) && error.status === 404))
+                return null;
+            throw new OwnerFlowError(error instanceof Error && error.message ? error.message : 'The change could not be saved.', code, true, error);
+        }
+        if (!object(reply) || reply.policyId !== policyId || reply.action !== UPDATE_PARAMS || reply.status !== 'confirmed')
+            throw new OwnerFlowError('The service did not confirm the change. The signed approval stays saved: resume to send it again.', null, true);
+        journal.set(updatedKey, JSON.stringify(identity));
+        journal.remove(approvalKey);
+        receipts.push({ policyId, action: UPDATE_PARAMS, status: 'confirmed', transactionHash: '' });
+        return { receipts, done: true };
+    };
+    const lapsed = () => new OwnerFlowError('The approval lapsed before the service took it. Resume to prepare the same change again.', OWNER_TRANSACTION_EXPIRED, true);
     let prepared;
-    try {
-        prepared = await ask('native/owner/prepare', { policyId, action: UPDATE_PARAMS, params, ...(expectedRevision === undefined ? {} : { expectedRevision }) });
+    // A signed approval that a lost reply left saved is sent again before anything new is signed. When the service no
+    // longer holds its preparation, the same change is prepared again: the same values give the same message, and the
+    // saved signature applies. A message that differs needs the owner's signature again.
+    const pendingApproval = savedApproval(journal, approvalKey, identity);
+    if (pendingApproval) {
+        const settled = await submitApproval(pendingApproval);
+        if (settled)
+            return settled;
+        prepared = await prepare();
+        if (approvalOf(prepared) === pendingApproval.message)
+            return (await submitApproval(pendingApproval)) ?? Promise.reject(lapsed());
+        journal.remove(approvalKey);
     }
-    catch (error) {
-        // The service's reason and typed code reach the owner unchanged.
-        const code = object(error) && typeof error.code === 'string' ? error.code : null;
-        throw new OwnerFlowError(error instanceof Error && error.message ? error.message : 'The change could not be prepared.', code, code === NETWORK_UNAVAILABLE, error);
+    else
+        prepared = await prepare();
+    // A Native wallet holds no values on chain: its change is a new approval of the policy, with no transaction.
+    const message = approvalOf(prepared);
+    if (message !== null) {
+        const fields = policyApproval(message, network);
+        if (!fields || fields.policyId !== policyId)
+            throw new OwnerFlowError('The approval differs from this change. Nothing was signed.', null, false);
+        // The owner signs only the reviewed policy with this change: the same wallet, source and rules, each changed
+        // param at exactly its requested value, and every other value as it is installed.
+        if (!installed || !object(installed.params))
+            throw new OwnerFlowError('The installed policy that you reviewed is missing. Nothing was signed.', null, false);
+        if (!nativeApprovalHolds(fields, installed.wallet, { source: installed.source, rules: installed.rules, params: { ...installed.params, ...params }, tier: installed.tier }))
+            throw new OwnerFlowError('The approval names another policy or other values than this change. Nothing was signed.', null, false);
+        const signer = await walletOwner(network, fields.wallet, 'Nothing was signed; try again.');
+        onStep('Sign the approval of the new values in your wallet…');
+        const step = approvalStep(message), signature = signatureBytes(await sign(step));
+        // Only the owner's own signature is kept: another account's signature would be refused and resent forever.
+        if (!ownerSigned(signer, step.hash, signature))
+            throw new OwnerFlowError('Your wallet signed with another account than the owner. Nothing was saved; sign with the owner account.', null, false);
+        // The signed approval is saved before it leaves: a lost reply is settled from it, never signed again.
+        const approval = { ...identity, message, signer, signature };
+        journal.set(approvalKey, JSON.stringify(approval));
+        return (await submitApproval(approval)) ?? Promise.reject(lapsed());
     }
     const step = stepOf(prepared?.step);
     if (!object(prepared) || prepared.policyId !== policyId || !step || step.action !== UPDATE_PARAMS)

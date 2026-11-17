@@ -43,6 +43,7 @@ fn native_setup_retains_before_sign_and_recovers_lost_reply_without_another_sign
         server: c.server.clone(),
         request_id: "setup-test-001".into(),
         fee_per_operation: 100,
+        funding: None,
     };
     let clock = Cell::new(wire::now());
     let before = || {
@@ -69,8 +70,8 @@ fn native_setup_retains_before_sign_and_recovers_lost_reply_without_another_sign
     drop(store);
     clock.set(clock.get() + 301);
     let reopened = Store::open(&path).unwrap();
-    // The resumed setup reads its retained signed bytes. It asks the signer for nothing, not
-    // even the derivation: a signer that cannot derive the same key again still recovers.
+    // The resumed setup reads its retained signed bytes. It asks the signer for nothing and
+    // needs no setup key: the retained bytes carry both signatures.
     let signer = Key {
         calls: AtomicUsize::new(0),
         bad: true,
@@ -95,49 +96,111 @@ fn native_setup_retains_before_sign_and_recovers_lost_reply_without_another_sign
         1
     );
 }
-/// The wallet account of an agent exists once. A setup of it under another request ID signs
-/// nothing: it reports the same wallet when the account holds the exact roles, and it is
-/// refused when the account holds any other authority.
+/// The CLI's setup funds the wallet in its one owner transaction: the starting balance holds the
+/// reserve, the float and the owner's amount, and the owner's account is its source. The request
+/// binds the amount, so the same request ID with another amount signs nothing.
 #[test]
-fn a_repeated_setup_signs_nothing_and_an_account_with_other_authority_is_refused() {
+fn a_funded_setup_is_one_owner_transaction_and_binds_its_amount() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().canonicalize().unwrap().join("proof")).unwrap();
     let c = selection().config;
     let chain = Arc::new(Chain::new(c.clone()));
     let runtime = Runtime::from_rpc(chain.clone());
-    let request = |id: &str, agent: &str| SetupRequest {
+    let request = |funding: i64| SetupRequest {
         network: c.network.clone(),
         owner: c.owner.clone(),
-        agent: agent.into(),
+        agent: c.agent.clone(),
         server: c.server.clone(),
-        request_id: id.into(),
+        request_id: "setup-funded-001".into(),
         fee_per_operation: 100,
+        funding: Some(funding),
     };
     let now = wire::now();
     let signer = key();
-    let first = workflow::configure_native(
-        &runtime,
-        &store,
-        &request("setup-first-001", &c.agent),
-        &signer,
-        &|| Ok(now),
-    )
+    let out = workflow::configure_native(&runtime, &store, &request(200_000_000), &signer, &|| {
+        Ok(now)
+    })
     .unwrap();
-    assert_eq!(first["state"], "configured");
+    assert_eq!(out["state"], "configured");
     assert_eq!(signer.calls.load(Ordering::SeqCst), 1);
-    let wallet = first["wallet"].as_str().unwrap().to_owned();
-    // The wallet is a new account, not the owner's, and the result names its roles.
-    assert!(![&c.owner, &c.agent, &c.server].contains(&&wallet));
-    assert_eq!(first["configuration"]["wallet"], wallet);
-    assert_eq!(first["configuration"]["owner"], c.owner);
-    assert_eq!(first["derivation"]["method"], "owner-signature");
-    assert_eq!(first["signers"]["walletKey"], 0);
     let sent = chain.direct_signed.lock().unwrap().clone().unwrap();
     let stellar_xdr::TransactionEnvelope::Tx(envelope) = crate::read(&sent).unwrap() else {
         panic!()
     };
-    // The owner and the new account's own key signed the one transaction.
-    assert_eq!(envelope.signatures.len(), 2);
+    assert_eq!(
+        envelope.tx.source_account,
+        stellar_xdr::MuxedAccount::Ed25519(stellar_xdr::Uint256(
+            crate::account_key(&c.owner).unwrap()
+        ))
+    );
+    let stellar_xdr::OperationBody::CreateAccount(create) = &envelope.tx.operations[0].body else {
+        panic!()
+    };
+    assert_eq!(envelope.tx.operations[0].source_account, None);
+    assert_eq!(
+        create.starting_balance,
+        crate::owner::default_starting_balance(false) + 200_000_000
+    );
+    let again = signer.calls.load(Ordering::SeqCst);
+    let refused = workflow::configure_native(&runtime, &store, &request(1), &signer, &|| Ok(now))
+        .unwrap_err();
+    assert!(
+        refused.message.contains("another intent"),
+        "{}",
+        refused.message
+    );
+    assert_eq!(signer.calls.load(Ordering::SeqCst), again);
+    assert!(request(0).validate().is_err());
+    // The ceiling of a request is the most that the setup transaction can carry.
+    use crate::provider::runtime::owner::MAX_SETUP_FUNDING;
+    assert!(request(MAX_SETUP_FUNDING).validate().is_ok());
+    assert!(request(MAX_SETUP_FUNDING + 1).validate().is_err());
+    let at_ceiling = crate::owner::prepare_native_setup(
+        &crate::AccountState {
+            address: c.owner.clone(),
+            sequence: 41,
+            master_weight: 1,
+            low_threshold: 0,
+            medium_threshold: 0,
+            high_threshold: 0,
+            signers: vec![],
+        },
+        &crate::owner::SetupTerms {
+            wallet: &crate::account_for_seed(&[21; 32]),
+            agent: &c.agent,
+            engine: &c.server,
+            request_id: "setup-ceiling-001",
+            network: &c.network,
+            fee_per_operation: 100,
+            starting_balance: Some(
+                crate::owner::default_starting_balance(false) + MAX_SETUP_FUNDING,
+            ),
+            trustline: None,
+        },
+        now,
+    );
+    assert!(at_ceiling.is_ok(), "{at_ceiling:?}");
+}
+/// The setup key of a wallet account is random and lives in one run. A request that settled
+/// reports its wallet again and signs nothing. A request that stopped before its signature
+/// holds no key and nothing signed: its next run prepares another account with a new key.
+#[test]
+fn a_settled_setup_signs_nothing_again_and_an_unsigned_one_takes_a_new_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().canonicalize().unwrap().join("proof")).unwrap();
+    let c = selection().config;
+    let chain = Arc::new(Chain::new(c.clone()));
+    let runtime = Runtime::from_rpc(chain.clone());
+    let request = |id: &str| SetupRequest {
+        network: c.network.clone(),
+        owner: c.owner.clone(),
+        agent: c.agent.clone(),
+        server: c.server.clone(),
+        request_id: id.into(),
+        fee_per_operation: 100,
+        funding: None,
+    };
+    let now = wire::now();
     let sends = || {
         chain
             .events
@@ -147,51 +210,67 @@ fn a_repeated_setup_signs_nothing_and_an_account_with_other_authority_is_refused
             .filter(|s| s.as_str() == "sendTransaction")
             .count()
     };
+    // The owner's signer fails: the request is retained unsigned and nothing is sent.
+    let failing = Key {
+        calls: AtomicUsize::new(0),
+        bad: true,
+        before: None,
+    };
+    workflow::configure_native(
+        &runtime,
+        &store,
+        &request("setup-first-001"),
+        &failing,
+        &|| Ok(now),
+    )
+    .unwrap_err();
+    let unsigned: Value = store.load("setup-first-001").unwrap().unwrap();
+    assert!(unsigned["signedXdr"].is_null());
+    assert_eq!(sends(), 0);
+    let abandoned = unsigned["setup"]["wallet"].as_str().unwrap().to_owned();
+    // No file of the store holds a seed: the record names the account and nothing else of the key.
+    assert!(!unsigned.to_string().contains("seed"));
+
+    // The next run of the same request holds no key for that account. It prepares another one.
+    let signer = key();
+    let first = workflow::configure_native(
+        &runtime,
+        &store,
+        &request("setup-first-001"),
+        &signer,
+        &|| Ok(now),
+    )
+    .unwrap();
+    assert_eq!(first["state"], "configured");
+    assert_eq!(signer.calls.load(Ordering::SeqCst), 1);
+    let wallet = first["wallet"].as_str().unwrap().to_owned();
+    assert_ne!(wallet, abandoned);
+    // The wallet is a new account, not the owner's, and the result names its roles.
+    assert!(![&c.owner, &c.agent, &c.server].contains(&&wallet));
+    assert_eq!(first["configuration"]["wallet"], wallet);
+    assert_eq!(first["configuration"]["owner"], c.owner);
+    assert!(first.get("derivation").is_none());
+    assert_eq!(first["signers"]["walletKey"], 0);
+    let sent = chain.direct_signed.lock().unwrap().clone().unwrap();
+    let stellar_xdr::TransactionEnvelope::Tx(envelope) = crate::read(&sent).unwrap() else {
+        panic!()
+    };
+    // The owner and the new account's own key signed the one transaction.
+    assert_eq!(envelope.signatures.len(), 2);
     assert_eq!(sends(), 1);
 
-    // The same agent under another request ID: the account exists with the exact roles.
+    // The settled request again: the same wallet, no signature and nothing sent.
     let signer = key();
     let again = workflow::configure_native(
         &runtime,
         &store,
-        &request("setup-again-001", &c.agent),
+        &request("setup-first-001"),
         &signer,
         &|| Ok(now),
     )
     .unwrap();
     assert_eq!(again["wallet"], wallet);
     assert_eq!(again["installation"], first["installation"]);
-    assert!(again["transactionHash"].is_null());
-    assert_eq!((signer.calls.load(Ordering::SeqCst), sends()), (0, 1));
-
-    // The account holds a signer that the setup does not name.
-    chain
-        .created
-        .lock()
-        .unwrap()
-        .as_mut()
-        .unwrap()
-        .signers
-        .push(crate::AccountSigner {
-            key: account(77),
-            weight: 1,
-        });
-    let signer = key();
-    let refused = workflow::configure_native(
-        &runtime,
-        &store,
-        &request("setup-third-001", &c.agent),
-        &signer,
-        &|| Ok(now),
-    )
-    .unwrap_err();
-    assert!(
-        refused
-            .message
-            .contains("already exists with other signers"),
-        "{}",
-        refused.message
-    );
     assert_eq!((signer.calls.load(Ordering::SeqCst), sends()), (0, 1));
 }
 #[test]
@@ -357,6 +436,7 @@ fn failed_signed_retention_prevents_native_transmission() {
         server: c.server,
         request_id: "native-retain-001".into(),
         fee_per_operation: 100,
+        funding: None,
     };
     let fail_retention =
         || std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();

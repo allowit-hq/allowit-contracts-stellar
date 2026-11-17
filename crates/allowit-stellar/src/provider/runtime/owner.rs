@@ -9,7 +9,15 @@ pub struct SetupRequest {
     pub server: String,
     pub request_id: String,
     pub fee_per_operation: u32,
+    /// The stroops that the setup moves into the wallet for the agent's payments, on top of the
+    /// account's reserve and its fee float. The owner's account pays all of it in the setup
+    /// transaction. `None` funds the reserve and the float only.
+    pub funding: Option<i64>,
 }
+/// The most that one setup funds, in stroops: the transaction's ceiling on the starting balance,
+/// less the reserve and the fee float that the starting balance also holds.
+pub const MAX_SETUP_FUNDING: i64 =
+    native::owner::MAX_STARTING_BALANCE - native::owner::default_starting_balance(false);
 impl SetupRequest {
     pub fn validate(&self) -> Result<()> {
         if self.network != "stellar:testnet" {
@@ -27,6 +35,12 @@ impl SetupRequest {
             return Err(Error::usage(
                 "Setup fee must be 100..100000 stroops per operation",
             ));
+        }
+        if self
+            .funding
+            .is_some_and(|f| !(1..=MAX_SETUP_FUNDING).contains(&f))
+        {
+            return Err(Error::usage("The setup funding amount is out of range"));
         }
         Ok(())
     }

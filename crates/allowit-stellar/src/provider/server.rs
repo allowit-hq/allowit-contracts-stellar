@@ -2758,7 +2758,7 @@ mod fee_account_owner_tests {
     use std::sync::{Arc, Mutex};
 
     const NOW: u64 = 1_800_000_000;
-    /// The key of a fee account, as the owner's signature derives it.
+    /// The setup key of a fee account.
     fn account_key() -> SigningKey {
         SigningKey::from_bytes(&[77; 32])
     }
@@ -2839,7 +2839,7 @@ mod fee_account_owner_tests {
             (problem.status, problem.code),
             (409, "fee_account_required")
         );
-        // The refusal names the wallet, so the owner's client derives the account for it.
+        // The refusal names the wallet, so the owner's client makes the account for it.
         assert_eq!(
             problem.details,
             Some(serde_json::json!({"wallet": c.wallet}))

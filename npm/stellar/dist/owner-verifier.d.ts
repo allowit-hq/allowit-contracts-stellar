@@ -16,7 +16,7 @@ export interface AdkOwnerSelection {
     wasmHash: string;
     wallet?: string;
     /**
-     * The fee account that the owner's key derived for this wallet. With it the verifier admits the
+     * The fee account that the owner's client made for this wallet. With it the verifier admits the
      * `create_fee_account` step of exactly that account, and reconstructs the creation and every update with the fee
      * account as the wallet's agent address.
      */
