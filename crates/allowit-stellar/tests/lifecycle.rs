@@ -3911,6 +3911,30 @@ fn portable_classic_custody_runs_another_source_only_with_the_servers_evaluator(
         assert!(admit_classic(&packet, &wallet.server, 86401, Some(&admits)).is_err());
     }
     assert_eq!(seen.get(), 1);
+    // The source of a classic account is server policy source: a server function reads the
+    // owner's text with `as_str()`. No contract compiles such a source.
+    let asks = PORTABLE.replace(
+        "    Ok(())\n",
+        "    let question: String = allowit::param(ctx, \"question\");\n    allowit::decision(ctx, &allowit::AllowitDecision {\n        id: \"purpose\",\n        query: question.as_str(),\n        deny_below: 3000,\n        allow_above: 8000,\n    })?;\n    Ok(())\n",
+    );
+    assert_ne!(asks, PORTABLE);
+    let error = policy::source_shape(&asks).unwrap_err();
+    assert!(error.contains("the method `as_str`"), "{error}");
+    let mut asking = hosted.clone();
+    asking.policy_source = asks.clone();
+    asking.source_hash = hash(&asks);
+    validate_config(&asking).unwrap();
+    observed.source_hash = asking.source_hash;
+    let prepared = prepare(&asking, &request, &observed, 86401, 86700).unwrap();
+    assert!(admit_classic(&prepared, &asking.server, 86401, None).is_err());
+    admit_classic(&prepared, &asking.server, 86401, Some(&admits)).unwrap();
+    assert_eq!(seen.get(), 2);
+    // The text of the agent's own arguments stays outside: only a param call gives a `String`
+    // here, and a policy wallet takes no such source.
+    let mut wallet_asking = wallet.clone();
+    wallet_asking.policy_source = asks.clone();
+    wallet_asking.source_hash = hash(&asks);
+    assert!(validate_config(&wallet_asking).is_err());
     // A source that writes state stays refused: a classic account stores none.
     let writes = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::set_state(ctx, \"seen\", 1)?;\n    Ok(())\n}\n";
     let mut stateful = hosted.clone();

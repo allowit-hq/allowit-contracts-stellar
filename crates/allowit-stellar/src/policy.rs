@@ -618,6 +618,23 @@ pub fn installed_source_digest(
 
 /// Shared portable source gate from the same released Core dependency as the library.
 pub use allowit_core::policy_source::{SourceShape, source_shape};
+/// The server functions of the pinned Core, as the registry of its server policy profile.
+const SERVER_FUNCTIONS: &[(&str, &str)] = &[
+    ("allowit", "price"),
+    ("allowit", "fetch"),
+    ("allowit", "internet_search"),
+    ("allowit", "marketplace_search"),
+    ("allowit", "decision"),
+    ("allowit", "request_screening"),
+    ("allowit", "new_decision_context"),
+];
+/// The checked shape of the source of a classic account. No contract compiles that source:
+/// the server evaluates it. It is therefore server policy source, which adds to the portable
+/// vocabulary the text of an owner param, read with `as_str()` for a server function. The
+/// host's own gate decides which server functions its build links.
+pub fn classic_shape(source: &str) -> Result<SourceShape> {
+    allowit_core::policy_source::source_shape_with_host_calls(source, SERVER_FUNCTIONS)
+}
 /// The rules a tier installs for `source`: the standard prefix for Common, none otherwise.
 pub fn tier_rules(tier: PolicyTier, source: &str) -> Result<Vec<String>> {
     let shape = source_shape(source)?;

@@ -630,9 +630,10 @@ fn validate_generated(
 ) -> Result<()> {
     let b = &policy.runtime.instance_binding;
     let d = &b.portable;
-    let shape = crate::host::authoring::check(&policy.code).map_err(|_| {
-        Error::uncertain("Returned policy source is outside the portable vocabulary")
-    })?;
+    let shape =
+        crate::provider::source_shape(kind == "owner-wallet", &policy.code).map_err(|_| {
+            Error::uncertain("Returned policy source is outside the portable vocabulary")
+        })?;
     if !crate::host::request::request_id_valid(&policy.id)
         || policy.revision == 0
         || policy.network != network

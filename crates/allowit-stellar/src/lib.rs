@@ -887,7 +887,7 @@ fn validate_config_for(c: &WalletConfig, admit_source: bool) -> Result<()> {
 /// the server, which admits each operation of it with [`admit_classic`] before it signs. Such
 /// a source takes the bounded params of a Custom policy, so it can read owner text.
 fn validate_classic_portable_install(c: &WalletConfig) -> Result<()> {
-    let tier = classic_tier(&policy::source_shape(&c.policy_source)?);
+    let tier = classic_tier(&policy::classic_shape(&c.policy_source)?);
     c.params.check(tier).map_err(|e| {
         if tier == PolicyTier::Simple {
             format!("Portable classic custody reads only canonical params for a canonical-only source: {e}")
@@ -1223,7 +1223,7 @@ fn verify_classic_portable(
     if terms.expense.is_some() {
         return Err("Classic custody derives its expense from the exact payment".into());
     }
-    let shape = policy::source_shape(&c.policy_source)?;
+    let shape = policy::classic_shape(&c.policy_source)?;
     if shape.writes_state {
         return Err("Classic custody cannot store allowit::set_state writes".into());
     }
