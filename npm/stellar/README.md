@@ -34,6 +34,27 @@ bytes and lets the owner sign a new step, and an unreadable chain keeps the step
 and `network_unavailable` keep the step for a retry (`OwnerFlowError.retry`). A saved step and the funded marker name
 the policy, agent key and amount; a resume with other inputs is refused.
 
+A new policy wallet has a fee account: the account that sends the agent's operations and pays their network fees.
+The server refuses a creation without one with `fee_account_required` and `details.wallet`. `installAndFund` then asks
+the host's `sign` for one message signature with the step action `derive_fee_account_key`: the `owner-sign` element
+shows the agent and the wallet, signs only the exact derivation message of the network and resolves with the
+signature. The workflow derives the account's one-time key from it, names the account to the server as
+`setup.feeAccount`, and adds the key's one signature to the owner-signed `create_fee_account` step before the bytes
+enter the journal. The key is never stored: after a reload the owner signs the same message again. The element shows
+what a `create_fee_account` step funds: the account and the XLM that it starts with.
+
+With `expected.feeAccount` the owner verifier admits the `create_fee_account` step of exactly that account for the
+selected agent and server, and reconstructs the creation and each update with the fee account as the agent address.
+
+`ownerWorkflow.feeAccount({network, document})` reads the fee account that an installation, profile or policy names
+from Horizon: `{address, exists, balance, spendable, low, text, refill}`. `low` is true below two operations at the
+wallet's fee ceiling. It is null for a document without a fee account. `ownerWorkflow.refillFees` builds one payment
+of XLM from the owner's account to the fee account, has the host's `sign` sign it as the step `refill_fees` and sends
+the signed bytes to Horizon itself. With `journal` and `key` the signed payment is saved before it is sent. A result
+that is unknown rejects with `RefillPendingError` and keeps it; the next call settles it first. It is done when Horizon
+holds it as successful, it is sent again while its own time bound lasts, and a new payment is signed only when Horizon
+holds it as failed or has read past its time bound while the owner's sequence is still below the payment's sequence.
+
 `ownerWorkflow.updateParams` changes installed params on an active wallet with one owner signature. The host passes
 each changed param with its complete typed value, such as `{daily_spending_limit: {Int: '50000000'}}`, and one journal
 key per change. The service checks the values and prepares the `update_params` step: one call that writes the next
@@ -61,6 +82,6 @@ The build regenerates `dist/` from `src/`. Keep the distribution with its source
 
 `customerKeyFromEntropy` encodes caller-supplied entropy. The caller generates entropy and retains the secret. `stellarSignInChallengeTimes` binds the native message and returns its dates. `connectStellarWallet` requires the caller's timestamp-admission capability. The capability must return `true` for admitted dates. HTTP-session freshness rules remain with the consumer.
 
-`deployAdkOwnerDraft` deploys and funds a reviewed ADK agent draft on Stellar Testnet. The consumer supplies its REST transport, owner confirmation of the installation and portable build admission. A Resume settles the saved step before it signs another one. When the server rejects a sent step with the `OWNER_TRANSACTION_EXPIRED` code and Horizon excludes the transaction, the journal drops the step and keeps its signed bytes under `adkOwnerArchiveKey`. `adkParamLines` labels draft params with the Core registry and shows amounts in XLM.
+`deployAdkOwnerDraft` deploys and funds a reviewed ADK agent draft on Stellar Testnet. It creates no fee account, so it refuses a wallet that needs one and names `installAndFund` and the CLI. The consumer supplies its REST transport, owner confirmation of the installation and portable build admission. A Resume settles the saved step before it signs another one. When the server rejects a sent step with the `OWNER_TRANSACTION_EXPIRED` code and Horizon excludes the transaction, the journal drops the step and keeps its signed bytes under `adkOwnerArchiveKey`. `adkParamLines` labels draft params with the Core registry and shows amounts in XLM.
 
 Portable bundle encoders require a consumer admission callback. The consumer checks authoring metadata and unresolved inputs. The adapter checks native wire types, selected policy identity, hashes and signatures. A missing callback rejects the export.

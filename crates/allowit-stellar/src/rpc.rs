@@ -386,12 +386,28 @@ pub fn prepare_with(
         };
         let Some(expense) = repriced else {
             let mut prepared = attach_simulation(&intent, &encoded)?;
+            fee_account_covers(rpc, &prepared)?;
             record_native_preflight(&mut prepared)?;
             return Ok(prepared);
         };
         terms.expense = Some(expense?);
         rounds += 1;
     }
+}
+/// The fee account of a policy wallet holds the fee that this operation declares, above its
+/// reserve. The network refuses a transaction whose source cannot pay its declared fee, so an
+/// empty fee account is refused here, before any signature, with what its owner does next.
+fn fee_account_covers(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<()> {
+    let Some(fee_account) = &p.config.fee_account else {
+        return Ok(());
+    };
+    let TransactionEnvelope::Tx(envelope) = read(&p.transaction_xdr)? else {
+        return Err("Unsupported transaction envelope".into());
+    };
+    if native_balance(rpc, fee_account)?.spendable(0) < i64::from(envelope.tx.fee) {
+        return Err(format!("{FEE_ACCOUNT_EMPTY} {fee_account}"));
+    }
+    Ok(())
 }
 /// How often preparation prices an operation again from the simulation of its priced
 /// invocation.
@@ -566,14 +582,6 @@ pub fn revalidate_prepared(
     p: &PreparedOperation,
     now: u64,
 ) -> Result<PreparedOperation> {
-    if p.payment_authorization.is_some() {
-        // A payment authorization has no transaction of its own to simulate again: the wallet
-        // must still be in the state that the entry binds.
-        crate::seller_settled::revalidate(rpc, p, now)?;
-        let mut validated = p.clone();
-        record_native_preflight(&mut validated)?;
-        return Ok(validated);
-    }
     validate_retained_prepared(p)?;
     if p.config.route != WalletRoute::PolicyWallet
         || p.state.contract_version != Some(CONTRACT_VERSION)
@@ -1394,10 +1402,23 @@ fn current_wallet_state(
         return Err("policy wallet automation is paused".into());
     }
     verify_custody(c, &state)?;
+    // A wallet with a fee account names exactly that account as its agent address.
+    if c.fee_account.as_ref().is_some_and(|f| *f != state.agent) {
+        return Err(FEE_ACCOUNT_DIFFERS.into());
+    }
     let source = get_account(rpc, &state.agent)?;
     source.validate_structure()?;
-    if require_customer_quorum && source.signer_weight(&c.agent)? == 0 {
-        return Err("Customer is not a current policy wallet agent account signer".into());
+    if source.stands_for_fee_account(c, &state.agent) {
+        return Err(FEE_ACCOUNT_DIFFERS.into());
+    }
+    if require_customer_quorum {
+        if c.fee_account.is_some() {
+            // The fee account holds exactly its roles. A signer or a threshold that the
+            // installation does not name ends every use of the wallet, as for a wallet account.
+            source.validate_roles(&c.owner, &c.agent, &c.server)?;
+        } else if source.signer_weight(&c.agent)? == 0 {
+            return Err("Customer is not a current policy wallet agent account signer".into());
+        }
     }
     PolicyBinding::from_scval(&readonly_call(rpc, c, &source, "policy_binding")?)?
         .verify(c, OperationKind::Transfer)?;

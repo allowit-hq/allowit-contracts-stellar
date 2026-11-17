@@ -51,6 +51,7 @@ fn fixture_with_wallet(
         wallet,
         owner: owner.clone(),
         agent: agent.clone(),
+        fee_account: None,
         server: engine.clone(),
         route: route.clone(),
         tier: portable.then_some(PolicyTier::Simple),
@@ -3103,8 +3104,15 @@ fn selected_implementations_bind_constructor_and_both_authorities() {
         assert!(sign(&unsigned, &[2; 32], 86401).is_err());
         let signed = server_ready(&unsigned);
         assert!(authorize(&signed, &[], 86401).is_err());
-        assert!(sign(&signed, &[3; 32], 86401).is_err());
-        authorize(&signed, &[sign(&signed, &[2; 32], 86401).unwrap()], 86401).unwrap();
+        // The server signs the transaction only after its own authorization of the operation.
+        // Where the agent key's own account is the source, that signature is no agent
+        // signature and the envelope does not carry it. No other key signs.
+        let server = sign(&signed, &[3; 32], 86401).unwrap();
+        assert!(authorize(&signed, std::slice::from_ref(&server), 86401).is_err());
+        assert!(sign(&signed, &[9; 32], 86401).is_err());
+        let agent = sign(&signed, &[2; 32], 86401).unwrap();
+        let alone = authorize(&signed, std::slice::from_ref(&agent), 86401).unwrap();
+        assert_eq!(alone, authorize(&signed, &[agent, server], 86401).unwrap());
     }
 }
 
@@ -4006,4 +4014,419 @@ fn service_capability_preserves_seed_bytes_and_never_signs_denied_packets() {
         authorize_server_using(&p, &service, 86401, None, |_| Err("caller declined".into()))
             .is_err()
     );
+}
+
+/// A policy wallet whose fee account sends its operations and pays their fees. The wallet
+/// names the fee account as its agent address; the agent key holds no account.
+fn fee_account_fixture() -> (WalletConfig, ExecutionRequest, TrustedState) {
+    let (mut c, mut r, mut s) = fixture(WalletRoute::PolicyWallet, true);
+    let fee_account = account_for_seed(&[11; 32]);
+    c.fee_account = Some(fee_account.clone());
+    let mut fee = r.fee_bounds.take().unwrap();
+    fee[0].payer = wf(&fee_account);
+    r.fee_bounds = Some(fee);
+    s.source = AccountState {
+        address: fee_account.clone(),
+        sequence: 40,
+        master_weight: 0,
+        low_threshold: 2,
+        medium_threshold: 2,
+        high_threshold: 3,
+        signers: vec![
+            AccountSigner {
+                key: c.agent.clone(),
+                weight: 1,
+            },
+            AccountSigner {
+                key: c.server.clone(),
+                weight: 1,
+            },
+            AccountSigner {
+                key: c.owner.clone(),
+                weight: 3,
+            },
+        ],
+    };
+    s.agent = fee_account;
+    (c, r, s)
+}
+/// The fixture ledger with `1` holding `2` stroops and the three signer entries of a fee
+/// account.
+struct Holding(PreflightRpc, String, i64);
+impl rpc::Rpc for Holding {
+    fn call(&self, method: &str, params: Value) -> Result<Value> {
+        use stellar_xdr::*;
+        let mut reply = rpc::Rpc::call(&self.0, method, params.clone())?;
+        let key = (method == "getLedgerEntries")
+            .then(|| {
+                LedgerKey::from_xdr_base64(params["keys"][0].as_str().unwrap(), Limits::none())
+                    .unwrap()
+            })
+            .filter(|key| {
+                matches!(key, LedgerKey::Account(a) if a.account_id
+                == AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+                    account_key(&self.1).unwrap(),
+                ))))
+            });
+        if key.is_some() {
+            let LedgerEntryData::Account(mut account) = LedgerEntryData::from_xdr_base64(
+                reply["entries"][0]["xdr"].as_str().unwrap(),
+                Limits::none(),
+            )
+            .unwrap() else {
+                panic!()
+            };
+            account.balance = self.2;
+            account.num_sub_entries = 3;
+            reply["entries"][0]["xdr"] = json!(
+                LedgerEntryData::Account(account)
+                    .to_xdr_base64(Limits::none())
+                    .unwrap()
+            );
+        }
+        Ok(reply)
+    }
+}
+/// The fixture ledger with a fee account that holds 100 XLM.
+fn funded(c: &WalletConfig, r: &ExecutionRequest, s: &TrustedState) -> Holding {
+    Holding(
+        preflight_rpc(c, r, s),
+        c.fee_account.clone().unwrap(),
+        1_000_000_000,
+    )
+}
+/// The operation of the fee account fixture with the server's authorization, ready for the
+/// transaction signatures.
+fn fee_account_operation() -> (WalletConfig, PreparedOperation) {
+    let (c, r, s) = fee_account_fixture();
+    let rpc = funded(&c, &r, &s);
+    let unsigned = rpc::prepare(&rpc, &c, &r, None, 86401, 86700).unwrap();
+    (c, server_ready(&unsigned))
+}
+
+#[test]
+fn a_fee_account_sends_the_operation_and_takes_the_agent_and_the_server_signature() {
+    let (c, p) = fee_account_operation();
+    let fee_account = c.fee_account.clone().unwrap();
+    let TransactionEnvelope::Tx(envelope) =
+        TransactionEnvelope::from_xdr_base64(&p.transaction_xdr, Limits::none()).unwrap()
+    else {
+        panic!()
+    };
+    // The fee account is the transaction source, so it pays the fee. The agent key has no
+    // account in this transaction.
+    assert_eq!(
+        envelope.tx.source_account,
+        stellar_xdr::MuxedAccount::Ed25519(stellar_xdr::Uint256(
+            account_key(&fee_account).unwrap()
+        ))
+    );
+    assert_ne!(fee_account, c.agent);
+    assert!(envelope.tx.operations[0].source_account.is_none());
+    let agent = sign(&p, &[2; 32], 86401).unwrap();
+    let server = sign(&p, &[3; 32], 86401).unwrap();
+    // Neither key alone, no stranger and no owner signature assembles the transaction.
+    assert!(authorize(&p, std::slice::from_ref(&agent), 86401).is_err());
+    assert!(authorize(&p, std::slice::from_ref(&server), 86401).is_err());
+    assert!(authorize(&p, &[], 86401).is_err());
+    assert!(sign(&p, &[9; 32], 86401).is_err());
+    assert!(sign(&p, &[1; 32], 86401).is_err());
+    assert!(sign(&p, &[11; 32], 86401).is_err());
+    let signed = authorize(&p, &[agent, server], 86401).unwrap();
+    validate_signed(&signed, 86401).unwrap();
+    let TransactionEnvelope::Tx(envelope) =
+        TransactionEnvelope::from_xdr_base64(&signed.transaction_xdr, Limits::none()).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(envelope.signatures.len(), 2);
+    // An envelope with one of the two signatures is no signed operation.
+    for keep in [0, 1] {
+        let mut one = envelope.clone();
+        one.signatures = vec![envelope.signatures[keep].clone()].try_into().unwrap();
+        let mut changed = signed.clone();
+        changed.transaction_xdr = TransactionEnvelope::Tx(one)
+            .to_xdr_base64(Limits::none())
+            .unwrap();
+        assert!(validate_signed(&changed, 86401).is_err());
+    }
+}
+
+#[test]
+fn the_fee_account_co_sign_path_signs_only_the_wallet_operation_that_the_server_prepared() {
+    use ed25519_dalek::{Signer, SigningKey};
+    use stellar_xdr as x;
+    let (c, p) = fee_account_operation();
+    let fee_account = c.fee_account.clone().unwrap();
+    // The control: the unchanged packet takes both signatures.
+    let both = [
+        sign(&p, &[2; 32], 86401).unwrap(),
+        sign(&p, &[3; 32], 86401).unwrap(),
+    ];
+    validate_signed(&authorize(&p, &both, 86401).unwrap(), 86401).unwrap();
+    let other = x::MuxedAccount::Ed25519(x::Uint256(
+        account_key(&account_for_seed(&[9; 32])).unwrap(),
+    ));
+    type Change = Box<dyn Fn(&mut x::Transaction)>;
+    let body = |body: x::OperationBody| -> Change {
+        Box::new(move |tx: &mut x::Transaction| {
+            tx.operations = vec![x::Operation {
+                source_account: None,
+                body: body.clone(),
+            }]
+            .try_into()
+            .unwrap();
+            tx.ext = x::TransactionExt::V0;
+        })
+    };
+    let call = |change: fn(&mut x::InvokeContractArgs)| -> Change {
+        Box::new(move |tx: &mut x::Transaction| {
+            let mut ops = tx.operations.to_vec();
+            let x::OperationBody::InvokeHostFunction(op) = &mut ops[0].body else {
+                panic!()
+            };
+            let x::HostFunction::InvokeContract(args) = &mut op.host_function else {
+                panic!()
+            };
+            change(args);
+            tx.operations = ops.try_into().unwrap();
+        })
+    };
+    let signer = |key: [u8; 32], weight: u32| x::Signer {
+        key: x::SignerKey::Ed25519(x::Uint256(account_key(&account_for_seed(&key)).unwrap())),
+        weight,
+    };
+    let changes: Vec<(&str, Change)> = vec![
+        (
+            "a payment of the fee float",
+            body(x::OperationBody::Payment(x::PaymentOp {
+                destination: other.clone(),
+                asset: x::Asset::Native,
+                amount: 10_000_000,
+            })),
+        ),
+        (
+            "a new signer",
+            body(x::OperationBody::SetOptions(x::SetOptionsOp {
+                signer: Some(signer([9; 32], 3)),
+                ..Default::default()
+            })),
+        ),
+        (
+            "a heavier agent signer",
+            body(x::OperationBody::SetOptions(x::SetOptionsOp {
+                signer: Some(signer([2; 32], 3)),
+                ..Default::default()
+            })),
+        ),
+        (
+            "lower thresholds",
+            body(x::OperationBody::SetOptions(x::SetOptionsOp {
+                low_threshold: Some(1),
+                med_threshold: Some(1),
+                high_threshold: Some(1),
+                ..Default::default()
+            })),
+        ),
+        (
+            "a merge",
+            body(x::OperationBody::AccountMerge(other.clone())),
+        ),
+        (
+            "a sequence bump",
+            body(x::OperationBody::BumpSequence(x::BumpSequenceOp {
+                bump_to: x::SequenceNumber(i64::MAX),
+            })),
+        ),
+        (
+            "another function of the wallet",
+            call(|args| args.function_name = x::ScSymbol("recover".try_into().unwrap())),
+        ),
+        (
+            "another contract",
+            call(|args| {
+                args.contract_address = x::ScAddress::Contract(x::ContractId(x::Hash([44; 32])));
+            }),
+        ),
+        (
+            "no request argument",
+            call(|args| args.args = x::VecM::default()),
+        ),
+        (
+            "another operation source",
+            Box::new({
+                let other = other.clone();
+                move |tx: &mut x::Transaction| {
+                    let mut ops = tx.operations.to_vec();
+                    ops[0].source_account = Some(other.clone());
+                    tx.operations = ops.try_into().unwrap();
+                }
+            }),
+        ),
+        (
+            "another transaction source",
+            Box::new({
+                let other = other.clone();
+                move |tx: &mut x::Transaction| tx.source_account = other.clone()
+            }),
+        ),
+        (
+            "a higher fee",
+            Box::new(|tx: &mut x::Transaction| tx.fee += 1),
+        ),
+        (
+            "another sequence",
+            Box::new(|tx: &mut x::Transaction| tx.seq_num.0 += 1),
+        ),
+    ];
+    for (name, change) in changes {
+        let TransactionEnvelope::Tx(mut envelope) =
+            TransactionEnvelope::from_xdr_base64(&p.transaction_xdr, Limits::none()).unwrap()
+        else {
+            panic!()
+        };
+        change(&mut envelope.tx);
+        let mut changed = p.clone();
+        changed.transaction_hash = transaction_hash(&c.network, &envelope.tx).unwrap();
+        changed.transaction_xdr = TransactionEnvelope::Tx(envelope)
+            .to_xdr_base64(Limits::none())
+            .unwrap();
+        assert_ne!(changed.transaction_hash, p.transaction_hash, "{name}");
+        // Neither role signs these bytes through the rail.
+        assert!(
+            sign(&changed, &[2; 32], 86401).is_err(),
+            "agent signs {name}"
+        );
+        assert!(
+            sign(&changed, &[3; 32], 86401).is_err(),
+            "server signs {name}"
+        );
+        // Signatures of both keys over these bytes, made outside the rail, assemble nothing.
+        let raw = |seed: [u8; 32]| DetachedSignature {
+            signer: account_for_seed(&seed),
+            signature: SigningKey::from_bytes(&seed)
+                .sign(&changed.transaction_hash)
+                .to_bytes()
+                .to_vec(),
+        };
+        assert!(
+            authorize(&changed, &[raw([2; 32]), raw([3; 32])], 86401).is_err(),
+            "both signatures assemble {name}"
+        );
+        assert!(validate_retained_prepared(&changed).is_err(), "{name}");
+    }
+    // The signatures of the prepared operation serve that one transaction: a signature over
+    // it is no signature over a payment from the fee account.
+    assert_eq!(p.state.source.address, fee_account);
+}
+
+#[test]
+fn a_fee_account_of_another_agent_or_with_other_authority_serves_no_operation() {
+    let (c, r, s) = fee_account_fixture();
+    let terms = ExecutionTerms::default();
+    let prepared =
+        |c: &WalletConfig, s: &TrustedState| prepare_with(c, &r, &terms, s, 86401, 86700);
+    // The control: the exact roles prepare.
+    prepared(&c, &s).unwrap();
+    let stranger = account_for_seed(&[12; 32]);
+    type Change = fn(&mut TrustedState, &str);
+    let changes: [(&str, Change); 7] = [
+        ("the fee account of another agent", |s, stranger| {
+            s.source.signers[0].key = stranger.into()
+        }),
+        ("a further signer", |s, stranger| {
+            s.source.signers.push(AccountSigner {
+                key: stranger.into(),
+                weight: 1,
+            })
+        }),
+        ("an agent signer that pays alone", |s, _| {
+            s.source.signers[0].weight = 2
+        }),
+        ("a payment threshold of one", |s, _| {
+            s.source.low_threshold = 1;
+            s.source.medium_threshold = 1;
+        }),
+        ("a high threshold that agent and server reach", |s, _| {
+            s.source.high_threshold = 2
+        }),
+        ("an own key with authority", |s, _| {
+            s.source.master_weight = 1
+        }),
+        ("no agent signer", |s, _| {
+            s.source.signers.remove(0);
+        }),
+    ];
+    for (name, change) in changes {
+        let mut changed = s.clone();
+        change(&mut changed, &stranger);
+        assert!(prepared(&c, &changed).is_err(), "{name}");
+        // The ledger read refuses the same account before anything is prepared.
+        let rpc = funded(&c, &r, &changed);
+        assert!(
+            rpc::prepare(&rpc, &c, &r, None, 86401, 86700).is_err(),
+            "{name}"
+        );
+    }
+    // A wallet whose agent address is another account than the fee account of its
+    // installation is refused, also when that account has the exact roles.
+    let mut other = c.clone();
+    other.fee_account = Some(stranger.clone());
+    assert_eq!(prepared(&other, &s).unwrap_err(), FEE_ACCOUNT_DIFFERS);
+    let rpc = funded(&other, &r, &s);
+    assert_eq!(
+        rpc::prepare(&rpc, &other, &r, None, 86401, 86700).unwrap_err(),
+        FEE_ACCOUNT_DIFFERS
+    );
+    // An installation without the fee account never stands for this wallet: it would ask
+    // for the agent's signature alone.
+    let mut without = c.clone();
+    without.fee_account = None;
+    assert_eq!(prepared(&without, &s).unwrap_err(), FEE_ACCOUNT_DIFFERS);
+    let rpc = funded(&c, &r, &s);
+    assert_eq!(
+        rpc::prepare(&rpc, &without, &r, None, 86401, 86700).unwrap_err(),
+        FEE_ACCOUNT_DIFFERS
+    );
+    assert_eq!(
+        rpc::trusted_state_for_discovery(&rpc, &without, None).unwrap_err(),
+        FEE_ACCOUNT_DIFFERS
+    );
+    // The fee account is an account of its own: no role key and no other route takes one.
+    for role in [&c.owner, &c.agent, &c.server] {
+        let mut reused = c.clone();
+        reused.fee_account = Some(role.clone());
+        assert!(validate_config(&reused).is_err());
+    }
+    let (mut native, _, _) = fixture(WalletRoute::Native, false);
+    native.fee_account = Some(stranger);
+    assert!(validate_config(&native).is_err());
+}
+
+#[test]
+fn an_empty_fee_account_is_refused_before_any_signature_with_its_address() {
+    let (c, r, s) = fee_account_fixture();
+    let fee_account = c.fee_account.clone().unwrap();
+    // The reserve of the account and its three signers is 2.5 XLM. One stroop below the
+    // declared fee above it is too little; the declared fee itself is enough.
+    let reserve = owner::wallet_reserve(false);
+    let fee = {
+        let rpc = funded(&c, &r, &s);
+        let p = rpc::prepare(&rpc, &c, &r, None, 86401, 86700).unwrap();
+        let TransactionEnvelope::Tx(envelope) =
+            TransactionEnvelope::from_xdr_base64(&p.transaction_xdr, Limits::none()).unwrap()
+        else {
+            panic!()
+        };
+        i64::from(envelope.tx.fee)
+    };
+    let poor = Holding(
+        preflight_rpc(&c, &r, &s),
+        fee_account.clone(),
+        reserve + fee - 1,
+    );
+    let refused = rpc::prepare(&poor, &c, &r, None, 86401, 86700).unwrap_err();
+    assert_eq!(refused, format!("{FEE_ACCOUNT_EMPTY} {fee_account}"));
+    let enough = Holding(preflight_rpc(&c, &r, &s), fee_account, reserve + fee);
+    rpc::prepare(&enough, &c, &r, None, 86401, 86700).unwrap();
 }

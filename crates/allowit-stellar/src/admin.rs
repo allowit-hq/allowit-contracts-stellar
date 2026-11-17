@@ -9,6 +9,18 @@ use serde_json::json;
 mod host;
 pub use host::{PolicyInstallation, wallet_salt};
 
+/// The x402 choice of a wallet. The contract verifies an x402 authorization against the raw
+/// key of its agent address. The key of a fee account signs nothing after setup, so a wallet
+/// with a fee account takes no x402 authorization.
+fn x402_for(c: &WalletConfig, x402_enabled: bool) -> Result<bool> {
+    if x402_enabled && c.fee_account.is_some() {
+        return Err(
+            "A policy wallet with a fee account takes no x402 authorization: its agent address is the fee account, whose own key signs nothing"
+                .into(),
+        );
+    }
+    Ok(x402_enabled)
+}
 /// Complete owner-approved configuration. The version is supplied to deploy_policy.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -52,12 +64,13 @@ impl PolicyDeployment {
         Ok((
             Self {
                 owner: c.owner.clone(),
-                agent: c.agent.clone(),
+                // The wallet keeps its agent address: its fee account when it has one.
+                agent: c.agent_account().into(),
                 server: c.server.clone(),
                 source_digest,
                 rules,
                 params,
-                x402_enabled,
+                x402_enabled: x402_for(c, x402_enabled)?,
                 wasm_hash: None,
             },
             check,
@@ -124,17 +137,6 @@ pub struct PolicyConfig {
     pub params: PolicyParams,
     pub x402_enabled: bool,
 }
-/// Whether a new wallet of `c` is created with x402 payment authorizations enabled.
-///
-/// A new policy wallet admits payment authorizations for a seller's facilitator: each one
-/// needs the raw signatures of the agent and the server and passes the wallet's own policy
-/// check, as an execution does. The custom-account check needs both roles as account keys.
-/// The owner disables it, or enables it on an earlier wallet, with a signed update.
-pub fn x402_at_creation(c: &WalletConfig) -> bool {
-    c.route == WalletRoute::PolicyWallet
-        && account_key(&c.agent).is_ok()
-        && account_key(&c.server).is_ok()
-}
 impl PolicyConfig {
     /// The constructor packet of a validated installation. `config.wallet` is the address that
     /// `wallet_address` derives, and `config.module_digest` the uploaded Wasm hash.
@@ -153,14 +155,16 @@ impl PolicyConfig {
         )?;
         let config = Self {
             owner: c.owner.clone(),
-            agent: c.agent.clone(),
+            // The wallet's agent address is the fee account, which sends the agent's
+            // operations. The agent key signs from that account and holds no account itself.
+            agent: c.agent_account().into(),
             server: c.server.clone(),
             asset: c.asset.clone(),
             policy_instance: c.policy_instance,
             source_digest: c.source_digest,
             rules: c.rules.clone(),
             params: c.params.clone(),
-            x402_enabled,
+            x402_enabled: x402_for(c, x402_enabled)?,
         };
         config.validate()?;
         Ok(config)

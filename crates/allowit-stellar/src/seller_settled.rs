@@ -7,43 +7,38 @@
 //!
 //! Here such a payment is an ordinary operation with one difference: who submits it. The
 //! request names the same transfer, carries no fee bound and holds [`marker`]. Preparation
-//! prepares that transfer as the wallet would execute it itself, so the wallet contract and
-//! the service decide on it exactly as on any payment, and then adds a
-//! [`PaymentAuthorization`]: the entry of exactly that transfer and the digest that the agent
-//! and the service sign. The wallet's custom-account check admits the entry only with both
-//! signatures, at the wallet nonce of the preparation, before the expiry, and counts the
-//! amount without gas. Nothing else can be done with the entry: it names the token, the
-//! payer, the payee and the amount, the ledger consumes its nonce once, and it expires.
+//! prepares that transfer as the wallet would execute it itself, so the same policy checks
+//! decide on it as on any payment, and then adds a [`PaymentAuthorization`]: the entry of
+//! exactly that transfer and the digest that the agent and the service sign. Nothing else can
+//! be done with the entry: it names the token, the payer, the payee and the amount, the
+//! ledger consumes its nonce once, and it expires.
 //!
-//! The service sends nothing. It reads the outcome from the ledger: the wallet stores a
-//! receipt under the operation id when the entry settles, and the token's transfer event
-//! names the transaction. An entry that did not settle by its expiry lapses as any policy
-//! wallet operation does, once the wallet still shows its nonce after the expiry.
+//! The service sends nothing. It reads the outcome from the ledger: the token's transfer
+//! events from the wallet to the payee, through the expiry ledger of the entry, name the
+//! transaction that carries the entry, or show that none does.
 //!
-//! Both custody forms sign such an entry:
+//! Only a keypair wallet signs such an entry. It is a classic account: the agent and the
+//! service each sign the host payload of the entry, and the entry holds both account
+//! signatures. Their weights reach the account's medium threshold only together.
 //!
-//! - A policy wallet is a contract account. Its entry carries the wallet's
-//!   `PolicyAuthorization`: the execution packet and the raw signatures of the agent and the
-//!   service over the digest of [`x402`]. The owner must have enabled x402 for the wallet.
-//! - A keypair wallet is a classic account. The agent and the service each sign the host
-//!   payload of the entry, and the entry holds both account signatures. Their weights reach
-//!   the account's medium threshold only together. The ledger keeps no record of the
-//!   operation for such a wallet, so its settlement and its lapse both read the token's
-//!   transfer events up to the expiry ledger of the entry.
+//! A policy wallet signs none. Its contract checks an authorization against the raw key of
+//! its agent address, and that address is the wallet's fee account, whose own key signs
+//! nothing after setup. A policy wallet pays a seller that takes the proof of a settled
+//! transaction.
 use crate::workflow::{
     Chain, EvidenceKind, EvidenceRef, WorkflowAsset, WorkflowEffectBound, WorkflowFeeBound,
 };
 use crate::*;
 use serde_json::json;
 
-/// The longest validity of an entry, in ledgers: the bound of [`x402`].
+/// The longest validity of an entry, in ledgers.
 pub const MAX_LEDGERS: u32 = 64;
 /// The ledger time that bounds the entry's expiry ledger. A facilitator admits an expiry of
 /// at most the seller's timeout divided by its own estimate of the ledger time, which is 5 or
 /// 6 seconds. The longer time gives the earlier ledger, which both estimates admit.
 pub const LEDGER_SECONDS: u64 = 6;
-/// The fault of a wallet whose owner has not enabled payment authorizations.
-pub const DISABLED: &str = "The owner has not enabled x402 payment authorizations for this wallet. The owner enables them with a signed update of the wallet.";
+/// The fault of a wallet that signs no payment authorization.
+pub const POLICY_WALLET: &str = "A policy wallet signs no payment authorization for a seller's facilitator: its contract checks the agent's signature against its fee account, whose own key signs nothing. It pays a seller that takes the proof of a settled transaction.";
 const EVIDENCE_NAMESPACE: u32 = 402;
 const EVIDENCE_SCHEMA: u16 = 1;
 const DOMAIN: &[u8] = b"allowit-seller-settled-payment-v1";
@@ -96,20 +91,18 @@ pub fn request(
 }
 
 /// The same transfer in the shape of an ordinary request, for decoding alone: the fee bound
-/// names a role key and pays nothing.
+/// names the wallet and pays nothing.
 fn shaped(c: &WalletConfig, r: &ExecutionRequest) -> Result<ExecutionRequest> {
     if !is_request(r) {
         return Err("The request asks for no payment authorization".into());
     }
-    let payer = if c.route == WalletRoute::Native {
-        &c.wallet
-    } else {
-        &c.agent
-    };
+    if c.route != WalletRoute::Native {
+        return Err(POLICY_WALLET.into());
+    }
     let mut out = r.clone();
     out.evidence.clear();
     out.fee_bounds = Some(vec![WorkflowFeeBound {
-        payer: request::account(payer)?,
+        payer: request::account(&c.wallet)?,
         asset: WorkflowAsset::Native {
             chain: Chain::Stellar,
             network: network_id(&c.network)?,
@@ -139,16 +132,10 @@ fn retained_transfer(c: &WalletConfig, r: &ExecutionRequest) -> Result<Transfer>
 pub struct PaymentAuthorization {
     /// The request as the agent sent it.
     pub request: ExecutionRequest,
-    /// The execution terms that both signers sign: the terms of the operation without gas,
-    /// because the facilitator pays the network fee.
-    pub terms: ExecutionTerms,
     /// The unsigned authorization entry of the wallet for exactly the transfer.
     pub authorization_xdr: String,
-    /// What the agent and the service sign.
+    /// What the agent and the service sign: the host payload of the entry.
     pub digest: [u8; 32],
-    /// The service's signature of `digest`, once it approved the operation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub server_signature: Option<Vec<u8>>,
 }
 
 /// The request that the agent sent for `p`: the authorization request, or the operation's.
@@ -172,33 +159,10 @@ fn part(p: &PreparedOperation) -> Result<&PaymentAuthorization> {
         .ok_or_else(|| "The operation is no payment authorization".into())
 }
 
-/// The terms without gas: the wallet counts the amount alone.
-fn terms_without_gas(terms: &ExecutionTerms) -> Result<ExecutionTerms> {
-    let mut out = terms.clone();
-    if let Some(expense) = &mut out.expense {
-        expense.spent_units = expense
-            .spent_units
-            .checked_sub(expense.gas_units)
-            .ok_or("Expense bounds overflow")?;
-        expense.gas_units = 0;
-        expense.max_fee_stroops = 0;
-    }
-    Ok(out)
-}
-
-/// The token contract of the wallet's asset: the installed contract of a policy wallet, or
-/// the asset contract of a keypair wallet's classic asset.
-fn token_contract(c: &WalletConfig) -> Result<String> {
-    if c.route == WalletRoute::Native {
-        sac_address(&c.network, &asset_xdr(c)?)
-    } else {
-        Ok(c.asset.clone())
-    }
-}
-
-/// The unsigned entry of `p`: the wallet authorizes `transfer(wallet, recipient, amount)` on
-/// its asset contract. The nonce derives from the operation id, so one request ID has one
-/// entry. The expiry ledger follows the validity of the operation.
+/// The unsigned entry of `p`: the wallet account authorizes
+/// `transfer(wallet, recipient, amount)` on the contract of its asset. The nonce derives from
+/// the operation id, so one request ID has one entry. The expiry ledger follows the validity
+/// of the operation.
 fn entry(p: &PreparedOperation) -> Result<SorobanAuthorizationEntry> {
     let c = &p.config;
     let t = retained_transfer(c, &p.request)?;
@@ -226,7 +190,7 @@ fn entry(p: &PreparedOperation) -> Result<SorobanAuthorizationEntry> {
         }),
         root_invocation: SorobanAuthorizedInvocation {
             function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
-                contract_address: address(&token_contract(c)?)?,
+                contract_address: address(&sac_address(&c.network, &asset_xdr(c)?)?)?,
                 function_name: ScSymbol(b"transfer".to_vec().try_into().map_err(err)?),
                 args: vec![
                     ScVal::Address(address(&c.wallet)?),
@@ -241,65 +205,6 @@ fn entry(p: &PreparedOperation) -> Result<SorobanAuthorizationEntry> {
     })
 }
 
-/// The execution packet that the wallet reads from the entry's signature.
-fn execution(p: &PreparedOperation, a: &PaymentAuthorization) -> Result<ScVal> {
-    let t = retained_transfer(&p.config, &p.request)?;
-    policy_wallet_request(
-        &p.config,
-        &p.request,
-        &a.terms,
-        &p.state,
-        &StellarOperation::Transfer(t),
-        p.expires_at,
-    )
-}
-
-/// The digest that both signers sign. For a policy wallet: the wallet's domain, the host
-/// payload of the entry and the execution packet, in the encoding of
-/// [`x402::signing_digest`] without its checks of the current time, so a retained packet reads
-/// after its expiry. For a keypair wallet: the host payload of the entry.
-fn digest(p: &PreparedOperation, a: &PaymentAuthorization) -> Result<[u8; 32]> {
-    let entry: SorobanAuthorizationEntry = read(&a.authorization_xdr)?;
-    let host_payload = authorization::payload(&p.config.network, &entry)?;
-    if p.config.route == WalletRoute::Native {
-        // The signers of a classic account sign the host payload of the entry itself.
-        return Ok(host_payload);
-    }
-    let domain = ScVal::Vec(Some(
-        vec![
-            value_symbol("allowit_wallet_v1")?,
-            value_bytes(&host_payload)?,
-            execution(p, a)?,
-        ]
-        .try_into()
-        .map_err(err)?,
-    ));
-    Ok(hash(domain.to_xdr(limits()).map_err(err)?))
-}
-
-/// The raw-key signing request of `p`, as [`x402`] checks it.
-pub fn signing_request(p: &PreparedOperation) -> Result<x402::SigningRequest> {
-    let a = part(p)?;
-    let policy = p
-        .state
-        .policy_state
-        .as_ref()
-        .ok_or("A payment authorization needs the wallet's policy state")?;
-    Ok(x402::SigningRequest {
-        config: p.config.clone(),
-        request: p.request.clone(),
-        state: x402::WalletState {
-            custody: p.state.clone(),
-            tier: p.config.tier.ok_or("Selected policy tier is required")?,
-            x402_enabled: policy.x402_enabled,
-            paused: false,
-        },
-        expires_at: p.expires_at,
-        terms: a.terms.clone(),
-        authorization_xdr: a.authorization_xdr.clone(),
-    })
-}
-
 fn signature(bytes: &[u8]) -> Result<[u8; 64]> {
     bytes
         .try_into()
@@ -307,84 +212,55 @@ fn signature(bytes: &[u8]) -> Result<[u8; 64]> {
 }
 
 /// Check the retained authorization part of `p` against the operation around it. Every field
-/// is rebuilt: the request names the operation's transfer, the terms are the operation's
-/// without gas, the entry is the one entry of that transfer, and the digest binds them. This
-/// reads no time and grants nothing.
+/// is rebuilt: the request names the operation's transfer under its operation id, the entry
+/// is the one entry of that transfer, and the digest is its host payload. This reads no time
+/// and grants nothing.
 pub fn validate(p: &PreparedOperation) -> Result<()> {
     let a = part(p)?;
     let c = &p.config;
-    if !matches!(c.route, WalletRoute::PolicyWallet | WalletRoute::Native) {
-        return Err("This wallet signs no payment authorization".into());
+    if c.route != WalletRoute::Native {
+        return Err(POLICY_WALLET.into());
     }
-    // The agent's request and the operation name one transfer under one operation id.
     if !is_request(&a.request)
         || a.request.operation != p.request.operation
         || retained_transfer(c, &shaped(c, &a.request)?)? != retained_transfer(c, &p.request)?
     {
         return Err("The payment authorization names another operation".into());
     }
-    if a.terms != terms_without_gas(&p.terms)?
-        || a.authorization_xdr != xdr(&entry(p)?)?
-        || a.digest != digest(p, a)?
+    let entry = entry(p)?;
+    if a.authorization_xdr != xdr(&entry)?
+        || a.digest != authorization::payload(&c.network, &entry)?
     {
         return Err("The payment authorization differs from its operation".into());
-    }
-    match (&a.server_signature, &c.route) {
-        (None, _) => {}
-        // The service of a keypair wallet signs with the agent when the entry is assembled.
-        (Some(_), WalletRoute::Native) => {
-            return Err("A keypair wallet's preparation holds no service signature".into());
-        }
-        (Some(bytes), _) => signing::verify_digest(&c.server, &a.digest, bytes)
-            .map_err(|_| "Invalid service signature of the payment authorization")?,
     }
     Ok(())
 }
 
-/// Admit `p` for a new signature at `now`: the policy holds on the exact terms that the
-/// signers sign, and every binding of [`x402::signing_digest`] holds now.
+/// Admit `p` for a new signature at `now`: the packet is whole and unexpired, the wallet
+/// account has exactly its roles, weights and thresholds, and the host policy check of an
+/// operation holds.
 pub fn admit(p: &PreparedOperation, now: u64) -> Result<[u8; 32]> {
     let a = part(p)?;
     validate_retained_prepared(p)?;
     if p.version != 1 || p.created_at > now || now >= p.expires_at {
         return Err("Prepared operation is stale".into());
     }
-    // The host policy check of an operation, on the terms that the signers sign.
+    p.state.source.validate_wallet(&p.config)?;
     verify_operation(
         &p.config,
         &p.request,
-        &a.terms,
+        &p.terms,
         &p.state,
         p.created_at,
         p.expires_at,
         None,
     )?;
-    let digest = if p.config.route == WalletRoute::Native {
-        // The exact roles, weights and thresholds of the wallet account, as for a payment.
-        p.state.source.validate_wallet(&p.config)?;
-        digest(p, a)?
-    } else {
-        x402::signing_digest(&signing_request(p)?, now).map_err(|error| {
-            if p.state
-                .policy_state
-                .as_ref()
-                .is_some_and(|state| !state.x402_enabled)
-            {
-                DISABLED.to_owned()
-            } else {
-                error
-            }
-        })?
-    };
-    if digest != a.digest {
-        return Err("The payment authorization digest differs".into());
-    }
-    Ok(digest)
+    Ok(a.digest)
 }
 
 /// Prepare the payment authorization of `r`. The same transfer is first prepared as the
-/// wallet would execute it itself: the recording simulation of that invocation runs the
-/// wallet's own checks and its policy. The authorization part is then derived from it.
+/// wallet would execute it itself, which runs the host policy check against the wallet's
+/// accounting. The authorization part is then derived from it.
 pub fn prepare(
     rpc: &dyn rpc::Rpc,
     c: &WalletConfig,
@@ -394,24 +270,10 @@ pub fn prepare(
     now: u64,
     expires_at: u64,
 ) -> Result<PreparedOperation> {
-    let policy_wallet = match c.route {
-        WalletRoute::PolicyWallet => true,
-        WalletRoute::Native => false,
-        WalletRoute::Odc => return Err("This wallet signs no payment authorization".into()),
-    };
     let t = transfer(c, r)?;
     let found = rpc::trusted_state_for_discovery(rpc, c, accounting.clone())?;
     if found.paused {
-        return Err("The wallet is paused".into());
-    }
-    if policy_wallet
-        && found
-            .state
-            .policy_state
-            .as_ref()
-            .is_none_or(|state| !state.x402_enabled)
-    {
-        return Err(DISABLED.into());
+        return Err("This wallet is paused: its owner removed the agent signer".into());
     }
     let ordinary = request::transfer(c, &found.state, r.operation.nonce, &t.recipient, t.amount)?;
     let p = rpc::prepare_with(rpc, c, &ordinary, terms, accounting, now, expires_at)?;
@@ -428,90 +290,34 @@ pub fn attach(
     if p.payment_authorization.is_some() {
         return Err("The operation is already a payment authorization".into());
     }
-    let mut a = PaymentAuthorization {
-        request: r.clone(),
-        terms: terms_without_gas(&p.terms)?,
-        authorization_xdr: xdr(&entry(&p)?)?,
-        digest: [0; 32],
-        server_signature: None,
-    };
-    a.digest = digest(&p, &a)?;
-    let preflight = p.native_preflight.is_some();
-    p.payment_authorization = Some(Box::new(a));
-    if preflight {
-        // The simulation of the operation established its preflight. It now binds the
-        // authorization part too.
-        record_native_preflight(&mut p)?;
+    if p.config.route != WalletRoute::Native {
+        return Err(POLICY_WALLET.into());
     }
+    let entry = entry(&p)?;
+    p.payment_authorization = Some(Box::new(PaymentAuthorization {
+        request: r.clone(),
+        authorization_xdr: xdr(&entry)?,
+        digest: authorization::payload(&p.config.network, &entry)?,
+    }));
     admit(&p, now)?;
     Ok(p)
 }
 
-/// The service's approval: after the same policy gates as for an operation that it submits
-/// itself, the service signs the digest. A Simple or Common wallet whose source is not
-/// canonical-only needs `evaluator`, as [`x402::verify_server`] states.
-pub fn authorize_server(
-    p: &PreparedOperation,
-    signer_account: &str,
-    now: u64,
-    evaluator: Option<policy::PortableEvaluator>,
-    sign_hash: impl FnOnce(&[u8; 32]) -> Result<[u8; 64]>,
-) -> Result<PreparedOperation> {
-    let a = part(p)?;
-    if p.config.route != WalletRoute::PolicyWallet || signer_account != p.config.server {
-        return Err("Configured policy service signer required".into());
-    }
-    if a.server_signature.is_some() {
-        return Err("Service authorization is already signed".into());
-    }
-    validate_prepared(p, now)?;
-    let digest = x402::verify_server(&signing_request(p)?, now, evaluator)?;
-    if digest != a.digest {
-        return Err("The payment authorization digest differs".into());
-    }
-    let signature = sign_hash(&digest)?;
-    signing::verify_digest(signer_account, &digest, &signature)?;
-    let mut out = p.clone();
-    let mut signed = a.clone();
-    signed.server_signature = Some(signature.to_vec());
-    out.payment_authorization = Some(Box::new(signed));
-    out.native_preflight = None;
-    validate(&out)?;
-    Ok(out)
-}
-
-/// Check `p` against the wallet as the ledger shows it now: the same nonce and configuration
-/// revision, x402 enabled and no pause. Another state means that the entry cannot settle.
+/// Check `p` against the wallet account as the ledger shows it now: the same signers,
+/// weights, thresholds and sequence as at the preparation. Another state means that the
+/// entry may no longer settle as it was decided.
 pub fn revalidate(rpc: &dyn rpc::Rpc, p: &PreparedOperation, now: u64) -> Result<()> {
     admit(p, now)?;
-    if p.config.route == WalletRoute::Native {
-        let current = rpc::get_account(rpc, &p.config.wallet)?;
-        current.validate_roles(&p.config.owner, &p.config.agent, &p.config.server)?;
-        if current != p.state.source {
-            return Err("The wallet changed since this payment authorization was prepared".into());
-        }
-        return Ok(());
-    }
-    let found = rpc::trusted_state_for_discovery(rpc, &p.config, None)?;
-    let enabled = found
-        .state
-        .policy_state
-        .as_ref()
-        .is_some_and(|state| state.x402_enabled);
-    if found.paused
-        || !enabled
-        || found.state.nonce != p.state.nonce
-        || found.state.deployment_version != p.state.deployment_version
-        || found.state.module_digest != p.state.module_digest
-    {
+    let current = rpc::get_account(rpc, &p.config.wallet)?;
+    current.validate_roles(&p.config.owner, &p.config.agent, &p.config.server)?;
+    if current != p.state.source {
         return Err("The wallet changed since this payment authorization was prepared".into());
     }
     Ok(())
 }
 
-/// A role's signature of the digest of `p`, after the same admission as [`admit`]. The agent
-/// of a policy wallet signs only what the service approved: the service's signature must be
-/// present. The agent and the service of a keypair wallet both sign here.
+/// A role's signature of the digest of `p`, after the admission of [`admit`]. The agent and
+/// the service both sign here, each with its own key.
 pub fn sign(
     p: &PreparedOperation,
     signer: &str,
@@ -519,16 +325,7 @@ pub fn sign(
     sign_hash: impl FnOnce(&[u8; 32]) -> Result<[u8; 64]>,
 ) -> Result<DetachedSignature> {
     let digest = admit(p, now)?;
-    let allowed = if p.config.route == WalletRoute::Native {
-        // The agent and the service of a keypair wallet sign the same payload.
-        signer == p.config.agent || signer == p.config.server
-    } else {
-        if part(p)?.server_signature.is_none() {
-            return Err("Service authorization is unsigned".into());
-        }
-        signer == p.config.agent
-    };
-    if !allowed {
+    if signer != p.config.agent && signer != p.config.server {
         return Err("Signer has no automated role".into());
     }
     let signature = sign_hash(&digest)?;
@@ -575,15 +372,9 @@ fn payload_transaction(p: &PreparedOperation, entry: &SorobanAuthorizationEntry)
     }))
 }
 
-/// The role signatures that a signed authorization holds, in role order: the agent alone for
-/// a policy wallet, whose preparation holds the service's signature, and the agent then the
-/// service for a keypair wallet.
-fn roles(c: &WalletConfig) -> Vec<&str> {
-    if c.route == WalletRoute::Native {
-        vec![c.agent.as_str(), c.server.as_str()]
-    } else {
-        vec![c.agent.as_str()]
-    }
+/// The roles that sign a payment authorization, in role order: the agent, then the service.
+fn roles(c: &WalletConfig) -> [&str; 2] {
+    [c.agent.as_str(), c.server.as_str()]
 }
 
 /// Check `signatures` against the roles of `p`: one valid signature of the digest per role,
@@ -592,81 +383,56 @@ fn role_signatures(
     p: &PreparedOperation,
     a: &PaymentAuthorization,
     signatures: &[DetachedSignature],
-) -> Result<Vec<[u8; 64]>> {
+) -> Result<[[u8; 64]; 2]> {
     let roles = roles(&p.config);
-    if p.config.agent == p.config.server || signatures.len() != roles.len() {
-        return Err("Every automated role must sign the payment authorization once".into());
+    let [agent, server] = signatures else {
+        return Err("The agent and the service must each sign the payment authorization".into());
+    };
+    if roles[0] == roles[1] || agent.signer != roles[0] || server.signer != roles[1] {
+        return Err("A role signature names another signer".into());
     }
-    roles
-        .iter()
-        .zip(signatures)
-        .map(|(role, proof)| {
-            if proof.signer != *role {
-                return Err("A role signature names another signer".into());
-            }
-            signing::verify_digest(role, &a.digest, &proof.signature)
-                .map_err(|_| "Invalid role signature of the payment authorization")?;
-            signature(&proof.signature)
-        })
-        .collect()
+    for proof in [agent, server] {
+        signing::verify_digest(&proof.signer, &a.digest, &proof.signature)
+            .map_err(|_| "Invalid role signature of the payment authorization")?;
+    }
+    Ok([signature(&agent.signature)?, signature(&server.signature)?])
 }
 
-/// The signed entry of `p`. A policy wallet's entry holds the wallet's `PolicyAuthorization`,
-/// in the encoding of [`x402::assemble`]. A keypair wallet's entry holds the account
-/// signatures of the agent and the service, in the order of their public keys.
+/// The signed entry of `p`: the entry with the account signatures of the agent and the
+/// service, in the order of their public keys.
 fn signed_entry(
     p: &PreparedOperation,
     a: &PaymentAuthorization,
-    signatures: &[[u8; 64]],
+    signatures: &[[u8; 64]; 2],
 ) -> Result<SorobanAuthorizationEntry> {
     let c = &p.config;
     let mut entry: SorobanAuthorizationEntry = read(&a.authorization_xdr)?;
     let SorobanCredentials::Address(credentials) = &mut entry.credentials else {
         return Err("A payment authorization needs wallet-address authorization".into());
     };
-    credentials.signature = if c.route == WalletRoute::Native {
-        let [agent, server] = signatures else {
-            return Err("A keypair wallet's entry holds two account signatures".into());
-        };
-        let mut signers = [
-            (account_key(&c.agent)?, agent),
-            (account_key(&c.server)?, server),
-        ];
-        signers.sort_by_key(|(key, _)| *key);
-        ScVal::Vec(Some(
-            signers
-                .iter()
-                .map(|(key, signature)| {
-                    value_map(vec![
-                        ("public_key", value_bytes(key)?),
-                        ("signature", value_bytes(*signature)?),
-                    ])
-                })
-                .collect::<Result<Vec<_>>>()?
-                .try_into()
-                .map_err(err)?,
-        ))
-    } else {
-        let [agent] = signatures else {
-            return Err("A policy wallet's entry holds the agent's signature".into());
-        };
-        let server = signature(
-            a.server_signature
-                .as_deref()
-                .ok_or("Service authorization is unsigned")?,
-        )?;
-        value_map(vec![
-            ("execution", execution(p, a)?),
-            ("agent_signature", value_bytes(agent)?),
-            ("server_signature", value_bytes(&server)?),
-        ])?
-    };
+    let mut signers = [
+        (account_key(&c.agent)?, &signatures[0]),
+        (account_key(&c.server)?, &signatures[1]),
+    ];
+    signers.sort_by_key(|(key, _)| *key);
+    credentials.signature = ScVal::Vec(Some(
+        signers
+            .iter()
+            .map(|(key, signature)| {
+                value_map(vec![
+                    ("public_key", value_bytes(key)?),
+                    ("signature", value_bytes(*signature)?),
+                ])
+            })
+            .collect::<Result<Vec<_>>>()?
+            .try_into()
+            .map_err(err)?,
+    ));
     Ok(entry)
 }
 
-/// Assemble the signed authorization of `p` from the role signatures. Every signature is
-/// verified against the digest and its role, and a policy wallet's entry must equal the one
-/// that the reviewed assembly of [`x402`] builds at `now`.
+/// Assemble the signed authorization of `p` from the signatures of the agent and the
+/// service. Each signature is verified against the digest and its role.
 pub fn assemble(
     p: &PreparedOperation,
     signatures: &[DetachedSignature],
@@ -674,19 +440,7 @@ pub fn assemble(
 ) -> Result<SignedOperation> {
     let a = part(p)?;
     admit(p, now)?;
-    let verified = role_signatures(p, a, signatures)?;
-    let entry = signed_entry(p, a, &verified)?;
-    if p.config.route == WalletRoute::PolicyWallet {
-        let server = signature(
-            a.server_signature
-                .as_deref()
-                .ok_or("Service authorization is unsigned")?,
-        )?;
-        let assembled = x402::assemble(&signing_request(p)?, &verified[0], &server, now)?;
-        if assembled != xdr(&entry)? {
-            return Err("The assembled payment authorization differs".into());
-        }
-    }
+    let entry = signed_entry(p, a, &role_signatures(p, a, signatures)?)?;
     let signed = SignedOperation {
         prepared: p.clone(),
         transaction_xdr: payload_transaction(p, &entry)?,
@@ -697,10 +451,10 @@ pub fn assemble(
     Ok(signed)
 }
 
-/// Assemble the signed authorization and check it against the ledger: the wallet is in the
-/// state that the entry binds, and the enforce-mode simulation of the payload runs the
-/// wallet's own check, or the account's signature check, with both signatures. A wallet that
-/// refuses it releases nothing to the seller.
+/// Assemble the signed authorization and check it against the ledger: the wallet account is
+/// as the preparation read it, and the enforce-mode simulation of the payload passes the
+/// account's signature check with both signatures. An entry that the ledger refuses is not
+/// released to the seller.
 pub fn authorize(
     rpc: &dyn rpc::Rpc,
     p: &PreparedOperation,
@@ -714,14 +468,14 @@ pub fn authorize(
         json!({"transaction": signed.transaction_xdr, "authMode": "enforce"}),
     )?;
     if simulated.get("error").is_some_and(|value| !value.is_null()) {
-        return Err("The wallet refuses this payment authorization".into());
+        return Err("The ledger refuses this payment authorization".into());
     }
     rpc::reject_restoration(&simulated)?;
     Ok(signed)
 }
 
 /// The signed entry that `s` carries, after checking the whole retained packet: the
-/// preparation, every role's signature of its digest, and a payload that is exactly the
+/// preparation, each role's signature of its digest, and a payload that is exactly the
 /// transaction of the signed entry.
 fn retained_entry(s: &SignedOperation) -> Result<SorobanAuthorizationEntry> {
     let p = &s.prepared;
@@ -807,11 +561,12 @@ fn transfers(rpc: &dyn rpc::Rpc, p: &PreparedOperation) -> Result<Transfers> {
     // A token reports three topics. An asset contract adds the asset as the fourth.
     let mut with_asset = prefix.to_vec();
     with_asset.push("*".into());
+    let token = sac_address(&c.network, &asset_xdr(c)?)?;
     let mut transactions = Vec::new();
     let mut cursor: Option<String> = None;
     for _ in 0..8 {
         let mut params = json!({
-            "filters": [{"type": "contract", "contractIds": [token_contract(c)?], "topics": [prefix, with_asset]}],
+            "filters": [{"type": "contract", "contractIds": [token], "topics": [prefix, with_asset]}],
             "pagination": {"limit": 200},
         });
         match &cursor {
@@ -862,9 +617,8 @@ pub struct Settlement {
 pub enum Observed {
     /// A successful transaction carries the entry.
     Settled(Box<Settlement>),
-    /// The entry did not settle and can no longer settle: its expiry ledger passed and no
-    /// transaction of the token's transfers through that ledger carries it. Only a keypair
-    /// wallet reports this here; a policy wallet's lapse is [`rpc::operation_lapsed`].
+    /// The entry did not settle and can no longer settle: its expiry ledger passed, and no
+    /// transaction of the token's transfers through that ledger carries it.
     Lapsed,
     /// Neither is established.
     Open,
@@ -878,16 +632,6 @@ fn carried_signatures(
     let SorobanCredentials::Address(credentials) = &found.credentials else {
         return Err("The settled entry is no address authorization".into());
     };
-    let bytes = |value: &ScVal| match value {
-        ScVal::Bytes(bytes) => Ok(bytes.to_vec()),
-        _ => Err("The settled entry holds an invalid signature".to_owned()),
-    };
-    if c.route != WalletRoute::Native {
-        return Ok(vec![DetachedSignature {
-            signer: c.agent.clone(),
-            signature: bytes(rpc::map_field(&credentials.signature, "agent_signature")?)?,
-        }]);
-    }
     let ScVal::Vec(Some(signers)) = &credentials.signature else {
         return Err("The settled entry holds no account signatures".into());
     };
@@ -899,9 +643,12 @@ fn carried_signatures(
                 .iter()
                 .find(|signer| rpc::map_field(signer, "public_key").ok() == Some(&key))
                 .ok_or("The settled entry lacks a role signature")?;
+            let ScVal::Bytes(bytes) = rpc::map_field(signer, "signature")? else {
+                return Err("The settled entry holds an invalid signature".into());
+            };
             Ok(DetachedSignature {
                 signer: role.to_owned(),
-                signature: bytes(rpc::map_field(signer, "signature")?)?,
+                signature: bytes.to_vec(),
             })
         })
         .collect()
@@ -909,26 +656,16 @@ fn carried_signatures(
 
 /// Read what the ledger shows of the authorization of `p`.
 ///
-/// A policy wallet stores a receipt under the operation id when the entry settles. Without
-/// that receipt the entry is open. With it, the token's transfer event names the
-/// transaction. A keypair wallet stores nothing, so the transfer events are read at once, and
-/// a complete read without the entry after its expiry ledger proves the lapse.
-///
-/// The transaction must succeed and carry the wallet's entry of `p`, which the nonce binds,
-/// with the signatures of the roles.
+/// A classic account keeps no record of the entry, so the token's transfer events from the
+/// wallet to the payee are read, from the ledger of the preparation through the expiry ledger
+/// of the entry. A successful transaction that carries the wallet's entry of `p`, which the
+/// nonce binds, with the signatures of both roles, settled it. A complete read without such a
+/// transaction, after the expiry ledger, proves the lapse: a settled entry moved the amount
+/// and the token reported it.
 pub fn observe(rpc: &dyn rpc::Rpc, p: &PreparedOperation) -> Result<Observed> {
     let a = part(p)?;
     validate_retained_prepared(p)?;
-    let policy_wallet = p.config.route == WalletRoute::PolicyWallet;
-    if policy_wallet {
-        let Some(executed) = rpc::operation_receipt(rpc, &p.config, &p.request.operation.nonce)?
-        else {
-            return Ok(Observed::Open);
-        };
-        if executed.transfer != rpc::expected_receipt(p)? {
-            return Err("The wallet executed another operation under this id".into());
-        }
-    } else if rpc.call("getNetwork", json!({}))?["passphrase"] != passphrase(&p.config.network)? {
+    if rpc.call("getNetwork", json!({}))?["passphrase"] != passphrase(&p.config.network)? {
         return Err("Stellar RPC network differs from installation".into());
     }
     let unsigned: SorobanAuthorizationEntry = read(&a.authorization_xdr)?;
@@ -960,12 +697,6 @@ pub fn observe(rpc: &dyn rpc::Rpc, p: &PreparedOperation) -> Result<Observed> {
         validate_settled(&signed, &receipt)?;
         return Ok(Observed::Settled(Box::new(Settlement { signed, receipt })));
     }
-    if policy_wallet {
-        return Err(
-            "The wallet executed this payment, and the ledger events no longer name its transaction"
-                .into(),
-        );
-    }
     Ok(if found.complete {
         Observed::Lapsed
     } else {
@@ -982,14 +713,8 @@ pub fn settlement(rpc: &dyn rpc::Rpc, p: &PreparedOperation) -> Result<Option<Se
 }
 
 /// Whether the authorization of `p` lapsed: it did not settle and can no longer settle.
-/// A policy wallet proves it with its nonce after the expiry ([`rpc::operation_lapsed`]), a
-/// keypair wallet with the token's transfer events through the expiry ledger of the entry.
 /// `false` means not proven.
 pub fn lapsed(rpc: &dyn rpc::Rpc, p: &PreparedOperation) -> Result<bool> {
-    part(p)?;
-    if p.config.route == WalletRoute::PolicyWallet {
-        return rpc::operation_lapsed(rpc, p);
-    }
     Ok(matches!(observe(rpc, p)?, Observed::Lapsed))
 }
 
@@ -1028,31 +753,6 @@ mod tests {
         let r = authorization_request(&ordinary);
         attach(ordinary, &r, NOW).unwrap()
     }
-    /// A policy wallet's prepared authorization: the fixture wallet with x402 enabled.
-    fn policy_wallet() -> PreparedOperation {
-        let old = test_support::policy_signed().prepared;
-        assert_eq!(old.config.agent, account_for_seed(&AGENT));
-        assert_eq!(old.config.server, account_for_seed(&SERVER));
-        let mut state = old.state.clone();
-        state.policy_state.as_mut().unwrap().x402_enabled = true;
-        let ordinary = prepare_with(
-            &old.config,
-            &old.request,
-            &old.terms,
-            &state,
-            old.created_at,
-            old.expires_at,
-        )
-        .unwrap();
-        let r = authorization_request(&ordinary);
-        attach(ordinary, &r, NOW).unwrap()
-    }
-    fn approved(p: &PreparedOperation) -> PreparedOperation {
-        authorize_server(p, &p.config.server, NOW, None, |digest| {
-            Ok(test_support::sign_digest(SERVER, digest))
-        })
-        .unwrap()
-    }
     fn entry_of(s: &SignedOperation) -> SorobanAuthorizationEntry {
         let TransactionEnvelope::Tx(envelope) = read(&s.transaction_xdr).unwrap() else {
             panic!("the payload is a transaction")
@@ -1086,7 +786,6 @@ mod tests {
     fn a_keypair_wallet_signs_one_entry_for_exactly_the_transfer() {
         let p = keypair_wallet();
         let a = part(&p).unwrap();
-        assert_eq!(a.server_signature, None);
         validate(&p).unwrap();
         let t = transfer_from_request(&p.config, &p.request).unwrap();
         let unsigned: SorobanAuthorizationEntry = read(&a.authorization_xdr).unwrap();
@@ -1197,72 +896,35 @@ mod tests {
     }
 
     #[test]
-    fn a_policy_wallet_signs_the_digest_of_the_raw_key_path_without_gas() {
-        let p = policy_wallet();
-        let a = part(&p).unwrap();
-        validate(&p).unwrap();
-        // The signed terms carry no gas: the facilitator pays the network fee.
-        assert_eq!(a.terms, terms_without_gas(&p.terms).unwrap());
-        if let Some(expense) = &a.terms.expense {
-            assert_eq!((expense.gas_units, expense.max_fee_stroops), (0, 0));
-        }
+    fn a_policy_wallet_signs_no_payment_authorization() {
+        let ordinary = test_support::policy_signed().prepared;
+        // Neither the request nor the part is built for it, and a part put on it is refused.
+        let t = transfer_from_request(&ordinary.config, &ordinary.request).unwrap();
         assert_eq!(
-            a.digest,
-            x402::signing_digest(&signing_request(&p).unwrap(), NOW).unwrap()
+            request(
+                &ordinary.config,
+                ordinary.request.operation.nonce,
+                &t.recipient,
+                t.amount
+            )
+            .unwrap_err(),
+            POLICY_WALLET
         );
-        // The agent signs only what the service approved.
-        assert!(
-            sign(&p, &p.config.agent, NOW, |digest| Ok(
-                test_support::sign_digest(AGENT, digest)
-            ))
-            .is_err()
-        );
-        let p = approved(&p);
-        validate(&p).unwrap();
-        validate_retained_prepared(&p).unwrap();
-        // The service signs once, and only the configured service signs.
-        assert!(
-            authorize_server(&p, &p.config.server, NOW, None, |digest| Ok(
-                test_support::sign_digest(SERVER, digest)
-            ))
-            .is_err()
-        );
-        let signed = assemble(&p, &[signed_by(AGENT, &p)], NOW).unwrap();
-        validate_signed(&signed).unwrap();
-        validate_retained_signed(&signed).unwrap();
-        // The entry is the one that the raw-key assembly builds.
-        let agent = signature(&signed.role_signatures[0].signature).unwrap();
-        let server = signature(part(&p).unwrap().server_signature.as_deref().unwrap()).unwrap();
+        let r = authorization_request(&test_support::native_signed().prepared);
         assert_eq!(
-            xdr(&entry_of(&signed)).unwrap(),
-            x402::assemble(&signing_request(&p).unwrap(), &agent, &server, NOW).unwrap()
+            attach(ordinary.clone(), &r, NOW).unwrap_err(),
+            POLICY_WALLET
         );
-        // The server's signature alone, or the service in the agent's place, assembles nothing.
-        assert!(assemble(&p, &[], NOW).is_err());
-        assert!(assemble(&p, &[signed_by(AGENT, &p), signed_by(AGENT, &p)], NOW).is_err());
-    }
-
-    #[test]
-    fn a_policy_wallet_without_x402_signs_nothing() {
-        let old = test_support::policy_signed().prepared;
-        let mut state = old.state.clone();
-        state.policy_state.as_mut().unwrap().x402_enabled = false;
-        let ordinary = prepare_with(
-            &old.config,
-            &old.request,
-            &old.terms,
-            &state,
-            old.created_at,
-            old.expires_at,
-        )
-        .unwrap();
-        let r = authorization_request(&ordinary);
-        assert_eq!(attach(ordinary, &r, NOW).unwrap_err(), DISABLED);
+        let mut forged = ordinary;
+        forged.payment_authorization = keypair_wallet().payment_authorization;
+        assert_eq!(validate(&forged).unwrap_err(), POLICY_WALLET);
+        assert!(validate_retained_prepared(&forged).is_err());
     }
 
     #[test]
     fn a_changed_authorization_part_is_refused() {
-        for p in [keypair_wallet(), approved(&policy_wallet())] {
+        {
+            let p = keypair_wallet();
             let change = |change: &dyn Fn(&mut PaymentAuthorization)| {
                 let mut changed = p.clone();
                 change(changed.payment_authorization.as_mut().unwrap());
@@ -1295,7 +957,6 @@ mod tests {
                 call.args = args.try_into().unwrap();
                 a.authorization_xdr = xdr(&entry).unwrap();
             });
-            change(&|a| a.server_signature = Some(vec![7; 64]));
             // The operation around it cannot change either: the part binds its transfer.
             let mut moved = p.clone();
             moved.expires_at += 1;
