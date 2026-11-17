@@ -252,6 +252,11 @@ struct Record {
     /// is signed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     paid_service: Option<PaidService>,
+    /// The ledger endpoint of this client when it wrote the record. A recovery of the record
+    /// reads the ledger through it: only this client's own read proves that a preparation
+    /// was released or that a payment authorization lapsed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rpc_url: Option<String>,
 }
 struct ExecutionProfile {
     policy_id: String,
@@ -277,6 +282,11 @@ fn revalidate_with_rpc_url(
             != checked(sdk::passphrase(&p.config.network))?
         {
             return Err(Error::config("Signing RPC belongs to another network"));
+        }
+        // The engine states the ledger from which an authorization's expiry counts: the
+        // agent signs only when its own endpoint has that ledger.
+        if p.payment_authorization.is_some() {
+            checked(sdk::seller_settled::current_ledger(&rpc, p))?;
         }
         let current = checked(sdk::rpc::get_account(&rpc, &p.config.wallet))?;
         verify_native_members(&current, &p.config)?;
@@ -1078,6 +1088,7 @@ pub fn exec_paid(
                 status: None,
                 lapsed: false,
                 paid_service: paid_service.cloned(),
+                rpc_url: (!c.rpc_url.is_empty()).then(|| c.rpc_url.clone()),
             },
             None,
         )
@@ -1292,6 +1303,7 @@ fn journaled(c: &Client, id: &str, record: Option<Record>, r: &Response) -> Reco
             // The engine keeps the context with the request ID. A record that a status read
             // creates keeps it too, so a later retry with the original context resumes.
             paid_service: r.paid_service.as_ref().and_then(recorded),
+            rpc_url: (!c.rpc_url.is_empty()).then(|| c.rpc_url.clone()),
         },
     };
     if old.prepared.is_none() {
@@ -1827,7 +1839,7 @@ pub fn recover(
         },
         signer,
         backend,
-        None,
+        original.0.rpc_url.clone(),
     )?;
     status(&client, journal, id, wait)
 }
@@ -2018,6 +2030,7 @@ mod native_revalidation_tests {
                 status: None,
                 lapsed: false,
                 paid_service: None,
+                rpc_url: None,
             };
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().canonicalize().unwrap();
@@ -2335,8 +2348,23 @@ mod native_revalidation_tests {
             status: None,
             lapsed: false,
             paid_service,
+            rpc_url: None,
         };
         let plain = serde_json::to_value(record(None)).unwrap();
+        // A record keeps the ledger endpoint of its client for a later recovery, and a record
+        // without one keeps its earlier bytes and still reads.
+        assert!(plain.get("rpcUrl").is_none());
+        let mut with_endpoint = record(None);
+        with_endpoint.rpc_url = Some("https://rpc.example".into());
+        let kept: Record =
+            serde_json::from_value(serde_json::to_value(&with_endpoint).unwrap()).unwrap();
+        assert_eq!(kept.rpc_url.as_deref(), Some("https://rpc.example"));
+        assert!(
+            serde_json::from_value::<Record>(plain.clone())
+                .unwrap()
+                .rpc_url
+                .is_none()
+        );
         assert!(plain.get("paidService").is_none());
         let kept: Record =
             serde_json::from_value(serde_json::to_value(record(Some(context.clone()))).unwrap())
@@ -2443,6 +2471,7 @@ mod native_revalidation_tests {
             status: Some(OperationStatus::Prepared),
             lapsed: false,
             paid_service: None,
+            rpc_url: None,
         };
         journal.save(&name, &record).unwrap();
         // The operation of another service is not this wallet's report.
@@ -3156,6 +3185,7 @@ mod native_revalidation_tests {
             status: Some(OperationStatus::SubmissionUnknown),
             lapsed: false,
             paid_service: None,
+            rpc_url: None,
         };
         assert!(client.proven_release(&r, Some(&record)));
         record.prepared = None;

@@ -260,6 +260,9 @@ exactly `transfer(wallet, payTo, amount)` on the asset contract, and its host pa
   the one invocation and the signed entry. It has no signature, and `rpc::broadcast` refuses it. The outcome
   document holds it as `paymentAuthorization.transaction`, and `proof` builds the standard payload
   `{x402Version, resource, accepted, payload: {transaction}}`.
+- **Ledger of the preparation.** The expiry ledger counts from the ledger that the preparation names. Each
+  signer checks that ledger against its own endpoint first (`seller_settled::current_ledger`): a ledger more
+  than five ahead of the signer's read is refused, so no party gets an entry that outlives its operation.
 - **Day.** The limits count a payment in the UTC day of its preparation. The operation of an authorization
   expires at least ten minutes before the end of that day (`seller_settled::DAY_MARGIN`), so its ledger
   closes inside the day while ledgers close within that margin. Later in the day no authorization is signed
@@ -272,8 +275,8 @@ exactly `transfer(wallet, payTo, amount)` on the asset contract, and its host pa
   network that stops for longer than the margin is outside this bound.
 - **Outcome.** The service sends nothing. `seller_settled::observe` reads the asset contract's `transfer`
   events from the wallet to the payee, from the ledger of the preparation through the expiry ledger. A
-  successful transaction whose one invocation is the transfer that the exact entry authorizes, with no other
-  entry of the wallet, settled it: its receipt has `VerifiedReceipt::settles`, and the operation keeps its
+  successful transaction whose one invocation is the transfer that the exact entry authorizes, with that
+  entry as its only authorization, settled it: its receipt has `VerifiedReceipt::settles`, and the operation keeps its
   own `transaction_hash` as its identity. The ledger admits an entry that no call uses, so a transaction
   that only carries the entry settles nothing; one that carries it in another shape leaves the outcome open.
   A complete read without a transaction that carries the entry, after the expiry ledger, proves the lapse
@@ -331,6 +334,8 @@ A seller that accepts this proof verifies it on its own:
 `exec_paid` sends the `paidService` context with the preparation of the transfer. The engine checks it
 against the operation and records it with the request ID. The journal keeps it with the original intent:
 a retry or a recovery of the same request ID with another context is refused before anything is signed.
+The journal also keeps the ledger endpoint of the client. A recovery of the record reads the ledger through
+it, so a status read of a retained request can prove that a payment authorization lapsed.
 The outcome document of a paid operation shows the recorded context under `paidService` and the wallet's
 network under `network`.
 

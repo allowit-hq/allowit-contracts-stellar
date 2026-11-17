@@ -351,11 +351,34 @@ pub fn attach(
     Ok(p)
 }
 
+/// How many ledgers the ledger of a preparation may be ahead of the signer's own ledger read:
+/// two endpoints do not close a ledger at the same moment.
+pub const LEDGER_AHEAD: u32 = 5;
+
+/// Check the ledger that `p` names against the signer's own read of the network. The expiry
+/// ledger of the entry counts from the ledger of the preparation, and the party that prepared
+/// `p` states that ledger. A later one would make the entry valid for longer than its
+/// operation, so a ledger that the network has not closed is refused before a signature.
+pub fn current_ledger(rpc: &dyn rpc::Rpc, p: &PreparedOperation) -> Result<()> {
+    part(p)?;
+    let latest = rpc.call("getLatestLedger", json!({}))?["sequence"]
+        .as_u64()
+        .ok_or("Missing ledger sequence")?;
+    if u64::from(p.state.ledger) > latest + u64::from(LEDGER_AHEAD) {
+        return Err(
+            "The payment authorization counts its expiry from a ledger that the network has not closed"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// Check `p` against the wallet account as the ledger shows it now: the same signers,
 /// weights, thresholds and sequence as at the preparation. Another state means that the
 /// entry may no longer settle as it was decided.
 pub fn revalidate(rpc: &dyn rpc::Rpc, p: &PreparedOperation, now: u64) -> Result<()> {
     admit(p, now)?;
+    current_ledger(rpc, p)?;
     let current = rpc::get_account(rpc, &p.config.wallet)?;
     current.validate_roles(&p.config.owner, &p.config.agent, &p.config.server)?;
     if current != p.state.source {
@@ -576,8 +599,8 @@ fn carried(receipt: &rpc::VerifiedReceipt) -> Result<Vec<SorobanAuthorizationEnt
 /// Whether the transaction of `receipt` executes `entry` when it succeeds. The ledger admits
 /// an entry that no call uses and leaves its nonce unspent, so the presence of the entry
 /// proves nothing. The transaction executes it when its one invocation is the call that the
-/// entry authorizes, and no other entry of the same address can authorize that call: the
-/// token then asks the wallet for exactly this authorization.
+/// entry authorizes and the entry is its only authorization: the token then asks the wallet
+/// for exactly this entry.
 fn executes(receipt: &rpc::VerifiedReceipt, entry: &SorobanAuthorizationEntry) -> Result<bool> {
     let Some(op) = invocation(receipt)? else {
         return Ok(false);
@@ -585,18 +608,13 @@ fn executes(receipt: &rpc::VerifiedReceipt, entry: &SorobanAuthorizationEntry) -
     let HostFunction::InvokeContract(call) = &op.host_function else {
         return Ok(false);
     };
-    let SorobanCredentials::Address(credentials) = &entry.credentials else {
+    if !matches!(&entry.credentials, SorobanCredentials::Address(_)) {
         return Ok(false);
-    };
-    let of_address = op
-        .auth
-        .iter()
-        .filter(|carried| {
-            matches!(&carried.credentials, SorobanCredentials::Address(other) if other.address == credentials.address)
-        })
-        .count();
-    Ok(of_address == 1
-        && op.auth.contains(entry)
+    }
+    // The entry is the only authorization of the transaction: with any other entry, of any
+    // credential kind, another authorization could have admitted the transfer and left this
+    // one unspent.
+    Ok(op.auth.as_slice() == std::slice::from_ref(entry)
         && entry.root_invocation.sub_invocations.is_empty()
         && entry.root_invocation.function == SorobanAuthorizedFunction::ContractFn(call.clone()))
 }
@@ -1179,6 +1197,28 @@ mod tests {
         assert!(
             rpc::validate_settled_policy_packet(&test_support::policy_signed(), &receipt).is_err()
         );
+    }
+
+    #[test]
+    fn the_ledger_of_a_preparation_is_one_that_the_signers_endpoint_has() {
+        struct Latest(u64);
+        impl rpc::Rpc for Latest {
+            fn call(&self, method: &str, _: serde_json::Value) -> Result<serde_json::Value> {
+                assert_eq!(method, "getLatestLedger");
+                Ok(json!({"sequence": self.0}))
+            }
+        }
+        let p = keypair_wallet();
+        let named = u64::from(p.state.ledger);
+        // The expiry ledger counts from the ledger that the preparation names. An endpoint
+        // that is a few ledgers behind is no reason to refuse; a ledger further ahead is.
+        current_ledger(&Latest(named + 100), &p).unwrap();
+        current_ledger(&Latest(named - u64::from(LEDGER_AHEAD)), &p).unwrap();
+        assert!(current_ledger(&Latest(named - u64::from(LEDGER_AHEAD) - 1), &p).is_err());
+        // A preparation that names a far later ledger would make the entry valid far longer.
+        let mut far = p.clone();
+        far.state.ledger += 100_000;
+        assert!(current_ledger(&Latest(named), &far).is_err());
     }
 
     #[test]
