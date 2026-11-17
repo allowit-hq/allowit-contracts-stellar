@@ -1154,6 +1154,13 @@ mod tests {
         op.auth = vec![op.auth[0].clone(), second].try_into().unwrap();
         twice.tx.operations = operations.try_into().unwrap();
         assert!(validate_settled(&signed, &settling(&twice, true)).is_err());
+        // Only the receipt of an authorization carries the mark: an operation that settled
+        // by its own transaction refuses a receipt with it.
+        let network = &p.config.network;
+        assert!(rpc::validate_own_receipt(&receipt, network, &receipt.transaction_hash).is_err());
+        let mut unmarked = receipt.clone();
+        unmarked.settles = None;
+        rpc::validate_own_receipt(&unmarked, network, &receipt.transaction_hash).unwrap();
         // The receipt of an authorization settles no ordinary operation.
         assert!(
             rpc::validate_settled_policy_packet(&test_support::policy_signed(), &receipt).is_err()

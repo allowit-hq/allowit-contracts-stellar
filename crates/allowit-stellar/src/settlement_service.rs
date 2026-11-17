@@ -577,9 +577,10 @@ impl SettlementProvider for Service {
         let payer = authorization.as_ref().map(|a| a.payer.clone());
         match rpc::send_transaction(&rpc, network, &envelope).map_err(rail)? {
             rpc::Broadcast::Submitted => {}
-            rpc::Broadcast::Rejected { .. } => {
-                // The network refused it before inclusion. The ledger decides when it shows
-                // the hash anyway; else nothing was submitted.
+            rpc::Broadcast::Rejected { .. } | rpc::Broadcast::RetryLater => {
+                // The network did not take the transaction: it refused it, or it asks for a
+                // later attempt. The ledger decides when it shows the hash anyway; else
+                // nothing was submitted, and the caller may settle again.
                 if let Some(settled) = outcome(&rpc, network, authorization.clone(), hash)? {
                     return Ok(settled);
                 }
@@ -597,7 +598,7 @@ impl SettlementProvider for Service {
                     fee_paid: None,
                 });
             }
-            rpc::Broadcast::RetryLater | rpc::Broadcast::Unknown => {
+            rpc::Broadcast::Unknown => {
                 return Ok(pending(network, authorization, hash));
             }
         }

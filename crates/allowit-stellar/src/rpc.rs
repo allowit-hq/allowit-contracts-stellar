@@ -944,6 +944,19 @@ pub fn validate_receipt(
     }
     Ok(())
 }
+/// Check the receipt of an operation that its own transaction settled. Only the receipt of a
+/// payment authorization names what it settles: the mark on any other receipt is refused, so
+/// it cannot change how the receipt is read.
+pub fn validate_own_receipt(
+    receipt: &VerifiedReceipt,
+    network: &str,
+    expected_hash: &[u8; 32],
+) -> Result<()> {
+    if receipt.settles.is_some() {
+        return Err("The receipt settles a payment authorization, not this operation".into());
+    }
+    validate_receipt(receipt, network, expected_hash)
+}
 /// Verify an exact policy-wallet envelope using its chain receipt after key rotation.
 /// This checks native identity and the retained server authorization, without current signing admission.
 /// A failed enclosing transaction does not revoke its reusable address authorization.

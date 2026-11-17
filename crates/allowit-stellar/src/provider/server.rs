@@ -1643,7 +1643,7 @@ fn verify_native_receipt(signed: &SignedOperation, receipt: &rpc::VerifiedReceip
                 "The settlement envelope differs from the original packet",
             ));
         }
-        checked(rpc::validate_receipt(
+        checked(rpc::validate_own_receipt(
             receipt,
             &signed.prepared.config.network,
             &signed.transaction_hash,

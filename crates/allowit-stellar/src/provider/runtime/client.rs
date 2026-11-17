@@ -607,7 +607,7 @@ fn validate_response_receipt(r: &Response) -> Result<()> {
         return Ok(());
     }
     if let Some(receipt) = &r.receipt {
-        checked(sdk::rpc::validate_receipt(
+        checked(sdk::rpc::validate_own_receipt(
             receipt,
             &p.config.network,
             &p.transaction_hash,
