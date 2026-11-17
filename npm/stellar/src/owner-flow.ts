@@ -269,15 +269,22 @@ function stepper({network, historyPauseMs, ask, sign, journal, key, policyId, on
   return {receipts, settleSaved, signAndSubmit};
 }
 
-/** The fee account whose creation this journal signed for the same policy, agent and amount, or undefined. */
+/**
+ * The fee account whose creation this journal signed for this policy and agent, or undefined. The account can hold
+ * the owner's XLM, so a marker is never dropped for other inputs: another funding amount keeps the account, and a
+ * marker of another policy or agent, or one that cannot be read, is refused before anything is prepared.
+ */
 function savedFeeAccount(journal: OwnerJournal, key: string, identity: {policyId: string; agent: string; amount: string}): string | undefined {
+  const raw = journal.get(key);
+  if (raw === null) return undefined;
+  let value: unknown;
   try {
-    const value: unknown = JSON.parse(journal.get(key) ?? 'null');
-    // The server and the rail check the address. A marker with any other shape names no account.
-    if (object(value) && typeof value.feeAccount === 'string' && /^G[A-Z2-7]{55}$/.test(value.feeAccount)
-      && value.policyId === identity.policyId && value.agent === identity.agent && value.amount === identity.amount) return value.feeAccount;
-  } catch {/* An unreadable marker names no account. */}
-  return undefined;
+    value = JSON.parse(raw);
+  } catch { /* refused below */ }
+  // The server and the rail check the address.
+  if (!object(value) || typeof value.feeAccount !== 'string' || !/^G[A-Z2-7]{55}$/.test(value.feeAccount)
+    || value.policyId !== identity.policyId || value.agent !== identity.agent) throw changed(identity);
+  return value.feeAccount;
 }
 
 async function run({network, ask, sign, journal, key, policyId, agent, amount, onStep, historyPauseMs = 1_500}: InstallAndFundInput): Promise<{wallet: string; receipts: OwnerReceipt[]}> {
@@ -340,7 +347,7 @@ async function run({network, ask, sign, journal, key, policyId, agent, amount, o
       await signAndSubmit(step, signedPayload => {
         try {
           const signed = countersignCreation(network, step, signedPayload, setupKey);
-          journal.set(feeAccountKey, JSON.stringify({feeAccount: account, ...identity}));
+          journal.set(feeAccountKey, JSON.stringify({feeAccount: account, policyId, agent}));
           return signed;
         } catch (cause) {
           throw new OwnerFlowError(cause instanceof Error ? cause.message : 'The fee account step could not be signed.', null, false, cause);

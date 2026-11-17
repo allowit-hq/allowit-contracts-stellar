@@ -373,6 +373,19 @@ fn deployment_fee_account(record: &mut Record) -> Result<Option<native::owner::W
     }
     new_fee_account(&mut record.selection.config).map(Some)
 }
+/// Whether a saved record is the workflow of `identity`. A record of an earlier release names
+/// its fee account in its saved identity; it is the same workflow when its content has the
+/// identity and its saved hash is the one that the earlier release computed.
+fn resumes(saved: &Record, identity: &str) -> Result<bool> {
+    if workflow_identity(&saved.selection, &saved.work, saved.max_fee_stroops)? != identity {
+        return Ok(false);
+    }
+    Ok(saved.intent_hash == identity
+        || saved.intent_hash
+            == intent_hash(
+                &json!({"selection":saved.selection,"work":saved.work,"maxFeeStroops":saved.max_fee_stroops}),
+            )?)
+}
 /// The identity of a workflow: its selection, its work and its fee ceiling. The identity of a
 /// deployment leaves out the fee account, because the workflow itself makes that account.
 fn workflow_identity(selection: &OwnerPolicy, work: &Work, max_fee: u32) -> Result<String> {
@@ -890,16 +903,14 @@ impl OwnerClient {
                     && saved.request_id == id
                     && saved.backend == self.session.backend()
                     && saved.origin == self.session.origin()
-                    && workflow_identity(&saved.selection, &saved.work, saved.max_fee_stroops)?
-                        == identity
-                    // A record of an earlier release keeps the identity that names its fee account.
-                    && (saved.intent_hash == identity
-                        || saved.intent_hash
-                            == intent_hash(
-                                &json!({"selection":saved.selection,"work":saved.work,"maxFeeStroops":saved.max_fee_stroops}),
-                            )?) =>
+                    && resumes(&saved, &identity)? =>
             {
-                saved
+                // A record of an earlier release takes the identity of this one, so it still
+                // resumes after this run replaces or keeps its fee account.
+                Record {
+                    intent_hash: identity,
+                    ..saved
+                }
             }
             Some(_) => {
                 return Err(Error::config(
@@ -2132,6 +2143,20 @@ mod submit_refusal_tests {
         assert_eq!(unsent.code, crate::provider::NETWORK_UNAVAILABLE);
         assert_eq!(unsent.api_code.as_deref(), Some("network_unavailable"));
     }
+    fn record_defaults() -> Record {
+        Record {
+            version: 1,
+            request_id: "deploy-001".into(),
+            backend: String::new(),
+            origin: String::new(),
+            intent_hash: String::new(),
+            selection: crate::test_support::owner::selection(),
+            work: Work::Deploy,
+            max_fee_stroops: 100,
+            steps: vec![],
+            complete: false,
+        }
+    }
     /// A deployment's fee account across runs. The setup key is never in the record.
     #[test]
     fn a_resumed_deployment_keeps_a_signed_fee_account_and_replaces_an_unsigned_one() {
@@ -2151,6 +2176,32 @@ mod submit_refusal_tests {
             steps: vec![],
             complete: false,
         };
+        assert!(resumes(&record, &identity).unwrap());
+        // A record of an earlier release: its identity names a fee account that its owner's
+        // key derived, and no creation is signed. It is this workflow. This run replaces the
+        // account, and with the identity of this release the next run resumes it again.
+        {
+            let mut legacy = record_defaults();
+            legacy.selection.config.fee_account = Some(crate::test_support::owner::account(77));
+            legacy.intent_hash = intent_hash(
+                &json!({"selection":legacy.selection,"work":legacy.work,"maxFeeStroops":legacy.max_fee_stroops}),
+            )
+            .unwrap();
+            assert_ne!(legacy.intent_hash, identity);
+            assert!(resumes(&legacy, &identity).unwrap());
+            let mut resumed = Record {
+                intent_hash: identity.clone(),
+                ..legacy
+            };
+            deployment_fee_account(&mut resumed).unwrap().unwrap();
+            let again: Record =
+                serde_json::from_str(&serde_json::to_string(&resumed).unwrap()).unwrap();
+            assert!(resumes(&again, &identity).unwrap());
+            // Another fee ceiling under the same request ID is another workflow.
+            let mut other = again;
+            other.max_fee_stroops = 101;
+            assert!(!resumes(&other, &identity).unwrap());
+        }
         // A new deployment: a new key, and the record names its account.
         let key = deployment_fee_account(&mut record).unwrap().unwrap();
         let first = record.selection.config.fee_account.clone().unwrap();

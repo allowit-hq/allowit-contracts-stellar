@@ -396,7 +396,7 @@ test('a saved account whose creation never applied is replaced: nothing holds fu
   const {ask, calls, state} = service(owner);
   const journal = recordingJournal(), lost = Keypair.random().publicKey();
   // The journal names an account, the ledger holds none, and no page holds its key.
-  journal.set(`${key}:fee-account`, JSON.stringify({feeAccount: lost, policyId, agent: AGENT, amount}));
+  journal.set(`${key}:fee-account`, JSON.stringify({feeAccount: lost, policyId, agent: AGENT}));
   const signed = [];
   const result = await flow({network, historyPauseMs: 0, ask, sign: walletOf(owner, signed), journal, key, policyId, agent: AGENT, amount, onStep() {}});
   assert.equal(result.wallet, WALLET);
@@ -405,12 +405,37 @@ test('a saved account whose creation never applied is replaced: nothing holds fu
   // The creation of the lost account was prepared and never signed.
   const prepares = calls.filter(([path]) => path === 'native/deploy/prepare').map(([, body]) => body.setup?.feeAccount ?? null);
   assert.deepEqual(prepares, [lost, state.feeAccount, state.feeAccount, state.feeAccount]);
-  // A marker of another policy, agent or amount names no account.
-  const other = recordingJournal();
-  other.set(`${key}:fee-account`, JSON.stringify({feeAccount: lost, policyId: 'policy-2', agent: AGENT, amount}));
-  const fresh = service(owner);
-  await flow({network, historyPauseMs: 0, ask: fresh.ask, sign: walletOf(owner), journal: other, key, policyId, agent: AGENT, amount, onStep() {}});
-  assert.equal(fresh.calls.find(([path]) => path === 'native/deploy/prepare')[1].setup, undefined);
+});
+
+test('a saved fee account stays with its policy and agent: another amount keeps it, other inputs are refused', async () => {
+  const owner = Keypair.fromRawEd25519Seed(Buffer.from(OWNER_SEED));
+  const {ask, state} = service(owner);
+  const journal = recordingJournal(), input = {network, historyPauseMs: 0, ask, journal, key, policyId, agent: AGENT, onStep() {}};
+  // The owner signs the creation and closes the page at the wallet creation.
+  const closing = async step => {
+    if (step.action === 'create_wallet') throw new Error('The page closed.');
+    return walletOf(owner)(step);
+  };
+  await assert.rejects(flow({...input, amount, sign: closing}), /The page closed/);
+  const account = state.feeAccount, marker = journal.get(`${key}:fee-account`);
+  // The marker of another policy or agent, or an unreadable one, is refused, and the marker stays.
+  const asked = [];
+  const silent = async path => { asked.push(path); throw new Error('nothing may be asked'); };
+  for (const [other, value] of [
+    [{policyId: 'policy-2'}, marker], [{agent: Keypair.random().publicKey()}, marker], [{}, 'not json'], [{}, JSON.stringify({feeAccount: 'G', policyId, agent: AGENT})],
+  ]) {
+    journal.set(`${key}:fee-account`, value);
+    await assert.rejects(flow({...input, amount, ...other, ask: silent, sign: walletOf(owner)}), OwnerFlowError);
+    assert.equal(journal.get(`${key}:fee-account`), value);
+  }
+  assert.deepEqual(asked, []);
+  // The owner resumes with another funding amount: the account that already holds the reserve and the float stays.
+  journal.set(`${key}:fee-account`, marker);
+  const signed = [];
+  const result = await flow({...input, amount: '9', sign: walletOf(owner, signed)});
+  assert.equal(result.wallet, WALLET);
+  assert.deepEqual(signed, ['create_wallet', 'fund']);
+  assert.equal(state.feeAccount, account);
 });
 
 test('a fee account that this workflow did not name, or another transaction, is never countersigned', async () => {
