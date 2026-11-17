@@ -381,7 +381,8 @@ test('a reload after the signed creation names the same account again and signs 
   await assert.rejects(flow({...input, sign: closing}), /The page closed/);
   assert.deepEqual(first, [CREATE_FEE_ACCOUNT]);
   const account = state.feeAccount;
-  assert.equal(JSON.parse(journal.get(`${key}:fee-account`)).feeAccount, account);
+  // The journal names the account and records that its creation is confirmed.
+  assert.deepEqual(JSON.parse(journal.get(`${key}:fee-account`)), {feeAccount: account, policyId, agent: AGENT, created: true});
   // The new page holds no key. It names the saved account, and the owner signs the wallet and the funding.
   const second = [];
   const result = await flow({...input, sign: walletOf(owner, second)});
@@ -436,6 +437,12 @@ test('a saved account that the ledger holds is never replaced, whatever the serv
     assert.deepEqual(signed, []);
     assert.equal(journal.get(`${key}:fee-account`), marker);
   }
+  // A creation that this journal saw confirmed is never replaced, even when the ledger read says otherwise.
+  const journal = recordingJournal(), confirmed = JSON.stringify({feeAccount: created, policyId, agent: AGENT, created: true});
+  journal.set(`${key}:fee-account`, confirmed);
+  globalThis.fetch = async () => new Response('{}', {status: 404});
+  await assert.rejects(flow({...input, journal, sign: walletOf(owner)}), error => error instanceof OwnerFlowError && error.retry === true && /already holds/.test(error.message));
+  assert.equal(journal.get(`${key}:fee-account`), confirmed);
   // Every preparation named the saved account, and no other account was ever named.
   assert.ok(asked.every(([, named]) => named === created));
 });

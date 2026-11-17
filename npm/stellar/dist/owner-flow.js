@@ -258,7 +258,8 @@ async function accountOnLedger(network, account) {
     }
 }
 /**
- * The fee account whose creation this journal signed for this policy and agent, or undefined. The account can hold
+ * The fee account whose creation this journal signed for this policy and agent, and whether the journal saw that
+ * creation confirmed, or undefined. The account can hold
  * the owner's XLM, so a marker is never dropped for other inputs: another funding amount keeps the account, and a
  * marker of another policy or agent, or one that cannot be read, is refused before anything is prepared.
  */
@@ -274,18 +275,24 @@ function savedFeeAccount(journal, key, identity) {
     // The server and the rail check the address.
     if (!object(value) || typeof value.feeAccount !== 'string' || !/^G[A-Z2-7]{55}$/.test(value.feeAccount)
         || value.policyId !== identity.policyId || value.agent !== identity.agent)
-        throw changed(identity);
-    return value.feeAccount;
+        throw changed({ ...identity, amount: '' });
+    return { account: value.feeAccount, created: value.created === true };
 }
 async function run({ network, ask, sign, journal, key, policyId, agent, amount, onStep, historyPauseMs = 1_500 }) {
     if (!canonicalNetwork(network))
         throw new OwnerFlowError('Select a supported Stellar network.', null, false);
-    const fundedKey = `${key}:funded`;
+    const fundedKey = `${key}:funded`, feeAccountKey = `${key}:fee-account`;
     const identity = { policyId, agent, amount };
     const { receipts, settleSaved, signAndSubmit } = stepper({ network, historyPauseMs, ask, sign, journal, key, policyId, onStep, identity,
-        // A confirmed funding is recorded before its signed bytes leave the journal.
-        confirmed: step => { if (step.action === 'fund')
-            journal.set(fundedKey, JSON.stringify(identity)); } });
+        // A confirmed funding is recorded before its signed bytes leave the journal. So is a confirmed creation of
+        // the fee account: from then on the account exists, and nothing ever replaces it.
+        confirmed: step => {
+            if (step.action === 'fund')
+                journal.set(fundedKey, JSON.stringify(identity));
+            const named = step.action === CREATE_FEE_ACCOUNT ? savedFeeAccount(journal, feeAccountKey, { policyId, agent }) : undefined;
+            if (named)
+                journal.set(feeAccountKey, JSON.stringify({ feeAccount: named.account, policyId, agent, created: true }));
+        } });
     // A saved step or a funded marker of other inputs is refused before anything is sent.
     saved(journal, key, identity);
     funded(journal, fundedKey, identity);
@@ -294,9 +301,11 @@ async function run({ network, ask, sign, journal, key, policyId, agent, amount, 
     // The setup key of the fee account is random and lives in this call only. It signs the creation once. The
     // journal keeps the address of an account whose creation was signed, never a key: after a reload the saved
     // signed step settles first, and the workflow names that account again.
-    const feeAccountKey = `${key}:fee-account`;
     let feeKey;
-    let feeAccount = savedFeeAccount(journal, feeAccountKey, { policyId, agent, amount });
+    const named = savedFeeAccount(journal, feeAccountKey, { policyId, agent });
+    let feeAccount = named?.account;
+    // True once this journal saw the creation confirmed on the network.
+    let created = named?.created ?? false;
     let replaced = false;
     // A deployment takes at most the fee account, the code upload, the wallet creation and a lifetime renewal.
     for (let i = 0; i < 5 && !wallet; i++) {
@@ -339,7 +348,7 @@ async function run({ network, ask, sign, journal, key, policyId, agent, amount, 
                 if (replaced)
                     throw new OwnerFlowError('The service prepared a fee account that this workflow did not name.', null, false);
                 if (feeAccount) {
-                    const held = await accountOnLedger(network, feeAccount);
+                    const held = created ? true : await accountOnLedger(network, feeAccount);
                     if (held === true)
                         throw new OwnerFlowError('The service prepared the creation of a fee account that the network already holds. Nothing was signed; resume in a moment.', null, true);
                     if (held === null)
@@ -366,6 +375,7 @@ async function run({ network, ask, sign, journal, key, policyId, agent, amount, 
                     throw new OwnerFlowError(cause instanceof Error ? cause.message : 'The fee account step could not be signed.', null, false, cause);
                 }
             });
+            created = true;
         }
         else
             await signAndSubmit(step);

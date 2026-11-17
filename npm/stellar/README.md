@@ -42,7 +42,8 @@ the key's one signature to the owner-signed `create_fee_account` step before the
 signs no message for it. The key is used once and dropped; nothing stores, derives or recovers it, because the
 creation sets its weight to 0 and makes the owner a signer that reaches every threshold alone. The journal keeps the
 address of an account whose creation was signed under `<key>:fee-account` until the wallet is installed, so a reload
-names the same account. When the service prepares the creation of a saved account again, Horizon decides: an account
+names the same account. The entry also records that the creation was confirmed; a confirmed account is never
+replaced. When the service prepares the creation of a saved, unconfirmed account again, Horizon decides: an account
 that the ledger holds stays and the step is refused as stale (`OwnerFlowError.retry`), an unreadable ledger keeps
 the account too, and only an account that the ledger does not hold is replaced. Its signed creation never applied,
 so nothing holds funds: the workflow makes a new key and names its account. A journal without a saved
