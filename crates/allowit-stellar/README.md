@@ -82,8 +82,11 @@ their network fees. The agent holds a key and no account.
 - **Setup key.** `owner::WalletKey::random()` makes the account's one-time key in the memory of the owner's client.
   The key signs the creation once and is dropped. Nothing stores, derives or recovers it: the creation transaction
   sets its weight to 0 and makes the owner a signer that reaches every threshold alone. The deployment workflow
-  makes the key and names the account; a deployment that stopped before the creation was signed names a new account
-  on its next run, and one that signed it keeps the account from its retained bytes.
+  makes the key and names the account. The retained bytes and the ledger decide which account a deployment uses:
+  a creation that its record signed keeps its account; else a wallet that the ledger holds names its agent address
+  (`rpc::installed_agent_address`), so a repeated deployment of an installed policy creates nothing; else the run
+  names a new account. A request whose record is lost after the account was created and before the wallet continues
+  with a new account, and the earlier one stays under the owner's key alone.
 - **Setup.** `owner::prepare_fee_account_setup` prepares one transaction from the owner's account: the creation with
   the reserve and the fee float (`fee_account_starting_balance`: 2.5 XLM and 5 XLM) and the three signer operations.
   The owner signs it and the account's own key signs it once. Its owner step has the action `create_fee_account`.

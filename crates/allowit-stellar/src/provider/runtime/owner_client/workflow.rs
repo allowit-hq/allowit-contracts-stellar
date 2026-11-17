@@ -349,12 +349,20 @@ fn new_fee_account(c: &mut WalletConfig) -> Result<native::owner::WalletKey> {
     checked(native::validate_config(c))?;
     Ok(key)
 }
-/// The setup key of the fee account of a deployment, for this run. The key is random and
-/// lives in this call only. While no creation is signed, the record holds no account that
-/// anything was signed for: this run drops a prepared, unsigned creation, makes a new key and
-/// names its account. Once a creation is signed, the retained bytes carry both signatures,
-/// the record keeps its account and nothing needs the key again.
-fn deployment_fee_account(record: &mut Record) -> Result<Option<native::owner::WalletKey>> {
+/// The fee account of a deployment and, when this run creates it, its setup key. The ledger and
+/// the retained bytes decide, in this order:
+///
+/// 1. A creation of the fee account or of the wallet is signed in this record: the retained
+///    bytes carry every signature. The record keeps its account and nothing needs a key.
+/// 2. The ledger holds the wallet: the wallet names its agent address, which is its fee
+///    account. The deployment creates nothing, and the final verification checks that address
+///    and its signers against the selection.
+/// 3. Otherwise no account of this record has a signature: this run drops a prepared, unsigned
+///    creation, makes a new random key and names its account. The key lives in this call only.
+fn deployment_fee_account(
+    record: &mut Record,
+    rpc: &dyn rpc::Rpc,
+) -> Result<Option<native::owner::WalletKey>> {
     if record.steps.iter().any(|s| {
         s.signed_xdr.is_some()
             && matches!(
@@ -371,7 +379,14 @@ fn deployment_fee_account(record: &mut Record) -> Result<Option<native::owner::W
     {
         record.steps.pop();
     }
-    new_fee_account(&mut record.selection.config).map(Some)
+    let c = &mut record.selection.config;
+    if let Some(agent_address) = checked(rpc::installed_agent_address(rpc, c))? {
+        // A wallet of an earlier release names the agent key's own account.
+        c.fee_account = (agent_address != c.agent).then_some(agent_address);
+        checked(native::validate_config(c))?;
+        return Ok(None);
+    }
+    new_fee_account(c).map(Some)
 }
 /// Whether a saved record is the workflow of `identity`. A record of an earlier release names
 /// its fee account in its saved identity; it is the same workflow when its content has the
@@ -931,7 +946,7 @@ impl OwnerClient {
             },
         };
         let mut setup_key = if deploying {
-            deployment_fee_account(&mut record)?
+            deployment_fee_account(&mut record, rpc)?
         } else {
             None
         };
@@ -2143,6 +2158,52 @@ mod submit_refusal_tests {
         assert_eq!(unsent.code, crate::provider::NETWORK_UNAVAILABLE);
         assert_eq!(unsent.api_code.as_deref(), Some("network_unavailable"));
     }
+    /// A ledger that holds no policy wallet.
+    struct NoWallet;
+    impl rpc::Rpc for NoWallet {
+        fn call(&self, method: &str, _: Value) -> native::Result<Value> {
+            assert_eq!(method, "getLedgerEntries");
+            Ok(json!({"entries":[]}))
+        }
+    }
+    /// The ledger of the owner fixture: it holds the wallet of its configuration.
+    struct Installed(crate::test_support::owner::OwnerLedger);
+    impl rpc::Rpc for Installed {
+        fn call(&self, method: &str, params: Value) -> native::Result<Value> {
+            self.0.call(method, params, &[])
+        }
+    }
+    /// The ledger holds the wallet: its agent address is the fee account of every deployment
+    /// of that policy, under any request ID, and no run makes a key or a second account.
+    #[test]
+    fn a_deployment_of_an_installed_wallet_takes_the_fee_account_that_the_wallet_names() {
+        let fee_account = crate::test_support::owner::account(77);
+        let mut installed = crate::test_support::owner::selection().config;
+        installed.fee_account = Some(fee_account.clone());
+        let ledger = Installed(crate::test_support::owner::OwnerLedger::new(installed));
+        let mut record = record_defaults();
+        assert_eq!(record.selection.config.fee_account, None);
+        assert!(
+            deployment_fee_account(&mut record, &ledger)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            record.selection.config.fee_account.as_deref(),
+            Some(fee_account.as_str())
+        );
+        // A wallet of an earlier release names the agent key's own account: no fee account.
+        let ledger = Installed(crate::test_support::owner::OwnerLedger::new(
+            crate::test_support::owner::selection().config,
+        ));
+        let mut record = record_defaults();
+        assert!(
+            deployment_fee_account(&mut record, &ledger)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(record.selection.config.fee_account, None);
+    }
     fn record_defaults() -> Record {
         Record {
             version: 1,
@@ -2193,7 +2254,9 @@ mod submit_refusal_tests {
                 intent_hash: identity.clone(),
                 ..legacy
             };
-            deployment_fee_account(&mut resumed).unwrap().unwrap();
+            deployment_fee_account(&mut resumed, &NoWallet)
+                .unwrap()
+                .unwrap();
             let again: Record =
                 serde_json::from_str(&serde_json::to_string(&resumed).unwrap()).unwrap();
             assert!(resumes(&again, &identity).unwrap());
@@ -2203,7 +2266,9 @@ mod submit_refusal_tests {
             assert!(!resumes(&other, &identity).unwrap());
         }
         // A new deployment: a new key, and the record names its account.
-        let key = deployment_fee_account(&mut record).unwrap().unwrap();
+        let key = deployment_fee_account(&mut record, &NoWallet)
+            .unwrap()
+            .unwrap();
         let first = record.selection.config.fee_account.clone().unwrap();
         assert_eq!(first, key.account());
         // The identity of the workflow does not move with the fee account.
@@ -2241,7 +2306,9 @@ mod submit_refusal_tests {
             step("upload_wasm", true),
             step(native::owner::CREATE_FEE_ACCOUNT, false),
         ];
-        let key = deployment_fee_account(&mut record).unwrap().unwrap();
+        let key = deployment_fee_account(&mut record, &NoWallet)
+            .unwrap()
+            .unwrap();
         let second = record.selection.config.fee_account.clone().unwrap();
         assert_ne!(second, first);
         assert_eq!(second, key.account());
@@ -2253,13 +2320,21 @@ mod submit_refusal_tests {
         record
             .steps
             .push(step(native::owner::CREATE_FEE_ACCOUNT, true));
-        assert!(deployment_fee_account(&mut record).unwrap().is_none());
+        assert!(
+            deployment_fee_account(&mut record, &NoWallet)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             record.selection.config.fee_account.as_deref(),
             Some(second.as_str())
         );
         record.steps.push(step("create_wallet", true));
-        assert!(deployment_fee_account(&mut record).unwrap().is_none());
+        assert!(
+            deployment_fee_account(&mut record, &NoWallet)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             record.selection.config.fee_account.as_deref(),
             Some(second.as_str())
