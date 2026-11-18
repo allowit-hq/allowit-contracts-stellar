@@ -275,6 +275,10 @@ impl OwnerClient {
         let mut selected_template = None;
         let mut selected_config = None;
         let installation = match &request.target {
+            // A new Native wallet is an account that the deployment creates from the owner's
+            // account. The server drafts it in the network's asset, and the deployment binds the
+            // draft to the account, as the app does.
+            Target::NewWallet if wallet.kind == "owner-wallet" => NEW_WALLET.to_owned(),
             Target::NewWallet => {
                 if wallet.kind != "contract-wallet" {
                     return Err(Error::usage(
@@ -424,6 +428,9 @@ impl OwnerClient {
         Ok(policy)
     }
 }
+/// The installation id of a draft for a new Native wallet: the server drafts for an account that
+/// the deployment creates, also when the owner has other wallet accounts on the network.
+const NEW_WALLET: &str = "new";
 /// The selected policy of a workspace reply, with only its public generation fields.
 fn selected_policy(result: Generated) -> Result<GeneratedPolicy> {
     if result.policies.len() > 30 || result.selected_id.is_empty() {
@@ -726,6 +733,13 @@ fn validate_generated(
         }
     }
     match &request.target {
+        // A Native draft for a new wallet account names no account until its deployment.
+        Target::NewWallet
+            if kind == "owner-wallet"
+                && b.template == Some(true)
+                && b.route == "native"
+                && b.wallet.is_empty()
+                && b.deployment_id.is_empty() => {}
         Target::NewWallet
             if b.template == Some(true)
                 && b.route == "policyWallet"

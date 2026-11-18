@@ -62,9 +62,83 @@ fn client(cx: &Context<'_>) -> Result<OwnerClient> {
 fn emit(value: impl serde::Serialize) -> Result<serde_json::Value> {
     serde_json::to_value(value).map_err(|_| Error::config("Cannot encode owner result"))
 }
+/// The XLM amount of a setup, in stroops. A Native wallet holds XLM.
+fn setup_funding(amount: &str) -> Result<i64> {
+    i64::try_from(workflow::amount_units(amount)?)
+        .ok()
+        .filter(|units| *units > 0)
+        .ok_or_else(|| Error::usage("The setup funding amount is out of range"))
+}
+/// The fee per operation of the setup that a Native deployment signs: the most that `limit`
+/// allows for the whole setup transaction, within the setup's own bounds. The network charges
+/// its current fee, at most this bid.
+fn native_setup_fee(limit: u32) -> Result<u32> {
+    let operations = crate::owner::setup_operation_count(false);
+    let minimum = u32::try_from(super::server_owner::fee_bounds().minimum)
+        .map_err(|_| Error::config("Invalid rail fee bounds"))?;
+    let per_operation = (limit / operations).min(100_000);
+    if per_operation < minimum {
+        return Err(Error::usage(format!(
+            "The fee limit is below the setup fee of {} stroops",
+            u64::from(minimum) * u64::from(operations)
+        )));
+    }
+    Ok(per_operation)
+}
+/// A Native draft for a new wallet account deploys as the app deploys it: one owner transaction
+/// creates the agent's wallet account and funds it with `amount`, and the server's registration
+/// of the account binds the draft to it. The account runs no wallet code, so the deployment
+/// takes no executable. The outcome selects the bound draft for activation.
+fn deploy_native(
+    cx: &Context<'_>,
+    policy: GeneratedPolicy,
+    r: &owner::Deploy<'_>,
+) -> Result<serde_json::Value> {
+    if !r.executable.is_empty() {
+        return Err(Error::usage(
+            "A Native wallet is an account and runs no wallet code: deploy it without an executable",
+        ));
+    }
+    if r.fee_asset_amount.is_some() {
+        return Err(Error::usage(
+            "A Native wallet holds XLM, which pays its fees: deploy it without a fee asset amount",
+        ));
+    }
+    if r.server != cx.authority.public_key() {
+        return Err(Error::usage(
+            "Deployment server differs from independently configured authority",
+        ));
+    }
+    let request = SetupRequest {
+        network: cx.network.into(),
+        owner: cx.signer.address().into(),
+        agent: r.agent.into(),
+        server: r.server.into(),
+        request_id: r.request_id.into(),
+        fee_per_operation: native_setup_fee(fee(r.fee_limit)?)?,
+        funding: r.amount.map(setup_funding).transpose()?,
+    };
+    request.validate()?;
+    let runtime = runtime(cx.rpc_url)?;
+    let store = (cx.store)()?;
+    emit(client(cx)?.deploy_native(
+        &runtime,
+        OwnerCapabilities {
+            store: &store,
+            rpc: runtime.rpc(),
+            signer: &super::OwnerSignerRef(cx.signer),
+            clock: cx.clock,
+        },
+        &policy,
+        &request,
+    )?)
+}
 impl OwnerProvider for Owner {
     fn deploy(&self, cx: &Context<'_>, r: owner::Deploy<'_>) -> Result<serde_json::Value> {
         let policy: GeneratedPolicy = decode(r.draft)?;
+        if policy.runtime.wallet.kind == "owner-wallet" {
+            return deploy_native(cx, policy, &r);
+        }
         if r.executable.len() > 131_072 {
             return Err(Error::usage(
                 "Selected wallet executable exceeds its native limit",
@@ -163,13 +237,6 @@ impl OwnerProvider for Owner {
         Ok(raw)
     }
     fn setup(&self, cx: &Context<'_>, r: owner::Setup<'_>) -> Result<serde_json::Value> {
-        /// The XLM amount of a setup, in stroops. A Native wallet holds XLM.
-        fn setup_funding(amount: &str) -> Result<i64> {
-            i64::try_from(workflow::amount_units(amount)?)
-                .ok()
-                .filter(|units| *units > 0)
-                .ok_or_else(|| Error::usage("The setup funding amount is out of range"))
-        }
         if r.server != cx.authority.public_key() {
             return Err(Error::usage(
                 "Setup server differs from independently configured authority",
@@ -202,7 +269,7 @@ impl OwnerProvider for Owner {
         // ID asks again and signs nothing.
         let registration = client(cx)
             .and_then(|client| {
-                client.register_native(&configured["configuration"], (cx.clock)()?)
+                client.register_native(&configured["configuration"], None, (cx.clock)()?)
             })
             .map_err(|error| {
                 let mut refused = Error::api(
@@ -549,5 +616,78 @@ mod storage_boundary_tests {
             error.message,
             "The request file must contain a JSON object."
         );
+    }
+    /// A Native draft deploys without wallet code and pays its fees in XLM. Each refusal comes
+    /// before the journal, the network or a signature.
+    #[test]
+    fn a_native_deployment_is_refused_before_the_journal_when_its_inputs_do_not_fit() {
+        let authority = crate::host::config::ServerAuthority::validated(
+            "stellar:testnet",
+            "http://localhost:3000",
+            &crate::account_for_seed(&[13; 32]),
+        )
+        .unwrap();
+        let context = Context {
+            network: "stellar:testnet",
+            backend: authority.origin(),
+            authority: &authority,
+            origin: "http://localhost:5173",
+            rpc_url: "invalid",
+            store: &|| panic!("a refused deployment opened the journal"),
+            signer: &Signer,
+            clock: &|| Ok(1),
+        };
+        let mut policy = crate::test_support::owner_generation_fixture()["policy"].clone();
+        crate::test_support::server::native_new_wallet(&mut policy);
+        let draft = serde_json::to_vec(&policy).unwrap();
+        let agent = crate::account_for_seed(&[12; 32]);
+        let server = crate::account_for_seed(&[13; 32]);
+        let deploy = |executable: &[u8], server: &str, fee_limit: &str, fee_asset: Option<&str>| {
+            OWNER
+                .deploy(
+                    &context,
+                    owner::Deploy {
+                        draft: &draft,
+                        agent: &agent,
+                        server,
+                        executable,
+                        request_id: "deploy-native-001",
+                        fee_limit,
+                        amount: Some("20"),
+                        fee_asset_amount: fee_asset,
+                    },
+                )
+                .unwrap_err()
+                .message
+        };
+        assert_eq!(
+            deploy(b"\0asm", &server, "2000000000", None),
+            "A Native wallet is an account and runs no wallet code: deploy it without an executable"
+        );
+        assert_eq!(
+            deploy(&[], &server, "2000000000", Some("1")),
+            "A Native wallet holds XLM, which pays its fees: deploy it without a fee asset amount"
+        );
+        assert_eq!(
+            deploy(&[], &agent, "2000000000", None),
+            "Deployment server differs from independently configured authority"
+        );
+        assert_eq!(
+            deploy(&[], &server, "399", None),
+            "The fee limit is below the setup fee of 400 stroops"
+        );
+        // The setup's own checks come next, also before the journal: this signer names no
+        // account.
+        assert_eq!(
+            deploy(&[], &server, "2000000000", None),
+            "Expected canonical Stellar G account"
+        );
+    }
+    #[test]
+    fn the_native_setup_bids_what_the_fee_limit_allows_within_its_bounds() {
+        assert_eq!(native_setup_fee(400).unwrap(), 100);
+        assert_eq!(native_setup_fee(1_000).unwrap(), 250);
+        assert_eq!(native_setup_fee(2_000_000_000).unwrap(), 100_000);
+        assert!(native_setup_fee(399).is_err());
     }
 }

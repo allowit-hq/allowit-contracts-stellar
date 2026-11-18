@@ -63,8 +63,23 @@ pub struct Plan {
     pub approval: Option<Value>,
     pub activation: Option<Value>,
     pub export: Option<Value>,
+    /// The server key of a Native draft for a new wallet account. The deployment's preparation
+    /// answers `wallet_setup_required` with the roles until a registration binds the draft;
+    /// the workspace then holds the bound draft.
+    pub native_server: Option<String>,
+    /// A change that the workspace shows in the bound draft, as a revision that arrived while
+    /// the wallet account was registered.
+    pub change_bound: Option<fn(&mut Value)>,
 }
 impl Plan {
+    /// A Native draft for a new wallet account, with `server` as the server key that the
+    /// deployment names.
+    pub fn native_new_wallet(&mut self, server: &str) {
+        self.discovery["wallets"][0]["profile"] = json!("allowit-native-v1");
+        self.discovery["wallets"][0]["kind"] = json!("owner-wallet");
+        crate::test_support::server::native_new_wallet(&mut self.policy);
+        self.native_server = Some(server.into());
+    }
     pub fn new(owner: &str) -> Self {
         let policy = fixture()["policy"].clone();
         let b = &policy["runtime"]["instanceBinding"];
@@ -92,6 +107,8 @@ impl Plan {
             approval: None,
             activation: None,
             export: None,
+            native_server: None,
+            change_bound: None,
         }
     }
 }
@@ -100,6 +117,7 @@ pub struct State {
     pub calls: BTreeMap<String, usize>,
     pub generated: Vec<Value>,
     pub owner_submissions: Vec<Value>,
+    pub registrations: Vec<Value>,
 }
 pub struct Server {
     pub url: String,
@@ -239,7 +257,63 @@ impl Server {
                     continue;
                 }
                 assert_eq!(headers.get("cookie"), Some(&owner));
+                // The registration of the Native draft `id`, once one bound it.
+                let registered = |id: &Value| {
+                    captured
+                        .lock()
+                        .unwrap()
+                        .registrations
+                        .iter()
+                        .find(|r| &r["policyId"] == id)
+                        .cloned()
+                };
                 match path.as_str() {
+                    "/api/native/deploy/prepare" if plan.native_server.is_some() => {
+                        match registered(&body["policyId"]) {
+                            None => reply(
+                                &mut stream,
+                                409,
+                                json!({"error":"Set up the wallet account of your agent.","code":"wallet_setup_required",
+                                    "details":{"walletKind":"native","policyId":body["policyId"],"network":"stellar:testnet",
+                                        "owner":plan.owner,"agent":body["agent"],"server":plan.native_server}}),
+                                "",
+                            ),
+                            Some(r) => {
+                                let c = &r["configuration"];
+                                reply(
+                                    &mut stream,
+                                    200,
+                                    json!({"policyId":body["policyId"],"installed":true,"approved":false,"walletKind":"native",
+                                        "wallet":c["wallet"],"installation":{"wallet":c["wallet"],"agent":c["agent"],"installation":"07".repeat(32)}}),
+                                    "",
+                                )
+                            }
+                        }
+                    }
+                    "/api/native/register" => {
+                        captured.lock().unwrap().registrations.push(body.clone());
+                        let c = &body["configuration"];
+                        reply(
+                            &mut stream,
+                            200,
+                            json!({"policyId":body.get("policyId"),"registered":true,"installation":"07".repeat(32),
+                                "walletKind":"native","network":c["network"],"wallet":c["wallet"],"agent":c["agent"],"server":c["server"]}),
+                            "",
+                        )
+                    }
+                    "/api/micro/policies" => {
+                        let mut policy = plan.policy.clone();
+                        if let Some(r) = registered(&policy["id"]) {
+                            policy = crate::test_support::server::native_bound(
+                                &policy,
+                                r["configuration"]["wallet"].as_str().unwrap(),
+                            );
+                            if let Some(change) = plan.change_bound {
+                                change(&mut policy);
+                            }
+                        }
+                        reply(&mut stream, 200, json!({"policies":[policy]}), "")
+                    }
                     "/api/native/approval" => reply(
                         &mut stream,
                         200,
