@@ -545,6 +545,38 @@ class ContractAdmin(unittest.TestCase):
             args.arguments = json.dumps({"update": deployment})
             self.assertIn("deploy_policy", ca.command(args))
 
+    def test_packed_config_is_the_bytes_that_the_wallet_stores(self):
+        # The instance values `c` that the kernel stored for these configurations.
+        stored_custom = ("0502" + "00" * 35 + "01ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216"
+            "218dc8997e416bd17d93ca7be741392a6f2928aadb2e9cf26b48125b1fcabb7c1058f09247979f25a853bedc1581cd0603ce11d2a1655096145e3f6e5c4f"
+            "c2a4a6b5f8cfbb1f553051527587ad4b000c040008ff066372656469740009020090030300c002050601050000000000000000000000000000000000000000"
+            "000000000000000000000002070080dac4090100f40308060403087472616e7366657203047377617003076465706f736974030672656465656d0000c80106"
+            "0601057be741392a6f2928aadb2e9cf26b48125b1fcabb7c1058f09247979f25a853beff06757267656e7402ff0b76656e646f725f6e6f7465030c706179"
+            "20696e766f69636573")
+        stored_common = ("0502" + "00" * 35 + "01ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216"
+            "218dc8997e416bd17d93ca7be741392a6f2928aadb2e9cf26b48125b1fcabb7c1058f09247979f25a853be" + "09" * 32 + "87ad4b090001020304050607"
+            "0809040008020090030300c002050601050000000000000000000000000000000000000000000000000000000000000002070080dac4090100f403080604"
+            "03087472616e7366657203047377617003076465706f736974030672656465656d0000c801060601057be741392a6f2928aadb2e9cf26b48125b1fcabb7c"
+            "1058f09247979f25a853be")
+        owner = StrKey.encode_contract(bytes(31) + b"\x01")
+        recipient = StrKey.encode_contract(bytes(31) + b"\x02")
+        asset = "CB56OQJZFJXSSKFK3MXJZ4TLJAJFWH6KXN6BAWHQSJDZPHZFVBJ353HU"
+        values = {"payment_limit": 100, "lifetime_spending_limit": 250, "daily_spending_limit": 200, "daily_volume_limit": 160,
+                  "call_limit": 4, "destinations": [recipient], "tokens": [asset], "expires_at": 10_000_000,
+                  "operations": ["transfer", "swap", "deposit", "redeem"]}
+        base = {"owner": owner, "agent": Keypair.from_raw_ed25519_seed(bytes([7]) * 32).public_key,
+                "server": Keypair.from_raw_ed25519_seed(bytes([8]) * 32).public_key, "asset": asset, "gas_cap": 1_234_567}
+        custom = dict(base, source_hash="dc1581cd0603ce11d2a1655096145e3f6e5c4fc2a4a6b5f8cfbb1f5530515275", rules=[],
+                      params=dict(values, vendor_note="pay invoices", urgent=True, credit=-5))
+        common = dict(base, source_hash="09" * 32, rules=list(ca.PARAM_KEYS), params=values)
+        self.assertEqual(ca.packed_config(custom, "custom").hex(), stored_custom)
+        self.assertEqual(ca.packed_config(common, "common").hex(), stored_common)
+        # A Standard wallet keeps only the params of its rules; the pause flag and the version are
+        # in the header.
+        simple = ca.packed_config(dict(common, rules=[]), "simple", version=3, paused=True)
+        self.assertEqual(simple[:6], bytes([5, 3, 0, 0, 0, 3]))
+        self.assertEqual(simple[-2:], bytes([0, 0]))  # No rules and no params.
+
     @unittest.skipUnless((ROOT / "target/wasm32v1-none/release/allowit_common_policy_engine.wasm").exists(), "contracts not built")
     def test_built_wallet_wasm_declares_the_current_custody_layout(self):
         for name in ("simple_policy_engine", "common_policy_engine", "custom_policy"):

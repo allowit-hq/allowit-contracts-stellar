@@ -71,13 +71,20 @@ class RealCliEncoding(unittest.TestCase):
                 policy = Path(config) / "policy.rs"
                 policy.write_text("use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n"
                                   "    allowit::payment_limit(ctx, &ctx.params[allowit::PAYMENT_LIMIT])?;\n    Ok(())\n}\n")
+                source_hash = hashlib.sha256(policy.read_bytes()).hexdigest()
+                server_key = Keypair.from_raw_ed25519_seed(bytes([4]) * 32).public_key
                 cmd = [CLI, "--config-dir", config, "contract", "invoke", "--id", contract, "--source-account", account, "--rpc-url", f"http://127.0.0.1:{server.server_port}", "--network-passphrase", Network.TESTNET_NETWORK_PASSPHRASE, "--build-only", "--", "deploy_policy"]
-                result = subprocess.run(cmd + ca.serialize({"deployment": {"deployment_version": 1, "owner": account, "agent": recipient, "server": Keypair.from_raw_ed25519_seed(bytes([4]) * 32).public_key, "source_digest": "22" * 32, "rules": ["payment_limit"], "params": params, "x402_enabled": False, "wasm_hash": None}}), check=True, capture_output=True, text=True, timeout=30)
+                result = subprocess.run(cmd + ca.serialize({"update": {"deployment_version": 1, "owner": account, "agent": recipient, "server": server_key, "source_hash": source_hash, "gas_cap": big, "rules": ["payment_limit"], "params": params, "wasm_hash": None}}), check=True, capture_output=True, text=True, timeout=30)
                 tx = TransactionEnvelope.from_xdr(result.stdout.strip(), Network.TESTNET_NETWORK_PASSPHRASE)
                 self.assertEqual(tx.signatures, [])
                 args = tx.transaction.operations[0].host_function.invoke_contract.args
                 packet = {entry.key.sym.sc_symbol.decode(): entry.val for entry in args[0].map.sc_map}
-                self.assertEqual(packet["deployment_version"].u64.uint64, 1)
+                self.assertEqual(packet["deployment_version"].u32.uint32, 1)
+                # The agent and the server are raw Ed25519 keys; the gas cap is an i128.
+                self.assertEqual(packet["agent"], scval.to_bytes(StrKey.decode_ed25519_public_key(recipient)))
+                self.assertEqual(packet["server"], scval.to_bytes(StrKey.decode_ed25519_public_key(server_key)))
+                self.assertEqual(packet["source_hash"], scval.to_bytes(bytes.fromhex(source_hash)))
+                self.assertEqual(packet["gas_cap"], scval.to_int128(big))
                 # Vec<AllowitRule>: each unit enum variant encodes as a one-symbol vector.
                 self.assertEqual(packet["rules"], scval.to_vec([scval.to_vec([scval.to_symbol("payment_limit")])]))
                 # Map<Symbol, AllowitValue>: only present keys; each value is a variant vector.
@@ -97,8 +104,8 @@ class RealCliEncoding(unittest.TestCase):
                         options = SimpleNamespace(action=action, network="testnet", allow_mainnet=False, source=account,
                             wasm=str(wasm), wasm_hash=expected, engine_wasm="11" * 32, tier="common", policy_source=str(policy),
                             owner=account, config=json.dumps({"owner": account, "agent": recipient,
-                                "server": Keypair.from_raw_ed25519_seed(bytes([4]) * 32).public_key, "asset": contract,
-                                "source_digest": "22" * 32, "rules": ["payment_limit"], "params": params, "x402_enabled": False, "policy_instance": "11" * 32}))
+                                "server": server_key, "asset": contract, "source_hash": source_hash, "gas_cap": 1_000_000,
+                                "rules": ["payment_limit"], "params": params}))
                         prepared = ca.command(options)
                         self.assertIn("--wasm", prepared)
                         self.assertNotIn("--wasm-hash", prepared)

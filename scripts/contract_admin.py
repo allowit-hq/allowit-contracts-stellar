@@ -284,6 +284,65 @@ def params(value, tier=None):
 TIERS = ("simple", "common", "custom")
 
 
+def _uleb(value):
+    out = bytearray()
+    while True:
+        byte, value = value & 0x7F, value >> 7
+        out.append(byte | (0x80 if value else 0))
+        if not value:
+            return bytes(out)
+
+
+def _raw(address):
+    return StrKey.decode_contract(address) if StrKey.is_valid_contract(address) else StrKey.decode_ed25519_public_key(address)
+
+
+def _packed_value(value):
+    """One `AllowitValue` in the wallet's packing: a tag, then a zigzag LEB128 integer, the
+    text length and bytes, the raw 32-byte address or the items of a list."""
+    (kind, item), = value.items()
+    if kind == "Int":
+        number = int(item)
+        return b"\x00" + _uleb((number << 1) ^ (number >> 127))
+    if kind == "Bool":
+        return b"\x02" if item else b"\x01"
+    if kind == "Str":
+        text = item.encode()
+        return b"\x03" + _uleb(len(text)) + text
+    if kind == "Addr":
+        return (b"\x05" if StrKey.is_valid_contract(item) else b"\x04") + _raw(item)
+    return b"\x06" + _uleb(len(item)) + b"".join(_packed_value(entry) for entry in item)
+
+
+def installed_params(config, tier):
+    """The params that a wallet stores: a Simple or Common wallet keeps only the params of its
+    rules; a Custom wallet keeps all."""
+    if tier == "custom":
+        return dict(config["params"])
+    return {key: value for key, value in config["params"].items() if key in config["rules"]}
+
+
+def packed_config(config, tier, version=0, paused=False):
+    """The instance value `c` of a layout 5 wallet that `config` created, as the wallet packs it:
+    the layout, the flags, the deployment version, the owner, the agent and server keys, the
+    asset, the source hash, then the gas cap, the rules and the params in key order."""
+    owner_contract = StrKey.is_valid_contract(config["owner"])
+    out = bytearray([WALLET_CONTRACT_VERSION, (2 if owner_contract else 0) | (1 if paused else 0)])
+    out += version.to_bytes(4, "big")
+    for role in ("owner", "agent", "server", "asset"):
+        out += _raw(config[role])
+    out += bytes.fromhex(config["source_hash"])
+    out += _uleb(config["gas_cap"])
+    out.append(len(config["rules"]))
+    out += bytes(PARAM_KEYS.index(rule) for rule in config["rules"])
+    stored = params(installed_params(config, tier), tier)
+    out += _uleb(len(stored))
+    for key in sorted(stored, key=lambda name: name.encode()):
+        out += bytes([PARAM_KEYS.index(key)]) if key in PARAM_KEYS else b"\xff" + bytes([len(key)]) + key.encode()
+        out += _packed_value(stored[key])
+    return bytes(out)
+
+
 def policy_rules(value, tier, source_path):
     """Bind an owner packet to its authored source. Every tier requires one self-contained file that
     binds `allowit` only to the canonical crate and passes the std-only compile of the offchain

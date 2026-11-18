@@ -37,6 +37,7 @@ CONTRACTS = {
 }
 KINDS = {"simple": "simple_policy_engine", "common": "common_policy_engine", "custom": "custom_policy"}
 MAX_FEE = 1_250_000_000  # First constructor can renew shared code; Testnet only, 125 XLM.
+GAS_CAP = 1_000_000  # The owner-signed gas that a smoke wallet repays at most per operation.
 HEX = re.compile(r"[0-9a-f]{64}")
 SHA = re.compile(r"[0-9a-f]{40}")
 TAG = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
@@ -434,10 +435,9 @@ def config_for(manifest, kind, owner, agent, server):
         "daily_spending_limit": 50_000_000, "daily_volume_limit": 50_000_000,
         "call_limit": 10, "destinations": [agent], "tokens": [asset],
         "expires_at": 4_102_444_800, "operations": ["transfer"]}
-    source = manifest["sample_policy"]["sha256"] if kind == "custom" else ca.prefix_digest(KINDS[kind], module, asset, rules)
-    instance = digest(canonical(["allowit_testnet_release_v1", manifest["tag"], kind, owner]))
+    # Every tier stores the SHA-256 of the owner's whole source: the release's sample policy.
     return {"owner": owner, "agent": agent, "server": server, "asset": asset,
-        "policy_instance": instance, "source_digest": source, "rules": rules, "params": params, "x402_enabled": False}
+        "source_hash": manifest["sample_policy"]["sha256"], "gas_cap": GAS_CAP, "rules": rules, "params": params}
 
 
 def check_constructor(create, config, module, salt):
@@ -460,11 +460,13 @@ def config_scval(config):
             params[name] = scval.to_enum("List", scval.to_vec([scval.to_enum(tag, encode(item)) for item in value]))
         else:
             params[name] = scval.to_enum("Int", scval.to_int128(value))
-    fields = {key: scval.to_address(config[key]) for key in ("owner", "agent", "server", "asset")}
-    fields.update(policy_instance=scval.to_bytes(bytes.fromhex(config["policy_instance"])),
-        source_digest=scval.to_bytes(bytes.fromhex(config["source_digest"])),
+    # `AllowitPolicyConfig`: the agent and the server are raw Ed25519 keys.
+    fields = {key: scval.to_address(config[key]) for key in ("owner", "asset")}
+    fields.update({role: scval.to_bytes(StrKey.decode_ed25519_public_key(config[role])) for role in ("agent", "server")})
+    fields.update(source_hash=scval.to_bytes(bytes.fromhex(config["source_hash"])),
+        gas_cap=scval.to_int128(config["gas_cap"]),
         rules=scval.to_vec([scval.to_enum(rule, None) for rule in config["rules"]]),
-        params=scval.to_struct(params), x402_enabled=scval.to_bool(config["x402_enabled"]))
+        params=scval.to_struct(params))
     return scval.to_struct(fields)
 
 
@@ -600,17 +602,15 @@ class Deployment:
         if instance.executable.type != xdr.ContractExecutableType.CONTRACT_EXECUTABLE_WASM or instance.executable.wasm_hash.hash.hex() != module:
             raise ValueError("Existing deterministic wallet uses different code")
         storage = instance.storage.sc_map if instance.storage is not None else []
-        if len(storage) != 1 or storage[0].key.to_xdr_bytes() != scval.to_uint32(0).to_xdr_bytes():
+        if len(storage) != 1 or storage[0].key.to_xdr_bytes() != scval.to_symbol("c").to_xdr_bytes():
             raise ValueError("Wallet instance has an unknown storage layout")
         config = self.intents[action.kind][0]
-        fields = scval.from_struct(config_scval(config))
-        fields.update(policy_state=scval.to_map({}), contract_version=scval.to_uint32(ca.WALLET_CONTRACT_VERSION),
-            token=scval.to_string("XLM"), deployment_version=scval.to_uint64(0), nonce=scval.to_uint64(0), paused=scval.to_bool(False))
-        if storage[0].val.to_xdr_bytes() != scval.to_struct(fields).to_xdr_bytes():
+        # The packed configuration of layout 5 at deployment version 0, not paused.
+        if storage[0].val.to_xdr_bytes() != scval.to_bytes(ca.packed_config(config, action.kind)).to_xdr_bytes():
             raise ValueError("Wallet native configuration or pristine state differs")
         return {"contract": action.key, "wasm_sha256": module, "ledger": snapshot[0], "live_until_ledger": item.live_until_ledger,
-            "config": config, "state": {**config, "params": ca.params(config["params"], action.kind), "policy_state": {},
-                "contract_version": ca.WALLET_CONTRACT_VERSION, "token": "XLM", "deployment_version": 0, "nonce": 0, "paused": False},
+            "config": config, "state": {**config, "params": ca.params(ca.installed_params(config, action.kind), action.kind),
+                "contract_version": ca.WALLET_CONTRACT_VERSION, "deployment_version": 0, "paused": False},
             "state_xdr": storage[0].val.to_xdr(), "funding": "No release funds are transferred to smoke wallets."}
 
     def asset_present(self, snapshot):
