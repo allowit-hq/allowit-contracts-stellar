@@ -4,6 +4,7 @@
  * the workflows, their journal and their recovery rules; these hooks build, send and read Stellar transactions and
  * check Stellar signatures.
  */
+import type {OwnerChain} from '@allowit/core';
 import {Keypair} from '@stellar/stellar-sdk/base';
 import {expiredRecord, horizonGet} from './chain-record.js';
 import {OWNER_WEIGHT, approvalStep, nativeApprovalHolds, nativeWalletConfiguration, policyApproval, prepareNativeSetup, sendNativeSetup,
@@ -11,11 +12,9 @@ import {OWNER_WEIGHT, approvalStep, nativeApprovalHolds, nativeWalletConfigurati
 
 const object = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
 
-/** What history holds for a transaction: `'missing'`, its record, or null when the read gave no clear answer. */
-export type TransactionRecord = 'missing' | {hash: string; ledger: number; successful: boolean} | null;
 
 /** The record of a transaction in the public ledger history. */
-async function transaction(network: string, hash: string): Promise<TransactionRecord> {
+async function transaction(network: string, hash: string): ReturnType<OwnerChain['transaction']> {
   const response = await horizonGet(network, `/transactions/${hash}`);
   if (response?.status === 404) return 'missing';
   const body: unknown = response?.ok ? await response.json().catch(() => null) : null;
@@ -41,8 +40,8 @@ function signedBy(signer: string, hash: string, signature: number[]): boolean {
   }
 }
 
-/** The hooks of the SDK's owner workflows. */
-export const ownerChain = Object.freeze({
+/** The hooks of the SDK's owner workflows: Core's `OwnerChain` contract. */
+export const ownerChain: OwnerChain = Object.freeze({
   transaction,
   /** Its ledger when the signed step applied before its time bound, null when it can never apply; throws when unknown. */
   expiredRecord,
