@@ -620,10 +620,20 @@ fn validate_response_receipt(r: &Response) -> Result<()> {
         return Ok(());
     }
     if let Some(receipt) = &r.receipt {
+        // A policy wallet's settled transaction is the sealed one: the prepared transaction
+        // with both cosignatures, its final resources and the sending account's signature.
+        let expected = if p.config.route == WalletRoute::PolicyWallet {
+            r.signed_operation
+                .as_ref()
+                .ok_or_else(|| Error::uncertain("Stellar receipt arrived without its sealed operation"))?
+                .transaction_hash
+        } else {
+            p.transaction_hash
+        };
         checked(sdk::rpc::validate_own_receipt(
             receipt,
             &p.config.network,
-            &p.transaction_hash,
+            &expected,
         ))?;
         if projected(p, receipt.status.clone()) != r.operation.status
             || r.signed_operation
@@ -822,7 +832,11 @@ impl Client {
         if r.operation.id != id
             || !config_matches(&self.bundle.config, &p.config)
             || p.request.operation.nonce != operation_nonce(&self.bundle.policy_id, id)
-            || r.operation.transaction_hash != sdk::hex(&p.transaction_hash)
+            || (r.operation.transaction_hash != sdk::hex(&p.transaction_hash)
+                && r.signed_operation.as_ref().is_none_or(|signed| {
+                    p.config.route != WalletRoute::PolicyWallet
+                        || r.operation.transaction_hash != sdk::hex(&signed.transaction_hash)
+                }))
             // A request for a payment authorization gets one, and no other request does.
             || record.is_some_and(|old| {
                 sdk::seller_settled::is_request(&old.request) != p.payment_authorization.is_some()
@@ -3153,9 +3167,9 @@ mod native_revalidation_tests {
         // Common R4.1 on testnet: the engine released the expired operation as `failed`
         // without a receipt, and the CLI reported `submissionUnknown`.
         let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
-        assert_eq!((p.expires_at, p.state.nonce), (86700, 4));
+        assert_eq!(p.expires_at, 86700);
         let not_found =
-            json!({"status":"NOT_FOUND","latestLedger":130,"latestLedgerCloseTime":"86700"});
+            json!({"status":"NOT_FOUND","latestLedger":185,"latestLedgerCloseTime":"86700"});
         let (rpc, stop, server) = rpc_server(lapse_rpc(not_found.clone(), 130));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -3204,17 +3218,21 @@ mod native_revalidation_tests {
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         let methods = server.join().unwrap();
         assert_eq!(methods[0], "getTransaction");
-        assert!(methods.iter().any(|m| m == "getLedgerEntries"));
 
-        let mut advanced = p.clone();
-        advanced.state.nonce = 3;
         for (transaction, entries_ledger, packet, lapsed) in [
             (not_found.clone(), 130, &p, true),
             (
-                json!({"status":"FAILED","latestLedger":130,"latestLedgerCloseTime":86701}),
+                json!({"status":"FAILED","latestLedger":186,"latestLedgerCloseTime":86701}),
                 131,
                 &p,
                 true,
+            ),
+            // At the expiration ledger of the wallet's authorization it can still run.
+            (
+                json!({"status":"NOT_FOUND","latestLedger":184,"latestLedgerCloseTime":"86700"}),
+                130,
+                &p,
+                false,
             ),
             // The closing ledger precedes the expiry: the wallet can still execute it.
             (
@@ -3235,10 +3253,6 @@ mod native_revalidation_tests {
                 &p,
                 false,
             ),
-            // The wallet entries predate the closing ledger.
-            (not_found.clone(), 129, &p, false),
-            // The wallet nonce moved past the packet: some operation executed.
-            (not_found.clone(), 130, &advanced, false),
         ] {
             let (rpc, stop, server) = rpc_server(lapse_rpc(transaction.clone(), entries_ledger));
             let result = sdk::rpc::operation_lapsed(&sdk::rpc::HttpRpc::new(&rpc).unwrap(), packet);
@@ -3247,45 +3261,13 @@ mod native_revalidation_tests {
             assert_eq!(result, Ok(lapsed), "{transaction} at {entries_ledger}");
         }
     }
-    /// Advance the wallet nonce in the instance entries of a `getLedgerEntries` reply, as if
-    /// the wallet executed another operation.
-    fn advance_nonce(reply: &mut serde_json::Value) {
-        use stellar_xdr::{LedgerEntryData, Limits, ReadXdr, ScVal, WriteXdr};
-        fn walk(value: &mut ScVal) {
-            let entries = match value {
-                ScVal::Map(Some(map)) => map.0.iter_mut(),
-                ScVal::ContractInstance(instance) => match &mut instance.storage {
-                    Some(map) => map.0.iter_mut(),
-                    None => return,
-                },
-                _ => return,
-            };
-            for entry in entries {
-                match (&entry.key, &mut entry.val) {
-                    (ScVal::Symbol(key), ScVal::U64(nonce)) if key.0.as_slice() == b"nonce" => {
-                        *nonce += 1
-                    }
-                    (_, val) => walk(val),
-                }
-            }
-        }
-        for entry in reply["entries"].as_array_mut().unwrap() {
-            let mut data =
-                LedgerEntryData::from_xdr_base64(entry["xdr"].as_str().unwrap(), Limits::none())
-                    .unwrap();
-            if let LedgerEntryData::ContractData(contract) = &mut data {
-                walk(&mut contract.val);
-            }
-            entry["xdr"] = json!(data.to_xdr_base64(Limits::none()).unwrap());
-        }
-    }
     #[test]
     fn proven_failure_stays_failed_after_the_nonce_moves_or_rpc_fails() {
         // Codex P2 on PR #45: poll journaled only `failed`, so a later status query that could
         // not repeat the lapse proof overwrote the terminal failure with `submissionUnknown`.
         let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
         let not_found =
-            json!({"status":"NOT_FOUND","latestLedger":130,"latestLedgerCloseTime":"86700"});
+            json!({"status":"NOT_FOUND","latestLedger":185,"latestLedgerCloseTime":"86700"});
         let released = serde_json::to_vec(&json!({"prepared":p,"operation":{"id":"released-001","status":OperationStatus::Failed,"transactionHash":sdk::hex(&p.transaction_hash)},"signedOperation":null,"receipt":null})).unwrap();
         // One engine status reply that releases the operation, read by a client using `rpc`.
         let query = |rpc: &str| {
@@ -3320,14 +3302,10 @@ mod native_revalidation_tests {
             )
             .unwrap();
 
-        let proof = lapse_rpc(not_found, 130);
-        let (moved, stop, server) = rpc_server(move |method, params| {
-            let mut reply = proof(method, params);
-            if method == "getLedgerEntries" {
-                advance_nonce(&mut reply);
-            }
-            reply
-        });
+        // A node that answers before the authorization's expiration ledger proves no lapse.
+        let early =
+            json!({"status":"NOT_FOUND","latestLedger":150,"latestLedgerCloseTime":"86700"});
+        let (moved, stop, server) = rpc_server(lapse_rpc(early, 130));
         assert_eq!(
             sdk::rpc::operation_lapsed(&sdk::rpc::HttpRpc::new(&moved).unwrap(), &p),
             Ok(false)

@@ -767,11 +767,12 @@ pub fn status_by_hash(
     let v = rpc.call("getTransaction", json!({"hash":hex(transaction_hash)}))?;
     verify_settlement(&v, network, transaction_hash)
 }
-/// Whether the policy wallet operation `p` lapsed without executing. The wallet refuses an
-/// operation in a ledger that closes at or after its `expires_at`, and it advances its nonce
-/// whenever it executes one. A ledger closed at or after the expiry, then wallet entries read at
-/// that ledger or later that still show the nonce that `p` binds, prove that no envelope with
-/// this authorization executed or can still execute. `false` means not proven.
+/// Whether the policy wallet operation `p` lapsed without executing: the network holds no
+/// successful transaction of its hash, a ledger closed at or after its `expires_at` (the wallet
+/// refuses it then), and the ledger is past the expiration ledger of the wallet's authorization,
+/// so no resubmission of that authorization can run. Another preparation of the same operation
+/// has its own transaction; the server never prepares one while an earlier one can still run.
+/// `false` means not proven.
 pub fn operation_lapsed(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<bool> {
     if p.config.route != WalletRoute::PolicyWallet {
         return Ok(false);
@@ -789,37 +790,13 @@ pub fn operation_lapsed(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<bool> {
     if !matches!(reply["status"].as_str(), Some("NOT_FOUND" | "FAILED")) || closed < p.expires_at {
         return Ok(false);
     }
-    let entries = EntryLedgers {
-        rpc,
-        oldest: std::sync::Mutex::new(None),
+    // Past the expiration ledger of the wallet's authorization, neither this transaction nor any
+    // resubmission of that authorization can run: the ledger refuses an expired signature.
+    let entry = authorization::wallet_authorization(p)?;
+    let SorobanCredentials::Address(credentials) = &entry.credentials else {
+        return Ok(false);
     };
-    let wallet = trusted_state_for_discovery(&entries, &p.config, None)?;
-    let oldest = *entries
-        .oldest
-        .lock()
-        .map_err(|_| "RPC ledger record is unavailable")?;
-    Ok(oldest.is_some_and(|ledger| ledger >= latest) && wallet.state.nonce == p.state.nonce)
-}
-/// An RPC endpoint that keeps the oldest ledger of its `getLedgerEntries` replies, because an
-/// RPC node can answer entry reads from an older ledger than the head it reported. A reply
-/// without a ledger counts as ledger zero.
-struct EntryLedgers<'a> {
-    rpc: &'a dyn Rpc,
-    oldest: std::sync::Mutex<Option<u64>>,
-}
-impl Rpc for EntryLedgers<'_> {
-    fn call(&self, method: &str, params: Value) -> Result<Value> {
-        let reply = self.rpc.call(method, params)?;
-        if method == "getLedgerEntries" {
-            let ledger = reply["latestLedger"].as_u64().unwrap_or(0);
-            let mut oldest = self
-                .oldest
-                .lock()
-                .map_err(|_| "RPC ledger record is unavailable")?;
-            *oldest = Some(oldest.map_or(ledger, |v| v.min(ledger)));
-        }
-        Ok(reply)
-    }
+    Ok(latest > u64::from(credentials.signature_expiration_ledger))
 }
 /// Verify a terminal CAP-15 wrapper before retaining the original inner transaction.
 /// This accepts settlement evidence only; owner intent signing still rejects fee-bump envelopes.
