@@ -242,6 +242,13 @@ pub struct WalletConfig {
     pub source_hash: [u8; 32],
     pub module_digest: [u8; 32],
     pub max_fee_stroops: u32,
+    /// The owner-signed most that a policy wallet repays for one request's network fee, in
+    /// stroops. Zero repays nothing.
+    #[serde(default, skip_serializing_if = "is_zero_i128")]
+    pub gas_cap: i128,
+}
+fn is_zero_i128(value: &i128) -> bool {
+    *value == 0
 }
 fn is_legacy(language: &PolicyLanguage) -> bool {
     *language == PolicyLanguage::Legacy
@@ -408,11 +415,23 @@ pub struct ExecutionTerms {
     pub args: PolicyParams,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expense: Option<ExpenseBounds>,
+    /// The XLM that a policy wallet repays for the network fee, and its payee.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gas: Option<GasRepayment>,
 }
 impl ExecutionTerms {
     pub fn is_empty(&self) -> bool {
-        self.args.0.is_empty() && self.expense.is_none()
+        self.args.0.is_empty() && self.expense.is_none() && self.gas.is_none()
     }
+}
+/// The gas that a policy wallet repays in the transaction: `stroops` of XLM to `payee`, the
+/// server's sending account, at most the owner-signed gas cap. The server signs it with the
+/// request; a repayment above the fee is carried to the wallet's next request.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GasRepayment {
+    pub stroops: i128,
+    pub payee: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1407,8 +1426,9 @@ fn legacy_wallet_request(
         ("invocation", invocation),
     ])
 }
-/// The layout 4 `AllowitExecutionRequest` of one operation: the full source identity, the
-/// executable, the typed native operation, the expense and the execution args.
+/// The layout 5 `AllowitExecutionRequest` of one operation: its id, the wallet's deployment
+/// version, the expiry, the typed native operation, the expense, the gas repayment and the
+/// execution args.
 pub(crate) fn policy_wallet_request(
     c: &WalletConfig,
     r: &ExecutionRequest,
@@ -1417,16 +1437,19 @@ pub(crate) fn policy_wallet_request(
     operation: &StellarOperation,
     expires: u64,
 ) -> Result<ScVal> {
+    let gas = terms
+        .gas
+        .as_ref()
+        .ok_or("A policy wallet request names its gas repayment and payee")?;
     contract::execution_request(contract::ExecutionPacket {
-        policy_instance: &c.policy_instance,
-        source_hash: &c.source_hash,
         operation_id: &r.operation.nonce,
-        nonce: state.nonce,
-        deployment_version: state.deployment_version,
+        deployment_version: u32::try_from(state.deployment_version)
+            .map_err(|_| "Deployment version exceeds u32")?,
         expires_at: expires,
-        module_digest: &c.module_digest,
         operation: contract::operation(&c.asset, operation)?,
         expense: contract::expense(terms.expense.as_ref())?,
+        gas_stroops: gas.stroops,
+        gas_payee: &gas.payee,
         args: &terms.args,
     })
 }
@@ -1521,7 +1544,7 @@ fn build(
                 amount: i64::try_from(t.amount).map_err(|_| "Classic payment exceeds i64")?,
             })
         }
-        WalletRoute::PolicyWallet | WalletRoute::Odc => {
+        WalletRoute::Odc => {
             state.source.validate_structure()?;
             if state.source.signer_weight(&c.agent)? == 0 {
                 return Err("Customer is not a current policy wallet agent account signer".into());
@@ -1531,20 +1554,10 @@ fn build(
                     "policy wallet executable or current agent transaction source differs".into(),
                 );
             }
-            let fee = &r.fee_bounds.as_ref().ok_or("Native fee bound required")?[0];
-            if workflow_address(&fee.payer)? != state.source.address {
-                return Err(
-                    "policy wallet fee payer differs from its current agent account".into(),
-                );
-            }
-            let request = if c.route == WalletRoute::Odc {
-                let StellarOperation::Transfer(t) = &operation else {
-                    return Err("Historical wallet packets hold only transfers".into());
-                };
-                legacy_wallet_request(c, r, state, t, expires, legacy_revision)?
-            } else {
-                policy_wallet_request(c, r, terms, state, &operation, expires)?
+            let StellarOperation::Transfer(t) = &operation else {
+                return Err("Historical wallet packets hold only transfers".into());
             };
+            let request = legacy_wallet_request(c, r, state, t, expires, legacy_revision)?;
             let call = InvokeContractArgs {
                 contract_address: address(&c.wallet)?,
                 function_name: ScSymbol(b"execute".to_vec().try_into().map_err(err)?),
@@ -1563,20 +1576,31 @@ fn build(
                 .map_err(err)?,
             })
         }
+        WalletRoute::PolicyWallet => {
+            // The server's sending account is the source and pays the fee. The agent holds a key
+            // and no account: it signs the wallet's own authorization with the server.
+            state.source.validate_structure()?;
+            if state.module_digest != c.module_digest {
+                return Err("policy wallet executable differs".into());
+            }
+            let fee = &r.fee_bounds.as_ref().ok_or("Native fee bound required")?[0];
+            if workflow_address(&fee.payer)? != state.source.address {
+                return Err("policy wallet fee payer differs from the sending account".into());
+            }
+            let request = policy_wallet_request(c, r, terms, state, &operation, expires)?;
+            let call = InvokeContractArgs {
+                contract_address: address(&c.wallet)?,
+                function_name: ScSymbol(b"execute".to_vec().try_into().map_err(err)?),
+                args: vec![request].try_into().map_err(err)?,
+            };
+            OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function: HostFunction::InvokeContract(call.clone()),
+                auth: vec![authorization::wallet_entry(c, r, state, call)?]
+                    .try_into()
+                    .map_err(err)?,
+            })
+        }
     };
-    if c.route == WalletRoute::PolicyWallet {
-        let OperationBody::InvokeHostFunction(op) = &mut body else {
-            unreachable!()
-        };
-        let mut auth = op.auth.to_vec();
-        auth.push(authorization::server_entry(
-            c,
-            r,
-            state,
-            auth[0].root_invocation.clone(),
-        )?);
-        op.auth = auth.try_into().map_err(err)?;
-    }
     let tx = Transaction {
         source_account: muxed(&state.source.address)?,
         fee: c.max_fee_stroops,
