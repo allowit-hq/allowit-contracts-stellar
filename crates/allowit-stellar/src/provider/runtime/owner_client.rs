@@ -543,6 +543,11 @@ impl OwnerClient {
             false,
         )
     }
+    /// The owner's signed-in session, after [`Self::authenticate`]. The SDK sends the owner
+    /// routes that need no rail step under it.
+    pub fn into_session(self) -> crate::host::owner_session::Client {
+        self.session
+    }
     pub fn edit_params(
         &self,
         draft: &GeneratedPolicy,

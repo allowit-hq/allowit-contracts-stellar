@@ -114,7 +114,8 @@ It reads the direct order book only: no path through another asset and no liquid
 `RailPlugin::message_signature` gives the SEP-53 text-message signature (`provider::message_signature`), the one that a browser wallet makes with `signMessage`. A server signs its own statements with it, such as the request of a signed fetch.
 
 The rail reports a wallet whose code on the ledger differs from the code of its configuration with the problem code
-`custom_code_hash_mismatch`. `OwnerProvider::custom_build` reads the owner's view of a build from the server: the
+`custom_code_hash_mismatch`. `OwnerProvider::owner_session` signs the owner in, as for the other owner calls, and
+returns Core's owner session; the SDK sends the owner routes that need no rail step, such as a reputation vote, under it. `OwnerProvider::custom_build` reads the owner's view of a build from the server: the
 admitted source and the code hash of the server's build.
 
 ## Wallet kinds, units and settlement reports
