@@ -140,7 +140,7 @@ test('wallet kinds, the bound kind and asset units come from the plugin', () => 
   assert.equal(plugin.assetDisplay('other:testnet', 'XLM'), null);
   assert.equal(plugin.review.fragment, '#adk-proposal-v1=');
   assert.equal(typeof plugin.review.parseLink, 'function');
-  for (const hook of [plugin.ownerChain.transaction, plugin.ownerChain.expiredRecord, plugin.ownerChain.keypairSetup.run, plugin.ownerChain.approval.signedBy])
+  for (const hook of [plugin.ownerChain.transaction, plugin.ownerChain.expiredRecord, plugin.ownerChain.keypairSetup.prepare, plugin.ownerChain.approval.signedBy])
     assert.equal(typeof hook, 'function');
   assert.equal(plugin.ownerWorkflow, undefined);
 });

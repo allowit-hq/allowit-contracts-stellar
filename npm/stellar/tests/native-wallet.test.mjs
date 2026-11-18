@@ -3,8 +3,9 @@ import {createHash} from 'node:crypto';
 import test from 'node:test';
 import {Asset, Keypair, Networks, Operation, TransactionBuilder, Account} from '@stellar/stellar-sdk/base';
 import {
-  APPROVE_POLICY, SET_UP_WALLET, WALLET_FEE_FLOAT, WALLET_RESERVE, WalletSetupPendingError, approvalMessage, approvalStep, messageDigest,
-  nativeSetupOf, nativeSetupTransaction, nativeWalletConfiguration, policyApproval, setUpNativeWallet, walletStartingBalance,
+  APPROVE_POLICY, SET_UP_WALLET, WALLET_FEE_FLOAT, WALLET_RESERVE, approvalMessage, approvalStep, messageDigest,
+  nativeSetupOf, nativeSetupTransaction, nativeWalletConfiguration, policyApproval, prepareNativeSetup, sendNativeSetup, signedNativeSetupOf,
+  walletStartingBalance,
 } from '../dist/native-wallet.js';
 import {ownerChain} from '../dist/owner-chain.js';
 
@@ -26,6 +27,14 @@ const ownerSigns = signed => async step => {
   tx.sign(owner);
   return tx.toXDR();
 };
+/** One setup with the owner's signature: prepared, signed, countersigned and sent. */
+async function createWallet(fetch, amount = '0') {
+  const prepared = await prepareNativeSetup({network, ...roles, amount, fetch});
+  const signedPayload = prepared.complete(await ownerSigns([])(prepared.step));
+  const ledger = await sendNativeSetup(network, signedPayload, prepared.step.hash, fetch);
+  assert.ok(Number.isSafeInteger(ledger));
+  return {wallet: prepared.wallet, signedPayload, hash: prepared.step.hash, ledger};
+}
 /**
  * The public network: the owner's account, the transactions that it was sent, and each created wallet account
  * with its signers. `send` decides what a submission answers.
@@ -129,71 +138,52 @@ test('the installation document is the document of the rail setup', () => {
   assert.throws(() => nativeWalletConfiguration(network, roles.owner, roles.owner, roles.agent, roles.server), /four accounts/);
 });
 
-test('the owner signs once: the new account countersigns, the network takes the setup and the journal is empty', async () => {
-  const {state, fetch} = ledger(), signed = [], journal = journalOf(), steps = [];
-  const result = await setUpNativeWallet({network, ...roles, amount: '5', sign: ownerSigns(signed), onStep: s => steps.push(s), journal, key: 'k', fetch});
+test('the owner signs once: the new account countersigns and the network takes the setup', async () => {
+  const {state, fetch} = ledger(), signed = [];
+  const prepared = await prepareNativeSetup({network, ...roles, amount: '5', fetch});
+  assert.equal(prepared.step.action, SET_UP_WALLET);
+  const signedPayload = prepared.complete(await ownerSigns(signed)(prepared.step));
   assert.deepEqual(signed, [SET_UP_WALLET]);
+  const result = await sendNativeSetup(network, signedPayload, prepared.step.hash, fetch);
   assert.equal(state.posted.length, 1);
   const tx = TransactionBuilder.fromXDR(state.posted[0], Networks.TESTNET), setup = nativeSetupOf(state.posted[0], network);
-  assert.deepEqual({...setup, startingBalance: undefined}, {...roles, wallet: result.wallet, startingBalance: undefined});
+  assert.deepEqual({...setup, startingBalance: undefined}, {...roles, wallet: prepared.wallet, startingBalance: undefined});
   assert.equal(setup.startingBalance, WALLET_RESERVE + WALLET_FEE_FLOAT + 50_000_000n);
   // Two signatures over the same hash: the owner's and the new account's own.
   assert.equal(tx.signatures.length, 2);
-  for (const key of [owner, Keypair.fromPublicKey(result.wallet)])
+  for (const key of [owner, Keypair.fromPublicKey(prepared.wallet)])
     assert.ok(tx.signatures.some(s => key.verify(tx.hash(), Buffer.from(s.signature instanceof Uint8Array ? s.signature : s.signature.value))), key.publicKey());
-  assert.deepEqual([result.transactionHash, result.ledger], [hex(tx.hash()), 8]);
-  assert.deepEqual(result.configuration, nativeWalletConfiguration(network, result.wallet, roles.owner, roles.agent, roles.server));
-  assert.equal(journal.map.size, 0);
+  assert.deepEqual([prepared.step.hash, result], [hex(tx.hash()), 8]);
+  // The signed bytes name their hash, roles and own time bound.
+  assert.deepEqual(signedNativeSetupOf(signedPayload, network), {hash: prepared.step.hash, ...roles, wallet: prepared.wallet, validUntil: Number(tx.timeBounds.maxTime)});
+  for (const other of ['not-xdr', nativeSetupTransaction(terms(Keypair.random().publicKey())).toXDR()])
+    assert.equal(signedNativeSetupOf(other, network)?.hash === prepared.step.hash, false);
+  assert.equal(signedNativeSetupOf(signedPayload, 'stellar:other'), null);
   // Each setup makes a new account: the key is random and nothing keeps it.
-  const second = await setUpNativeWallet({network, ...roles, amount: '5', sign: ownerSigns(signed), onStep() {}, journal, key: 'k', fetch});
-  assert.notEqual(second.wallet, result.wallet);
-  // A wallet that returns another transaction, or an unsigned one, sends nothing.
-  const before = state.posted.length;
-  await assert.rejects(setUpNativeWallet({network, ...roles, amount: '5', sign: async () => nativeSetupTransaction(terms(Keypair.random().publicKey())).toXDR(), onStep() {}, journal, key: 'k', fetch}), /another transaction/);
-  await assert.rejects(setUpNativeWallet({network, ...roles, amount: '5', sign: async step => step.payload, onStep() {}, journal, key: 'k', fetch}), /another transaction/);
-  for (const amount of ['-1', '1.00000001', 'all']) await assert.rejects(setUpNativeWallet({network, ...roles, amount, sign: ownerSigns(signed), onStep() {}, journal, key: 'k', fetch}));
-  assert.equal(state.posted.length, before);
-  assert.equal(journal.map.size, 0);
+  const second = await prepareNativeSetup({network, ...roles, amount: '5', fetch});
+  assert.notEqual(second.wallet, prepared.wallet);
+  // A wallet that returns another transaction, or an unsigned one, is refused before anything is sent.
+  assert.throws(() => second.complete(nativeSetupTransaction(terms(Keypair.random().publicKey())).toXDR()), /another transaction/);
+  assert.throws(() => second.complete(second.step.payload), /another transaction/);
+  for (const amount of ['-1', '1.00000001', 'all']) await assert.rejects(prepareNativeSetup({network, ...roles, amount, fetch}), /at most seven decimals/);
+  assert.equal(state.posted.length, 1);
 });
 
-test('a setup whose result is unknown stays saved and is settled before anything is signed again', async () => {
-  const {state, fetch} = ledger({send: 'lost'}), signed = [], journal = journalOf();
-  const input = {network, ...roles, amount: '5', sign: ownerSigns(signed), onStep() {}, journal, key: 'k', fetch};
-  await assert.rejects(setUpNativeWallet(input), error => error instanceof WalletSetupPendingError && error.retry);
-  const saved = JSON.parse(journal.get('k'));
-  const wallet = nativeSetupOf(saved.signedPayload, network).wallet;
-  // The network has no record yet and the time bound lasts: the same bytes go again, and nothing is signed.
-  state.send = 'ok';
-  const settled = await setUpNativeWallet(input);
-  assert.deepEqual([settled.wallet, settled.transactionHash, signed.length, state.posted.length], [wallet, saved.hash, 1, 2]);
-  assert.equal(state.posted[0], state.posted[1]);
-  assert.equal(journal.map.size, 0);
-  // Another agent key or amount never replaces a saved signed setup.
-  state.send = 'lost';
-  await assert.rejects(setUpNativeWallet(input), WalletSetupPendingError);
-  for (const other of [{agent: Keypair.random().publicKey()}, {amount: '6'}])
-    await assert.rejects(setUpNativeWallet({...input, ...other}), /another agent key or amount/);
-  assert.equal(signed.length, 2);
-  // The network holds the setup as failed: it created nothing, and a new setup with a new account is signed.
-  state.send = 'failed';
-  const failed = JSON.parse(journal.get('k'));
-  state.held.set(failed.hash, {hash: failed.hash, successful: false, ledger: 9, signed: failed.signedPayload});
-  state.send = 'ok';
-  const replaced = await setUpNativeWallet(input);
-  assert.notEqual(replaced.wallet, nativeSetupOf(failed.signedPayload, network).wallet);
-  assert.equal(signed.length, 3);
-  // Unreadable saved bytes are never replaced.
-  await assert.rejects(setUpNativeWallet({...input, journal: journalOf({k: '{"hash":"x"}'})}), /unreadable/);
-});
-
-test('a retained setup names the same wallet again until its caller drops it', async () => {
-  const {state, fetch} = ledger(), signed = [], journal = journalOf();
-  const input = {network, ...roles, amount: '0', sign: ownerSigns(signed), onStep() {}, journal, key: 'k', retain: true, fetch};
-  const first = await setUpNativeWallet(input);
-  assert.ok(journal.get('k'));
-  const again = await setUpNativeWallet(input);
-  assert.deepEqual([again.wallet, again.transactionHash, signed.length, state.posted.length], [first.wallet, first.transactionHash, 1, 1]);
-  assert.equal(nativeSetupOf(state.posted[0], network).startingBalance, WALLET_RESERVE + WALLET_FEE_FLOAT);
+test('a send without a certain answer is null: lost, refused or a record of another transaction', async () => {
+  for (const send of ['lost', 'failed']) {
+    const {state, fetch} = ledger({send});
+    const prepared = await prepareNativeSetup({network, ...roles, amount: '5', fetch});
+    const signedPayload = prepared.complete(await ownerSigns([])(prepared.step));
+    assert.equal(await sendNativeSetup(network, signedPayload, prepared.step.hash, fetch), null, send);
+    assert.equal(state.posted.length, 1);
+  }
+  const {fetch} = ledger();
+  const prepared = await prepareNativeSetup({network, ...roles, amount: '5', fetch});
+  const signedPayload = prepared.complete(await ownerSigns([])(prepared.step));
+  assert.equal(await sendNativeSetup(network, signedPayload, hex(Buffer.alloc(32)), fetch), null);
+  assert.equal(await sendNativeSetup('other:testnet', signedPayload, prepared.step.hash, fetch), null);
+  // The owner account that the network cannot read prepares nothing.
+  await assert.rejects(prepareNativeSetup({network, ...roles, owner: Keypair.random().publicKey(), amount: '5', fetch}), /owner account could not be read/);
 });
 
 const canonicalJson = value => Array.isArray(value) ? `[${value.map(canonicalJson).join(',')}]`
@@ -246,36 +236,36 @@ test('only the exact approval message of this network is read, and its step carr
  * The hooks that the SDK's owner workflows call for a Native wallet, together: the setup creates and funds the account
  * once and names it again for a resume, and the owner's approval is read, checked and signed by the account's owner.
  */
-test('the Native hooks set up the account once and accept only its owner\'s approval of the reviewed policy', async () => {
-  const {state: chain, fetch} = ledger(), signed = [], journal = journalOf();
+test('the Native hooks set up the account and accept only its owner\'s approval of the reviewed policy', async () => {
+  const {state: chain, fetch} = ledger(), signed = [];
   globalThis.fetch = fetch;
-  const input = {network, ...roles, amount: '5', sign: ownerSigns(signed), onStep() {}, journal, key: 'flow:wallet-setup', retain: true};
-  const setup = await ownerChain.keypairSetup.run(input);
-  // The signed setup stays saved for the registration, and names this wallet and agent.
-  const saved = JSON.parse(journal.get('flow:wallet-setup'));
-  const named = ownerChain.keypairSetup.of(saved.signedPayload, network);
-  assert.deepEqual([named.wallet, named.agent], [setup.wallet, roles.agent]);
+  const prepared = await ownerChain.keypairSetup.prepare({network, ...roles, amount: '5'});
+  const signedPayload = prepared.complete(await ownerSigns(signed)(prepared.step));
+  const read = ownerChain.keypairSetup.read(signedPayload, network);
+  assert.deepEqual([read.hash, read.wallet, read.agent], [prepared.step.hash, prepared.wallet, roles.agent]);
+  assert.equal(await ownerChain.keypairSetup.send(network, signedPayload, prepared.step.hash), 8);
+  assert.deepEqual(await ownerChain.transaction(network, prepared.step.hash), {hash: prepared.step.hash, ledger: 8, successful: true});
   assert.equal(nativeSetupOf(chain.posted[0], network).startingBalance, WALLET_RESERVE + WALLET_FEE_FLOAT + 50_000_000n);
-  // A resume names the same account and signs no second setup.
-  const again = await ownerChain.keypairSetup.run(input);
-  assert.deepEqual([again.wallet, signed, chain.posted.length], [setup.wallet, [SET_UP_WALLET], 1]);
+  assert.deepEqual(ownerChain.keypairSetup.configuration(network, prepared.wallet, roles.owner, roles.agent, roles.server),
+    nativeWalletConfiguration(network, prepared.wallet, roles.owner, roles.agent, roles.server));
   // The approval of the reviewed policy for this account holds; its owner signs it, and only that signature counts.
-  const {message} = approval({wallet: setup.wallet});
+  const {message} = approval({wallet: prepared.wallet});
   const fields = ownerChain.approval.read(message, network);
-  assert.equal(ownerChain.approval.holds(fields, setup.wallet, reviewedOf()), true);
+  assert.equal(ownerChain.approval.holds(fields, prepared.wallet, reviewedOf()), true);
   const step = ownerChain.approval.step(message);
   assert.deepEqual([step.action, step.hash], [APPROVE_POLICY, messageDigest(message)]);
-  const owner = await ownerChain.approval.walletOwner(network, setup.wallet);
-  assert.equal(owner, roles.owner);
+  const walletOwner = await ownerChain.approval.walletOwner(network, prepared.wallet);
+  assert.equal(walletOwner, roles.owner);
   const signature = Array.from(Buffer.from(await ownerSigns(signed)(step), 'base64'));
-  assert.equal(ownerChain.approval.signedBy(owner, step.hash, signature), true);
-  assert.equal(ownerChain.approval.signedBy(owner, step.hash, Array.from(agent.sign(Buffer.from(step.hash, 'hex')))), false);
+  assert.equal(ownerChain.approval.signedBy(walletOwner, step.hash, signature), true);
+  assert.equal(ownerChain.approval.signedBy(walletOwner, step.hash, Array.from(agent.sign(Buffer.from(step.hash, 'hex')))), false);
+  assert.deepEqual(signed, [SET_UP_WALLET, APPROVE_POLICY]);
 });
 
 test('an approval holds only for the reviewed policy, the wallet\'s own configuration and the requested values', async () => {
   const {fetch} = ledger();
   globalThis.fetch = fetch;
-  const setup = await setUpNativeWallet({network, ...roles, amount: '0', sign: ownerSigns([]), onStep() {}, journal: journalOf(), key: 'k', fetch});
+  const setup = await createWallet(fetch);
   const holds = (message, policy) => {
     const fields = ownerChain.approval.read(message, network);
     return fields !== null && ownerChain.approval.holds(fields, setup.wallet, policy);
@@ -320,19 +310,16 @@ test('the owner pays every part of a setup: the server\'s account is no source, 
   assert.equal(rest.at(-1).signer.ed25519PublicKey, roles.server);
 });
 
-test('a setup signed by another account than the owner is refused before it is saved or sent', async () => {
-  const {state: chain, fetch} = ledger(), journal = journalOf();
-  globalThis.fetch = fetch;
+test('a setup signed by another account than the owner is refused before it is sent', async () => {
+  const {state: chain, fetch} = ledger();
   const stranger = Keypair.random();
-  const strangerSigns = async step => {
-    const tx = TransactionBuilder.fromXDR(step.payload, Networks.TESTNET);
-    tx.sign(stranger);
-    return tx.toXDR();
-  };
-  await assert.rejects(setUpNativeWallet({network, ...roles, amount: '5', sign: strangerSigns, onStep() {}, journal, key: 'k', fetch}), /another account than the owner/);
-  assert.deepEqual([journal.map.size, chain.posted.length], [0, 0]);
+  const prepared = await prepareNativeSetup({network, ...roles, amount: '5', fetch});
+  const tx = TransactionBuilder.fromXDR(prepared.step.payload, Networks.TESTNET);
+  tx.sign(stranger);
+  assert.throws(() => prepared.complete(tx.toXDR()), /another account than the owner/);
+  assert.equal(chain.posted.length, 0);
   // The owner then signs, and the setup goes through.
-  const setup = await setUpNativeWallet({network, ...roles, amount: '5', sign: ownerSigns([]), onStep() {}, journal, key: 'k', fetch});
+  const signedPayload = prepared.complete(await ownerSigns([])(prepared.step));
+  assert.equal(await sendNativeSetup(network, signedPayload, prepared.step.hash, fetch), 8);
   assert.equal(chain.posted.length, 1);
-  assert.ok(setup.wallet);
 });

@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {Account, Keypair, Networks, Operation, TransactionBuilder} from '@stellar/stellar-sdk/base';
 import {ownerChain} from '../dist/owner-chain.js';
-import {WalletSetupPendingError} from '../dist/native-wallet.js';
 
 const network = 'stellar:testnet';
 const hash = n => String(n).repeat(64).slice(0, 64);
@@ -121,10 +120,4 @@ test('an approval signature counts only when the named signer made it over the s
   assert.equal(ownerChain.approval.signedBy(owner.publicKey(), hash(5), signature), false);
   assert.equal(ownerChain.approval.signedBy('not a key', step.hash, signature), false);
   assert.equal(ownerChain.approval.signedBy(owner.publicKey(), step.hash, signature.slice(1)), false);
-});
-
-test('a setup failure that stays saved is pending; any other failure is not', () => {
-  assert.equal(ownerChain.keypairSetup.pending(new WalletSetupPendingError('unknown result')), true);
-  assert.equal(ownerChain.keypairSetup.pending(new Error('refused')), false);
-  assert.equal(ownerChain.keypairSetup.of('not-xdr', network), null);
 });

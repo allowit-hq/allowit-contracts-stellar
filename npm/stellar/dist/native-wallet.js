@@ -4,13 +4,14 @@
  * key and the server pay from it only together. The account's own key is random, signs the creation once and then
  * has weight 0. The agent holds a key and no account.
  *
- * This module builds the setup from the owner's own sequence, sends the signed bytes to the public network itself
- * and returns the installation document that the server registers. The server takes no part in the setup.
+ * This module builds the setup from the owner's own sequence, reads and sends the signed bytes, and returns the
+ * installation document that the server registers. The SDK's owner workflow keeps the signed setup and decides when to
+ * send it again or replace it. The server takes no part in the setup.
  */
 import { Account, Keypair, Memo, Operation, StrKey, TransactionBuilder } from '@stellar/stellar-sdk/base';
 import { sha256 } from '@noble/hashes/sha256';
 import { canonicalNetwork, networkPassphrase } from './networks.js';
-import { ChainUnchecked, expiredRecord, horizonGet, horizonOrigin } from './chain-record.js';
+import { horizonOrigin } from './chain-record.js';
 import { stellarAssetContract } from './stellar-asset.js';
 /** The action of the owner step that creates the agent's wallet account. */
 export const SET_UP_WALLET = 'set_up_wallet';
@@ -162,61 +163,11 @@ export function nativeSetupOf(payload, network) {
     }
     return { owner, wallet, agent, server, startingBalance: starting };
 }
-/** An uncertain setup: the signed transaction stays saved, and the next call settles it before it signs anything. */
-export class WalletSetupPendingError extends Error {
-    retry = true;
-    constructor(message, cause) {
-        super(message, { cause });
-        this.name = 'WalletSetupPendingError';
-    }
-}
-function savedSetup(journal, key) {
-    const raw = journal.get(key);
-    if (raw === null)
-        return null;
-    let value;
-    try {
-        value = JSON.parse(raw);
-    }
-    catch { /* unreadable below */ }
-    if (!object(value) || typeof value.hash !== 'string' || !/^[0-9a-f]{64}$/.test(value.hash) || typeof value.signedPayload !== 'string'
-        || typeof value.owner !== 'string' || typeof value.agent !== 'string' || typeof value.server !== 'string' || typeof value.amount !== 'string')
-        throw new WalletSetupPendingError('The saved signed wallet setup is unreadable. It stays saved; nothing was signed.');
-    return value;
-}
-/** Setups that run in this page, by lock name. */
-const running = new Set();
 /**
- * Sets up the wallet account of an agent: one transaction that the owner's wallet signs. The account's own key is
- * random and lives in this call only; it signs the creation once, beside the owner.
- *
- * The signed bytes are saved before they are sent. A send whose result is unknown keeps them, and the next call
- * settles that setup first: it is done when the network holds it as successful, it is sent again while its time
- * bound lasts, and it is dropped only when the network holds it as failed or has read past its time bound without
- * it. Only then is a new setup prepared, so one call never creates two wallets. A setup that stopped before the
- * owner signed names a new account on its next run: nothing was signed for the earlier one.
+ * Prepares the setup of the wallet account of an agent: one transaction from the owner's own sequence. The account's
+ * own key is random; it signs the creation once, beside the owner, in `complete`.
  */
-export async function setUpNativeWallet(input) {
-    const name = `allowit.wallet-setup:${input.key}`;
-    const busy = () => new WalletSetupPendingError('This wallet setup is already running in this or another tab. Nothing was signed.');
-    if (running.has(name))
-        throw busy();
-    running.add(name);
-    try {
-        const locks = globalThis.navigator?.locks;
-        if (!locks)
-            return await setUp(input);
-        return await locks.request(name, { ifAvailable: true }, async (lock) => {
-            if (!lock)
-                throw busy();
-            return setUp(input);
-        });
-    }
-    finally {
-        running.delete(name);
-    }
-}
-async function setUp({ network, owner, agent, server, amount, sign, onStep, journal, key, retain = false, fetch: send = fetch }) {
+export async function prepareNativeSetup({ network, owner, agent, server, amount, fetch: send = fetch }) {
     const id = canonicalNetwork(network), base = horizonOrigin(network);
     if (!id || !base)
         throw new Error('Select a supported Stellar network.');
@@ -224,104 +175,64 @@ async function setUp({ network, owner, agent, server, amount, sign, onStep, jour
     if (funding === null)
         throw new Error('Enter an amount of XLM with at most seven decimals.');
     const passphrase = networkPassphrase(id);
-    const json = async (response) => response.json().catch(() => null);
-    const pending = (cause) => new WalletSetupPendingError('The network did not confirm the wallet setup. The signed setup stays saved: resume to check it. Nothing is signed twice.', cause);
-    const result = (wallet, hash, ledger) => ({ wallet, transactionHash: hash, ledger, configuration: nativeWalletConfiguration(id, wallet, owner, agent, server) });
-    const settled = (record, hash) => object(record) && record.hash === hash && record.successful === true && Number.isSafeInteger(record.ledger)
-        ? record.ledger : null;
-    /** Sends signed bytes. Null means that the network gave no certain answer. */
-    const submit = async (signedPayload, hash) => {
-        const sent = await send(`${base}/transactions`, {
-            method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: `tx=${encodeURIComponent(signedPayload)}`, signal: AbortSignal.timeout(60_000),
-        }).catch(() => null);
-        return sent?.ok ? settled(await json(sent), hash) : null;
-    };
-    const saved = savedSetup(journal, key);
-    if (saved) {
-        if (saved.owner !== owner || saved.agent !== agent || saved.server !== server || saved.amount !== amount)
-            throw new WalletSetupPendingError('A signed wallet setup with another agent key or amount is saved. It stays saved; use the agent key and amount of that setup.');
-        onStep('Checking the saved wallet setup…');
-        // The saved bytes decide: their hash, the account that they create and their own time bound.
-        const setup = nativeSetupOf(saved.signedPayload, id);
-        let validUntil = NaN;
-        try {
-            const tx = TransactionBuilder.fromXDR(saved.signedPayload, passphrase);
-            if (!('innerTransaction' in tx) && hex(tx.hash()) === saved.hash)
-                validUntil = Number(tx.timeBounds?.maxTime);
-        }
-        catch { /* unreadable below */ }
-        if (!setup || setup.owner !== owner || setup.agent !== agent || setup.server !== server || !Number.isSafeInteger(validUntil) || validUntil <= 0)
-            throw new WalletSetupPendingError('The saved signed wallet setup is unreadable. It stays saved; nothing was signed.');
-        const found = await horizonGet(id, `/transactions/${saved.hash}`, send);
-        if (!found)
-            throw pending();
-        if (found.ok) {
-            // Only the record of this exact transaction settles it: successful, or failed in a ledger.
-            const record = await json(found);
-            const ledger = settled(record, saved.hash);
-            if (ledger !== null) {
-                if (!retain)
-                    journal.remove(key);
-                return result(setup.wallet, saved.hash, ledger);
-            }
-            if (!object(record) || record.hash !== saved.hash || record.successful !== false || !Number.isSafeInteger(record.ledger))
-                throw pending();
-            // The network holds the setup as failed: it used its sequence, created nothing and can never apply.
-        }
-        else if (found.status !== 404)
-            throw pending();
-        else if (validUntil >= Math.floor(Date.now() / 1000)) {
-            // The same signed bytes go again while their time bound lasts.
-            const ledger = await submit(saved.signedPayload, saved.hash);
-            if (ledger === null)
-                throw pending();
-            if (!retain)
-                journal.remove(key);
-            return result(setup.wallet, saved.hash, ledger);
-        }
-        else {
-            // Past its time bound a missing record proves nothing: history can lack an applied setup.
-            const record = await expiredRecord(id, saved.hash, saved.signedPayload, send).catch(cause => { throw pending(cause instanceof ChainUnchecked ? cause : undefined); });
-            if (record) {
-                if (!retain)
-                    journal.remove(key);
-                return result(setup.wallet, saved.hash, record.ledger);
-            }
-        }
-        journal.remove(key);
-    }
-    onStep('Preparing the wallet…');
     const read = await send(`${base}/accounts/${owner}`, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(15_000) }).catch(() => null);
-    const account = read?.ok ? await json(read) : null;
+    const account = read?.ok ? await read.json().catch(() => null) : null;
     if (!object(account) || account.account_id !== owner || typeof account.sequence !== 'string' || !/^[0-9]{1,19}$/.test(account.sequence))
         throw new Error('The owner account could not be read from the network.');
-    // The setup key is random and lives in this call only. Nothing stores, derives or recovers it.
+    // The setup key is random and lives in this object only. Nothing stores, derives or recovers it.
     const setupKey = Keypair.random(), wallet = setupKey.publicKey();
     const requestId = `wallet-${hex(setupKey.rawPublicKey()).slice(0, 32)}`;
     const tx = nativeSetupTransaction({ network: id, owner, sequence: account.sequence, wallet, agent, server, funding, requestId, expiresAt: Math.floor(Date.now() / 1000) + 300 });
     const hash = hex(tx.hash()), expiresAt = Number(tx.timeBounds?.maxTime);
-    onStep('Sign the wallet setup in your wallet…');
-    const ownerSigned = await sign({ action: SET_UP_WALLET, payload: tx.toXDR(), hash, expiresAt });
-    const signed = TransactionBuilder.fromXDR(ownerSigned, passphrase);
-    if ('innerTransaction' in signed || hex(signed.hash()) !== hash || signed.signatures.length !== 1)
-        throw new Error('The wallet returned another transaction. Nothing was sent.');
-    // The one signature must be the owner's: the transaction hash leaves signatures out, so another key's signature
-    // would pass the check above and the network would refuse the setup.
-    if (!Keypair.fromPublicKey(owner).verify(signed.hash(), signed.signatures[0].signature.value))
-        throw new Error('The wallet signed with another account than the owner. Nothing was saved or sent; sign with the owner account.');
-    // The new account's own key signs its creation once, beside the owner. Then the key is dropped.
-    signed.sign(setupKey);
-    const signedPayload = signed.toXDR();
-    // The signed bytes are saved before they leave: an unknown result is settled from them, never signed again.
-    journal.set(key, JSON.stringify({ hash, signedPayload, owner, agent, server, amount }));
-    onStep('Waiting for the network to confirm…');
-    const ledger = await submit(signedPayload, hash);
-    if (ledger === null)
-        throw pending();
-    if (!retain)
-        journal.remove(key);
-    return result(wallet, hash, ledger);
+    return {
+        wallet,
+        step: { action: SET_UP_WALLET, payload: tx.toXDR(), hash, expiresAt },
+        complete(ownerSigned) {
+            const signed = TransactionBuilder.fromXDR(ownerSigned, passphrase);
+            if ('innerTransaction' in signed || hex(signed.hash()) !== hash || signed.signatures.length !== 1)
+                throw new Error('The wallet returned another transaction. Nothing was sent.');
+            // The one signature must be the owner's: the transaction hash leaves signatures out, so another key's signature
+            // would pass the check above and the network would refuse the setup.
+            if (!Keypair.fromPublicKey(owner).verify(signed.hash(), signed.signatures[0].signature.value))
+                throw new Error('The wallet signed with another account than the owner. Nothing was saved or sent; sign with the owner account.');
+            signed.sign(setupKey);
+            return signed.toXDR();
+        },
+    };
+}
+/**
+ * What signed setup bytes are: their hash, their roles and their own time bound. Null for bytes that are no setup of
+ * this network. The signed bytes decide; saved metadata is unsigned.
+ */
+export function signedNativeSetupOf(signedPayload, network) {
+    const id = canonicalNetwork(network);
+    const setup = id ? nativeSetupOf(signedPayload, id) : null;
+    if (!id || !setup)
+        return null;
+    try {
+        const tx = TransactionBuilder.fromXDR(signedPayload, networkPassphrase(id));
+        if ('innerTransaction' in tx)
+            return null;
+        const validUntil = Number(tx.timeBounds?.maxTime);
+        if (!Number.isSafeInteger(validUntil) || validUntil <= 0)
+            return null;
+        return { hash: hex(tx.hash()), owner: setup.owner, wallet: setup.wallet, agent: setup.agent, server: setup.server, validUntil };
+    }
+    catch {
+        return null;
+    }
+}
+/** Sends signed setup bytes to Horizon. The ledger of the successful transaction, or null without a certain answer. */
+export async function sendNativeSetup(network, signedPayload, hash, send = fetch) {
+    const base = horizonOrigin(network);
+    if (!base)
+        return null;
+    const sent = await send(`${base}/transactions`, {
+        method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: `tx=${encodeURIComponent(signedPayload)}`, signal: AbortSignal.timeout(60_000),
+    }).catch(() => null);
+    const record = sent?.ok ? await sent.json().catch(() => null) : null;
+    return object(record) && record.hash === hash && record.successful === true && Number.isSafeInteger(record.ledger) ? record.ledger : null;
 }
 /** The SEP-53 digest of a wallet message, as lowercase hexadecimal. */
 export function messageDigest(message) {

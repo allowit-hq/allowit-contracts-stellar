@@ -1,5 +1,5 @@
 import { expiredRecord } from './chain-record.js';
-import { type NativeWalletSetup, type NativeWalletSetupInput, type PolicyApproval, type ReviewedPolicy } from './native-wallet.js';
+import { nativeWalletConfiguration, prepareNativeSetup, signedNativeSetupOf, type PolicyApproval, type ReviewedPolicy } from './native-wallet.js';
 /** What history holds for a transaction: `'missing'`, its record, or null when the read gave no clear answer. */
 export type TransactionRecord = 'missing' | {
     hash: string;
@@ -17,16 +17,15 @@ export declare const ownerChain: Readonly<{
     transaction: typeof transaction;
     /** Its ledger when the signed step applied before its time bound, null when it can never apply; throws when unknown. */
     expiredRecord: typeof expiredRecord;
-    /** A Native wallet account: one owner signature creates and funds it. */
+    /**
+     * A Native wallet account: one owner signature creates and funds it. The SDK keeps the signed setup in its journal
+     * and decides when to send it again or replace it; these steps only build, read and send Stellar transactions.
+     */
     keypairSetup: Readonly<{
-        run: (input: NativeWalletSetupInput) => Promise<NativeWalletSetup>;
-        /** The wallet and agent of a signed setup, or null. */
-        of: (signedPayload: string, network: string) => {
-            wallet: string;
-            agent: string;
-        } | null;
-        /** True when a failed setup stays saved and the same run can resume it without a new signature. */
-        pending: (error: unknown) => boolean;
+        prepare: typeof prepareNativeSetup;
+        read: typeof signedNativeSetupOf;
+        send: (network: string, signedPayload: string, hash: string) => Promise<number | null>;
+        configuration: typeof nativeWalletConfiguration;
     }>;
     /** The owner's approval of a Native policy: one message signature, and no transaction. */
     approval: Readonly<{

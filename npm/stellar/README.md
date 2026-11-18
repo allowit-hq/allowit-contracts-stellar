@@ -35,8 +35,9 @@ signed step whose result is unknown and their typed errors. `ownerChain` supplie
   null when it can never apply. The signed bytes decide the time bound. The step never applied only when Horizon has
   read past that bound and holds the failed transaction, or holds none while the source sequence is still below the
   transaction's. Anything else rejects, and the SDK keeps the step.
-- `keypairSetup`: `run` sets up a Native wallet account (below), `of` reads the wallet and agent of a signed setup, and
-  `pending` names a setup that stays saved for a resume.
+- `keypairSetup`: `prepare` builds a Native wallet account's setup (below) and returns its step with `complete`, which
+  checks the owner's signed bytes and adds the new account's own signature; `read` reads the hash, roles and time bound
+  of signed setup bytes; `send` sends them to Horizon; `configuration` is the installation document of the account.
 - `approval`: `read` reads the exact approval message of a network, `holds` checks it against the reviewed policy and
   the wallet's own configuration, `step` makes the `approve_policy` step, `walletOwner` reads the account's one signer
   of the owner's weight, and `signedBy` checks an Ed25519 signature over the step's digest.
@@ -51,17 +52,18 @@ A Native policy needs the wallet account of its agent: a new classic account, on
 `installAndFund` deploys it without a server step. The service answers the deployment of such a draft with
 `wallet_setup_required` and the roles `{owner, agent, server}`. The workflow then, with these hooks:
 
-1. Builds the setup from the owner's own sequence (`native-wallet.ts`): one transaction that creates the account with
+1. Builds the setup from the owner's own sequence (`prepareNativeSetup` in `native-wallet.ts`): one transaction that creates the account with
    its starting balance, adds the owner signer (weight 3), the agent signer (1) and the server signer (1), sets the
    thresholds 2, 2 and 3 and gives the account's own key weight 0. The starting balance is the reserve of the account
    (2.5 XLM), 0.5 XLM for the fees of the owner's own steps and the owner's funding amount.
-2. Has the host's `sign` sign it as the step `set_up_wallet`. The account's own key is random, lives in that call only
+2. Has the host's `sign` sign it as the step `set_up_wallet`. The account's own key is random, lives in `complete` only
    and signs the creation once beside the owner. The `owner-sign` element reads the step from its bytes: it shows the
    wallet account, the agent and the funding, and it refuses any transaction that is not exactly this setup.
-3. Sends the signed bytes to Horizon itself. They stay in the journal under `<key>:wallet-setup` until the service has
-   registered the wallet, so a run that stops in between names the same account again and signs no second setup. A
-   result that is unknown is settled first: done when Horizon holds it as successful, sent again while its time bound
-   lasts, and replaced only when Horizon holds it as failed or has read past its time bound without it.
+3. Saves the signed bytes in the host's journal under `<key>:wallet-setup` and sends them with `send`. They stay saved
+   until the service has registered the wallet, so a run that stops in between names the same account again and signs
+   no second setup. A result that is unknown is settled first: done when Horizon holds it as successful, sent again
+   while its time bound lasts, and replaced only when Horizon holds it as failed or has read past its time bound
+   without it.
 4. Registers the account for the policy (`native/register` with the installation document and the `policyId`).
 5. Asks for the owner's approval of the policy (`native/approval`) and has `sign` sign it as the step `approve_policy`:
    a message, never a transaction. The payload is the base64 UTF-8 text of the message, and the hash its SEP-53 digest.

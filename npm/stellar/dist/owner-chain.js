@@ -1,11 +1,12 @@
 /**
  * What the SDK's owner workflows need from Stellar: the network's record of a transaction, the record of an expired
- * signed step, the setup of a Native wallet account and the owner's approval of a Native policy. The SDK holds the
- * workflows, their journal and their recovery rules; these hooks only read the network and check Stellar signatures.
+ * signed step, the steps of a Native wallet account's setup and the owner's approval of a Native policy. The SDK holds
+ * the workflows, their journal and their recovery rules; these hooks build, send and read Stellar transactions and
+ * check Stellar signatures.
  */
 import { Keypair } from '@stellar/stellar-sdk/base';
 import { expiredRecord, horizonGet } from './chain-record.js';
-import { OWNER_WEIGHT, WalletSetupPendingError, approvalStep, nativeApprovalHolds, nativeSetupOf, policyApproval, setUpNativeWallet } from './native-wallet.js';
+import { OWNER_WEIGHT, approvalStep, nativeApprovalHolds, nativeWalletConfiguration, policyApproval, prepareNativeSetup, sendNativeSetup, signedNativeSetupOf } from './native-wallet.js';
 const object = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 /** The record of a transaction in the public ledger history. */
 async function transaction(network, hash) {
@@ -39,13 +40,15 @@ export const ownerChain = Object.freeze({
     transaction,
     /** Its ledger when the signed step applied before its time bound, null when it can never apply; throws when unknown. */
     expiredRecord,
-    /** A Native wallet account: one owner signature creates and funds it. */
+    /**
+     * A Native wallet account: one owner signature creates and funds it. The SDK keeps the signed setup in its journal
+     * and decides when to send it again or replace it; these steps only build, read and send Stellar transactions.
+     */
     keypairSetup: Object.freeze({
-        run: (input) => setUpNativeWallet(input),
-        /** The wallet and agent of a signed setup, or null. */
-        of: (signedPayload, network) => nativeSetupOf(signedPayload, network),
-        /** True when a failed setup stays saved and the same run can resume it without a new signature. */
-        pending: (error) => error instanceof WalletSetupPendingError,
+        prepare: prepareNativeSetup,
+        read: signedNativeSetupOf,
+        send: (network, signedPayload, hash) => sendNativeSetup(network, signedPayload, hash),
+        configuration: nativeWalletConfiguration,
     }),
     /** The owner's approval of a Native policy: one message signature, and no transaction. */
     approval: Object.freeze({

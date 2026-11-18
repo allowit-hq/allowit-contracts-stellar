@@ -90,12 +90,10 @@ declare const plugin: Readonly<{
         transaction: (network: string, hash: string) => Promise<import("./owner-chain.js").TransactionRecord>;
         expiredRecord: typeof import("./chain-record.js").expiredRecord;
         keypairSetup: Readonly<{
-            run: (input: import("./native-wallet.js").NativeWalletSetupInput) => Promise<import("./native-wallet.js").NativeWalletSetup>;
-            of: (signedPayload: string, network: string) => {
-                wallet: string;
-                agent: string;
-            } | null;
-            pending: (error: unknown) => boolean;
+            prepare: typeof import("./native-wallet.js").prepareNativeSetup;
+            read: typeof import("./native-wallet.js").signedNativeSetupOf;
+            send: (network: string, signedPayload: string, hash: string) => Promise<number | null>;
+            configuration: typeof import("./native-wallet.js").nativeWalletConfiguration;
         }>;
         approval: Readonly<{
             read: (message: unknown, network: string) => import("./native-wallet.js").PolicyApproval | null;
