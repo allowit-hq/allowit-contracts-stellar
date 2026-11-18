@@ -24,10 +24,9 @@ export interface AdkOwnerSelection {
   validUntil: number;
   /**
    * The params update that the owner reviewed, for an `update_params` step. `params` then holds the complete new
-   * params. `deploymentVersion` is the configuration revision that the update writes, in canonical decimal text,
-   * and `x402Enabled` is the installed x402 choice, which the update keeps.
+   * params. `deploymentVersion` is the configuration revision that the update writes, in canonical decimal text.
    */
-  update?: {deploymentVersion: string; x402Enabled: boolean};
+  update?: {deploymentVersion: string};
 }
 
 type Verifier = {

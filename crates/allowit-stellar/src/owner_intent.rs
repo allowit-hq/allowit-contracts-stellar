@@ -600,6 +600,12 @@ fn validate_host(
             let HostFunction::InvokeContract(call) = &invoke.host_function else {
                 return Err("Owner creation goes through the deployer".into());
             };
+            if call.contract_address != address(&admin::deployer_address(&limits.network)?)? {
+                return Err(
+                    "Owner creation goes through another contract than the network's deployer"
+                        .into(),
+                );
+            }
             let mut items = Vec::new();
             for (asset, amount) in funding {
                 Contract::from_string(asset).map_err(err)?;

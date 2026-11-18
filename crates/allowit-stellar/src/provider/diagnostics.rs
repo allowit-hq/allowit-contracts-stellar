@@ -67,7 +67,7 @@ fn wallet_error_code(name: &str) -> &'static str {
     match name {
         "Paused" => "wallet_paused",
         "InsufficientFunds" => "insufficient_funds",
-        "Replay" | "StaleRequest" => "stale_request",
+        "StaleRequest" => "stale_request",
         _ => "wallet_rejected",
     }
 }

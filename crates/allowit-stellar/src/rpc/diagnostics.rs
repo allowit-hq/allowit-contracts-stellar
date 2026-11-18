@@ -115,7 +115,7 @@ pub enum WalletError {
     UnsupportedOperation = 16,
     InvalidInvocation = 17,
     PolicyDenied = 18,
-    Replay = 19,
+    GasAboveCap = 20,
 }
 impl WalletError {
     pub fn from_code(code: u32) -> Option<Self> {
@@ -135,7 +135,7 @@ impl WalletError {
             16 => Self::UnsupportedOperation,
             17 => Self::InvalidInvocation,
             18 => Self::PolicyDenied,
-            19 => Self::Replay,
+            20 => Self::GasAboveCap,
             _ => return None,
         })
     }
@@ -156,7 +156,7 @@ impl WalletError {
             Self::UnsupportedOperation => "UnsupportedOperation",
             Self::InvalidInvocation => "InvalidInvocation",
             Self::PolicyDenied => "PolicyDenied",
-            Self::Replay => "Replay",
+            Self::GasAboveCap => "GasAboveCap",
         }
     }
 }

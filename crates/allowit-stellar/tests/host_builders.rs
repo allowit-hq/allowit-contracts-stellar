@@ -394,7 +394,7 @@ fn installation_preserves_policy_instance_salt_and_constructor_binding() {
         c.wallet,
         wallet_address(NETWORK, &c.owner, &wallet_salt(&c.policy_instance)).unwrap()
     );
-    let constructor = PolicyConfig::for_policy(&c, false).unwrap();
+    let constructor = PolicyConfig::for_policy(&c).unwrap();
     constructor.constructor_args().unwrap();
     assert_eq!(c.source_hash, hash(SOURCE));
     assert_eq!(c.asset, sac_address(NETWORK, &x::Asset::Native).unwrap());
@@ -1016,7 +1016,9 @@ fn a_simulated_transaction_names_the_contract_it_invokes() {
             seen += 1;
         }
     }
-    assert_eq!(seen, 2);
+    // The recording simulation of the preparation; the sending account's enforcing simulation
+    // runs when it seals the transaction, after this fixture.
+    assert_eq!(seen, 1);
     // Text that is no transaction envelope names no contract.
     for other in ["", "invalid XDR"] {
         assert!(rpc::simulated_contract(other).is_none());
@@ -1049,7 +1051,7 @@ fn native_error_codes_follow_the_contract_and_host_envelope() {
         count += 1;
     }
     assert_eq!(count, 16);
-    for code in [0, 10, 12, 13, 20, 101, u32::MAX] {
+    for code in [0, 10, 12, 13, 19, 101, u32::MAX] {
         assert!(rpc::WalletError::from_code(code).is_none());
     }
     assert_eq!(
