@@ -2,7 +2,7 @@
 //! The server prepares the update and the owner client reconstructs it from its own document
 //! and its own RPC, so both sides derive the same `deploy_policy` packet.
 use crate::admin::PolicyDeployment;
-use crate::contract::CustodyState;
+use crate::packed::Configuration;
 use crate::host::{
     error::{Error, Result},
     owner::{Comparison, Counters, StateReadback, Verification},
@@ -183,7 +183,7 @@ fn ledger_height(rpc: &dyn rpc::Rpc) -> Result<u64> {
 }
 /// The executable hash and the decoded state of the wallet instance, read without trusting
 /// the document: a difference is a result of verification, not a failure of the read.
-fn wallet_instance(rpc: &dyn rpc::Rpc, wallet: &str) -> Result<([u8; 32], CustodyState)> {
+fn wallet_instance(rpc: &dyn rpc::Rpc, wallet: &str) -> Result<([u8; 32], Configuration)> {
     let contract = checked(native::address(wallet))?;
     let key = LedgerKey::ContractData(LedgerKeyContractData {
         contract: contract.clone(),
@@ -221,12 +221,15 @@ fn wallet_instance(rpc: &dyn rpc::Rpc, wallet: &str) -> Result<([u8; 32], Custod
         ));
     };
     let storage = instance.storage.ok_or_else(missing)?;
-    let raw = storage
+    let key = checked(native::value_symbol("c"))?;
+    let Some(ScVal::Bytes(raw)) = storage
         .iter()
-        .find(|entry| entry.key == ScVal::U32(0))
+        .find(|entry| entry.key == key)
         .map(|entry| &entry.val)
-        .ok_or_else(missing)?;
-    Ok((module.0, checked(CustodyState::from_scval(raw))?))
+    else {
+        return Err(missing());
+    };
+    Ok((module.0, checked(native::packed::configuration(raw.as_slice()))?))
 }
 /// Compare the owner's installation document with the ledger and read the wallet state back.
 /// The read uses the owner's RPC only. A difference is reported, not raised.

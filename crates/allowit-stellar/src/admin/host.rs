@@ -57,7 +57,7 @@ impl PolicyInstallation {
             module_digest: self.module_digest,
             max_fee_stroops: self.max_fee_stroops,
         };
-        PolicyConfig::for_policy(&config, false)?;
+        PolicyConfig::for_policy(&config)?;
         Ok(config)
     }
 }

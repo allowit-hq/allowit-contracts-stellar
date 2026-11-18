@@ -331,7 +331,7 @@ mod tests {
             max_fee_stroops: 1_000_000,
         };
         let (deployment, _) =
-            crate::admin::PolicyDeployment::for_source(&config, CODE, config.params.clone(), false)
+            crate::admin::PolicyDeployment::for_source(&config, CODE, config.params.clone())
                 .unwrap();
         let step = update_step(&config, &deployment, version, NOW);
         serde_json::json!({

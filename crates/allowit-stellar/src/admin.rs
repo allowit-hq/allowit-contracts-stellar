@@ -1,8 +1,7 @@
-//! Owner preparation for the layout 4 policy wallet interface: Wasm upload, wallet creation and
-//! owner calls. Preparation simulates and checks every authorization; it never signs. The owner
-//! validates its business intent with `owner_intent` before signing through a caller capability.
-//! SDK engine submits and observes the exact native hash.
-use crate::contract::{CustodyState, KeptState, PolicyBinding};
+//! Owner preparation for the layout 5 policy wallet interface: Wasm upload, the deployer's one-call
+//! creation and funding, and owner calls. Preparation simulates and checks every authorization; it
+//! never signs. The owner validates its business intent with `owner_intent` before signing through
+//! a caller capability. SDK engine submits and observes the exact native hash.
 use crate::*;
 use allowit_core::admin::{DeployPolicy, DeploymentVersion, RecoverFunds, SetPause};
 use serde_json::json;
@@ -15,18 +14,18 @@ pub use host::{PolicyInstallation, wallet_salt};
 pub struct PolicyDeployment {
     /// Native address of the desired policy owner; a changed owner must authorize too.
     pub owner: String,
-    /// Desired delegated agent address. Enabling x402 requires a native G-account.
+    /// The agent's key, as an account address. The agent needs no account.
     pub agent: String,
-    /// Independent service signer address.
+    /// The server's signing key, as an account address.
     pub server: String,
-    /// Standard prefix digest, or the complete compiled source digest for Custom.
-    pub source_digest: [u8; 32],
+    /// SHA-256 of the owner's full policy source, which the owner's policy signature binds.
+    pub source_hash: [u8; 32],
+    /// The most that the wallet repays for one request's network fee, in stroops.
+    pub gas_cap: i128,
     /// Ordered canonical rules: the standard prefix for Common, none otherwise.
     pub rules: Vec<String>,
     /// Replacement owner params; changing only them needs no code redeployment.
     pub params: PolicyParams,
-    /// Owner opt-in to x402 using the configured native G-agent Ed25519 key.
-    pub x402_enabled: bool,
     /// Optional uploaded policy executable hash to install atomically.
     pub wasm_hash: Option<[u8; 32]>,
 }
@@ -37,27 +36,27 @@ impl PolicyDeployment {
         c: &WalletConfig,
         source: &str,
         params: PolicyParams,
-        x402_enabled: bool,
     ) -> Result<(Self, policy::PolicyCheck)> {
         let tier = c.tier.ok_or("Selected policy tier is required")?;
         let rules = policy::tier_rules(tier, source)?;
-        let source_digest =
-            policy::installed_source_digest(tier, &c.module_digest, &c.asset, &rules, source)?;
-        if tier == PolicyTier::Custom && source_digest != c.source_digest {
+        let source_hash = hash(source.as_bytes());
+        if tier == PolicyTier::Custom && source_hash != c.source_hash {
             return Err(
                 "A Custom wallet binds its compiled source; new source needs new code".into(),
             );
         }
+        let source_digest =
+            policy::installed_source_digest(tier, &c.module_digest, &c.asset, &rules, source)?;
         let check = policy::policy_rules(tier, source, &rules, &source_digest, &params)?;
         Ok((
             Self {
                 owner: c.owner.clone(),
                 agent: c.agent.clone(),
                 server: c.server.clone(),
-                source_digest,
+                source_hash,
+                gas_cap: c.gas_cap,
                 rules,
                 params,
-                x402_enabled,
                 wasm_hash: None,
             },
             check,
@@ -65,48 +64,40 @@ impl PolicyDeployment {
     }
     /// Field checks of `contract_admin.py` `deployment`.
     pub fn validate(&self, version: DeploymentVersion) -> Result<()> {
-        if version.0 == 0 {
+        if version.0 == 0 || version.0 > u64::from(u32::MAX) {
             return Err("Invalid deployment version".into());
         }
-        for role in [&self.owner, &self.agent, &self.server] {
-            address(role)?;
-        }
+        address(&self.owner)?;
+        // The wallet stores the agent and server as raw Ed25519 keys.
+        account_key(&self.agent).map_err(|_| "The agent is an Ed25519 key")?;
+        account_key(&self.server).map_err(|_| "The server is an Ed25519 key")?;
         if [&self.agent, &self.server].contains(&&self.owner) || self.agent == self.server {
             return Err("Owner, agent and server must differ".into());
         }
-        if self.source_digest == [0; 32] {
-            return Err("Source digest must be nonzero".into());
+        if self.source_hash == [0; 32] {
+            return Err("Source hash must be nonzero".into());
+        }
+        if self.gas_cap < 0 {
+            return Err("The gas cap is not negative".into());
         }
         policy::parse_rules(&self.rules)?;
         self.params.check(PolicyTier::Custom)?;
-        if self.x402_enabled
-            && (account_key(&self.agent).is_err() || account_key(&self.server).is_err())
-        {
-            return Err("x402 requires native G-agent and G-server signers".into());
-        }
         Ok(())
     }
-    /// The exact `AllowitPolicyDeployment` argument.
+    /// The exact `AllowitPolicyUpdate` argument.
     pub fn scval(&self, version: DeploymentVersion) -> Result<ScVal> {
         self.validate(version)?;
-        contract::struct_value(vec![
-            ("agent", ScVal::Address(address(&self.agent)?)),
-            ("deployment_version", ScVal::U64(version.0)),
-            ("owner", ScVal::Address(address(&self.owner)?)),
-            ("params", self.params.scval()?),
-            ("rules", policy::rules_scval(&self.rules)?),
-            ("server", ScVal::Address(address(&self.server)?)),
-            ("source_digest", value_bytes(&self.source_digest)?),
-            (
-                "wasm_hash",
-                self.wasm_hash
-                    .as_ref()
-                    .map(|k| value_bytes(k))
-                    .transpose()?
-                    .unwrap_or(ScVal::Void),
-            ),
-            ("x402_enabled", ScVal::Bool(self.x402_enabled)),
-        ])
+        contract::policy_update(contract::PolicyUpdate {
+            deployment_version: u32::try_from(version.0).map_err(err)?,
+            owner: &self.owner,
+            agent: &self.agent,
+            server: &self.server,
+            source_hash: &self.source_hash,
+            gas_cap: self.gas_cap,
+            rules: &self.rules,
+            params: &self.params,
+            wasm_hash: self.wasm_hash.as_ref(),
+        })
     }
 }
 
@@ -118,16 +109,15 @@ pub struct PolicyConfig {
     pub agent: String,
     pub server: String,
     pub asset: String,
-    pub policy_instance: [u8; 32],
-    pub source_digest: [u8; 32],
+    pub source_hash: [u8; 32],
+    pub gas_cap: i128,
     pub rules: Vec<String>,
     pub params: PolicyParams,
-    pub x402_enabled: bool,
 }
 impl PolicyConfig {
     /// The constructor packet of a validated installation. `config.wallet` is the address that
     /// `wallet_address` derives, and `config.module_digest` the uploaded Wasm hash.
-    pub fn for_policy(c: &WalletConfig, x402_enabled: bool) -> Result<Self> {
+    pub fn for_policy(c: &WalletConfig) -> Result<Self> {
         validate_config(c)?;
         if c.route != WalletRoute::PolicyWallet {
             return Err("A contract policy-wallet rail is required".into());
@@ -145,11 +135,10 @@ impl PolicyConfig {
             agent: c.agent.clone(),
             server: c.server.clone(),
             asset: c.asset.clone(),
-            policy_instance: c.policy_instance,
-            source_digest: c.source_digest,
+            source_hash: c.source_hash,
+            gas_cap: c.gas_cap,
             rules: c.rules.clone(),
             params: c.params.clone(),
-            x402_enabled,
         };
         config.validate()?;
         Ok(config)
@@ -160,35 +149,31 @@ impl PolicyConfig {
             owner: self.owner.clone(),
             agent: self.agent.clone(),
             server: self.server.clone(),
-            source_digest: self.source_digest,
+            source_hash: self.source_hash,
+            gas_cap: self.gas_cap,
             rules: self.rules.clone(),
             params: self.params.clone(),
-            x402_enabled: self.x402_enabled,
             wasm_hash: None,
         }
         .validate(DeploymentVersion(1))?;
         Contract::from_string(&self.asset).map_err(err)?;
         account_key(&self.owner)
             .map_err(|_| "Policy wallet deployment source must be its G-account owner")?;
-        if self.policy_instance == [0; 32] {
-            return Err("Policy and source identities must be nonzero".into());
-        }
         Ok(())
     }
     /// The single constructor argument.
     pub fn constructor_args(&self) -> Result<Vec<ScVal>> {
         self.validate()?;
-        Ok(vec![contract::struct_value(vec![
-            ("agent", ScVal::Address(address(&self.agent)?)),
-            ("asset", ScVal::Address(address(&self.asset)?)),
-            ("owner", ScVal::Address(address(&self.owner)?)),
-            ("params", self.params.scval()?),
-            ("policy_instance", value_bytes(&self.policy_instance)?),
-            ("rules", policy::rules_scval(&self.rules)?),
-            ("server", ScVal::Address(address(&self.server)?)),
-            ("source_digest", value_bytes(&self.source_digest)?),
-            ("x402_enabled", ScVal::Bool(self.x402_enabled)),
-        ])?])
+        Ok(vec![contract::policy_config(contract::PolicyConfig {
+            owner: &self.owner,
+            agent: &self.agent,
+            server: &self.server,
+            asset: &self.asset,
+            source_hash: &self.source_hash,
+            gas_cap: self.gas_cap,
+            rules: &self.rules,
+            params: &self.params,
+        })?])
     }
 }
 
@@ -244,7 +229,7 @@ enum Reach {
 struct Snapshot {
     owner: AccountState,
     deployment_version: DeploymentVersion,
-    state: Option<CustodyState>,
+    state: Option<packed::Configuration>,
 }
 impl AccountState {
     /// `wallet_admin.py` `owner_only`: only the master key is active and it meets every
@@ -310,39 +295,40 @@ impl OwnerAdmin<'_> {
             return Err("policy wallet executable differs from owner-approved code".into());
         }
         let storage = instance.storage.ok_or("Missing policy wallet storage")?;
-        let raw = storage
+        let Some(ScVal::Bytes(raw)) = storage
             .iter()
-            .find(|e| e.key == ScVal::U32(0))
+            .find(|e| e.key == value_symbol("c").unwrap_or(ScVal::Void))
             .map(|e| &e.val)
-            .ok_or("Missing policy wallet custody state")?;
-        // Recovery reads only the kept fields; the other owner calls need the current layout.
-        let kept = KeptState::from_scval(raw)?;
-        if kept.owner != c.owner {
+        else {
+            return Err("Missing policy wallet configuration".into());
+        };
+        // The owner calls read the fixed header, which every layout keeps; the others need the
+        // whole configuration of this layout.
+        let header = packed::header(raw.as_slice())?;
+        if header.owner != c.owner {
             return Err("Current owner differs from the bound owner".into());
         }
-        if kept.asset != c.asset || kept.policy_instance != c.policy_instance {
-            return Err("Stored asset or policy instance differs from the installation".into());
+        if header.asset != c.asset {
+            return Err("Stored asset differs from the installation".into());
         }
-        account_key(&kept.owner)
+        account_key(&header.owner)
             .map_err(|_| "Contract owners require a separate native authorization adapter")?;
-        let owner = rpc::get_account(self.rpc, &kept.owner)?;
+        let owner = rpc::get_account(self.rpc, &header.owner)?;
         owner.validate_owner_only()?;
         let state = if reach == Reach::Kept {
             None
         } else {
-            Some(CustodyState::from_scval(raw)?)
+            Some(packed::configuration(raw.as_slice())?)
         };
         if reach == Reach::Bound {
             let state = state
                 .as_ref()
-                .ok_or("Missing policy wallet custody state")?;
-            PolicyBinding::from_scval(&rpc::readonly_call(self.rpc, c, &owner, "policy_binding")?)?
-                .verify(c, OperationKind::Transfer)?;
-            rpc::verify_custody(c, state)?;
+                .ok_or("Missing policy wallet configuration")?;
+            rpc::verify_configuration(c, state)?;
         }
         Ok(Snapshot {
             owner,
-            deployment_version: DeploymentVersion(kept.deployment_version),
+            deployment_version: DeploymentVersion(u64::from(header.deployment_version)),
             state,
         })
     }
@@ -649,27 +635,21 @@ impl OwnerAdmin<'_> {
             &artifact.rules,
             source,
         )?;
-        if artifact.source_digest != digest
+        if artifact.source_hash != hash(source.as_bytes())
             || (tier != PolicyTier::Common && !artifact.rules.is_empty())
         {
             return Err(
-                "Deployment rules and source digest differ from the installed tier binding".into(),
+                "Deployment rules and source hash differ from the installed tier and source".into(),
             );
         }
-        if tier == PolicyTier::Custom && digest != self.config.source_digest {
+        if tier == PolicyTier::Custom && artifact.source_hash != self.config.source_hash {
             return Err(
                 "A Custom wallet binds its compiled source; new source needs new code".into(),
             );
         }
         // The Common rules are the standard prefix of the target source, and standard tiers
         // write no state.
-        let check = policy::policy_rules(
-            tier,
-            source,
-            &artifact.rules,
-            &artifact.source_digest,
-            &artifact.params,
-        )?;
+        let check = policy::policy_rules(tier, source, &artifact.rules, &digest, &artifact.params)?;
         let mut prepared = self.prepare_deployment(version, artifact, Reach::Bound)?;
         prepared.warnings = check.warnings;
         Ok(prepared)
@@ -704,17 +684,14 @@ impl OwnerAdmin<'_> {
             &artifact.rules,
             &self.config.policy_source,
         )?;
-        if artifact.source_digest != digest {
-            return Err(
-                "Deployment source digest differs from the binding of the new code and source"
-                    .into(),
-            );
+        if artifact.source_hash != crate::hash(self.config.policy_source.as_bytes()) {
+            return Err("Deployment source hash differs from the selected source".into());
         }
         let check = policy::policy_rules(
             tier,
             &self.config.policy_source,
             &artifact.rules,
-            &artifact.source_digest,
+            &digest,
             &artifact.params,
         )?;
         artifact.wasm_hash = Some(hash);
@@ -745,7 +722,7 @@ impl OwnerAdmin<'_> {
         self.prepare(s, "deploy_policy", vec![arguments], version, authorizers)
     }
     /// Recover `amount` of the wallet asset to `recipient`. Like the contract's `recover`, this
-    /// reads only the kept fields: no layout 4 State, executable or policy binding.
+    /// reads only the fixed header: no whole configuration, executable or source.
     pub fn recover_to(&mut self, recipient: &str, amount: i128) -> Result<PreparedOwnerOperation> {
         let s = self.snapshot(Reach::Kept)?;
         if amount <= 0 {
@@ -760,10 +737,25 @@ impl OwnerAdmin<'_> {
         self.prepare(
             s,
             "recover",
-            vec![ScVal::Address(address(recipient)?), i128_value(amount)],
+            vec![
+                ScVal::Address(address(&self.config.asset)?),
+                ScVal::Address(address(recipient)?),
+                i128_value(amount),
+            ],
             version,
             vec![owner],
         )
+    }
+    /// The owner's stop: one call that pauses the wallet at the next deployment version and
+    /// returns its whole asset and XLM balance to the owner. It reads only the fixed header.
+    pub fn stop(&mut self, version: DeploymentVersion) -> Result<PreparedOwnerOperation> {
+        let s = self.snapshot(Reach::Kept)?;
+        if !version.follows(s.deployment_version) {
+            return Err("A stop must target the next deployment version".into());
+        }
+        let owner = s.owner.address.clone();
+        let next = u32::try_from(version.0).map_err(err)?;
+        self.prepare(s, "stop", vec![ScVal::U32(next)], version, vec![owner])
     }
     /// The current deployment version, read as `set_pause` reads the wallet: the exact layout 4
     /// State and the owner-only account. A changed executable, policy binding or service signer
@@ -771,11 +763,11 @@ impl OwnerAdmin<'_> {
     pub fn deployment_version(&self) -> Result<DeploymentVersion> {
         Ok(self.snapshot(Reach::Layout)?.deployment_version)
     }
-    /// The current decoded custody State and owner account, read as owner preparation does.
-    pub fn custody(&self) -> Result<CustodyState> {
+    /// The current decoded configuration, read as owner preparation does.
+    pub fn custody(&self) -> Result<packed::Configuration> {
         self.snapshot(Reach::Bound)?
             .state
-            .ok_or_else(|| "Missing policy wallet custody state".into())
+            .ok_or_else(|| "Missing policy wallet configuration".into())
     }
 }
 impl SetPause for OwnerAdmin<'_> {
@@ -795,7 +787,10 @@ impl SetPause for OwnerAdmin<'_> {
         self.prepare(
             s,
             "set_pause",
-            vec![ScVal::Bool(paused), ScVal::U64(version.0)],
+            vec![
+                ScVal::Bool(paused),
+                ScVal::U32(u32::try_from(version.0).map_err(err)?),
+            ],
             version,
             authorizers,
         )
@@ -843,7 +838,11 @@ impl RecoverFunds for OwnerAdmin<'_> {
         self.prepare(
             s,
             "recover",
-            vec![ScVal::Address(address(&owner)?), i128_value(amount)],
+            vec![
+                ScVal::Address(address(token)?),
+                ScVal::Address(address(&owner)?),
+                i128_value(amount),
+            ],
             version,
             vec![owner],
         )
@@ -992,7 +991,14 @@ pub fn validate_auth(
         if !scope {
             return Err("Simulation requested unexpected authorization scope".into());
         }
-        if let HostFunction::CreateContractV2(create) = host {
+        if let HostFunction::InvokeContract(call) = host
+            && call.function_name.0.as_slice() == b"deploy"
+        {
+            if entry.credentials != SorobanCredentials::SourceAccount {
+                return Err("A deployment through the deployer is the owner's own call".into());
+            }
+            validate_deployer_tree(network, call, root)?;
+        } else if let HostFunction::CreateContractV2(create) = host {
             if entry.credentials != SorobanCredentials::SourceAccount
                 || root.sub_invocations.len() != 1
             {
@@ -1045,6 +1051,78 @@ pub fn validate_auth(
     }
     Ok(())
 }
+/// The owner's authorization of `deployer.deploy(owner, wasm_hash, salt, [config], funding)`: the
+/// call itself, then exactly the creation of the wallet at the owner's address and salt with the
+/// pinned code and the constructor's argument, and one transfer from the owner to that wallet for
+/// each funding item, in order. Nothing else is signed.
+fn validate_deployer_tree(
+    network: &str,
+    call: &InvokeContractArgs,
+    root: &SorobanAuthorizedInvocation,
+) -> Result<()> {
+    let [owner, wasm, salt, constructor_args, funding] = call.args.as_slice() else {
+        return Err("The deployer call has five arguments".into());
+    };
+    let (ScVal::Address(owner), ScVal::Bytes(wasm), ScVal::Bytes(salt)) = (owner, wasm, salt)
+    else {
+        return Err("Unexpected deployer arguments".into());
+    };
+    let (ScVal::Vec(Some(constructor_args)), ScVal::Vec(Some(funding))) =
+        (constructor_args, funding)
+    else {
+        return Err("Unexpected deployer arguments".into());
+    };
+    let wasm: [u8; 32] = wasm.as_slice().try_into().map_err(|_| "Invalid Wasm hash")?;
+    let salt: [u8; 32] = salt.as_slice().try_into().map_err(|_| "Invalid salt")?;
+    let preimage = ContractIdPreimage::Address(ContractIdPreimageFromAddress {
+        address: owner.clone(),
+        salt: Uint256(salt),
+    });
+    let wallet = ScAddress::Contract(ContractId(Hash(contract_id(network, &preimage)?)));
+    let create = CreateContractArgsV2 {
+        contract_id_preimage: preimage,
+        executable: ContractExecutable::Wasm(Hash(wasm)),
+        constructor_args: constructor_args.clone(),
+    };
+    let constructor = SorobanAuthorizedInvocation {
+        function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+            contract_address: wallet.clone(),
+            function_name: ScSymbol(b"__constructor".to_vec().try_into().map_err(err)?),
+            args: constructor_args.clone(),
+        }),
+        sub_invocations: VecM::default(),
+    };
+    let mut expected = vec![SorobanAuthorizedInvocation {
+        function: SorobanAuthorizedFunction::CreateContractV2HostFn(create),
+        sub_invocations: vec![constructor].try_into().map_err(err)?,
+    }];
+    for item in funding.iter() {
+        let ScVal::Vec(Some(pair)) = item else {
+            return Err("A funding item is an asset and an amount".into());
+        };
+        let [ScVal::Address(asset), amount @ ScVal::I128(_)] = pair.as_slice() else {
+            return Err("A funding item is an asset and an amount".into());
+        };
+        expected.push(SorobanAuthorizedInvocation {
+            function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                contract_address: asset.clone(),
+                function_name: ScSymbol(b"transfer".to_vec().try_into().map_err(err)?),
+                args: vec![
+                    ScVal::Address(owner.clone()),
+                    ScVal::Address(wallet.clone()),
+                    amount.clone(),
+                ]
+                .try_into()
+                .map_err(err)?,
+            }),
+            sub_invocations: VecM::default(),
+        });
+    }
+    if root.sub_invocations.as_slice() != expected.as_slice() {
+        return Err("The owner's deployment authorization holds more than the creation and its funding".into());
+    }
+    Ok(())
+}
 /// `contract_admin.py` `prepare_xdr` intent checks for an externally assembled transaction:
 /// the raw transaction is unsigned v1 from `source` with one host function, and simulation added
 /// only authorization, resources and their fee, within `max_fee`.
@@ -1069,11 +1147,21 @@ pub fn check_assembled(
     let OperationBody::InvokeHostFunction(invoke) = &op.body else {
         return Err("Expected exactly one Soroban host-function operation".into());
     };
-    if let Some(wasm) = expected_wasm
-        && !matches!(&invoke.host_function, HostFunction::CreateContractV2(create)
-            if create.executable == ContractExecutable::Wasm(Hash(wasm)))
-    {
-        return Err("Deployment transaction does not use the pinned Wasm executable".into());
+    if let Some(wasm) = expected_wasm {
+        let pinned = match &invoke.host_function {
+            HostFunction::CreateContractV2(create) => {
+                create.executable == ContractExecutable::Wasm(Hash(wasm))
+            }
+            // The deployer's call names the code hash; the owner's signature binds it.
+            HostFunction::InvokeContract(call) => {
+                call.function_name.0.as_slice() == b"deploy"
+                    && call.args.get(1) == Some(&value_bytes(&wasm)?)
+            }
+            _ => false,
+        };
+        if !pinned {
+            return Err("Deployment transaction does not use the pinned Wasm executable".into());
+        }
     }
     if op
         .source_account
@@ -1323,6 +1411,56 @@ impl Deployer<'_> {
             return Err("Wasm upload needs no contract authorization".into());
         }
         self.prepared(&account, "upload_wasm", wasm_hash, None, tx)
+    }
+    /// Prepare the owner's one transaction that creates the policy wallet of `wasm` (uploaded by
+    /// the server) through `deployer` and funds it with each `(asset, amount)` of `funding`. The
+    /// owner signs it once: the creation, the constructor's owner check and the transfers are one
+    /// authorization tree. The wallet address derives from the owner and `salt`.
+    pub fn deploy_and_fund(
+        &self,
+        deployer: &str,
+        config: &PolicyConfig,
+        wasm: &[u8],
+        salt: [u8; 32],
+        funding: &[(String, i128)],
+    ) -> Result<PreparedDeployment> {
+        let wasm_hash = check_wallet_code(wasm)?;
+        let account = self.account(&config.owner)?;
+        account.validate_owner_only()?;
+        let wallet = wallet_address(self.network, &config.owner, &salt)?;
+        if [&config.owner, &config.agent, &config.server, &deployer.to_owned()].contains(&&wallet)
+        {
+            return Err("Owner, agent, server, deployer and policy wallet must be distinct".into());
+        }
+        let mut items = Vec::new();
+        for (asset, amount) in funding {
+            if *amount <= 0 {
+                return Err("A funding amount is positive".into());
+            }
+            items.push(ScVal::Vec(Some(
+                vec![ScVal::Address(address(asset)?), i128_value(*amount)]
+                    .try_into()
+                    .map_err(err)?,
+            )));
+        }
+        let host = HostFunction::InvokeContract(InvokeContractArgs {
+            contract_address: address(deployer)?,
+            function_name: ScSymbol(b"deploy".to_vec().try_into().map_err(err)?),
+            args: vec![
+                ScVal::Address(address(&config.owner)?),
+                value_bytes(&wasm_hash)?,
+                value_bytes(&salt)?,
+                ScVal::Vec(Some(config.constructor_args()?.try_into().map_err(err)?)),
+                ScVal::Vec(Some(items.try_into().map_err(err)?)),
+            ]
+            .try_into()
+            .map_err(err)?,
+        });
+        let (tx, value) = self.assemble(&account, host, Some(wasm_hash))?;
+        if value != ScVal::Address(address(&wallet)?) {
+            return Err("Creation simulation returned another wallet address".into());
+        }
+        self.prepared(&account, "deploy_wallet", wasm_hash, Some(wallet), tx)
     }
     /// Prepare `CreateContractV2` of a policy wallet: the owner deploys `wasm` (already
     /// uploaded) with the exact constructor packet and authorizes the constructor as the

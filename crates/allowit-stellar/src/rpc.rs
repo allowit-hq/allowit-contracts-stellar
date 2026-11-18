@@ -1,6 +1,5 @@
 //! Stellar RPC protocol, native observations and transaction validity.
 //! Common transport owns HTTP bounds; SDK engine owns persistence, polling and retry workflows.
-use crate::contract::{CustodyState, PolicyBinding};
 use crate::*;
 mod diagnostics;
 mod owner_actions;
@@ -350,15 +349,18 @@ pub fn prepare_with(
     now: u64,
     expires_at: u64,
 ) -> Result<PreparedOperation> {
-    let state = trusted_state(rpc, c, accounting)?;
+    let mut state = trusted_state(rpc, c, accounting)?;
     if c.route == WalletRoute::Native {
         return super::prepare_with(c, request, terms, &state, now, expires_at);
     }
-    let operation = operation_from_request(c, request)?;
-    if operation.kind() != OperationKind::Transfer {
-        PolicyBinding::from_scval(&readonly_call(rpc, c, &state.source, "policy_binding")?)?
-            .verify(c, operation.kind())?;
-    }
+    // The server's sending account is the source and pays the fee; the wallet repays its gas
+    // to that same account.
+    let sender = &terms
+        .gas
+        .as_ref()
+        .ok_or("A policy wallet request names its gas repayment and payee")?
+        .payee;
+    state.source = get_account(rpc, sender)?;
     let ceiling = terms.expense.as_ref();
     let mut terms = priced_terms(rpc, c, request, terms, &state, now, expires_at)?;
     // The invocation that carries the priced expense is simulated on its own. A policy that
@@ -500,9 +502,8 @@ fn simulated_resources(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<String> {
         return Err("policy wallet simulation rejected the exact policy operation".into());
     }
     reject_restoration(&v)?;
-    let result = readonly_result(&v)?;
-    if result != expected_receipt(p)?.scval()? {
-        return Err("Native simulation returned a different transfer receipt".into());
+    if readonly_result(&v)? != ScVal::Void {
+        return Err("Native simulation returned a value from execute".into());
     }
     let TransactionEnvelope::Tx(env) = read(&p.transaction_xdr)? else {
         return Err("Unsupported preflight envelope".into());
@@ -1116,33 +1117,6 @@ pub(crate) fn map_field<'a>(value: &'a ScVal, name: &str) -> Result<&'a ScVal> {
         .map(|e| &e.val)
         .ok_or_else(|| format!("Missing contract field {name}"))
 }
-/// The transfer receipt that `execute` returns for this exact packet: a deposit reports its
-/// underlying debit to the vault, and a redeem its share debit at the vault.
-pub fn expected_receipt(p: &PreparedOperation) -> Result<TransferReceipt> {
-    let operation = operation_from_request(&p.config, &p.request)?;
-    let (to, amount) = operation.debit();
-    Ok(TransferReceipt {
-        operation_id: p.request.operation.nonce,
-        token: operation.debit_token(&p.config.asset).into(),
-        from: p.config.wallet.clone(),
-        to: to.into(),
-        amount,
-        nonce: p.state.nonce,
-        deployment_version: p.state.deployment_version,
-    })
-}
-/// Check decoded layout 4 State against the installation: tier binding, rules, server and asset.
-pub(crate) fn verify_custody(c: &WalletConfig, state: &CustodyState) -> Result<()> {
-    if state.source_digest != c.source_digest
-        || state.rules != c.rules
-        || state.server != c.server
-        || state.asset != c.asset
-        || state.policy_instance != c.policy_instance
-    {
-        return Err("Installed policy tier, source, rules, service signer or asset differs".into());
-    }
-    Ok(())
-}
 pub(crate) fn number(value: &ScVal) -> Result<u64> {
     match value {
         ScVal::U32(v) => Ok((*v).into()),
@@ -1347,12 +1321,14 @@ pub fn installed_agent_address(rpc: &dyn Rpc, c: &WalletConfig) -> Result<Option
         return Err("Missing policy wallet instance state".into());
     };
     let storage = instance.storage.ok_or("Missing policy wallet storage")?;
-    let state = storage
+    let Some(ScVal::Bytes(raw)) = storage
         .iter()
-        .find(|e| e.key == ScVal::U32(0))
+        .find(|e| e.key == value_symbol("c").unwrap_or(ScVal::Void))
         .map(|e| &e.val)
-        .ok_or("Missing policy wallet custody state")?;
-    Ok(Some(CustodyState::from_scval(state)?.agent))
+    else {
+        return Err("Missing policy wallet configuration".into());
+    };
+    Ok(Some(packed::configuration(raw.as_slice())?.agent))
 }
 /// The fault of a wallet whose code on the ledger differs from the code of its configuration.
 pub const EXECUTABLE_DIFFERS: &str = "policy wallet executable differs from installed code";
@@ -1444,9 +1420,15 @@ fn trusted_state_inner(
         return Err(EXECUTABLE_DIFFERS.into());
     }
     let storage = instance.storage.ok_or("Missing policy wallet storage")?;
+    // Layout 5 keeps its packed configuration under `c`; historical wallets keep State under 0.
+    let state_key = if c.route == WalletRoute::PolicyWallet {
+        value_symbol("c")?
+    } else {
+        ScVal::U32(0)
+    };
     let state = storage
         .iter()
-        .find(|e| e.key == ScVal::U32(0))
+        .find(|e| e.key == state_key)
         .map(|e| &e.val)
         .ok_or("Missing policy wallet custody state")?;
     if c.route == WalletRoute::PolicyWallet {
@@ -1454,8 +1436,9 @@ fn trusted_state_inner(
     }
     historical_wallet_state(rpc, c, state, module.0, ledger, require_customer_quorum)
 }
-/// Layout 4 discovery: decode State exactly, verify the tier binding and read params and
-/// policy state from the instance entry.
+/// Layout 5 discovery: decode the packed configuration, check it against the installation, and
+/// read the figures from `t` and an open `d`. The transaction source is the server's sending
+/// account, which `prepare_with` reads; discovery leaves it empty.
 fn current_wallet_state(
     rpc: &dyn Rpc,
     c: &WalletConfig,
@@ -1464,55 +1447,84 @@ fn current_wallet_state(
     ledger: u32,
     require_customer_quorum: bool,
 ) -> Result<DiscoveredState> {
-    let state = CustodyState::from_scval(raw)?;
-    if require_customer_quorum && state.paused {
+    let ScVal::Bytes(bytes) = raw else {
+        return Err("Missing the policy wallet configuration".into());
+    };
+    let config = packed::configuration(bytes.as_slice())?;
+    if require_customer_quorum && config.paused {
         return Err("policy wallet automation is paused".into());
     }
-    verify_custody(c, &state)?;
-    let source = get_account(rpc, &state.agent)?;
-    source.validate_structure()?;
-    if require_customer_quorum && source.signer_weight(&c.agent)? == 0 {
-            return Err("Customer is not a current policy wallet agent account signer".into());
-        }
-    PolicyBinding::from_scval(&readonly_call(rpc, c, &source, "policy_binding")?)?
-        .verify(c, OperationKind::Transfer)?;
-    if require_customer_quorum {
-        let server = get_account(rpc, &c.server)?;
-        server.validate_signer_quorum(&[&c.server], server.medium_threshold)?;
-    }
-    let standard = |key: &str| match state.policy_state.get(key) {
-        Some(PolicyValue::Int(v)) => Ok(*v),
-        None => Ok(0),
-        _ => Err(format!("Invalid standard policy state {key}")),
-    };
-    let counter = |key: &str| -> Result<u64> { u64::try_from(standard(key)?).map_err(err) };
+    verify_configuration(c, &config)?;
+    let figures = figures(rpc, c, ledger)?;
     Ok(DiscoveredState {
         state: TrustedState {
-            contract_version: Some(state.contract_version),
+            contract_version: Some(u32::from(config.layout)),
             policy_state: Some(PolicyStateSnapshot {
-                params: state.params.clone(),
-                state: state.policy_state.clone(),
-                rules: state.rules.clone(),
-                source_digest: state.source_digest,
-                x402_enabled: state.x402_enabled,
+                params: config.params.clone(),
+                rules: config.rules.clone(),
+                source_hash: config.source_hash,
+                figures: figures.clone(),
             }),
-            source,
-            nonce: state.nonce,
-            deployment_version: state.deployment_version,
-            spent_daily: standard("day_spent")?,
-            spent_total: standard("spent")?,
-            spent_day: counter("day")?,
-            calls: counter("calls")?,
+            source: AccountState {
+                address: String::new(),
+                sequence: 0,
+                master_weight: 0,
+                low_threshold: 0,
+                medium_threshold: 0,
+                high_threshold: 0,
+                signers: vec![],
+            },
+            nonce: 0,
+            deployment_version: u64::from(config.deployment_version),
+            spent_daily: if figures.day_ends != 0 { figures.day_spent } else { 0 },
+            spent_total: figures.spent,
+            spent_day: 0,
+            calls: figures.calls,
             ledger,
             module_digest: module,
-            source_hash: c.source_hash,
-            owner: state.owner,
-            agent: state.agent,
-            server: state.server,
+            source_hash: config.source_hash,
+            owner: config.owner,
+            agent: config.agent,
+            server: config.server,
             policy_instance: c.policy_instance,
         },
-        paused: state.paused,
+        paused: config.paused,
     })
+}
+/// The figures of the wallet at `ledger`: `t`, and `d` while its window is open.
+pub fn figures(rpc: &dyn Rpc, c: &WalletConfig, ledger: u32) -> Result<packed::Figures> {
+    let key = |name: &str, durability| -> Result<LedgerKey> {
+        Ok(LedgerKey::ContractData(LedgerKeyContractData {
+            contract: address(&c.wallet)?,
+            key: value_symbol(name)?,
+            durability,
+        }))
+    };
+    let mut figures = packed::Figures::default();
+    if let Some(ScVal::Bytes(raw)) =
+        persistent_entry(rpc, &key("t", ContractDataDurability::Persistent)?)?
+    {
+        packed::totals(raw.as_slice(), packed::SPENT | packed::CALLS, &mut figures)?;
+    }
+    if let Some(ScVal::Bytes(raw)) =
+        persistent_entry(rpc, &key("d", ContractDataDurability::Temporary)?)?
+    {
+        packed::daily(raw.as_slice(), ledger, &mut figures)?;
+    }
+    Ok(figures)
+}
+/// Check a decoded configuration against the installation: rules, agent, server, asset and the
+/// owner's source hash.
+pub(crate) fn verify_configuration(c: &WalletConfig, config: &packed::Configuration) -> Result<()> {
+    if config.rules != c.rules
+        || config.agent != c.agent
+        || config.server != c.server
+        || config.asset != c.asset
+        || config.source_hash != c.source_hash
+    {
+        return Err("Installed policy rules, agent, service signer, asset or source differs".into());
+    }
+    Ok(())
 }
 /// Read-only discovery of a historical ODC wallet, for status and recovery of retained bytes.
 fn historical_wallet_state(
@@ -1573,20 +1585,6 @@ fn historical_wallet_state(
     Ok(DiscoveredState { state: out, paused })
 }
 
-/// Settled effects of one operation, read from the wallet's persistent receipts.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ExecutionReceipt {
-    /// The replay marker's transfer receipt: for a deposit, the underlying debit to the vault;
-    /// for a redeem, the share debit at the vault.
-    pub transfer: TransferReceipt,
-    /// The settled share credit of a deposit.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deposit: Option<DepositReceipt>,
-    /// The settled asset credit of a redeem.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub redeem: Option<RedeemReceipt>,
-}
 fn persistent_entry(rpc: &dyn Rpc, key: &LedgerKey) -> Result<Option<ScVal>> {
     let encoded = xdr(key)?;
     let response = rpc.call("getLedgerEntries", json!({"keys":[encoded]}))?;
@@ -1617,63 +1615,6 @@ fn persistent_entry(rpc: &dyn Rpc, key: &LedgerKey) -> Result<Option<ScVal>> {
     }
     Ok(Some(data.val))
 }
-/// Read the settled receipts of `operation_id` from the wallet's persistent storage. `None`
-/// means no successful execution consumed it yet.
-pub fn operation_receipt(
-    rpc: &dyn Rpc,
-    c: &WalletConfig,
-    operation_id: &[u8; 32],
-) -> Result<Option<ExecutionReceipt>> {
-    validate_config(c)?;
-    if c.route != WalletRoute::PolicyWallet {
-        return Err("Operation receipts require policy wallet custody".into());
-    }
-    if rpc.call("getNetwork", json!({}))?["passphrase"] != passphrase(&c.network)? {
-        return Err("Stellar RPC network differs from installation".into());
-    }
-    let Some(transfer) = persistent_entry(rpc, &contract::operation_key(&c.wallet, operation_id)?)?
-    else {
-        return Ok(None);
-    };
-    let transfer = TransferReceipt::from_scval(&transfer)?;
-    let deposit = persistent_entry(rpc, &contract::deposit_key(&c.wallet, operation_id)?)?
-        .map(|value| DepositReceipt::from_scval(&value))
-        .transpose()?;
-    let redeem = persistent_entry(rpc, &contract::redeem_key(&c.wallet, operation_id)?)?
-        .map(|value| RedeemReceipt::from_scval(&value))
-        .transpose()?;
-    // A redeem debits the vault's shares; every other operation debits the asset.
-    let token = redeem.as_ref().map_or(&c.asset, |r| &r.vault);
-    if transfer.operation_id != *operation_id
-        || transfer.from != c.wallet
-        || transfer.token != *token
-        || (deposit.is_some() && redeem.is_some())
-    {
-        return Err("Receipt differs from the requested operation".into());
-    }
-    if let Some(d) = &deposit
-        && (d.operation_id != *operation_id
-            || d.vault != transfer.to
-            || d.assets != transfer.amount
-            || d.nonce != transfer.nonce)
-    {
-        return Err("Deposit receipt differs from its transfer receipt".into());
-    }
-    if let Some(r) = &redeem
-        && (r.operation_id != *operation_id
-            || r.vault != transfer.to
-            || r.shares != transfer.amount
-            || r.nonce != transfer.nonce)
-    {
-        return Err("Redeem receipt differs from its transfer receipt".into());
-    }
-    Ok(Some(ExecutionReceipt {
-        transfer,
-        deposit,
-        redeem,
-    }))
-}
-
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod transport_tests {
     use super::*;

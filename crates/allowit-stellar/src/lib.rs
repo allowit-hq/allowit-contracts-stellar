@@ -41,7 +41,7 @@ pub use authorization::{
     authorize_server, authorize_server_using, authorize_server_with, sign_account_entry,
     validate_server_authorization,
 };
-pub use contract::{CONTRACT_VERSION, DepositReceipt, RedeemReceipt, TransferReceipt};
+pub use contract::CONTRACT_VERSION;
 pub use policy::{PolicyEngine, PolicyLanguage, PolicyParams, PolicyTier, PolicyValue};
 pub mod rpc;
 pub mod seller_settled;
@@ -619,14 +619,42 @@ impl AccountState {
 pub struct PolicyStateSnapshot {
     /// Current owner params.
     pub params: PolicyParams,
-    /// Current free-form policy state before this operation.
-    pub state: PolicyParams,
     /// Installed ordered canonical rules.
     pub rules: Vec<String>,
-    /// Installed binding digest.
-    pub source_digest: [u8; 32],
-    /// Owner opt-in to x402.
-    pub x402_enabled: bool,
+    /// The owner-signed hash of the owner's full policy source.
+    pub source_hash: [u8; 32],
+    /// The cumulated figures that the wallet keeps, read at the snapshot's ledger.
+    pub figures: packed::Figures,
+}
+impl PolicyStateSnapshot {
+    /// Core's standard state before an operation at `now`: the totals, and the daily figures of
+    /// an open window as the figures of today. The wallet's day is the life of its daily entry,
+    /// not a UTC day, and it feeds its rules the same way.
+    pub fn standard_state(&self, now: u64) -> PolicyParams {
+        let f = &self.figures;
+        let open = f.day_ends != 0;
+        let mut state = std::collections::BTreeMap::new();
+        state.insert("calls".to_owned(), PolicyValue::Int(i128::from(f.calls)));
+        state.insert("spent".to_owned(), PolicyValue::Int(f.spent));
+        state.insert("unpriced".to_owned(), PolicyValue::Bool(f.unpriced));
+        state.insert(
+            "day".to_owned(),
+            PolicyValue::Int(i128::from(now / allowit_core::DAY)),
+        );
+        state.insert(
+            "day_spent".to_owned(),
+            PolicyValue::Int(if open { f.day_spent } else { 0 }),
+        );
+        state.insert(
+            "day_total".to_owned(),
+            PolicyValue::Int(if open { f.day_total } else { 0 }),
+        );
+        state.insert(
+            "day_unpriced".to_owned(),
+            PolicyValue::Bool(open && f.day_unpriced),
+        );
+        PolicyParams(state)
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1335,9 +1363,9 @@ fn verify_wallet_portable(
     let snapshot = state
         .policy_state
         .as_ref()
-        .ok_or("Trusted layout 4 params and policy state are required")?;
+        .ok_or("Trusted layout 5 params and figures are required")?;
     if state.contract_version != Some(CONTRACT_VERSION)
-        || snapshot.source_digest != c.source_digest
+        || snapshot.source_hash != c.source_hash
         || snapshot.rules != c.rules
     {
         return Err("Installed policy wallet binding differs from the installation".into());
@@ -1359,7 +1387,7 @@ fn verify_wallet_portable(
         &shape,
         &c.rules,
         &snapshot.params,
-        &snapshot.state,
+        &snapshot.standard_state(now),
         &request,
         evaluator,
     )
