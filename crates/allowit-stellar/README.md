@@ -111,6 +111,8 @@ It reads the direct order book only: no path through another asset and no liquid
   one creation signature names the code by its hash. A client that builds the same source gets the same hash and
   compares it (`check_code_hash`) before the owner signs.
 
+`RailPlugin::message_signature` gives the SEP-53 text-message signature (`provider::message_signature`), the one that a browser wallet makes with `signMessage`. A server signs its own statements with it, such as the request of a signed fetch.
+
 The rail reports a wallet whose code on the ledger differs from the code of its configuration with the problem code
 `custom_code_hash_mismatch`. `OwnerProvider::custom_build` reads the owner's view of a build from the server: the
 admitted source and the code hash of the server's build.

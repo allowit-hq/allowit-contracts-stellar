@@ -186,6 +186,12 @@ impl RailPlugin for Plugin {
     ) -> Option<&'static dyn allowit_core::vendor::custom_build::CustomWalletBuild> {
         Some(&provider::custom_build::CUSTOM_BUILD)
     }
+    /// The SEP-53 text-message signature, with which a server signs its own statements.
+    fn message_signature(
+        &self,
+    ) -> Option<&'static dyn allowit_core::vendor::wallet::MessageSignature> {
+        Some(&provider::message_signature::MESSAGE_SIGNING)
+    }
     /// The price observation of a server policy: [`provider::price`].
     fn policy_functions(
         &self,

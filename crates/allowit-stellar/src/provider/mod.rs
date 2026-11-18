@@ -2,6 +2,7 @@
 pub mod custom_build;
 pub mod execution;
 pub mod formats;
+pub mod message_signature;
 pub mod owner;
 pub mod paid_service;
 pub mod params_update;
