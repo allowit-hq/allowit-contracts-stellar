@@ -361,7 +361,7 @@ pub fn prepare_with(
     let mut terms = priced_terms(rpc, c, request, terms, &state, now, expires_at)?;
     // The invocation that carries the priced expense is simulated on its own. A policy that
     // reads the gas can need more resources with it than with the provisional expense. Its
-    // bound then follows from its own resource fee, within the ceiling, at most
+    // bound then follows from its own resource fee, within the ceiling and the gas cap, at most
     // `REPRICE_ROUNDS` times. After that the bound decides, and `attach_simulation` refuses a
     // resource fee above it.
     let mut rounds = 0;
@@ -371,7 +371,9 @@ pub fn prepare_with(
         let repriced = match (ceiling, &terms.expense) {
             (Some(ceiling), Some(signed)) if rounds < REPRICE_ROUNDS => {
                 let resources: SorobanTransactionData = read(&encoded)?;
-                let bound = fee_bound(resources.resource_fee)?.min(ceiling.max_fee_stroops);
+                let bound = fee_bound(resources.resource_fee)?
+                    .min(ceiling.max_fee_stroops)
+                    .min(c.max_fee_stroops);
                 // The margin of the signed bound absorbs a small change. Only a declared fee
                 // above the signed bound prices the operation again, and only upward.
                 let declared = resources
@@ -441,11 +443,13 @@ fn priced_terms(
             ..terms.clone()
         });
     };
-    // The wallet's gas cap is the installed fee ceiling, which its creation set.
+    // The wallet's gas cap is the installed fee ceiling, which its creation set. The fee bound
+    // stays within the quote and within the cap: the wallet repays no more than its cap, and the
+    // sending account declares no fee above it.
     let gas_cap = i128::from(c.max_fee_stroops);
+    let limit = ceiling.max_fee_stroops.min(c.max_fee_stroops);
     let with_bound = |fee: u32| -> Result<ExecutionTerms> {
-        let (expense, gas_due) =
-            bounded(terms, ceiling, fee.min(ceiling.max_fee_stroops), gas_cap)?;
+        let (expense, gas_due) = bounded(terms, ceiling, fee.min(limit), gas_cap)?;
         Ok(ExecutionTerms {
             args: terms.args.clone(),
             expense: Some(expense),
@@ -463,7 +467,7 @@ fn priced_terms(
     };
     let simulated = match resource_fee(INCLUSION_FEE_STROOPS) {
         Ok(fee) => fee,
-        Err(lowest) => resource_fee(ceiling.max_fee_stroops).map_err(|_| lowest)?,
+        Err(lowest) => resource_fee(limit).map_err(|_| lowest)?,
     };
     with_bound(fee_bound(simulated)?)
 }

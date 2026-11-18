@@ -435,8 +435,9 @@ impl ExpenseBounds {
     /// transaction, such as the restoration of the wallet's lapsed code. The whole repayment converts
     /// once, at the rate of these bounds, and rounds up, so an XLM wallet counts exactly what it
     /// repays and another asset counts its units at the quoted rate; spent units change by the same
-    /// gas. Without a carry or a due this is [`Self::with_fee_bound`]. Returns the bounds and the part
-    /// of `due` that the wallet repays.
+    /// gas. Without a carry or a due this is [`Self::with_fee_bound`]. A bound that, less the carry,
+    /// is above the gas cap is refused: the wallet repays at most its cap. Returns the bounds and
+    /// the part of `due` that the wallet repays.
     pub fn with_repayment(
         &self,
         fee_stroops: u32,
@@ -449,6 +450,9 @@ impl ExpenseBounds {
         }
         let bound = i128::from(fee_stroops);
         let base = bound - i128::try_from(carry).unwrap_or(i128::MAX).min(bound);
+        if base > gas_cap {
+            return Err("The repayment exceeds the wallet's gas cap".into());
+        }
         let part = i128::try_from(due)
             .unwrap_or(i128::MAX)
             .min(gas_cap.saturating_sub(base).max(0));

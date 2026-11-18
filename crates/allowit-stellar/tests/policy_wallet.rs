@@ -1625,6 +1625,36 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
     // A resource fee inside the margin of the signed bound prices nothing again.
     let inside = priced(&[], Some(|_| gas() as i64 - 100)).unwrap();
     assert_eq!(inside.terms.expense.as_ref().unwrap().gas_units, gas());
+    // A quote above the wallet's gas cap is priced within the cap: a fee that fits the cap is
+    // not raised above it by the margin of the bound, which the wallet would refuse to repay.
+    // 995,000 + 100 fits 1,000,000; with the margin the bound would be 1,005,050.
+    let quoted = ExecutionTerms {
+        expense: Some(ExpenseBounds::xlm(10_000_000, 0, MAX_FEE * 2, ledger - 1, NOW).unwrap()),
+        ..terms(10_000_000, ledger)
+    };
+    let capped = rpc::prepare_with(
+        &ReadsGas {
+            chain: &chain,
+            refused: &[],
+            cost: Some(|_| 995_000),
+        },
+        &c,
+        &transfer,
+        &quoted,
+        Some(chain.accounting()),
+        NOW,
+        NOW + 300,
+    )
+    .unwrap();
+    let bound = capped.terms.expense.as_ref().unwrap();
+    assert_eq!(
+        (bound.gas_units, bound.max_fee_stroops),
+        (i128::from(MAX_FEE), MAX_FEE)
+    );
+    assert_eq!(
+        capped.terms.repaid_stroops().unwrap(),
+        i128::from(c.max_fee_stroops)
+    );
     for cost in [(|gas| gas as i64) as fn(i128) -> i64, |_| {
         i64::from(MAX_FEE)
     }] {
@@ -2700,6 +2730,21 @@ fn a_contract_wallet_reports_the_roles_that_its_configuration_holds() {
 /// A wallet that counts an asset other than XLM converts its whole repayment once, at the rate of
 /// the server's ceiling: a due that fills the gas cap counts the ceiling's asset units, not the
 /// rounded units of a small fee bound scaled up to the repayment.
+#[test]
+fn a_repayment_never_exceeds_the_gas_cap() {
+    let ceiling = ExpenseBounds::xlm(5, 0, 2_000, LEDGER, NOW).unwrap();
+    // A fee bound above the gas cap, less no carry, is a repayment above it: refused, with a
+    // due or without.
+    for due in [0, 100] {
+        assert!(
+            ceiling.with_repayment(1_009, 0, due, 1_000).is_err(),
+            "{due}"
+        );
+    }
+    // After a carry the repayment fits, and the due fills the rest of the cap.
+    let (bounds, part) = ceiling.with_repayment(1_009, 100, 500, 1_000).unwrap();
+    assert_eq!((part, bounds.gas_units), (91, 1_000));
+}
 #[test]
 fn a_gas_due_of_another_asset_counts_units_at_the_ceiling_rate() {
     // The ceiling prices 1,000,000 stroops at 10 asset units, over a principal of 5.
