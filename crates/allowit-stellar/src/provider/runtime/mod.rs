@@ -151,9 +151,9 @@ impl Runtime {
             .ok_or_else(|| "A needed transaction was not sent".into())
     }
     /// As `send_and_poll`, for a transaction that another one can make needless before it is
-    /// accepted. A send that the network does not accept yet is repeated only while `needed`
-    /// answers true; otherwise nothing was sent, and the answer is `None`. Once a send is
-    /// accepted, or its outcome is uncertain, only its hash is looked up.
+    /// accepted. Each send until the network accepts one, the first included, goes out only
+    /// while `needed` answers true; otherwise no send was accepted, and the answer is `None`.
+    /// Once a send is accepted, or its outcome is uncertain, only its hash is looked up.
     pub fn send_and_poll_while(
         &self,
         network: &str,
@@ -173,8 +173,9 @@ impl Runtime {
             if attempt > 0 {
                 std::thread::sleep(poll.interval);
             }
-            // The last send was not accepted: it is repeated only while it is needed.
-            if !sent && attempt > 0 && !needed()? {
+            // A send that is not accepted yet, the first one included, goes out only while it is
+            // needed: the transaction can become needless while it is signed or waits.
+            if !sent && !needed()? {
                 return Ok(None);
             }
             if !sent {

@@ -25,27 +25,35 @@ pub enum CodeState {
 }
 /// Whether an exact code entry is live, lapsed or absent.
 pub fn code_state(rpc: &dyn Rpc, network: &str, code: &[u8; 32]) -> Result<CodeState> {
-    code_observation(rpc, network, code).map(|(state, _)| state)
+    code_observation(rpc, network, code).map(|(state, _, _)| state)
 }
 /// As `code_state`, for a decision to pay for a transaction that only code that is not live
 /// needs. An RPC node can serve an entry some ledgers behind the closing head, which can miss a
 /// transaction that made the code live meanwhile. A negative answer must be dated at the closing
 /// head: a read that trails it, or that trails the head read before it, is taken once more, and
-/// a second one that trails is refused.
+/// a second one that trails is refused. Nodes behind a load balancer need not agree, so the read
+/// taken again must not answer at a head below one that the first read saw.
 pub fn current_code_state(rpc: &dyn Rpc, network: &str, code: &[u8; 32]) -> Result<CodeState> {
+    let mut seen = 0;
     for attempt in 0..2 {
         match code_observation(rpc, network, code) {
-            Ok((CodeState::Live, _)) => return Ok(CodeState::Live),
-            Ok((state, true)) => return Ok(state),
-            Ok((_, false)) => {}
+            Ok((CodeState::Live, _, _)) => return Ok(CodeState::Live),
+            Ok((state, observed, closing)) if observed == closing && closing >= seen => {
+                return Ok(state);
+            }
+            Ok((_, _, closing)) => seen = seen.max(closing),
             Err(stale) if attempt == 0 && stale == owner_observation::STALE_OBSERVATION => {}
             Err(error) => return Err(error),
         }
     }
     Err("The observation of the wallet code trails the network's head".into())
 }
-/// The state of an exact code entry and whether its observation is dated at the closing head.
-fn code_observation(rpc: &dyn Rpc, network: &str, code: &[u8; 32]) -> Result<(CodeState, bool)> {
+/// The state of an exact code entry, the ledger that dates it and the closing head.
+fn code_observation(
+    rpc: &dyn Rpc,
+    network: &str,
+    code: &[u8; 32],
+) -> Result<(CodeState, u32, u32)> {
     if *code == [0; 32] {
         return Err("Missing executable identity".into());
     }
@@ -56,7 +64,7 @@ fn code_observation(rpc: &dyn Rpc, network: &str, code: &[u8; 32]) -> Result<(Co
         Some(until) if until >= closing => CodeState::Live,
         Some(_) => CodeState::Lapsed,
     };
-    Ok((state, observed == closing))
+    Ok((state, observed, closing))
 }
 /// Whether a native C-address currently has a live Wasm instance. This grants no trust in its config.
 pub fn contract_exists(rpc: &dyn Rpc, network: &str, contract: &str) -> Result<bool> {

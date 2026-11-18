@@ -362,6 +362,9 @@ struct Model {
     behind_head_code_reads: u32,
     /// The `behind_head_code_reads` that a restoration's simulation starts.
     behind_reads_on_restore_simulation: u32,
+    /// The heads that the next `getLatestLedger` calls answer, as nodes behind a load balancer
+    /// that do not agree.
+    heads: std::collections::VecDeque<u32>,
     tiers: BTreeMap<[u8; 32], PolicyTier>,
     wallet: Option<Wallet>,
     settled: BTreeMap<String, String>,
@@ -592,7 +595,10 @@ impl rpc::Rpc for ModelChain {
         let mut m = self.0.lock().unwrap();
         match method {
             "getNetwork" => Ok(json!({"passphrase": passphrase(NETWORK)?})),
-            "getLatestLedger" => Ok(json!({"sequence": m.ledger})),
+            "getLatestLedger" => {
+                let head = m.heads.pop_front().unwrap_or(m.ledger);
+                Ok(json!({"sequence": head}))
+            }
             "getLedgerEntries" => {
                 let encoded = params["keys"][0].as_str().unwrap();
                 let key: x::LedgerKey = de(encoded);
@@ -3344,6 +3350,21 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
             Ok(vec![0; 64])
         }
     }
+    // A sending account whose signer is overtaken: another account restores the code while it
+    // signs, and the signature is valid.
+    struct Overtaken(Arc<ModelChain>, [u8; 32]);
+    impl SendingAccounts for Overtaken {
+        fn account(&self) -> allowit_core::client::error::Result<String> {
+            Ok(sender())
+        }
+        fn sign(&self, _: &str, hash: &[u8; 32]) -> allowit_core::client::error::Result<Vec<u8>> {
+            self.0.0.lock().unwrap().lapsed_code.remove(&self.1);
+            Ok(SigningKey::from_bytes(&SENDER)
+                .sign(hash)
+                .to_bytes()
+                .to_vec())
+        }
+    }
     // A sending account whose signer refuses while another account restores the code.
     struct Refusing(Arc<ModelChain>, [u8; 32]);
     impl SendingAccounts for Refusing {
@@ -4145,6 +4166,37 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         assert_eq!(m.behind_head_code_reads, 0);
         assert!(!m.lapsed_code.contains(&installed));
     }
+    // A read taken again may come from a node behind a head that the first read saw: its
+    // negative answer does not decide.
+    {
+        let mut m = chain.0.lock().unwrap();
+        m.lapsed_code.insert(installed);
+        let head = m.ledger;
+        m.heads = [head, head + 1, head, head].into();
+    }
+    let refused = rpc::current_code_state(&*chain, NETWORK, &installed).unwrap_err();
+    assert!(refused.contains("trails"), "{refused}");
+    {
+        let mut m = chain.0.lock().unwrap();
+        assert!(m.heads.is_empty());
+        m.lapsed_code.remove(&installed);
+    }
+    // Another account restores the code while the sending account signs: the restoration is
+    // not sent.
+    chain.0.lock().unwrap().lapsed_code.insert(installed);
+    assert!(
+        allowit_stellar::PLUGIN
+            .sending_runtime(
+                NETWORK,
+                Arc::new(Wire(chain.clone())),
+                Arc::new(Overtaken(chain.clone(), installed)),
+            )
+            .unwrap()
+            .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!chain.0.lock().unwrap().lapsed_code.contains(&installed));
     // Code that the network does not have cannot be restored: it needs an upload.
     chain.0.lock().unwrap().code_bytes.remove(&installed);
     let signed = signatures();

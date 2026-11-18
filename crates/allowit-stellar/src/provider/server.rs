@@ -537,9 +537,9 @@ impl Provider {
                 Ok(signed) => signed,
                 Err(refused) => return unless_live(refused),
             };
-        // A send that the network does not accept yet is repeated only while the code is not
-        // live, by a read dated at the closing head: another transaction can restore or upload
-        // it meanwhile.
+        // Each send until the network accepts one, the first included, goes out only while a read
+        // dated at the closing head shows the code not live: another transaction can restore or
+        // upload it while the transaction is signed or waits.
         let Some(receipt) = checked(self.runtime.send_and_poll_while(
             &c.network,
             &signed,
