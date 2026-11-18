@@ -2548,15 +2548,14 @@ fn a_creation_funds_the_asset_and_the_gas_and_recovery_returns_both() {
     assert_eq!(admin::next_recovery(&c.asset, &xlm, 0, 0), None);
     assert_eq!(admin::next_recovery(&xlm, &xlm, 0, 0), None);
 }
-/// A diagnostic session of a server provider sends and signs with the provider's own sending
-/// accounts: a code upload through the session reaches them.
+/// The server's runtime from the plugin sends with the server's own accounts, and so does its
+/// diagnostic session: a code upload through either reaches them.
 #[test]
-fn a_diagnostic_session_keeps_the_sending_accounts() {
-    use allowit_core::vendor::RuntimeProvider;
+fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts() {
     use allowit_core::vendor::plugin::RailPlugin;
     use allowit_core::vendor::profiles::Description;
+    use allowit_core::vendor::runtime::SendingAccounts;
     use allowit_core::vendor::runtime::{Installation, Poll, Transport};
-    use allowit_stellar::provider::server::{Provider, SendingAccounts};
     use std::sync::Arc;
     struct Wire(Arc<ModelChain>);
     impl Transport for Wire {
@@ -2567,12 +2566,19 @@ fn a_diagnostic_session_keeps_the_sending_accounts() {
     }
     struct Sending;
     impl SendingAccounts for Sending {
-        fn account(&self) -> Result<String> {
+        fn account(&self) -> allowit_core::client::error::Result<String> {
             Ok(sender())
         }
-        fn sign(&self, account: &str, hash: &[u8; 32]) -> Result<[u8; 64]> {
+        fn sign(
+            &self,
+            account: &str,
+            hash: &[u8; 32],
+        ) -> allowit_core::client::error::Result<Vec<u8>> {
             assert_eq!(account, sender());
-            Ok(SigningKey::from_bytes(&SENDER).sign(hash).to_bytes())
+            Ok(SigningKey::from_bytes(&SENDER)
+                .sign(hash)
+                .to_bytes()
+                .to_vec())
         }
     }
     let wasm = wasm_for(PolicyTier::Common);
@@ -2604,9 +2610,21 @@ fn a_diagnostic_session_keeps_the_sending_accounts() {
         export: None,
         authority: None,
     };
-    let provider = Provider::with_transport(NETWORK, Arc::new(Wire(chain.clone())))
-        .unwrap()
-        .with_sender(Arc::new(Sending));
+    let provider = allowit_stellar::PLUGIN
+        .sending_runtime(NETWORK, Arc::new(Wire(chain.clone())), Arc::new(Sending))
+        .unwrap();
+    // The plain runtime has no sending account.
+    let plain = allowit_stellar::PLUGIN
+        .runtime(NETWORK, Arc::new(Wire(chain.clone())))
+        .unwrap();
+    let unsent = wasm_for(PolicyTier::Custom);
+    assert!(
+        plain
+            .upload_code(&installation, &unsent, Poll::default(), NOW)
+            .unwrap_err()
+            .message
+            .contains("no sending account")
+    );
     let session = provider.diagnostic_session(&installation).unwrap().unwrap();
     // Code that the ledger does not hold yet: the session's sending account uploads it.
     let other = wasm_for(PolicyTier::Simple);
@@ -2630,6 +2648,20 @@ fn a_diagnostic_session_keeps_the_sending_accounts() {
             .upload_code(&installation, &other, Poll::default(), NOW)
             .unwrap()
             .is_none()
+    );
+    // The runtime itself uploads with the same accounts.
+    chain
+        .0
+        .lock()
+        .unwrap()
+        .tiers
+        .insert(hash(&unsent), PolicyTier::Custom);
+    chain.step("upload");
+    assert!(
+        provider
+            .upload_code(&installation, &unsent, Poll::default(), NOW)
+            .unwrap()
+            .is_some()
     );
 }
 /// A wallet whose instance and `t` lapsed: the ledger still gives their values, so the server
