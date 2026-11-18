@@ -475,9 +475,13 @@ fn read_figures(env: &Env, kept: u8) -> Result<Stored, AllowitWalletError> {
         let mut calls = [0; 4];
         calls.copy_from_slice(&buf[8..]);
         let calls = u32::from_be_bytes(calls);
-        figures.spent = i128::from(u64::from_be_bytes(spent));
-        figures.calls = u64::from(calls & !UNPRICED_BIT);
-        figures.unpriced = calls & UNPRICED_BIT != 0;
+        if kept & SPENT != 0 {
+            figures.spent = i128::from(u64::from_be_bytes(spent));
+            figures.unpriced = calls & UNPRICED_BIT != 0;
+        }
+        if kept & CALLS != 0 {
+            figures.calls = u64::from(calls & !UNPRICED_BIT);
+        }
     }
     let mut day_ends = None;
     let daily: Option<Bytes> = if kept & DAILIES != 0 {
@@ -517,19 +521,30 @@ fn read_figures(env: &Env, kept: u8) -> Result<Stored, AllowitWalletError> {
         total_exists: total.is_some(),
     })
 }
+/// The total figures that `kept` names; the others are zero. Spent carries the unpriced flag: the
+/// lifetime spending limit reads both.
+fn totals(kept: u8, f: &Figures) -> (i128, u64, bool) {
+    let spent = kept & SPENT != 0;
+    (
+        if spent { f.spent } else { 0 },
+        if kept & CALLS != 0 { f.calls } else { 0 },
+        spent && f.unpriced,
+    )
+}
 /// Write `t`: spent as 8 bytes, then calls in 31 bits with the unpriced flag in the top bit. The
 /// value has one fixed size, so a payment never grows it: a larger value would pay rent for the
-/// whole prepaid lifetime of `t`. A figure beyond its width is `Overflow`. A new `t` lives
-/// `TOTAL_LEDGERS`.
-fn write_total(env: &Env, f: &Figures, exists: bool) -> Result<(), AllowitWalletError> {
-    let spent = u64::try_from(f.spent).map_err(|_| AllowitWalletError::Overflow)?;
-    let calls = u32::try_from(f.calls)
+/// whole prepaid lifetime of `t`. A figure that no check reads is written as zero. A figure beyond
+/// its width is `Overflow`. A new `t` lives `TOTAL_LEDGERS`.
+fn write_total(env: &Env, kept: u8, f: &Figures, exists: bool) -> Result<(), AllowitWalletError> {
+    let (spent, calls, unpriced) = totals(kept, f);
+    let spent = u64::try_from(spent).map_err(|_| AllowitWalletError::Overflow)?;
+    let calls = u32::try_from(calls)
         .ok()
         .filter(|calls| calls & UNPRICED_BIT == 0)
         .ok_or(AllowitWalletError::Overflow)?;
     let mut buf = [0u8; TOTAL_BYTES];
     buf[..8].copy_from_slice(&spent.to_be_bytes());
-    let flag = if f.unpriced { UNPRICED_BIT } else { 0 };
+    let flag = if unpriced { UNPRICED_BIT } else { 0 };
     buf[8..].copy_from_slice(&(calls | flag).to_be_bytes());
     let storage = env.storage().persistent();
     storage.set(&TOTAL, &Bytes::from_slice(env, &buf));
@@ -575,7 +590,7 @@ fn write_daily(
 fn reshape_total(env: &Env, kept: u8) -> Result<(), AllowitWalletError> {
     let stored = read_figures(env, TOTALS)?;
     if kept & TOTALS != 0 {
-        write_total(env, &stored.figures, stored.total_exists)
+        write_total(env, kept, &stored.figures, stored.total_exists)
     } else {
         if stored.total_exists {
             env.storage().persistent().remove(&TOTAL);
@@ -664,7 +679,7 @@ pub fn construct<P: AllowitPolicy>(
     config.store(env)?;
     let kept = kept::<P>(&config.rules, &config.params);
     if kept & TOTALS != 0 {
-        write_total(env, &Figures::default(), false)?;
+        write_total(env, kept, &Figures::default(), false)?;
     }
     env.deployer().extend_ttl_for_contract_instance(
         env.current_contract_address(),
@@ -677,7 +692,8 @@ pub fn construct<P: AllowitPolicy>(
 /// Read the stored wallet.
 pub fn state<P: AllowitPolicy>(env: &Env) -> Result<AllowitState, AllowitWalletError> {
     let config = Config::load(env)?;
-    let stored = read_figures(env, ALL)?;
+    let kept = kept::<P>(&config.rules, &config.params);
+    let stored = read_figures(env, kept)?;
     let f = stored.figures;
     Ok(AllowitState {
         contract_version: CONTRACT_VERSION,
@@ -689,7 +705,7 @@ pub fn state<P: AllowitPolicy>(env: &Env) -> Result<AllowitState, AllowitWalletE
         paused: config.paused,
         source_hash: config.source_hash,
         gas_cap: config.gas_cap,
-        kept: u32::from(kept::<P>(&config.rules, &config.params)),
+        kept: u32::from(kept),
         rules: config.rules,
         params: config.params,
         figures: AllowitFigures {
@@ -871,12 +887,9 @@ fn admit<P: AllowitPolicy>(
         day_unpriced: s.day_unpriced,
     };
     let before = &stored.figures;
-    if kept & TOTALS != 0
-        && (!stored.total_exists
-            || (after.calls, after.spent, after.unpriced)
-                != (before.calls, before.spent, before.unpriced))
+    if kept & TOTALS != 0 && (!stored.total_exists || totals(kept, &after) != totals(kept, before))
     {
-        write_total(env, &after, stored.total_exists)?;
+        write_total(env, kept, &after, stored.total_exists)?;
     }
     if kept & DAILIES != 0
         && (after.day_spent, after.day_total, after.day_unpriced)

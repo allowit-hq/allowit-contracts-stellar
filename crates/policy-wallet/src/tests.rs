@@ -843,6 +843,15 @@ fn an_owner_update_reshapes_the_kept_figures() {
     assert_eq!(f.figures().spent, 0);
     assert_eq!(f.run(&f.transfer(200, 0)), Ok(()));
     assert_eq!(f.figures().spent, 200);
+    // No check reads the call count, so it is not kept.
+    assert_eq!(f.figures().calls, 0);
+    let stored_calls = || {
+        f.env.as_contract(&f.wallet, || {
+            let raw: Bytes = f.env.storage().persistent().get(&TOTAL).unwrap();
+            raw.slice(8..12)
+        })
+    };
+    assert_eq!(stored_calls(), Bytes::from_array(&f.env, &[0; 4]));
     // Keeping it carries the figure; dropping every total removes t.
     let mut u = f.update();
     u.params.set(
