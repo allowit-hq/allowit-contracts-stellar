@@ -382,6 +382,11 @@ struct Model {
     /// The answer `TRY_AGAIN_LATER` names one ledger later, at which another account restored
     /// the code, and a replica at the earlier ledger answers from then on.
     replica_on_retry_later: bool,
+    /// The replica serves the code as live until its own ledger, its last live ledger.
+    replica_serves_live: bool,
+    /// A replica that predates the upload of this code answers the simulations of its
+    /// restoration and its upload, and the next reads of it, as if the network never had it.
+    predating_replica: Option<([u8; 32], u32)>,
     tiers: BTreeMap<[u8; 32], PolicyTier>,
     wallet: Option<Wallet>,
     settled: BTreeMap<String, String>,
@@ -633,6 +638,14 @@ impl rpc::Rpc for ModelChain {
                     return Err("The RPC is unreachable".into());
                 }
                 if let x::LedgerKey::ContractCode(code) = &key
+                    && let Some((predated, reads)) = m.predating_replica
+                    && predated == code.hash.0
+                    && reads > 0
+                {
+                    m.predating_replica = Some((predated, reads - 1));
+                    return Ok(json!({"latestLedger": m.ledger, "entries": []}));
+                }
+                if let x::LedgerKey::ContractCode(code) = &key
                     && let Some(bytes) = m.code_bytes.get(&code.hash.0).cloned()
                     && let Some(ledger) = m.replica_code_reads.pop_front().or(m.replica_ledger)
                 {
@@ -641,9 +654,10 @@ impl rpc::Rpc for ModelChain {
                         hash: code.hash.clone(),
                         code: bytes.try_into().unwrap(),
                     });
+                    let live_until = if m.replica_serves_live { ledger } else { 0 };
                     return Ok(json!({
                         "latestLedger": ledger,
-                        "entries": [{"key": encoded, "xdr": b64(&entry), "liveUntilLedgerSeq": 0}],
+                        "entries": [{"key": encoded, "xdr": b64(&entry), "liveUntilLedgerSeq": live_until}],
                     }));
                 }
                 if m.stale_code_reads > 0
@@ -791,7 +805,8 @@ impl rpc::Rpc for ModelChain {
                         .read_write
                         .iter()
                         .filter(|key| {
-                            matches!(key, x::LedgerKey::ContractCode(code) if m.lapsed_code.contains(&code.hash.0))
+                            matches!(key, x::LedgerKey::ContractCode(code) if m.lapsed_code.contains(&code.hash.0)
+                                && m.predating_replica.is_none_or(|(predated, _)| predated != code.hash.0))
                         })
                         .cloned()
                         .collect();
@@ -826,8 +841,11 @@ impl rpc::Rpc for ModelChain {
                     }));
                 }
                 let op = host_op(&env.tx);
+                let predated =
+                    |code: &[u8; 32]| m.predating_replica.is_some_and(|(p, _)| p == *code);
                 if let x::HostFunction::UploadContractWasm(code) = &op.host_function
                     && m.lapsed_code.contains(&hash(code.as_slice()))
+                    && !predated(&hash(code.as_slice()))
                 {
                     if !m.upload_restores_in_place {
                         return Ok(
@@ -911,7 +929,8 @@ impl rpc::Rpc for ModelChain {
                             })]
                             .try_into()
                             .unwrap();
-                        if m.code_bytes.contains_key(&code_hash) {
+                        let predated = m.predating_replica.is_some_and(|(p, _)| p == code_hash);
+                        if m.code_bytes.contains_key(&code_hash) && !predated {
                             footprint.read_only = key;
                         } else {
                             footprint.read_write = key;
@@ -3406,6 +3425,22 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
             Ok(vec![0; 64])
         }
     }
+    // Sending accounts that are all leased, after which a replica at the code's last live ledger
+    // answers: it serves the code as live at its own head.
+    struct LeasedBehindReplica(Arc<ModelChain>);
+    impl SendingAccounts for LeasedBehindReplica {
+        fn account(&self) -> allowit_core::client::error::Result<String> {
+            let mut m = self.0.0.lock().unwrap();
+            m.replica_ledger = Some(m.ledger - 1);
+            m.replica_serves_live = true;
+            Err(allowit_core::client::error::Error::config(
+                "All sending accounts are leased",
+            ))
+        }
+        fn sign(&self, _: &str, _: &[u8; 32]) -> allowit_core::client::error::Result<Vec<u8>> {
+            panic!("a leased account signs nothing")
+        }
+    }
     // A sending account whose signer is overtaken: another account restores the code while it
     // signs, and the signature is valid.
     struct Overtaken(Arc<ModelChain>, [u8; 32]);
@@ -4305,6 +4340,47 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         assert!(m.replica_ledger.is_some() && m.replica_from_network_check.is_none());
         m.replica_ledger = None;
         assert!(!m.lapsed_code.contains(&installed));
+    }
+    // A replica that predates the upload answers the simulations and the first reads, so an
+    // upload is prepared, but the read before the signature finds the code lapsed: an upload of
+    // archived code would fail and still cost its fee, so nothing is signed.
+    {
+        let mut m = chain.0.lock().unwrap();
+        m.lapsed_code.insert(installed);
+        m.predating_replica = Some((installed, 2));
+    }
+    let signed = signatures();
+    let refused = session
+        .provider
+        .upload_code_within(&installation, &wasm, ceiling, Poll::default(), NOW)
+        .unwrap_err();
+    assert!(refused.message.contains("lapsed"), "{}", refused.message);
+    assert_eq!(signatures(), signed);
+    {
+        let mut m = chain.0.lock().unwrap();
+        assert_eq!(m.predating_replica, Some((installed, 0)));
+        m.predating_replica = None;
+        assert!(m.lapsed_code.remove(&installed));
+    }
+    // The sending accounts are all leased, and a replica at the code's last live ledger then
+    // serves it as live at its own head: the code is not live at the highest ledger seen, so
+    // the refusal stands.
+    chain.0.lock().unwrap().lapsed_code.insert(installed);
+    let refused = allowit_stellar::PLUGIN
+        .sending_runtime(
+            NETWORK,
+            Arc::new(Wire(chain.clone())),
+            Arc::new(LeasedBehindReplica(chain.clone())),
+        )
+        .unwrap()
+        .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+        .unwrap_err();
+    assert!(refused.message.contains("leased"), "{}", refused.message);
+    {
+        let mut m = chain.0.lock().unwrap();
+        m.replica_ledger = None;
+        m.replica_serves_live = false;
+        assert!(m.lapsed_code.remove(&installed));
     }
     // The answer TRY_AGAIN_LATER names H+1, where another account restored the code, and the
     // check before the repeated send reads wholly from a replica at H: the ledger of the send's

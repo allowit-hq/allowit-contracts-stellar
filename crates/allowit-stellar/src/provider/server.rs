@@ -461,22 +461,23 @@ impl Provider {
         // Every call of this decision, its sends included, goes through one mark of the highest
         // ledger that its replies name.
         let mark = rpc::LedgerMark::new(self.rpc());
-        let state = checked(rpc::code_state(&mark, &c.network, &code_hash))?;
-        if state == rpc::CodeState::Live {
+        // Nothing is done only when a read shows the code live at the highest ledger seen; a
+        // replica can serve it as live at its own, older head. Something is paid only when a read
+        // dated at that ledger shows the state that the prepared transaction needs. The code is
+        // observed first, again by every refusal on the way to a signature, the signature
+        // included, and again just before the signature and before every send: another
+        // transaction, from another sending account or from this one, can make it live at any of
+        // these steps, and live code needs nothing. Such a transaction can still land after the
+        // last observation, until the code transaction applies: the ledger has no precondition
+        // on an entry's state, so the code transaction then applies to live code and its source
+        // pays its fee, within the ceiling.
+        if checked(rpc::code_live_at(&mark, &c.network, &code_hash, &mark.seen))? {
             return Ok(None);
         }
-        // Code is restored or uploaded only while its last observation shows it not live. The
-        // code is observed first, again by every refusal on the way to a signature, the
-        // signature included, and again just before the signature: another transaction, from
-        // another sending account or from this one, can make it live at any of these steps, and
-        // live code needs nothing. Such a transaction can still land after the last observation,
-        // until the code transaction applies: the ledger has no precondition on an entry's
-        // state, so the code transaction then applies to live code and its source pays its fee,
-        // within the ceiling.
         let live = || {
             matches!(
-                rpc::code_state(&mark, &c.network, &code_hash),
-                Ok(rpc::CodeState::Live)
+                rpc::code_live_at(&mark, &c.network, &code_hash, &mark.seen),
+                Ok(true)
             )
         };
         // A refusal can come from the transaction that made the code live: a simulated fee above
@@ -520,16 +521,34 @@ impl Provider {
         };
         let (sender, account, p) = match prepare() {
             Ok(Some(prepared)) => prepared,
-            Ok(None) => return Ok(None),
+            // The preparation found the code live: that holds only at the highest ledger seen.
+            Ok(None) => {
+                return unless_live(crate::provider::failure(
+                    "The preparation found the wallet code live, but it is not live at the highest ledger seen",
+                ));
+            }
             Err(refused) => return unless_live(refused),
         };
-        // A negative read that decides a paid transaction is dated at the highest ledger that the
-        // decision has seen, here and before every send.
-        match checked(rpc::current_code_state(
-            &mark, &c.network, &code_hash, &mark.seen,
-        )) {
-            Ok(rpc::CodeState::Live) => return Ok(None),
-            Ok(_) => {}
+        // The state that the prepared transaction needs, from a read dated at the highest ledger
+        // that the decision has seen, here and before every send. Live code needs nothing. A
+        // restoration needs code that is not live: an RPC that serves no archived entry reads
+        // lapsed code as absent. An upload needs absent code: lapsed code contradicts it, since
+        // the ledger would fail its upload and still charge its fee.
+        let needed = |state: rpc::CodeState| -> native::Result<bool> {
+            match (state, p.function.as_str()) {
+                (rpc::CodeState::Live, _) => Ok(false),
+                (rpc::CodeState::Lapsed, "upload_wasm") => Err(
+                    "The wallet code lapsed after its upload was prepared: lapsed code is restored, not uploaded"
+                        .into(),
+                ),
+                _ => Ok(true),
+            }
+        };
+        match checked(
+            rpc::current_code_state(&mark, &c.network, &code_hash, &mark.seen).and_then(&needed),
+        ) {
+            Ok(true) => {}
+            Ok(false) => return Ok(None),
             Err(refused) => return unless_live(refused),
         }
         let signed =
@@ -544,8 +563,8 @@ impl Provider {
                 Err(refused) => return unless_live(refused),
             };
         // Each send until the network accepts one, the first included, goes out only while a read
-        // dated at the highest ledger seen shows the code not live: another transaction can
-        // restore or upload it while the transaction is signed or waits.
+        // dated at the highest ledger seen shows the state that the transaction needs: another
+        // transaction can restore or upload the code while this one is signed or waits.
         let Some(receipt) = checked(crate::provider::runtime::Runtime::send_and_poll_while(
             &mark,
             &c.network,
@@ -555,10 +574,7 @@ impl Provider {
                 interval: poll.interval,
             },
             &|| {
-                Ok(
-                    rpc::current_code_state(&mark, &c.network, &code_hash, &mark.seen)?
-                        != rpc::CodeState::Live,
-                )
+                rpc::current_code_state(&mark, &c.network, &code_hash, &mark.seen).and_then(&needed)
             },
         ))?
         else {

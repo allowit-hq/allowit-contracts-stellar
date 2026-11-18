@@ -65,6 +65,19 @@ pub fn current_code_state(
     }
     Err("The observation of the wallet code trails the network's head".into())
 }
+/// Whether the code is live at the highest ledger that `seen` holds, after one more read through
+/// `rpc`. A replica can serve code as live at its own head, below a ledger that the decision saw,
+/// where the code has lapsed: only a live-until ledger at or above the highest ledger counts.
+pub fn code_live_at(
+    rpc: &dyn Rpc,
+    network: &str,
+    code: &[u8; 32],
+    seen: &std::sync::atomic::AtomicU32,
+) -> Result<bool> {
+    let (live_until, closing) = observed_entry(rpc, network, &code_key(code)?)?;
+    let highest = seen.fetch_max(closing, Ordering::SeqCst).max(closing);
+    Ok(live_until.is_some_and(|until| until >= highest))
+}
 /// An RPC transport that keeps the highest ledger that its replies name: the sequence of
 /// `getLatestLedger` and the `latestLedger` of every other reply. A decision that makes all its
 /// calls through it, its preparation and its sends included, passes `seen` to
