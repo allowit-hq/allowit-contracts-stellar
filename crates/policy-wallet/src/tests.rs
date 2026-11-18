@@ -33,7 +33,7 @@ pub(super) const CUSTOM: &[u8] =
 /// that calls `set_state`.
 pub(super) const CATCHING: &[u8] =
     include_bytes!("../../../target/test-fixtures/custom_catching.wasm");
-const VAULT: &[u8] =
+pub(super) const VAULT: &[u8] =
     include_bytes!("../../../target/wasm32v1-none/release/allowit_sep56_test_vault.wasm");
 
 /// A `List` of `Addr` values.
@@ -54,7 +54,7 @@ fn op_names(env: &Env, names: &[&str]) -> AllowitValue {
 }
 
 /// A classic account of `key`.
-fn add_account(env: &Env, key: &SigningKey) -> Address {
+pub(super) fn add_account(env: &Env, key: &SigningKey) -> Address {
     let account_id = xdr::AccountId(xdr::PublicKey::PublicKeyTypeEd25519(xdr::Uint256(
         key.verifying_key().to_bytes(),
     )));
@@ -88,7 +88,7 @@ fn add_account(env: &Env, key: &SigningKey) -> Address {
         )),
     )
 }
-fn native_sac(env: &Env) -> Address {
+pub(super) fn native_sac(env: &Env) -> Address {
     let created = env
         .host()
         .invoke_function(xdr::HostFunction::CreateContract(xdr::CreateContractArgs {

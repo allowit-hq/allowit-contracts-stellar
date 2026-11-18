@@ -1258,4 +1258,6 @@ macro_rules! policy_wallet {
 }
 
 #[cfg(test)]
+mod core_vectors_tests;
+#[cfg(test)]
 mod tests;
