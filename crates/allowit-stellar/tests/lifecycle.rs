@@ -105,10 +105,12 @@ fn fixture_with_wallet(
             stroops: units,
         }
     };
-    let payer = if route == WalletRoute::Native {
-        &c.wallet
-    } else {
-        &c.agent
+    // A policy wallet's operation is sent and paid by the server's sending account.
+    let sender = account_for_seed(&[10; 32]);
+    let payer = match route {
+        WalletRoute::Native => &c.wallet,
+        WalletRoute::PolicyWallet => &sender,
+        WalletRoute::Odc => &c.agent,
     };
     let request = ExecutionRequest {
         operation: OperationRef {
@@ -156,7 +158,7 @@ fn fixture_with_wallet(
         }
     } else {
         AccountState {
-            address: c.agent.clone(),
+            address: payer.clone(),
             sequence: 40,
             master_weight: 1,
             low_threshold: 0,
@@ -169,13 +171,12 @@ fn fixture_with_wallet(
         contract_version: portable.then_some(CONTRACT_VERSION),
         policy_state: portable.then(|| PolicyStateSnapshot {
             params: c.params.clone(),
-            state: PolicyParams::default(),
             rules: vec![],
-            source_digest: c.source_digest,
-            x402_enabled: false,
+            source_hash: c.source_hash,
+            figures: Default::default(),
         }),
         source: account,
-        nonce: 9,
+        nonce: if portable { 0 } else { 9 },
         deployment_version: 4,
         spent_daily: 0,
         spent_total: 0,
@@ -298,18 +299,11 @@ fn server_ready(p: &PreparedOperation) -> PreparedOperation {
                 intent.tx.operations = operations.try_into().unwrap();
             }
             assert_eq!(envelope, intent);
-            let auth = match rpc_auth(
-                &params,
-                &envelope.tx,
-                &[
-                    address(&p.state.source.address)?,
-                    address(&p.config.server)?,
-                ],
-            ) {
+            let auth = match rpc_auth(&params, &envelope.tx, &[address(&p.config.wallet)?]) {
                 Ok(auth) => auth,
                 Err(error) => return Ok(json!({ "error": error })),
             };
-            let receipt = rpc::expected_receipt(p)?.scval()?;
+            let receipt = stellar_xdr::ScVal::Void;
             let resources = p.simulation_data.clone().unwrap_or(
                 SorobanTransactionData::default()
                     .to_xdr_base64(Limits::none())
@@ -577,10 +571,9 @@ fn classic_limits_keep_exact_local_math_while_odc_requires_native_preflight() {
             );
             s.policy_state = Some(PolicyStateSnapshot {
                 params: c.params.clone(),
-                state: PolicyParams::default(),
                 rules: c.rules.clone(),
-                source_digest: c.source_digest,
-                x402_enabled: false,
+                source_hash: c.source_hash,
+                figures: Default::default(),
             });
         }
         s.source_hash = c.source_hash;
@@ -1438,54 +1431,31 @@ fn sc_map(fields: Vec<(&str, stellar_xdr::ScVal)>) -> stellar_xdr::ScVal {
 }
 /// Portable canonical-only source of the policy wallet fixtures.
 const PORTABLE: &str = "use allowit::prelude::*;\n/// Pay only destinations I approve.\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::destinations(ctx, &ctx.params[allowit::DESTINATIONS])?;\n    Ok(())\n}\n";
-/// Layout 4 State of the fixture wallet.
+/// The packed configuration of the fixture wallet, as the instance stores it under `c`.
 fn custody_scval(
     c: &WalletConfig,
-    agent: &str,
     owner: &str,
     paused: bool,
-    nonce: u64,
-    deployment_version: u64,
+    deployment_version: u32,
 ) -> stellar_xdr::ScVal {
-    allowit_stellar::contract::CustodyState {
-        policy_state: PolicyParams::default(),
-        contract_version: CONTRACT_VERSION,
-        owner: owner.into(),
-        agent: agent.into(),
-        server: c.server.clone(),
-        asset: c.asset.clone(),
-        policy_instance: c.policy_instance,
-        source_digest: c.source_digest,
-        rules: c.rules.clone(),
-        params: c.params.clone(),
-        x402_enabled: false,
-        token: c.asset_symbol.clone(),
-        deployment_version,
-        nonce,
-        paused,
-    }
-    .scval()
-    .unwrap()
-}
-/// The installed binding of the fixture wallet: Simple and Common run every operation, Custom
-/// no deposit.
-fn binding_scval(c: &WalletConfig) -> stellar_xdr::ScVal {
-    use OperationKind::*;
-    let tier = c.tier.unwrap();
-    allowit_stellar::contract::PolicyBinding {
-        engine_kind: tier.kind().into(),
-        contract_version: CONTRACT_VERSION,
-        policy_instance: c.policy_instance,
-        module_digest: c.module_digest,
-        source_digest: c.source_digest,
-        operations: if tier == PolicyTier::Custom {
-            vec![Transfer, Swap, Redeem]
-        } else {
-            vec![Transfer, Swap, Deposit, Redeem]
-        },
-    }
-    .scval()
-    .unwrap()
+    stellar_xdr::ScVal::Bytes(
+        allowit_stellar::packed::encode(&allowit_stellar::packed::Configuration {
+            layout: allowit_stellar::packed::LAYOUT,
+            paused,
+            deployment_version,
+            owner: owner.into(),
+            agent: c.agent.clone(),
+            server: c.server.clone(),
+            asset: c.asset.clone(),
+            source_hash: c.source_hash,
+            gas_cap: i128::from(c.max_fee_stroops),
+            rules: c.rules.clone(),
+            params: c.params.clone(),
+        })
+        .unwrap()
+        .try_into()
+        .unwrap(),
+    )
 }
 struct PolicyWalletAccountRpc {
     config: WalletConfig,
@@ -1531,14 +1501,7 @@ impl rpc::Rpc for PolicyWalletAccountRpc {
                 {
                     return Ok(json!({"latestLedger":120,"entries":[]}));
                 }
-                let state = custody_scval(
-                    c,
-                    &self.source.address,
-                    &Contract([33; 32]).to_string(),
-                    self.paused,
-                    4,
-                    2,
-                );
+                let state = custody_scval(c, &Contract([33; 32]).to_string(), self.paused, 2);
                 let entry = LedgerEntryData::ContractData(ContractDataEntry {
                     ext: ExtensionPoint::V0,
                     contract: address(&c.wallet)?,
@@ -1548,7 +1511,7 @@ impl rpc::Rpc for PolicyWalletAccountRpc {
                         executable: ContractExecutable::Wasm(Hash(c.module_digest)),
                         storage: Some(
                             vec![ScMapEntry {
-                                key: ScVal::U32(0),
+                                key: ScVal::Symbol(ScSymbol(b"c".to_vec().try_into().unwrap())),
                                 val: state,
                             }]
                             .try_into()
@@ -1557,28 +1520,6 @@ impl rpc::Rpc for PolicyWalletAccountRpc {
                     }),
                 });
                 Ok(json!({"entries":[{"xdr":entry.to_xdr_base64(Limits::none()).unwrap()}]}))
-            }
-            "simulateTransaction" => {
-                let TransactionEnvelope::Tx(tx) = TransactionEnvelope::from_xdr_base64(
-                    params["transaction"].as_str().unwrap(),
-                    Limits::none(),
-                )
-                .unwrap() else {
-                    panic!()
-                };
-                assert_eq!(
-                    tx.tx.source_account,
-                    MuxedAccount::Ed25519(Uint256(account_key(&self.source.address)?))
-                );
-                let OperationBody::InvokeHostFunction(op) = &tx.tx.operations[0].body else {
-                    panic!()
-                };
-                let HostFunction::InvokeContract(call) = &op.host_function else {
-                    panic!()
-                };
-                assert_eq!(call.function_name.0.as_slice(), b"policy_binding");
-                let binding = binding_scval(c);
-                Ok(json!({"results":[{"xdr":binding.to_xdr_base64(Limits::none()).unwrap()}]}))
             }
             _ => Err("unexpected RPC".into()),
         }
@@ -1843,21 +1784,19 @@ impl rpc::Rpc for AdminRpc {
                 panic!()
             };
             let mut storage = instance.storage.clone().unwrap().to_vec();
-            let state = &mut storage[0].val;
-            replace_field(
-                state,
-                "contract_version",
-                ScVal::U32(self.state_contract_version),
-            );
-            replace_field(
-                state,
-                "owner",
-                ScVal::Address(address(if self.wrong_owner {
-                    &self.base.source.address
-                } else {
-                    &self.base.config.owner
-                })?),
-            );
+            let ScVal::Bytes(raw) = &storage[0].val else {
+                panic!()
+            };
+            // The fixture's owner, or another one; the layout byte that the test selects.
+            let mut config = allowit_stellar::packed::configuration(raw.as_slice()).unwrap();
+            if self.wrong_owner {
+                config.owner = self.base.source.address.clone();
+            } else {
+                config.owner = self.base.config.owner.clone();
+            }
+            let mut bytes = allowit_stellar::packed::encode(&config).unwrap();
+            bytes[0] = u8::try_from(self.state_contract_version).unwrap();
+            storage[0].val = ScVal::Bytes(bytes.try_into().unwrap());
             instance.storage = Some(storage.try_into().unwrap());
             response["entries"][0]["xdr"] = json!(entry.to_xdr_base64(Limits::none()).unwrap());
             return Ok(response);
@@ -1877,24 +1816,6 @@ impl rpc::Rpc for AdminRpc {
                 panic!()
             };
             let function = String::from_utf8(call.function_name.0.to_vec()).unwrap();
-            if function == "policy_binding" {
-                let mut binding = binding_scval(&self.base.config);
-                let ScVal::Map(Some(map)) = &mut binding else {
-                    panic!()
-                };
-                let mut fields = map.to_vec();
-                fields.retain(|e| {
-                    e.key
-                        != ScVal::Symbol(ScSymbol(b"contract_version".to_vec().try_into().unwrap()))
-                });
-                *map = fields.try_into().unwrap();
-                if let Some(version) = &self.binding_contract_version {
-                    replace_field(&mut binding, "contract_version", version.clone());
-                }
-                return Ok(
-                    json!({"results":[{"xdr":binding.to_xdr_base64(Limits::none()).unwrap()}]}),
-                );
-            }
             self.calls
                 .lock()
                 .unwrap()
@@ -2166,91 +2087,84 @@ fn contract_release_and_persisted_counter_names_are_exact() {
     }
 }
 
+
+/// Sign the new owner's recorded entry as a native wallet does.
 #[test]
 fn full_policy_deployment_uses_one_versioned_owner_flow_and_owner_handoff_authorization() {
     use allowit_core::admin::{Admin, DeploymentVersion};
     use allowit_stellar::admin::{OwnerAdmin, PolicyDeployment};
-    for enabled in [false, true] {
-        let rpc = admin_fixture(4, Some(stellar_xdr::ScVal::U32(4)));
-        let c = &rpc.base.config;
-        let next_owner = account_for_seed(&[51; 32]);
-        let artifact = PolicyDeployment {
-            owner: next_owner.clone(),
-            agent: c.agent.clone(),
-            server: c.server.clone(),
-            source_digest: c.source_digest,
-            rules: Vec::new(),
-            params: policy::params_from_json(
-                &json!({"destinations": [account_for_seed(&[6; 32])], "call_limit": 20}),
-                Some(PolicyTier::Simple),
-            )
-            .unwrap(),
-            x402_enabled: enabled,
-            wasm_hash: None,
-        };
-        let mut admin = Admin::new(OwnerAdmin {
-            rpc: &rpc,
-            config: c,
-            now: 86401,
-        });
-        assert!(
-            admin
-                .deploy_policy(DeploymentVersion(2), artifact.clone())
-                .is_err()
-        );
-        assert!(
-            admin
-                .deploy_policy(DeploymentVersion(4), artifact.clone())
-                .is_err()
-        );
-        let prepared = admin.deploy_policy(DeploymentVersion(3), artifact).unwrap();
-        assert_eq!(
-            prepared.required_authorizers,
-            vec![c.owner.clone(), next_owner.clone()]
-        );
-        // The unsigned transaction carries the recorded entries of both owners.
-        let stellar_xdr::TransactionEnvelope::Tx(envelope) =
-            stellar_xdr::TransactionEnvelope::from_xdr_base64(
-                &prepared.transaction_xdr,
-                Limits::none(),
-            )
+    let rpc = admin_fixture(4, Some(stellar_xdr::ScVal::U32(4)));
+    let c = &rpc.base.config;
+    let next_owner = account_for_seed(&[51; 32]);
+    let artifact = PolicyDeployment {
+        owner: next_owner.clone(),
+        agent: c.agent.clone(),
+        server: c.server.clone(),
+        source_hash: c.source_hash,
+        gas_cap: i128::from(c.max_fee_stroops),
+        rules: Vec::new(),
+        params: policy::params_from_json(
+            &json!({"destinations": [account_for_seed(&[6; 32])], "call_limit": 20}),
+            Some(PolicyTier::Simple),
+        )
+        .unwrap(),
+        wasm_hash: None,
+    };
+    let mut admin = Admin::new(OwnerAdmin {
+        rpc: &rpc,
+        config: c,
+        now: 86401,
+    });
+    assert!(
+        admin
+            .deploy_policy(DeploymentVersion(2), artifact.clone())
+            .is_err()
+    );
+    assert!(
+        admin
+            .deploy_policy(DeploymentVersion(4), artifact.clone())
+            .is_err()
+    );
+    let prepared = admin.deploy_policy(DeploymentVersion(3), artifact).unwrap();
+    assert_eq!(
+        prepared.required_authorizers,
+        vec![c.owner.clone(), next_owner.clone()]
+    );
+    // The unsigned transaction carries the recorded entries of both owners.
+    let stellar_xdr::TransactionEnvelope::Tx(envelope) =
+        stellar_xdr::TransactionEnvelope::from_xdr_base64(&prepared.transaction_xdr, Limits::none())
             .unwrap()
-        else {
-            panic!()
-        };
-        let OperationBody::InvokeHostFunction(op) = &envelope.tx.operations[0].body else {
-            panic!()
-        };
-        assert_eq!(op.auth.len(), 2);
-        assert_eq!(
-            op.auth[0].credentials,
-            stellar_xdr::SorobanCredentials::SourceAccount
-        );
-        assert!(matches!(
-            &op.auth[1].credentials,
-            stellar_xdr::SorobanCredentials::Address(c) if c.address == address(&next_owner).unwrap()
-        ));
-        assert_eq!(prepared.pending_authorizers, vec![next_owner.clone()]);
-        let calls = rpc.calls.lock().unwrap();
-        let (name, args) = calls.last().unwrap();
-        assert_eq!(name, "deploy_policy");
-        assert_eq!(args.len(), 1);
-        let stellar_xdr::ScVal::Map(Some(fields)) = &args[0] else {
-            panic!()
-        };
-        assert_eq!(fields.len(), 9);
-        assert!(fields.iter().any(|e|matches!(&e.key,stellar_xdr::ScVal::Symbol(k) if k.0.as_slice()==b"deployment_version") && e.val==stellar_xdr::ScVal::U64(3)));
-        assert!(fields.iter().any(
-            |e| matches!(&e.key,stellar_xdr::ScVal::Symbol(k) if k.0.as_slice()==b"x402_enabled")
-                && e.val == stellar_xdr::ScVal::Bool(enabled)
-        ));
-        assert!(!fields.iter().any(|e| matches!(&e.key,stellar_xdr::ScVal::Symbol(k) if [b"x402_signer".as_slice(),b"policy_version".as_slice()].contains(&k.0.as_slice()))));
-        drop(calls);
-        owner_handoff_completes_with_the_new_owner_signature(&rpc, &prepared, &op.auth[1]);
-    }
+    else {
+        panic!()
+    };
+    let OperationBody::InvokeHostFunction(op) = &envelope.tx.operations[0].body else {
+        panic!()
+    };
+    assert_eq!(op.auth.len(), 2);
+    assert_eq!(
+        op.auth[0].credentials,
+        stellar_xdr::SorobanCredentials::SourceAccount
+    );
+    assert!(matches!(
+        &op.auth[1].credentials,
+        stellar_xdr::SorobanCredentials::Address(c) if c.address == address(&next_owner).unwrap()
+    ));
+    assert_eq!(prepared.pending_authorizers, vec![next_owner.clone()]);
+    let calls = rpc.calls.lock().unwrap();
+    let (name, args) = calls.last().unwrap();
+    assert_eq!(name, "deploy_policy");
+    assert_eq!(args.len(), 1);
+    let stellar_xdr::ScVal::Map(Some(fields)) = &args[0] else {
+        panic!()
+    };
+    // `AllowitPolicyUpdate`: agent, deployment version, gas cap, owner, params, rules, server,
+    // source hash and code.
+    assert_eq!(fields.len(), 9);
+    assert!(fields.iter().any(|e|matches!(&e.key,stellar_xdr::ScVal::Symbol(k) if k.0.as_slice()==b"deployment_version") && e.val==stellar_xdr::ScVal::U32(3)));
+    assert!(!fields.iter().any(|e| matches!(&e.key,stellar_xdr::ScVal::Symbol(k) if [b"x402_enabled".as_slice(),b"policy_version".as_slice()].contains(&k.0.as_slice()))));
+    drop(calls);
+    owner_handoff_completes_with_the_new_owner_signature(&rpc, &prepared, &op.auth[1]);
 }
-
-/// Sign the new owner's recorded entry as a native wallet does.
 fn sign_owner_entry(
     network: &str,
     recorded: &stellar_xdr::SorobanAuthorizationEntry,
@@ -2425,30 +2339,6 @@ fn canonical_main_revision_packet_is_status_only_and_preserves_signed_bytes() {
     assert!(validate_retained_signed(&changed).is_err());
 }
 
-#[test]
-fn enabled_x402_rejects_contract_agents() {
-    use allowit_core::admin::{Admin, DeploymentVersion};
-    use allowit_stellar::admin::{OwnerAdmin, PolicyDeployment};
-    let rpc = admin_fixture(4, Some(stellar_xdr::ScVal::U32(4)));
-    let c = &rpc.base.config;
-    let mut admin = Admin::new(OwnerAdmin {
-        rpc: &rpc,
-        config: c,
-        now: 86401,
-    });
-    let artifact = PolicyDeployment {
-        owner: c.owner.clone(),
-        agent: c.wallet.clone(),
-        server: c.server.clone(),
-        source_digest: c.source_digest,
-        rules: Vec::new(),
-        params: c.params.clone(),
-        x402_enabled: true,
-        wasm_hash: None,
-    };
-    assert!(admin.deploy_policy(DeploymentVersion(3), artifact).is_err());
-    assert!(rpc.calls.lock().unwrap().is_empty());
-}
 
 #[test]
 fn explicit_engine_release_query_distinguishes_legacy_absence_from_failures() {
@@ -2603,36 +2493,13 @@ impl rpc::Rpc for PreflightRpc {
             return Ok(json!({"error":"native policy denied"}));
         }
         let c = &self.base.config;
-        let transfer = transfer_from_request(c, &self.request)?;
-        let receipt = sc_map(vec![
-            (
-                "operation_id",
-                ScVal::Bytes(ScBytes(
-                    self.request.operation.nonce.to_vec().try_into().unwrap(),
-                )),
-            ),
-            ("token", ScVal::Address(address(&c.asset)?)),
-            ("from", ScVal::Address(address(&c.wallet)?)),
-            ("to", ScVal::Address(address(&transfer.recipient)?)),
-            (
-                "amount",
-                ScVal::I128(Int128Parts {
-                    hi: 0,
-                    lo: if self.failure == "receipt" {
-                        1
-                    } else {
-                        transfer.amount as u64
-                    },
-                }),
-            ),
-            ("nonce", ScVal::U64(4)),
-            ("deployment_version", ScVal::U64(2)),
-        ]);
-        let mut auth = match rpc_auth(
-            &params,
-            &env.tx,
-            &[address(&self.base.source.address)?, address(&c.server)?],
-        ) {
+        // `execute` returns nothing; a value is a different contract.
+        let receipt = if self.failure == "receipt" {
+            ScVal::U32(1)
+        } else {
+            ScVal::Void
+        };
+        let mut auth = match rpc_auth(&params, &env.tx, &[address(&c.wallet)?]) {
             Ok(auth) => auth,
             Err(error) => return Ok(json!({ "error": error })),
         };
@@ -2710,9 +2577,8 @@ fn native_preflight_binds_new_signing_and_json_cannot_restore_it() {
                     .policy_state
                     .as_mut()
                     .unwrap()
-                    .state
-                    .0
-                    .insert("counter".into(), PolicyValue::Int(1));
+                    .figures
+                    .calls = 1;
             }
             _ => unreachable!(),
         };
@@ -3080,8 +2946,8 @@ fn selected_implementations_bind_constructor_and_both_authorities() {
             LIMITED,
             json!({"destinations": [account_for_seed(&[6; 32])], "payment_limit": 100_000_000}),
         );
-        let config = PolicyConfig::for_policy(&c, false).unwrap();
-        assert_eq!(config.source_digest, c.source_digest);
+        let config = PolicyConfig::for_policy(&c).unwrap();
+        assert_eq!(config.source_hash, c.source_hash);
         assert_eq!(config.server, c.server);
         assert_eq!(config.params, c.params);
         assert_eq!(
@@ -3092,11 +2958,8 @@ fn selected_implementations_bind_constructor_and_both_authorities() {
                 vec![]
             }
         );
-        if tier == PolicyTier::Custom {
-            assert_eq!(config.source_digest, c.source_hash);
-        } else {
-            assert_ne!(config.source_digest, c.source_hash);
-        }
+        // Every tier stores the hash of the owner's whole source.
+        assert_eq!(config.source_hash, hash(&c.policy_source));
         assert_eq!(config.constructor_args().unwrap().len(), 1);
         let rpc = preflight_rpc(&c, &r, &s);
         let unsigned = rpc::prepare(&rpc, &c, &r, None, 86401, 86700).unwrap();
@@ -3332,225 +3195,7 @@ fn direct_server_account_must_exist_and_authorize_its_current_threshold() {
     }
 }
 
-#[test]
-fn x402_packet_binds_both_raw_keys_and_the_complete_native_scope() {
-    use ed25519_dalek::{Signer, SigningKey};
-    use stellar_xdr::*;
-    let (c, r, mut state) = fixture(WalletRoute::PolicyWallet, true);
-    // Raw x402 keys do not derive authority from a funded G-account or its weights.
-    state.source.master_weight = 0;
-    state.source.signers.clear();
-    let transfer = transfer_from_request(&c, &r).unwrap();
-    let entry = SorobanAuthorizationEntry {
-        credentials: SorobanCredentials::Address(SorobanAddressCredentials {
-            address: address(&c.wallet).unwrap(),
-            nonce: 17,
-            signature_expiration_ledger: state.ledger + 20,
-            signature: ScVal::Void,
-        }),
-        root_invocation: SorobanAuthorizedInvocation {
-            function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
-                contract_address: address(&c.asset).unwrap(),
-                function_name: ScSymbol(b"transfer".to_vec().try_into().unwrap()),
-                args: vec![
-                    ScVal::Address(address(&c.wallet).unwrap()),
-                    ScVal::Address(address(&transfer.recipient).unwrap()),
-                    ScVal::I128(Int128Parts {
-                        hi: 0,
-                        lo: transfer.amount as u64,
-                    }),
-                ]
-                .try_into()
-                .unwrap(),
-            }),
-            sub_invocations: VecM::default(),
-        },
-    };
-    let request = x402::SigningRequest {
-        config: c,
-        request: r,
-        state: x402::WalletState {
-            custody: state,
-            tier: PolicyTier::Simple,
-            x402_enabled: true,
-            paused: false,
-        },
-        expires_at: 86700,
-        terms: ExecutionTerms::default(),
-        authorization_xdr: entry.to_xdr_base64(Limits::none()).unwrap(),
-    };
-    let digest = x402::signing_digest(&request, 86401).unwrap();
-    // The fixture source is canonical-only, so the host runs the full Simple policy.
-    assert_eq!(x402::verify_server(&request, 86401, None).unwrap(), digest);
-    let agent = SigningKey::from_bytes(&[2; 32]).sign(&digest).to_bytes();
-    let server = SigningKey::from_bytes(&[3; 32]).sign(&digest).to_bytes();
-    let encoded = x402::assemble(&request, &agent, &server, 86401).unwrap();
-    let decoded = SorobanAuthorizationEntry::from_xdr_base64(encoded, Limits::none()).unwrap();
-    assert_eq!(decoded.root_invocation, entry.root_invocation);
-    let SorobanCredentials::Address(credential) = decoded.credentials else {
-        panic!()
-    };
-    let ScVal::Map(Some(fields)) = credential.signature else {
-        panic!()
-    };
-    assert_eq!(fields.len(), 3);
-    for (a, s) in [([0; 64], server), (agent, [0; 64]), (server, agent)] {
-        assert!(x402::assemble(&request, &a, &s, 86401).is_err());
-    }
-    for case in [
-        "nonce",
-        "version",
-        "operation",
-        "expires_at",
-        "ledger",
-        "scope",
-        "network",
-        "tier",
-        "disabled",
-        "paused",
-        "zero_operation",
-    ] {
-        let mut changed = request.clone();
-        match case {
-            "tier" => changed.state.tier = PolicyTier::Common,
-            "disabled" => changed.state.x402_enabled = false,
-            "paused" => changed.state.paused = true,
-            "zero_operation" => changed.request.operation.nonce = [0; 32],
-            "nonce" => changed.state.custody.nonce += 1,
-            "version" => changed.state.custody.deployment_version += 1,
-            "operation" => changed.request.operation.nonce[0] ^= 1,
-            "expires_at" => changed.expires_at -= 1,
-            "network" => changed.config.network = "stellar:mainnet".into(),
-            "ledger" | "scope" => {
-                let mut entry = entry.clone();
-                if case == "ledger" {
-                    let SorobanCredentials::Address(c) = &mut entry.credentials else {
-                        panic!()
-                    };
-                    c.signature_expiration_ledger += 1;
-                } else {
-                    entry.root_invocation.sub_invocations =
-                        vec![entry.root_invocation.clone()].try_into().unwrap();
-                }
-                changed.authorization_xdr = entry.to_xdr_base64(Limits::none()).unwrap();
-            }
-            _ => unreachable!(),
-        }
-        assert!(
-            x402::assemble(&changed, &agent, &server, 86401).is_err(),
-            "{case}"
-        );
-    }
-    assert!(x402::assemble(&request, &agent, &server, 86700).is_err());
-    // A priced request signed before UTC midnight must not settle after it: the kernel checks
-    // the expense day against the settlement ledger time.
-    let late_now = 2 * 86_400 - 100;
-    let mut late = request.clone();
-    late.terms.expense = Some(ExpenseBounds {
-        gas_units: 100,
-        conversion_units: 0,
-        spent_units: 100,
-        max_fee_stroops: 100,
-        observed_ledger: late.state.custody.ledger,
-        day: 1,
-    });
-    for expires_at in [late_now + 200, 2 * 86_400 + 1] {
-        late.expires_at = expires_at;
-        let error = x402::signing_digest(&late, late_now).unwrap_err();
-        assert!(error.contains("cross its UTC expense day"), "{error}");
-    }
-    // The expiry is exclusive: a request that expires at midnight settles before it.
-    for expires_at in [2 * 86_400 - 1, 2 * 86_400] {
-        late.expires_at = expires_at;
-        if let Err(error) = x402::signing_digest(&late, late_now) {
-            assert!(!error.contains("cross its UTC expense day"), "{error}");
-        }
-    }
-}
 
-#[test]
-fn x402_server_approval_runs_the_full_simple_policy() {
-    use stellar_xdr::*;
-    let (mut c, r, state) = fixture(WalletRoute::PolicyWallet, true);
-    let recipient = account_for_seed(&[6; 32]);
-    let transfer = transfer_from_request(&c, &r).unwrap();
-    let entry = SorobanAuthorizationEntry {
-        credentials: SorobanCredentials::Address(SorobanAddressCredentials {
-            address: address(&c.wallet).unwrap(),
-            nonce: 17,
-            signature_expiration_ledger: state.ledger + 20,
-            signature: ScVal::Void,
-        }),
-        root_invocation: SorobanAuthorizedInvocation {
-            function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
-                contract_address: address(&c.asset).unwrap(),
-                function_name: ScSymbol(b"transfer".to_vec().try_into().unwrap()),
-                args: vec![
-                    ScVal::Address(address(&c.wallet).unwrap()),
-                    ScVal::Address(address(&transfer.recipient).unwrap()),
-                    ScVal::I128(Int128Parts {
-                        hi: 0,
-                        lo: transfer.amount as u64,
-                    }),
-                ]
-                .try_into()
-                .unwrap(),
-            }),
-            sub_invocations: VecM::default(),
-        },
-    };
-    let compiled = |ctx: &allowit_core::AllowitContext| -> allowit_core::Result {
-        allowit_core::destinations(ctx, &ctx.params[allowit_core::DESTINATIONS])?;
-        let limit: i128 = allowit_core::param(ctx, "payment_limit");
-        if ctx.request.amount > limit {
-            return Err(allowit_core::AllowitError::PaymentLimitExceeded);
-        }
-        Ok(())
-    };
-    for (limit, approved) in [(1, false), (100_000_000, true)] {
-        install(
-            &mut c,
-            PolicyTier::Simple,
-            SUFFIXED,
-            json!({"destinations": [recipient], "payment_limit": limit}),
-        );
-        let mut custody = state.clone();
-        custody.source_hash = c.source_hash;
-        custody.policy_state = Some(PolicyStateSnapshot {
-            params: c.params.clone(),
-            state: PolicyParams::default(),
-            rules: c.rules.clone(),
-            source_digest: c.source_digest,
-            x402_enabled: true,
-        });
-        let request = x402::SigningRequest {
-            config: c.clone(),
-            request: r.clone(),
-            state: x402::WalletState {
-                custody,
-                tier: PolicyTier::Simple,
-                x402_enabled: true,
-                paused: false,
-            },
-            expires_at: 86700,
-            terms: ExecutionTerms::default(),
-            authorization_xdr: entry.to_xdr_base64(Limits::none()).unwrap(),
-        };
-        // Encoding the digest is no approval. Only the onchain prefix runs without an evaluator.
-        let digest = x402::signing_digest(&request, 86401).unwrap();
-        assert!(
-            x402::verify_server(&request, 86401, None)
-                .unwrap_err()
-                .contains("compiled evaluator")
-        );
-        let verdict = x402::verify_server(&request, 86401, Some(&compiled));
-        if approved {
-            assert_eq!(verdict.unwrap(), digest);
-        } else {
-            assert!(verdict.unwrap_err().contains("PaymentLimitExceeded"));
-        }
-    }
-}
 
 #[test]
 fn malformed_retained_policy_wallet_envelopes_return_errors() {
@@ -3683,10 +3328,10 @@ fn owner_recovery_reads_only_kept_fields_and_pause_only_the_current_layout() {
         owner: c.owner.clone(),
         agent: c.agent.clone(),
         server: c.server.clone(),
-        source_digest: c.source_digest,
+        source_hash: c.source_hash,
+        gas_cap: i128::from(c.max_fee_stroops),
         rules: Vec::new(),
         params: c.params.clone(),
-        x402_enabled: false,
         wasm_hash: None,
     };
     assert!(
@@ -3757,16 +3402,10 @@ fn owner_deployment_binds_common_rules_to_the_installed_source_prefix() {
         owner: c.owner.clone(),
         agent: c.agent.clone(),
         server: c.server.clone(),
-        source_digest: policy::standard_prefix_digest(
-            PolicyTier::Common,
-            &c.module_digest,
-            &c.asset,
-            &rules,
-        )
-        .unwrap(),
+        source_hash: hash(LIMITED),
+        gas_cap: i128::from(c.max_fee_stroops),
         rules,
         params: c.params.clone(),
-        x402_enabled: false,
         wasm_hash: None,
     };
     let error = admin
@@ -3797,7 +3436,7 @@ fn owner_deployment_binds_common_rules_to_a_target_source() {
     };
     // A rules-only Common update: the target source adds `payment_limit` to the prefix and
     // keeps the installed code.
-    let (artifact, _) = PolicyDeployment::for_source(&c, LIMITED, c.params.clone(), false).unwrap();
+    let (artifact, _) = PolicyDeployment::for_source(&c, LIMITED, c.params.clone()).unwrap();
     assert_eq!(artifact.rules, ["destinations", "payment_limit"]);
     // The installed source does not bind the new prefix.
     let error = admin
@@ -3822,7 +3461,7 @@ fn owner_deployment_binds_common_rules_to_a_target_source() {
         now: 86401,
     };
     let artifact = PolicyDeployment {
-        source_digest: hash(LIMITED),
+        source_hash: hash(LIMITED),
         rules: Vec::new(),
         ..artifact
     };
@@ -3950,10 +3589,10 @@ fn owner_preparation_refuses_address_v2_entries_that_the_handoff_cannot_sign() {
         owner: account_for_seed(&[51; 32]),
         agent: c.agent.clone(),
         server: c.server.clone(),
-        source_digest: c.source_digest,
+        source_hash: c.source_hash,
+        gas_cap: i128::from(c.max_fee_stroops),
         rules: Vec::new(),
         params: c.params.clone(),
-        x402_enabled: false,
         wasm_hash: None,
     };
     let mut admin = OwnerAdmin {
