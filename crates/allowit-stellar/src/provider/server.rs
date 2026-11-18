@@ -372,7 +372,13 @@ pub struct Provider {
     network: String,
     runtime: crate::provider::runtime::Runtime,
     transport: std::sync::Arc<dyn rpc::Rpc>,
+    sender: Option<Sender>,
 }
+/// The signing capability of the server's sending accounts: it signs a transaction hash with the
+/// key of the named account. A policy wallet operation is sent from one of them, which pays its
+/// fee; the wallet repays the gas to it.
+pub type Sender =
+    std::sync::Arc<dyn Fn(&str, &[u8; 32]) -> native::Result<[u8; 64]> + Send + Sync>;
 impl Provider {
     /// One owner action on a keypair wallet: a transaction from the owner's account whose
     /// operations the owner's signature authorizes alone. `Recover` without an amount closes
@@ -492,7 +498,13 @@ impl Provider {
             network: network.into(),
             runtime: super::runtime::Runtime::from_rpc(inner.clone()),
             transport: inner,
+            sender: None,
         }
+    }
+    /// This provider with the signing capability of the server's sending accounts.
+    pub fn with_sender(mut self, sender: Sender) -> Self {
+        self.sender = Some(sender);
+        self
     }
     #[cfg(test)]
     pub fn from_rpc(network: &str, rpc: std::sync::Arc<dyn rpc::Rpc>) -> Self {
@@ -1063,6 +1075,20 @@ impl crate::host::vendors::RuntimeProvider for Provider {
             checked(native::seller_settled::authorize(self.rpc(), &p, &s, now))?
         } else {
             checked(native::authorize(&p, &s, now))?
+        };
+        // A policy wallet operation leaves this step final: the sending account that the request
+        // names as its fee payer seals it, so the retained packet is the transaction the network
+        // gets.
+        let signed = if p.config.route == WalletRoute::PolicyWallet
+            && p.payment_authorization.is_none()
+        {
+            let sender = self.sender.as_ref().ok_or_else(|| {
+                Error::config("This server has no sending account for policy wallet operations")
+            })?;
+            let source = checked(native::gas_payee(&p.request, &p.terms))?;
+            checked(rpc::seal(self.rpc(), &signed, |hash| sender(&source, hash)))?
+        } else {
+            signed
         };
         Ok(Signed(packet(&p.config.network, &signed)?))
     }

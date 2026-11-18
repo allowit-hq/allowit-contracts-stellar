@@ -1464,6 +1464,11 @@ pub(crate) fn gas_repayment(r: &ExecutionRequest, terms: &ExecutionTerms) -> Res
         payee: workflow_address(&fee.payer)?,
     })
 }
+/// The sending account that a policy wallet operation names: the payee of its gas repayment and
+/// the fee payer of its request.
+pub fn gas_payee(r: &ExecutionRequest, terms: &ExecutionTerms) -> Result<String> {
+    Ok(gas_repayment(r, terms)?.payee)
+}
 /// The layout 5 `AllowitExecutionRequest` of one operation: its id, the wallet's deployment
 /// version, the expiry, the typed native operation, the expense, the gas repayment and the
 /// execution args.
