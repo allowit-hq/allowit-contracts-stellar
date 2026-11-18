@@ -411,20 +411,20 @@ const REPRICE_ROUNDS: u8 = 2;
 /// The expense of `terms` at the fee bound `fee`: the default repayment follows the bound less
 /// the gas carry, and an explicit repayment keeps its gas. It always starts from the caller's
 /// `ceiling`, so a price taken again subtracts the carry once.
-/// The gas due joins the repayment as far as the wallet's gas cap `cap` allows; the priced terms
+/// The gas due joins the repayment as far as the wallet's gas cap `gas_cap` allows; the priced terms
 /// keep that part.
 fn bounded(
     terms: &ExecutionTerms,
     ceiling: &ExpenseBounds,
     fee: u32,
-    cap: i128,
+    gas_cap: i128,
 ) -> Result<(ExpenseBounds, u128)> {
     if terms.gas.is_some() {
         Ok((ceiling.with_fee_bound_only(fee)?, terms.gas_due))
     } else {
         ceiling
             .with_fee_bound(fee)?
-            .with_gas_due(terms.gas_carry, terms.gas_due, cap)
+            .with_gas_due(terms.gas_carry, terms.gas_due, gas_cap)
     }
 }
 fn priced_terms(
@@ -444,9 +444,10 @@ fn priced_terms(
         });
     };
     // The wallet's gas cap is the installed fee ceiling, which its creation set.
-    let cap = i128::from(c.max_fee_stroops);
+    let gas_cap = i128::from(c.max_fee_stroops);
     let with_bound = |fee: u32| -> Result<ExecutionTerms> {
-        let (expense, gas_due) = bounded(terms, ceiling, fee.min(ceiling.max_fee_stroops), cap)?;
+        let (expense, gas_due) =
+            bounded(terms, ceiling, fee.min(ceiling.max_fee_stroops), gas_cap)?;
         Ok(ExecutionTerms {
             args: terms.args.clone(),
             expense: Some(expense),

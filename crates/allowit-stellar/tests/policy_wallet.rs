@@ -2679,11 +2679,11 @@ fn a_gas_due_joins_the_repayment_within_the_gas_cap() {
     let chain = ModelChain::new(BTreeMap::from([(hash(&wasm), PolicyTier::Common)]));
     let c = create(&chain, PolicyTier::Common, &wasm, [0x37; 32]);
     let recipient = account_for_seed(&RECIPIENT);
-    let cap = i128::from(c.max_fee_stroops);
-    // A due that fits, a due beyond the cap and a due after a carry.
+    let gas_cap = i128::from(c.max_fee_stroops);
+    // A due that fits, a due beyond the gas cap and a due after a carry.
     for (id, carry, due) in [
         (1u8, 0u128, 500u128),
-        (2, 0, cap as u128 * 2),
+        (2, 0, gas_cap as u128 * 2),
         (3, 300, 1_000),
     ] {
         let state = sending_state(&chain, &c);
@@ -2705,9 +2705,9 @@ fn a_gas_due_joins_the_repayment_within_the_gas_cap() {
         )
         .unwrap();
         let base = (gas() - carry as i128).max(0);
-        let part = (due as i128).min(cap - base);
+        let part = (due as i128).min(gas_cap - base);
         let repaid = base + part;
-        assert!(repaid <= cap);
+        assert!(repaid <= gas_cap);
         assert_eq!(prepared.terms.gas_due, part as u128, "{id}");
         assert_eq!(prepared.terms.repaid_stroops().unwrap(), repaid);
         let expense = prepared.terms.expense.as_ref().unwrap();
