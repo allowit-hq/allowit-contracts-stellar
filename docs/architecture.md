@@ -359,8 +359,9 @@ owner-written request and returns its passing constraint:
 `decision(ctx, &AllowitDecision { id, query, deny_below, allow_above })` the passing confidence,
 and `new_decision_context(ctx, contents)` nothing: it starts a new decision context, empty or with the optional
 `contents` as its first contents. `id` names the decision call within the policy. Scores and confidences are basis points. There they are
-stubs that return `Unsupported` until the server fills them. A Custom policy that calls one does not
-compile, because the Soroban backend has none of them.
+stubs that return `Unsupported` until the server fills them. The Soroban backend has none of them:
+the contract of a Custom wallet compiles the on-chain part of its source, which names no server
+function ([one source, two parts](custom-policy-kernel.md#one-source-two-parts)).
 
 | Rule and canonical param key | Param value | Pass value |
 | --- | --- | --- |

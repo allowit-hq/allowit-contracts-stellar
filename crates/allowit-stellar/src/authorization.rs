@@ -309,6 +309,14 @@ pub fn authorize_server_using(
     if tier.standard() && evaluation == policy::Evaluation::Prefix {
         return Err("The service must evaluate the full Simple or Common policy; supply its compiled evaluator".into());
     }
+    // The contract of a Custom wallet runs only the on-chain part of its source. The server
+    // evaluates the whole source before it signs, so a source with a server part needs the
+    // server's evaluator.
+    if evaluation == policy::Evaluation::Prefix
+        && policy::custom_parts(&p.config.policy_source)?.server_part
+    {
+        return Err(policy::NEEDS_SERVER_EVALUATION.into());
+    }
     if cosignatures(p)? != (None, None) {
         return Err("Service authorization is already signed".into());
     }

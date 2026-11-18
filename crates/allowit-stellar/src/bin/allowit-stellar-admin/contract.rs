@@ -420,8 +420,22 @@ pub fn policy_rules(
     };
     let bytes = std::fs::read(path).map_err(|_| "Cannot read the policy source")?;
     let source = std::str::from_utf8(&bytes).map_err(|_| "Policy source is not UTF-8")?;
-    let shape = policy::source_shape(source)?;
-    compile(path)?;
+    let shape = policy::wallet_shape(tier, source)?;
+    // The contract of a Custom wallet compiles the on-chain part of its source.
+    let parts = (tier == PolicyTier::Custom)
+        .then(|| policy::custom_parts(source))
+        .transpose()?
+        .filter(|parts| parts.server_part);
+    match parts {
+        Some(parts) => {
+            let scratch = Scratch::new()?;
+            let onchain = scratch.0.join("onchain.rs");
+            std::fs::write(&onchain, &parts.onchain)
+                .map_err(|_| "Cannot write the on-chain part of the policy source")?;
+            compile(onchain.to_str().ok_or("Scratch path is not UTF-8")?)?;
+        }
+        None => compile(path)?,
+    }
     let expected = if tier == PolicyTier::Common {
         shape.prefix
     } else {
@@ -441,7 +455,7 @@ pub fn policy_rules(
     // Simple and Common store only standard state, so their server denies every policy write. A
     // Custom wallet keeps the state entries that its build declares.
     if tier == PolicyTier::Custom {
-        allowit_stellar::custom_state_entries(source)?;
+        allowit_stellar::custom_wallet_state_entries(source)?;
     } else if shape.writes_state {
         return Err(policy::WRITES_STATE.into());
     }

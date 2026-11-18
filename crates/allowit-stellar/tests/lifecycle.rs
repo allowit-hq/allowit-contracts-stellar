@@ -2469,6 +2469,65 @@ fn native_preflight_binds_new_signing_and_json_cannot_restore_it() {
         assert!(sign(&changed, &[2; 32], 86401).is_err(), "{change}");
     }
 }
+/// A Custom wallet whose source has a server part. Its contract compiles only the on-chain part,
+/// so the server signs after it evaluated the whole source: without its evaluator it does not
+/// sign, a denial of the evaluator is its denial, and a pass signs. The wallet keeps the figures
+/// that its on-chain part reads, so an execution needs the server's accounting of the others.
+#[test]
+fn a_custom_wallet_with_a_server_part_signs_only_after_the_servers_evaluation() {
+    let mut rpc = preflight_fixture();
+    let one = PORTABLE.replace(
+        "    Ok(())\n}",
+        "    let score = allowit::decision(ctx, &allowit::AllowitDecision { id: \"research\", query: \"Is this payment for research?\", deny_below: 3000, allow_above: 8000 })?;\n    allowit::set_state(ctx, \"last_score\", score)?;\n    Ok(())\n}",
+    );
+    assert_ne!(one, PORTABLE);
+    let parts = policy::custom_parts(&one).unwrap();
+    assert!(parts.server_part && parts.onchain == PORTABLE);
+    assert_eq!(parts.server_keys, ["last_score"]);
+    rpc.base.config.source_hash = hash(&one);
+    rpc.base.config.source_digest = rpc.base.config.source_hash;
+    rpc.base.config.policy_source = one;
+    let c = rpc.base.config.clone();
+    assert_eq!(kept_figures(&c), 0);
+    assert!(
+        rpc::prepare(&rpc, &c, &rpc.request, None, 86401, 86700)
+            .unwrap_err()
+            .contains("needs the server's accounting")
+    );
+    let accounting = rpc::NativeAccounting {
+        nonce: 0,
+        deployment_version: 0,
+        spent_daily: 0,
+        spent_total: 0,
+        spent_day: 1,
+        volume_daily: 0,
+        unpriced_total: false,
+        unpriced_daily: false,
+        calls: 0,
+    };
+    let p = rpc::prepare(&rpc, &c, &rpc.request, Some(accounting), 86401, 86700).unwrap();
+    assert_eq!(
+        authorize_server(&p, &[3; 32], 86401, None).unwrap_err(),
+        policy::NEEDS_SERVER_EVALUATION
+    );
+    let deny: policy::PortableEvaluator = &|_| Err(allowit_core::AllowitError::Unsupported);
+    assert!(
+        authorize_server_with(&p, &[3; 32], 86401, deny)
+            .unwrap_err()
+            .contains("denied")
+    );
+    // The server part writes its own key: the server keeps it, and the wallet's build does
+    // not declare it.
+    let pass: policy::PortableEvaluator =
+        &|ctx| allowit_core::set_state(ctx, "last_score", 9_000u32);
+    authorize_server_with(&p, &[3; 32], 86401, pass).unwrap();
+    let stray: policy::PortableEvaluator = &|ctx| allowit_core::set_state(ctx, "other", 1u32);
+    assert!(
+        authorize_server_with(&p, &[3; 32], 86401, stray)
+            .unwrap_err()
+            .contains("does not declare")
+    );
+}
 #[test]
 fn local_revalidation_preserves_existing_unsigned_identity_and_checks_current_authority() {
     let rpc = preflight_fixture();

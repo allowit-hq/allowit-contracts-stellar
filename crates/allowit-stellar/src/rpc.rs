@@ -1862,12 +1862,12 @@ fn current_wallet_state(
     // A wallet that keeps every figure needs no account of the server's.
     let accounting = accounting.filter(|_| crate::kept_figures(c) != packed::ALL);
     // The server's account of the figures that the wallet does not keep: a Simple wallet keeps
-    // none, a Common wallet those of its rules with params. An execution needs it; discovery
-    // reports the wallet's own figures without it.
+    // none, a Common wallet those of its rules with params, and a Custom wallet whose source has
+    // a server part those of its on-chain part. An execution needs it; discovery reports the
+    // wallet's own figures without it.
     if require_customer_quorum && accounting.is_none() && crate::kept_figures(c) != packed::ALL {
         return Err(
-            "A Simple or Common wallet needs the server's accounting of the figures that it does not keep"
-                .into(),
+            "This wallet needs the server's accounting of the figures that it does not keep".into(),
         );
     }
     Ok(DiscoveredState {
@@ -1938,8 +1938,8 @@ pub fn figures(rpc: &dyn Rpc, c: &WalletConfig, ledger: u32) -> Result<packed::F
     }
     Ok(figures)
 }
-/// A Custom policy's own state entries at `ledger`: each key that its build declares, read from
-/// its short storage key. A daily entry whose window ended and a persistent entry without a
+/// A Custom policy's own state entries at `ledger`: each key that the build of its on-chain part
+/// declares, read from its short storage key. A daily entry whose window ended and a persistent entry without a
 /// value are absent. Other tiers store none.
 pub fn custom_state(
     rpc: &dyn Rpc,
@@ -1950,7 +1950,7 @@ pub fn custom_state(
     if c.tier != Some(crate::PolicyTier::Custom) {
         return Ok(state);
     }
-    for entry in crate::custom_state_entries(&c.policy_source)? {
+    for entry in crate::custom_wallet_state_entries(&c.policy_source)? {
         let key = LedgerKey::ContractData(LedgerKeyContractData {
             contract: address(&c.wallet)?,
             key: ScVal::U32(entry.key),

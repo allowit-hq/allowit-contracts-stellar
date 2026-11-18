@@ -116,7 +116,7 @@ Three wallet implementations share one custody core (`crates/policy-wallet`) and
 | --- | --- | --- |
 | `AllowitSimplePolicyEngine` | Agent and server | Offchain. The server checks the authored policy before it signs. The contract enforces custody invariants only. |
 | `AllowitCommonPolicyEngine` | Agent and server | Onchain, from the standard prefix: the leading canonical rule calls of the authored policy, which the owner approves as `rules`. |
-| `AllowitCustomPolicy` | Agent and server | Onchain, compiled. The complete authored policy file compiles verbatim into its own contract, on the same custody mixins. |
+| `AllowitCustomPolicy` | Agent and server | Onchain, compiled. The on-chain part of the authored policy file compiles verbatim into its own contract, on the same custody mixins. A file with no server function is its own on-chain part. |
 
 Pick **Simple** when your server already runs the whole policy and you want the lightest contract. Pick **Common** when you want standard limits enforced by the ledger itself. Pick **Custom** when the policy needs logic the canonical rules do not cover.
 
@@ -140,7 +140,7 @@ Value types, the standard state keys and error mapping are in [docs/architecture
 
 ## Write a policy
 
-Policy source is ordinary synchronous Rust against the same released portable `allowit` package. The offchain server and `AllowitCustomPolicy` compile the same file verbatim:
+Policy source is ordinary synchronous Rust against the same released portable `allowit` package. The offchain server evaluates the file, and `AllowitCustomPolicy` compiles its on-chain part verbatim. A file with no server function, as this one, is its own on-chain part:
 
 ```rust
 use allowit::prelude::*;
@@ -163,7 +163,7 @@ pub fn execute(ctx: &AllowitContext) -> allowit::Result {
 - A rule takes the param value, so it may read any key, such as `&ctx.params["vendor_limit"]`.
 - Only an error that the policy returns denies. A policy may catch a rule error and continue.
 - `allowit::param(ctx, key)` and `allowit::arg(ctx, key)` return the typed value of an owner param or an agent arg. They panic when the key is missing or mistyped. A panic denies the run and discards its writes.
-- After approval the wallet and the server run the same standard `allowit::post_flight`. It updates the cumulated figures that the wallet's checks read. A Simple or Common wallet stores no policy state of its own, so its post-flight denies every `allowit::set_state` write, on the server as onchain. A Custom wallet keeps the state entries that its build declares ([policy state](docs/custom-policy-kernel.md#policy-state)).
+- After approval the wallet and the server run the same standard `allowit::post_flight`. It updates the cumulated figures that the wallet's checks read. A Simple or Common wallet stores no policy state of its own, so its post-flight denies every `allowit::set_state` write, on the server as onchain. A Custom wallet keeps the state entries that its build declares, and the server keeps the state of the part of the source that only it runs ([policy state](docs/custom-policy-kernel.md#policy-state)).
 
 `scripts/policy_source.py` admits policy code through an allowlist, so the same file behaves the same offchain and onchain. The admin binary `allowit-stellar-admin` derives the standard `rules` from the source file. The server uses `allowit = { default-features = false, features = ["std"] }` and builds with `overflow-checks = true`. The full authoring rules are in [docs/architecture.md](docs/architecture.md).
 
@@ -305,7 +305,7 @@ docs/                     Architecture, engine parent, administration, mainnet
 ## Documentation
 
 - [Architecture and authoring](docs/architecture.md): wallets, policy source, rules, configuration, the wallet's own authorization, deposits, swaps, redeems and owner operations.
-- [Kernel interface for Custom sources](docs/custom-policy-kernel.md): what a compiled source reads and the figures it keeps.
+- [Kernel interface for Custom sources](docs/custom-policy-kernel.md): the two parts of one source, what a compiled source reads, and the figures and state it keeps.
 - [Engine parent](docs/engine-parent.md): shared engine state, calls and lifetime.
 - [Setup and administration](docs/admin.md): preparing, reviewing and signing wallet transactions.
 - [Mainnet preparation](docs/mainnet.md): bounded, unsigned release packets.

@@ -635,9 +635,65 @@ const SERVER_FUNCTIONS: &[(&str, &str)] = &[
 pub fn classic_shape(source: &str) -> Result<SourceShape> {
     allowit_core::policy_source::source_shape_with_host_calls(source, SERVER_FUNCTIONS)
 }
+/// The two parts of the one source of a Custom wallet. The owner writes and signs `source`, and
+/// the server evaluates all of it before it signs. The contract compiles the on-chain part,
+/// which Core derives from the source: the same source gives the same part, byte for byte, on
+/// the server and on the owner's client.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CustomParts {
+    /// The on-chain part: the source of `contracts/allowit-custom-policy/policy/policy.rs`. It
+    /// equals the owner's source when that source has no server part.
+    pub onchain: String,
+    /// Whether the owner's source has a part that only the server runs: the on-chain part
+    /// differs from the source.
+    pub server_part: bool,
+    /// The checked shape of the owner's source.
+    pub shape: SourceShape,
+    /// The state keys that the server keeps, sorted. The contract never stores them.
+    pub server_keys: Vec<String>,
+}
+/// Check the one source of a Custom wallet and derive its on-chain part.
+///
+/// A source without a server part is portable source, and the contract compiles all of it. A
+/// source with a server part is server policy source: it can read owner text with `as_str()`
+/// for a server function. Its on-chain part is portable source that names no server function.
+pub fn custom_parts(source: &str) -> Result<CustomParts> {
+    let derived = allowit_core::policy_source::derive(source)?;
+    let server_part = derived.source != source;
+    let shape = if server_part {
+        classic_shape(source)?
+    } else {
+        source_shape(source)?
+    };
+    // The contract compiles the on-chain part, so that part passes the portable gate and its
+    // build's own scan of state keys.
+    source_shape(&derived.source)?;
+    crate::custom_state_entries(&derived.source)?;
+    Ok(CustomParts {
+        server_part,
+        shape,
+        server_keys: derived
+            .state
+            .into_iter()
+            .filter(|entry| entry.keeper == allowit_core::policy_source::Keeper::Server)
+            .map(|entry| entry.key)
+            .collect(),
+        onchain: derived.source,
+    })
+}
+/// The checked shape of the source of a policy wallet of `tier`. The contract of a Simple or
+/// Common wallet runs canonical rules of portable source. The contract of a Custom wallet
+/// compiles the on-chain part of its source ([`custom_parts`]).
+pub fn wallet_shape(tier: PolicyTier, source: &str) -> Result<SourceShape> {
+    if tier == PolicyTier::Custom {
+        Ok(custom_parts(source)?.shape)
+    } else {
+        source_shape(source)
+    }
+}
 /// The rules a tier installs for `source`: the standard prefix for Common, none otherwise.
 pub fn tier_rules(tier: PolicyTier, source: &str) -> Result<Vec<String>> {
-    let shape = source_shape(source)?;
+    let shape = wallet_shape(tier, source)?;
     Ok(if tier == PolicyTier::Common {
         shape.prefix
     } else {
@@ -652,8 +708,8 @@ pub struct PolicyCheck {
 }
 /// Bind an owner packet to its authored source: `scripts/contract_admin.py` `policy_rules`.
 /// Common binds the source's standard prefix; Simple and Custom bind none. Custom also binds
-/// the source bytes. Simple and Common cannot store `allowit::set_state` writes; a Custom source's
-/// state keys must pass its build's scan.
+/// the source bytes. Simple and Common cannot store `allowit::set_state` writes; the state keys
+/// of a Custom source's on-chain part must pass its build's scan.
 pub fn policy_rules(
     tier: PolicyTier,
     source: &str,
@@ -661,7 +717,7 @@ pub fn policy_rules(
     source_digest: &[u8; 32],
     params: &PolicyParams,
 ) -> Result<PolicyCheck> {
-    let shape = source_shape(source)?;
+    let shape = wallet_shape(tier, source)?;
     let expected = if tier == PolicyTier::Common {
         shape.prefix.clone()
     } else {
@@ -676,10 +732,9 @@ pub fn policy_rules(
     if tier == PolicyTier::Custom && *source_digest != hash(source.as_bytes()) {
         return Err("Custom source_digest must be the SHA-256 of the policy source".into());
     }
-    // Only a Custom wallet stores its policy's own state: the entries that its build declares.
-    if tier == PolicyTier::Custom {
-        crate::custom_state_entries(source)?;
-    } else if shape.writes_state {
+    // Only a Custom wallet stores its policy's own state: the entries that the build of its
+    // on-chain part declares, which `wallet_shape` checked.
+    if tier != PolicyTier::Custom && shape.writes_state {
         return Err(WRITES_STATE.into());
     }
     params.check(tier)?;
@@ -802,6 +857,18 @@ fn run_rule(ctx: &AllowitContext, rule: AllowitRule) -> allowit_core::Result {
 }
 /// The refusal of a policy source that writes state: a policy wallet stores none.
 pub const WRITES_STATE: &str = "A Simple or Common wallet stores no policy state; a source that calls allowit::set_state is refused";
+/// The refusal of an operation of a Custom wallet whose source has a server part, without the
+/// server's evaluator.
+pub const NEEDS_SERVER_EVALUATION: &str = "The server must evaluate the whole source of a Custom wallet that has a server part; supply its compiled evaluator";
+/// The state keys that the source of a policy wallet may write.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WalletKeys<'a> {
+    /// The keys that the contract stores: those that the build of its compiled source declares.
+    pub stored: &'a [String],
+    /// The keys that the server keeps for the part of a Custom wallet's source that only it
+    /// runs.
+    pub server: &'a [String],
+}
 /// What host evaluation established.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Evaluation {
@@ -816,11 +883,12 @@ pub enum Evaluation {
 /// or any source with a supplied compiled evaluator, then runs in full through
 /// `allowit::evaluate`, where an absent param denies with `MissingParam`.
 ///
-/// A policy wallet (`wallet` names the state keys that its build declares) runs the post-flight
-/// of its kernel: a Simple or Common wallet stores no policy state, so the evaluation runs the
+/// A policy wallet (`wallet` names the state keys of its source) runs the post-flight of its
+/// kernel: a Simple or Common wallet stores no policy state, so the evaluation runs the
 /// standard post-flight right after the policy, which denies a write with `Unsupported`. A Custom
-/// wallet keeps the writes of its declared keys, as its kernel does; a write of any other key is
-/// refused. A Custom wallet also admits its own params.
+/// wallet keeps the writes of the keys that its build declares, as its kernel does, each within
+/// its packed bound. The server keeps the writes of the keys of the server part. A write of any
+/// other key is refused. A Custom wallet also admits its own params.
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate(
     tier: PolicyTier,
@@ -830,7 +898,7 @@ pub fn evaluate(
     state: &PolicyParams,
     request: &RuleRequest,
     evaluator: Option<PortableEvaluator>,
-    wallet: Option<&[String]>,
+    wallet: Option<WalletKeys<'_>>,
 ) -> Result<Evaluation> {
     let ctx = context(params, state, request);
     for rule in parse_rules(rules)? {
@@ -879,14 +947,14 @@ pub fn evaluate(
         &full.map_err(|e| format!("Authored policy denied this exact operation: {e:?}"))?,
     );
     // The wallet stores only the standard figures and the declared keys, each declared value
-    // within its packed bound.
-    if let (true, Some(declared)) = (keeps_state, wallet) {
+    // within its packed bound. The server keeps the keys of the server part.
+    if let (true, Some(keys)) = (keeps_state, wallet) {
         let standard = crate::state_keys::STANDARD.map(|(key, _)| key);
         for (key, value) in &next.0 {
-            if standard.contains(&key.as_str()) {
+            if standard.contains(&key.as_str()) || keys.server.contains(key) {
                 continue;
             }
-            if !declared.contains(key) {
+            if !keys.stored.contains(key) {
                 return Err(format!(
                     "The policy wrote the state key {key:?}, which its build does not declare"
                 ));
@@ -932,6 +1000,10 @@ mod tests {
         let writer: PortableEvaluator = &|ctx| allowit_core::set_state(ctx, "seen", 1u64);
         let reader: PortableEvaluator = &|_| Ok(());
         let declared = ["seen".to_owned()];
+        let keys = Some(WalletKeys {
+            stored: &declared,
+            server: &[],
+        });
         let run = |tier, evaluator, wallet| {
             evaluate(
                 tier,
@@ -945,17 +1017,16 @@ mod tests {
             )
         };
         assert!(
-            run(PolicyTier::Simple, writer, Some(&declared))
+            run(PolicyTier::Simple, writer, keys)
                 .unwrap_err()
                 .contains("Unsupported")
         );
-        let Evaluation::Full(custom) = run(PolicyTier::Custom, writer, Some(&declared)).unwrap()
-        else {
+        let Evaluation::Full(custom) = run(PolicyTier::Custom, writer, keys).unwrap() else {
             panic!()
         };
         assert_eq!(custom.0.get("seen"), Some(&PolicyValue::Int(1)));
         assert!(
-            run(PolicyTier::Custom, writer, Some(&[]))
+            run(PolicyTier::Custom, writer, Some(WalletKeys::default()))
                 .unwrap_err()
                 .contains("does not declare")
         );
@@ -963,8 +1034,7 @@ mod tests {
             panic!()
         };
         assert!(kept.0.contains_key("seen"));
-        let Evaluation::Full(stored) = run(PolicyTier::Custom, reader, Some(&declared)).unwrap()
-        else {
+        let Evaluation::Full(stored) = run(PolicyTier::Custom, reader, keys).unwrap() else {
             panic!()
         };
         assert!(!stored.0.contains_key("seen"));
@@ -984,11 +1054,90 @@ mod tests {
                 allowit_core::AllowitValue::Str("x".repeat(63).as_str().into()),
             )
         };
-        assert!(run(PolicyTier::Custom, fits, Some(&declared)).is_ok());
+        assert!(run(PolicyTier::Custom, fits, keys).is_ok());
         assert!(
-            run(PolicyTier::Custom, long, Some(&declared))
+            run(PolicyTier::Custom, long, keys)
                 .unwrap_err()
                 .contains("longer than 64")
+        );
+        // The server keeps a key of the server part: its write passes, and the wallet's packed
+        // bound does not apply to it.
+        let server = Some(WalletKeys {
+            stored: &[],
+            server: &declared,
+        });
+        let Evaluation::Full(kept) = run(PolicyTier::Custom, long, server).unwrap() else {
+            panic!()
+        };
+        assert!(kept.0.contains_key("seen"));
+    }
+
+    /// The one source of a Custom wallet: the contract compiles its on-chain part, and the
+    /// server evaluates the whole source. A source without a server part is its own on-chain
+    /// part. Each state key has one keeper.
+    #[test]
+    fn a_custom_source_has_an_on_chain_part_and_names_the_keeper_of_each_key() {
+        let plain = custom_parts(SOURCE).unwrap();
+        assert!(!plain.server_part && plain.onchain == SOURCE && plain.server_keys.is_empty());
+        const ONE: &str = r#"use allowit::prelude::*;
+use allowit::AllowitDecision;
+pub fn execute(ctx: &AllowitContext) -> allowit::Result {
+    allowit::daily_spending_limit(ctx, &ctx.params[allowit::DAILY_SPENDING_LIMIT])?;
+    let payments: u64 = allowit::get_state(ctx, "day_payments")?.unwrap_or(0);
+    if payments >= 3 {
+        return Err(AllowitError::CallLimitExceeded);
+    }
+    allowit::set_state(ctx, "day_payments", payments + 1)?;
+    let question: String = allowit::param(ctx, "question");
+    let score = allowit::decision(ctx, &AllowitDecision { id: "research", query: question.as_str(), deny_below: 3000, allow_above: 8000 })?;
+    allowit::set_state(ctx, "last_score", score)?;
+    if score < 9000 {
+        allowit::call_limit(ctx, &ctx.params[allowit::CALL_LIMIT])?;
+    }
+    Ok(())
+}
+"#;
+        let parts = custom_parts(ONE).unwrap();
+        assert!(parts.server_part);
+        for gone in ["decision", "as_str", "last_score", "call_limit", "question"] {
+            assert!(
+                ONE.contains(gone) && !parts.onchain.contains(gone),
+                "{gone}"
+            );
+        }
+        assert!(
+            parts
+                .onchain
+                .contains("allowit::set_state(ctx, \"day_payments\", payments + 1)?;")
+        );
+        assert_eq!(parts.server_keys, ["last_score"]);
+        // The contract stores the key of its own part, and keeps the figures that this part
+        // reads: those of the daily limit, not those of the rule that only the server runs.
+        let stored: Vec<String> = crate::custom_wallet_state_entries(ONE)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(stored, ["day_payments"]);
+        let (_, read) =
+            crate::state_keys::declared(&parts.onchain, |name| crate::hash(name)).unwrap();
+        assert_eq!(crate::state_keys::figures(&parts.onchain, read), 4);
+        let (_, read) = crate::state_keys::declared(ONE, |name| crate::hash(name)).unwrap();
+        assert_eq!(crate::state_keys::figures(ONE, read), 4 | 2);
+        // Only a Custom wallet holds server policy source: the contract of another tier
+        // compiles no part of it.
+        assert_eq!(tier_rules(PolicyTier::Custom, ONE).unwrap(), [""; 0]);
+        assert!(wallet_shape(PolicyTier::Common, ONE).is_err());
+        assert!(tier_rules(PolicyTier::Simple, ONE).is_err());
+        // A state key that the build cannot declare is refused with the source.
+        let dynamic = ONE.replace(
+            "allowit::get_state(ctx, \"day_payments\")",
+            "allowit::get_state(ctx, question.as_str())",
+        );
+        assert!(
+            custom_parts(&dynamic)
+                .unwrap_err()
+                .contains("string literal")
         );
     }
 

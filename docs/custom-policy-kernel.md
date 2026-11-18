@@ -3,7 +3,24 @@
 A Custom wallet is the shared wallet kernel (`crates/policy-wallet`) with one compiled policy. The
 owner writes and signs one policy source. The on-chain policy is derived from it, compiled into the
 contract and run by the kernel on every agent operation. This page states what that compiled
-policy may call, which figures the wallet keeps for it, and how the contract is built.
+policy may call, which figures and state the wallet keeps for it, and how the contract is built.
+
+## One source, two parts
+
+The server evaluates the whole source before it signs. A contract cannot call a server function,
+so the contract compiles the on-chain part: the statements that the chain can check by itself.
+Core derives that part (`allowit_core::policy_source::derive`). It is a pure function of the source
+bytes, so the server and the owner's client build the same code from the same source.
+
+| Source | `policy/policy.rs` | `policy/source.rs` | Server signs |
+| --- | --- | --- | --- |
+| No server part: the on-chain part equals the source | The source | Absent | After the contract's recording simulation |
+| A server part: a server function, owner text read with `as_str()`, or state that the server keeps | The on-chain part | The source | Only after its evaluator passed the whole source |
+
+`policy::custom_parts` gives both parts in the rail. Every place that reads the source of a Custom
+wallet uses it: the build hook, the installation binding, the read of the wallet's state entries,
+the figures that the wallet keeps and the server's evaluation. A source with a server part is
+server policy source; its on-chain part is portable source that names no server function.
 
 ## Build rule
 
@@ -11,8 +28,8 @@ The contract `contracts/allowit-custom-policy` compiles two files:
 
 | File | Content | Who writes it |
 | --- | --- | --- |
-| `policy/policy.rs` | The on-chain policy, compiled verbatim as a module | The host builder, or `scripts/build-custom-policy.sh POLICY.rs OUT_DIR [SOURCE.rs]` |
-| `policy/source.rs` | The owner's full source, from which `policy.rs` is derived | The same builder, when the policy is derived. Without it the build treats `policy.rs` as the full source |
+| `policy/policy.rs` | The on-chain policy, compiled verbatim as a module | The build hook (`provider/custom_build.rs`), which derives it from the owner's source, or `scripts/build-custom-policy.sh POLICY.rs OUT_DIR [SOURCE.rs]` |
+| `policy/source.rs` | The owner's full source, from which `policy.rs` is derived | The same builder, when the on-chain part differs from the source. Without it the build treats `policy.rs` as the full source |
 
 `build.rs` derives three constants:
 
@@ -75,8 +92,8 @@ read them:
 | `day_spent`, `day_unpriced` | `daily_spending_limit` | `d`, temporary |
 | `day_total`, `day_unpriced` | `daily_volume_limit` | `d`, temporary |
 
-`build.rs` finds the figures in the compiled `policy.rs`. It reads whole words and leaves out the
-lines that start with `//`:
+`build.rs` finds the figures in the compiled `policy.rs` (`state_keys::figures`, the scan that the
+rail runs too). It reads whole words and leaves out the lines that start with `//`:
 
 - each rule name above keeps its figure;
 - a `get_state` read of a standard figure keeps that figure;
@@ -85,6 +102,12 @@ lines that start with `//`:
 
 A derived policy calls its rules by name and reads its own state through `get_state`, so it keeps
 exactly the figures of its rules. A word in a trailing comment or a string literal can only add a figure.
+
+A rule that runs only on the server, such as a rule in a branch that depends on a server function,
+is no part of `policy.rs`, so the wallet keeps no figure for it. The server's own accounting gives
+that figure to the server's evaluation (`kept_figures`): the wallet's figures for the on-chain
+part, the server's for the rest. So an execution of a wallet whose source has a server part needs
+the server's accounting, as an execution of a Simple or Standard wallet does.
 
 `t` is created by the constructor and paid for 2,073,600 ledgers (the Mainnet minimum lifetime of a
 persistent entry, about 120 days). Nothing extends it; after it lapses, the next operation restores
@@ -105,6 +128,15 @@ A Custom policy can keep its own state when its checks need it. Generation prefe
 state; a figure that a canonical rule already keeps or that the request derives; then the
 smallest packed state. The wallet itself still writes only the figures that the installed checks
 read (`d`, `t`): no receipts and no lifetime paid ahead.
+
+Each key has one keeper, which Core's derivation names (`Derived::state`):
+
+| Keeper | When | Where the value lives |
+| --- | --- | --- |
+| The contract | Every statement that writes the key is in `policy.rs` | In the wallet, as stated below. The server reads it from the wallet when it evaluates the whole source |
+| The server | A statement that writes the key depends on a server function, or only such statements read it | With the server. No statement of `policy.rs` names the key, and the wallet never stores it |
+
+The rest of this section is about the keys that the contract keeps: the keys of `policy.rs`.
 
 ### Calls
 
@@ -143,8 +175,9 @@ The build reads every `get_state` and `set_state` call of `policy.rs`:
 
 A call in a comment or in a string literal is no call. The scan is
 `contracts/allowit-custom-policy/state_keys.rs`; the rail's server evaluation runs the same file on
-the installed source, reads each declared entry with the same lifetimes and evaluates the policy
-with the Custom post-flight, so the server decides with the state that the wallet holds.
+the on-chain part of the installed source, reads each declared entry with the same lifetimes and
+evaluates the policy with the Custom post-flight, so the server decides with the state that the
+wallet holds. A write of a key that neither the build declares nor the server keeps is refused.
 
 The wallet never stores the key name. The storage key of an entry is a `u32`: the first four bytes
 of the SHA-256 of the name, big-endian. The same name keeps the same storage key across source

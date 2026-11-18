@@ -731,9 +731,15 @@ impl AccountState {
 /// The state entries of a Custom policy source: the same scan as the contract's build.
 #[path = "../../../contracts/allowit-custom-policy/state_keys.rs"]
 pub mod state_keys;
-/// The declared state entries of a Custom policy source, as its build declares them.
+/// The declared state entries of the compiled source of a Custom policy, as its build declares
+/// them. `source` is the on-chain part of the owner's source ([`policy::custom_parts`]).
 pub fn custom_state_entries(source: &str) -> Result<Vec<state_keys::StateEntry>> {
     state_keys::declared(source, |name| hash(name)).map(|(entries, _)| entries)
+}
+/// The state entries that the contract of a Custom wallet stores for the owner's `source`: those
+/// of its on-chain part.
+pub fn custom_wallet_state_entries(source: &str) -> Result<Vec<state_keys::StateEntry>> {
+    custom_state_entries(&policy::custom_parts(source)?.onchain)
 }
 /// Chain-observed policy inputs of a layout 4 policy wallet.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1055,11 +1061,22 @@ pub fn max_fee_ceiling(route: &WalletRoute) -> u32 {
 }
 
 /// The figures that a policy wallet keeps for its checks: a Simple or Common wallet those of its
-/// rules with params; a Custom wallet every figure that its compiled source reads, which are the
-/// only ones that the source can read on the server too.
+/// rules with params. A Custom wallet whose contract compiles its whole source keeps every figure
+/// that the source reads, which are the only ones that the source can read on the server too. A
+/// Custom wallet whose source has a server part keeps the figures that its on-chain part reads,
+/// and the server's accounting gives every other figure to the part that only the server runs.
 pub fn kept_figures(c: &WalletConfig) -> u8 {
     if c.tier == Some(PolicyTier::Custom) {
-        return packed::ALL;
+        // The build of the on-chain part finds the figures with this same scan. A source that
+        // no longer passes the gate keeps every figure: its operations are refused elsewhere.
+        return policy::custom_parts(&c.policy_source)
+            .ok()
+            .filter(|parts| parts.server_part)
+            .and_then(|parts| {
+                let (_, read) = state_keys::declared(&parts.onchain, |name| hash(name)).ok()?;
+                Some(state_keys::figures(&parts.onchain, read))
+            })
+            .unwrap_or(packed::ALL);
     }
     packed::standard_kept(&c.rules, &installed_params(c))
 }
@@ -1170,7 +1187,7 @@ fn validate_portable_install(c: &WalletConfig) -> Result<()> {
     if c.language != PolicyLanguage::Portable {
         return Err("Policy wallets of layout 4 run portable policy source".into());
     }
-    let shape = policy::source_shape(&c.policy_source)?;
+    let shape = policy::wallet_shape(tier, &c.policy_source)?;
     let expected = if tier == PolicyTier::Common {
         shape.prefix.clone()
     } else {
@@ -1179,12 +1196,10 @@ fn validate_portable_install(c: &WalletConfig) -> Result<()> {
     if c.rules != expected {
         return Err("Installed rules differ from the standard prefix of the policy source".into());
     }
-    // Only a Custom wallet stores its policy's own state: the entries that its build declares.
+    // Only a Custom wallet stores its policy's own state: the entries that the build of its
+    // on-chain part declares, which `wallet_shape` checked.
     if shape.writes_state && tier != PolicyTier::Custom {
         return Err(policy::WRITES_STATE.into());
-    }
-    if tier == PolicyTier::Custom {
-        custom_state_entries(&c.policy_source)?;
     }
     let digest = policy::installed_source_digest(
         tier,
@@ -1475,8 +1490,9 @@ pub fn verify_policy(
 /// binding, owner params, execution args and expense bounds, run the Common prefix as the
 /// contract does and evaluate the full policy on the host when the source is canonical-only or
 /// `evaluator` compiles it. `Evaluation::Prefix` means only the onchain part ran: a Custom wallet
-/// runs the rest in native preflight, and the server evaluates the rest of a Simple or Common
-/// policy with `authorize_server_with`.
+/// runs the on-chain part of its source in native preflight, and the server evaluates the whole
+/// source of a Simple or Common policy, and of a Custom policy with a server part, with
+/// `authorize_server_with`.
 pub fn verify_operation(
     c: &WalletConfig,
     r: &ExecutionRequest,
@@ -1675,7 +1691,6 @@ fn verify_wallet_portable(
     if let Some(expense) = &terms.expense {
         validate_expense(c, expense, repaid, operation, state, now)?;
     }
-    let shape = policy::source_shape(&c.policy_source)?;
     let request = policy::RuleRequest::new(
         operation,
         &c.asset,
@@ -1684,13 +1699,17 @@ fn verify_wallet_portable(
         terms.expense.clone(),
         terms.args.clone(),
     );
-    let declared: Vec<String> = if tier == PolicyTier::Custom {
-        custom_state_entries(&c.policy_source)?
+    // The keys that the policy may write: those that the contract stores, and those that the
+    // server keeps for the part of a Custom wallet's source that only it runs.
+    let (shape, stored, server) = if tier == PolicyTier::Custom {
+        let parts = policy::custom_parts(&c.policy_source)?;
+        let stored: Vec<String> = custom_state_entries(&parts.onchain)?
             .into_iter()
             .map(|entry| entry.name)
-            .collect()
+            .collect();
+        (parts.shape, stored, parts.server_keys)
     } else {
-        vec![]
+        (policy::source_shape(&c.policy_source)?, vec![], vec![])
     };
     policy::evaluate(
         tier,
@@ -1700,7 +1719,10 @@ fn verify_wallet_portable(
         &state.policy_wallet_state(c, now)?,
         &request,
         evaluator,
-        Some(&declared),
+        Some(policy::WalletKeys {
+            stored: &stored,
+            server: &server,
+        }),
     )
 }
 fn muxed(value: &str) -> Result<MuxedAccount> {
