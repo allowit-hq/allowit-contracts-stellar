@@ -56,6 +56,7 @@ fn with_reply(
 }
 
 #[test]
+#[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
 fn native_error_results_and_exact_auth_tree_payloads_are_preserved() {
     let fixture: Value = serde_json::from_str(include_str!(
         "fixtures/stellar-policy-wallet-revalidation-rpc.json"
@@ -93,6 +94,7 @@ fn native_error_results_and_exact_auth_tree_payloads_are_preserved() {
 }
 
 #[test]
+#[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
 fn malformed_envelopes_and_top_level_rpc_refusals_do_not_become_results() {
     for response in [
         json!({"jsonrpc":"2.0","id":2,"result":{}}),
@@ -109,6 +111,7 @@ fn malformed_envelopes_and_top_level_rpc_refusals_do_not_become_results() {
 }
 
 #[test]
+#[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
 fn bounded_response_and_lost_send_never_trigger_an_automatic_write_retry() {
     let (client, task) =
         with_reply(|_| json!({"jsonrpc":"2.0","id":1,"result":"x".repeat(1_048_576)}));

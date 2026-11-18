@@ -1936,6 +1936,7 @@ mod transport_tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
     fn the_newest_ledger_reads_with_its_close_metadata_and_other_replies_keep_their_bound() {
         // Testnet ledger 5684062 answered `getLatestLedger` with 1,155,616 characters of
         // metadata: more than the bound of every other reply.
@@ -1962,6 +1963,7 @@ mod transport_tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
     fn calls_without_an_answer_are_network_unavailable() {
         // Connection refused: nothing listens on the port.
         let closed = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1990,6 +1992,7 @@ mod transport_tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
     fn a_dropped_answer_stays_unknown() {
         // The server reads the request, then closes the connection without a reply.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

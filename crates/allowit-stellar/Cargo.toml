@@ -12,6 +12,9 @@ description = "Canonical Stellar wallet preparation, native authorization and se
 [features]
 test-support = []
 browser-owner-verifier = []
+# Runs the end-to-end tests too: tests that bind a local socket for a fixture RPC or server.
+# Without it, `cargo test` runs only the hermetic tests. No library code reads it.
+e2e = []
 
 [dependencies]
 allowit-core = { git = "https://github.com/allowit-hq/allowit-core.git", rev = "1b2c787ac19710fa0f62274020611760744698eb", version = "0.12", default-features = false, features = ["std", "client", "policy-source"] }
