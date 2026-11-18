@@ -54,7 +54,7 @@ impl PolicyDeployment {
                 agent: c.agent.clone(),
                 server: c.server.clone(),
                 source_hash,
-                gas_cap: c.gas_cap,
+                gas_cap: i128::from(c.max_fee_stroops),
                 rules,
                 params,
                 wasm_hash: None,
@@ -136,7 +136,7 @@ impl PolicyConfig {
             server: c.server.clone(),
             asset: c.asset.clone(),
             source_hash: c.source_hash,
-            gas_cap: c.gas_cap,
+            gas_cap: i128::from(c.max_fee_stroops),
             rules: c.rules.clone(),
             params: c.params.clone(),
         };
@@ -1072,7 +1072,10 @@ fn validate_deployer_tree(
     else {
         return Err("Unexpected deployer arguments".into());
     };
-    let wasm: [u8; 32] = wasm.as_slice().try_into().map_err(|_| "Invalid Wasm hash")?;
+    let wasm: [u8; 32] = wasm
+        .as_slice()
+        .try_into()
+        .map_err(|_| "Invalid Wasm hash")?;
     let salt: [u8; 32] = salt.as_slice().try_into().map_err(|_| "Invalid salt")?;
     let preimage = ContractIdPreimage::Address(ContractIdPreimageFromAddress {
         address: owner.clone(),
@@ -1082,13 +1085,13 @@ fn validate_deployer_tree(
     let create = CreateContractArgsV2 {
         contract_id_preimage: preimage,
         executable: ContractExecutable::Wasm(Hash(wasm)),
-        constructor_args: constructor_args.clone(),
+        constructor_args: constructor_args.clone().into(),
     };
     let constructor = SorobanAuthorizedInvocation {
         function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
             contract_address: wallet.clone(),
             function_name: ScSymbol(b"__constructor".to_vec().try_into().map_err(err)?),
-            args: constructor_args.clone(),
+            args: constructor_args.clone().into(),
         }),
         sub_invocations: VecM::default(),
     };
@@ -1119,7 +1122,10 @@ fn validate_deployer_tree(
         });
     }
     if root.sub_invocations.as_slice() != expected.as_slice() {
-        return Err("The owner's deployment authorization holds more than the creation and its funding".into());
+        return Err(
+            "The owner's deployment authorization holds more than the creation and its funding"
+                .into(),
+        );
     }
     Ok(())
 }
@@ -1428,7 +1434,13 @@ impl Deployer<'_> {
         let account = self.account(&config.owner)?;
         account.validate_owner_only()?;
         let wallet = wallet_address(self.network, &config.owner, &salt)?;
-        if [&config.owner, &config.agent, &config.server, &deployer.to_owned()].contains(&&wallet)
+        if [
+            &config.owner,
+            &config.agent,
+            &config.server,
+            &deployer.to_owned(),
+        ]
+        .contains(&&wallet)
         {
             return Err("Owner, agent, server, deployer and policy wallet must be distinct".into());
         }

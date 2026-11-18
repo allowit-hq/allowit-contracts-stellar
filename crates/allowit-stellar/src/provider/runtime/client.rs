@@ -1917,7 +1917,7 @@ impl Bundle {
                 || live.state.policy_instance != c.policy_instance
                 || live.state.module_digest != c.module_digest
                 || live.state.policy_state.as_ref().is_none_or(|p| {
-                    p.params != c.params || p.rules != c.rules || p.source_digest != c.source_digest
+                    p.params != c.params || p.rules != c.rules || p.source_hash != c.source_hash
                 })
             {
                 return Err(Error::config(

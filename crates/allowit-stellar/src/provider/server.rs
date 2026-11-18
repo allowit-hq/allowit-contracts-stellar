@@ -906,6 +906,8 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                     })
                 })
                 .transpose()?,
+            // The repayment follows from the expense and the request's fee payer.
+            gas: None,
         };
         let accounting = accounting(a);
         let request: native::workflow::ExecutionRequest = decode_packet(&r.0)?;
@@ -1289,7 +1291,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         use super::params_update;
         let c = self.config(i)?;
         let installed = params_update::installed(self.rpc(), &c, update)?;
-        let deployment = params_update::deployment(&c, update, installed.x402_enabled)?;
+        let deployment = params_update::deployment(&c, update)?;
         // The preparation refuses a simulated fee above its configured ceiling.
         let mut bounded = c.clone();
         bounded.max_fee_stroops = bounded
@@ -1441,6 +1443,13 @@ pub fn signed_preparation(p: &Packet) -> Result<Prepared> {
     )?))
 }
 
+/// The server's clock in Unix seconds.
+fn unix_now() -> Result<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|_| Error::config("The server's clock is before 1970"))
+}
 fn snapshot_from(network: &str, live: rpc::DiscoveredState) -> Result<Snapshot> {
     let s = &live.state;
     let convert = |v: &native::PolicyParams| {
@@ -1465,10 +1474,12 @@ fn snapshot_from(network: &str, live: rpc::DiscoveredState) -> Result<Snapshot> 
             .map(|p| convert(&p.params))
             .transpose()?
             .unwrap_or_default(),
+        // The wallet's daily figures count while its daily entry's window is open, whatever the
+        // UTC day; the snapshot states them as today's, as the wallet feeds its own rules.
         state: s
             .policy_state
             .as_ref()
-            .map(|p| convert(&p.state))
+            .map(|p| convert(&p.standard_state(unix_now()?)))
             .transpose()?
             .unwrap_or_default(),
         evidence: packet(network, &live)?,

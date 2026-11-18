@@ -48,12 +48,11 @@ struct Selection {
 }
 
 /// The facts of a params update that the host read from the installation: the configuration
-/// revision that the update writes and the x402 choice that it keeps.
+/// revision that the update writes.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Update {
     deployment_version: String,
-    x402_enabled: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -176,7 +175,6 @@ fn verify(input: Input) -> Result<()> {
         "create_wallet" => OwnerAction::CreateWallet {
             config: Box::new(installation(&expected, &wallet)?),
             salt,
-            x402_enabled: false,
         },
         // The packet keeps the installed roles, source binding and code and holds the complete
         // new params at the revision that the host read.
@@ -187,7 +185,6 @@ fn verify(input: Input) -> Result<()> {
                 &config,
                 &config.policy_source,
                 config.params.clone(),
-                update.x402_enabled,
             )?;
             OwnerAction::UpdatePolicy {
                 wallet,

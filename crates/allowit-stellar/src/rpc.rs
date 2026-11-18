@@ -355,12 +355,7 @@ pub fn prepare_with(
     }
     // The server's sending account is the source and pays the fee; the wallet repays its gas
     // to that same account.
-    let sender = &terms
-        .gas
-        .as_ref()
-        .ok_or("A policy wallet request names its gas repayment and payee")?
-        .payee;
-    state.source = get_account(rpc, sender)?;
+    state.source = get_account(rpc, &super::gas_repayment(request, terms)?.payee)?;
     let ceiling = terms.expense.as_ref();
     let mut terms = priced_terms(rpc, c, request, terms, &state, now, expires_at)?;
     // The invocation that carries the priced expense is simulated on its own. A policy that
@@ -425,6 +420,7 @@ fn priced_terms(
         Ok(ExecutionTerms {
             args: terms.args.clone(),
             expense: Some(ceiling.with_fee_bound(fee.min(ceiling.max_fee_stroops))?),
+            gas: terms.gas.clone(),
         })
     };
     let resource_fee = |fee: u32| -> Result<i64> {
@@ -476,10 +472,12 @@ fn simulated_resources(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<String> {
         return Err("Simulation network differs from installation".into());
     }
     // Stellar RPC rejects recording mode when the transaction already has auth entries.
-    // An unsigned intent is therefore recorded from a copy without them; the recorded scope is
-    // compared with the intent's entries below. The signed intent is simulated as is in enforce
-    // mode, which supplies the final resources, including the service entry's fixed nonce key.
-    let recording = authorization::server_signature(p, false)? == ScVal::Void;
+    // An intent without both signatures is therefore recorded from a copy without them; the
+    // recorded scope is compared with the intent's entries below. The wallet's `__check_auth`
+    // runs only in enforce mode, so only an entry that the agent and the server both signed is
+    // simulated as is; that run gives the final resources, including the wallet's nonce key.
+    let (agent, server) = authorization::cosignatures(p)?;
+    let recording = agent.is_none() || server.is_none();
     let (transaction, mode) = if recording {
         let TransactionEnvelope::Tx(mut env) = read(&p.transaction_xdr)? else {
             return Err("Unsupported preflight envelope".into());
@@ -1476,7 +1474,11 @@ fn current_wallet_state(
             },
             nonce: 0,
             deployment_version: u64::from(config.deployment_version),
-            spent_daily: if figures.day_ends != 0 { figures.day_spent } else { 0 },
+            spent_daily: if figures.day_ends != 0 {
+                figures.day_spent
+            } else {
+                0
+            },
             spent_total: figures.spent,
             spent_day: 0,
             calls: figures.calls,
@@ -1522,7 +1524,9 @@ pub(crate) fn verify_configuration(c: &WalletConfig, config: &packed::Configurat
         || config.asset != c.asset
         || config.source_hash != c.source_hash
     {
-        return Err("Installed policy rules, agent, service signer, asset or source differs".into());
+        return Err(
+            "Installed policy rules, agent, service signer, asset or source differs".into(),
+        );
     }
     Ok(())
 }

@@ -124,7 +124,6 @@ pub fn sign_account_entry(
     Ok(signed)
 }
 
-
 /// The one wallet authorization entry of a prepared policy wallet operation, checked against the
 /// entry that its request gives.
 pub(crate) fn wallet_authorization(p: &PreparedOperation) -> Result<SorobanAuthorizationEntry> {
@@ -172,7 +171,8 @@ pub(crate) fn cosignatures(p: &PreparedOperation) -> Result<(Option<[u8; 64]>, O
         return Err("Invalid wallet cosignatures".into());
     };
     let part = |i: usize| -> Result<Option<[u8; 64]>> {
-        let ScVal::Bytes(bytes) = parts.get(i).ok_or("Two wallet cosignatures are required")? else {
+        let ScVal::Bytes(bytes) = parts.get(i).ok_or("Two wallet cosignatures are required")?
+        else {
             return Err("Invalid wallet cosignature".into());
         };
         let bytes: [u8; 64] = bytes
@@ -193,9 +193,20 @@ pub(crate) fn cosignatures(p: &PreparedOperation) -> Result<(Option<[u8; 64]>, O
     }
     Ok((agent, server))
 }
+/// The signature value of the wallet's entry, after checking each part that is signed.
+pub(crate) fn wallet_signature(p: &PreparedOperation) -> Result<ScVal> {
+    cosignatures(p)?;
+    let SorobanCredentials::Address(credentials) = wallet_authorization(p)?.credentials else {
+        return Err("Expected the wallet's address authorization".into());
+    };
+    Ok(credentials.signature)
+}
 /// The server's verified signature of the wallet's entry, or an error when `require_signed`
 /// and it is missing.
-pub(crate) fn server_signature(p: &PreparedOperation, require_signed: bool) -> Result<Option<[u8; 64]>> {
+pub(crate) fn server_signature(
+    p: &PreparedOperation,
+    require_signed: bool,
+) -> Result<Option<[u8; 64]>> {
     let (_, server) = cosignatures(p)?;
     if require_signed && server.is_none() {
         return Err("Service authorization is unsigned".into());

@@ -43,12 +43,12 @@ pub use authorization::{
 };
 pub use contract::CONTRACT_VERSION;
 pub use policy::{PolicyEngine, PolicyLanguage, PolicyParams, PolicyTier, PolicyValue};
+pub mod packed;
 pub mod rpc;
 pub mod seller_settled;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod settlement_service;
 pub mod signing;
-pub mod packed;
 pub mod x402;
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -241,14 +241,9 @@ pub struct WalletConfig {
     /// SHA-256 of the complete policy source, which agent and server authorization cover.
     pub source_hash: [u8; 32],
     pub module_digest: [u8; 32],
+    /// The owner's fee ceiling of one operation, in stroops. For a policy wallet it is also the
+    /// owner-signed gas cap: the most that the wallet repays for one request's network fee.
     pub max_fee_stroops: u32,
-    /// The owner-signed most that a policy wallet repays for one request's network fee, in
-    /// stroops. Zero repays nothing.
-    #[serde(default, skip_serializing_if = "is_zero_i128")]
-    pub gas_cap: i128,
-}
-fn is_zero_i128(value: &i128) -> bool {
-    *value == 0
 }
 fn is_legacy(language: &PolicyLanguage) -> bool {
     *language == PolicyLanguage::Legacy
@@ -1454,6 +1449,22 @@ fn legacy_wallet_request(
         ("invocation", invocation),
     ])
 }
+/// The gas that a policy wallet repays for `r`: the explicit repayment of `terms`, else the fee
+/// bound of its expense, in stroops, to the request's fee payer, the server's sending account. An
+/// unpriced request repays nothing.
+pub(crate) fn gas_repayment(r: &ExecutionRequest, terms: &ExecutionTerms) -> Result<GasRepayment> {
+    if let Some(gas) = &terms.gas {
+        return Ok(gas.clone());
+    }
+    let fee = &r.fee_bounds.as_ref().ok_or("Native fee bound required")?[0];
+    Ok(GasRepayment {
+        stroops: terms
+            .expense
+            .as_ref()
+            .map_or(0, |e| i128::from(e.max_fee_stroops)),
+        payee: workflow_address(&fee.payer)?,
+    })
+}
 /// The layout 5 `AllowitExecutionRequest` of one operation: its id, the wallet's deployment
 /// version, the expiry, the typed native operation, the expense, the gas repayment and the
 /// execution args.
@@ -1465,10 +1476,7 @@ pub(crate) fn policy_wallet_request(
     operation: &StellarOperation,
     expires: u64,
 ) -> Result<ScVal> {
-    let gas = terms
-        .gas
-        .as_ref()
-        .ok_or("A policy wallet request names its gas repayment and payee")?;
+    let gas = gas_repayment(r, terms)?;
     contract::execution_request(contract::ExecutionPacket {
         operation_id: &r.operation.nonce,
         deployment_version: u32::try_from(state.deployment_version)
@@ -1871,7 +1879,7 @@ pub fn validate_retained_prepared(p: &PreparedOperation) -> Result<()> {
         .payment_authorization
         .clone_from(&p.payment_authorization);
     if p.config.route == WalletRoute::PolicyWallet {
-        expected = authorization::attach(&expected, authorization::server_signature(p, false)?)?;
+        expected = authorization::attach(&expected, authorization::wallet_signature(p)?)?;
     }
     if let Some(data) = &p.simulation_data {
         let current = attach_simulation(&expected, data)?;
@@ -1989,7 +1997,7 @@ pub fn sign_with(
         authorization::server_signature(p, true)?;
     }
     let allowed = if p.config.route == WalletRoute::Native {
-            signer == p.config.agent || signer == p.config.server
+        signer == p.config.agent || signer == p.config.server
     } else {
         signer == p.config.agent
     };
@@ -2295,11 +2303,9 @@ fn attach_resources(
     out.transaction_hash = transaction_hash(&p.config.network, &env.tx)?;
     out.transaction_xdr = xdr(&TransactionEnvelope::Tx(env))?;
     out.simulation_data = Some(data.into());
-    // An unsigned service entry has not established the final transaction hash.
-    // Exact source-account quorum is checked after that entry is signed.
-    if out.config.route != WalletRoute::PolicyWallet
-        || authorization::server_signature(&out, false)? != ScVal::Void
-    {
+    // A policy wallet's source is the server's sending account, which signs last; the agent and
+    // the server sign the wallet's own authorization instead.
+    if out.config.route != WalletRoute::PolicyWallet {
         transaction_signers(&out, &automated_roles(&out.config))?;
     }
     Ok(out)

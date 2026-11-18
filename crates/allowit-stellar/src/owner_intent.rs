@@ -201,7 +201,6 @@ pub enum OwnerAction {
     CreateWallet {
         config: Box<WalletConfig>,
         salt: [u8; 32],
-        x402_enabled: bool,
     },
     /// Exactly one SEP-41 transfer from the selected owner to the selected policy wallet.
     Fund {
@@ -576,15 +575,11 @@ fn validate_host(
                 return Err("Owner upload differs from the reviewed executable".into());
             }
         }
-        OwnerAction::CreateWallet {
-            config,
-            salt,
-            x402_enabled,
-        } => {
+        OwnerAction::CreateWallet { config, salt } => {
             if config.network != limits.network || config.owner != limits.owner {
                 return Err("Wallet configuration differs from caller network or owner".into());
             }
-            let constructor = admin::PolicyConfig::for_policy(config, *x402_enabled)?;
+            let constructor = admin::PolicyConfig::for_policy(config)?;
             let wallet = admin::wallet_address(&limits.network, &limits.owner, salt)?;
             if wallet != config.wallet
                 || [&config.owner, &config.agent, &config.server].contains(&&wallet)

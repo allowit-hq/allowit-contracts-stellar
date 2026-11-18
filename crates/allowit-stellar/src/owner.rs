@@ -158,9 +158,9 @@ fn operation_count(v: &NativeSetup) -> u32 {
 }
 
 fn transaction(v: &NativeSetup) -> Result<Transaction> {
-            if v.network != "stellar:testnet" {
-                return Err("Native wallet setup supports Stellar Testnet only".into());
-            }
+    if v.network != "stellar:testnet" {
+        return Err("Native wallet setup supports Stellar Testnet only".into());
+    }
     let owner = account_key(&v.owner)?;
     let wallet = account_key(&v.wallet)?;
     let agent = account_key(&v.agent)?;

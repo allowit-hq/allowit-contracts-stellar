@@ -69,11 +69,9 @@ enum Work {
         amount: String,
         units: i128,
     },
-    /// A params update over the configuration revision that `update` expects. The x402 choice
-    /// is the one that the wallet held when the workflow started; the packet keeps it.
+    /// A params update over the configuration revision that `update` expects.
     UpdateParams {
         update: crate::host::runtime::ParamsUpdate,
-        x402_enabled: bool,
     },
 }
 /// The selection after a confirmed params update: the same policy and wallet with the new
@@ -391,7 +389,6 @@ fn expected(record: &Record, step: &RetainedStep) -> Result<ExpectedOwnerIntent>
         (Work::Deploy, "create_wallet") => OwnerAction::CreateWallet {
             config: Box::new(c.clone()),
             salt: wallet_salt(&c.policy_instance),
-            x402_enabled: false,
         },
         (Work::Fund { units, .. }, "fund") if c.route == WalletRoute::Native => {
             OwnerAction::Wallet {
@@ -415,26 +412,18 @@ fn expected(record: &Record, step: &RetainedStep) -> Result<ExpectedOwnerIntent>
             to: c.wallet.clone(),
             amount: *units,
         },
-        (
-            Work::UpdateParams {
-                update,
-                x402_enabled,
-            },
-            crate::provider::params_update::ACTION,
-        ) => OwnerAction::UpdatePolicy {
-            wallet: c.wallet.clone(),
-            deployment: Box::new(crate::provider::params_update::deployment(
-                c,
-                update,
-                *x402_enabled,
-            )?),
-            version: crate::provider::params_update::next_version(
-                update.expected_revision.ok_or_else(|| {
-                    Error::config("Retained params update names no configuration revision")
-                })?,
-            )?
-            .0,
-        },
+        (Work::UpdateParams { update }, crate::provider::params_update::ACTION) => {
+            OwnerAction::UpdatePolicy {
+                wallet: c.wallet.clone(),
+                deployment: Box::new(crate::provider::params_update::deployment(c, update)?),
+                version: crate::provider::params_update::next_version(
+                    update.expected_revision.ok_or_else(|| {
+                        Error::config("Retained params update names no configuration revision")
+                    })?,
+                )?
+                .0,
+            }
+        }
         (_, "extend") => OwnerAction::Extend {
             wallet: c.wallet.clone(),
             wasm_hash: c.module_digest,
@@ -561,19 +550,14 @@ impl OwnerClient {
             .load::<Value>(request_id)?
             .and_then(|value| serde_json::from_value::<Record>(value).ok())
             .and_then(|record| match record.work {
-                Work::UpdateParams {
-                    update: saved,
-                    x402_enabled,
-                } if saved.policy_id == update.policy_id
-                    && saved.changes == update.changes
-                    && update
-                        .expected_revision
-                        .is_none_or(|expected| saved.expected_revision == Some(expected)) =>
+                Work::UpdateParams { update: saved }
+                    if saved.policy_id == update.policy_id
+                        && saved.changes == update.changes
+                        && update
+                            .expected_revision
+                            .is_none_or(|expected| saved.expected_revision == Some(expected)) =>
                 {
-                    Some(Work::UpdateParams {
-                        update: saved,
-                        x402_enabled,
-                    })
+                    Some(Work::UpdateParams { update: saved })
                 }
                 _ => None,
             });
@@ -588,7 +572,6 @@ impl OwnerClient {
                         expected_revision: Some(installed.revision),
                         ..update.clone()
                     },
-                    x402_enabled: installed.x402_enabled,
                 }
             }
         };
@@ -1210,7 +1193,7 @@ impl OwnerClient {
             || live.state.policy_instance != c.policy_instance
             || live.state.module_digest != c.module_digest
             || live.state.policy_state.as_ref().is_none_or(|s| {
-                s.params != c.params || s.rules != c.rules || s.source_digest != c.source_digest
+                s.params != c.params || s.rules != c.rules || s.source_hash != c.source_hash
             })
         {
             return Err(Error::config(

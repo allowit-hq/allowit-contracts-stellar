@@ -93,7 +93,8 @@ impl<'a> Reader<'a> {
         }
     }
     fn amount(&mut self) -> Result<i128> {
-        i128::try_from(self.uint()?).map_err(|_| "A stored policy wallet amount is too large".into())
+        i128::try_from(self.uint()?)
+            .map_err(|_| "A stored policy wallet amount is too large".into())
     }
     fn int(&mut self) -> Result<i128> {
         let value = self.uint()?;
@@ -188,7 +189,8 @@ pub fn configuration(raw: &[u8]) -> Result<Configuration> {
         let name = match r.byte()? {
             0xff => {
                 let n = usize::from(r.byte()?);
-                String::from_utf8(r.take(n)?.to_vec()).map_err(|_| "A stored param key is not text")?
+                String::from_utf8(r.take(n)?.to_vec())
+                    .map_err(|_| "A stored param key is not text")?
             }
             index => keys
                 .get(usize::from(index))
@@ -305,7 +307,10 @@ mod tests {
         assert_eq!((f.spent, f.calls, f.unpriced), (250, 3, true));
         let mut only_calls = Figures::default();
         totals(&t, CALLS, &mut only_calls).unwrap();
-        assert_eq!((only_calls.spent, only_calls.calls, only_calls.unpriced), (0, 3, false));
+        assert_eq!(
+            (only_calls.spent, only_calls.calls, only_calls.unpriced),
+            (0, 3, false)
+        );
         let mut d = 500u32.to_be_bytes().to_vec();
         d.extend([DAY_SPENT, 0, 100]);
         let mut open = Figures::default();
