@@ -48,6 +48,7 @@ pub mod seller_settled;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod settlement_service;
 pub mod signing;
+pub mod packed;
 pub mod x402;
 pub type Result<T> = std::result::Result<T, String>;
 
