@@ -1278,6 +1278,18 @@ pub fn check_assembled(
     Ok(())
 }
 
+/// What a simulated restoration of a code entry found: the decision between a restoration and an
+/// upload, whatever a read of the entry showed. An RPC can serve no archived entry, and another
+/// transaction can make the code live after it was read.
+#[derive(Clone, Debug)]
+pub enum CodeRestoration {
+    /// The network's archive holds the code: this restoration of its entry makes it live.
+    Prepared(PreparedDeployment),
+    /// The code is live: nothing is needed.
+    Live,
+    /// Neither archived nor live: the code needs an upload of its bytes.
+    Absent,
+}
 /// Unsigned Wasm upload or wallet creation for the source account to sign.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1480,16 +1492,23 @@ impl Deployer<'_> {
         if !op.auth.is_empty() {
             return Err("Wasm upload needs no contract authorization".into());
         }
+        // An upload whose simulation restores an archived entry in place would upload code that
+        // the archive holds: lapsed code is restored, not uploaded (`restore_code`).
+        if let TransactionExt::V1(data) = &tx.ext
+            && matches!(&data.ext, SorobanTransactionDataExt::V1(ext) if !ext.archived_soroban_entries.is_empty())
+        {
+            return Err(
+                "The upload restores an archived entry: lapsed code is restored, not uploaded"
+                    .into(),
+            );
+        }
         self.prepared(&account, "upload_wasm", wasm_hash, None, tx)
     }
-    /// Prepare `RestoreFootprint` of the lapsed code entry `wasm_hash` from `source`. It names
-    /// that entry alone and gives no authority; the simulation sets its fee, within the ceiling.
-    /// `None` when the code is live again: another transaction restored it since it was read.
-    pub fn restore_code(
-        &self,
-        source: &str,
-        wasm_hash: [u8; 32],
-    ) -> Result<Option<PreparedDeployment>> {
+    /// Prepare `RestoreFootprint` of the code entry `wasm_hash` from `source` when the network's
+    /// archive holds it. It names that entry alone and gives no authority; the simulation sets
+    /// its fee, within the ceiling. A simulation that names no entry, or that refuses the
+    /// restoration, leaves code that is live, read again, or absent.
+    pub fn restore_code(&self, source: &str, wasm_hash: [u8; 32]) -> Result<CodeRestoration> {
         let account = self.account(source)?;
         let key = LedgerKey::ContractCode(LedgerKeyContractCode {
             hash: Hash(wasm_hash),
@@ -1529,39 +1548,35 @@ impl Deployer<'_> {
             tx: tx.clone(),
             signatures: VecM::default(),
         }))?;
-        // A restoration that cannot be simulated may have lost to another transaction that
-        // restored the code since it was read, from this account too, which then changed during
-        // the simulation. Code that is live again needs nothing; anything else is refused.
-        let live_again = || {
-            matches!(
-                crate::rpc::code_state(self.rpc, self.network, &wasm_hash),
-                Ok(crate::rpc::CodeState::Live)
-            )
+        // Code that is live, read again, needs nothing: another transaction restored or uploaded
+        // it since it was read, from this account too, which then changed during the simulation.
+        let live_or_absent = || match crate::rpc::code_state(self.rpc, self.network, &wasm_hash) {
+            Ok(crate::rpc::CodeState::Live) => CodeRestoration::Live,
+            _ => CodeRestoration::Absent,
         };
         let response = match self.simulate(&account, &raw, false) {
             Ok(response) if response.get("error").is_none_or(|v| v.is_null()) => response,
-            _ if live_again() => return Ok(None),
-            Ok(_) => return Err("Code restoration simulation failed".into()),
-            Err(error) => return Err(error),
+            // A refused restoration restores nothing. An upload of code that the archive holds
+            // is refused in its own simulation.
+            Ok(_) => return Ok(live_or_absent()),
+            Err(error) => {
+                return match live_or_absent() {
+                    CodeRestoration::Live => Ok(CodeRestoration::Live),
+                    _ => Err(error),
+                };
+            }
         };
         let data: SorobanTransactionData = read(
             response["transactionData"]
                 .as_str()
                 .ok_or("Missing restoration resources")?,
         )?;
-        // The simulation restores only archived entries. Another transaction can restore the
-        // code after it was read as lapsed: the simulation then names no entry, and the code,
-        // read again, is live.
+        // The simulation restores only archived entries: it names none for code that is live or
+        // absent.
         if data.resources.footprint.read_only.is_empty()
             && data.resources.footprint.read_write.is_empty()
         {
-            return match crate::rpc::code_state(self.rpc, self.network, &wasm_hash)? {
-                crate::rpc::CodeState::Live => Ok(None),
-                _ => Err(
-                    "The wallet code is not on the network: a restoration needs code that lapsed"
-                        .into(),
-                ),
-            };
+            return Ok(live_or_absent());
         }
         if !data.resources.footprint.read_only.is_empty()
             || data.resources.footprint.read_write.as_slice() != [key]
@@ -1589,7 +1604,7 @@ impl Deployer<'_> {
         tx.fee = fee;
         tx.ext = TransactionExt::V1(data);
         self.prepared(&account, "restore_code", wasm_hash, None, tx)
-            .map(Some)
+            .map(CodeRestoration::Prepared)
     }
     /// Prepare the owner's one transaction that creates the policy wallet of `wasm` (uploaded by
     /// the server) through `deployer` and funds it with each `(asset, amount)` of `funding`. The

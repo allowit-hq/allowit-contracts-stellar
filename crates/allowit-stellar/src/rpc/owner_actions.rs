@@ -63,9 +63,12 @@ fn observed_entry(rpc: &dyn Rpc, network: &str, key: &LedgerKey) -> Result<(Opti
     let before = owner_observation::head(rpc)?;
     let value = rpc.call("getLedgerEntries", json!({"keys":[xdr(key)?]}))?;
     let observed = owner_observation::ledger(&value["latestLedger"])?;
-    let entries = value["entries"]
-        .as_array()
-        .ok_or("Missing native entries")?;
+    // A reply that finds no entry can omit the list.
+    let none = Vec::new();
+    let entries = match value.get("entries") {
+        None | Some(Value::Null) => &none,
+        Some(entries) => entries.as_array().ok_or("Invalid native entries")?,
+    };
     let live_until = match entries.as_slice() {
         [] => None,
         [entry] => {

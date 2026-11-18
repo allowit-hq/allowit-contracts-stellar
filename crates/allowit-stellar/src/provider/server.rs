@@ -474,24 +474,19 @@ impl Provider {
             now,
             max_fee_stroops,
         };
-        // An RPC that serves no archived entry reads lapsed code as absent. A simulated
-        // restoration of the code entry tells them apart: it names the entry only when the
-        // archive holds it. `None` from a restoration means that the code is live again.
-        let restoration = || checked(deployer.restore_code(&account, code_hash));
-        let p = match (state, wasm) {
-            (rpc::CodeState::Lapsed, _) | (_, None) => match restoration()? {
-                Some(p) => p,
-                None => return Ok(None),
-            },
-            // Absent code is uploaded. The network refuses an upload of code that its archive
-            // holds: that code, which the read did not show, is restored instead.
-            (_, Some(wasm)) => match checked(deployer.upload_wasm(&account, wasm)) {
-                Ok(p) => p,
-                Err(refused) => match restoration() {
-                    Ok(Some(p)) => p,
-                    Ok(None) => return Ok(None),
-                    Err(_) => return Err(refused),
-                },
+        // A simulated restoration of the code entry decides between a restoration and an
+        // upload: it names the entry only when the network's archive holds it, which a read can
+        // miss, since an RPC can serve no archived entry. Absent code needs its bytes.
+        let p = match checked(deployer.restore_code(&account, code_hash))? {
+            native::admin::CodeRestoration::Prepared(p) => p,
+            native::admin::CodeRestoration::Live => return Ok(None),
+            native::admin::CodeRestoration::Absent => match wasm {
+                Some(wasm) => checked(deployer.upload_wasm(&account, wasm))?,
+                None => {
+                    return Err(Error::usage(
+                        "The wallet code is not on the network: a restoration needs code that lapsed",
+                    ));
+                }
             },
         };
         let signature = sending_signature(sender, &account, &p.transaction_hash)?;
@@ -526,17 +521,15 @@ impl Provider {
         // an error, never a receipt of live code. Its source still paid the fee: the error names
         // the transaction and that fee, in stroops, for the server's accounts.
         if receipt.status != native::OperationStatus::Confirmed {
-            return Err(
-                crate::provider::failure(if state == rpc::CodeState::Lapsed {
-                    "The restoration of the wallet code failed on the ledger"
-                } else {
-                    "The upload of the wallet code failed on the ledger"
-                })
-                .with_details(serde_json::json!({
-                    "transactionHash": native::hex(&receipt.transaction_hash),
-                    "nativeUnits": fee.to_string(),
-                })),
-            );
+            return Err(crate::provider::failure(if p.function == "restore_code" {
+                "The restoration of the wallet code failed on the ledger"
+            } else {
+                "The upload of the wallet code failed on the ledger"
+            })
+            .with_details(serde_json::json!({
+                "transactionHash": native::hex(&receipt.transaction_hash),
+                "nativeUnits": fee.to_string(),
+            })));
         }
         Ok(Some(Receipt(packet)))
     }

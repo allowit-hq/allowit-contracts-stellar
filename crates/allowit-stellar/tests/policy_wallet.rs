@@ -329,6 +329,10 @@ struct Model {
     charged_fee: Option<i64>,
     /// The RPC serves no archived entry: a read of lapsed code finds nothing.
     hide_archived: bool,
+    /// An upload simulation of lapsed code restores the code entry in place instead of failing.
+    upload_restores_in_place: bool,
+    /// A read that finds no entry omits the entry list.
+    omit_empty_entries: bool,
     tiers: BTreeMap<[u8; 32], PolicyTier>,
     wallet: Option<Wallet>,
     settled: BTreeMap<String, String>,
@@ -645,6 +649,9 @@ impl rpc::Rpc for ModelChain {
                     .into_iter()
                     .map(|e| json!({"key": encoded, "xdr": b64(&e), "liveUntilLedgerSeq": live_until}))
                     .collect();
+                if entries.is_empty() && m.omit_empty_entries {
+                    return Ok(json!({"latestLedger": m.ledger}));
+                }
                 Ok(json!({"latestLedger": m.ledger, "entries": entries}))
             }
             "simulateTransaction" => {
@@ -701,9 +708,38 @@ impl rpc::Rpc for ModelChain {
                 if let x::HostFunction::UploadContractWasm(code) = &op.host_function
                     && m.lapsed_code.contains(&hash(code.as_slice()))
                 {
-                    return Ok(
-                        json!({"error": "trying to access an archived contract code entry"}),
-                    );
+                    if !m.upload_restores_in_place {
+                        return Ok(
+                            json!({"error": "trying to access an archived contract code entry"}),
+                        );
+                    }
+                    // A simulation that restores the archived code entry in the upload's own
+                    // transaction.
+                    let code_hash = hash(code.as_slice());
+                    let key = x::LedgerKey::ContractCode(x::LedgerKeyContractCode {
+                        hash: x::Hash(code_hash),
+                    });
+                    let data = x::SorobanTransactionData {
+                        ext: x::SorobanTransactionDataExt::V1(x::SorobanResourcesExtV0 {
+                            archived_soroban_entries: vec![0].try_into().unwrap(),
+                        }),
+                        resources: x::SorobanResources {
+                            footprint: x::LedgerFootprint {
+                                read_only: Default::default(),
+                                read_write: vec![key].try_into().unwrap(),
+                            },
+                            instructions: 0,
+                            disk_read_bytes: 0,
+                            write_bytes: 0,
+                        },
+                        resource_fee: RECORD_FEE,
+                    };
+                    return Ok(json!({
+                        "latestLedger": m.ledger,
+                        "minResourceFee": RECORD_FEE.to_string(),
+                        "transactionData": b64(&data),
+                        "results": [{"xdr": b64(&bytes(&code_hash)), "auth": []}],
+                    }));
                 }
                 let source = source_of(&env.tx);
                 let record = params["authMode"] == "record";
@@ -3535,7 +3571,78 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
             }]
         ));
     }
+    // A restoration of such code that the ledger fails is reported as a restoration, the
+    // operation that the sending account sent, not as an upload.
+    {
+        let mut m = chain.0.lock().unwrap();
+        m.lapsed_code.insert(installed);
+        m.failing_restore = true;
+    }
+    chain.step("failed restoration of unread code");
+    let failed = provider
+        .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+        .unwrap_err();
+    assert!(
+        failed
+            .message
+            .contains("restoration of the wallet code failed"),
+        "{}",
+        failed.message
+    );
+    chain.0.lock().unwrap().failing_restore = false;
+    chain.step("restore of unread code after a failure");
+    assert!(
+        provider
+            .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+            .unwrap()
+            .is_some()
+    );
     chain.0.lock().unwrap().hide_archived = false;
+    // An upload simulation that restores the archived code entry in place is refused: lapsed
+    // code is restored by a restoration of the code entry alone, never uploaded. The upload step
+    // restores it.
+    {
+        let mut m = chain.0.lock().unwrap();
+        m.lapsed_code.insert(installed);
+        m.upload_restores_in_place = true;
+    }
+    let deployer = Deployer {
+        rpc: &*chain,
+        network: NETWORK,
+        now: NOW,
+        max_fee_stroops: u32::MAX,
+    };
+    let refused = deployer.upload_wasm(&sender(), &wasm).unwrap_err();
+    assert!(refused.contains("restored, not uploaded"), "{refused}");
+    chain.step("upload step of code that an upload would restore");
+    assert!(
+        provider
+            .upload_code_within(&installation, &wasm, ceiling, Poll::default(), NOW)
+            .unwrap()
+            .is_some()
+    );
+    {
+        let mut m = chain.0.lock().unwrap();
+        assert!(m.lapsed_code.is_empty());
+        let x::TransactionEnvelope::Tx(env) = de(&m.steps.last().unwrap().1) else {
+            panic!()
+        };
+        assert!(matches!(
+            env.tx.operations.as_slice(),
+            [x::Operation {
+                body: x::OperationBody::RestoreFootprint(_),
+                ..
+            }]
+        ));
+        m.upload_restores_in_place = false;
+    }
+    // A read that finds no entry can omit the entry list: the code is absent.
+    chain.0.lock().unwrap().omit_empty_entries = true;
+    assert_eq!(
+        rpc::code_state(&*chain, NETWORK, &[0x5a; 32]).unwrap(),
+        rpc::CodeState::Absent
+    );
+    chain.0.lock().unwrap().omit_empty_entries = false;
     // Code that the network does not have cannot be restored: it needs an upload.
     chain.0.lock().unwrap().code_bytes.remove(&installed);
     let signed = signatures();
