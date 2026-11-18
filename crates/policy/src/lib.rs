@@ -85,10 +85,6 @@ pub mod soroban {
         fail(&params.env, AllowitError::MissingParam, key)
     }
 
-    /// Temporary-storage key of the running operation's policy writes. `post_flight` removes it,
-    /// and a failed operation rolls it back, so it never outlives the transaction.
-    const WRITES: Symbol = soroban_sdk::symbol_short!("allowit_w");
-
     /// The value of `key` in `map`, or `None` when it is absent or no map can hold the key.
     fn lookup(map: &AllowitMap, key: &str) -> Option<AllowitValue> {
         key_ok(key)
@@ -190,23 +186,49 @@ pub mod soroban {
         Ok(())
     }
 
+    /// The policy writes of the running call, held in memory: a write costs no ledger entry.
+    /// Each contract call runs in its own Wasm instance, so the buffer lives for that call only.
+    #[cfg(target_family = "wasm")]
+    mod buffer {
+        use super::AllowitMap;
+        struct Writes(core::cell::RefCell<Option<AllowitMap>>);
+        // A contract instance runs on one thread.
+        unsafe impl Sync for Writes {}
+        static WRITES: Writes = Writes(core::cell::RefCell::new(None));
+        pub(super) fn with<R>(f: impl FnOnce(&mut Option<AllowitMap>) -> R) -> R {
+            f(&mut WRITES.0.borrow_mut())
+        }
+    }
+    /// Host builds, such as tests, run each contract call on the caller's thread.
+    #[cfg(not(target_family = "wasm"))]
+    mod buffer {
+        extern crate std;
+        use super::AllowitMap;
+        std::thread_local! {
+            static WRITES: core::cell::RefCell<Option<AllowitMap>> = const { core::cell::RefCell::new(None) };
+        }
+        pub(super) fn with<R>(f: impl FnOnce(&mut Option<AllowitMap>) -> R) -> R {
+            WRITES.with(|writes| f(&mut writes.borrow_mut()))
+        }
+    }
+
+    /// Drop every buffered write. The wallet calls it before it runs a policy, so writes that a
+    /// failed run left behind never reach a later one.
+    pub fn reset_writes() {
+        buffer::with(|writes| *writes = None);
+    }
+
     /// Buffer one policy write for `post_flight`.
     fn record(env: &AllowitEnv, key: &str, value: AllowitValue) -> Result {
-        let store = env.storage().temporary();
-        let mut writes = store.get(&WRITES).unwrap_or_else(|| Map::new(env));
-        insert(&mut writes, key, value)?;
-        store.set(&WRITES, &writes);
-        Ok(())
+        buffer::with(|writes| {
+            let map = writes.get_or_insert_with(|| Map::new(env));
+            insert(map, key, value)
+        })
     }
 
     /// Remove and return the buffered policy writes.
     fn take_writes(env: &AllowitEnv) -> AllowitMap {
-        let store = env.storage().temporary();
-        let writes: AllowitMap = store.get(&WRITES).unwrap_or_else(|| Map::new(env));
-        if !writes.is_empty() {
-            store.remove(&WRITES);
-        }
-        writes
+        buffer::with(|writes| writes.take()).unwrap_or_else(|| Map::new(env))
     }
 
     /// Apply `writes` over `state`.

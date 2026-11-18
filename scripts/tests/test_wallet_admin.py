@@ -384,17 +384,20 @@ class ContractAdmin(unittest.TestCase):
             self.assertEqual(ca.policy_rules({"rules": [], "source_hash": digest}, "simple", str(policy))["rules"], [])
             with self.assertRaises(ValueError):
                 ca.policy_rules(packet, "common", None)
-            # A policy wallet stores no policy state on any tier: a policy that writes state is refused.
+            # Only a Custom wallet stores its policy's own state: Simple and Common refuse a policy
+            # that writes state, and Custom admits it.
             writer = source(CALL("destinations") + "    allowit::set_state(ctx, \"seen\", 1u64)?;\n")
             # A raw identifier names the same function and compiles on the host.
             raw = source(CALL("destinations") + "    allowit::r#set_state(ctx, \"seen\", 1u64)?;\n")
             for body in (raw, writer):
                 policy.write_text(body)
-                for tier in ("common", "simple", "custom"):
+                body_hash = hashlib.sha256(body.encode()).hexdigest()
+                for tier in ("common", "simple"):
                     rules = ["destinations"] if tier == "common" else []
-                    body_hash = hashlib.sha256(body.encode()).hexdigest()
                     with self.subTest(tier=tier, source=body), self.assertRaisesRegex(ValueError, "set_state"):
                         ca.policy_rules({"rules": rules, "source_hash": body_hash}, tier, str(policy))
+                admitted = {"rules": [], "source_hash": body_hash}
+                self.assertEqual(ca.policy_rules(admitted, "custom", str(policy)), admitted)
             # Simple and Common admit only canonical params; Custom admits its own keys.
             policy.write_text(text)
             custom_key = {"rules": [], "source_hash": digest, "params": {"vendor_limit": 5}}

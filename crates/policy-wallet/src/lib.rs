@@ -65,6 +65,24 @@ const UNPRICED_BIT: u32 = 1 << 31;
 const DAILIES: u8 = DAY_SPENT | DAY_TOTAL;
 const ALL: u8 = TOTALS | DAILIES;
 
+/// One state entry of a Custom policy, as its build declares it: the name that the source reads
+/// with `allowit::get_state` and writes with `allowit::set_state`, the short key that the wallet
+/// stores it under, and its lifetime. The name itself is never stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AllowitStateKey {
+    /// The source's key name.
+    pub name: &'static str,
+    /// The storage key: the first four bytes of the SHA-256 of the name, big-endian.
+    pub key: u32,
+    /// A `day_` name: a temporary entry that lives one daily window. Any other name: a
+    /// persistent entry that lives the minimum persistent lifetime from its creation.
+    pub daily: bool,
+}
+/// Most state entries of one policy. The build refuses more.
+pub const MAX_POLICY_STATE: usize = 8;
+/// Most packed bytes of one state value. A larger write fails the operation.
+pub const MAX_STATE_VALUE: usize = 64;
+
 // Fixed header of the packed configuration. Every layout keeps these offsets, so an owner call
 // reads the owner and the asset whatever the rest holds.
 const H_LAYOUT: usize = 0;
@@ -193,6 +211,9 @@ pub trait AllowitPolicy {
     /// The figures that a compiled source's checks read, from its build. The standard tiers derive
     /// them from their rules.
     const FIGURES: Option<u8> = None;
+    /// The state entries that a compiled source reads and writes, from its build. The standard
+    /// tiers keep none.
+    const STATE: &'static [AllowitStateKey] = &[];
     /// A bespoke implementation binds the owner's source hash. Fixed tiers take the owner's.
     fn source_digest(_env: &Env) -> Option<BytesN<32>> {
         None
@@ -585,6 +606,138 @@ fn write_daily(
     }
     Ok(())
 }
+/// One state entry as the wallet holds it before a policy run.
+#[derive(Clone, Default)]
+struct Slot {
+    value: Option<AllowitValue>,
+    /// The end ledger of an open daily entry.
+    day_ends: Option<u32>,
+    /// The entry is on the ledger, whatever it holds.
+    exists: bool,
+}
+/// The policy's state entries. A daily entry whose end ledger has passed reads as absent, even
+/// if someone paid to keep it alive; a persistent entry that holds no value reads as absent. No
+/// read extends a lifetime.
+fn read_policy_state<P: AllowitPolicy>(
+    env: &Env,
+) -> Result<[Slot; MAX_POLICY_STATE], AllowitWalletError> {
+    let mut slots: [Slot; MAX_POLICY_STATE] = Default::default();
+    if P::STATE.len() > MAX_POLICY_STATE {
+        return Err(AllowitWalletError::InvalidState);
+    }
+    for (slot, entry) in slots.iter_mut().zip(P::STATE) {
+        let raw: Option<Bytes> = if entry.daily {
+            env.storage().temporary().get(&entry.key)
+        } else {
+            env.storage().persistent().get(&entry.key)
+        };
+        let Some(raw) = raw else {
+            continue;
+        };
+        slot.exists = true;
+        let mut buf = [0u8; 4 + MAX_STATE_VALUE];
+        let len = raw.len() as usize;
+        if len > buf.len() {
+            return Err(AllowitWalletError::InvalidState);
+        }
+        raw.copy_into_slice(&mut buf[..len]);
+        let mut r = Reader::new(&buf[..len]);
+        if entry.daily {
+            let mut end = [0; 4];
+            end.copy_from_slice(r.take(4)?);
+            let end = u32::from_be_bytes(end);
+            if env.ledger().sequence() > end {
+                continue;
+            }
+            slot.day_ends = Some(end);
+        } else if r.done() {
+            continue;
+        }
+        slot.value = Some(pack::get_value(env, &mut r)?);
+        if !r.done() {
+            return Err(AllowitWalletError::InvalidState);
+        }
+    }
+    Ok(slots)
+}
+/// Write each state entry whose value the policy changed. A daily entry holds its window's end
+/// ledger before the value: a new window ends `DAY_LEDGERS - 1` ledgers from now and the entry
+/// lives that long. A new persistent entry lives `TOTAL_LEDGERS`. The wallet never extends an
+/// entry later. A value of more than `MAX_STATE_VALUE` packed bytes, and a key that the build did
+/// not declare, are `InvalidState`.
+fn write_policy_state<P: AllowitPolicy>(
+    env: &Env,
+    state: &Map<Symbol, AllowitValue>,
+    before: &[Slot; MAX_POLICY_STATE],
+) -> Result<(), AllowitWalletError> {
+    let mut declared = 0u32;
+    for (slot, entry) in before.iter().zip(P::STATE) {
+        let Some(value) = state.get(Symbol::new(env, entry.name)) else {
+            continue;
+        };
+        declared += 1;
+        if slot.value.as_ref() == Some(&value) {
+            continue;
+        }
+        let mut buf = [0u8; 4 + MAX_STATE_VALUE];
+        let mut w = Writer::new(&mut buf);
+        let opens = entry.daily && slot.day_ends.is_none();
+        if entry.daily {
+            let end = match slot.day_ends {
+                Some(end) => end,
+                None => checked(env.ledger().sequence().checked_add(DAY_LEDGERS - 1))?,
+            };
+            w.put(&end.to_be_bytes())?;
+        }
+        let start = w.bytes().len();
+        pack::put_value(&mut w, &value).map_err(|_| AllowitWalletError::InvalidState)?;
+        if w.bytes().len() - start > MAX_STATE_VALUE {
+            return Err(AllowitWalletError::InvalidState);
+        }
+        let bytes = Bytes::from_slice(env, w.bytes());
+        if entry.daily {
+            let storage = env.storage().temporary();
+            storage.set(&entry.key, &bytes);
+            if opens {
+                // Also covers an entry that someone kept alive past its own end ledger.
+                storage.extend_ttl(&entry.key, DAY_LEDGERS - 1, DAY_LEDGERS - 1);
+            }
+        } else {
+            let storage = env.storage().persistent();
+            storage.set(&entry.key, &bytes);
+            if !slot.exists {
+                storage.extend_ttl(&entry.key, TOTAL_LEDGERS - 1, TOTAL_LEDGERS - 1);
+            }
+        }
+    }
+    // Every other key is a standard figure; the build admits no other key name.
+    let standard = [
+        allowit::SPENT,
+        allowit::DAY_SPENT,
+        allowit::DAY_TOTAL,
+        allowit::CALLS,
+        allowit::DAY_KEY,
+        allowit::UNPRICED,
+        allowit::DAY_UNPRICED,
+    ]
+    .iter()
+    .filter(|key| state.contains_key(Symbol::new(env, key)))
+    .count() as u32;
+    if state.len() != standard + declared {
+        return Err(AllowitWalletError::InvalidState);
+    }
+    Ok(())
+}
+/// Create the persistent state entries of a Custom policy, empty, so that the owner's deployment
+/// pays their minimum lifetime. Daily entries open with the first write.
+fn create_policy_state<P: AllowitPolicy>(env: &Env) {
+    let storage = env.storage().persistent();
+    for entry in P::STATE.iter().filter(|entry| !entry.daily) {
+        storage.set(&entry.key, &Bytes::new(env));
+        storage.extend_ttl(&entry.key, TOTAL_LEDGERS - 1, TOTAL_LEDGERS - 1);
+    }
+}
+
 /// Make `t` match the figures that a new configuration keeps: rewrite it for a new set, create it
 /// at zero for a set that gains totals, remove it for one that keeps none.
 fn reshape_total(env: &Env, kept: u8) -> Result<(), AllowitWalletError> {
@@ -681,6 +834,7 @@ pub fn construct<P: AllowitPolicy>(
     if kept & TOTALS != 0 {
         write_total(env, kept, &Figures::default(), false)?;
     }
+    create_policy_state::<P>(env);
     env.deployer().extend_ttl_for_contract_instance(
         env.current_contract_address(),
         TOTAL_LEDGERS - 1,
@@ -866,14 +1020,30 @@ fn admit<P: AllowitPolicy>(
     } else {
         read_figures(env, kept)?
     };
-    let ctx = rule_input(env, config, execution, operation, &stored.figures)?;
+    let mut ctx = rule_input(env, config, execution, operation, &stored.figures)?;
+    // A Custom policy reads its own state entries beside the figures.
+    let custom = read_policy_state::<P>(env)?;
+    for (slot, entry) in custom.iter().zip(P::STATE) {
+        if let Some(value) = &slot.value {
+            ctx.state.set(Symbol::new(env, entry.name), value.clone());
+        }
+    }
+    allowit::reset_writes();
     P::check(&ctx, &config.rules)?;
     // A Standard policy writes nothing but figures. Custom runs the shared post-flight even with
-    // none, so a source write fails as `Unsupported` instead of being stored.
+    // none, so a write of a source whose build declared no state fails as `Unsupported`.
     if kept == 0 && P::STANDARD_PREFIX {
         return Ok(());
     }
-    let state = allowit::post_flight(&ctx, AllowitTier::Standard)?;
+    let tier = if P::STATE.is_empty() {
+        AllowitTier::Standard
+    } else {
+        AllowitTier::Custom
+    };
+    let state = allowit::post_flight(&ctx, tier)?;
+    if !P::STATE.is_empty() {
+        write_policy_state::<P>(env, &state, &custom)?;
+    }
     if kept == 0 {
         return Ok(());
     }

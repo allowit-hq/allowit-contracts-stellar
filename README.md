@@ -163,7 +163,7 @@ pub fn execute(ctx: &AllowitContext) -> allowit::Result {
 - A rule takes the param value, so it may read any key, such as `&ctx.params["vendor_limit"]`.
 - Only an error that the policy returns denies. A policy may catch a rule error and continue.
 - `allowit::param(ctx, key)` and `allowit::arg(ctx, key)` return the typed value of an owner param or an agent arg. They panic when the key is missing or mistyped. A panic denies the run and discards its writes.
-- After approval the wallet and the server run the same standard `allowit::post_flight`. It updates the cumulated figures that the wallet's checks read. A wallet stores no policy state of its own, so the post-flight denies every `allowit::set_state` write, on the server as onchain.
+- After approval the wallet and the server run the same standard `allowit::post_flight`. It updates the cumulated figures that the wallet's checks read. A Simple or Common wallet stores no policy state of its own, so its post-flight denies every `allowit::set_state` write, on the server as onchain. A Custom wallet keeps the state entries that its build declares ([policy state](docs/custom-policy-kernel.md#policy-state)).
 
 `scripts/policy_source.py` admits policy code through an allowlist, so the same file behaves the same offchain and onchain. The admin binary `allowit-stellar-admin` derives the standard `rules` from the source file. The server uses `allowit = { default-features = false, features = ["std"] }` and builds with `overflow-checks = true`. The full authoring rules are in [docs/architecture.md](docs/architecture.md).
 

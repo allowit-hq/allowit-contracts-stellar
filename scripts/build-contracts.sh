@@ -24,6 +24,8 @@ CARGO_TARGET_DIR="$fixtures" "$stellar_bin" contract build --locked --package al
 cp "$fixtures/wasm32v1-none/release/allowit_wallet_engine.wasm" target/test-fixtures/engine_deny.wasm
 CARGO_TARGET_DIR="$fixtures" "$stellar_bin" contract build --locked --package allowit-custom-policy --features test-catching
 cp "$fixtures/wasm32v1-none/release/allowit_custom_policy.wasm" target/test-fixtures/custom_catching.wasm
+CARGO_TARGET_DIR="$fixtures" "$stellar_bin" contract build --locked --package allowit-custom-policy --features test-daily
+cp "$fixtures/wasm32v1-none/release/allowit_custom_policy.wasm" target/test-fixtures/custom_daily.wasm
 # The Stellar CLI truncates a Wasm that it copies onto itself, so copy only from another directory.
 if [ "$cargo_target" -ef target ]; then
   "$stellar_bin" contract build --locked

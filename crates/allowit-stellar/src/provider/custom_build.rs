@@ -41,6 +41,7 @@ static TREE: &[(&str, &[u8])] = tree![
     "contracts/allowit-custom-policy/build.rs",
     "contracts/allowit-custom-policy/src/branch_policy.rs",
     "contracts/allowit-custom-policy/src/catching_policy.rs",
+    "contracts/allowit-custom-policy/src/daily_policy.rs",
     "contracts/allowit-custom-policy/src/lib.rs",
     "crates/policy/Cargo.toml",
     "crates/policy/build.rs",
