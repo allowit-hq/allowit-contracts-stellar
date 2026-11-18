@@ -781,8 +781,17 @@ fn total_figures_are_created_at_deployment_and_kept_for_their_checks() {
         f.env.deployer().get_contract_instance_ttl(&f.wallet),
         TOTAL_LEDGERS - 1
     );
+    let total_bytes = || {
+        f.env.as_contract(&f.wallet, || {
+            let raw: Bytes = f.env.storage().persistent().get(&TOTAL).unwrap();
+            raw.len()
+        })
+    };
+    // `t` has one fixed size, so no payment pays rent for a larger value.
+    assert_eq!(total_bytes(), 12);
     for amount in [100, 100] {
         assert_eq!(f.run(&f.transfer(amount, 0)), Ok(()));
+        assert_eq!(total_bytes(), 12);
     }
     assert_eq!(
         f.run(&f.transfer(51, 0)),
