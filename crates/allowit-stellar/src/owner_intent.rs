@@ -63,7 +63,9 @@ pub fn validate_retained_owner_transaction(original: &OwnerTransaction) -> Resul
                 // the first argument.
                 function == original.action.as_bytes()
                     || match (original.action.as_str(), function) {
-                        ("fund", b"transfer")
+                        // A creation runs through the network's deployer.
+                        ("create_wallet", b"deploy")
+                        | ("fund", b"transfer")
                         | ("update_params", b"deploy_policy")
                         | ("withdraw", b"recover") => true,
                         ("pause" | "resume", b"set_pause") => matches!(

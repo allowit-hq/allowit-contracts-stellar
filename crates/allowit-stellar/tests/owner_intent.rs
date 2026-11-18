@@ -426,6 +426,16 @@ fn four_owner_intents_sign_only_the_validated_digest_once() {
         native(),
     ] {
         let proof = validate_owner_transaction(&packet, &expected, NOW).unwrap();
+        // The retained packet describes its own transaction, so it can be restored and
+        // signed later; a packet under another action name cannot.
+        validate_retained_owner_transaction(&packet).unwrap();
+        let mut relabelled = packet.clone();
+        relabelled.action = if packet.action == "fund" {
+            "pause".into()
+        } else {
+            "fund".into()
+        };
+        assert!(validate_retained_owner_transaction(&relabelled).is_err());
         assert_eq!(proof.transaction_hash(), packet.transaction_hash);
         assert_eq!(proof.unsigned_xdr(), packet.transaction_xdr);
         let calls = Cell::new(0);
