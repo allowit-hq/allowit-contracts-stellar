@@ -66,10 +66,11 @@ struct Template {
 struct Installations {
     installations: Vec<Installation>,
 }
+/// One installation of `native/policies`. The client selects it by the policy instance in its
+/// configuration, never by a policy id.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Installation {
-    policy_id: String,
     config: native::WalletConfig,
     profile: String,
 }
@@ -326,8 +327,7 @@ impl OwnerClient {
                     .installations
                     .iter()
                     .filter(|i| {
-                        i.policy_id == *id
-                            && i.profile == request.profile
+                        i.profile == request.profile
                             && i.config.network == *network
                             && i.config.owner == self.session.owner()
                             && native::hex(&i.config.policy_instance) == *id
