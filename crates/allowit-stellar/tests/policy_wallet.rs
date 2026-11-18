@@ -306,6 +306,8 @@ struct Model {
     now: u64,
     accounts: BTreeMap<String, AccountState>,
     code: BTreeMap<[u8; 32], PolicyTier>,
+    /// The uploaded code by its hash.
+    code_bytes: BTreeMap<[u8; 32], Vec<u8>>,
     tiers: BTreeMap<[u8; 32], PolicyTier>,
     wallet: Option<Wallet>,
     settled: BTreeMap<String, String>,
@@ -598,6 +600,15 @@ impl rpc::Rpc for ModelChain {
                             val,
                         }))
                     }),
+                    x::LedgerKey::ContractCode(code) => {
+                        m.code_bytes.get(&code.hash.0).map(|bytes| {
+                            x::LedgerEntryData::ContractCode(x::ContractCodeEntry {
+                                ext: x::ContractCodeEntryExt::V0,
+                                hash: code.hash.clone(),
+                                code: bytes.clone().try_into().unwrap(),
+                            })
+                        })
+                    }
                     _ => None,
                 };
                 let entries: Vec<Value> = entry
@@ -832,6 +843,7 @@ fn apply(m: &mut Model, tx: &x::Transaction) -> x::ScVal {
             let h = hash(code.as_slice());
             let tier = m.tiers[&h];
             m.code.insert(h, tier);
+            m.code_bytes.insert(h, code.to_vec());
             bytes(&h)
         }
         x::HostFunction::InvokeContract(call)
@@ -2254,15 +2266,25 @@ fn a_simple_wallet_counts_the_gross_volume_of_a_lossless_deposit() {
     run(&chain, &c, &within, &terms(headroom, ledger), "transfer").unwrap();
     assert_eq!(chain.accounting().volume_daily, 6_000_000);
 }
-/// A chain whose wallet entry `t` lapsed: each simulation of the wallet's `execute` restores it
-/// in place, or, with `preamble`, asks for a separate restoration first.
+/// A chain whose wallet entry `t` lapsed, and with `instance` the wallet's instance too: the
+/// ledger reports them no longer live, and each simulation restores them in place. With
+/// `preamble`, a simulation asks for a separate restoration first.
 struct Lapsed<'a> {
     chain: &'a ModelChain,
     preamble: bool,
+    instance: bool,
 }
 impl rpc::Rpc for Lapsed<'_> {
     fn call(&self, method: &str, params: Value) -> Result<Value> {
         let mut reply = self.chain.call(method, params)?;
+        if method == "getLedgerEntries" && self.instance {
+            for entry in reply["entries"].as_array_mut().unwrap() {
+                let data: x::LedgerEntryData = de(entry["xdr"].as_str().unwrap());
+                if matches!(data, x::LedgerEntryData::ContractData(_)) {
+                    entry["liveUntilLedgerSeq"] = json!(0);
+                }
+            }
+        }
         if method == "simulateTransaction"
             && reply.get("error").is_none()
             && let Some(data) = reply["transactionData"].as_str()
@@ -2282,16 +2304,21 @@ impl rpc::Rpc for Lapsed<'_> {
                     .address
                     .clone();
                 let mut data: x::SorobanTransactionData = de(data);
-                data.resources.footprint.read_write =
-                    vec![x::LedgerKey::ContractData(x::LedgerKeyContractData {
+                let entry = |key: x::ScVal| {
+                    x::LedgerKey::ContractData(x::LedgerKeyContractData {
                         contract: address(&wallet).unwrap(),
-                        key: x::ScVal::Symbol("t".try_into().unwrap()),
+                        key,
                         durability: x::ContractDataDurability::Persistent,
-                    })]
-                    .try_into()
-                    .unwrap();
+                    })
+                };
+                let mut lapsed = vec![entry(x::ScVal::Symbol("t".try_into().unwrap()))];
+                if self.instance {
+                    lapsed.push(entry(x::ScVal::LedgerKeyContractInstance));
+                }
+                let archived: Vec<u32> = (0..lapsed.len() as u32).collect();
+                data.resources.footprint.read_write = lapsed.try_into().unwrap();
                 data.ext = x::SorobanTransactionDataExt::V1(x::SorobanResourcesExtV0 {
-                    archived_soroban_entries: vec![0].try_into().unwrap(),
+                    archived_soroban_entries: archived.try_into().unwrap(),
                 });
                 reply["transactionData"] = json!(b64(&data));
             }
@@ -2311,6 +2338,7 @@ fn a_lapsed_entry_restores_in_the_operation_that_needs_it() {
     let lapsed = Lapsed {
         chain: &chain,
         preamble: false,
+        instance: false,
     };
     let prepared = rpc::prepare_with(
         &lapsed,
@@ -2350,6 +2378,7 @@ fn a_lapsed_entry_restores_in_the_operation_that_needs_it() {
     let preamble = Lapsed {
         chain: &chain,
         preamble: true,
+        instance: false,
     };
     let state = sending_state(&chain, &c);
     let ledger = chain.ledger();
@@ -2518,4 +2547,161 @@ fn a_creation_funds_the_asset_and_the_gas_and_recovery_returns_both() {
     );
     assert_eq!(admin::next_recovery(&c.asset, &xlm, 0, 0), None);
     assert_eq!(admin::next_recovery(&xlm, &xlm, 0, 0), None);
+}
+/// A diagnostic session of a server provider sends and signs with the provider's own sending
+/// accounts: a code upload through the session reaches them.
+#[test]
+fn a_diagnostic_session_keeps_the_sending_accounts() {
+    use allowit_core::vendor::RuntimeProvider;
+    use allowit_core::vendor::plugin::RailPlugin;
+    use allowit_core::vendor::profiles::Description;
+    use allowit_core::vendor::runtime::{Installation, Poll, Transport};
+    use allowit_stellar::provider::server::{Provider, SendingAccounts};
+    use std::sync::Arc;
+    struct Wire(Arc<ModelChain>);
+    impl Transport for Wire {
+        fn call(&self, method: &str, params: Value) -> allowit_core::client::error::Result<Value> {
+            rpc::Rpc::call(&*self.0, method, params)
+                .map_err(allowit_core::client::error::Error::config)
+        }
+    }
+    struct Sending;
+    impl SendingAccounts for Sending {
+        fn account(&self) -> Result<String> {
+            Ok(sender())
+        }
+        fn sign(&self, account: &str, hash: &[u8; 32]) -> Result<[u8; 64]> {
+            assert_eq!(account, sender());
+            Ok(SigningKey::from_bytes(&SENDER).sign(hash).to_bytes())
+        }
+    }
+    let wasm = wasm_for(PolicyTier::Common);
+    let chain = Arc::new(ModelChain::new(BTreeMap::from([(
+        hash(&wasm),
+        PolicyTier::Common,
+    )])));
+    let c = create(&chain, PolicyTier::Common, &wasm, [0x36; 32]);
+    let owners = allowit_stellar::PLUGIN.owner_runtime();
+    let document = owners
+        .configuration(NETWORK, &serde_json::to_vec(&c).unwrap())
+        .unwrap();
+    let installation = Installation {
+        description: Description {
+            network: NETWORK.into(),
+            wallet: c.wallet.clone(),
+            agent: c.agent.clone(),
+            policy_id: "policy".into(),
+            owner: c.owner.clone(),
+            server: c.server.clone(),
+            asset: c.asset.clone(),
+            asset_symbol: c.asset_symbol.clone(),
+            source: c.policy_source.clone(),
+            source_hash: hex(&c.source_hash),
+            module_digest: hex(&c.module_digest),
+            params: document.params.clone(),
+        },
+        config: document.document().to_owned(),
+        export: None,
+        authority: None,
+    };
+    let provider = Provider::with_transport(NETWORK, Arc::new(Wire(chain.clone())))
+        .unwrap()
+        .with_sender(Arc::new(Sending));
+    let session = provider.diagnostic_session(&installation).unwrap().unwrap();
+    // Code that the ledger does not hold yet: the session's sending account uploads it.
+    let other = wasm_for(PolicyTier::Simple);
+    chain
+        .0
+        .lock()
+        .unwrap()
+        .tiers
+        .insert(hash(&other), PolicyTier::Simple);
+    chain.step("upload");
+    let receipt = session
+        .provider
+        .upload_code(&installation, &other, Poll::default(), NOW)
+        .unwrap();
+    assert!(receipt.is_some());
+    assert!(chain.0.lock().unwrap().code.contains_key(&hash(&other)));
+    // The ledger holds it now: nothing is sent.
+    assert!(
+        session
+            .provider
+            .upload_code(&installation, &other, Poll::default(), NOW)
+            .unwrap()
+            .is_none()
+    );
+}
+/// A wallet whose instance and `t` lapsed: the ledger still gives their values, so the server
+/// reads the wallet and the agent's payment restores both in place; the owner's stop then
+/// restores them too and returns everything with one signature.
+#[test]
+fn a_lapsed_instance_restores_in_the_payment_and_in_the_owners_stop() {
+    let wasm = wasm_for(PolicyTier::Common);
+    let chain = ModelChain::new(BTreeMap::from([(hash(&wasm), PolicyTier::Common)]));
+    let c = create(&chain, PolicyTier::Common, &wasm, [0x37; 32]);
+    let lapsed = Lapsed {
+        chain: &chain,
+        preamble: false,
+        instance: true,
+    };
+    let mut state = rpc::trusted_state(&lapsed, &c, Some(chain.accounting())).unwrap();
+    state.source = rpc::get_account(&lapsed, &sender()).unwrap();
+    let ledger = chain.ledger();
+    let recipient = account_for_seed(&RECIPIENT);
+    let transfer = request::transfer(&c, &state, [1; 32], &recipient, 1_000_000).unwrap();
+    let prepared = rpc::prepare_with(
+        &lapsed,
+        &c,
+        &transfer,
+        &terms(1_000_000, ledger),
+        Some(chain.accounting()),
+        NOW,
+        NOW + 300,
+    )
+    .unwrap();
+    let served = authorize_server(&prepared, &SERVER, NOW, None).unwrap();
+    let simulated = rpc::simulate(&lapsed, &served).unwrap();
+    let proof = sign(&simulated, &AGENT, NOW).unwrap();
+    let signed = authorize(&simulated, &[proof], NOW).unwrap();
+    let sealed = rpc::seal(&lapsed, &signed, |hash| {
+        Ok(SigningKey::from_bytes(&SENDER).sign(hash).to_bytes())
+    })
+    .unwrap();
+    let x::TransactionEnvelope::Tx(envelope) = de(&sealed.transaction_xdr) else {
+        panic!()
+    };
+    let x::TransactionExt::V1(data) = &envelope.tx.ext else {
+        panic!()
+    };
+    assert!(matches!(
+        &data.ext,
+        x::SorobanTransactionDataExt::V1(ext) if ext.archived_soroban_entries.as_slice() == [0, 1]
+    ));
+    chain.step("transfer");
+    assert_eq!(
+        rpc::broadcast(&chain, &sealed, NOW).unwrap(),
+        rpc::Broadcast::Submitted
+    );
+    // The owner alone: the stop reads the lapsed instance and restores it in the same call.
+    let mut owner = OwnerAdmin {
+        rpc: &lapsed,
+        config: &c,
+        now: NOW,
+    };
+    let version = owner.deployment_version().unwrap().0 + 1;
+    let stop = owner.stop(DeploymentVersion(version)).unwrap();
+    let x::TransactionEnvelope::Tx(envelope) = de(&stop.transaction_xdr) else {
+        panic!()
+    };
+    let x::TransactionExt::V1(data) = &envelope.tx.ext else {
+        panic!()
+    };
+    assert!(matches!(
+        &data.ext,
+        x::SorobanTransactionDataExt::V1(ext) if ext.archived_soroban_entries.len() == 2
+    ));
+    owner_submit(&chain, "stop", &stop.transaction_xdr);
+    assert_eq!(chain.balance(), 0);
+    assert!(chain.config().paused);
 }

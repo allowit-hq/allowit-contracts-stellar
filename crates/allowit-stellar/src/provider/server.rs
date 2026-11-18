@@ -695,7 +695,9 @@ impl crate::host::vendors::RuntimeProvider for Provider {
             wallet: config.wallet,
             captured: captured.clone(),
         });
-        let provider = Self::from_rpc_inner(&self.network, probe);
+        // The session sends and signs as this provider does: it keeps the sending accounts.
+        let mut provider = Self::from_rpc_inner(&self.network, probe);
+        provider.sender = self.sender.clone();
         Ok(Some(DiagnosticSession {
             provider: Box::new(provider),
             classify: Box::new(move |error| {

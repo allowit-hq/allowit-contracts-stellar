@@ -273,7 +273,7 @@ impl OwnerAdmin<'_> {
             .as_array()
             .ok_or("Missing policy wallet instance")?;
         if list.len() != 1 {
-            return Err("policy wallet instance not found".into());
+            return Err("The policy wallet instance is not on the ledger. A lapsed instance is read whatever its lifetime; if the RPC serves no archived entry, restore the wallet's instance first (for example with stellar contract restore).".into());
         }
         let LedgerEntryData::ContractData(data) =
             read(list[0]["xdr"].as_str().ok_or("Missing instance XDR")?)?
