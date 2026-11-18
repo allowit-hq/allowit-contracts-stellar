@@ -217,6 +217,100 @@ pub fn configuration(raw: &[u8]) -> Result<Configuration> {
     })
 }
 
+fn put_uint(out: &mut Vec<u8>, mut value: u128) {
+    loop {
+        let low = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(low);
+            return;
+        }
+        out.push(low | 0x80);
+    }
+}
+fn put_key(out: &mut Vec<u8>, kind_account: u8, kind_contract: u8, address: &str) -> Result<()> {
+    use stellar_strkey::Strkey;
+    match Strkey::from_string(address).map_err(|_| "Invalid address")? {
+        Strkey::PublicKeyEd25519(k) => {
+            out.push(kind_account);
+            out.extend(k.0);
+        }
+        Strkey::Contract(c) => {
+            out.push(kind_contract);
+            out.extend(c.0);
+        }
+        _ => return Err("Only account and contract addresses are stored".into()),
+    }
+    Ok(())
+}
+fn put_value(out: &mut Vec<u8>, value: &PolicyValue) -> Result<()> {
+    match value {
+        PolicyValue::Int(n) => {
+            out.push(0);
+            put_uint(out, ((n << 1) ^ (n >> 127)) as u128);
+        }
+        PolicyValue::Bool(flag) => out.push(if *flag { 2 } else { 1 }),
+        PolicyValue::Str(text) => {
+            out.push(3);
+            put_uint(out, text.len() as u128);
+            out.extend(text.as_bytes());
+        }
+        PolicyValue::Addr(address) => put_key(out, 4, 5, address)?,
+        PolicyValue::List(items) => {
+            out.push(6);
+            put_uint(out, items.len() as u128);
+            for item in items {
+                put_value(out, item)?;
+            }
+        }
+    }
+    Ok(())
+}
+fn raw_key(address: &str) -> Result<[u8; 32]> {
+    match stellar_strkey::Strkey::from_string(address).map_err(|_| "Invalid address")? {
+        stellar_strkey::Strkey::PublicKeyEd25519(k) => Ok(k.0),
+        stellar_strkey::Strkey::Contract(c) => Ok(c.0),
+        _ => Err("Only account and contract addresses are stored".into()),
+    }
+}
+/// Pack a configuration as the wallet kernel stores it: the exact bytes that
+/// [`configuration`] reads back.
+pub fn encode(c: &Configuration) -> Result<Vec<u8>> {
+    let owner_contract = c.owner.starts_with('C');
+    let mut out = vec![
+        c.layout,
+        u8::from(c.paused) * PAUSED | if owner_contract { OWNER_CONTRACT } else { 0 },
+    ];
+    out.extend(c.deployment_version.to_be_bytes());
+    for address in [&c.owner, &c.agent, &c.server, &c.asset] {
+        out.extend(raw_key(address)?);
+    }
+    out.extend(c.source_hash);
+    put_uint(
+        &mut out,
+        u128::try_from(c.gas_cap).map_err(|_| "A negative gas cap")?,
+    );
+    let keys = param_keys();
+    let index = |name: &str| keys.iter().position(|k| *k == name);
+    out.push(u8::try_from(c.rules.len()).map_err(|_| "Too many rules")?);
+    for rule in &c.rules {
+        out.push(index(rule).ok_or("Unknown rule")? as u8);
+    }
+    put_uint(&mut out, c.params.0.len() as u128);
+    for (name, value) in &c.params.0 {
+        match index(name) {
+            Some(i) => out.push(i as u8),
+            None => {
+                out.push(0xff);
+                out.push(u8::try_from(name.len()).map_err(|_| "Param key too long")?);
+                out.extend(name.as_bytes());
+            }
+        }
+        put_value(&mut out, value)?;
+    }
+    Ok(out)
+}
+
 /// The total figures of a stored `t`, the ones that `kept` names.
 pub fn totals(raw: &[u8], kept: u8, figures: &mut Figures) -> Result<()> {
     let raw: [u8; 12] = raw
@@ -294,6 +388,7 @@ mod tests {
             c.params.get("daily_spending_limit"),
             Some(&PolicyValue::Int(200))
         );
+        assert_eq!(encode(&c).unwrap(), raw);
         raw.push(0);
         assert!(configuration(&raw).is_err());
     }

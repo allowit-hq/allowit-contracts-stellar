@@ -308,24 +308,20 @@ impl OwnerLedger {
                     .unwrap()
                     .clone()
                     .unwrap_or((c.params.clone(), 1, Default::default()));
-                let state = native::contract::CustodyState {
-                    policy_state,
-                    contract_version: native::CONTRACT_VERSION,
+                let state = native::packed::encode(&native::packed::Configuration {
+                    layout: native::packed::LAYOUT,
+                    paused: false,
+                    deployment_version: u32::try_from(deployment_version).unwrap(),
                     owner: c.owner.clone(),
                     agent: c.agent.clone(),
                     server: c.server.clone(),
                     asset: c.asset.clone(),
-                    policy_instance: c.policy_instance,
-                    source_digest: c.source_digest,
+                    source_hash: c.source_hash,
+                    gas_cap: i128::from(c.max_fee_stroops),
                     rules: c.rules.clone(),
                     params,
-                    x402_enabled: false,
-                    token: c.asset_symbol.clone(),
-                    deployment_version,
-                    nonce: 0,
-                    paused: false,
-                }
-                .scval()?;
+                })?;
+                let _ = policy_state;
                 let data = x::LedgerEntryData::ContractData(x::ContractDataEntry {
                     ext: x::ExtensionPoint::V0,
                     contract: addr(&c.wallet),
@@ -335,8 +331,8 @@ impl OwnerLedger {
                         executable: x::ContractExecutable::Wasm(x::Hash(c.module_digest)),
                         storage: Some(
                             vec![x::ScMapEntry {
-                                key: x::ScVal::U32(0),
-                                val: state,
+                                key: native::value_symbol("c")?,
+                                val: x::ScVal::Bytes(state.try_into().unwrap()),
                             }]
                             .try_into()
                             .unwrap(),
@@ -345,23 +341,7 @@ impl OwnerLedger {
                 });
                 Ok(json!({"entries":[{"xdr":enc(&data)}]}))
             }
-            "simulateTransaction" => {
-                let b = native::contract::PolicyBinding {
-                    engine_kind: c.tier.unwrap().kind().into(),
-                    contract_version: native::CONTRACT_VERSION,
-                    policy_instance: c.policy_instance,
-                    module_digest: c.module_digest,
-                    source_digest: c.source_digest,
-                    operations: vec![
-                        native::OperationKind::Transfer,
-                        native::OperationKind::Swap,
-                        native::OperationKind::Deposit,
-                        native::OperationKind::Redeem,
-                    ],
-                }
-                .scval()?;
-                Ok(json!({"results":[{"xdr":enc(&b)}]}))
-            }
+            "simulateTransaction" => Ok(json!({"results":[{"xdr":enc(&x::ScVal::Void)}]})),
             "getTransaction" => {
                 let signed = self.direct_signed.lock().unwrap().clone().or_else(|| {
                     owner_submissions
