@@ -364,6 +364,17 @@ fn gas_carry(repays_gas: bool, carry: u128) -> Result<u128> {
         )),
     }
 }
+/// The gas due of an operation, as for its carry: only a policy wallet operation that repays its
+/// gas repays one.
+fn gas_due(repays_gas: bool, due: u128) -> Result<u128> {
+    match (repays_gas, due) {
+        (true, due) => Ok(due),
+        (false, 0) => Ok(0),
+        (false, _) => Err(Error::usage(
+            "Only a policy wallet operation that repays its gas takes a gas due",
+        )),
+    }
+}
 pub fn receipt_info(p: &Packet) -> Result<ReceiptInfo> {
     let r: rpc::VerifiedReceipt = decode_packet(p)?;
     let result: stellar_xdr::TransactionResult = checked(native::read(&r.result_xdr))?;
@@ -1047,6 +1058,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
             gas: None,
             sender: None,
             gas_carry: 0,
+            gas_due: 0,
         };
         let accounting = accounting(a);
         let request: native::workflow::ExecutionRequest = decode_packet(&r.0)?;
@@ -1059,6 +1071,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
             terms.sender = Some(self.sending_account()?);
         }
         terms.gas_carry = gas_carry(repays_gas, t.gas_carry_units)?;
+        terms.gas_due = gas_due(repays_gas, t.gas_due_units)?;
         if native::seller_settled::is_request(&request) {
             return self.packet(&checked(native::seller_settled::prepare(
                 self.rpc(),
@@ -2035,6 +2048,19 @@ mod receipt_fee_tests {
                 .unwrap_err()
                 .message
                 .contains("takes a gas carry")
+        );
+    }
+
+    /// Only an operation that repays its gas takes a gas due.
+    #[test]
+    fn only_an_operation_that_repays_its_gas_takes_a_gas_due() {
+        assert_eq!(gas_due(true, 7).unwrap(), 7);
+        assert_eq!(gas_due(false, 0).unwrap(), 0);
+        assert!(
+            gas_due(false, 1)
+                .unwrap_err()
+                .message
+                .contains("takes a gas due")
         );
     }
 

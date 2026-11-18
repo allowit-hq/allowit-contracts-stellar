@@ -432,6 +432,44 @@ impl ExpenseBounds {
             ..self.clone()
         })
     }
+    /// These bounds at their fee bound when the wallet repays the bound less `carry`, at least
+    /// zero, and also as much of `due` as fits under the gas cap `cap`: stroops that the server
+    /// paid for the operation outside its transaction, such as the restoration of the wallet's
+    /// lapsed code. The gas changes in proportion to the repayment and rounds up, as for a carry,
+    /// so an XLM wallet counts exactly what it repays; spent units change by the same gas. Returns
+    /// the bounds and the part of `due` that the wallet repays.
+    pub fn with_gas_due(&self, carry: u128, due: u128, cap: i128) -> Result<(Self, u128)> {
+        let base = self.repaid_after_carry(carry);
+        let part = i128::try_from(due)
+            .unwrap_or(i128::MAX)
+            .min(cap.saturating_sub(base).max(0));
+        if part == 0 || self.max_fee_stroops == 0 {
+            return Ok((self.with_gas_carry(carry)?, 0));
+        }
+        if self.gas_units < 0 {
+            return Err("A gas due raises nonnegative gas".into());
+        }
+        let bound = i128::from(self.max_fee_stroops);
+        let gas_units = self
+            .gas_units
+            .checked_mul(base + part)
+            .and_then(|units| units.checked_add(bound - 1))
+            .map(|units| units / bound)
+            .ok_or("Expense overflow")?;
+        let bounds = Self {
+            gas_units,
+            spent_units: self
+                .spent_units
+                .checked_sub(self.gas_units)
+                .and_then(|principal| principal.checked_add(gas_units))
+                .ok_or("Expense overflow")?,
+            ..self.clone()
+        };
+        Ok((
+            bounds,
+            u128::try_from(part).map_err(|_| "Expense overflow")?,
+        ))
+    }
     pub fn with_fee_bound(&self, fee_stroops: u32) -> Result<Self> {
         if fee_stroops == 0 || fee_stroops > self.max_fee_stroops || self.gas_units < 0 {
             return Err("A fee bound lowers a positive fee ceiling".into());
@@ -477,6 +515,12 @@ pub struct ExecutionTerms {
     /// less this carry, at least zero. An explicit `gas` takes no carry.
     #[serde(default, skip_serializing_if = "is_zero_carry")]
     pub gas_carry: u128,
+    /// The stroops that the server paid for this operation outside its transaction, such as
+    /// the restoration of the wallet's lapsed code, which the wallet repays with its gas. The
+    /// caller names the whole fee; priced terms hold the part that fits under the wallet's gas
+    /// cap, and the server charges the rest to the request. An explicit `gas` takes none.
+    #[serde(default, skip_serializing_if = "is_zero_carry")]
+    pub gas_due: u128,
 }
 fn is_zero_carry(carry: &u128) -> bool {
     *carry == 0
@@ -488,20 +532,27 @@ impl ExecutionTerms {
             && self.gas.is_none()
             && self.sender.is_none()
             && self.gas_carry == 0
+            && self.gas_due == 0
     }
     /// The stroops that a policy wallet repays under these terms: the explicit repayment, else
-    /// the fee bound of the expense less the gas carry, at least zero; nothing when unpriced.
-    /// An explicit repayment takes no carry.
+    /// the fee bound of the expense less the gas carry, at least zero, plus the gas due;
+    /// nothing when unpriced. An explicit repayment takes no carry and no due.
     pub fn repaid_stroops(&self) -> Result<i128> {
         match &self.gas {
             Some(_) if self.gas_carry != 0 => {
                 Err("An explicit gas repayment takes no gas carry".into())
             }
+            Some(_) if self.gas_due != 0 => {
+                Err("An explicit gas repayment takes no gas due".into())
+            }
             Some(gas) => Ok(gas.stroops),
-            None => Ok(self
-                .expense
-                .as_ref()
-                .map_or(0, |e| e.repaid_after_carry(self.gas_carry))),
+            None => match &self.expense {
+                None => Ok(0),
+                Some(e) => e
+                    .repaid_after_carry(self.gas_carry)
+                    .checked_add(i128::try_from(self.gas_due).map_err(|_| "Gas due overflow")?)
+                    .ok_or_else(|| "Gas due overflow".into()),
+            },
         }
     }
 }

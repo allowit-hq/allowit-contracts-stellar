@@ -378,7 +378,7 @@ pub fn prepare_with(
                     .resource_fee
                     .saturating_add(i64::from(INCLUSION_FEE_STROOPS));
                 (declared > i64::from(signed.max_fee_stroops) && bound > signed.max_fee_stroops)
-                    .then(|| bounded(&terms, ceiling, bound))
+                    .then(|| bounded(&terms, ceiling, bound, i128::from(c.max_fee_stroops)))
             }
             _ => None,
         };
@@ -387,7 +387,10 @@ pub fn prepare_with(
             record_native_preflight(&mut prepared)?;
             return Ok(prepared);
         };
-        terms.expense = Some(expense?);
+        // A higher bound leaves less room under the gas cap: the due that fits can only shrink.
+        let (expense, gas_due) = expense?;
+        terms.expense = Some(expense);
+        terms.gas_due = gas_due;
         rounds += 1;
     }
 }
@@ -408,11 +411,20 @@ const REPRICE_ROUNDS: u8 = 2;
 /// The expense of `terms` at the fee bound `fee`: the default repayment follows the bound less
 /// the gas carry, and an explicit repayment keeps its gas. It always starts from the caller's
 /// `ceiling`, so a price taken again subtracts the carry once.
-fn bounded(terms: &ExecutionTerms, ceiling: &ExpenseBounds, fee: u32) -> Result<ExpenseBounds> {
+/// The gas due joins the repayment as far as the wallet's gas cap `cap` allows; the priced terms
+/// keep that part.
+fn bounded(
+    terms: &ExecutionTerms,
+    ceiling: &ExpenseBounds,
+    fee: u32,
+    cap: i128,
+) -> Result<(ExpenseBounds, u128)> {
     if terms.gas.is_some() {
-        ceiling.with_fee_bound_only(fee)
+        Ok((ceiling.with_fee_bound_only(fee)?, terms.gas_due))
     } else {
-        ceiling.with_fee_bound(fee)?.with_gas_carry(terms.gas_carry)
+        ceiling
+            .with_fee_bound(fee)?
+            .with_gas_due(terms.gas_carry, terms.gas_due, cap)
     }
 }
 fn priced_terms(
@@ -425,15 +437,23 @@ fn priced_terms(
     expires_at: u64,
 ) -> Result<ExecutionTerms> {
     let Some(ceiling) = terms.expense.as_ref().filter(|e| e.max_fee_stroops > 0) else {
-        return Ok(terms.clone());
+        // An unpriced operation repays nothing: the server charges a gas due to the request.
+        return Ok(ExecutionTerms {
+            gas_due: 0,
+            ..terms.clone()
+        });
     };
+    // The wallet's gas cap is the installed fee ceiling, which its creation set.
+    let cap = i128::from(c.max_fee_stroops);
     let with_bound = |fee: u32| -> Result<ExecutionTerms> {
+        let (expense, gas_due) = bounded(terms, ceiling, fee.min(ceiling.max_fee_stroops), cap)?;
         Ok(ExecutionTerms {
             args: terms.args.clone(),
-            expense: Some(bounded(terms, ceiling, fee.min(ceiling.max_fee_stroops))?),
+            expense: Some(expense),
             gas: terms.gas.clone(),
             sender: terms.sender.clone(),
             gas_carry: terms.gas_carry,
+            gas_due,
         })
     };
     let resource_fee = |fee: u32| -> Result<i64> {
