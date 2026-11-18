@@ -2870,10 +2870,37 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         .unwrap()
         .tiers
         .insert(hash(&other), PolicyTier::Simple);
+    // The server pays the upload, within its fee ceiling: a ceiling below the simulated fee
+    // refuses it before anything is signed or sent.
+    let refused = session
+        .provider
+        .upload_code_within(&installation, &other, 100, Poll::default(), NOW)
+        .unwrap_err();
+    assert!(
+        refused
+            .message
+            .contains("exceeds the explicitly selected ceiling"),
+        "{}",
+        refused.message
+    );
+    assert!(!chain.0.lock().unwrap().code.contains_key(&hash(&other)));
+    // A ceiling outside the native fee range is refused too.
+    assert!(
+        session
+            .provider
+            .upload_code_within(&installation, &other, u64::MAX, Poll::default(), NOW)
+            .is_err()
+    );
     chain.step("upload");
     let receipt = session
         .provider
-        .upload_code(&installation, &other, Poll::default(), NOW)
+        .upload_code_within(
+            &installation,
+            &other,
+            u64::from(u32::MAX),
+            Poll::default(),
+            NOW,
+        )
         .unwrap();
     assert!(receipt.is_some());
     assert!(chain.0.lock().unwrap().code.contains_key(&hash(&other)));

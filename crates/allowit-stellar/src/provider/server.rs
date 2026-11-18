@@ -413,6 +413,62 @@ fn sending_signature(sender: &Sender, account: &str, hash: &[u8; 32]) -> Result<
         .map_err(|_| Error::config("A sending account returned a signature of another size"))
 }
 impl Provider {
+    /// Upload `wasm` from a sending account, refusing a simulated fee above `max_fee_stroops`
+    /// before anything is signed.
+    fn upload(
+        &self,
+        i: &Installation,
+        wasm: &[u8],
+        max_fee_stroops: u32,
+        poll: Poll,
+        now: u64,
+    ) -> Result<Option<Receipt>> {
+        let c = self.config(i)?;
+        if c.route != WalletRoute::PolicyWallet {
+            return Err(Error::unsupported(
+                "A keypair wallet has no code: its owner creates it with the wallet setup",
+            ));
+        }
+        let code_hash = checked(native::admin::check_wallet_code(wasm))?;
+        if checked(rpc::code_uploaded(self.rpc(), &c.network, &code_hash))? {
+            return Ok(None);
+        }
+        let sender = self.sender.as_ref().ok_or_else(|| {
+            Error::config("This server has no sending account to upload wallet code")
+        })?;
+        let account = sender.account()?;
+        // The server pays the upload, a cost that the ledger consumes; the simulation sets it,
+        // within the ceiling.
+        let p = checked(
+            native::admin::Deployer {
+                rpc: self.rpc(),
+                network: &c.network,
+                now,
+                max_fee_stroops,
+            }
+            .upload_wasm(&account, wasm),
+        )?;
+        let signature = sending_signature(sender, &account, &p.transaction_hash)?;
+        let signed = checked(native::admin::with_source_signature(
+            &c.network,
+            &p.transaction_xdr,
+            &signature,
+        ))?;
+        let receipt = checked(self.runtime.send_and_poll(
+            &c.network,
+            &signed,
+            crate::provider::runtime::Poll {
+                attempts: poll.attempts,
+                interval: poll.interval,
+            },
+        ))?;
+        checked(rpc::validate_receipt(
+            &receipt,
+            &c.network,
+            &p.transaction_hash,
+        ))?;
+        Ok(Some(Receipt(packet(&c.network, &receipt)?)))
+    }
     /// One owner action on a keypair wallet: a transaction from the owner's account whose
     /// operations the owner's signature authorizes alone. `Recover` without an amount closes
     /// the wallet: every signer is removed and the account merges into the owner's account.
@@ -1453,50 +1509,17 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         poll: Poll,
         now: u64,
     ) -> Result<Option<Receipt>> {
-        let c = self.config(i)?;
-        if c.route != WalletRoute::PolicyWallet {
-            return Err(Error::unsupported(
-                "A keypair wallet has no code: its owner creates it with the wallet setup",
-            ));
-        }
-        let code_hash = checked(native::admin::check_wallet_code(wasm))?;
-        if checked(rpc::code_uploaded(self.rpc(), &c.network, &code_hash))? {
-            return Ok(None);
-        }
-        let sender = self.sender.as_ref().ok_or_else(|| {
-            Error::config("This server has no sending account to upload wallet code")
-        })?;
-        let account = sender.account()?;
-        // The server pays the upload, a cost that the ledger consumes; the simulation sets it.
-        let p = checked(
-            native::admin::Deployer {
-                rpc: self.rpc(),
-                network: &c.network,
-                now,
-                max_fee_stroops: u32::MAX,
-            }
-            .upload_wasm(&account, wasm),
-        )?;
-        let signature = sending_signature(sender, &account, &p.transaction_hash)?;
-        let signed = checked(native::admin::with_source_signature(
-            &c.network,
-            &p.transaction_xdr,
-            &signature,
-        ))?;
-        let receipt = checked(self.runtime.send_and_poll(
-            &c.network,
-            &signed,
-            crate::provider::runtime::Poll {
-                attempts: poll.attempts,
-                interval: poll.interval,
-            },
-        ))?;
-        checked(rpc::validate_receipt(
-            &receipt,
-            &c.network,
-            &p.transaction_hash,
-        ))?;
-        Ok(Some(Receipt(packet(&c.network, &receipt)?)))
+        self.upload(i, wasm, u32::MAX, poll, now)
+    }
+    fn upload_code_within(
+        &self,
+        i: &Installation,
+        wasm: &[u8],
+        max_fee: u64,
+        poll: Poll,
+        now: u64,
+    ) -> Result<Option<Receipt>> {
+        self.upload(i, wasm, fee(max_fee)?, poll, now)
     }
     fn submit_owner<'a>(
         &self,
