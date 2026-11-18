@@ -662,6 +662,9 @@ pub fn revalidate_prepared(
         spent_daily: p.state.spent_daily,
         spent_total: p.state.spent_total,
         spent_day: p.state.spent_day,
+        volume_daily: p.state.volume_daily,
+        unpriced_total: p.state.unpriced_total,
+        unpriced_daily: p.state.unpriced_daily,
         calls: p.state.calls,
     });
     let mut current = trusted_state(rpc, &p.config, accounting)?;
@@ -1173,7 +1176,9 @@ fn receipt_from_response(
         settles: None,
     }))
 }
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// The server's account of a wallet's standard figures: Core's `vendor::runtime::Accounting`.
+/// A policy wallet reads the figures that it keeps from the ledger and these for the others.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NativeAccounting {
     pub nonce: u64,
@@ -1182,6 +1187,15 @@ pub struct NativeAccounting {
     pub spent_daily: i128,
     pub spent_total: i128,
     pub spent_day: u64,
+    /// Gross amounts plus separate attributable gas on `spent_day` (`day_total`).
+    #[serde(default, skip_serializing_if = "crate::no_amount")]
+    pub volume_daily: i128,
+    /// An operation lacked price facts in the wallet's lifetime (`unpriced`).
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub unpriced_total: bool,
+    /// An operation on `spent_day` lacked price facts (`day_unpriced`).
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub unpriced_daily: bool,
     pub calls: u64,
 }
 pub(crate) fn map_field<'a>(value: &'a ScVal, name: &str) -> Result<&'a ScVal> {
@@ -1451,6 +1465,9 @@ fn trusted_state_inner(
                 spent_daily: a.spent_daily,
                 spent_total: a.spent_total,
                 spent_day: a.spent_day,
+                volume_daily: a.volume_daily,
+                unpriced_total: a.unpriced_total,
+                unpriced_daily: a.unpriced_daily,
                 calls: a.calls,
                 ledger,
                 module_digest: c.module_digest,
@@ -1586,6 +1603,9 @@ fn current_wallet_state(
             ),
             spent_total: accounting.as_ref().map_or(figures.spent, |a| a.spent_total),
             spent_day: accounting.as_ref().map_or(0, |a| a.spent_day),
+            volume_daily: accounting.as_ref().map_or(0, |a| a.volume_daily),
+            unpriced_total: accounting.as_ref().is_some_and(|a| a.unpriced_total),
+            unpriced_daily: accounting.as_ref().is_some_and(|a| a.unpriced_daily),
             calls: accounting.as_ref().map_or(figures.calls, |a| a.calls),
             ledger,
             module_digest: module,
@@ -1690,6 +1710,9 @@ fn historical_wallet_state(
         spent_daily: wide(map_field(state, "spent_daily")?)?,
         spent_total: wide(map_field(state, "spent_total")?)?,
         spent_day: number(map_field(state, "spent_day")?)?,
+        volume_daily: 0,
+        unpriced_total: false,
+        unpriced_daily: false,
         calls: number(map_field(state, "calls")?)?,
         ledger,
         module_digest: module,

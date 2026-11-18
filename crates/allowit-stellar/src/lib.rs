@@ -197,6 +197,12 @@ impl WalletRoute {
         }
     }
 }
+pub(crate) fn no_amount(v: &i128) -> bool {
+    *v == 0
+}
+pub(crate) fn is_false(v: &bool) -> bool {
+    !*v
+}
 fn is_zero(v: &[u8; 32]) -> bool {
     *v == [0; 32]
 }
@@ -689,10 +695,15 @@ impl TrustedState {
         );
         state.insert(
             "unpriced".to_owned(),
-            PolicyValue::Bool(kept & packed::SPENT != 0 && wallet.unpriced),
+            PolicyValue::Bool(if kept & packed::SPENT != 0 {
+                wallet.unpriced
+            } else {
+                self.unpriced_total
+            }),
         );
         state.insert("day".to_owned(), PolicyValue::Int(i128::from(today)));
         let server_daily = if server_today { self.spent_daily } else { 0 };
+        let server_volume = if server_today { self.volume_daily } else { 0 };
         let own_daily = |value: i128| if open { value } else { 0 };
         state.insert(
             "day_spent".to_owned(),
@@ -707,14 +718,16 @@ impl TrustedState {
             PolicyValue::Int(pick(
                 packed::DAY_TOTAL,
                 own_daily(wallet.day_total),
-                server_daily,
+                server_volume,
             )),
         );
         state.insert(
             "day_unpriced".to_owned(),
-            PolicyValue::Bool(
-                kept & (packed::DAY_SPENT | packed::DAY_TOTAL) != 0 && open && wallet.day_unpriced,
-            ),
+            PolicyValue::Bool(if kept & (packed::DAY_SPENT | packed::DAY_TOTAL) != 0 {
+                open && wallet.day_unpriced
+            } else {
+                server_today && self.unpriced_daily
+            }),
         );
         Ok(PolicyParams(state))
     }
@@ -736,6 +749,14 @@ pub struct TrustedState {
     pub spent_daily: i128,
     pub spent_total: i128,
     pub spent_day: u64,
+    /// The server's gross volume on `spent_day`, and its unpriced flags: figures that a policy
+    /// wallet which does not keep them reads from the server's accounting.
+    #[serde(default, skip_serializing_if = "no_amount")]
+    pub volume_daily: i128,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unpriced_total: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unpriced_daily: bool,
     pub calls: u64,
     pub ledger: u32,
     pub module_digest: [u8; 32],

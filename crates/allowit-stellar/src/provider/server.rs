@@ -176,6 +176,9 @@ fn accounting(a: Option<&Accounting>) -> Option<rpc::NativeAccounting> {
         spent_daily: a.spent_daily,
         spent_total: a.spent_total,
         spent_day: a.spent_day,
+        volume_daily: a.volume_daily,
+        unpriced_total: a.unpriced_total,
+        unpriced_daily: a.unpriced_daily,
         calls: a.calls,
     })
 }
@@ -1521,6 +1524,9 @@ fn snapshot_from(network: &str, live: rpc::DiscoveredState) -> Result<Snapshot> 
             spent_daily: s.spent_daily,
             spent_total: s.spent_total,
             spent_day: s.spent_day,
+            volume_daily: s.volume_daily,
+            unpriced_total: s.unpriced_total,
+            unpriced_daily: s.unpriced_daily,
             calls: s.calls,
         },
         observed_height: u64::from(s.ledger),
@@ -2628,12 +2634,8 @@ mod keypair_wallet_owner_tests {
             super::super::server_owner::configuration(&c.network, &serde_json::to_vec(&c).unwrap())
                 .unwrap();
         let usage = Accounting {
-            nonce: 0,
             deployment_version: 1,
-            spent_daily: 0,
-            spent_total: 0,
-            spent_day: 0,
-            calls: 0,
+            ..Accounting::default()
         };
         assert!(
             provider
@@ -2650,12 +2652,8 @@ mod keypair_wallet_owner_tests {
             super::super::server_owner::configuration(&c.network, &serde_json::to_vec(&c).unwrap())
                 .unwrap();
         let usage = Accounting {
-            nonce: 0,
             deployment_version: 1,
-            spent_daily: 0,
-            spent_total: 0,
-            spent_day: 0,
-            calls: 0,
+            ..Accounting::default()
         };
         provider
             .discover_snapshot(&configuration, Some(&usage))

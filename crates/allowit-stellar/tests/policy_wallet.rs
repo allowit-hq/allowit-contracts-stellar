@@ -145,9 +145,9 @@ struct Wallet {
     tier: PolicyTier,
     config: packed::Configuration,
     stored: Stored,
-    /// The server's account of every execution, from its receipts: spent, calls and the day's
-    /// spent.
-    served: (i128, u64, i128),
+    /// The server's account of every execution, from its receipts: every standard figure, as
+    /// Core's post-flight computes it.
+    served: packed::Figures,
     /// XLM: the asset, and the gas the wallet repays.
     balance: i128,
     shares: i128,
@@ -357,14 +357,20 @@ impl ModelChain {
     /// or Common wallet does not keep.
     fn accounting(&self) -> rpc::NativeAccounting {
         let m = self.0.lock().unwrap();
-        let (spent_total, calls, spent_daily) = m.wallet.as_ref().map_or((0, 0, 0), |w| w.served);
+        let f = m
+            .wallet
+            .as_ref()
+            .map(|w| w.served.clone())
+            .unwrap_or_default();
         rpc::NativeAccounting {
-            nonce: 0,
-            deployment_version: 0,
-            spent_daily,
-            spent_total,
+            spent_daily: f.day_spent,
+            spent_total: f.spent,
             spent_day: NOW / 86_400,
-            calls,
+            volume_daily: f.day_total,
+            unpriced_total: f.unpriced,
+            unpriced_daily: f.day_unpriced,
+            calls: f.calls,
+            ..Default::default()
         }
     }
     fn figures(&self) -> packed::Figures {
@@ -830,7 +836,7 @@ fn apply(m: &mut Model, tx: &x::Transaction) -> x::ScVal {
                     rules,
                 },
                 stored: Stored::default(),
-                served: (0, 0, 0),
+                served: packed::Figures::default(),
                 balance: 0,
                 shares: 0,
             };
@@ -984,10 +990,9 @@ fn execute(w: &mut Wallet, request: &x::ScVal, now: u64, ledger: u32, source: &s
             }
             _ => panic!(),
         };
-    let kept = w.kept();
-    let runs = w.tier == PolicyTier::Custom || !w.config.rules.is_empty();
-    if runs && kept != 0 {
-        let before = w.figures(kept, ledger);
+    // Every standard figure after this execution, from the figures before it, as Core's
+    // post-flight computes them.
+    let advance = |w: &Wallet, before: &packed::Figures| -> packed::Figures {
         let state = PolicyStateSnapshot {
             params: w.config.params.clone(),
             rules: w.config.rules.clone(),
@@ -1000,13 +1005,13 @@ fn execute(w: &mut Wallet, request: &x::ScVal, now: u64, ledger: u32, source: &s
             params: w.config.params.allowit().into(),
             state: state.allowit(),
             request: allowit_core::AllowitRequest {
-                operation: kind,
+                operation: kind.clone(),
                 asset: allowit_core::Address::new(asset.clone()),
-                recipient: allowit_core::Address::new(recipient),
+                recipient: allowit_core::Address::new(recipient.clone()),
                 amount,
-                token_in: allowit_core::Address::new(token_in),
+                token_in: allowit_core::Address::new(token_in.clone()),
                 amount_in,
-                token_out: token_out.map(allowit_core::Address::new),
+                token_out: token_out.clone().map(allowit_core::Address::new),
                 min_out,
                 now,
                 expires_at: *expires_at,
@@ -1024,7 +1029,7 @@ fn execute(w: &mut Wallet, request: &x::ScVal, now: u64, ledger: u32, source: &s
             other => panic!("{key}: {other:?}"),
         };
         let flag = |key: &str| matches!(after.get(key), Some(PolicyValue::Bool(true)));
-        let figures = packed::Figures {
+        packed::Figures {
             calls: number("calls") as u64,
             spent: number("spent"),
             unpriced: flag("unpriced"),
@@ -1032,7 +1037,21 @@ fn execute(w: &mut Wallet, request: &x::ScVal, now: u64, ledger: u32, source: &s
             day_total: number("day_total"),
             day_unpriced: flag("day_unpriced"),
             day_ends: before.day_ends,
-        };
+        }
+    };
+    // The server counts every execution; its day stays open for the whole model run.
+    let served = advance(
+        w,
+        &packed::Figures {
+            day_ends: u32::MAX,
+            ..w.served.clone()
+        },
+    );
+    let kept = w.kept();
+    let runs = w.tier == PolicyTier::Custom || !w.config.rules.is_empty();
+    if runs && kept != 0 {
+        let before = w.figures(kept, ledger);
+        let figures = advance(w, &before);
         let totals = |f: &packed::Figures| {
             (
                 if kept & SPENT != 0 { f.spent } else { 0 },
@@ -1084,7 +1103,7 @@ fn execute(w: &mut Wallet, request: &x::ScVal, now: u64, ledger: u32, source: &s
         }
     }
     w.balance -= gas;
-    w.served = (w.served.0 + spent, w.served.1 + 1, w.served.2 + spent);
+    w.served = served;
     x::ScVal::Void
 }
 
@@ -1784,6 +1803,32 @@ fn owner_params_update_step_matches_the_owner_reconstruction_and_keeps_usage() {
         };
         let revision = u64::from(before.deployment_version);
         let update = change(250_000_000, Some(revision));
+        // The owner changed the gas cap on the ledger: an update from this installation would
+        // write the old cap back, so it is refused, and verification names the difference.
+        let other_cap = WalletConfig {
+            max_fee_stroops: MAX_FEE - 1,
+            ..c.clone()
+        };
+        assert!(
+            params_update::installed(&*chain, &other_cap, &update)
+                .unwrap_err()
+                .to_string()
+                .contains("gas cap")
+        );
+        let differs = params_update::verify(&*chain, "policy", &other_cap).unwrap();
+        assert!(!differs.matches);
+        let cap = serde_json::to_value(&differs.comparisons)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row.to_string().contains("gasCap"))
+            .cloned()
+            .unwrap();
+        assert!(
+            cap.to_string().contains(&(MAX_FEE - 1).to_string()),
+            "{cap}"
+        );
         let owners = allowit_stellar::PLUGIN.owner_runtime();
         let document = owners
             .configuration(NETWORK, &serde_json::to_vec(&c).unwrap())
@@ -2128,4 +2173,51 @@ fn the_sending_account_is_the_gas_payee_and_the_gas_follows_the_priced_expense()
             .unwrap_err()
             .contains("needs the server's sending account")
     );
+}
+#[test]
+fn a_simple_wallet_counts_the_gross_volume_of_a_lossless_deposit() {
+    let wasm = wasm_for(PolicyTier::Simple);
+    let chain = ModelChain::new(BTreeMap::from([(hash(&wasm), PolicyTier::Simple)]));
+    let mut c = create(&chain, PolicyTier::Simple, &wasm, [0x32; 32]);
+    // A Simple wallet stores no params: the server holds them and evaluates its limits.
+    c.params
+        .0
+        .insert("daily_volume_limit".into(), PolicyValue::Int(6_000_000));
+    let state = sending_state(&chain, &c);
+    let ledger = chain.ledger();
+    let deposit = request::deposit(&c, &state, [2; 32], &vault(), 5_000_000, 5_000_000).unwrap();
+    let lossless = ExecutionTerms {
+        args: PolicyParams::default(),
+        expense: Some(ExpenseBounds::xlm(0, 0, MAX_FEE, ledger - 1, NOW).unwrap()),
+        gas: None,
+        sender: Some(sender()),
+    };
+    run(&chain, &c, &deposit, &lossless, "deposit").unwrap();
+    // The deposit spent only its gas; its gross amount fills the day's volume.
+    let account = chain.accounting();
+    assert_eq!(
+        (account.spent_daily, account.volume_daily),
+        (gas(), 5_000_000 + gas())
+    );
+    let state = sending_state(&chain, &c);
+    let ledger = chain.ledger();
+    let recipient = account_for_seed(&RECIPIENT);
+    let headroom = 6_000_000 - account.volume_daily - gas();
+    let over = request::transfer(&c, &state, [3; 32], &recipient, headroom + 1).unwrap();
+    assert!(
+        rpc::prepare_with(
+            &chain,
+            &c,
+            &over,
+            &terms(headroom + 1, ledger),
+            Some(chain.accounting()),
+            NOW,
+            NOW + 300
+        )
+        .unwrap_err()
+        .contains("DailyVolumeLimitExceeded")
+    );
+    let within = request::transfer(&c, &state, [4; 32], &recipient, headroom).unwrap();
+    run(&chain, &c, &within, &terms(headroom, ledger), "transfer").unwrap();
+    assert_eq!(chain.accounting().volume_daily, 6_000_000);
 }

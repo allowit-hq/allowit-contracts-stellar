@@ -181,6 +181,9 @@ fn fixture_with_wallet(
         spent_daily: 0,
         spent_total: 0,
         spent_day: 1,
+        volume_daily: 0,
+        unpriced_total: false,
+        unpriced_daily: false,
         calls: 0,
         ledger: 100,
         module_digest: c.module_digest,
@@ -201,6 +204,7 @@ fn server_accounting() -> rpc::NativeAccounting {
         spent_total: 0,
         spent_day: 0,
         calls: 0,
+        ..Default::default()
     }
 }
 fn sign_native(p: &PreparedOperation) -> SignedOperation {
@@ -828,6 +832,7 @@ fn native_state_uses_network_and_real_account_xdr_with_explicit_usage() {
         spent_total: 20,
         spent_day: 1,
         calls: 2,
+        ..Default::default()
     };
     let observed = rpc::trusted_state(&rpc, &c, Some(accounting.clone())).unwrap();
     assert_eq!(observed.source, s.source);
@@ -1081,6 +1086,7 @@ fn changed_customer_signer_is_resolved_from_current_native_account() {
         spent_total: state.spent_total,
         spent_day: state.spent_day,
         calls: state.calls,
+        ..Default::default()
     };
     // An installation that names the former agent no longer describes the account: neither
     // discovery nor execution admits it.
@@ -1112,6 +1118,7 @@ fn native_discovery_refuses_foreign_signers_threshold_drift_and_reports_a_pause(
         spent_total: 0,
         spent_day: 1,
         calls: 0,
+        ..Default::default()
     };
     let observe = |account: &AccountState| {
         let rpc = AccountRpc {
@@ -1357,6 +1364,7 @@ fn rpc_decodes_known_additional_signer_types_without_an_offline_allowlist() {
         spent_total: 0,
         spent_day: 1,
         calls: 0,
+        ..Default::default()
     };
     // The reader decodes every signer type. A wallet with a hash, pre-authorized or
     // signed-payload signer is no wallet of this installation.
@@ -2732,6 +2740,61 @@ fn a_simple_wallet_counts_with_the_servers_accounting() {
 }
 
 #[test]
+fn a_simple_wallet_reads_the_daily_volume_and_unpriced_flags_from_the_servers_accounting() {
+    let (mut c, r, s) = fixture(WalletRoute::PolicyWallet, true);
+    install(
+        &mut c,
+        PolicyTier::Simple,
+        LIMITED,
+        json!({"destinations": [account_for_seed(&[6; 32])], "payment_limit": 1}),
+    );
+    let rpc = preflight_rpc(&c, &r, &s);
+    let now = 86_401;
+    let account = rpc::NativeAccounting {
+        spent_daily: 3,
+        spent_total: 4,
+        spent_day: now / 86_400,
+        volume_daily: 9,
+        unpriced_total: true,
+        unpriced_daily: true,
+        calls: 2,
+        ..server_accounting()
+    };
+    let figures = |account: rpc::NativeAccounting| {
+        rpc::trusted_state(&rpc, &c, Some(account))
+            .unwrap()
+            .policy_wallet_state(&c, now)
+            .unwrap()
+            .0
+    };
+    let today = figures(account.clone());
+    for (key, value) in [
+        ("calls", PolicyValue::Int(2)),
+        ("spent", PolicyValue::Int(4)),
+        ("unpriced", PolicyValue::Bool(true)),
+        ("day_spent", PolicyValue::Int(3)),
+        ("day_total", PolicyValue::Int(9)),
+        ("day_unpriced", PolicyValue::Bool(true)),
+    ] {
+        assert_eq!(today[key], value, "{key}");
+    }
+    // The daily figures of another day count nothing today; the totals stay.
+    let yesterday = figures(rpc::NativeAccounting {
+        spent_day: 0,
+        ..account
+    });
+    for (key, value) in [
+        ("spent", PolicyValue::Int(4)),
+        ("unpriced", PolicyValue::Bool(true)),
+        ("day_spent", PolicyValue::Int(0)),
+        ("day_total", PolicyValue::Int(0)),
+        ("day_unpriced", PolicyValue::Bool(false)),
+    ] {
+        assert_eq!(yesterday[key], value, "{key}");
+    }
+}
+
+#[test]
 fn simple_service_authorization_evaluates_the_full_policy() {
     let (mut c, r, s) = fixture(WalletRoute::PolicyWallet, true);
     let recipient = account_for_seed(&[6; 32]);
@@ -2764,6 +2827,7 @@ fn simple_service_authorization_evaluates_the_full_policy() {
         spent_total: 0,
         spent_day: 1,
         calls: 0,
+        ..Default::default()
     };
     assert!(
         authorize_server(&prepared, &[3; 32], 86401, None)

@@ -107,7 +107,8 @@ pub struct Installed {
     pub revision: u64,
 }
 /// Read the installed revision and check that the wallet still holds this installation: its
-/// code, source, rules, roles, asset and params. The read is the
+/// code, source, rules, roles, asset, gas cap and params. An update writes the installation's
+/// gas cap, so a cap that the owner changed on the ledger is not overwritten. The read is the
 /// wallet instance alone, so an update needs no account of the agent or the server.
 /// A wallet at another revision than the expected one is refused.
 pub fn installed(rpc: &dyn rpc::Rpc, c: &WalletConfig, update: &ParamsUpdate) -> Result<Installed> {
@@ -132,10 +133,11 @@ pub fn installed(rpc: &dyn rpc::Rpc, c: &WalletConfig, update: &ParamsUpdate) ->
         || state.agent != c.agent
         || state.server != c.server
         || state.asset != c.asset
+        || state.gas_cap != i128::from(c.max_fee_stroops)
         || state.params != native::installed_params(c)
     {
         return Err(Error::config(
-            "The wallet's code, roles or params differ from this installation. Verify the installation first.",
+            "The wallet's code, roles, gas cap or params differ from this installation. Verify the installation first.",
         ));
     }
     let revision = u64::from(state.deployment_version);
@@ -305,6 +307,11 @@ pub fn verify(rpc: &dyn rpc::Rpc, policy_id: &str, c: &WalletConfig) -> Result<V
         Comparison::new("agent", json!(c.agent), json!(state.agent)),
         Comparison::new("server", json!(c.server), json!(state.server)),
         Comparison::new("asset", json!(c.asset), json!(state.asset)),
+        Comparison::new(
+            "gasCap",
+            json!(c.max_fee_stroops.to_string()),
+            json!(state.gas_cap.to_string()),
+        ),
     ];
     let ledger = u32::try_from(observed_height)
         .map_err(|_| Error::config("The RPC reported an invalid ledger height"))?;
