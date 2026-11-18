@@ -147,6 +147,20 @@ impl Runtime {
         envelope_xdr: &str,
         poll: Poll,
     ) -> native::Result<rpc::VerifiedReceipt> {
+        self.send_and_poll_while(network, envelope_xdr, poll, &|| Ok(true))?
+            .ok_or_else(|| "A needed transaction was not sent".into())
+    }
+    /// As `send_and_poll`, for a transaction that another one can make needless before it is
+    /// accepted. A send that the network does not accept yet is repeated only while `needed`
+    /// answers true; otherwise nothing was sent, and the answer is `None`. Once a send is
+    /// accepted, or its outcome is uncertain, only its hash is looked up.
+    pub fn send_and_poll_while(
+        &self,
+        network: &str,
+        envelope_xdr: &str,
+        poll: Poll,
+        needed: &dyn Fn() -> native::Result<bool>,
+    ) -> native::Result<Option<rpc::VerifiedReceipt>> {
         let hash = rpc::signed_transaction_hash(network, envelope_xdr)?;
         let id = native::hex(&hash);
         let unknown = |reason: String| {
@@ -159,6 +173,10 @@ impl Runtime {
             if attempt > 0 {
                 std::thread::sleep(poll.interval);
             }
+            // The last send was not accepted: it is repeated only while it is needed.
+            if !sent && attempt > 0 && !needed()? {
+                return Ok(None);
+            }
             if !sent {
                 match rpc::send_transaction(self.rpc(), network, envelope_xdr)? {
                     rpc::Broadcast::Submitted => sent = true,
@@ -170,7 +188,7 @@ impl Runtime {
                         if let Some(receipt) =
                             rpc::receipt_by_hash(self.rpc(), network, &hash).map_err(unknown)?
                         {
-                            return Ok(receipt);
+                            return Ok(Some(receipt));
                         }
                         return Err(format!(
                             "Stellar rejected transaction {id}: {}",
@@ -182,7 +200,7 @@ impl Runtime {
             if let Some(receipt) =
                 rpc::receipt_by_hash(self.rpc(), network, &hash).map_err(unknown)?
             {
-                return Ok(receipt);
+                return Ok(Some(receipt));
             }
         }
         Err(format!(

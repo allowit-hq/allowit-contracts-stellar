@@ -520,26 +520,37 @@ impl Provider {
             Ok(None) => return Ok(None),
             Err(refused) => return unless_live(refused),
         };
-        if checked(rpc::code_state(self.rpc(), &c.network, &code_hash))? == rpc::CodeState::Live {
-            return Ok(None);
-        }
-        let signature = match sending_signature(sender, &account, &p.transaction_hash) {
-            Ok(signature) => signature,
+        // A negative read that decides a paid transaction is dated at the closing head.
+        match checked(rpc::current_code_state(self.rpc(), &c.network, &code_hash)) {
+            Ok(rpc::CodeState::Live) => return Ok(None),
+            Ok(_) => {}
             Err(refused) => return unless_live(refused),
-        };
-        let signed = checked(native::admin::with_source_signature(
-            &c.network,
-            &p.transaction_xdr,
-            &signature,
-        ))?;
-        let receipt = checked(self.runtime.send_and_poll(
+        }
+        let signed =
+            match sending_signature(sender, &account, &p.transaction_hash).and_then(|signature| {
+                checked(native::admin::with_source_signature(
+                    &c.network,
+                    &p.transaction_xdr,
+                    &signature,
+                ))
+            }) {
+                Ok(signed) => signed,
+                Err(refused) => return unless_live(refused),
+            };
+        // A send that the network does not accept yet is repeated only while the code is not
+        // live: another transaction can restore or upload it meanwhile.
+        let Some(receipt) = checked(self.runtime.send_and_poll_while(
             &c.network,
             &signed,
             crate::provider::runtime::Poll {
                 attempts: poll.attempts,
                 interval: poll.interval,
             },
-        ))?;
+            &|| Ok(rpc::code_state(self.rpc(), &c.network, &code_hash)? != rpc::CodeState::Live),
+        ))?
+        else {
+            return Ok(None);
+        };
         checked(rpc::validate_receipt(
             &receipt,
             &c.network,

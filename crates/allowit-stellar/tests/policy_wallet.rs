@@ -348,6 +348,13 @@ struct Model {
     /// The upload of `uploaded_meanwhile` came from the upload's own source, whose sequence it
     /// advanced.
     uploaded_by_source: bool,
+    /// The next submission is not accepted (`TRY_AGAIN_LATER`) while another account restores
+    /// this code.
+    retry_later_restores: Option<[u8; 32]>,
+    /// The next reads of code entries come from a node that trails: it serves the code as
+    /// lapsed at the head before another account's restoration, and the head then closes one
+    /// more ledger.
+    stale_code_reads: u32,
     tiers: BTreeMap<[u8; 32], PolicyTier>,
     wallet: Option<Wallet>,
     settled: BTreeMap<String, String>,
@@ -584,6 +591,23 @@ impl rpc::Rpc for ModelChain {
                 let key: x::LedgerKey = de(encoded);
                 if m.failing_code_reads && matches!(key, x::LedgerKey::ContractCode(_)) {
                     return Err("The RPC is unreachable".into());
+                }
+                if m.stale_code_reads > 0
+                    && let x::LedgerKey::ContractCode(code) = &key
+                    && let Some(bytes) = m.code_bytes.get(&code.hash.0).cloned()
+                {
+                    m.stale_code_reads -= 1;
+                    let observed = m.ledger;
+                    m.ledger += 1;
+                    let entry = x::LedgerEntryData::ContractCode(x::ContractCodeEntry {
+                        ext: x::ContractCodeEntryExt::V0,
+                        hash: code.hash.clone(),
+                        code: bytes.try_into().unwrap(),
+                    });
+                    return Ok(json!({
+                        "latestLedger": observed,
+                        "entries": [{"key": encoded, "xdr": b64(&entry), "liveUntilLedgerSeq": 0}],
+                    }));
                 }
                 let entry = match &key {
                     x::LedgerKey::Account(a) => {
@@ -957,6 +981,10 @@ impl rpc::Rpc for ModelChain {
                 let tx_hash = hexs(&digest);
                 if m.settled.contains_key(&tx_hash) {
                     return Ok(json!({"hash": tx_hash, "status": "DUPLICATE"}));
+                }
+                if let Some(code) = m.retry_later_restores.take() {
+                    m.lapsed_code.remove(&code);
+                    return Ok(json!({"hash": tx_hash, "status": "TRY_AGAIN_LATER"}));
                 }
                 // The source signs alone.
                 let source = source_of(&env.tx);
@@ -3289,6 +3317,18 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
             panic!("a leased account signs nothing")
         }
     }
+    // A sending account whose signer gives a signature that does not verify while another
+    // account restores the code.
+    struct Garbled(Arc<ModelChain>, [u8; 32]);
+    impl SendingAccounts for Garbled {
+        fn account(&self) -> allowit_core::client::error::Result<String> {
+            Ok(sender())
+        }
+        fn sign(&self, _: &str, _: &[u8; 32]) -> allowit_core::client::error::Result<Vec<u8>> {
+            self.0.0.lock().unwrap().lapsed_code.remove(&self.1);
+            Ok(vec![0; 64])
+        }
+    }
     // A sending account whose signer refuses while another account restores the code.
     struct Refusing(Arc<ModelChain>, [u8; 32]);
     impl SendingAccounts for Refusing {
@@ -4002,6 +4042,60 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
             .is_none()
     );
     assert!(!chain.0.lock().unwrap().lapsed_code.contains(&installed));
+    // The signature does not verify while another account restores the code: nothing is needed.
+    chain.0.lock().unwrap().lapsed_code.insert(installed);
+    assert!(
+        allowit_stellar::PLUGIN
+            .sending_runtime(
+                NETWORK,
+                Arc::new(Wire(chain.clone())),
+                Arc::new(Garbled(chain.clone(), installed)),
+            )
+            .unwrap()
+            .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+            .unwrap()
+            .is_none()
+    );
+    // A node that trails serves the code as lapsed after another account restored it: a
+    // negative read that trails the closing head does not decide a paid transaction, and the
+    // code is read again.
+    let signed = signatures();
+    {
+        let mut m = chain.0.lock().unwrap();
+        m.lapsed_code.insert(installed);
+        m.restored_after_simulation = true;
+        m.stale_code_reads = 2;
+    }
+    assert!(
+        provider
+            .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(signatures(), signed);
+    assert_eq!(chain.0.lock().unwrap().stale_code_reads, 0);
+    // The network does not accept the restoration yet, and another account restores the code
+    // meanwhile: the restoration is not sent again.
+    {
+        let mut m = chain.0.lock().unwrap();
+        m.lapsed_code.insert(installed);
+        m.retry_later_restores = Some(installed);
+    }
+    let quick = Poll {
+        attempts: 3,
+        interval: std::time::Duration::ZERO,
+    };
+    assert!(
+        provider
+            .restore_code_within(&installation, ceiling, quick, NOW)
+            .unwrap()
+            .is_none()
+    );
+    {
+        let m = chain.0.lock().unwrap();
+        assert!(m.retry_later_restores.is_none());
+        assert!(!m.lapsed_code.contains(&installed));
+    }
     // Code that the network does not have cannot be restored: it needs an upload.
     chain.0.lock().unwrap().code_bytes.remove(&installed);
     let signed = signatures();

@@ -25,15 +25,35 @@ pub enum CodeState {
 }
 /// Whether an exact code entry is live, lapsed or absent.
 pub fn code_state(rpc: &dyn Rpc, network: &str, code: &[u8; 32]) -> Result<CodeState> {
+    code_observation(rpc, network, code).map(|(state, _)| state)
+}
+/// As `code_state`, for a decision to pay for a transaction that only code that is not live
+/// needs. An RPC node can serve an entry some ledgers behind the closing head, which can miss a
+/// transaction that made the code live meanwhile. A negative answer must be dated at the closing
+/// head: a read that trails it is taken once more, and a second one that trails is refused.
+pub fn current_code_state(rpc: &dyn Rpc, network: &str, code: &[u8; 32]) -> Result<CodeState> {
+    for _ in 0..2 {
+        match code_observation(rpc, network, code)? {
+            (CodeState::Live, _) => return Ok(CodeState::Live),
+            (state, true) => return Ok(state),
+            (_, false) => {}
+        }
+    }
+    Err("The observation of the wallet code trails the network's head".into())
+}
+/// The state of an exact code entry and whether its observation is dated at the closing head.
+fn code_observation(rpc: &dyn Rpc, network: &str, code: &[u8; 32]) -> Result<(CodeState, bool)> {
     if *code == [0; 32] {
         return Err("Missing executable identity".into());
     }
     let key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: Hash(*code) });
-    Ok(match observed_entry(rpc, network, &key)? {
-        (None, _) => CodeState::Absent,
-        (Some(until), closing) if until >= closing => CodeState::Live,
-        (Some(_), _) => CodeState::Lapsed,
-    })
+    let (live_until, observed, closing) = dated_entry(rpc, network, &key)?;
+    let state = match live_until {
+        None => CodeState::Absent,
+        Some(until) if until >= closing => CodeState::Live,
+        Some(_) => CodeState::Lapsed,
+    };
+    Ok((state, observed == closing))
 }
 /// Whether a native C-address currently has a live Wasm instance. This grants no trust in its config.
 pub fn contract_exists(rpc: &dyn Rpc, network: &str, contract: &str) -> Result<bool> {
@@ -59,6 +79,11 @@ fn live_entry(rpc: &dyn Rpc, network: &str, key: LedgerKey) -> Result<bool> {
 /// entry, and the closing head of the observation. An archived entry that the RPC serves without
 /// a live-until ledger reads as 0.
 fn observed_entry(rpc: &dyn Rpc, network: &str, key: &LedgerKey) -> Result<(Option<u32>, u32)> {
+    dated_entry(rpc, network, key).map(|(live_until, _, closing)| (live_until, closing))
+}
+/// As `observed_entry`, with the ledger that dates the entry between the live-until ledger and
+/// the closing head.
+fn dated_entry(rpc: &dyn Rpc, network: &str, key: &LedgerKey) -> Result<(Option<u32>, u32, u32)> {
     owner_observation::network(rpc, network)?;
     let before = owner_observation::head(rpc)?;
     let value = rpc.call("getLedgerEntries", json!({"keys":[xdr(key)?]}))?;
@@ -111,6 +136,7 @@ fn observed_entry(rpc: &dyn Rpc, network: &str, key: &LedgerKey) -> Result<(Opti
     };
     Ok((
         live_until,
+        observed,
         owner_observation::current(rpc, before, observed)?,
     ))
 }
