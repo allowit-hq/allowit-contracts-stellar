@@ -64,7 +64,16 @@ impl OwnerReceipt {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 enum Work {
-    Deploy,
+    /// One owner transaction that creates the wallet and funds it: `units` of the installed
+    /// asset and `fee_asset_units` of XLM. The server uploads the code before.
+    Deploy {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        amount: Option<String>,
+        units: i128,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fee_asset_amount: Option<String>,
+        fee_asset_units: i128,
+    },
     Fund {
         amount: String,
         units: i128,
@@ -383,13 +392,18 @@ fn network(rpc: &dyn rpc::Rpc, selected: &str) -> Result<()> {
 fn expected(record: &Record, step: &RetainedStep) -> Result<ExpectedOwnerIntent> {
     let c = &record.selection.config;
     let action = match (&record.work, step.packet.action.as_str()) {
-        (Work::Deploy, "upload_wasm") => OwnerAction::UploadWasm {
-            wasm_hash: c.module_digest,
-        },
-        (Work::Deploy, "create_wallet") => OwnerAction::CreateWallet {
+        // The owner signs no upload: the server uploads the code with its own account.
+        (
+            Work::Deploy {
+                units,
+                fee_asset_units,
+                ..
+            },
+            "create_wallet",
+        ) => OwnerAction::CreateWallet {
             config: Box::new(c.clone()),
             salt: wallet_salt(&c.policy_instance),
-            funding: Vec::new(),
+            funding: checked(native::admin::creation_funding(c, *units, *fee_asset_units))?,
         },
         (Work::Fund { units, .. }, "fund") if c.route == WalletRoute::Native => {
             OwnerAction::Wallet {
@@ -485,21 +499,39 @@ fn verify_retained(record: &Record, step: &RetainedStep) -> Result<()> {
     Ok(())
 }
 impl OwnerClient {
-    /// Execute the next upload/create steps, retaining every packet and signature before submission.
+    /// Create and fund the wallet with one owner signature, retaining the packet and the
+    /// signature before submission. `amount` is the installed asset and `fee_asset_amount` the
+    /// XLM from which the wallet repays network fees, as decimal text.
     pub fn deploy(
         &self,
         capabilities: OwnerCapabilities<'_>,
         selection: &OwnerPolicy,
         request_id: &str,
+        amount: Option<&str>,
+        fee_asset_amount: Option<&str>,
         max_fee_stroops: u32,
     ) -> Result<Outcome> {
-        self.run_owner(
-            capabilities,
-            selection,
-            request_id,
-            Work::Deploy,
-            max_fee_stroops,
-        )
+        let units = |amount: Option<&str>| amount.map_or(Ok(0), amount_units);
+        let work = Work::Deploy {
+            amount: amount.map(str::to_owned),
+            units: units(amount)?,
+            fee_asset_amount: fee_asset_amount.map(str::to_owned),
+            fee_asset_units: units(fee_asset_amount)?,
+        };
+        // The funding is checked against the installation before the server is asked.
+        if let Work::Deploy {
+            units,
+            fee_asset_units,
+            ..
+        } = &work
+        {
+            checked(native::admin::creation_funding(
+                &selection.config,
+                *units,
+                *fee_asset_units,
+            ))?;
+        }
+        self.run_owner(capabilities, selection, request_id, work, max_fee_stroops)
     }
     pub fn fund(
         &self,
@@ -862,10 +894,21 @@ impl OwnerClient {
                     step: Option<Step>,
                 }
                 let (path, body) = match &record.work {
-                    Work::Deploy => (
-                        "/api/native/deploy/prepare",
-                        json!({"policyId":selection.policy.id,"agent":selection.config.agent}),
-                    ),
+                    Work::Deploy {
+                        amount,
+                        fee_asset_amount,
+                        ..
+                    } => {
+                        let mut body =
+                            json!({"policyId":selection.policy.id,"agent":selection.config.agent});
+                        if let Some(amount) = amount {
+                            body["amount"] = json!(amount);
+                        }
+                        if let Some(amount) = fee_asset_amount {
+                            body["feeAssetAmount"] = json!(amount);
+                        }
+                        ("/api/native/deploy/prepare", body)
+                    }
                     Work::Fund { amount, .. } => (
                         "/api/native/owner/prepare",
                         json!({"policyId":selection.policy.id,"action":"fund","amount":amount}),
@@ -893,7 +936,7 @@ impl OwnerClient {
                     return Err(Error::config("Owner preparation selected another policy"));
                 }
                 let Some(step) = response.step else {
-                    if !matches!(record.work, Work::Deploy) {
+                    if !matches!(record.work, Work::Deploy { .. }) {
                         return Err(Error::uncertain(
                             "Owner preparation omitted its transaction",
                         ));
@@ -982,7 +1025,7 @@ impl OwnerClient {
                         ));
                     }
                 }
-                if !matches!(record.work, Work::Deploy) {
+                if !matches!(record.work, Work::Deploy { .. }) {
                     self.verify_binding(selection, rpc)?;
                 }
                 let now = clock()?;
@@ -1005,7 +1048,7 @@ impl OwnerClient {
                 store.save(id, &record)?;
             }
             verify_retained(&record, &record.steps[index])?;
-            if !matches!(record.work, Work::Deploy) && !record.steps[index].submitted {
+            if !matches!(record.work, Work::Deploy { .. }) && !record.steps[index].submitted {
                 self.verify_binding(selection, rpc)?;
             }
             let hash = checked(native::unhex(&record.steps[index].packet.transaction_hash))?;
@@ -1116,7 +1159,7 @@ impl OwnerClient {
                 "Owner flow retains an unfinished step; resume the same request ID",
             ));
         }
-        if matches!(record.work, Work::Deploy) {
+        if matches!(record.work, Work::Deploy { .. }) {
             self.verify_binding(selection, rpc)?;
         }
         // The wallet now holds the updated params: the outcome selects that installation.
@@ -1131,7 +1174,7 @@ impl OwnerClient {
         Ok(Outcome {
             request_id: id.into(),
             state: match record.work {
-                Work::Deploy => "installed",
+                Work::Deploy { .. } => "installed",
                 Work::Fund { .. } => "funded",
                 Work::UpdateParams { .. } => "updated",
             }

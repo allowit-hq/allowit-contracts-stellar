@@ -5,7 +5,6 @@ export declare const ELEMENTS: Readonly<{
     readonly amount: "allowit-stellar-amount";
     readonly 'wallet-sign-in': "allowit-stellar-wallet-sign-in";
     readonly 'owner-sign': "allowit-stellar-owner-sign";
-    readonly 'build-attest': "allowit-stellar-build-attest";
     readonly 'owner-answer': "allowit-stellar-owner-answer";
     readonly receipt: "allowit-stellar-receipt";
     readonly 'binding-review': "allowit-stellar-binding-review";

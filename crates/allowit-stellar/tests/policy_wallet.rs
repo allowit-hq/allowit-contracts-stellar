@@ -2482,3 +2482,40 @@ fn recovery_finds_a_policy_wallet_execution_by_its_event() {
             .is_empty()
     );
 }
+#[test]
+fn a_creation_funds_the_asset_and_the_gas_and_recovery_returns_both() {
+    let mut c = installation(PolicyTier::Common, [1; 32], [2; 32]);
+    let xlm = xlm();
+    // An XLM wallet takes one amount: its gas is its asset.
+    assert_eq!(
+        admin::creation_funding(&c, 5, 0).unwrap(),
+        vec![(xlm.clone(), 5)]
+    );
+    assert!(
+        admin::creation_funding(&c, 5, 7)
+            .unwrap_err()
+            .contains("XLM")
+    );
+    // A wallet of another asset also takes the XLM from which it repays network fees.
+    c.asset = Contract([77; 32]).to_string();
+    assert_eq!(
+        admin::creation_funding(&c, 5, 7).unwrap(),
+        vec![(c.asset.clone(), 5), (xlm.clone(), 7)]
+    );
+    assert_eq!(
+        admin::creation_funding(&c, 0, 7).unwrap(),
+        vec![(xlm.clone(), 7)]
+    );
+    assert!(admin::creation_funding(&c, -1, 0).is_err());
+    // A recovery of everything returns the asset, then the XLM, then nothing.
+    assert_eq!(
+        admin::next_recovery(&c.asset, &xlm, 3, 9),
+        Some(c.asset.as_str())
+    );
+    assert_eq!(
+        admin::next_recovery(&c.asset, &xlm, 0, 9),
+        Some(xlm.as_str())
+    );
+    assert_eq!(admin::next_recovery(&c.asset, &xlm, 0, 0), None);
+    assert_eq!(admin::next_recovery(&xlm, &xlm, 0, 0), None);
+}

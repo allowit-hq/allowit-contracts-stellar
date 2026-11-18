@@ -453,7 +453,7 @@ impl Provider {
                     recipient: Some(recipient),
                 }
             }
-            OwnerAction::Upload { .. } | OwnerAction::Create { .. } | OwnerAction::Extend => {
+            OwnerAction::Create { .. } | OwnerAction::Extend => {
                 return Err(Error::unsupported(
                     "A keypair wallet has no code: its owner creates it with the wallet setup",
                 ));
@@ -1247,24 +1247,18 @@ impl crate::host::vendors::RuntimeProvider for Provider {
             max_fee_stroops: fee(fee_limit)?,
         };
         let p = match a {
-            OwnerAction::Upload { wasm } => {
-                let p = checked(d.upload_wasm(&c.owner, &wasm))?;
-                native::owner_intent::OwnerTransaction {
-                    network: p.network,
-                    action: p.function,
-                    transaction_xdr: p.transaction_xdr,
-                    transaction_hash: p.transaction_hash,
-                    expires_at: p.expires_at,
-                }
-            }
-            OwnerAction::Create { wasm } => {
+            OwnerAction::Create {
+                wasm,
+                units,
+                fee_asset_units,
+            } => {
                 let config = checked(native::admin::PolicyConfig::for_policy(&c))?;
                 let p = checked(d.deploy_and_fund(
                     &checked(native::admin::deployer_address(&c.network))?,
                     &config,
                     &wasm,
                     native::admin::wallet_salt(&c.policy_instance),
-                    &[],
+                    &checked(native::admin::creation_funding(&c, units, fee_asset_units))?,
                 ))?;
                 native::owner_intent::OwnerTransaction {
                     network: p.network,
@@ -1291,14 +1285,15 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 )?
             }
             OwnerAction::Recover { units, recipient } => {
-                use allowit_core::admin::RecoverFunds;
                 let mut admin = native::admin::OwnerAdmin {
                     rpc: self.rpc(),
                     config: &c,
                     now,
                 };
                 let prepared = match (units, recipient) {
-                    (None, None) => checked(admin.recover_funds(&c.asset))?,
+                    // Everything returns, one balance per call: the asset, then the XLM that a
+                    // wallet of another asset holds for its gas.
+                    (None, None) => checked(admin.recover_all())?,
                     (Some(units), recipient) => {
                         checked(admin.recover_to(recipient.as_deref().unwrap_or(&c.owner), units))?
                     }
@@ -1390,6 +1385,58 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 signed_payload: signed_payload.into(),
             },
         )?))
+    }
+    fn upload_code(
+        &self,
+        i: &Installation,
+        wasm: &[u8],
+        poll: Poll,
+        now: u64,
+    ) -> Result<Option<Receipt>> {
+        let c = self.config(i)?;
+        if c.route != WalletRoute::PolicyWallet {
+            return Err(Error::unsupported(
+                "A keypair wallet has no code: its owner creates it with the wallet setup",
+            ));
+        }
+        let code_hash = checked(native::admin::check_wallet_code(wasm))?;
+        if checked(rpc::code_uploaded(self.rpc(), &c.network, &code_hash))? {
+            return Ok(None);
+        }
+        let sender = self.sender.as_ref().ok_or_else(|| {
+            Error::config("This server has no sending account to upload wallet code")
+        })?;
+        let account = checked(sender.account())?;
+        // The server pays the upload, a cost that the ledger consumes; the simulation sets it.
+        let p = checked(
+            native::admin::Deployer {
+                rpc: self.rpc(),
+                network: &c.network,
+                now,
+                max_fee_stroops: u32::MAX,
+            }
+            .upload_wasm(&account, wasm),
+        )?;
+        let signature = checked(sender.sign(&account, &p.transaction_hash))?;
+        let signed = checked(native::admin::with_source_signature(
+            &c.network,
+            &p.transaction_xdr,
+            &signature,
+        ))?;
+        let receipt = checked(self.runtime.send_and_poll(
+            &c.network,
+            &signed,
+            crate::provider::runtime::Poll {
+                attempts: poll.attempts,
+                interval: poll.interval,
+            },
+        ))?;
+        checked(rpc::validate_receipt(
+            &receipt,
+            &c.network,
+            &p.transaction_hash,
+        ))?;
+        Ok(Some(Receipt(packet(&c.network, &receipt)?)))
     }
     fn submit_owner<'a>(
         &self,
@@ -2614,8 +2661,11 @@ mod keypair_wallet_owner_tests {
         // A wallet that is not paused takes no resume, and a keypair wallet has no code.
         assert!(prepare(OwnerAction::SetPause { paused: false }).is_err());
         for action in [
-            OwnerAction::Upload { wasm: vec![] },
-            OwnerAction::Create { wasm: vec![] },
+            OwnerAction::Create {
+                wasm: vec![],
+                units: 1,
+                fee_asset_units: 0,
+            },
             OwnerAction::Extend,
         ] {
             assert!(prepare(action).is_err());

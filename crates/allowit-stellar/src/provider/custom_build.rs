@@ -1,15 +1,12 @@
 //! The "build custom wallet" hook: build the `AllowitCustomPolicy` Wasm from the exact policy
-//! source with the Stellar CLI and the Rust toolchain, hash wallet code, and sign and verify the
-//! build statements as SEP-53 wallet messages.
+//! source with the Stellar CLI and the Rust toolchain, and hash wallet code. The server builds
+//! and uploads the code; an owner's client that builds the same source gets the same hash.
 //!
 //! The build tree is the contract workspace of this release, embedded in the crate, with the
 //! policy source in place of `contracts/allowit-custom-policy/policy/policy.rs`. It compiles the
 //! same files as `scripts/build-custom-policy.sh` does from a checkout of this revision, so the
 //! same source, toolchain and Stellar CLI give the same Wasm.
-use crate::host::{
-    Signer,
-    error::{Error, Result},
-};
+use crate::host::error::{Error, Result};
 use allowit_core::vendor::custom_build::{CustomWalletBuild, WalletCode, code, refusal};
 use std::{
     path::{Path, PathBuf},
@@ -237,189 +234,29 @@ impl CustomWalletBuild for CustomBuild {
         crate::host::routing::normalize(network)?;
         crate::admin::check_wallet_code(code).map_err(Error::usage)
     }
-    /// A SEP-53 message signature: the one that a browser wallet makes with `signMessage`.
-    fn sign_message(&self, signer: &dyn Signer, message: &str) -> Result<Vec<u8>> {
-        signer.sign_hash(&crate::signing::signed_message_digest(message))
-    }
-    fn verify_message(
-        &self,
-        network: &str,
-        address: &str,
-        message: &str,
-        signature: &[u8],
-    ) -> Result<()> {
-        crate::host::routing::normalize(network)?;
-        crate::signing::verify_digest(
-            address,
-            &crate::signing::signed_message_digest(message),
-            signature,
-        )
-        .map_err(|_| Error::usage("The message signature is invalid"))
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use allowit_core::vendor::custom_build::{
-        Admitted, attest, check_code_hash, presign, verify_attestation, verify_presignature,
-    };
+    use allowit_core::vendor::custom_build::check_code_hash;
 
     const NETWORK: &str = "stellar:testnet";
     const SOURCE: &str =
         include_str!("../../../../contracts/allowit-custom-policy/policy/policy.rs");
 
-    struct Key(crate::signing::LocalSigner);
-    fn key(seed: u8) -> Key {
-        Key(crate::signing::LocalSigner::from_entropy(&[seed; 32]).unwrap())
-    }
-    impl Signer for Key {
-        fn network(&self) -> &str {
-            NETWORK
-        }
-        fn address(&self) -> &str {
-            self.0.account()
-        }
-        fn sign_hash(&self, digest: &[u8]) -> Result<Vec<u8>> {
-            self.0.sign_digest(digest).map_err(Error::config)
-        }
-    }
     fn refused(error: Error) -> String {
         error.api_code.unwrap_or_default()
     }
 
     #[test]
-    fn the_statements_are_wallet_message_signatures() {
-        let (server, owner) = (key(1), key(2));
-        let presignature = presign(&CUSTOM_BUILD, &server, NETWORK, "policy-1", SOURCE).unwrap();
-        let admitted = Admitted {
-            network: NETWORK,
-            policy_id: "policy-1",
-            source: SOURCE,
-            server: server.address(),
-        };
-        verify_presignature(&CUSTOM_BUILD, &presignature, &admitted).unwrap();
-        // The signature is the SEP-53 signature of the message text, as a wallet makes it.
-        let message = presignature.message().unwrap();
-        let wallet = server
-            .0
-            .sign_digest(&crate::signing::signed_message_digest(&message))
-            .unwrap();
-        assert_eq!(crate::hex(&wallet), presignature.signature);
-        let attestation = attest(&CUSTOM_BUILD, &owner, &presignature, &[9; 32]).unwrap();
-        verify_attestation(&CUSTOM_BUILD, &attestation, &admitted, owner.address()).unwrap();
-        check_code_hash(&attestation, &[9; 32]).unwrap();
+    fn code_other_than_the_clients_build_is_refused() {
+        let code = fixture_wallet_code();
+        let built = CUSTOM_BUILD.code_hash(NETWORK, &code).unwrap();
+        check_code_hash(&built, &crate::hash(&code)).unwrap();
         assert_eq!(
-            refused(check_code_hash(&attestation, &[8; 32]).unwrap_err()),
+            refused(check_code_hash(&built, &[8; 32]).unwrap_err()),
             code::CODE_HASH_MISMATCH
-        );
-    }
-
-    #[test]
-    fn a_presignature_is_bound_to_its_network_policy_source_and_server_key() {
-        let server = key(1);
-        let presignature = presign(&CUSTOM_BUILD, &server, NETWORK, "policy-1", SOURCE).unwrap();
-        let admitted = Admitted {
-            network: NETWORK,
-            policy_id: "policy-1",
-            source: SOURCE,
-            server: server.address(),
-        };
-        let altered = format!("{SOURCE}// altered\n");
-        let untrusted = key(3);
-        for other in [
-            Admitted {
-                network: "stellar:pubnet",
-                ..admitted
-            },
-            Admitted {
-                policy_id: "policy-2",
-                ..admitted
-            },
-            Admitted {
-                source: &altered,
-                ..admitted
-            },
-            Admitted {
-                server: untrusted.address(),
-                ..admitted
-            },
-        ] {
-            let error = verify_presignature(&CUSTOM_BUILD, &presignature, &other).unwrap_err();
-            assert_eq!(refused(error), code::PRESIGNATURE_MISMATCH);
-        }
-        // A statement relabelled for Mainnet keeps a signature that covers Testnet.
-        let mut replayed = presignature.clone();
-        replayed.network = "stellar:pubnet".into();
-        let mainnet = Admitted {
-            network: "stellar:pubnet",
-            ..admitted
-        };
-        let error = verify_presignature(&CUSTOM_BUILD, &replayed, &mainnet).unwrap_err();
-        assert_eq!(refused(error), code::PRESIGNATURE_MISMATCH);
-        // A presignature that an untrusted key signed under the trusted key's name.
-        let mut forged = presign(&CUSTOM_BUILD, &untrusted, NETWORK, "policy-1", SOURCE).unwrap();
-        forged.server = server.address().into();
-        let error = verify_presignature(&CUSTOM_BUILD, &forged, &admitted).unwrap_err();
-        assert_eq!(refused(error), code::PRESIGNATURE_MISMATCH);
-    }
-
-    #[test]
-    fn an_attestation_needs_the_owner_signature_over_the_code_hash() {
-        let (server, owner, stranger) = (key(1), key(2), key(3));
-        let presignature = presign(&CUSTOM_BUILD, &server, NETWORK, "policy-1", SOURCE).unwrap();
-        let admitted = Admitted {
-            network: NETWORK,
-            policy_id: "policy-1",
-            source: SOURCE,
-            server: server.address(),
-        };
-        let by_stranger = attest(&CUSTOM_BUILD, &stranger, &presignature, &[9; 32]).unwrap();
-        let error = verify_attestation(&CUSTOM_BUILD, &by_stranger, &admitted, owner.address())
-            .unwrap_err();
-        assert_eq!(refused(error), code::ATTESTATION_INVALID);
-        let mut changed = attest(&CUSTOM_BUILD, &owner, &presignature, &[9; 32]).unwrap();
-        changed.code_hash = crate::hex(&[8; 32]);
-        let error =
-            verify_attestation(&CUSTOM_BUILD, &changed, &admitted, owner.address()).unwrap_err();
-        assert_eq!(refused(error), code::ATTESTATION_INVALID);
-    }
-
-    #[test]
-    fn a_sign_in_signature_is_not_a_build_statement() {
-        // The same key signs a sign-in message. That signature covers another text.
-        let server = key(1);
-        let presignature = presign(&CUSTOM_BUILD, &server, NETWORK, "policy-1", SOURCE).unwrap();
-        let sign_in = server
-            .0
-            .sign_digest(&crate::signing::signed_message_digest(
-                "example.org wants you to sign in",
-            ))
-            .unwrap();
-        assert!(
-            CUSTOM_BUILD
-                .verify_message(
-                    NETWORK,
-                    server.address(),
-                    &presignature.message().unwrap(),
-                    &sign_in
-                )
-                .is_err()
-        );
-        // A raw signature of the message bytes, without the SEP-53 prefix, is refused too.
-        let raw = server
-            .0
-            .sign_digest(&crate::hash(presignature.message().unwrap().as_bytes()))
-            .unwrap();
-        assert!(
-            CUSTOM_BUILD
-                .verify_message(
-                    NETWORK,
-                    server.address(),
-                    &presignature.message().unwrap(),
-                    &raw
-                )
-                .is_err()
         );
     }
 

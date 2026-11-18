@@ -8,7 +8,6 @@
 use crate::*;
 
 const MAX_OWNER_XDR: usize = 192 * 1024;
-const MAX_WASM: usize = 128 * 1024;
 const MAX_FOOTPRINT: usize = 256;
 
 /// Untrusted common fields of a server-prepared owner step. SDK clients parse the server's
@@ -54,7 +53,8 @@ pub fn validate_retained_owner_transaction(original: &OwnerTransaction) -> Resul
                 ..
             },
         ] => match &invoke.host_function {
-            HostFunction::UploadContractWasm(_) => original.action == "upload_wasm",
+            // The owner signs no code upload: the server uploads with its own account.
+            HostFunction::UploadContractWasm(_) => false,
             HostFunction::CreateContractV2(_) => original.action == "create_wallet",
             HostFunction::InvokeContract(call) => {
                 let function = call.function_name.0.as_slice();
@@ -193,9 +193,6 @@ pub struct OwnerLimits {
 /// The owner actions needed to establish, fund and renew native and policy-wallet custody.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OwnerAction {
-    /// The hash of the independently reviewed wallet executable. The packet must contain its
-    /// exact bytes and declare the supported custody layout.
-    UploadWasm { wasm_hash: [u8; 32] },
     /// The complete selected policy installation, constructor and deterministic wallet address.
     /// `config` includes the selected tier, source, params, roles, asset and executable hash.
     /// The creation goes through the network's deployer, which holds no authority: the owner's
@@ -256,7 +253,6 @@ pub enum OwnerAction {
 impl OwnerAction {
     fn name(&self) -> &'static str {
         match self {
-            Self::UploadWasm { .. } => "upload_wasm",
             Self::CreateWallet { .. } => "create_wallet",
             Self::Fund { .. } => "fund",
             Self::Extend { .. } => "extend",
@@ -568,18 +564,6 @@ fn validate_host(
     invoke: &InvokeHostFunctionOp,
 ) -> Result<()> {
     match action {
-        OwnerAction::UploadWasm { wasm_hash } => {
-            let HostFunction::UploadContractWasm(wasm) = &invoke.host_function else {
-                return Err("Expected the caller-selected Wasm upload".into());
-            };
-            if wasm.len() > MAX_WASM
-                || *wasm_hash == [0; 32]
-                || admin::check_wallet_code(wasm)? != *wasm_hash
-                || !invoke.auth.is_empty()
-            {
-                return Err("Owner upload differs from the reviewed executable".into());
-            }
-        }
         OwnerAction::CreateWallet {
             config,
             salt,
@@ -705,18 +689,17 @@ fn validate_host(
 }
 
 /// Validate every deployment metadata field as well as its complete transaction. This adapter
-/// accepts only upload/create intent, so unrelated prepared-operation metadata cannot be reused.
+/// accepts only creation intent, so unrelated prepared-operation metadata cannot be reused.
 pub fn validate_deployment(
     packet: &admin::PreparedDeployment,
     expected: &ExpectedOwnerIntent,
     now: u64,
 ) -> Result<ValidatedOwnerTransaction> {
     let (wasm, wallet) = match &expected.action {
-        OwnerAction::UploadWasm { wasm_hash } => (*wasm_hash, None),
         OwnerAction::CreateWallet { config, .. } => {
             (config.module_digest, Some(config.wallet.clone()))
         }
-        _ => return Err("Expected upload or wallet-creation intent".into()),
+        _ => return Err("Expected wallet-creation intent".into()),
     };
     if packet.source != expected.limits.owner
         || packet.wasm_hash != wasm

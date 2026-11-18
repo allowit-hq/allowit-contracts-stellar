@@ -232,7 +232,9 @@ export async function deployAdkOwnerDraft({
       const chain = await horizonRead<Chain>(`/transactions/${receipt.transactionHash}`);
       if (chain.hash !== receipt.transactionHash || chain.ledger !== receipt.ledger || chain.successful !== true)
         throw new Error('Stellar did not confirm the saved owner transaction.');
-      save({...journal, pending: undefined, ...(signed.step.action === 'create_wallet' ? {wallet: expectedWallet} : {}),
+      // The creation funds the wallet in the same transaction.
+      save({...journal, pending: undefined,
+        ...(signed.step.action === 'create_wallet' ? {wallet: expectedWallet, funded: signed} : {}),
         ...(signed.step.action === 'fund' ? {funded: signed} : {})});
       return true;
     };
@@ -247,8 +249,8 @@ export async function deployAdkOwnerDraft({
       const expected: AdkOwnerSelection = {
         owner, agent, server, policyInstance, code: proposal.code, sourceHash: proposal.sourceHash,
         params: proposal.params, wasmHash, wallet, asset, policyMaxFeeStroops: template.maxFeeUnits,
-        // Upload and creation use the deployment ceiling. Funding and renewal keep the installed policy ceiling.
-        maxFeeStroops: step.action === 'upload_wasm' || step.action === 'create_wallet' ? deploymentFee : template.maxFeeUnits,
+        // Creation uses the deployment ceiling. Funding and renewal keep the installed policy ceiling.
+        maxFeeStroops: step.action === 'create_wallet' ? deploymentFee : template.maxFeeUnits,
         amount, nextSequence: await sequence(owner), validUntil: now + 300,
       };
       ensureCurrent();
@@ -269,16 +271,17 @@ export async function deployAdkOwnerDraft({
 
     onStep('Preparing the Stellar wallet…');
     let installed: string | undefined;
-    // Upload, creation and a lifetime renewal each take one step before the installation reply.
+    // The creation, which funds the wallet, and a lifetime renewal each take one step before the installation
+    // reply. The server uploads the code itself.
     for (let index = 0; index < 4; index++) {
-      const reply = await ask<Reply>('native/deploy/prepare', {policyId, agent});
+      const reply = await ask<Reply>('native/deploy/prepare', {policyId, agent, amount});
       if (reply.policyId !== policyId) throw new Error('The deployment reply names a different policy.');
       if (reply.installed === true && reply.installation?.wallet === expectedWallet) {
         installed = expectedWallet;
         break;
       }
       if (!reply.step || reply.wallet !== expectedWallet
-        || !['upload_wasm', 'create_wallet', 'extend'].includes(reply.step.action))
+        || !['create_wallet', 'extend'].includes(reply.step.action))
         throw new Error('The Stellar service did not prepare this wallet for deployment.');
       // A renewal can be due while a funding result is unknown. Settle the funding first. Its submission can use
       // the sequence of this renewal, so prepare the renewal again.
@@ -302,7 +305,7 @@ export async function deployAdkOwnerDraft({
       await confirm(journal.pending);
     }
     if (journal.funded) {
-      if (journal.funded.step.action !== 'fund' || journal.funded.expected.wallet !== installed)
+      if (!['create_wallet', 'fund'].includes(journal.funded.step.action) || journal.funded.expected.wallet !== installed)
         throw new Error('The saved funding names a different wallet.');
       await verifySaved(journal.funded);
       const chain = await horizonRead<{hash: string; successful: boolean}>(`/transactions/${journal.funded.step.transactionHash}`);

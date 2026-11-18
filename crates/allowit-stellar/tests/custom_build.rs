@@ -3,29 +3,13 @@
 //!
 //!   cargo test --locked --manifest-path crates/allowit-stellar/Cargo.toml --test custom_build -- --ignored
 use allowit_core::vendor::{
-    custom_build::{attest, check_code_hash, code, presign},
+    custom_build::{check_code_hash, code},
     plugin::RailPlugin,
-    wallet::Signer,
 };
-use allowit_stellar::{plugin::PLUGIN, signing::LocalSigner};
+use allowit_stellar::plugin::PLUGIN;
 
 const NETWORK: &str = "stellar:testnet";
 const SOURCE: &str = include_str!("../../../contracts/allowit-custom-policy/policy/policy.rs");
-
-struct Key(LocalSigner);
-impl Signer for Key {
-    fn network(&self) -> &str {
-        NETWORK
-    }
-    fn address(&self) -> &str {
-        self.0.account()
-    }
-    fn sign_hash(&self, digest: &[u8]) -> allowit_core::client::error::Result<Vec<u8>> {
-        self.0
-            .sign_digest(digest)
-            .map_err(allowit_core::client::error::Error::config)
-    }
-}
 
 #[test]
 #[ignore = "runs the Stellar CLI and fetches crates"]
@@ -52,18 +36,15 @@ fn the_same_source_builds_the_same_code_and_altered_source_builds_other_code() {
             expected
         );
     }
-    // The owner attests the code of the admitted source. A build from altered source has
-    // another hash, so it is not the attested code.
-    let server = Key(LocalSigner::from_entropy(&[1; 32]).unwrap());
-    let owner = Key(LocalSigner::from_entropy(&[2; 32]).unwrap());
-    let presignature = presign(hook, &server, NETWORK, "policy-1", SOURCE).unwrap();
-    let attestation = attest(hook, &owner, &presignature, &first.code_hash).unwrap();
+    // The owner's client builds the admitted source itself. Code built from altered source has
+    // another hash, so the client refuses to sign a creation that names it.
     let altered = SOURCE.replace("pub fn execute", "/// Altered.\npub fn execute");
     assert_ne!(altered, SOURCE);
     let other = hook
         .build(NETWORK, &altered, &work.path().join("a"))
         .unwrap();
     assert_ne!(other.code_hash, first.code_hash);
-    let error = check_code_hash(&attestation, &other.code_hash).unwrap_err();
+    check_code_hash(&first.code_hash, &again.code_hash).unwrap();
+    let error = check_code_hash(&first.code_hash, &other.code_hash).unwrap_err();
     assert_eq!(error.api_code.as_deref(), Some(code::CODE_HASH_MISMATCH));
 }

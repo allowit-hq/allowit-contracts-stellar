@@ -40,6 +40,9 @@ struct Selection {
     max_fee_stroops: u32,
     policy_max_fee_stroops: u32,
     amount: String,
+    /// The XLM that a creation moves into a wallet of another asset for its network fees.
+    #[serde(default)]
+    fee_asset_amount: Option<String>,
     next_sequence: String,
     valid_until: u64,
     /// The params update that the owner reviewed. `params` then holds the complete new params.
@@ -171,12 +174,27 @@ fn verify(input: Input) -> Result<()> {
         return Err("The owner selection reviews a params update only".into());
     }
     let action = match step.action.as_str() {
-        "upload_wasm" => OwnerAction::UploadWasm { wasm_hash },
-        "create_wallet" => OwnerAction::CreateWallet {
-            config: Box::new(installation(&expected, &wallet)?),
-            salt,
-            funding: Vec::new(),
-        },
+        // The owner signs no code upload: the server uploads with its own account.
+        "create_wallet" => {
+            let config = installation(&expected, &wallet)?;
+            let units = |amount: &str| {
+                if amount.is_empty() {
+                    Ok(0)
+                } else {
+                    stroops(amount)
+                }
+            };
+            let funding = crate::admin::creation_funding(
+                &config,
+                units(&expected.amount)?,
+                units(expected.fee_asset_amount.as_deref().unwrap_or(""))?,
+            )?;
+            OwnerAction::CreateWallet {
+                config: Box::new(config),
+                salt,
+                funding,
+            }
+        }
         // The packet keeps the installed roles, source binding and code and holds the complete
         // new params at the revision that the host read.
         "update_params" if expected.wallet.is_some() && expected.update.is_some() => {

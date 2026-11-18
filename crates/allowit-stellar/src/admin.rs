@@ -818,6 +818,63 @@ impl RecoverFunds for OwnerAdmin<'_> {
         {
             return Err("A policy wallet recovers only its installed asset or XLM".into());
         }
+        let amount = self.balance_of(&s, token)?;
+        if amount <= 0 {
+            return Err(NO_RECOVERABLE_BALANCE.into());
+        }
+        let owner = s.owner.address.clone();
+        let version = s.deployment_version;
+        self.prepare(
+            s,
+            "recover",
+            vec![
+                ScVal::Address(address(token)?),
+                ScVal::Address(address(&owner)?),
+                i128_value(amount),
+            ],
+            version,
+            vec![owner],
+        )
+    }
+}
+/// The refusal of a recovery of a token that the wallet holds none of.
+pub const NO_RECOVERABLE_BALANCE: &str = "Selected token has no recoverable balance";
+/// The token that a recovery of everything returns next, one balance per call: the installed
+/// asset while the wallet holds some, then the XLM that a wallet of another asset holds for its
+/// gas. `None` when nothing is left.
+pub fn next_recovery<'a>(
+    asset: &'a str,
+    xlm: &'a str,
+    asset_balance: i128,
+    xlm_balance: i128,
+) -> Option<&'a str> {
+    if asset_balance > 0 {
+        Some(asset)
+    } else if asset != xlm && xlm_balance > 0 {
+        Some(xlm)
+    } else {
+        None
+    }
+}
+impl OwnerAdmin<'_> {
+    /// Return everything to the owner, one balance per call: see [`next_recovery`].
+    pub fn recover_all(&mut self) -> Result<PreparedOwnerOperation> {
+        let s = self.snapshot(Reach::Kept)?;
+        let asset = self.config.asset.clone();
+        let xlm = crate::sac_address(&self.config.network, &stellar_xdr::Asset::Native)?;
+        let asset_balance = self.balance_of(&s, &asset)?;
+        let xlm_balance = if asset == xlm {
+            asset_balance
+        } else {
+            self.balance_of(&s, &xlm)?
+        };
+        let token = next_recovery(&asset, &xlm, asset_balance, xlm_balance)
+            .ok_or(NO_RECOVERABLE_BALANCE)?
+            .to_owned();
+        self.recover_funds(&token)
+    }
+    /// The balance of `token` that the wallet holds, read through the owner's simulation.
+    fn balance_of(&self, s: &Snapshot, token: &str) -> Result<i128> {
         let tx = self.transaction(
             &s.owner,
             token,
@@ -835,27 +892,11 @@ impl RecoverFunds for OwnerAdmin<'_> {
         if values.len() != 1 {
             return Err("Unexpected token balance result count".into());
         }
-        let amount = rpc::wide(&read(
+        rpc::wide(&read(
             values[0]["xdr"]
                 .as_str()
                 .ok_or("Missing token balance XDR")?,
-        )?)?;
-        if amount <= 0 {
-            return Err("Selected token has no recoverable balance".into());
-        }
-        let owner = s.owner.address.clone();
-        let version = s.deployment_version;
-        self.prepare(
-            s,
-            "recover",
-            vec![
-                ScVal::Address(address(token)?),
-                ScVal::Address(address(&owner)?),
-                i128_value(amount),
-            ],
-            version,
-            vec![owner],
-        )
+        )?)
     }
 }
 
@@ -1497,6 +1538,52 @@ impl Deployer<'_> {
         }
         self.prepared(&account, "create_wallet", wasm_hash, Some(wallet), tx)
     }
+}
+/// The funding of a creation: `units` of the installed asset, then `fee_asset_units` of XLM, from
+/// which the wallet repays the network fee of its operations. A zero amount moves nothing. A
+/// wallet whose asset is XLM takes its funding as `units` alone.
+pub fn creation_funding(
+    c: &WalletConfig,
+    units: i128,
+    fee_asset_units: i128,
+) -> Result<Vec<(String, i128)>> {
+    if units < 0 || fee_asset_units < 0 {
+        return Err("A funding amount is positive or zero".into());
+    }
+    let xlm = sac_address(&c.network, &Asset::Native)?;
+    if c.asset == xlm && fee_asset_units != 0 {
+        return Err("The wallet's asset is XLM: fund it with the amount alone".into());
+    }
+    Ok([(c.asset.clone(), units), (xlm, fee_asset_units)]
+        .into_iter()
+        .filter(|(_, amount)| *amount > 0)
+        .collect())
+}
+/// The unsigned v1 transaction `transaction_xdr` with the source account's `signature` of its
+/// hash, after checking that signature.
+pub fn with_source_signature(
+    network: &str,
+    transaction_xdr: &str,
+    signature: &[u8; 64],
+) -> Result<String> {
+    let TransactionEnvelope::Tx(mut envelope) = read(transaction_xdr)? else {
+        return Err("Expected an unsigned v1 transaction".into());
+    };
+    let MuxedAccount::Ed25519(Uint256(key)) = envelope.tx.source_account.clone() else {
+        return Err("The source is a plain account".into());
+    };
+    if !envelope.signatures.is_empty() {
+        return Err("The transaction is signed already".into());
+    }
+    let digest = transaction_hash(network, &envelope.tx)?;
+    signing::verify_digest(&account_for_public_key(&key), &digest, signature)?;
+    envelope.signatures = vec![DecoratedSignature {
+        hint: SignatureHint(key[28..].try_into().map_err(err)?),
+        signature: stellar_xdr::Signature(signature.to_vec().try_into().map_err(err)?),
+    }]
+    .try_into()
+    .map_err(err)?;
+    xdr(&TransactionEnvelope::Tx(envelope))
 }
 /// Low-level source-account signing. This checks unsigned v1 envelope ownership only; it does
 /// not validate the business intent, fees or expiry. Use [`crate::owner_intent`] to validate an

@@ -330,9 +330,10 @@ async function run({ network, ask, sign, journal, key, policyId, agent, amount, 
     const fundedKey = `${key}:funded`;
     const identity = { policyId, agent, amount };
     const { receipts, settleSaved, signAndSubmit } = stepper({ network, historyPauseMs, ask, sign, journal, key, policyId, onStep, identity,
-        // A confirmed funding is recorded before its signed bytes leave the journal.
+        // A confirmed funding is recorded before its signed bytes leave the journal. A contract wallet's creation funds
+        // it in the same transaction.
         confirmed: step => {
-            if (step.action === 'fund')
+            if (step.action === 'fund' || step.action === 'create_wallet')
                 journal.set(fundedKey, JSON.stringify(identity));
         } });
     // A saved step or a funded marker of other inputs is refused before anything is sent.
@@ -386,12 +387,13 @@ async function run({ network, ask, sign, journal, key, policyId, agent, amount, 
         await ask('micro/allocation/confirm', { id: policyId, revision: fields.revision, sourceApproval: [{ signer, signature }] });
         receipts.push({ policyId, action: APPROVE_POLICY, status: 'confirmed', transactionHash: '' });
     };
-    // A deployment takes at most the code upload, the wallet creation and a lifetime renewal.
+    // A deployment takes at most the wallet creation, which funds it, and a lifetime renewal. The server uploads the
+    // code itself.
     for (let i = 0; i < 4 && !wallet; i++) {
         onStep('Preparing the wallet…');
         let reply;
         try {
-            reply = await ask('native/deploy/prepare', { policyId, agent });
+            reply = await ask('native/deploy/prepare', { policyId, agent, amount });
         }
         catch (error) {
             const { code, details } = (object(error) ? error : {});

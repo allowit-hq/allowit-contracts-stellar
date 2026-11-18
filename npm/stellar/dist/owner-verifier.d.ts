@@ -1,6 +1,6 @@
 export interface AdkOwnerStep {
     network: string;
-    action: 'upload_wasm' | 'create_wallet' | 'extend' | 'fund' | 'update_params';
+    action: 'create_wallet' | 'extend' | 'fund' | 'update_params';
     transactionXdr: string;
     transactionHash: string;
     expiresAt: number;
@@ -18,17 +18,18 @@ export interface AdkOwnerSelection {
     asset: string;
     maxFeeStroops: number;
     policyMaxFeeStroops: number;
+    /** The installed asset that a creation or a funding moves into the wallet, as decimal text. */
     amount: string;
+    /** The XLM that a creation moves into a wallet of another asset for the network fees that it repays. */
+    feeAssetAmount?: string;
     nextSequence: string;
     validUntil: number;
     /**
      * The params update that the owner reviewed, for an `update_params` step. `params` then holds the complete new
-     * params. `deploymentVersion` is the configuration revision that the update writes, in canonical decimal text,
-     * and `x402Enabled` is the installed x402 choice, which the update keeps.
+     * params. `deploymentVersion` is the configuration revision that the update writes, in canonical decimal text.
      */
     update?: {
         deploymentVersion: string;
-        x402Enabled: boolean;
     };
 }
 /** Check a step before the owner signs it. The step must be fresh now. */

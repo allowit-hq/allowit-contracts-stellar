@@ -1,6 +1,6 @@
 export interface AdkOwnerStep {
   network: string;
-  action: 'upload_wasm' | 'create_wallet' | 'extend' | 'fund' | 'update_params';
+  action: 'create_wallet' | 'extend' | 'fund' | 'update_params';
   transactionXdr: string;
   transactionHash: string;
   expiresAt: number;
@@ -19,7 +19,10 @@ export interface AdkOwnerSelection {
   asset: string;
   maxFeeStroops: number;
   policyMaxFeeStroops: number;
+  /** The installed asset that a creation or a funding moves into the wallet, as decimal text. */
   amount: string;
+  /** The XLM that a creation moves into a wallet of another asset for the network fees that it repays. */
+  feeAssetAmount?: string;
   nextSequence: string;
   validUntil: number;
   /**
@@ -37,7 +40,7 @@ type Verifier = {
 };
 
 const inputLimit = 512 * 1024;
-const verifierHash = '4196d15010a10d80cc0eb8f2e255d3f000a61942e98db55afc03b9dc5254ef8e';
+const verifierHash = 'ac94e89bce29172be8c5cebf54986804e98d14a3f30953649f785499301093c0';
 let verifier: Promise<Verifier> | undefined;
 
 async function loadVerifier(): Promise<Verifier> {

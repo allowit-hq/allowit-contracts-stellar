@@ -106,12 +106,14 @@ It reads the direct order book only: no path through another asset and no liquid
   CLI release is a `custom_toolchain_missing` refusal that says what to install. A failed compile is
   `custom_build_failed`.
 - `code_hash` is the SHA-256 of a wallet Wasm of the current custody layout: the hash of the code on the ledger.
-- `sign_message` and `verify_message` are the SEP-53 message signature, the one that a browser wallet makes with
-  `signMessage`. The server presignature and the owner attestation of a build use it, so a local key and a browser
-  wallet sign the same statement.
+- The server builds the code of a Custom policy from the source that the owner's policy signature binds, and
+  uploads it from its sending account with `RuntimeProvider::upload_code`; an upload gives no authority. The owner's
+  one creation signature names the code by its hash. A client that builds the same source gets the same hash and
+  compares it (`check_code_hash`) before the owner signs.
 
 The rail reports a wallet whose code on the ledger differs from the code of its configuration with the problem code
-`custom_code_hash_mismatch`. `OwnerProvider::custom_build` reads the owner's view of a build from the server.
+`custom_code_hash_mismatch`. `OwnerProvider::custom_build` reads the owner's view of a build from the server: the
+admitted source and the code hash of the server's build.
 
 ## Wallet kinds, units and settlement reports
 
@@ -316,8 +318,8 @@ network under `network`.
 
 `admin::PolicyConfig::for_policy` builds the `AllowitPolicyConfig` constructor packet of a validated installation, and `constructor_args` emits it. `admin::Deployer` prepares unsigned setup transactions through Stellar RPC simulation:
 
-- `upload_wasm` prepares `UploadContractWasm` of wallet code that declares custody layout 5 (`check_wallet_code`). The server uploads the code and pays its fee.
-- `deploy_and_fund` prepares the owner's one transaction through the stateless deployer contract (`deployer_address`): `deploy(owner, wasm_hash, salt, constructor_args, funding)` creates the wallet at the owner's address and salt with the constructor packet and moves each funding amount from the owner to it. The owner is the transaction source and must be owner-only; the owner's authorization covers exactly the creation, its constructor and the transfers. `wallet_address` derives the wallet address from the owner and salt.
+- `upload_wasm` prepares `UploadContractWasm` of wallet code that declares custody layout 5 (`check_wallet_code`). The server uploads the code from its sending account and pays its fee (`RuntimeProvider::upload_code`, which skips code that the ledger holds); the owner signs no upload.
+- `deploy_and_fund` prepares the owner's one transaction through the stateless deployer contract (`deployer_address`): `deploy(owner, wasm_hash, salt, constructor_args, funding)` creates the wallet at the owner's address and salt with the constructor packet and moves each funding amount from the owner to it. `creation_funding` gives that list: the installed asset, then the XLM from which a wallet of another asset repays network fees (`OwnerAction::Create { units, fee_asset_units }`). The owner client's deployment is this one step. The owner is the transaction source and must be owner-only; the owner's authorization covers exactly the creation, its constructor and the transfers. `wallet_address` derives the wallet address from the owner and salt.
 - `fund` prepares one exact SEP-41 owner-to-wallet transfer, within the installed fee ceiling.
 - `extend_wallet` prepares instance/code renewal to the independently observed network lifetime limit.
 

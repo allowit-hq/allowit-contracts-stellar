@@ -152,21 +152,12 @@ fn wasm() -> Vec<u8> {
     wasm.extend(section);
     wasm
 }
-fn upload() -> (OwnerTransaction, ExpectedOwnerIntent) {
-    let wasm = wasm();
-    let expected = ExpectedOwnerIntent {
-        limits: limits(),
-        action: OwnerAction::UploadWasm {
-            wasm_hash: hash(&wasm),
-        },
-    };
-    (
-        base(
-            x::HostFunction::UploadContractWasm(wasm.try_into().unwrap()),
-            vec![],
-            "upload_wasm",
-        ),
-        expected,
+/// A code upload for the owner to sign. The owner signs none: the server uploads the code.
+fn upload() -> OwnerTransaction {
+    base(
+        x::HostFunction::UploadContractWasm(wasm().try_into().unwrap()),
+        vec![],
+        "upload_wasm",
     )
 }
 fn fund() -> (OwnerTransaction, ExpectedOwnerIntent) {
@@ -428,7 +419,6 @@ fn assert_refused(packet: &OwnerTransaction, expected: &ExpectedOwnerIntent, lab
 #[test]
 fn four_owner_intents_sign_only_the_validated_digest_once() {
     for (packet, expected) in [
-        upload(),
         fund(),
         create(PolicyTier::Simple),
         create(PolicyTier::Common),
@@ -548,24 +538,11 @@ fn envelope_metadata_and_nonbusiness_fields_cannot_bypass_consent() {
 }
 #[test]
 fn upload_and_funding_business_values_and_auth_are_exact() {
-    let (packet, expected) = upload();
-    let mut p = packet.clone();
-    modify_host(&mut p, |host| {
-        let x::HostFunction::UploadContractWasm(code) = &mut host.host_function else {
-            panic!()
-        };
-        let mut altered = code.to_vec();
-        altered.push(0);
-        *code = altered.try_into().unwrap();
-    });
-    assert_refused(&p, &expected, "upload hash");
-    let mut p = packet;
-    modify_host(&mut p, |host| {
-        host.auth = vec![x::SorobanAuthorizationEntry::default()]
-            .try_into()
-            .unwrap()
-    });
-    assert_refused(&p, &expected, "upload hidden auth");
+    // The owner signs no code upload, whatever the intent; the server uploads with its own
+    // account.
+    for (_, expected) in [fund(), create(PolicyTier::Custom)] {
+        assert_refused(&upload(), &expected, "owner upload");
+    }
     let (packet, expected) = fund();
     for field in 0..5 {
         let mut p = packet.clone();
@@ -1015,9 +992,8 @@ fn assert_validation_refused(result: Result<ValidatedOwnerTransaction>, label: &
 }
 #[test]
 fn deployment_and_setup_adapters_validate_all_public_metadata() {
-    for (packet, expected) in [upload(), create(PolicyTier::Common)] {
+    for (packet, expected) in [create(PolicyTier::Common)] {
         let (wasm_hash, wallet) = match &expected.action {
-            OwnerAction::UploadWasm { wasm_hash } => (*wasm_hash, None),
             OwnerAction::CreateWallet { config, .. } => {
                 (config.module_digest, Some(config.wallet.clone()))
             }

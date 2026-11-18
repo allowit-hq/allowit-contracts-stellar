@@ -357,9 +357,10 @@ async function run({network, ask, sign, journal, key, policyId, agent, amount, r
   const fundedKey = `${key}:funded`;
   const identity: Identity = {policyId, agent, amount};
   const {receipts, settleSaved, signAndSubmit} = stepper({network, historyPauseMs, ask, sign, journal, key, policyId, onStep, identity,
-    // A confirmed funding is recorded before its signed bytes leave the journal.
+    // A confirmed funding is recorded before its signed bytes leave the journal. A contract wallet's creation funds
+    // it in the same transaction.
     confirmed: step => {
-      if (step.action === 'fund') journal.set(fundedKey, JSON.stringify(identity));
+      if (step.action === 'fund' || step.action === 'create_wallet') journal.set(fundedKey, JSON.stringify(identity));
     }});
   // A saved step or a funded marker of other inputs is refused before anything is sent.
   saved(journal, key, identity);
@@ -409,12 +410,13 @@ async function run({network, ask, sign, journal, key, policyId, agent, amount, r
     receipts.push({policyId, action: APPROVE_POLICY, status: 'confirmed', transactionHash: ''});
   };
 
-  // A deployment takes at most the code upload, the wallet creation and a lifetime renewal.
+  // A deployment takes at most the wallet creation, which funds it, and a lifetime renewal. The server uploads the
+  // code itself.
   for (let i = 0; i < 4 && !wallet; i++) {
     onStep('Preparing the wallet…');
     let reply: Prepared;
     try {
-      reply = await ask<Prepared>('native/deploy/prepare', {policyId, agent});
+      reply = await ask<Prepared>('native/deploy/prepare', {policyId, agent, amount});
     } catch (error) {
       const {code, details} = (object(error) ? error : {}) as {code?: unknown; details?: unknown};
       // A Native policy needs the wallet account of its agent. This workflow sets the account up from the
