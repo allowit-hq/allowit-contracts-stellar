@@ -3748,7 +3748,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     assert!(refused.message.contains("trails"), "{}", refused.message);
     assert_eq!(signatures(), before);
     {
-        let mut m = chain.0.lock().unwrap();
+        let m = chain.0.lock().unwrap();
         assert!(m.heads.is_empty() && m.restore_simulation_ledgers.is_empty());
         assert!(!m.code.contains_key(&hash(&other)));
     }
