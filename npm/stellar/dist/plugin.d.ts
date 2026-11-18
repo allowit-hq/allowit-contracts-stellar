@@ -86,28 +86,7 @@ declare const plugin: Readonly<{
      * What the SDK's owner workflows read from Stellar and check with its keys: transaction records, the record of an
      * expired step, the Native wallet's setup and the owner's approval. The SDK holds the workflows and their journal.
      */
-    ownerChain: Readonly<{
-        transaction: (network: string, hash: string) => Promise<import("./owner-chain.js").TransactionRecord>;
-        expiredRecord: typeof import("./chain-record.js").expiredRecord;
-        keypairSetup: Readonly<{
-            prepare: typeof import("./native-wallet.js").prepareNativeSetup;
-            read: typeof import("./native-wallet.js").signedNativeSetupOf;
-            send: (network: string, signedPayload: string, hash: string) => Promise<number | null>;
-            configuration: typeof import("./native-wallet.js").nativeWalletConfiguration;
-        }>;
-        approval: Readonly<{
-            read: (message: unknown, network: string) => import("./native-wallet.js").PolicyApproval | null;
-            holds: (fields: import("./native-wallet.js").PolicyApproval, wallet: string, reviewed: import("./native-wallet.js").ReviewedPolicy) => boolean;
-            step: (message: string) => {
-                action: string;
-                payload: string;
-                hash: string;
-                expiresAt: number;
-            };
-            walletOwner: (network: string, account: string) => Promise<string | null>;
-            signedBy: (signer: string, hash: string, signature: number[]) => boolean;
-        }>;
-    }>;
+    ownerChain: import("@allowit/core").OwnerChain;
     test: Readonly<{
         network: "stellar:testnet";
         skips: Readonly<Partial<Record<Feature, string>>>;

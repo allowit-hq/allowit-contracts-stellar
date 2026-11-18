@@ -1,9 +1,3 @@
-/**
- * What the SDK's owner workflows need from Stellar: the network's record of a transaction, the record of an expired
- * signed step, the steps of a Native wallet account's setup and the owner's approval of a Native policy. The SDK holds
- * the workflows, their journal and their recovery rules; these hooks build, send and read Stellar transactions and
- * check Stellar signatures.
- */
 import { Keypair } from '@stellar/stellar-sdk/base';
 import { expiredRecord, horizonGet } from './chain-record.js';
 import { OWNER_WEIGHT, approvalStep, nativeApprovalHolds, nativeWalletConfiguration, policyApproval, prepareNativeSetup, sendNativeSetup, signedNativeSetupOf } from './native-wallet.js';
@@ -35,7 +29,7 @@ function signedBy(signer, hash, signature) {
         return false;
     }
 }
-/** The hooks of the SDK's owner workflows. */
+/** The hooks of the SDK's owner workflows: Core's `OwnerChain` contract. */
 export const ownerChain = Object.freeze({
     transaction,
     /** Its ledger when the signed step applied before its time bound, null when it can never apply; throws when unknown. */
