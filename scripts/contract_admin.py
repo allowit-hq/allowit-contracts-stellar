@@ -88,14 +88,6 @@ def code_hash(value):
     return value
 
 
-def prefix_digest(kind, module, asset, rules):
-    """Canonical standard-prefix binding of executable, asset and ordered native rules."""
-    checks = scval.to_vec([scval.to_vec([scval.to_symbol(rule)]) for rule in rules])
-    value = scval.to_vec([scval.to_symbol("allowit_std_prefix"), scval.to_symbol(kind),
-        scval.to_bytes(bytes.fromhex(module)), scval.to_address(asset), checks])
-    return hashlib.sha256(value.to_xdr_bytes()).hexdigest()
-
-
 def plain_params(native):
     """Plain owner parameter values from decoded native AllowitValue enums."""
     def plain(value):
