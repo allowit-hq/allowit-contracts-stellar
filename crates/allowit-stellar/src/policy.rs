@@ -675,10 +675,9 @@ pub fn policy_rules(
     if tier == PolicyTier::Custom && *source_digest != hash(source.as_bytes()) {
         return Err("Custom source_digest must be the SHA-256 of the policy source".into());
     }
-    if tier.standard() && shape.writes_state {
-        return Err(
-            "Simple and Common cannot store allowit::set_state writes; use the custom tier".into(),
-        );
+    // A policy wallet stores no policy state on any tier.
+    if shape.writes_state {
+        return Err(WRITES_STATE.into());
     }
     params.check(tier)?;
     let unset: Vec<_> = rules
@@ -798,6 +797,9 @@ fn run_rule(ctx: &AllowitContext, rule: AllowitRule) -> allowit_core::Result {
         AllowitRule::operations => allowit_core::operations(ctx, value).map(drop),
     }
 }
+/// The refusal of a policy source that writes state: a policy wallet stores none.
+pub const WRITES_STATE: &str =
+    "A policy wallet stores no policy state; a source that calls allowit::set_state is refused";
 /// What host evaluation established.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Evaluation {
@@ -811,6 +813,11 @@ pub enum Evaluation {
 /// Common wallet runs first, skipping absent params like the contract. A canonical-only source,
 /// or any source with a supplied compiled evaluator, then runs in full through
 /// `allowit::evaluate`, where an absent param denies with `MissingParam`.
+///
+/// A policy `wallet` stores no policy state on any tier: like its kernel, the evaluation runs the
+/// standard post-flight right after the policy, which denies a write with `Unsupported`. A
+/// Custom wallet still admits its own params.
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate(
     tier: PolicyTier,
     shape: &SourceShape,
@@ -819,13 +826,27 @@ pub fn evaluate(
     state: &PolicyParams,
     request: &RuleRequest,
     evaluator: Option<PortableEvaluator>,
+    wallet: bool,
 ) -> Result<Evaluation> {
     let ctx = context(params, state, request);
     for rule in parse_rules(rules)? {
         allowit_core::preflight(&ctx, rule).map_err(|e| format!("Policy prefix denied: {e:?}"))?;
     }
+    let refuse_writes = |ctx: &AllowitContext| -> allowit_core::Result {
+        if wallet {
+            allowit_core::post_flight(ctx, AllowitTier::Standard)?;
+        }
+        Ok(())
+    };
     let full = if let Some(evaluator) = evaluator {
-        allowit_core::evaluate(&ctx, evaluator, tier.allowit())
+        allowit_core::evaluate(
+            &ctx,
+            |ctx| {
+                evaluator(ctx)?;
+                refuse_writes(ctx)
+            },
+            tier.allowit(),
+        )
     } else if shape.canonical_only {
         let prefix = parse_rules(&shape.prefix)?;
         allowit_core::evaluate(
@@ -834,7 +855,7 @@ pub fn evaluate(
                 for rule in &prefix {
                     run_rule(ctx, *rule)?;
                 }
-                Ok(())
+                refuse_writes(ctx)
             },
             tier.allowit(),
         )
@@ -858,6 +879,52 @@ pub fn evaluate(
 mod tests {
     use super::*;
     const SOURCE: &str = include_str!("../../../contracts/allowit-custom-policy/policy/policy.rs");
+
+    /// A policy wallet stores no policy state on any tier, so the server's evaluation of a
+    /// Custom wallet denies a write as its kernel does. A classic account's evaluation keeps it.
+    #[test]
+    fn a_policy_wallet_evaluation_denies_a_policy_write() {
+        let shape = source_shape(SOURCE).unwrap();
+        let asset = stellar_strkey::Contract([1; 32]).to_string();
+        let request = RuleRequest {
+            operation: crate::OperationKind::Transfer,
+            asset: asset.clone(),
+            recipient: crate::account_for_seed(&[2; 32]),
+            amount: 1,
+            token_in: asset,
+            amount_in: 1,
+            token_out: None,
+            min_out: 0,
+            now: 1_000,
+            expires_at: 2_000,
+            expense: None,
+            args: PolicyParams::default(),
+        };
+        let none = PolicyParams::default();
+        let writer: PortableEvaluator = &|ctx| allowit_core::set_state(ctx, "seen", 1u64);
+        let reader: PortableEvaluator = &|_| Ok(());
+        let run = |evaluator, wallet| {
+            evaluate(
+                PolicyTier::Custom,
+                &shape,
+                &[],
+                &none,
+                &none,
+                &request,
+                Some(evaluator),
+                wallet,
+            )
+        };
+        assert!(run(writer, true).unwrap_err().contains("Unsupported"));
+        let Evaluation::Full(kept) = run(writer, false).unwrap() else {
+            panic!()
+        };
+        assert!(kept.0.contains_key("seen"));
+        let Evaluation::Full(stored) = run(reader, true).unwrap() else {
+            panic!()
+        };
+        assert!(!stored.0.contains_key("seen"));
+    }
 
     #[test]
     fn canonical_source_has_the_full_prefix_and_is_canonical_only() {

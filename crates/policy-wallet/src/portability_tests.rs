@@ -1,0 +1,872 @@
+//! Four-target portability test. One shared vector set (`scripts/policy-vectors.rs`) runs through:
+//!
+//! 1. the host backend: `scripts/policy-smoke.rs` compiled with plain `rustc` against `allowit`
+//!    with only the `std` feature, so a policy that names `soroban_sdk` or a wallet crate fails;
+//! 2. `AllowitCustomPolicy`: the Soroban backend of the same sources, then the real custom Wasm,
+//!    and the `test-catching` fixture Wasm, whose policy catches a daily spending limit error,
+//!    continues and tries to write its own state key;
+//! 3. `AllowitCommonPolicyEngine`: the real standard Wasm with the policy's leading-rule prefix;
+//! 4. `AllowitSimplePolicyEngine`: the real simple Wasm, which has no rules.
+//!
+//! Host and Soroban outcomes must be identical on every pass value, error and post-flight state.
+//! Each vector holds the current state before the operation. The wallets then run every vector
+//! that their storage can hold: its figures in `t` and `d`, its params, and a transfer of the
+//! installed asset. The custom contract must return the mapped policy result, the catching fixture
+//! the mapped result of the standard post-flight, which denies its write, and the standard
+//! contract the mapped first prefix preflight error. The simple contract runs no rules. Each
+//! success stores exactly the figures of the host's post-flight that the wallet keeps. Kernel
+//! violations reject identically in every contract.
+//!
+//! A wallet stores no policy state of its own, so every tier runs the standard post-flight: the
+//! host and the chain deny a policy write alike, and the server's evaluation equals the stored
+//! figures for every tier.
+extern crate std;
+use super::tests::{CATCHING, COMMON, CUSTOM, Fixture, SIMPLE};
+use super::*;
+use allowit::{AllowitError, AllowitStandardState, AllowitTier, RULES};
+use allowit_wallet_protocol::{AllowitExpense, AllowitStellarOperation};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger},
+    token::StellarAssetClient,
+};
+use std::{
+    format,
+    path::Path,
+    process::Command,
+    string::{String as Text, ToString},
+    vec::Vec as List,
+};
+
+#[path = "../../../contracts/allowit-custom-policy/src/branch_policy.rs"]
+mod branch;
+#[path = "../../../contracts/allowit-custom-policy/src/catching_policy.rs"]
+mod catching;
+#[path = "../../../contracts/allowit-custom-policy/policy/policy.rs"]
+mod sample;
+mod vectors {
+    use super::std::{self, format, string::String, vec, vec::Vec};
+    include!("../../../scripts/policy-vectors.rs");
+}
+use vectors::{Op, Ops, Outcome, Vector};
+
+/// Every rule error, indexed by its code minus one.
+const ERRORS: [AllowitError; 16] = [
+    AllowitError::MissingParam,
+    AllowitError::PaymentLimitExceeded,
+    AllowitError::LifetimeSpendingLimitExceeded,
+    AllowitError::DailySpendingLimitExceeded,
+    AllowitError::DailyVolumeLimitExceeded,
+    AllowitError::CallLimitExceeded,
+    AllowitError::DestinationNotAllowed,
+    AllowitError::TokenNotAllowed,
+    AllowitError::Expired,
+    AllowitError::Unpriced,
+    AllowitError::InvalidParam,
+    AllowitError::InvalidState,
+    AllowitError::Overflow,
+    AllowitError::Unsupported,
+    AllowitError::OperationNotAllowed,
+    AllowitError::Panicked,
+];
+/// The contract error of a policy error code. A failed read, such as an unset `ctx.params[key]`,
+/// aborts the call with its own `AllowitError` code; a returned rule error maps to its wallet
+/// error.
+fn wallet_error(code: u32) -> u32 {
+    let error = ERRORS[code as usize - 101];
+    assert_eq!(error as u32, code);
+    if error == AllowitError::MissingParam {
+        return code;
+    }
+    AllowitWalletError::from(error) as u32
+}
+/// The contract error of a policy error code in a Custom wallet: a rule denial keeps its own
+/// `AllowitError` code, and every other error is its wallet error.
+fn custom_error(code: u32) -> u32 {
+    match wallet_error(code) {
+        denied if denied == AllowitWalletError::PolicyDenied as u32 => code,
+        other => other,
+    }
+}
+/// The result of `run` inside `contract` as an error code. An abort, such as an unset
+/// `ctx.params[key]`, rolls the frame back and is its `AllowitError` code, as onchain.
+fn stopped<T>(
+    env: &Env,
+    contract: &Address,
+    run: impl FnOnce() -> allowit::Result<T>,
+) -> Result<T, u32> {
+    match env.try_as_contract::<_, AllowitError>(contract, run) {
+        Ok(result) => result.map_err(|e| e as u32),
+        Err(Ok(error)) => Err(error as u32),
+        Err(Err(other)) => panic!("{other:?}"),
+    }
+}
+
+/// Build the host smoke with plain `rustc` against `allowit` with only the `std` feature, run it
+/// and return its vector lines.
+fn host_lines() -> List<Text> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let out = root
+        .join("target/policy-smoke")
+        .join(std::process::id().to_string());
+    std::fs::create_dir_all(&out).unwrap();
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let lib = out.join("liballowit.rlib");
+    let resolved = Command::new("python3")
+        .args(["scripts/core_sources.py", "--portable-lib"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(
+        resolved.status.success(),
+        "{}",
+        Text::from_utf8_lossy(&resolved.stderr)
+    );
+    let portable_lib = Text::from_utf8(resolved.stdout).unwrap();
+    let bin = out.join("policy-smoke");
+    let run = |command: &mut Command| {
+        let output = command.current_dir(&root).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            Text::from_utf8_lossy(&output.stdout),
+            Text::from_utf8_lossy(&output.stderr)
+        );
+        Text::from_utf8(output.stdout).unwrap()
+    };
+    // Overflow checks are explicit, as in the contract release profile and the offchain server.
+    run(Command::new(&rustc)
+        .args([
+            "--edition=2024",
+            "-Coverflow-checks=on",
+            "--crate-type=rlib",
+            "--crate-name=allowit",
+        ])
+        .args(["--cfg", "feature=\"std\""])
+        .arg(portable_lib.trim())
+        .arg("-o")
+        .arg(&lib));
+    run(Command::new(&rustc)
+        .args([
+            "--edition=2024",
+            "-Coverflow-checks=on",
+            "--test",
+            "--extern",
+        ])
+        .arg(format!("allowit={}", lib.display()))
+        .args(["scripts/policy-smoke.rs", "-o"])
+        .arg(&bin));
+    let stdout = run(Command::new(&bin).args([
+        "vectors_print_host_outcomes",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1",
+    ]));
+    std::fs::remove_dir_all(&out).unwrap();
+    // libtest prints the test name without a newline before the first captured line.
+    stdout
+        .lines()
+        .filter_map(|line| line.find("vector ").map(|i| line[i..].to_string()))
+        .collect()
+}
+
+/// A `List` of the universe addresses at `items`, or `None`.
+fn list(env: &Env, universe: &[Address], items: &Option<List<usize>>) -> Option<AllowitValue> {
+    let mut out = Vec::new(env);
+    for i in items.as_ref()? {
+        out.push_back(AllowitValue::Addr(universe[*i].clone()));
+    }
+    Some(AllowitValue::List(out))
+}
+/// The `operations` value of `ops`.
+fn operations(env: &Env, ops: &Ops) -> AllowitValue {
+    let text = |name: &str| AllowitValue::Str(soroban_sdk::String::from_str(env, name));
+    match ops {
+        Ops::Text(name) => text(name),
+        Ops::List(names) => {
+            let mut out = Vec::new(env);
+            for name in names {
+                out.push_back(text(name));
+            }
+            AllowitValue::List(out)
+        }
+    }
+}
+/// A key => value map of `entries`, without the absent ones.
+fn map(env: &Env, entries: &[(&str, Option<AllowitValue>)]) -> Map<Symbol, AllowitValue> {
+    let mut out = Map::new(env);
+    for (key, value) in entries {
+        if let Some(value) = value {
+            out.set(Symbol::new(env, key), value.clone());
+        }
+    }
+    out
+}
+/// The params of a vector: its canonical params and the custom `invoice_limit`.
+fn params(env: &Env, universe: &[Address], v: &Vector) -> Map<Symbol, AllowitValue> {
+    let int = |n: Option<i128>| n.map(AllowitValue::Int);
+    map(
+        env,
+        &[
+            (allowit::PAYMENT_LIMIT, int(v.limits[0])),
+            (allowit::LIFETIME_SPENDING_LIMIT, int(v.limits[1])),
+            (allowit::DAILY_SPENDING_LIMIT, int(v.limits[2])),
+            (allowit::DAILY_VOLUME_LIMIT, int(v.limits[3])),
+            (allowit::CALL_LIMIT, v.call_limit.map(AllowitValue::from)),
+            (allowit::DESTINATIONS, list(env, universe, &v.destinations)),
+            (allowit::TOKENS, list(env, universe, &v.tokens)),
+            (
+                allowit::EXPIRES_AT,
+                v.expires_at_param.map(AllowitValue::from),
+            ),
+            (
+                allowit::OPERATIONS,
+                v.operations.as_ref().map(|ops| operations(env, ops)),
+            ),
+            (vectors::INVOICE_LIMIT, int(v.invoice_limit)),
+        ],
+    )
+}
+/// The agent's execution params of a vector, with its filler args.
+fn args(env: &Env, v: &Vector) -> Map<Symbol, AllowitValue> {
+    let mut args = map(
+        env,
+        &[(vectors::INVOICE, v.invoice.then_some(AllowitValue::Int(1)))],
+    );
+    for i in 0..v.extra_args {
+        let key = Symbol::new(env, &vectors::arg_key(i));
+        args.set(key, AllowitValue::from(i as u64));
+    }
+    args
+}
+/// The current state map of a vector, with the catching policy's key when set and its filler keys.
+fn state_map(env: &Env, v: &Vector) -> Map<Symbol, AllowitValue> {
+    let mut state = Map::new(env);
+    let s = AllowitStandardState {
+        calls: v.calls,
+        spent: v.spent,
+        unpriced: v.unpriced,
+        day: v.day,
+        day_spent: v.day_spent,
+        day_total: v.day_total,
+        day_unpriced: v.day_unpriced,
+    };
+    s.write(&mut state).unwrap();
+    if let Some(over) = v.over {
+        state.set(Symbol::new(env, vectors::OVER), over.into());
+    }
+    for i in 0..v.extra_state {
+        let key = Symbol::new(env, &vectors::state_key(i));
+        state.set(key, AllowitValue::from(i as u64));
+    }
+    if !v.blob.is_empty() {
+        let mut texts = Vec::new(env);
+        for n in &v.blob {
+            let text = soroban_sdk::String::from_str(env, &"x".repeat(*n));
+            texts.push_back(AllowitValue::Str(text));
+        }
+        state.set(Symbol::new(env, vectors::BLOB), AllowitValue::List(texts));
+    }
+    state
+}
+/// A state map as `vectors::state_line`.
+fn line(env: &Env, state: &Map<Symbol, AllowitValue>) -> Text {
+    let s = AllowitStandardState::read(state).unwrap();
+    let over = state
+        .get(Symbol::new(env, vectors::OVER))
+        .map(|value| u64::try_from(value).unwrap());
+    vectors::state_line(
+        s.calls,
+        s.spent,
+        s.unpriced,
+        s.day,
+        s.day_spent,
+        s.day_total,
+        s.day_unpriced,
+        over,
+    )
+}
+fn context(env: &Env, universe: &[Address], v: &Vector) -> AllowitContext {
+    AllowitContext {
+        env: env.clone(),
+        params: AllowitParams::new(env, params(env, universe, v)).unwrap(),
+        state: state_map(env, v),
+        request: AllowitRequest {
+            operation: match v.op {
+                Op::Transfer => AllowitOperation::transfer,
+                Op::Deposit => AllowitOperation::deposit,
+                Op::Swap => AllowitOperation::swap,
+                Op::Redeem => AllowitOperation::redeem,
+            },
+            asset: universe[v.asset].clone(),
+            recipient: universe[v.recipient].clone(),
+            amount: v.amount,
+            token_in: universe[v.token_in].clone(),
+            amount_in: v.amount_in,
+            token_out: v.token_out.map(|i| universe[i].clone()),
+            min_out: v.min_out,
+            now: v.now,
+            expires_at: v.expires_at,
+            spent_units: v.spent_units,
+            gas_units: v.gas_units,
+            unpriced: !v.priced,
+            args: AllowitArgs(args(env, v)),
+        },
+    }
+}
+/// Soroban backend outcome. Each step runs in its own frame of the contract, so policy writes
+/// have temporary storage and an abort, such as an unset `ctx.params[key]`, has its error code.
+fn soroban_outcome(env: &Env, contract: &Address, universe: &[Address], v: &Vector) -> Outcome {
+    let c = context(env, universe, v);
+    let code = |e: AllowitError| e as u32;
+    let index = |a: Address| format!("@{}", universe.iter().position(|x| *x == a).unwrap());
+    let run = |execute: &dyn Fn(&AllowitContext) -> allowit::Result, tier| {
+        stopped(env, contract, || allowit::evaluate(&c, execute, tier))
+            .map(|state| line(env, &state))
+    };
+    let evaluate = |tier| run(&catching::execute, tier);
+    // The Common wallet's policy with the full canonical prefix.
+    let prefix = |c: &AllowitContext| {
+        RULES
+            .into_iter()
+            .try_for_each(|rule| allowit::preflight(c, rule))
+    };
+    let stopped = |run: &dyn Fn() -> allowit::Result<Text>| stopped(env, contract, run);
+    let rules: List<Result<Text, u32>> = [
+        stopped(&|| {
+            allowit::payment_limit(&c, &c.params[allowit::PAYMENT_LIMIT]).map(|v| v.to_string())
+        }),
+        stopped(&|| {
+            allowit::lifetime_spending_limit(&c, &c.params[allowit::LIFETIME_SPENDING_LIMIT])
+                .map(|v| v.to_string())
+        }),
+        stopped(&|| {
+            allowit::daily_spending_limit(&c, &c.params[allowit::DAILY_SPENDING_LIMIT])
+                .map(|v| v.to_string())
+        }),
+        stopped(&|| {
+            allowit::daily_volume_limit(&c, &c.params[allowit::DAILY_VOLUME_LIMIT])
+                .map(|v| v.to_string())
+        }),
+        stopped(&|| allowit::call_limit(&c, &c.params[allowit::CALL_LIMIT]).map(|v| v.to_string())),
+        stopped(&|| allowit::destinations(&c, &c.params[allowit::DESTINATIONS]).map(index)),
+        stopped(&|| allowit::tokens(&c, &c.params[allowit::TOKENS]).map(index)),
+        stopped(&|| allowit::expires_at(&c, &c.params[allowit::EXPIRES_AT]).map(|v| v.to_string())),
+        stopped(&|| allowit::operations(&c, &c.params[allowit::OPERATIONS]).map(|v| v.to_string())),
+    ]
+    .into();
+    let unit = |result: Result<Text, u32>| result.map(drop);
+    Outcome {
+        policy: unit(stopped(&|| sample::execute(&c).map(|()| Text::new()))),
+        branch: unit(stopped(&|| branch::execute(&c).map(|()| Text::new()))),
+        catching: unit(stopped(&|| catching::execute(&c).map(|()| Text::new()))),
+        rules,
+        preflight: RULES
+            .into_iter()
+            .map(|rule| allowit::preflight(&c, rule).map_err(code))
+            .collect(),
+        // The bare catching run above may have buffered a write; `evaluate` clears it first.
+        next: run(&|_| Ok(()), AllowitTier::Custom),
+        common: run(&prefix, AllowitTier::Standard),
+        simple: run(&|_| Ok(()), AllowitTier::Standard),
+        catching_next: evaluate(AllowitTier::Custom),
+        catching_standard: evaluate(AllowitTier::Standard),
+    }
+}
+
+/// The leading canonical calls of the sample policy, as `scripts/policy_source.py` derives them
+/// for the standard contract.
+fn sample_prefix() -> List<AllowitRule> {
+    let source = include_str!("../../../contracts/allowit-custom-policy/policy/policy.rs");
+    let (_, body) = source
+        .split_once("pub fn execute(ctx: &AllowitContext) -> allowit::Result {")
+        .unwrap();
+    let mut rules = List::new();
+    for line in body.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        let call = line
+            .strip_prefix("allowit::")
+            .and_then(|call| call.strip_suffix("])?;"))
+            .and_then(|call| call.split_once("(ctx, &ctx.params[allowit::"));
+        let Some(rule) = call.and_then(|(rule, key)| {
+            let i = RULES.iter().position(|r| std::format!("{r:?}") == rule)?;
+            (rule.to_uppercase() == key).then_some(RULES[i])
+        }) else {
+            break;
+        };
+        rules.push(rule);
+    }
+    rules
+}
+
+/// Whether every tier's owner configuration admits an `operations` value: `*` or a list of op names.
+/// A custom contract is ASCII letters or digits; a function adds underscores and has 1 to 32 bytes.
+fn operations_valid(ops: &Ops) -> bool {
+    let function = |f: &str| {
+        (1..=32).contains(&f.len()) && f.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    };
+    let name = |name: &&str| {
+        ["transfer", "swap", "deposit", "redeem", "custom"].contains(name)
+            || name.strip_prefix("custom.").is_some_and(function)
+            || name
+                .strip_prefix("custom:")
+                .and_then(|call| call.rsplit_once('.'))
+                .is_some_and(|(contract, f)| {
+                    !contract.is_empty()
+                        && contract.bytes().all(|b| b.is_ascii_alphanumeric())
+                        && function(f)
+                })
+    };
+    match ops {
+        Ops::Text(text) => *text == "*",
+        Ops::List(names) => names.iter().all(name),
+    }
+}
+
+/// The current UTC day of a vector.
+fn today(v: &Vector) -> u64 {
+    v.now / allowit::DAY
+}
+/// Whether the kernel and the stored layout can produce the vector through `execute` of a
+/// transfer: a transfer of the installed asset whose expense bounds, when priced, attest principal
+/// plus gas, with args that the kernel admits and params that every tier admits, and a current
+/// state that `t` and `d` hold. They hold the totals in 64 and 31 bits and the daily figures of
+/// today or of an ended window, and no policy key.
+fn realizable(v: &Vector) -> bool {
+    let cost = if v.priced {
+        v.gas_units >= 0 && v.spent_units == v.amount + v.gas_units
+    } else {
+        v.spent_units == 0 && v.gas_units == 0
+    };
+    let stored = (0..=i128::from(u64::MAX)).contains(&v.spent)
+        && v.calls < 1 << 31
+        && v.day_spent >= 0
+        && v.day_total >= 0
+        && v.day <= today(v)
+        && v.over.is_none()
+        && v.extra_state == 0
+        && v.blob.is_empty();
+    v.op == Op::Transfer
+        && v.extra_args + usize::from(v.invoice) <= vectors::MAX_ARGS
+        && v.asset == vectors::ASSET
+        && v.amount > 0
+        && v.expires_at > v.now
+        && cost
+        && stored
+        && v.limits.iter().flatten().all(|limit| *limit >= 0)
+        && v.operations.as_ref().is_none_or(operations_valid)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Tier {
+    Custom,
+    Common,
+    Simple,
+    /// The custom contract compiled with the catching policy.
+    Catching,
+}
+/// Every deployed contract that the vectors run through.
+const TIERS: [Tier; 4] = [Tier::Custom, Tier::Common, Tier::Simple, Tier::Catching];
+/// One deployed wallet Wasm and its address universe.
+struct Wallet {
+    f: Fixture,
+    tier: Tier,
+    universe: List<Address>,
+    operations: core::cell::Cell<u64>,
+}
+impl Wallet {
+    /// Deploy the tier's Wasm of an issued asset, fund it and bind Common to the sample policy's
+    /// prefix, with a gas cap above every vector's repayment.
+    fn new(tier: Tier) -> Self {
+        let f = Fixture::with(Self::wasm(tier), true, |_, c| c.gas_cap = 1_000);
+        f.env.mock_all_auths();
+        StellarAssetClient::new(&f.env, &f.asset).mint(&f.wallet, &1_000_000);
+        f.env.set_auths(&[]);
+        let mut universe = List::from([f.asset.clone(), f.recipient.clone()]);
+        while universe.len() < vectors::ADDRESSES {
+            universe.push(Address::generate(&f.env));
+        }
+        let wallet = Self {
+            f,
+            tier,
+            universe,
+            operations: core::cell::Cell::new(0),
+        };
+        if tier == Tier::Common {
+            assert_eq!(
+                wallet.f.client().state().rules.len() as usize,
+                sample_prefix().len()
+            );
+        }
+        wallet
+    }
+    /// The deployed Wasm of a tier.
+    fn wasm(tier: Tier) -> &'static [u8] {
+        match tier {
+            Tier::Custom => CUSTOM,
+            Tier::Common => COMMON,
+            Tier::Simple => SIMPLE,
+            Tier::Catching => CATCHING,
+        }
+    }
+    /// The figures that the wallet keeps.
+    fn kept(&self) -> u8 {
+        self.f.client().state().kept as u8
+    }
+    /// Install the vector's params and its current figures, and move the ledger to the request
+    /// time. A Standard wallet stores the params of its rules; the owner changes param values
+    /// without code redeployment. The daily figures of today live in an open `d`; those of an
+    /// earlier day are in a window that has ended, which leaves no `d`.
+    fn seed(&self, v: &Vector, paused: bool) {
+        let env = &self.f.env;
+        env.ledger().with_mut(|l| l.timestamp = v.now);
+        env.as_contract(&self.f.wallet, || {
+            let mut c = Config::load(env).unwrap();
+            let mut params = params(env, &self.universe, v);
+            if self.tier == Tier::Common || self.tier == Tier::Simple {
+                let mut kept = Map::new(env);
+                for rule in c.rules.iter() {
+                    let key = Symbol::new(env, rule.key());
+                    if let Some(value) = params.get(key.clone()) {
+                        kept.set(key, value);
+                    }
+                }
+                params = kept;
+            }
+            c.params = params;
+            c.paused = paused;
+            c.store(env).unwrap();
+        });
+        let kept = self.kept();
+        env.as_contract(&self.f.wallet, || {
+            let storage = env.storage();
+            storage.persistent().remove(&TOTAL);
+            storage.temporary().remove(&DAILY);
+            let figures = Figures {
+                calls: v.calls,
+                spent: v.spent,
+                unpriced: v.unpriced,
+                day_spent: v.day_spent,
+                day_total: v.day_total,
+                day_unpriced: v.day_unpriced,
+            };
+            if kept & TOTALS != 0 {
+                write_total(env, kept, &figures, false).unwrap();
+            }
+            if kept & DAILIES != 0 && v.day == today(v) {
+                write_daily(env, kept, &figures, None).unwrap();
+            }
+        });
+    }
+    fn request(&self, v: &Vector) -> AllowitExecutionRequest {
+        let env = &self.f.env;
+        let operation = self.operations.get() + 1;
+        self.operations.set(operation);
+        let mut id = [0u8; 32];
+        id[24..].copy_from_slice(&operation.to_be_bytes());
+        // The wallet's asset is issued, so the gas units are attested and one stroop of XLM is
+        // repaid for them.
+        let gas = i128::from(v.priced && v.gas_units > 0);
+        AllowitExecutionRequest(
+            BytesN::from_array(env, &id),
+            self.f.client().state().deployment_version,
+            v.expires_at,
+            AllowitStellarOperation::Transfer(
+                self.universe[v.asset].clone(),
+                self.universe[v.recipient].clone(),
+                v.amount,
+            ),
+            if v.priced {
+                AllowitExpense::Priced(v.gas_units, 0, v.spent_units, env.ledger().sequence())
+            } else {
+                AllowitExpense::Unpriced
+            },
+            gas,
+            self.f.payee.clone(),
+            args(env, v),
+        )
+    }
+    fn execute(&self, e: &AllowitExecutionRequest) -> Result<(), u32> {
+        match self.f.run(e) {
+            Ok(()) => Ok(()),
+            Err(Ok(error)) => Err(error as u32),
+            // A policy read that fails aborts with its `AllowitError` code.
+            Err(Err(soroban_sdk::InvokeError::Contract(code))) => Err(code),
+            other => panic!("{:?} {:?}", self.tier, other),
+        }
+    }
+    /// The stored figures as a state line, with the day of the request.
+    fn stored(&self, v: &Vector) -> Text {
+        let f = self.f.client().state().figures;
+        vectors::state_line(
+            f.calls,
+            f.spent,
+            f.unpriced,
+            today(v),
+            f.day_spent,
+            f.day_total,
+            f.day_unpriced,
+            None,
+        )
+    }
+}
+/// A state line of the host's post-flight, masked to the figures that a wallet keeps: a figure
+/// that no check reads stays zero, the daily flag goes with the daily figures and the unpriced
+/// flag with spent.
+fn masked(state: &str, kept: u8) -> Text {
+    let fields: List<&str> = state.split('/').collect();
+    let int = |i: usize, figure: u8| {
+        if kept & figure != 0 {
+            fields[i].parse::<i128>().unwrap()
+        } else {
+            0
+        }
+    };
+    vectors::state_line(
+        int(0, CALLS) as u64,
+        int(1, SPENT),
+        kept & SPENT != 0 && fields[2] == "true",
+        fields[3].parse().unwrap(),
+        int(4, DAY_SPENT),
+        int(5, DAY_TOTAL),
+        kept & DAILIES != 0 && fields[6] == "true",
+        None,
+    )
+}
+
+#[test]
+fn one_vector_set_has_matching_outcomes_on_host_custom_standard_and_simple() {
+    assert_eq!(vectors::MAX_ARGS, allowit::MAX_ARGS as usize);
+    assert_eq!(
+        vectors::MAX_POLICY_KEYS + 7,
+        allowit::MAX_STATE_KEYS as usize
+    );
+    assert_eq!(vectors::MAX_STATE_BYTES, allowit::MAX_STATE_BYTES as usize);
+    let all = vectors::vectors();
+    let host = host_lines();
+    assert_eq!(host.len(), all.len());
+    let wallets = TIERS.map(Wallet::new);
+    let custom = &wallets[0];
+    let prefix = sample_prefix();
+    assert_eq!(prefix, RULES);
+    let mut realized = 0;
+    for (v, host) in all.iter().zip(&host) {
+        // 1 and 2: the host smoke and the Soroban backend agree on every pass value, error and
+        // post-flight state.
+        let outcome = soroban_outcome(&custom.f.env, &custom.f.wallet, &custom.universe, v);
+        assert_eq!(*host, outcome.line(v.name));
+        if !realizable(v) {
+            continue;
+        }
+        realized += 1;
+        let next = outcome.next.clone().map(|_| ());
+        let first_prefix_error = prefix
+            .iter()
+            .map(|rule| outcome.preflight[RULES.iter().position(|r| r == rule).unwrap()])
+            .find(Result::is_err);
+        // A standard evaluation admits only canonical params, then runs the prefix and the plain
+        // post-flight.
+        let custom_param = v
+            .invoice_limit
+            .map_or(Ok(()), |_| Err(AllowitError::InvalidParam as u32));
+        let common = custom_param
+            .and(first_prefix_error.unwrap_or(Ok(())))
+            .and(next);
+        assert_eq!(outcome.common.clone().map(|_| ()), common, "{}", v.name);
+        // A standard evaluation denies the catching policy's write; the chain denies it alike.
+        let wrote = outcome.catching_next != outcome.catching.and(outcome.next.clone());
+        let standard = custom_param.map(|()| Text::new()).and(if wrote {
+            Err(AllowitError::Unsupported as u32)
+        } else {
+            outcome.catching.and(outcome.next.clone())
+        });
+        assert_eq!(outcome.catching_standard, standard, "{}", v.name);
+        // A Custom wallet admits its own params and, like every wallet, stores no policy write:
+        // the server's evaluation runs the standard post-flight right after the policy.
+        let env = &custom.f.env;
+        let c = context(env, &custom.universe, v);
+        let wallet_custom = stopped(env, &custom.f.wallet, || {
+            allowit::evaluate(
+                &c,
+                |c| {
+                    catching::execute(c)?;
+                    allowit::post_flight(c, AllowitTier::Standard).map(drop)
+                },
+                AllowitTier::Custom,
+            )
+        })
+        .map(|state| line(env, &state));
+        if v.invoice_limit.is_none() {
+            assert_eq!(wallet_custom, standard, "{}", v.name);
+        }
+        for wallet in &wallets {
+            // A Standard wallet holds no custom param.
+            if v.invoice_limit.is_some() && matches!(wallet.tier, Tier::Common | Tier::Simple) {
+                continue;
+            }
+            wallet.seed(v, false);
+            let kept = wallet.kept();
+            let (expected, state) = match wallet.tier {
+                Tier::Custom => (
+                    outcome.policy.and(next).map_err(custom_error),
+                    outcome.next.clone(),
+                ),
+                Tier::Catching => (
+                    wallet_custom.clone().map(|_| ()).map_err(custom_error),
+                    wallet_custom.clone(),
+                ),
+                // A Common wallet that keeps no figure runs only its prefix.
+                Tier::Common if kept == 0 => (
+                    first_prefix_error.unwrap_or(Ok(())).map_err(wallet_error),
+                    outcome.next.clone(),
+                ),
+                Tier::Common => (
+                    outcome.common.clone().map(|_| ()).map_err(wallet_error),
+                    outcome.common.clone(),
+                ),
+                // A Simple wallet runs no rule and keeps no figure.
+                Tier::Simple => (Ok(()), outcome.next.clone()),
+            };
+            let result = wallet.execute(&wallet.request(v));
+            assert_eq!(result, expected, "{} {:?}", v.name, wallet.tier);
+            // The contract stored exactly the figures of the host's post-flight that it keeps.
+            if result.is_ok() && kept != 0 {
+                let want = masked(&state.clone().unwrap(), kept);
+                assert_eq!(wallet.stored(v), want, "{} {:?}", v.name, wallet.tier);
+            }
+        }
+    }
+    // 49 before this layout; the others hold a policy key, a backward day or a total beyond
+    // the width of `t`, which no wallet of this layout stores.
+    assert_eq!(realized, 41);
+}
+
+#[test]
+fn kernel_violations_reject_identically_in_every_contract() {
+    use AllowitWalletError as W;
+    let v = vectors::base();
+    assert!(realizable(&v));
+    for wallet in TIERS.map(Wallet::new) {
+        let tier = wallet.tier;
+        let reject = |change: &dyn Fn(&mut AllowitExecutionRequest), paused: bool| {
+            wallet.seed(&v, paused);
+            let mut e = wallet.request(&v);
+            change(&mut e);
+            wallet.execute(&e)
+        };
+        let other = wallet.universe[vectors::OTHER].clone();
+        let to = |e: &mut AllowitExecutionRequest, token: Option<Address>, to: Option<Address>| {
+            let AllowitStellarOperation::Transfer(t, r, amount) = e.3.clone() else {
+                panic!()
+            };
+            e.3 = AllowitStellarOperation::Transfer(token.unwrap_or(t), to.unwrap_or(r), amount);
+        };
+        let asset = |e: &mut AllowitExecutionRequest| to(e, Some(other.clone()), None);
+        let to_self = |e: &mut AllowitExecutionRequest| to(e, None, Some(wallet.f.wallet.clone()));
+        let expired = |e: &mut AllowitExecutionRequest| e.2 = v.now;
+        let stale = |e: &mut AllowitExecutionRequest| e.1 += 1;
+        assert_eq!(
+            reject(&asset, false),
+            Err(W::InvalidInvocation as u32),
+            "{tier:?}"
+        );
+        assert_eq!(
+            reject(&to_self, false),
+            Err(W::InvalidRecipient as u32),
+            "{tier:?}"
+        );
+        assert_eq!(reject(&expired, false), Err(W::Expired as u32), "{tier:?}");
+        assert_eq!(
+            reject(&stale, false),
+            Err(W::StaleRequest as u32),
+            "{tier:?}"
+        );
+        assert_eq!(reject(&|_| {}, true), Err(W::Paused as u32), "{tier:?}");
+        // The same signed authorization runs once: its ledger nonce is spent.
+        wallet.seed(&v, false);
+        let e = wallet.request(&v);
+        let f = &wallet.f;
+        let entry = f.signed(&e, &f.akey, &f.skey, 7, f.env.ledger().sequence() + 50);
+        assert!(f.run_signed(&e, entry.clone()), "{tier:?}");
+        assert!(!f.run_signed(&e, entry), "{tier:?}");
+    }
+}
+
+/// A wallet stores no policy state: the catching policy's write is denied by the server's
+/// standard evaluation and by every wallet alike, so the chain never drops a write that the server
+/// counted.
+#[test]
+fn every_tier_denies_a_policy_write_as_the_server_does() {
+    let base = vectors::base();
+    let mut over = base.clone();
+    over.limits[2] = Some(44);
+    let catching = Wallet::new(Tier::Catching);
+    let env = &catching.f.env;
+    for v in [&base, &over] {
+        catching.seed(v, false);
+        let host = env.as_contract(&catching.f.wallet, || {
+            let c = context(env, &catching.universe, v);
+            allowit::evaluate(&c, catching::execute, AllowitTier::Standard)
+        });
+        let written = v.limits[2] == Some(44);
+        let result = catching.execute(&catching.request(v));
+        if written {
+            assert_eq!(host, Err(AllowitError::Unsupported));
+            assert_eq!(result, Err(AllowitWalletError::UnsupportedOperation as u32));
+        } else {
+            assert!(host.is_ok());
+            assert_eq!(result, Ok(()));
+        }
+    }
+}
+
+/// The agent's execution params reach a Custom policy, are covered by the agent's and the
+/// server's signatures, stay within their bound, and the standard tiers ignore them.
+#[test]
+fn execution_params_reach_custom_policy_are_signed_and_standard_tiers_ignore_them() {
+    let mut v = vectors::base();
+    v.invoice_limit = Some(39);
+    let custom = Wallet::new(Tier::Catching);
+    custom.seed(&v, false);
+    assert_eq!(custom.execute(&custom.request(&v)), Ok(()));
+    v.invoice = true;
+    let over_limit = Err(custom_error(AllowitError::PaymentLimitExceeded as u32));
+    assert_eq!(over_limit, Err(102));
+    assert_eq!(custom.execute(&custom.request(&v)), over_limit);
+    v.invoice_limit = Some(40);
+    custom.seed(&v, false);
+    assert_eq!(custom.execute(&custom.request(&v)), Ok(()));
+    // The standard tiers store no custom param and ignore the args.
+    v.invoice_limit = None;
+    for tier in [Tier::Common, Tier::Simple] {
+        let wallet = Wallet::new(tier);
+        wallet.seed(&v, false);
+        assert_eq!(wallet.execute(&wallet.request(&v)), Ok(()), "{tier:?}");
+    }
+    for wallet in TIERS.map(Wallet::new) {
+        let (f, env) = (&wallet.f, &wallet.f.env);
+        wallet.seed(&v, false);
+        // Agent and server sign the full invocation: a changed arg fails authorization.
+        let signed = wallet.request(&v);
+        let entry = f.signed(&signed, &f.akey, &f.skey, 11, env.ledger().sequence() + 50);
+        let mut changed = signed.clone();
+        changed
+            .7
+            .set(Symbol::new(env, vectors::INVOICE), AllowitValue::Int(2));
+        assert!(!f.run_signed(&changed, entry));
+        // More than MAX_ARGS keys, or an oversized value, reject in the kernel.
+        let mut many = wallet.request(&v);
+        for i in 0..=allowit::MAX_ARGS {
+            let key = Symbol::new(env, &std::format!("key_{i}"));
+            many.7.set(key, AllowitValue::Bool(true));
+        }
+        let invalid = Err(AllowitWalletError::InvalidInvocation as u32);
+        assert_eq!(wallet.execute(&many), invalid, "{:?}", wallet.tier);
+        let mut long = wallet.request(&v);
+        let text = soroban_sdk::String::from_str(env, &"x".repeat(257));
+        long.7
+            .set(Symbol::new(env, "memo"), AllowitValue::Str(text));
+        assert_eq!(wallet.execute(&long), invalid, "{:?}", wallet.tier);
+    }
+}

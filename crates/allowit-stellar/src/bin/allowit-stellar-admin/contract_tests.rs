@@ -178,7 +178,7 @@ fn commands_match_the_recorded_vectors_and_never_submit() {
         }
         prepared += 1;
     }
-    assert_eq!(prepared, 27);
+    assert_eq!(prepared, 26);
 }
 
 #[test]

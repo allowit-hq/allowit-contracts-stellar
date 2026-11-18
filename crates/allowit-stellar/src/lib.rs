@@ -940,8 +940,8 @@ fn validate_portable_install(c: &WalletConfig) -> Result<()> {
     if c.rules != expected {
         return Err("Installed rules differ from the standard prefix of the policy source".into());
     }
-    if tier.standard() && shape.writes_state {
-        return Err("Simple and Common cannot store allowit::set_state writes".into());
+    if shape.writes_state {
+        return Err(policy::WRITES_STATE.into());
     }
     let digest = policy::installed_source_digest(
         tier,
@@ -1279,6 +1279,7 @@ fn verify_classic_portable(
         &standard,
         &request,
         evaluator,
+        false,
     )
 }
 /// The server's admission of one prepared operation of a classic account: the whole installed
@@ -1402,6 +1403,7 @@ fn verify_wallet_portable(
         &snapshot.standard_state(now),
         &request,
         evaluator,
+        true,
     )
 }
 fn muxed(value: &str) -> Result<MuxedAccount> {

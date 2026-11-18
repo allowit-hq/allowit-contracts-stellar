@@ -105,16 +105,16 @@ fn hash(env: &Env, bytes: &[u8]) -> BytesN<32> {
 }
 
 pub(super) struct Fixture {
-    env: Env,
-    wallet: Address,
+    pub(super) env: Env,
+    pub(super) wallet: Address,
     owner: Address,
     /// The wallet's asset: XLM unless the fixture says otherwise.
-    asset: Address,
+    pub(super) asset: Address,
     native: Address,
-    recipient: Address,
-    payee: Address,
-    akey: SigningKey,
-    skey: SigningKey,
+    pub(super) recipient: Address,
+    pub(super) payee: Address,
+    pub(super) akey: SigningKey,
+    pub(super) skey: SigningKey,
     source: BytesN<32>,
     nonce: core::cell::Cell<i64>,
 }
@@ -136,7 +136,7 @@ impl Fixture {
     }
     /// A wallet of `wasm`; `issued` makes an issued asset the wallet's asset, and `edit` changes
     /// the configuration before creation.
-    fn with(
+    pub(super) fn with(
         wasm: &'static [u8],
         issued: bool,
         edit: impl FnOnce(&Env, &mut AllowitPolicyConfig),
@@ -230,7 +230,7 @@ impl Fixture {
             nonce: core::cell::Cell::new(1_000),
         }
     }
-    fn client(&self) -> Client<'_> {
+    pub(super) fn client(&self) -> Client<'_> {
         Client::new(&self.env, &self.wallet)
     }
     fn balance(&self, token: &Address, holder: &Address) -> i128 {
@@ -265,7 +265,7 @@ impl Fixture {
     }
     /// Run `e` under the wallet's own authorization, signed by the agent and the server with a
     /// fresh ledger nonce.
-    fn run(
+    pub(super) fn run(
         &self,
         e: &AllowitExecutionRequest,
     ) -> Result<(), Result<AllowitWalletError, InvokeError>> {
@@ -284,7 +284,7 @@ impl Fixture {
         result.map(|_| ())
     }
     /// The wallet's own authorization entry for `e`, signed by `agent` and `server`.
-    fn signed(
+    pub(super) fn signed(
         &self,
         e: &AllowitExecutionRequest,
         agent: &SigningKey,
@@ -322,7 +322,7 @@ impl Fixture {
             root_invocation: invocation,
         }
     }
-    fn run_signed(
+    pub(super) fn run_signed(
         &self,
         e: &AllowitExecutionRequest,
         entry: xdr::SorobanAuthorizationEntry,

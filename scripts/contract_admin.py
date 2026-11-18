@@ -350,9 +350,9 @@ def policy_rules(value, tier, source_path):
         raise ValueError("Rules must be the standard prefix derived from the policy source: " + json.dumps(expected))
     if value["source_hash"] != hashlib.sha256(source).hexdigest():
         raise ValueError("source_hash must be the SHA-256 of the policy source")
-    # Simple and Common store only standard state, so their server denies every policy write.
-    if tier != "custom" and writes_state(source.decode()):
-        raise ValueError("Simple and Common cannot store allowit::set_state writes; use the custom tier")
+    # A policy wallet stores no policy state on any tier, so its server denies every policy write.
+    if writes_state(source.decode()):
+        raise ValueError("A policy wallet stores no policy state; a source that calls allowit::set_state is refused")
     values = value.get("params", {})
     params(values, tier)
     # Valid configuration: the owner can set the param later without code redeployment.

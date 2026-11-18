@@ -439,10 +439,9 @@ pub fn policy_rules(
         return Err("source_hash must be the SHA-256 of the policy source".into());
     }
     // Simple and Common store only standard state, so their server denies every policy write.
-    if tier != PolicyTier::Custom && shape.writes_state {
-        return Err(
-            "Simple and Common cannot store allowit::set_state writes; use the custom tier".into(),
-        );
+    // A policy wallet stores no policy state on any tier.
+    if shape.writes_state {
+        return Err(policy::WRITES_STATE.into());
     }
     let empty = json!({});
     let values = value.get("params").unwrap_or(&empty);

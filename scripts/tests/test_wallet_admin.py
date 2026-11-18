@@ -384,23 +384,21 @@ class ContractAdmin(unittest.TestCase):
             self.assertEqual(ca.policy_rules({"rules": [], "source_hash": digest}, "simple", str(policy))["rules"], [])
             with self.assertRaises(ValueError):
                 ca.policy_rules(packet, "common", None)
-            # Simple and Common store only standard state: a policy that writes state needs Custom.
+            # A policy wallet stores no policy state on any tier: a policy that writes state is refused.
             writer = source(CALL("destinations") + "    allowit::set_state(ctx, \"seen\", 1u64)?;\n")
             # A raw identifier names the same function and compiles on the host.
             raw = source(CALL("destinations") + "    allowit::r#set_state(ctx, \"seen\", 1u64)?;\n")
             for body in (raw, writer):
                 policy.write_text(body)
-                for tier in ("common", "simple"):
+                for tier in ("common", "simple", "custom"):
                     rules = ["destinations"] if tier == "common" else []
                     body_hash = hashlib.sha256(body.encode()).hexdigest()
                     with self.subTest(tier=tier, source=body), self.assertRaisesRegex(ValueError, "set_state"):
                         ca.policy_rules({"rules": rules, "source_hash": body_hash}, tier, str(policy))
-            writer_digest = hashlib.sha256(writer.encode()).hexdigest()
-            self.assertEqual(ca.policy_rules({"rules": [], "source_hash": writer_digest}, "custom", str(policy))["rules"], [])
             # Simple and Common admit only canonical params; Custom admits its own keys.
-            custom_key = {"rules": [], "source_hash": writer_digest, "params": {"vendor_limit": 5}}
-            self.assertEqual(ca.policy_rules(custom_key, "custom", str(policy)), custom_key)
             policy.write_text(text)
+            custom_key = {"rules": [], "source_hash": digest, "params": {"vendor_limit": 5}}
+            self.assertEqual(ca.policy_rules(custom_key, "custom", str(policy)), custom_key)
             with self.assertRaisesRegex(ValueError, "canonical keys"):
                 ca.policy_rules(dict(packet, params={"vendor_limit": 5}), "common", str(policy))
             # The admin packet path applies the same binding.
