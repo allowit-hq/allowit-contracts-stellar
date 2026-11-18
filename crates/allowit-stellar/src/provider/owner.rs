@@ -240,6 +240,9 @@ impl OwnerProvider for Owner {
     fn custom_build(&self, cx: &Context<'_>, policy_id: &str) -> Result<serde_json::Value> {
         client(cx)?.custom_build(policy_id, (cx.clock)()?)
     }
+    fn owner_session(&self, cx: &Context<'_>) -> Result<crate::host::owner_session::Client> {
+        Ok(client(cx)?.into_session())
+    }
     fn update_params(
         &self,
         cx: &Context<'_>,
