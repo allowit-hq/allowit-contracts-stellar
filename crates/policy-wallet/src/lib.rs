@@ -178,7 +178,7 @@ pub enum AllowitWalletError {
     InvalidInvocation = 17,
     PolicyDenied = 18,
     /// The request's gas repayment exceeds the owner-signed gas cap.
-    GasAboveCap = 20,
+    ExcessGas = 20,
 }
 
 /// Compile-time policy mixin. No runtime fallback or system-controlled executable reference exists.
@@ -733,7 +733,7 @@ fn validate_expense(
         return Err(AllowitWalletError::InvalidAmount);
     }
     if gas > config.gas_cap {
-        return Err(AllowitWalletError::GasAboveCap);
+        return Err(AllowitWalletError::ExcessGas);
     }
     if gas > 0 && *execution.gas_payee() == env.current_contract_address() {
         return Err(AllowitWalletError::InvalidRecipient);

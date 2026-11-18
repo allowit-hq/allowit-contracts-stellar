@@ -170,7 +170,7 @@ fn fixture_with_wallet(
     let state = TrustedState {
         contract_version: portable.then_some(CONTRACT_VERSION),
         policy_state: portable.then(|| PolicyStateSnapshot {
-            params: c.params.clone(),
+            params: installed_params(&c),
             rules: vec![],
             source_hash: c.source_hash,
             figures: Default::default(),
@@ -570,7 +570,7 @@ fn classic_limits_keep_exact_local_math_while_odc_requires_native_preflight() {
                 json!({"destinations": [account_for_seed(&[6; 32])], "payment_limit": 20_000_000}),
             );
             s.policy_state = Some(PolicyStateSnapshot {
-                params: c.params.clone(),
+                params: installed_params(&c),
                 rules: c.rules.clone(),
                 source_hash: c.source_hash,
                 figures: Default::default(),
@@ -1386,7 +1386,7 @@ fn custody_scval(
             source_hash: c.source_hash,
             gas_cap: i128::from(c.max_fee_stroops),
             rules: c.rules.clone(),
-            params: c.params.clone(),
+            params: installed_params(c),
         })
         .unwrap()
         .try_into()

@@ -242,8 +242,8 @@ fn deployer() -> String {
 fn create(tier: PolicyTier) -> (OwnerTransaction, ExpectedOwnerIntent) {
     let salt = [8; 32];
     let c = config(tier, &salt);
-    // `AllowitPolicyConfig`: the agent and server keys raw, the owner's source hash and the gas
-    // cap; the fixture's own encoder is the contract's field order.
+    // `AllowitPolicyConfig`: the agent and server keys raw, the owner's source hash and the
+    // gas cap; the fixture's own encoder is the contract's field order.
     let raw_key = |account: &str| bytes(&allowit_stellar::account_key(account).unwrap());
     let constructor = scmap(vec![
         ("agent", raw_key(&c.agent)),

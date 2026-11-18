@@ -69,7 +69,8 @@ fn native_error_results_and_exact_auth_tree_payloads_are_preserved() {
         .max_by_key(|v| v["params"]["transaction"].as_str().unwrap().len())
         .unwrap()["params"]
         .clone();
-    assert!(params["transaction"].as_str().unwrap().len() > 1_000);
+    // The whole execution request, positional, with its wallet authorization scope.
+    assert!(params["transaction"].as_str().unwrap().len() > 600);
     for result in [
         json!({"error":"HostError: Error(Contract, #101)","events":[]}),
         json!({"error":"FeeTooLow","minResourceFee":"2645894"}),

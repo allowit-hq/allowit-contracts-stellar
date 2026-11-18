@@ -345,7 +345,10 @@ impl OwnerLedger {
                     source_hash: c.source_hash,
                     gas_cap: i128::from(c.max_fee_stroops),
                     rules: c.rules.clone(),
-                    params,
+                    params: native::installed_params(&native::WalletConfig {
+                        params,
+                        ..c.clone()
+                    }),
                 })?;
                 let _ = policy_state;
                 let data = x::LedgerEntryData::ContractData(x::ContractDataEntry {

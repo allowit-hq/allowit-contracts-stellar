@@ -3370,6 +3370,7 @@ mod native_revalidation_tests {
         let account = sdk::account_for_seed(&[42; 32]);
         let data = fixture();
         let signed: SignedOperation = serde_json::from_value(data["signed"].clone()).unwrap();
+        let signed = crate::test_support::policy_sealed(&signed);
         let result = TransactionResult {
             fee_charged: 100,
             result: TransactionResultResult::TxFailed(Default::default()),

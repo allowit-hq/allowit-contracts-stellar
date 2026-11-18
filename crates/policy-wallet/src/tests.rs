@@ -599,7 +599,7 @@ fn request_bindings_and_gas_are_checked() {
             AllowitWalletError::InvalidInvocation,
         ),
         (
-            "gas above the cap",
+            "gas above the gas cap",
             |_, e| {
                 e.5 = 21;
                 if let AllowitExpense::Priced(gas_units, _, spent, _) = &mut e.4 {
@@ -607,7 +607,7 @@ fn request_bindings_and_gas_are_checked() {
                     *spent = 31;
                 }
             },
-            AllowitWalletError::GasAboveCap,
+            AllowitWalletError::ExcessGas,
         ),
         (
             "negative gas",
@@ -678,7 +678,7 @@ fn a_wallet_of_another_asset_repays_gas_in_xlm_and_counts_its_attested_units() {
     let f = Fixture::with(COMMON, true, |_, c| c.gas_cap = 0);
     assert_eq!(
         f.run(&f.transfer(10, 1)),
-        Err(Ok(AllowitWalletError::GasAboveCap))
+        Err(Ok(AllowitWalletError::ExcessGas))
     );
     assert_eq!(f.run(&f.transfer(10, 0)), Ok(()));
 }

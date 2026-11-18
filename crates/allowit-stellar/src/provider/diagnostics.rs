@@ -261,7 +261,7 @@ mod tests {
             assert_eq!(other.details.unwrap()["contractError"], code);
         }
         // A code that the wallet's enum does not define is a plain conflict.
-        assert_eq!(classify(20, &[error_event(WALLET, 20)]).code, "");
+        assert_eq!(classify(19, &[error_event(WALLET, 19)]).code, "");
         // The same code from another contract is a rejection: raised by it alone, relayed
         // through the wallet, or without events.
         for events in [
