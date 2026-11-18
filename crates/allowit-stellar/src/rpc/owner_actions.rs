@@ -30,13 +30,16 @@ pub fn code_state(rpc: &dyn Rpc, network: &str, code: &[u8; 32]) -> Result<CodeS
 /// As `code_state`, for a decision to pay for a transaction that only code that is not live
 /// needs. An RPC node can serve an entry some ledgers behind the closing head, which can miss a
 /// transaction that made the code live meanwhile. A negative answer must be dated at the closing
-/// head: a read that trails it is taken once more, and a second one that trails is refused.
+/// head: a read that trails it, or that trails the head read before it, is taken once more, and
+/// a second one that trails is refused.
 pub fn current_code_state(rpc: &dyn Rpc, network: &str, code: &[u8; 32]) -> Result<CodeState> {
-    for _ in 0..2 {
-        match code_observation(rpc, network, code)? {
-            (CodeState::Live, _) => return Ok(CodeState::Live),
-            (state, true) => return Ok(state),
-            (_, false) => {}
+    for attempt in 0..2 {
+        match code_observation(rpc, network, code) {
+            Ok((CodeState::Live, _)) => return Ok(CodeState::Live),
+            Ok((state, true)) => return Ok(state),
+            Ok((_, false)) => {}
+            Err(stale) if attempt == 0 && stale == owner_observation::STALE_OBSERVATION => {}
+            Err(error) => return Err(error),
         }
     }
     Err("The observation of the wallet code trails the network's head".into())

@@ -355,6 +355,13 @@ struct Model {
     /// lapsed at the head before another account's restoration, and the head then closes one
     /// more ledger.
     stale_code_reads: u32,
+    /// The `stale_code_reads` that the answer `TRY_AGAIN_LATER` starts.
+    stale_reads_on_retry_later: u32,
+    /// The next reads of code entries answer at a ledger before the head that was read just
+    /// before them, from a node that trails; the entry itself is current.
+    behind_head_code_reads: u32,
+    /// The `behind_head_code_reads` that a restoration's simulation starts.
+    behind_reads_on_restore_simulation: u32,
     tiers: BTreeMap<[u8; 32], PolicyTier>,
     wallet: Option<Wallet>,
     settled: BTreeMap<String, String>,
@@ -691,10 +698,15 @@ impl rpc::Rpc for ModelChain {
                     .into_iter()
                     .map(|e| json!({"key": encoded, "xdr": b64(&e), "liveUntilLedgerSeq": live_until}))
                     .collect();
-                if entries.is_empty() && m.omit_empty_entries {
-                    return Ok(json!({"latestLedger": m.ledger}));
+                let mut latest = m.ledger;
+                if m.behind_head_code_reads > 0 && matches!(key, x::LedgerKey::ContractCode(_)) {
+                    m.behind_head_code_reads -= 1;
+                    latest -= 1;
                 }
-                Ok(json!({"latestLedger": m.ledger, "entries": entries}))
+                if entries.is_empty() && m.omit_empty_entries {
+                    return Ok(json!({"latestLedger": latest}));
+                }
+                Ok(json!({"latestLedger": latest, "entries": entries}))
             }
             "simulateTransaction" => {
                 let x::TransactionEnvelope::Tx(env) = de(params["transaction"].as_str().unwrap())
@@ -737,6 +749,8 @@ impl rpc::Rpc for ModelChain {
                         .cloned()
                         .collect();
                     data.resources.footprint.read_write = archived.try_into().unwrap();
+                    m.behind_head_code_reads =
+                        std::mem::take(&mut m.behind_reads_on_restore_simulation);
                     if m.restored_after_simulation {
                         m.restored_after_simulation = false;
                         for key in data.resources.footprint.read_write.iter() {
@@ -984,6 +998,7 @@ impl rpc::Rpc for ModelChain {
                 }
                 if let Some(code) = m.retry_later_restores.take() {
                     m.lapsed_code.remove(&code);
+                    m.stale_code_reads = std::mem::take(&mut m.stale_reads_on_retry_later);
                     return Ok(json!({"hash": tx_hash, "status": "TRY_AGAIN_LATER"}));
                 }
                 // The source signs alone.
@@ -4094,6 +4109,40 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     {
         let m = chain.0.lock().unwrap();
         assert!(m.retry_later_restores.is_none());
+        assert!(!m.lapsed_code.contains(&installed));
+    }
+    // So when the read before the repeated send trails the closing head: that read does not
+    // decide, and the code is read again.
+    {
+        let mut m = chain.0.lock().unwrap();
+        m.lapsed_code.insert(installed);
+        m.retry_later_restores = Some(installed);
+        m.stale_reads_on_retry_later = 1;
+    }
+    assert!(
+        provider
+            .restore_code_within(&installation, ceiling, quick, NOW)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(chain.0.lock().unwrap().stale_code_reads, 0);
+    // The read before the signature answers at a ledger before the head read just before it:
+    // it is taken once more, and the restoration of code that is still lapsed goes on.
+    {
+        let mut m = chain.0.lock().unwrap();
+        m.lapsed_code.insert(installed);
+        m.behind_reads_on_restore_simulation = 1;
+    }
+    chain.step("restore after a read that trails the head");
+    assert!(
+        provider
+            .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+            .unwrap()
+            .is_some()
+    );
+    {
+        let m = chain.0.lock().unwrap();
+        assert_eq!(m.behind_head_code_reads, 0);
         assert!(!m.lapsed_code.contains(&installed));
     }
     // Code that the network does not have cannot be restored: it needs an upload.

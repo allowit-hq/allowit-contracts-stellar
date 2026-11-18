@@ -538,7 +538,8 @@ impl Provider {
                 Err(refused) => return unless_live(refused),
             };
         // A send that the network does not accept yet is repeated only while the code is not
-        // live: another transaction can restore or upload it meanwhile.
+        // live, by a read dated at the closing head: another transaction can restore or upload
+        // it meanwhile.
         let Some(receipt) = checked(self.runtime.send_and_poll_while(
             &c.network,
             &signed,
@@ -546,7 +547,10 @@ impl Provider {
                 attempts: poll.attempts,
                 interval: poll.interval,
             },
-            &|| Ok(rpc::code_state(self.rpc(), &c.network, &code_hash)? != rpc::CodeState::Live),
+            &|| {
+                Ok(rpc::current_code_state(self.rpc(), &c.network, &code_hash)?
+                    != rpc::CodeState::Live)
+            },
         ))?
         else {
             return Ok(None);
