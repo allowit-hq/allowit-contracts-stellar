@@ -3038,6 +3038,51 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
             .unwrap()
             .is_none()
     );
+    // Before a wallet operation the server restores the installation's lapsed code by its hash,
+    // without its bytes, and nothing when the code is live.
+    let ceiling = u64::try_from(RESTORE_FEE).unwrap() + 100;
+    assert!(
+        provider
+            .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+            .unwrap()
+            .is_none()
+    );
+    chain.0.lock().unwrap().lapsed_code.insert(installed);
+    assert!(
+        plain
+            .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+            .unwrap_err()
+            .message
+            .contains("no sending account")
+    );
+    assert!(
+        provider
+            .restore_code_within(&installation, 100, Poll::default(), NOW)
+            .unwrap_err()
+            .message
+            .contains("exceeds the explicitly selected ceiling")
+    );
+    chain.step("restore before an operation");
+    assert!(
+        provider
+            .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+            .unwrap()
+            .is_some()
+    );
+    {
+        let m = chain.0.lock().unwrap();
+        assert!(m.lapsed_code.is_empty());
+        assert_eq!(m.steps.last().unwrap().0, "restore before an operation");
+    }
+    // Code that the network does not have cannot be restored: it needs an upload.
+    chain.0.lock().unwrap().code_bytes.remove(&installed);
+    assert!(
+        provider
+            .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+            .unwrap_err()
+            .message
+            .contains("not on the network")
+    );
 }
 /// A wallet whose instance and `t` lapsed: the ledger still gives their values, so the server
 /// reads the wallet and the agent's payment restores both in place; the owner's stop then

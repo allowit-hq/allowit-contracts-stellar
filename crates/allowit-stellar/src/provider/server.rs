@@ -413,13 +413,14 @@ fn sending_signature(sender: &Sender, account: &str, hash: &[u8; 32]) -> Result<
         .map_err(|_| Error::config("A sending account returned a signature of another size"))
 }
 impl Provider {
-    /// Make the code of `wasm` live from a sending account: upload it when the network does not
-    /// have it, restore it when it lapsed. A simulated fee above `max_fee_stroops` is refused
-    /// before anything is signed.
+    /// Make wallet code live from a sending account: the code of `wasm`, or without it the
+    /// installation's code. Absent code is uploaded, which needs its bytes; lapsed code is
+    /// restored by its hash. A simulated fee above `max_fee_stroops` is refused before anything
+    /// is signed.
     fn upload(
         &self,
         i: &Installation,
-        wasm: &[u8],
+        wasm: Option<&[u8]>,
         max_fee_stroops: u32,
         poll: Poll,
         now: u64,
@@ -430,11 +431,22 @@ impl Provider {
                 "A keypair wallet has no code: its owner creates it with the wallet setup",
             ));
         }
-        let code_hash = checked(native::admin::check_wallet_code(wasm))?;
+        let code_hash = match wasm {
+            Some(wasm) => checked(native::admin::check_wallet_code(wasm))?,
+            None => c.module_digest,
+        };
         let state = checked(rpc::code_state(self.rpc(), &c.network, &code_hash))?;
         if state == rpc::CodeState::Live {
             return Ok(None);
         }
+        let wasm = match (state, wasm) {
+            (rpc::CodeState::Absent, None) => {
+                return Err(Error::usage(
+                    "The wallet code is not on the network: a restoration needs code that lapsed",
+                ));
+            }
+            (_, wasm) => wasm.unwrap_or_default(),
+        };
         let sender = self.sender.as_ref().ok_or_else(|| {
             Error::config("This server has no sending account to upload wallet code")
         })?;
@@ -1517,7 +1529,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         poll: Poll,
         now: u64,
     ) -> Result<Option<Receipt>> {
-        self.upload(i, wasm, u32::MAX, poll, now)
+        self.upload(i, Some(wasm), u32::MAX, poll, now)
     }
     fn upload_code_within(
         &self,
@@ -1527,7 +1539,16 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         poll: Poll,
         now: u64,
     ) -> Result<Option<Receipt>> {
-        self.upload(i, wasm, fee(max_fee)?, poll, now)
+        self.upload(i, Some(wasm), fee(max_fee)?, poll, now)
+    }
+    fn restore_code_within(
+        &self,
+        i: &Installation,
+        max_fee: u64,
+        poll: Poll,
+        now: u64,
+    ) -> Result<Option<Receipt>> {
+        self.upload(i, None, fee(max_fee)?, poll, now)
     }
     fn submit_owner<'a>(
         &self,
