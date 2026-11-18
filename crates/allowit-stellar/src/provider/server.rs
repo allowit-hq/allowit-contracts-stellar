@@ -413,7 +413,8 @@ fn sending_signature(sender: &Sender, account: &str, hash: &[u8; 32]) -> Result<
         .map_err(|_| Error::config("A sending account returned a signature of another size"))
 }
 impl Provider {
-    /// Upload `wasm` from a sending account, refusing a simulated fee above `max_fee_stroops`
+    /// Make the code of `wasm` live from a sending account: upload it when the network does not
+    /// have it, restore it when it lapsed. A simulated fee above `max_fee_stroops` is refused
     /// before anything is signed.
     fn upload(
         &self,
@@ -430,24 +431,28 @@ impl Provider {
             ));
         }
         let code_hash = checked(native::admin::check_wallet_code(wasm))?;
-        if checked(rpc::code_uploaded(self.rpc(), &c.network, &code_hash))? {
+        let state = checked(rpc::code_state(self.rpc(), &c.network, &code_hash))?;
+        if state == rpc::CodeState::Live {
             return Ok(None);
         }
         let sender = self.sender.as_ref().ok_or_else(|| {
             Error::config("This server has no sending account to upload wallet code")
         })?;
         let account = sender.account()?;
-        // The server pays the upload, a cost that the ledger consumes; the simulation sets it,
-        // within the ceiling.
-        let p = checked(
-            native::admin::Deployer {
-                rpc: self.rpc(),
-                network: &c.network,
-                now,
-                max_fee_stroops,
-            }
-            .upload_wasm(&account, wasm),
-        )?;
+        // The server pays the upload or the restoration, a cost that the ledger consumes; the
+        // simulation sets it, within the ceiling. Lapsed code is restored, never uploaded again:
+        // the network refuses an upload of code that its archive holds.
+        let deployer = native::admin::Deployer {
+            rpc: self.rpc(),
+            network: &c.network,
+            now,
+            max_fee_stroops,
+        };
+        let p = checked(if state == rpc::CodeState::Lapsed {
+            deployer.restore_code(&account, code_hash)
+        } else {
+            deployer.upload_wasm(&account, wasm)
+        })?;
         let signature = sending_signature(sender, &account, &p.transaction_hash)?;
         let signed = checked(native::admin::with_source_signature(
             &c.network,
@@ -931,9 +936,12 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 lifetime: None,
             });
         }
-        let code_present = checked(rpc::code_uploaded(self.rpc(), &c.network, &c.module_digest))?;
+        // Lapsed code is not present: the server's upload step restores it.
+        let code_present = checked(rpc::code_state(self.rpc(), &c.network, &c.module_digest))?
+            == rpc::CodeState::Live;
         let wallet_present = checked(rpc::contract_exists(self.rpc(), &c.network, &c.wallet))?;
-        let lifetime = if wallet_present {
+        // A lifetime reads live entries only: lapsed code has none until it is restored.
+        let lifetime = if wallet_present && code_present {
             let l = checked(rpc::wallet_lifetime(
                 self.rpc(),
                 &c.network,

@@ -12,6 +12,29 @@ pub fn code_uploaded(rpc: &dyn Rpc, network: &str, code: &[u8; 32]) -> Result<bo
         LedgerKey::ContractCode(LedgerKeyContractCode { hash: Hash(*code) }),
     )
 }
+/// The state of an exact code entry on the network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodeState {
+    /// Live at the closing observation.
+    Live,
+    /// Past its lifetime, on the ledger or in the network's archive. A restoration of the entry
+    /// makes it live again; an upload of the same code can fail once the network archived it.
+    Lapsed,
+    /// Not on the network. This does not prove that it never existed.
+    Absent,
+}
+/// Whether an exact code entry is live, lapsed or absent.
+pub fn code_state(rpc: &dyn Rpc, network: &str, code: &[u8; 32]) -> Result<CodeState> {
+    if *code == [0; 32] {
+        return Err("Missing executable identity".into());
+    }
+    let key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: Hash(*code) });
+    Ok(match observed_entry(rpc, network, &key)? {
+        (None, _) => CodeState::Absent,
+        (Some(until), closing) if until >= closing => CodeState::Live,
+        (Some(_), _) => CodeState::Lapsed,
+    })
+}
 /// Whether a native C-address currently has a live Wasm instance. This grants no trust in its config.
 pub fn contract_exists(rpc: &dyn Rpc, network: &str, contract: &str) -> Result<bool> {
     Contract::from_string(contract).map_err(err)?;
@@ -26,9 +49,19 @@ pub fn contract_exists(rpc: &dyn Rpc, network: &str, contract: &str) -> Result<b
     )
 }
 fn live_entry(rpc: &dyn Rpc, network: &str, key: LedgerKey) -> Result<bool> {
+    let (live_until, closing) = observed_entry(rpc, network, &key)?;
+    if live_until.is_some_and(|until| until < closing) {
+        return Err("Native resource is archived or expired at the closing observation".into());
+    }
+    Ok(live_until.is_some())
+}
+/// The live-until ledger of the verified entry of `key`, `None` when the network has no such
+/// entry, and the closing head of the observation. An archived entry that the RPC serves without
+/// a live-until ledger reads as 0.
+fn observed_entry(rpc: &dyn Rpc, network: &str, key: &LedgerKey) -> Result<(Option<u32>, u32)> {
     owner_observation::network(rpc, network)?;
     let before = owner_observation::head(rpc)?;
-    let value = rpc.call("getLedgerEntries", json!({"keys":[xdr(&key)?]}))?;
+    let value = rpc.call("getLedgerEntries", json!({"keys":[xdr(key)?]}))?;
     let observed = owner_observation::ledger(&value["latestLedger"])?;
     let entries = value["entries"]
         .as_array()
@@ -38,13 +71,13 @@ fn live_entry(rpc: &dyn Rpc, network: &str, key: LedgerKey) -> Result<bool> {
         [entry] => {
             if entry
                 .get("key")
-                .is_some_and(|v| v.as_str() != xdr(&key).ok().as_deref())
+                .is_some_and(|v| v.as_str() != xdr(key).ok().as_deref())
             {
                 return Err("Native observation key differs".into());
             }
             let data: LedgerEntryData =
                 read(entry["xdr"].as_str().ok_or("Missing native entry XDR")?)?;
-            let matches = match (&key, data) {
+            let matches = match (key, data) {
                 (LedgerKey::ContractCode(expected), LedgerEntryData::ContractCode(actual)) => {
                     actual.hash == expected.hash && hash(actual.code.as_slice()) == expected.hash.0
                 }
@@ -65,15 +98,18 @@ fn live_entry(rpc: &dyn Rpc, network: &str, key: LedgerKey) -> Result<bool> {
             if !matches {
                 return Err("Native entry differs from the selected resource".into());
             }
-            Some(owner_observation::ledger(&entry["liveUntilLedgerSeq"])?)
+            Some(match &entry["liveUntilLedgerSeq"] {
+                Value::Null => 0,
+                value if value.as_u64() == Some(0) => 0,
+                value => owner_observation::ledger(value)?,
+            })
         }
         _ => return Err("Unexpected native entry count".into()),
     };
-    let closing = owner_observation::current(rpc, before, observed)?;
-    if live_until.is_some_and(|until| until < closing) {
-        return Err("Native resource is archived or expired at the closing observation".into());
-    }
-    Ok(live_until.is_some())
+    Ok((
+        live_until,
+        owner_observation::current(rpc, before, observed)?,
+    ))
 }
 /// Only a verified native receipt is terminal. A missing lookup or expiry cannot prove absence.
 #[derive(Clone, Debug, PartialEq, Eq)]

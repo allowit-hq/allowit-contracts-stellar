@@ -1482,6 +1482,81 @@ impl Deployer<'_> {
         }
         self.prepared(&account, "upload_wasm", wasm_hash, None, tx)
     }
+    /// Prepare `RestoreFootprint` of the lapsed code entry `wasm_hash` from `source`. It names
+    /// that entry alone and gives no authority; the simulation sets its fee, within the ceiling.
+    pub fn restore_code(&self, source: &str, wasm_hash: [u8; 32]) -> Result<PreparedDeployment> {
+        let account = self.account(source)?;
+        let key = LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: Hash(wasm_hash),
+        });
+        let mut tx = Transaction {
+            source_account: muxed(&account.address)?,
+            fee: 100,
+            seq_num: SequenceNumber(account.sequence.checked_add(1).ok_or("Sequence overflow")?),
+            cond: Preconditions::Time(TimeBounds {
+                min_time: TimePoint(0),
+                max_time: TimePoint(self.now.checked_add(300).ok_or("Expiry overflow")?),
+            }),
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::RestoreFootprint(RestoreFootprintOp {
+                    ext: ExtensionPoint::V0,
+                }),
+            }]
+            .try_into()
+            .map_err(err)?,
+            ext: TransactionExt::V1(SorobanTransactionData {
+                ext: SorobanTransactionDataExt::V0,
+                resources: SorobanResources {
+                    footprint: LedgerFootprint {
+                        read_only: VecM::default(),
+                        read_write: vec![key.clone()].try_into().map_err(err)?,
+                    },
+                    instructions: 0,
+                    disk_read_bytes: 0,
+                    write_bytes: 0,
+                },
+                resource_fee: 0,
+            }),
+        };
+        let raw = xdr(&TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: tx.clone(),
+            signatures: VecM::default(),
+        }))?;
+        let response = self.simulate(&account, &raw, false)?;
+        if response.get("error").is_some_and(|v| !v.is_null()) {
+            return Err("Code restoration simulation failed".into());
+        }
+        let data: SorobanTransactionData = read(
+            response["transactionData"]
+                .as_str()
+                .ok_or("Missing restoration resources")?,
+        )?;
+        if !data.resources.footprint.read_only.is_empty()
+            || data.resources.footprint.read_write.as_slice() != [key]
+        {
+            return Err("Restoration resources name another entry".into());
+        }
+        let fee = response["minResourceFee"]
+            .as_str()
+            .ok_or("Missing restoration fee")?
+            .parse::<u32>()
+            .map_err(err)?
+            .checked_add(100)
+            .ok_or("Restoration fee overflow")?;
+        if fee > self.max_fee_stroops {
+            return Err("Simulated fee exceeds the explicitly selected ceiling".into());
+        }
+        if data.resource_fee < 0
+            || u64::try_from(data.resource_fee).map_err(err)? + 100 != u64::from(fee)
+        {
+            return Err("Restoration resource fee differs from simulation".into());
+        }
+        tx.fee = fee;
+        tx.ext = TransactionExt::V1(data);
+        self.prepared(&account, "restore_code", wasm_hash, None, tx)
+    }
     /// Prepare the owner's one transaction that creates the policy wallet of `wasm` (uploaded by
     /// the server) through `deployer` and funds it with each `(asset, amount)` of `funding`. The
     /// owner signs it once: the creation, the constructor's owner check and the transfers are one

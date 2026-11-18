@@ -38,6 +38,8 @@ const MAX_FEE: u32 = 1_000_000;
 const RECORD_FEE: i64 = 1_500;
 /// The resource fee of the sending account's enforcing simulation.
 const ENFORCE_FEE: i64 = 1_000;
+/// The resource fee of a code restoration in the model.
+const RESTORE_FEE: i64 = 4_000;
 /// The XLM that the owner's creation moves into the wallet.
 const FUNDING: i128 = 500_000_000;
 const DAY_LEDGERS: u32 = 17_280;
@@ -308,6 +310,9 @@ struct Model {
     code: BTreeMap<[u8; 32], PolicyTier>,
     /// The uploaded code by its hash.
     code_bytes: BTreeMap<[u8; 32], Vec<u8>>,
+    /// Uploaded code past its lifetime: Stellar RPC serves it with a live-until ledger of 0,
+    /// an upload of it fails and a `RestoreFootprint` of its entry makes it live again.
+    lapsed_code: BTreeSet<[u8; 32]>,
     tiers: BTreeMap<[u8; 32], PolicyTier>,
     wallet: Option<Wallet>,
     settled: BTreeMap<String, String>,
@@ -611,9 +616,13 @@ impl rpc::Rpc for ModelChain {
                     }
                     _ => None,
                 };
+                let live_until = match &key {
+                    x::LedgerKey::ContractCode(code) if m.lapsed_code.contains(&code.hash.0) => 0,
+                    _ => m.ledger + 10_000,
+                };
                 let entries: Vec<Value> = entry
                     .into_iter()
-                    .map(|e| json!({"key": encoded, "xdr": b64(&e), "liveUntilLedgerSeq": m.ledger + 10_000}))
+                    .map(|e| json!({"key": encoded, "xdr": b64(&e), "liveUntilLedgerSeq": live_until}))
                     .collect();
                 Ok(json!({"latestLedger": m.ledger, "entries": entries}))
             }
@@ -622,7 +631,28 @@ impl rpc::Rpc for ModelChain {
                 else {
                     panic!()
                 };
+                if let x::OperationBody::RestoreFootprint(_) = &env.tx.operations[0].body {
+                    let x::TransactionExt::V1(data) = &env.tx.ext else {
+                        return Ok(json!({"error": "a restoration names its footprint"}));
+                    };
+                    let data = x::SorobanTransactionData {
+                        resource_fee: RESTORE_FEE,
+                        ..data.clone()
+                    };
+                    return Ok(json!({
+                        "latestLedger": m.ledger,
+                        "minResourceFee": RESTORE_FEE.to_string(),
+                        "transactionData": b64(&data),
+                    }));
+                }
                 let op = host_op(&env.tx);
+                if let x::HostFunction::UploadContractWasm(code) = &op.host_function
+                    && m.lapsed_code.contains(&hash(code.as_slice()))
+                {
+                    return Ok(
+                        json!({"error": "trying to access an archived contract code entry"}),
+                    );
+                }
                 let source = source_of(&env.tx);
                 let record = params["authMode"] == "record";
                 if record && !op.auth.is_empty() {
@@ -784,6 +814,23 @@ impl rpc::Rpc for ModelChain {
                 assert_eq!(env.tx.seq_num.0, account.sequence + 1, "sequence");
                 account.sequence += 1;
                 let ledger = m.ledger;
+                if let x::OperationBody::RestoreFootprint(_) = &env.tx.operations[0].body {
+                    let x::TransactionExt::V1(data) = &env.tx.ext else {
+                        panic!("a restoration names its footprint")
+                    };
+                    for key in data.resources.footprint.read_write.iter() {
+                        let x::LedgerKey::ContractCode(code) = key else {
+                            panic!("the model restores code only")
+                        };
+                        assert!(m.lapsed_code.remove(&code.hash.0), "restore of live code");
+                    }
+                    let name = std::mem::take(&mut m.pending_name);
+                    m.steps
+                        .push((name, signed.clone(), ledger, x::ScVal::Void, None));
+                    m.settled.insert(tx_hash.clone(), signed);
+                    m.ledger += 1;
+                    return Ok(json!({"hash": tx_hash, "status": "PENDING"}));
+                }
                 let result = apply(&mut m, &env.tx);
                 // An execution publishes `allowit` with its operation id.
                 if let x::HostFunction::InvokeContract(call) = &host_op(&env.tx).host_function
@@ -2785,7 +2832,8 @@ fn a_creation_funds_the_asset_and_the_gas_and_recovery_returns_both() {
     assert_eq!(admin::next_recovery(&xlm, &xlm, 0, 0), None);
 }
 /// The server's runtime from the plugin sends with the server's own accounts, and so does its
-/// diagnostic session: a code upload through either reaches them.
+/// diagnostic session: a code upload through either reaches them. Code that lapsed is restored
+/// from those accounts, never uploaded again.
 #[test]
 fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts() {
     use allowit_core::vendor::plugin::RailPlugin;
@@ -2925,6 +2973,70 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
             .upload_code(&installation, &unsent, Poll::default(), NOW)
             .unwrap()
             .is_some()
+    );
+    // The installation's code lapsed: it is not present, and the server's upload step restores
+    // it from a sending account, within the ceiling, with the code entry as its only footprint.
+    let installed = c.module_digest;
+    chain.0.lock().unwrap().lapsed_code.insert(installed);
+    assert!(!provider.resources(&installation).unwrap().code_present);
+    let refused = provider
+        .upload_code_within(&installation, &wasm, 100, Poll::default(), NOW)
+        .unwrap_err();
+    assert!(
+        refused
+            .message
+            .contains("exceeds the explicitly selected ceiling"),
+        "{}",
+        refused.message
+    );
+    assert!(chain.0.lock().unwrap().lapsed_code.contains(&installed));
+    chain.step("restore");
+    let restored = provider
+        .upload_code_within(
+            &installation,
+            &wasm,
+            u64::try_from(RESTORE_FEE).unwrap() + 100,
+            Poll::default(),
+            NOW,
+        )
+        .unwrap();
+    assert!(restored.is_some());
+    {
+        let m = chain.0.lock().unwrap();
+        assert!(m.lapsed_code.is_empty());
+        let (name, signed, ..) = m.steps.last().unwrap();
+        assert_eq!(name, "restore");
+        let x::TransactionEnvelope::Tx(env) = de(signed) else {
+            panic!()
+        };
+        assert!(matches!(
+            env.tx.operations.as_slice(),
+            [x::Operation {
+                body: x::OperationBody::RestoreFootprint(_),
+                ..
+            }]
+        ));
+        let x::TransactionExt::V1(data) = &env.tx.ext else {
+            panic!()
+        };
+        assert_eq!(
+            data.resources.footprint.read_write.as_slice(),
+            [x::LedgerKey::ContractCode(x::LedgerKeyContractCode {
+                hash: x::Hash(installed)
+            })]
+        );
+        assert!(data.resources.footprint.read_only.is_empty());
+        assert_eq!(source_of(&env.tx), sender());
+    }
+    assert_eq!(
+        rpc::code_state(&*chain, NETWORK, &installed).unwrap(),
+        rpc::CodeState::Live
+    );
+    assert!(
+        provider
+            .upload_code(&installation, &wasm, Poll::default(), NOW)
+            .unwrap()
+            .is_none()
     );
 }
 /// A wallet whose instance and `t` lapsed: the ledger still gives their values, so the server

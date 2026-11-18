@@ -11,7 +11,8 @@ pub(crate) mod owner_observation;
 #[cfg(not(target_arch = "wasm32"))]
 use allowit_core::transport::rpc::{EnvelopeValidation, ErrorKind, RpcClient};
 pub use owner_actions::{
-    OwnerSettlement, code_uploaded, contract_exists, owner_settlement, vault_redeemable,
+    CodeState, OwnerSettlement, code_state, code_uploaded, contract_exists, owner_settlement,
+    vault_redeemable,
 };
 pub use owner_observation::{AssetBalance, WalletLifetime, asset_balance, wallet_lifetime};
 use serde_json::{Value, json};
