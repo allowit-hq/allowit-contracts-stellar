@@ -14,11 +14,15 @@ from policy_source import checked_code, host_compile
 ROOT = Path(__file__).resolve().parents[1]
 source = (ROOT / "contracts/allowit-custom-policy/policy/policy.rs").read_bytes()
 contract = (ROOT / "contracts/allowit-custom-policy/src/lib.rs").read_text()
-# The only alternative module is the `test-catching` fixture, which deployment tooling rejects.
-POLICY_MODULE = ('#[cfg(not(feature = "test-catching"))]\n#[path = "../policy/policy.rs"]\nmod policy;\n'
+# The only alternative modules are the `test-catching` and `test-daily` fixtures, which deployment
+# tooling never builds.
+POLICY_MODULE = ('#[cfg(not(any(feature = "test-catching", feature = "test-daily")))]\n'
+                 '#[path = "../policy/policy.rs"]\nmod policy;\n'
                  '/// Test fixture only: a policy that catches a rule error, continues and writes its own state.\n'
-                 '#[cfg(feature = "test-catching")]\n#[path = "catching_policy.rs"]\nmod policy;\n')
-if contract.count("mod policy;") != 2 or POLICY_MODULE not in contract or "/source_hash.rs" not in contract:
+                 '#[cfg(feature = "test-catching")]\n#[path = "catching_policy.rs"]\nmod policy;\n'
+                 '/// Test fixture only: a policy with one daily state entry.\n'
+                 '#[cfg(feature = "test-daily")]\n#[path = "daily_policy.rs"]\nmod policy;\n')
+if contract.count("mod policy;") != 3 or POLICY_MODULE not in contract or "/source_hash.rs" not in contract:
     raise SystemExit("Custom policy must compile and hash its authored source verbatim")
 for path in ("contracts/allowit-custom-policy/policy/policy.rs", "contracts/allowit-custom-policy/src/branch_policy.rs",
              "contracts/allowit-custom-policy/src/catching_policy.rs"):

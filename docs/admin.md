@@ -116,8 +116,9 @@ creates and funds a wallet with one signature through the deployer contract.
 Every tier requires one self-contained, portable source file. The tooling rejects every
 construct listed in [One portable policy source](architecture.md#one-portable-policy-source), such
 as macros other than the assertion and `matches!` macros, writes to `ctx.env`, the map inside params
-and args, list methods, indexing other than `ctx.params[key]` and pointer-width methods. A wallet
-stores no policy state, so the tool rejects a source that calls `allowit::set_state`. It also runs the std-only
+and args, list methods, indexing other than `ctx.params[key]` and pointer-width methods. A Simple or
+Common wallet stores no policy state, so the tool rejects such a source that calls
+`allowit::set_state`; a Custom source keeps the state entries that its build declares. It also runs the std-only
 compile described there, so it needs `rustc`. For `--tier custom`, also build the
 reviewed custom Wasm from the same file, which is the Soroban compile:
 

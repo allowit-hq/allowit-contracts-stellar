@@ -633,10 +633,20 @@ impl AccountState {
         Ok(())
     }
 }
+/// The state entries of a Custom policy source: the same scan as the contract's build.
+#[path = "../../../contracts/allowit-custom-policy/state_keys.rs"]
+pub mod state_keys;
+/// The declared state entries of a Custom policy source, as its build declares them.
+pub fn custom_state_entries(source: &str) -> Result<Vec<state_keys::StateEntry>> {
+    state_keys::declared(source, |name| hash(name)).map(|(entries, _)| entries)
+}
 /// Chain-observed policy inputs of a layout 4 policy wallet.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PolicyStateSnapshot {
+    /// A Custom policy's own state entries at the snapshot's ledger, by key name.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub custom: std::collections::BTreeMap<String, PolicyValue>,
     /// Current owner params.
     pub params: PolicyParams,
     /// Installed ordered canonical rules.
@@ -673,6 +683,8 @@ impl PolicyStateSnapshot {
             "day_unpriced".to_owned(),
             PolicyValue::Bool(open && f.day_unpriced),
         );
+        // A Custom policy reads its own state beside the figures.
+        state.extend(self.custom.clone());
         PolicyParams(state)
     }
 }
@@ -741,6 +753,7 @@ impl TrustedState {
                 server_today && self.unpriced_daily
             }),
         );
+        state.extend(snapshot.custom.clone());
         Ok(PolicyParams(state))
     }
 }
@@ -1051,8 +1064,12 @@ fn validate_portable_install(c: &WalletConfig) -> Result<()> {
     if c.rules != expected {
         return Err("Installed rules differ from the standard prefix of the policy source".into());
     }
-    if shape.writes_state {
+    // Only a Custom wallet stores its policy's own state: the entries that its build declares.
+    if shape.writes_state && tier != PolicyTier::Custom {
         return Err(policy::WRITES_STATE.into());
+    }
+    if tier == PolicyTier::Custom {
+        custom_state_entries(&c.policy_source)?;
     }
     let digest = policy::installed_source_digest(
         tier,
@@ -1395,7 +1412,7 @@ fn verify_classic_portable(
         &standard,
         &request,
         evaluator,
-        false,
+        None,
     )
 }
 /// The server's admission of one prepared operation of a classic account: the whole installed
@@ -1516,6 +1533,14 @@ fn verify_wallet_portable(
         terms.expense.clone(),
         terms.args.clone(),
     );
+    let declared: Vec<String> = if tier == PolicyTier::Custom {
+        custom_state_entries(&c.policy_source)?
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect()
+    } else {
+        vec![]
+    };
     policy::evaluate(
         tier,
         &shape,
@@ -1524,7 +1549,7 @@ fn verify_wallet_portable(
         &state.policy_wallet_state(c, now)?,
         &request,
         evaluator,
-        true,
+        Some(&declared),
     )
 }
 fn muxed(value: &str) -> Result<MuxedAccount> {

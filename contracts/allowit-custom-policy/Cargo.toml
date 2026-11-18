@@ -13,6 +13,9 @@ crate-type = ["cdylib", "rlib"]
 # Test fixture only: compile `src/catching_policy.rs` instead of `policy/policy.rs`, so tests run
 # a policy that catches rule failures in the deployed Wasm. Never deploy this build.
 test-catching = []
+# Test fixture only: compile `src/daily_policy.rs`, a policy with one daily state entry. Never deploy
+# this build.
+test-daily = []
 
 [dependencies]
 soroban-sdk = { workspace = true }

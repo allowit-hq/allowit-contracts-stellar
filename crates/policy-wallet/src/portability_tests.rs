@@ -4,7 +4,7 @@
 //!    with only the `std` feature, so a policy that names `soroban_sdk` or a wallet crate fails;
 //! 2. `AllowitCustomPolicy`: the Soroban backend of the same sources, then the real custom Wasm,
 //!    and the `test-catching` fixture Wasm, whose policy catches a daily spending limit error,
-//!    continues and tries to write its own state key;
+//!    continues and writes its own state key;
 //! 3. `AllowitCommonPolicyEngine`: the real standard Wasm with the policy's leading-rule prefix;
 //! 4. `AllowitSimplePolicyEngine`: the real simple Wasm, which has no rules.
 //!
@@ -12,14 +12,14 @@
 //! Each vector holds the current state before the operation. The wallets then run every vector
 //! that their storage can hold: its figures in `t` and `d`, its params, and a transfer of the
 //! installed asset. The custom contract must return the mapped policy result, the catching fixture
-//! the mapped result of the standard post-flight, which denies its write, and the standard
-//! contract the mapped first prefix preflight error. The simple contract runs no rules. Each
+//! the mapped result of the Custom post-flight, which keeps its write, and the standard contract
+//! the mapped first prefix preflight error. The simple contract runs no rules. Each
 //! success stores exactly the figures of the host's post-flight that the wallet keeps. Kernel
 //! violations reject identically in every contract.
 //!
-//! A wallet stores no policy state of its own, so every tier runs the standard post-flight: the
-//! host and the chain deny a policy write alike, and the server's evaluation equals the stored
-//! figures for every tier.
+//! A Custom wallet stores the state entries that its build declares, so its post-flight is the
+//! Custom one: the host and the chain keep a declared write alike. A standard wallet denies every
+//! policy write. The server's evaluation equals the stored figures for every tier.
 extern crate std;
 use super::tests::{CATCHING, COMMON, CUSTOM, Fixture, SIMPLE};
 use super::*;
@@ -682,24 +682,15 @@ fn one_vector_set_has_matching_outcomes_on_host_custom_standard_and_simple() {
             outcome.catching.and(outcome.next.clone())
         });
         assert_eq!(outcome.catching_standard, standard, "{}", v.name);
-        // A Custom wallet admits its own params and, like every wallet, stores no policy write:
-        // the server's evaluation runs the standard post-flight right after the policy.
+        // A Custom wallet admits its own params and keeps the policy's declared write: the
+        // server's evaluation runs the Custom post-flight right after the policy.
         let env = &custom.f.env;
         let c = context(env, &custom.universe, v);
         let wallet_custom = stopped(env, &custom.f.wallet, || {
-            allowit::evaluate(
-                &c,
-                |c| {
-                    catching::execute(c)?;
-                    allowit::post_flight(c, AllowitTier::Standard).map(drop)
-                },
-                AllowitTier::Custom,
-            )
+            allowit::evaluate(&c, catching::execute, AllowitTier::Custom)
         })
         .map(|state| line(env, &state));
-        if v.invoice_limit.is_none() {
-            assert_eq!(wallet_custom, standard, "{}", v.name);
-        }
+        assert_eq!(wallet_custom, outcome.catching_next, "{}", v.name);
         for wallet in &wallets {
             // A Standard wallet holds no custom param.
             if v.invoice_limit.is_some() && matches!(wallet.tier, Tier::Common | Tier::Simple) {
@@ -793,11 +784,11 @@ fn kernel_violations_reject_identically_in_every_contract() {
     }
 }
 
-/// A wallet stores no policy state: the catching policy's write is denied by the server's
-/// standard evaluation and by every wallet alike, so the chain never drops a write that the server
-/// counted.
+/// A Custom wallet keeps the write of a key that its build declares, as the server's Custom
+/// evaluation does; the standard evaluation denies it, as a standard wallet does. The chain never
+/// drops a write that the server counted.
 #[test]
-fn every_tier_denies_a_policy_write_as_the_server_does() {
+fn a_custom_wallet_keeps_a_declared_policy_write_as_the_server_does() {
     let base = vectors::base();
     let mut over = base.clone();
     over.limits[2] = Some(44);
@@ -805,18 +796,24 @@ fn every_tier_denies_a_policy_write_as_the_server_does() {
     let env = &catching.f.env;
     for v in [&base, &over] {
         catching.seed(v, false);
-        let host = env.as_contract(&catching.f.wallet, || {
+        let (custom, standard) = env.as_contract(&catching.f.wallet, || {
             let c = context(env, &catching.universe, v);
-            allowit::evaluate(&c, catching::execute, AllowitTier::Standard)
+            (
+                allowit::evaluate(&c, catching::execute, AllowitTier::Custom),
+                allowit::evaluate(&c, catching::execute, AllowitTier::Standard),
+            )
         });
         let written = v.limits[2] == Some(44);
         let result = catching.execute(&catching.request(v));
+        assert!(custom.is_ok());
+        assert_eq!(result, Ok(()));
+        let key = Symbol::new(env, "over_daily_spending_limit");
         if written {
-            assert_eq!(host, Err(AllowitError::Unsupported));
-            assert_eq!(result, Err(AllowitWalletError::UnsupportedOperation as u32));
+            assert_eq!(standard, Err(AllowitError::Unsupported));
+            assert_eq!(custom.unwrap().get(key), Some(AllowitValue::Int(1)));
         } else {
-            assert!(host.is_ok());
-            assert_eq!(result, Ok(()));
+            assert!(standard.is_ok());
+            assert_eq!(custom.unwrap().get(key), None);
         }
     }
 }

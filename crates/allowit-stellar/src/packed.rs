@@ -141,6 +141,36 @@ fn value(r: &mut Reader) -> Result<PolicyValue> {
     })
 }
 
+/// The packed size of a Custom policy's state value, as the wallet stores it.
+pub fn state_value_bytes(value: &PolicyValue) -> Result<usize> {
+    let mut out = Vec::new();
+    put_value(&mut out, value)?;
+    Ok(out.len())
+}
+/// The value of a Custom policy's state entry at `ledger`, or `None`. A daily entry holds its
+/// window's end ledger first and reads as absent after it; a persistent entry without bytes holds
+/// no value. The value is packed as the configuration's params are.
+pub fn state_value(raw: &[u8], daily: bool, ledger: u32) -> Result<Option<PolicyValue>> {
+    let mut r = Reader { buf: raw, pos: 0 };
+    if daily {
+        let end = u32::from_be_bytes(
+            r.take(4)?
+                .try_into()
+                .map_err(|_| "A stored policy state entry is short")?,
+        );
+        if ledger > end {
+            return Ok(None);
+        }
+    } else if r.done() {
+        return Ok(None);
+    }
+    let found = value(&mut r)?;
+    if !r.done() {
+        return Err("A stored policy state value has trailing bytes".into());
+    }
+    Ok(Some(found))
+}
+
 /// The flags, version, owner and asset at the fixed header offsets, which every layout keeps.
 pub struct Header {
     pub layout: u8,

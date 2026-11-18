@@ -213,8 +213,8 @@ The portability test, `crates/policy-wallet/src/portability_tests.rs`, runs one 
    A fixture Wasm built with the `test-catching` feature compiles `src/catching_policy.rs`
    instead. That policy catches a daily spending limit error, counts it in its own state key and
    continues, at most twice. When the agent's args name an `invoice`, it also limits the payment
-   with the custom `invoice_limit` param. The wallet stores no policy state, so it denies that
-   write as the server's evaluation does.
+   with the custom `invoice_limit` param. The wallet keeps that declared state key, as the
+   server's Custom evaluation does.
 3. `AllowitCommonPolicyEngine`: the real standard Wasm, bound to the sample policy's prefix, must
    return the mapped first prefix preflight error. It skips absent params.
 4. `AllowitSimplePolicyEngine`: the real simple Wasm runs no rules.
@@ -336,15 +336,18 @@ wallet can hold a custom param after a code change from Custom, because the new 
 kept params only at its next admission. `evaluate` then runs `execute`, and runs `post_flight` on
 approval; a denial discards the policy's writes.
 So no write outlives its evaluation, also when the server reuses an `AllowitEnv`. Onchain, the
-wallet runs `post_flight` after its own policy check, and a denied transaction rolls the temporary
-buffer back.
+buffer is in memory and costs no ledger entry: the wallet clears it before its policy check and runs
+`post_flight` after it. Each contract call runs in its own Wasm instance, and a denied transaction
+keeps no change.
 
-A policy wallet stores no policy state of its own. Every tier runs the standard post-flight,
-which denies a policy write with `Unsupported`, on the host as onchain: the server never approves
-an operation whose state the chain would drop. A Custom wallet still admits its own params, so the
-server evaluates its source with the Custom params check and the standard post-flight. The
-figures that the wallet keeps are the server's next `ctx.state`. `allowit-stellar-admin` refuses
-a source that calls `allowit::set_state`, also through the raw identifier `allowit::r#set_state`.
+A Simple or Common wallet stores no policy state of its own: it runs the standard post-flight,
+which denies a policy write with `Unsupported`, on the host as onchain. A Custom wallet stores the
+state entries that its build declares, and runs the Custom post-flight: the server evaluates its
+source with the Custom params check and the Custom post-flight, so the server never approves an
+operation whose state the chain would drop. [Custom policy on the wallet kernel](custom-policy-kernel.md#policy-state)
+states the calls, keys, values, lifetimes and bounds. The figures and state entries that the wallet
+keeps are the server's next `ctx.state`. `allowit-stellar-admin` refuses a Simple or Common source
+that calls `allowit::set_state`, also through the raw identifier `allowit::r#set_state`.
 
 The server-only enrichment functions exist only in the host backend. Each takes the context and an
 owner-written request and returns its passing constraint:
@@ -419,7 +422,8 @@ caught panic. A policy may also return it; onchain it is then a rule denial. A
 failed call rolls back its events, so a standard wallet's specific rule error comes only from the
 host evaluator and the shared engine.
 
-A wallet stores no policy state of its own, only the cumulated figures that its checks read:
+Besides a Custom policy's declared state entries, a wallet stores only the cumulated figures that
+its checks read:
 spent and calls in the persistent entry `t`, and the day's spent and total in the temporary entry
 `d`. A Standard wallet keeps the figure of each rule that has its param set; a Custom wallet keeps
 the figures that its build finds in its source. With cost bounds a figure counts the conservative

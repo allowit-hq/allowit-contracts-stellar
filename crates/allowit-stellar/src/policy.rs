@@ -652,7 +652,8 @@ pub struct PolicyCheck {
 }
 /// Bind an owner packet to its authored source: `scripts/contract_admin.py` `policy_rules`.
 /// Common binds the source's standard prefix; Simple and Custom bind none. Custom also binds
-/// the source bytes. Simple and Common cannot store `allowit::set_state` writes.
+/// the source bytes. Simple and Common cannot store `allowit::set_state` writes; a Custom source's
+/// state keys must pass its build's scan.
 pub fn policy_rules(
     tier: PolicyTier,
     source: &str,
@@ -675,8 +676,10 @@ pub fn policy_rules(
     if tier == PolicyTier::Custom && *source_digest != hash(source.as_bytes()) {
         return Err("Custom source_digest must be the SHA-256 of the policy source".into());
     }
-    // A policy wallet stores no policy state on any tier.
-    if shape.writes_state {
+    // Only a Custom wallet stores its policy's own state: the entries that its build declares.
+    if tier == PolicyTier::Custom {
+        crate::custom_state_entries(source)?;
+    } else if shape.writes_state {
         return Err(WRITES_STATE.into());
     }
     params.check(tier)?;
@@ -798,8 +801,7 @@ fn run_rule(ctx: &AllowitContext, rule: AllowitRule) -> allowit_core::Result {
     }
 }
 /// The refusal of a policy source that writes state: a policy wallet stores none.
-pub const WRITES_STATE: &str =
-    "A policy wallet stores no policy state; a source that calls allowit::set_state is refused";
+pub const WRITES_STATE: &str = "A Simple or Common wallet stores no policy state; a source that calls allowit::set_state is refused";
 /// What host evaluation established.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Evaluation {
@@ -814,9 +816,11 @@ pub enum Evaluation {
 /// or any source with a supplied compiled evaluator, then runs in full through
 /// `allowit::evaluate`, where an absent param denies with `MissingParam`.
 ///
-/// A policy `wallet` stores no policy state on any tier: like its kernel, the evaluation runs the
-/// standard post-flight right after the policy, which denies a write with `Unsupported`. A
-/// Custom wallet still admits its own params.
+/// A policy wallet (`wallet` names the state keys that its build declares) runs the post-flight
+/// of its kernel: a Simple or Common wallet stores no policy state, so the evaluation runs the
+/// standard post-flight right after the policy, which denies a write with `Unsupported`. A Custom
+/// wallet keeps the writes of its declared keys, as its kernel does; a write of any other key is
+/// refused. A Custom wallet also admits its own params.
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate(
     tier: PolicyTier,
@@ -826,14 +830,15 @@ pub fn evaluate(
     state: &PolicyParams,
     request: &RuleRequest,
     evaluator: Option<PortableEvaluator>,
-    wallet: bool,
+    wallet: Option<&[String]>,
 ) -> Result<Evaluation> {
     let ctx = context(params, state, request);
     for rule in parse_rules(rules)? {
         allowit_core::preflight(&ctx, rule).map_err(|e| format!("Policy prefix denied: {e:?}"))?;
     }
+    let keeps_state = wallet.is_some() && tier == PolicyTier::Custom;
     let refuse_writes = |ctx: &AllowitContext| -> allowit_core::Result {
-        if wallet {
+        if wallet.is_some() && !keeps_state {
             allowit_core::post_flight(ctx, AllowitTier::Standard)?;
         }
         Ok(())
@@ -870,9 +875,31 @@ pub fn evaluate(
             .map_err(|e| format!("Policy state rejected: {e:?}"))?;
         return Ok(Evaluation::Prefix);
     };
-    Ok(Evaluation::Full(PolicyParams::from_allowit(
+    let next = PolicyParams::from_allowit(
         &full.map_err(|e| format!("Authored policy denied this exact operation: {e:?}"))?,
-    )))
+    );
+    // The wallet stores only the standard figures and the declared keys, each declared value
+    // within its packed bound.
+    if let (true, Some(declared)) = (keeps_state, wallet) {
+        let standard = crate::state_keys::STANDARD.map(|(key, _)| key);
+        for (key, value) in &next.0 {
+            if standard.contains(&key.as_str()) {
+                continue;
+            }
+            if !declared.contains(key) {
+                return Err(format!(
+                    "The policy wrote the state key {key:?}, which its build does not declare"
+                ));
+            }
+            if crate::packed::state_value_bytes(value)? > crate::state_keys::MAX_STATE_VALUE {
+                return Err(format!(
+                    "The policy's state value of {key:?} is longer than {} packed bytes",
+                    crate::state_keys::MAX_STATE_VALUE
+                ));
+            }
+        }
+    }
+    Ok(Evaluation::Full(next))
 }
 
 #[cfg(test)]
@@ -880,10 +907,11 @@ mod tests {
     use super::*;
     const SOURCE: &str = include_str!("../../../contracts/allowit-custom-policy/policy/policy.rs");
 
-    /// A policy wallet stores no policy state on any tier, so the server's evaluation of a
-    /// Custom wallet denies a write as its kernel does. A classic account's evaluation keeps it.
+    /// A Simple or Common wallet stores no policy state, so the server's evaluation denies a write
+    /// as its kernel does. A Custom wallet keeps a write of a key that its build declares and
+    /// refuses any other key. A classic account's evaluation keeps every write.
     #[test]
-    fn a_policy_wallet_evaluation_denies_a_policy_write() {
+    fn a_policy_wallet_evaluation_keeps_only_the_writes_that_its_kernel_keeps() {
         let shape = source_shape(SOURCE).unwrap();
         let asset = stellar_strkey::Contract([1; 32]).to_string();
         let request = RuleRequest {
@@ -903,9 +931,10 @@ mod tests {
         let none = PolicyParams::default();
         let writer: PortableEvaluator = &|ctx| allowit_core::set_state(ctx, "seen", 1u64);
         let reader: PortableEvaluator = &|_| Ok(());
-        let run = |evaluator, wallet| {
+        let declared = ["seen".to_owned()];
+        let run = |tier, evaluator, wallet| {
             evaluate(
-                PolicyTier::Custom,
+                tier,
                 &shape,
                 &[],
                 &none,
@@ -915,15 +944,52 @@ mod tests {
                 wallet,
             )
         };
-        assert!(run(writer, true).unwrap_err().contains("Unsupported"));
-        let Evaluation::Full(kept) = run(writer, false).unwrap() else {
+        assert!(
+            run(PolicyTier::Simple, writer, Some(&declared))
+                .unwrap_err()
+                .contains("Unsupported")
+        );
+        let Evaluation::Full(custom) = run(PolicyTier::Custom, writer, Some(&declared)).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(custom.0.get("seen"), Some(&PolicyValue::Int(1)));
+        assert!(
+            run(PolicyTier::Custom, writer, Some(&[]))
+                .unwrap_err()
+                .contains("does not declare")
+        );
+        let Evaluation::Full(kept) = run(PolicyTier::Custom, writer, None).unwrap() else {
             panic!()
         };
         assert!(kept.0.contains_key("seen"));
-        let Evaluation::Full(stored) = run(reader, true).unwrap() else {
+        let Evaluation::Full(stored) = run(PolicyTier::Custom, reader, Some(&declared)).unwrap()
+        else {
             panic!()
         };
         assert!(!stored.0.contains_key("seen"));
+        // A declared value over the wallet's packed bound is refused, as the wallet refuses it:
+        // 62 text bytes pack into 64, 63 into 65.
+        let fits: PortableEvaluator = &|ctx| {
+            allowit_core::set_state(
+                ctx,
+                "seen",
+                allowit_core::AllowitValue::Str("x".repeat(62).as_str().into()),
+            )
+        };
+        let long: PortableEvaluator = &|ctx| {
+            allowit_core::set_state(
+                ctx,
+                "seen",
+                allowit_core::AllowitValue::Str("x".repeat(63).as_str().into()),
+            )
+        };
+        assert!(run(PolicyTier::Custom, fits, Some(&declared)).is_ok());
+        assert!(
+            run(PolicyTier::Custom, long, Some(&declared))
+                .unwrap_err()
+                .contains("longer than 64")
+        );
     }
 
     #[test]

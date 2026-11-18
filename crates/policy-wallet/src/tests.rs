@@ -33,6 +33,10 @@ pub(super) const CUSTOM: &[u8] =
 /// that calls `set_state`.
 pub(super) const CATCHING: &[u8] =
     include_bytes!("../../../target/test-fixtures/custom_catching.wasm");
+/// `AllowitCustomPolicy` built with `test-daily`: a policy with one daily state entry,
+/// `day_payments`.
+pub(super) const DAILY_STATE: &[u8] =
+    include_bytes!("../../../target/test-fixtures/custom_daily.wasm");
 pub(super) const VAULT: &[u8] =
     include_bytes!("../../../target/wasm32v1-none/release/allowit_sep56_test_vault.wasm");
 
@@ -191,6 +195,11 @@ impl Fixture {
             hash(
                 &env,
                 include_bytes!("../../../contracts/allowit-custom-policy/src/catching_policy.rs"),
+            )
+        } else if wasm == DAILY_STATE {
+            hash(
+                &env,
+                include_bytes!("../../../contracts/allowit-custom-policy/src/daily_policy.rs"),
             )
         } else {
             BytesN::from_array(&env, &[9; 32])
@@ -443,7 +452,7 @@ impl Fixture {
 }
 
 fn denied(wasm: &[u8], rule: AllowitError) -> Result<(), Result<AllowitWalletError, InvokeError>> {
-    if wasm == CUSTOM || wasm == CATCHING {
+    if wasm == CUSTOM || wasm == CATCHING || wasm == DAILY_STATE {
         Err(Err(InvokeError::Contract(rule as u32)))
     } else {
         Err(Ok(AllowitWalletError::PolicyDenied))
@@ -971,18 +980,200 @@ fn standard_and_custom_rules_deny_on_chain_and_simple_runs_none() {
     assert_eq!(f.run(&f.transfer(500, 0)), Ok(()));
 }
 
+/// The storage key of the catching fixture's `over_daily_spending_limit`.
+const OVER_KEY: u32 = 0xce9c7d57;
+/// The storage key of the daily fixture's `day_payments`.
+const DAY_PAYMENTS_KEY: u32 = 0x6df215e2;
+
+impl Fixture {
+    /// The raw value of a persistent policy state entry, with the ledgers that it still lives.
+    fn persistent_state(&self, key: u32) -> Option<(soroban_sdk::Bytes, u32)> {
+        self.env.as_contract(&self.wallet, || {
+            let storage = self.env.storage().persistent();
+            storage
+                .get::<u32, soroban_sdk::Bytes>(&key)
+                .map(|raw| (raw, storage.get_ttl(&key)))
+        })
+    }
+    /// The raw value of a daily policy state entry, with the ledgers that it still lives.
+    fn daily_state(&self, key: u32) -> Option<(soroban_sdk::Bytes, u32)> {
+        self.env.as_contract(&self.wallet, || {
+            let storage = self.env.storage().temporary();
+            storage
+                .get::<u32, soroban_sdk::Bytes>(&key)
+                .map(|raw| (raw, storage.get_ttl(&key)))
+        })
+    }
+}
+
 #[test]
-fn a_custom_source_cannot_write_its_own_state_on_chain() {
+fn a_custom_source_keeps_its_own_state_under_a_short_key() {
     let f = Fixture::new(CATCHING);
-    assert_eq!(f.client().state().kept, u32::from(ALL));
-    // Within the daily limit of 200 no write happens and the payment runs.
+    // The source reads the daily spending figure and its own counter: the wallet keeps that one
+    // figure, not every figure.
+    assert_eq!(f.client().state().kept, u32::from(DAY_SPENT));
+    // The deployment creates the persistent entry, empty, for the minimum persistent lifetime.
+    let (raw, ttl) = f.persistent_state(OVER_KEY).unwrap();
+    assert_eq!((raw.len(), ttl), (0, TOTAL_LEDGERS - 1));
+    // Within the daily limit of 200 nothing is written.
     assert_eq!(f.run(&f.transfer(100, 0)), Ok(()));
-    // Over it, the source catches the denial and writes a counter: the wallet refuses the write.
+    assert_eq!(f.persistent_state(OVER_KEY).unwrap().0.len(), 0);
+    // Over it the source catches the denial and counts: twice.
+    for count in 1..=2 {
+        f.advance(10);
+        assert_eq!(f.run(&f.transfer(101, 0)), Ok(()));
+        let (raw, ttl) = f.persistent_state(OVER_KEY).unwrap();
+        let mut value = [0u8; 64];
+        raw.copy_into_slice(&mut value[..raw.len() as usize]);
+        // The packed value: one type byte and the integer, nothing else.
+        let mut r = pack::Reader::new(&value[..raw.len() as usize]);
+        assert_eq!(
+            pack::get_value(&f.env, &mut r).ok(),
+            Some(AllowitValue::Int(count))
+        );
+        assert!(r.done());
+        // A write never extends the entry: it lives from the deployment.
+        assert_eq!(ttl, TOTAL_LEDGERS - 1 - 10 * count as u32);
+    }
+    // The third time the counter denies.
+    f.advance(10);
     assert_eq!(
         f.run(&f.transfer(101, 0)),
-        Err(Ok(AllowitWalletError::UnsupportedOperation))
+        denied(CATCHING, AllowitError::DailySpendingLimitExceeded)
     );
-    assert_eq!(f.balance(&f.asset, &f.recipient), 100);
+    assert_eq!(f.balance(&f.asset, &f.recipient), 302);
+    // The wallet stores no key name: only the configuration, the daily figures and the counter.
+    let keys: List<List<u8>> = f.entries().into_iter().map(|(key, _, _)| key).collect();
+    assert_eq!(keys.len(), 3, "{keys:?}");
+}
+
+#[test]
+fn a_write_of_a_denied_run_never_reaches_a_later_one() {
+    let f = Fixture::with(CATCHING, false, |env, config| {
+        config
+            .params
+            .set(Symbol::new(env, "invoice_limit"), AllowitValue::Int(50));
+    });
+    assert_eq!(f.run(&f.transfer(150, 0)), Ok(()));
+    // Over the daily limit with an invoice above its limit: the source counts, then the invoice
+    // limit denies.
+    f.advance(10);
+    let mut e = f.transfer(60, 0);
+    e.7.set(Symbol::new(&f.env, "invoice"), AllowitValue::Int(1));
+    assert_eq!(
+        f.run(&e),
+        denied(CATCHING, AllowitError::PaymentLimitExceeded)
+    );
+    assert_eq!(f.persistent_state(OVER_KEY).unwrap().0.len(), 0);
+    // The next run writes nothing: the denied run's count never reaches it.
+    f.advance(10);
+    assert_eq!(f.run(&f.transfer(10, 0)), Ok(()));
+    assert_eq!(f.persistent_state(OVER_KEY).unwrap().0.len(), 0);
+}
+
+#[test]
+fn a_daily_state_entry_lives_one_window_and_a_read_never_extends_it() {
+    let f = Fixture::new(DAILY_STATE);
+    // The source reads no figure and creates no persistent entry.
+    assert_eq!(f.client().state().kept, 0);
+    assert!(f.daily_state(DAY_PAYMENTS_KEY).is_none());
+    let start = f.env.ledger().sequence();
+    assert_eq!(f.run(&f.transfer(10, 0)), Ok(()));
+    // The first write opens a window: the entry holds its end ledger and lives that long.
+    let (raw, ttl) = f.daily_state(DAY_PAYMENTS_KEY).unwrap();
+    let mut value = [0u8; 68];
+    raw.copy_into_slice(&mut value[..raw.len() as usize]);
+    assert_eq!(&value[..4], &(start + DAY_LEDGERS - 1).to_be_bytes());
+    assert_eq!(ttl, DAY_LEDGERS - 1);
+    f.advance(100);
+    assert_eq!(f.run(&f.transfer(10, 0)), Ok(()));
+    // A write in an open window keeps its end and its lifetime.
+    assert_eq!(
+        f.daily_state(DAY_PAYMENTS_KEY).unwrap().1,
+        DAY_LEDGERS - 101
+    );
+    // Two payments today: the third is denied, and the denial writes nothing.
+    f.advance(100);
+    assert_eq!(
+        f.run(&f.transfer(10, 0)),
+        denied(DAILY_STATE, AllowitError::CallLimitExceeded)
+    );
+    // Someone pays to keep the entry alive past its end ledger: after that ledger it still reads
+    // as absent.
+    f.env.as_contract(&f.wallet, || {
+        f.env
+            .storage()
+            .temporary()
+            .extend_ttl(&DAY_PAYMENTS_KEY, DAY_LEDGERS, DAY_LEDGERS)
+    });
+    f.advance(DAY_LEDGERS - 200);
+    assert!(f.daily_state(DAY_PAYMENTS_KEY).is_some());
+    assert_eq!(f.run(&f.transfer(10, 0)), Ok(()));
+    // The new window starts now and the entry lives one window again.
+    let now = f.env.ledger().sequence();
+    let (raw, ttl) = f.daily_state(DAY_PAYMENTS_KEY).unwrap();
+    raw.copy_into_slice(&mut value[..raw.len() as usize]);
+    assert_eq!(&value[..4], &(now + DAY_LEDGERS - 1).to_be_bytes());
+    assert_eq!(ttl, DAY_LEDGERS - 1);
+    assert_eq!(f.balance(&f.asset, &f.recipient), 30);
+}
+
+/// A policy that declares one persistent and one daily entry, for direct calls of the state
+/// functions.
+struct Declared;
+impl AllowitPolicy for Declared {
+    const KIND: &'static str = "declared";
+    const STATE: &'static [AllowitStateKey] = &[
+        AllowitStateKey {
+            name: "note",
+            key: 1,
+            daily: false,
+        },
+        AllowitStateKey {
+            name: "day_note",
+            key: 2,
+            daily: true,
+        },
+    ];
+    fn check(_: &AllowitContext, _: &Vec<AllowitRule>) -> Result<(), AllowitWalletError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_state_value_over_its_bound_or_an_undeclared_key_is_refused() {
+    let f = Fixture::new(SIMPLE);
+    let env = &f.env;
+    f.env.as_contract(&f.wallet, || {
+        let before: [Slot; MAX_POLICY_STATE] = Default::default();
+        let text =
+            |len: usize| AllowitValue::Str(soroban_sdk::String::from_str(env, &"x".repeat(len)));
+        let write = |key: &str, value: AllowitValue| {
+            let mut state = Map::new(env);
+            state.set(Symbol::new(env, key), value);
+            write_policy_state::<Declared>(env, &state, &before)
+        };
+        // 62 text bytes pack into 64: the most that a value holds.
+        assert_eq!(write("note", text(62)), Ok(()));
+        assert_eq!(write("day_note", text(62)), Ok(()));
+        assert_eq!(
+            write("note", text(63)),
+            Err(AllowitWalletError::InvalidState)
+        );
+        assert_eq!(
+            write("day_note", text(63)),
+            Err(AllowitWalletError::InvalidState)
+        );
+        // A key that the build did not declare is never stored.
+        assert_eq!(
+            write("other", AllowitValue::Int(1)),
+            Err(AllowitWalletError::InvalidState)
+        );
+        // Both entries read back with their values.
+        let slots = read_policy_state::<Declared>(env).unwrap();
+        assert_eq!(slots[0].value, Some(text(62)));
+        assert_eq!(slots[1].value, Some(text(62)));
+    });
 }
 
 #[test]
