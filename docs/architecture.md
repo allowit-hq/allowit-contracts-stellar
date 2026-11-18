@@ -588,8 +588,9 @@ The request names the gas that the wallet repays in XLM and its payee, the serve
 account. The repayment is at most the owner-signed gas cap; a wallet without XLM repays zero. For
 an XLM wallet the gas units equal the repaid stroops and count against the limits. The rail signs
 the fee bound of the simulated resource fee plus the inclusion fee plus a 1% margin as the gas; the
-sending account declares that bound as the fee while the final simulation fits it. A repayment
-above the fee charged is carried to the wallet's next request. The [rail
+sending account declares that bound as the fee while the final simulation fits it. The server
+keeps the part of a repayment above the fee charged and subtracts it from the wallet's next
+repayment, down to zero; the wallet counts what it repays. The [rail
 guide](../crates/allowit-stellar/README.md) gives the steps.
 
 `execute` checks the operation that the tier runs, the immutable asset, amounts, positive debit,

@@ -404,13 +404,14 @@ const REPRICE_ROUNDS: u8 = 2;
 /// first refusal is the answer. The caller then simulates the operation again with the returned
 /// terms, which decides the policy and the declared fee, and prices it again when that
 /// simulation needs a higher bound.
-/// The expense of `terms` at the fee bound `fee`: the default repayment follows the bound, and
-/// an explicit repayment keeps its gas.
+/// The expense of `terms` at the fee bound `fee`: the default repayment follows the bound less
+/// the gas carry, and an explicit repayment keeps its gas. It always starts from the caller's
+/// `ceiling`, so a price taken again subtracts the carry once.
 fn bounded(terms: &ExecutionTerms, ceiling: &ExpenseBounds, fee: u32) -> Result<ExpenseBounds> {
     if terms.gas.is_some() {
         ceiling.with_fee_bound_only(fee)
     } else {
-        ceiling.with_fee_bound(fee)
+        ceiling.with_fee_bound(fee)?.with_gas_carry(terms.gas_carry)
     }
 }
 fn priced_terms(
@@ -431,6 +432,7 @@ fn priced_terms(
             expense: Some(bounded(terms, ceiling, fee.min(ceiling.max_fee_stroops))?),
             gas: terms.gas.clone(),
             sender: terms.sender.clone(),
+            gas_carry: terms.gas_carry,
         })
     };
     let resource_fee = |fee: u32| -> Result<i64> {
@@ -1156,36 +1158,57 @@ pub fn validate_settled_policy_packet(
     Ok(())
 }
 
+/// The positional request of the `execute` invocation of a confirmed transaction: `None` for a
+/// failed transaction, which counts and repays nothing, and for a transaction that invokes no
+/// policy wallet.
+fn executed_request(receipt: &VerifiedReceipt) -> Result<Option<Vec<ScVal>>> {
+    if receipt.status != OperationStatus::Confirmed {
+        return Ok(None);
+    }
+    let TransactionEnvelope::Tx(envelope) = read(&receipt.envelope_xdr)? else {
+        return Ok(None);
+    };
+    let Some(OperationBody::InvokeHostFunction(op)) =
+        envelope.tx.operations.first().map(|op| &op.body)
+    else {
+        return Ok(None);
+    };
+    let HostFunction::InvokeContract(call) = &op.host_function else {
+        return Ok(None);
+    };
+    match call
+        .args
+        .first()
+        .filter(|_| call.function_name.0.as_slice() == b"execute")
+    {
+        Some(ScVal::Vec(Some(request))) => Ok(Some(request.to_vec())),
+        _ => Ok(None),
+    }
+}
 /// The gas units that the wallet contract counted against its limits for the transaction of
 /// `receipt`: the `gas_units` of the expense that its `execute` invocation carries. Zero for a
 /// failed transaction, which counts nothing, for an unpriced request and for a transaction that
 /// invokes no policy wallet.
 pub fn counted_gas_units(receipt: &VerifiedReceipt) -> Result<i128> {
-    if receipt.status != OperationStatus::Confirmed {
-        return Ok(0);
-    }
-    let TransactionEnvelope::Tx(envelope) = read(&receipt.envelope_xdr)? else {
-        return Ok(0);
-    };
-    let Some(OperationBody::InvokeHostFunction(op)) =
-        envelope.tx.operations.first().map(|op| &op.body)
-    else {
-        return Ok(0);
-    };
-    let HostFunction::InvokeContract(call) = &op.host_function else {
+    let Some(request) = executed_request(receipt)? else {
         return Ok(0);
     };
     // The positional request: its expense is field 4, `Priced(gas, conversion, spent, observed)`.
-    let Some(ScVal::Vec(Some(request))) = call
-        .args
-        .first()
-        .filter(|_| call.function_name.0.as_slice() == b"execute")
-    else {
-        return Ok(0);
-    };
     match request.get(4) {
         Some(ScVal::Vec(Some(variant))) if variant.len() == 5 => wide(&variant[1]),
         _ => Ok(0),
+    }
+}
+/// The stroops that the wallet repaid to the sending account for the network fee in the
+/// transaction of `receipt`: field 5 of its `execute` request. Zero for a failed transaction,
+/// which repays nothing, and for a transaction that invokes no policy wallet.
+pub fn repaid_gas_stroops(receipt: &VerifiedReceipt) -> Result<u128> {
+    let Some(request) = executed_request(receipt)? else {
+        return Ok(0);
+    };
+    match request.get(5) {
+        Some(value) => u128::try_from(wide(value)?).map_err(|_| "A negative gas repayment".into()),
+        None => Err("The execute request has no gas repayment".into()),
     }
 }
 /// Read a verified terminal receipt. Absence remains unknown and does not release reservations.

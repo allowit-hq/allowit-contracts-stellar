@@ -1205,6 +1205,7 @@ fn terms(principal: i128, ledger: u32) -> ExecutionTerms {
         expense: Some(ExpenseBounds::xlm(principal, 0, MAX_FEE, ledger - 1, NOW).unwrap()),
         gas: None,
         sender: Some(sender()),
+        gas_carry: 0,
     }
 }
 fn seal(chain: &ModelChain, authorized: &SignedOperation) -> Result<SignedOperation> {
@@ -1265,13 +1266,15 @@ fn run(
     let settled =
         rpc::receipt_by_hash(chain, &c.network, &sealed.transaction_hash)?.ok_or("no receipt")?;
     rpc::validate_settled_policy_packet(&sealed, &settled)?;
-    // The settled transaction reports the gas that the wallet counted for it.
+    // The settled transaction reports the gas that the wallet counted for it and repaid.
     assert_eq!(rpc::counted_gas_units(&settled)?, gas());
+    assert_eq!(rpc::repaid_gas_stroops(&settled)?, gas() as u128);
     let failed = rpc::VerifiedReceipt {
         status: OperationStatus::Failed,
         ..settled
     };
     assert_eq!(rpc::counted_gas_units(&failed)?, 0);
+    assert_eq!(rpc::repaid_gas_stroops(&failed)?, 0);
     Ok(sealed)
 }
 fn submit(chain: &ModelChain, name: &str, xdr: &str, seed: &[u8; 32]) {
@@ -1286,8 +1289,10 @@ fn submit(chain: &ModelChain, name: &str, xdr: &str, seed: &[u8; 32]) {
         .unwrap()
         .unwrap();
     assert_eq!(receipt.status, OperationStatus::Confirmed);
-    // An owner or upload transaction is no wallet execution: no limit counts gas for it.
+    // An owner or upload transaction is no wallet execution: no limit counts gas for it, and
+    // the wallet repays none.
     assert_eq!(rpc::counted_gas_units(&receipt).unwrap(), 0);
+    assert_eq!(rpc::repaid_gas_stroops(&receipt).unwrap(), 0);
 }
 fn owner_submit(chain: &ModelChain, name: &str, xdr: &str) {
     submit(chain, name, xdr, &OWNER);
@@ -1661,6 +1666,7 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
         expense: Some(ExpenseBounds::xlm(0, 0, MAX_FEE, ledger - 1, NOW).unwrap()),
         gas: None,
         sender: Some(sender()),
+        gas_carry: 0,
     };
     run(&chain, &c, &deposit, &priced(ledger), "deposit").unwrap();
     let ledger = chain.ledger();
@@ -2068,6 +2074,37 @@ fn a_fee_bound_covers_the_declared_fee_and_lowers_gas_rounded_up() {
     for fee in [0, 5_000_001] {
         assert!(xlm.with_fee_bound(fee).is_err(), "{fee}");
     }
+    // A gas carry: the wallet repays the bound less the carry, at least zero, and an XLM wallet
+    // counts exactly that. The fee bound stays.
+    let bound = xlm.with_fee_bound(2_670_684).unwrap();
+    assert_eq!(bound.with_gas_carry(0).unwrap(), bound);
+    let carried = bound.with_gas_carry(670_684).unwrap();
+    assert_eq!(
+        (
+            carried.gas_units,
+            carried.spent_units,
+            carried.max_fee_stroops,
+            bound.repaid_after_carry(670_684)
+        ),
+        (2_000_000, 4_000_000, 2_670_684, 2_000_000)
+    );
+    let covered = bound.with_gas_carry(3_000_000).unwrap();
+    assert_eq!(
+        (
+            covered.gas_units,
+            covered.spent_units,
+            bound.repaid_after_carry(3_000_000),
+            bound.repaid_after_carry(u128::MAX)
+        ),
+        (0, 2_000_000, 0, 0)
+    );
+    // Another asset: the gas falls in proportion and rounds up, so it stays above zero while the
+    // wallet repays any stroop.
+    let other = priced.with_fee_bound(2_670_684).unwrap();
+    let half = other.with_gas_carry(1_335_342).unwrap();
+    assert_eq!((half.gas_units, half.spent_units), (164_858, 165_558));
+    assert_eq!(other.with_gas_carry(2_670_683).unwrap().gas_units, 1);
+    assert_eq!(other.with_gas_carry(2_670_684).unwrap().gas_units, 0);
     let negative = ExpenseBounds {
         gas_units: -1,
         ..xlm
@@ -2237,6 +2274,7 @@ fn a_simple_wallet_counts_the_gross_volume_of_a_lossless_deposit() {
         expense: Some(ExpenseBounds::xlm(0, 0, MAX_FEE, ledger - 1, NOW).unwrap()),
         gas: None,
         sender: Some(sender()),
+        gas_carry: 0,
     };
     run(&chain, &c, &deposit, &lossless, "deposit").unwrap();
     // The deposit spent only its gas; its gross amount fills the day's volume.
@@ -2477,6 +2515,101 @@ fn an_explicit_gas_repayment_keeps_its_gas_through_pricing() {
         )
         .unwrap_err()
         .contains("differs from the gas that the wallet repays")
+    );
+}
+#[test]
+fn a_gas_carry_lowers_the_repayment_and_the_gas_that_the_wallet_counts() {
+    let wasm = wasm_for(PolicyTier::Common);
+    let chain = ModelChain::new(BTreeMap::from([(hash(&wasm), PolicyTier::Common)]));
+    let c = create(&chain, PolicyTier::Common, &wasm, [0x36; 32]);
+    let recipient = account_for_seed(&RECIPIENT);
+    // A carry below the priced bound leaves the rest to repay; a carry above it repays nothing
+    // and counts no gas. The transaction still declares the whole bound.
+    for (id, carry) in [(1u8, 300u128), (2, gas() as u128 * 3)] {
+        let state = sending_state(&chain, &c);
+        let ledger = chain.ledger();
+        let transfer = request::transfer(&c, &state, [id; 32], &recipient, 1_000_000).unwrap();
+        let carried = ExecutionTerms {
+            gas_carry: carry,
+            ..terms(1_000_000, ledger)
+        };
+        let prepared = rpc::prepare_with(
+            &chain,
+            &c,
+            &transfer,
+            &carried,
+            Some(chain.accounting()),
+            NOW,
+            NOW + 300,
+        )
+        .unwrap();
+        let repaid = (gas() - carry as i128).max(0);
+        let expense = prepared.terms.expense.as_ref().unwrap();
+        assert_eq!(
+            (
+                expense.gas_units,
+                expense.spent_units,
+                i128::from(expense.max_fee_stroops)
+            ),
+            (repaid, 1_000_000 + repaid, gas())
+        );
+        let before = chain.balance();
+        let served = authorize_server(&prepared, &SERVER, NOW, None).unwrap();
+        let simulated = rpc::simulate(&chain, &served).unwrap();
+        let proof = sign(&simulated, &AGENT, NOW).unwrap();
+        let signed = authorize(&simulated, &[proof], NOW).unwrap();
+        let sealed = seal(&chain, &signed).unwrap();
+        let x::TransactionEnvelope::Tx(envelope) = de(&sealed.transaction_xdr) else {
+            panic!()
+        };
+        assert_eq!(i128::from(envelope.tx.fee), gas());
+        chain.step("transfer");
+        assert_eq!(
+            rpc::broadcast(&chain, &sealed, NOW).unwrap(),
+            rpc::Broadcast::Submitted
+        );
+        assert_eq!(chain.balance(), before - 1_000_000 - repaid);
+        let settled = rpc::receipt_by_hash(&chain, &c.network, &sealed.transaction_hash)
+            .unwrap()
+            .unwrap();
+        rpc::validate_settled_policy_packet(&sealed, &settled).unwrap();
+        assert_eq!(
+            (
+                rpc::repaid_gas_stroops(&settled).unwrap(),
+                rpc::counted_gas_units(&settled).unwrap()
+            ),
+            (repaid as u128, repaid)
+        );
+    }
+    // An explicit repayment takes no carry.
+    let state = sending_state(&chain, &c);
+    let ledger = chain.ledger();
+    let transfer = request::transfer(&c, &state, [3; 32], &recipient, 1_000_000).unwrap();
+    let both = ExecutionTerms {
+        expense: Some(ExpenseBounds {
+            gas_units: 500,
+            spent_units: 1_000_500,
+            ..ExpenseBounds::xlm(1_000_000, 0, MAX_FEE, ledger - 1, NOW).unwrap()
+        }),
+        gas: Some(GasRepayment {
+            stroops: 500,
+            payee: sender(),
+        }),
+        gas_carry: 100,
+        ..terms(1_000_000, ledger)
+    };
+    assert!(
+        rpc::prepare_with(
+            &chain,
+            &c,
+            &transfer,
+            &both,
+            Some(chain.accounting()),
+            NOW,
+            NOW + 300
+        )
+        .unwrap_err()
+        .contains("takes no gas carry")
     );
 }
 #[test]
