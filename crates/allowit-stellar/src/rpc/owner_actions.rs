@@ -1,5 +1,6 @@
 //! Native observations and original-owner-packet settlement. No polling, retries or storage.
 use super::*;
+use std::sync::atomic::Ordering;
 
 /// Whether an exact code entry is currently live. False does not prove it never existed.
 pub fn code_uploaded(rpc: &dyn Rpc, network: &str, code: &[u8; 32]) -> Result<bool> {
@@ -42,7 +43,7 @@ pub fn current_code_state(
     rpc: &dyn Rpc,
     network: &str,
     code: &[u8; 32],
-    seen: &std::cell::Cell<u32>,
+    seen: &std::sync::atomic::AtomicU32,
 ) -> Result<CodeState> {
     let key = code_key(code)?;
     for _ in 0..2 {
@@ -50,8 +51,11 @@ pub fn current_code_state(
         let before = owner_observation::head(rpc)?;
         let (live_until, observed) = entry_reply(rpc, &key)?;
         let closing = owner_observation::head(rpc)?;
-        let highest = seen.get().max(before).max(observed).max(closing);
-        seen.set(highest);
+        let highest = seen
+            .fetch_max(before.max(observed).max(closing), Ordering::SeqCst)
+            .max(before)
+            .max(observed)
+            .max(closing);
         match live_until {
             Some(until) if until >= highest => return Ok(CodeState::Live),
             Some(_) if observed == highest => return Ok(CodeState::Lapsed),
@@ -60,6 +64,36 @@ pub fn current_code_state(
         }
     }
     Err("The observation of the wallet code trails the network's head".into())
+}
+/// An RPC transport that keeps the highest ledger that its replies name: the sequence of
+/// `getLatestLedger` and the `latestLedger` of every other reply. A decision that makes all its
+/// calls through it, its preparation and its sends included, passes `seen` to
+/// `current_code_state`, so no ledger that any of its replies named is forgotten.
+pub struct LedgerMark<'a> {
+    rpc: &'a dyn Rpc,
+    pub seen: std::sync::atomic::AtomicU32,
+}
+impl<'a> LedgerMark<'a> {
+    pub fn new(rpc: &'a dyn Rpc) -> Self {
+        Self {
+            rpc,
+            seen: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+}
+impl Rpc for LedgerMark<'_> {
+    fn call(&self, method: &str, params: Value) -> Result<Value> {
+        let value = self.rpc.call(method, params)?;
+        let named = if method == "getLatestLedger" {
+            &value["sequence"]
+        } else {
+            &value["latestLedger"]
+        };
+        if let Some(ledger) = named.as_u64().and_then(|v| u32::try_from(v).ok()) {
+            self.seen.fetch_max(ledger, Ordering::SeqCst);
+        }
+        Ok(value)
+    }
 }
 fn code_key(code: &[u8; 32]) -> Result<LedgerKey> {
     if *code == [0; 32] {

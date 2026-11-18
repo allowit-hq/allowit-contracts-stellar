@@ -371,6 +371,17 @@ struct Model {
     /// The `heads` and `replica_code_reads` that the answer `TRY_AGAIN_LATER` starts.
     heads_on_retry_later: Vec<u32>,
     replica_reads_on_retry_later: Vec<u32>,
+    /// A replica at this ledger answers every head and every read of a code entry; it serves
+    /// the code as lapsed.
+    replica_ledger: Option<u32>,
+    /// The next restoration's simulation answers one ledger later, at which another account
+    /// restored the code, and a replica at the earlier ledger answers from the second network
+    /// check after it on (the first one closes the simulation's own observation).
+    replica_after_restore_simulation: bool,
+    replica_from_network_check: Option<(u32, u32)>,
+    /// The answer `TRY_AGAIN_LATER` names one ledger later, at which another account restored
+    /// the code, and a replica at the earlier ledger answers from then on.
+    replica_on_retry_later: bool,
     tiers: BTreeMap<[u8; 32], PolicyTier>,
     wallet: Option<Wallet>,
     settled: BTreeMap<String, String>,
@@ -600,9 +611,19 @@ impl rpc::Rpc for ModelChain {
     fn call(&self, method: &str, params: Value) -> Result<Value> {
         let mut m = self.0.lock().unwrap();
         match method {
-            "getNetwork" => Ok(json!({"passphrase": passphrase(NETWORK)?})),
+            "getNetwork" => {
+                if let Some((ledger, checks)) = m.replica_from_network_check {
+                    m.replica_from_network_check = if checks <= 1 {
+                        m.replica_ledger = Some(ledger);
+                        None
+                    } else {
+                        Some((ledger, checks - 1))
+                    };
+                }
+                Ok(json!({"passphrase": passphrase(NETWORK)?}))
+            }
             "getLatestLedger" => {
-                let head = m.heads.pop_front().unwrap_or(m.ledger);
+                let head = m.heads.pop_front().or(m.replica_ledger).unwrap_or(m.ledger);
                 Ok(json!({"sequence": head}))
             }
             "getLedgerEntries" => {
@@ -613,7 +634,7 @@ impl rpc::Rpc for ModelChain {
                 }
                 if let x::LedgerKey::ContractCode(code) = &key
                     && let Some(bytes) = m.code_bytes.get(&code.hash.0).cloned()
-                    && let Some(ledger) = m.replica_code_reads.pop_front()
+                    && let Some(ledger) = m.replica_code_reads.pop_front().or(m.replica_ledger)
                 {
                     let entry = x::LedgerEntryData::ContractCode(x::ContractCodeEntry {
                         ext: x::ContractCodeEntryExt::V0,
@@ -777,6 +798,10 @@ impl rpc::Rpc for ModelChain {
                     data.resources.footprint.read_write = archived.try_into().unwrap();
                     m.behind_head_code_reads =
                         std::mem::take(&mut m.behind_reads_on_restore_simulation);
+                    if std::mem::take(&mut m.replica_after_restore_simulation) {
+                        m.replica_from_network_check = Some((m.ledger, 2));
+                        m.ledger += 1;
+                    }
                     if m.restored_after_simulation {
                         m.restored_after_simulation = false;
                         for key in data.resources.footprint.read_write.iter() {
@@ -1028,7 +1053,15 @@ impl rpc::Rpc for ModelChain {
                     m.heads = std::mem::take(&mut m.heads_on_retry_later).into();
                     m.replica_code_reads =
                         std::mem::take(&mut m.replica_reads_on_retry_later).into();
-                    return Ok(json!({"hash": tx_hash, "status": "TRY_AGAIN_LATER"}));
+                    if std::mem::take(&mut m.replica_on_retry_later) {
+                        m.replica_ledger = Some(m.ledger);
+                        m.ledger += 1;
+                    }
+                    return Ok(json!({
+                        "hash": tx_hash,
+                        "status": "TRY_AGAIN_LATER",
+                        "latestLedger": m.ledger,
+                    }));
                 }
                 // The source signs alone.
                 let source = source_of(&env.tx);
@@ -4214,7 +4247,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     assert!(refused.contains("trails"), "{refused}");
     // The highest ledger seen holds across the reads of one decision: a later read from a
     // replica behind it does not decide.
-    let seen = std::cell::Cell::new(0);
+    let seen = std::sync::atomic::AtomicU32::new(0);
     assert_eq!(
         rpc::current_code_state(&*chain, NETWORK, &installed, &seen).unwrap(),
         rpc::CodeState::Lapsed
@@ -4250,6 +4283,46 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     {
         let m = chain.0.lock().unwrap();
         assert!(m.heads.is_empty() && m.replica_code_reads.is_empty());
+        assert!(!m.lapsed_code.contains(&installed));
+    }
+    // The restoration's simulation answers at H+1, where another account restored the code, and
+    // the checks before the signature and before the send read wholly from a replica at H: the
+    // ledgers that the preparation saw count, so nothing is signed.
+    {
+        let mut m = chain.0.lock().unwrap();
+        m.lapsed_code.insert(installed);
+        m.restored_after_simulation = true;
+        m.replica_after_restore_simulation = true;
+    }
+    let signed = signatures();
+    let refused = provider
+        .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+        .unwrap_err();
+    assert!(refused.message.contains("trails"), "{}", refused.message);
+    assert_eq!(signatures(), signed);
+    {
+        let mut m = chain.0.lock().unwrap();
+        assert!(m.replica_ledger.is_some() && m.replica_from_network_check.is_none());
+        m.replica_ledger = None;
+        assert!(!m.lapsed_code.contains(&installed));
+    }
+    // The answer TRY_AGAIN_LATER names H+1, where another account restored the code, and the
+    // check before the repeated send reads wholly from a replica at H: the ledger of the send's
+    // answer counts, so nothing is sent again.
+    {
+        let mut m = chain.0.lock().unwrap();
+        m.lapsed_code.insert(installed);
+        m.retry_later_restores = Some(installed);
+        m.replica_on_retry_later = true;
+    }
+    let refused = provider
+        .restore_code_within(&installation, ceiling, quick, NOW)
+        .unwrap_err();
+    assert!(refused.message.contains("trails"), "{}", refused.message);
+    {
+        let mut m = chain.0.lock().unwrap();
+        assert!(m.replica_ledger.is_some());
+        m.replica_ledger = None;
         assert!(!m.lapsed_code.contains(&installed));
     }
     // Another account restores the code while the sending account signs: the restoration is

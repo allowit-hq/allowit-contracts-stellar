@@ -147,15 +147,16 @@ impl Runtime {
         envelope_xdr: &str,
         poll: Poll,
     ) -> native::Result<rpc::VerifiedReceipt> {
-        self.send_and_poll_while(network, envelope_xdr, poll, &|| Ok(true))?
+        Self::send_and_poll_while(self.rpc(), network, envelope_xdr, poll, &|| Ok(true))?
             .ok_or_else(|| "A needed transaction was not sent".into())
     }
     /// As `send_and_poll`, for a transaction that another one can make needless before it is
     /// accepted. Each send until the network accepts one, the first included, goes out only
     /// while `needed` answers true; otherwise no send was accepted, and the answer is `None`.
     /// Once a send is accepted, or its outcome is uncertain, only its hash is looked up.
+    /// The calls go through `rpc`, so a caller can observe their replies.
     pub fn send_and_poll_while(
-        &self,
+        rpc: &dyn rpc::Rpc,
         network: &str,
         envelope_xdr: &str,
         poll: Poll,
@@ -179,7 +180,7 @@ impl Runtime {
                 return Ok(None);
             }
             if !sent {
-                match rpc::send_transaction(self.rpc(), network, envelope_xdr)? {
+                match rpc::send_transaction(rpc, network, envelope_xdr)? {
                     rpc::Broadcast::Submitted => sent = true,
                     rpc::Broadcast::RetryLater => continue,
                     rpc::Broadcast::Unknown => {
@@ -187,7 +188,7 @@ impl Runtime {
                     }
                     rpc::Broadcast::Rejected { error_result_xdr } => {
                         if let Some(receipt) =
-                            rpc::receipt_by_hash(self.rpc(), network, &hash).map_err(unknown)?
+                            rpc::receipt_by_hash(rpc, network, &hash).map_err(unknown)?
                         {
                             return Ok(Some(receipt));
                         }
@@ -198,9 +199,7 @@ impl Runtime {
                     }
                 }
             }
-            if let Some(receipt) =
-                rpc::receipt_by_hash(self.rpc(), network, &hash).map_err(unknown)?
-            {
+            if let Some(receipt) = rpc::receipt_by_hash(rpc, network, &hash).map_err(unknown)? {
                 return Ok(Some(receipt));
             }
         }

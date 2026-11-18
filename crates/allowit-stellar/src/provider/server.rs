@@ -458,7 +458,10 @@ impl Provider {
             Some(wasm) => checked(native::admin::check_wallet_code(wasm))?,
             None => c.module_digest,
         };
-        let state = checked(rpc::code_state(self.rpc(), &c.network, &code_hash))?;
+        // Every call of this decision, its sends included, goes through one mark of the highest
+        // ledger that its replies name.
+        let mark = rpc::LedgerMark::new(self.rpc());
+        let state = checked(rpc::code_state(&mark, &c.network, &code_hash))?;
         if state == rpc::CodeState::Live {
             return Ok(None);
         }
@@ -472,7 +475,7 @@ impl Provider {
         // within the ceiling.
         let live = || {
             matches!(
-                rpc::code_state(self.rpc(), &c.network, &code_hash),
+                rpc::code_state(&mark, &c.network, &code_hash),
                 Ok(rpc::CodeState::Live)
             )
         };
@@ -490,7 +493,7 @@ impl Provider {
             // the simulation sets it, within the ceiling. Lapsed code is restored, never
             // uploaded again: the network refuses an upload of code that its archive holds.
             let deployer = native::admin::Deployer {
-                rpc: self.rpc(),
+                rpc: &mark,
                 network: &c.network,
                 now,
                 max_fee_stroops,
@@ -522,12 +525,8 @@ impl Provider {
         };
         // A negative read that decides a paid transaction is dated at the highest ledger that the
         // decision has seen, here and before every send.
-        let seen = std::cell::Cell::new(0);
         match checked(rpc::current_code_state(
-            self.rpc(),
-            &c.network,
-            &code_hash,
-            &seen,
+            &mark, &c.network, &code_hash, &mark.seen,
         )) {
             Ok(rpc::CodeState::Live) => return Ok(None),
             Ok(_) => {}
@@ -547,7 +546,8 @@ impl Provider {
         // Each send until the network accepts one, the first included, goes out only while a read
         // dated at the highest ledger seen shows the code not live: another transaction can
         // restore or upload it while the transaction is signed or waits.
-        let Some(receipt) = checked(self.runtime.send_and_poll_while(
+        let Some(receipt) = checked(crate::provider::runtime::Runtime::send_and_poll_while(
+            &mark,
             &c.network,
             &signed,
             crate::provider::runtime::Poll {
@@ -556,7 +556,7 @@ impl Provider {
             },
             &|| {
                 Ok(
-                    rpc::current_code_state(self.rpc(), &c.network, &code_hash, &seen)?
+                    rpc::current_code_state(&mark, &c.network, &code_hash, &mark.seen)?
                         != rpc::CodeState::Live,
                 )
             },
