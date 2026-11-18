@@ -313,6 +313,14 @@ struct Model {
     /// Uploaded code past its lifetime: Stellar RPC serves it with a live-until ledger of 0,
     /// an upload of it fails and a `RestoreFootprint` of its entry makes it live again.
     lapsed_code: BTreeSet<[u8; 32]>,
+    /// The next restorations fail when the ledger applies them: the code stays lapsed and the
+    /// source still pays the fee.
+    failing_restore: bool,
+    /// The archived entries that a restoration's simulation names, by their index in the
+    /// read-write footprint.
+    restore_archived: Vec<u32>,
+    /// The transactions that the ledger included and failed.
+    failed: BTreeSet<String>,
     tiers: BTreeMap<[u8; 32], PolicyTier>,
     wallet: Option<Wallet>,
     settled: BTreeMap<String, String>,
@@ -635,10 +643,15 @@ impl rpc::Rpc for ModelChain {
                     let x::TransactionExt::V1(data) = &env.tx.ext else {
                         return Ok(json!({"error": "a restoration names its footprint"}));
                     };
-                    let data = x::SorobanTransactionData {
+                    let mut data = x::SorobanTransactionData {
                         resource_fee: RESTORE_FEE,
                         ..data.clone()
                     };
+                    if !m.restore_archived.is_empty() {
+                        data.ext = x::SorobanTransactionDataExt::V1(x::SorobanResourcesExtV0 {
+                            archived_soroban_entries: m.restore_archived.clone().try_into().unwrap(),
+                        });
+                    }
                     return Ok(json!({
                         "latestLedger": m.ledger,
                         "minResourceFee": RESTORE_FEE.to_string(),
@@ -822,7 +835,13 @@ impl rpc::Rpc for ModelChain {
                         let x::LedgerKey::ContractCode(code) = key else {
                             panic!("the model restores code only")
                         };
-                        assert!(m.lapsed_code.remove(&code.hash.0), "restore of live code");
+                        assert!(m.lapsed_code.contains(&code.hash.0), "restore of live code");
+                        if !m.failing_restore {
+                            m.lapsed_code.remove(&code.hash.0);
+                        }
+                    }
+                    if m.failing_restore {
+                        m.failed.insert(tx_hash.clone());
                     }
                     let name = std::mem::take(&mut m.pending_name);
                     m.steps
@@ -869,13 +888,18 @@ impl rpc::Rpc for ModelChain {
                 let Some(envelope) = m.settled.get(tx_hash) else {
                     return Ok(json!({"status": "NOT_FOUND"}));
                 };
+                let failed = m.failed.contains(tx_hash);
                 let result = x::TransactionResult {
                     fee_charged: 100,
-                    result: x::TransactionResultResult::TxSuccess(Default::default()),
+                    result: if failed {
+                        x::TransactionResultResult::TxFailed(Default::default())
+                    } else {
+                        x::TransactionResultResult::TxSuccess(Default::default())
+                    },
                     ext: x::TransactionResultExt::V0,
                 };
                 Ok(
-                    json!({"status": "SUCCESS", "ledger": m.ledger, "envelopeXdr": envelope, "resultXdr": b64(&result)}),
+                    json!({"status": if failed { "FAILED" } else { "SUCCESS" }, "ledger": m.ledger, "envelopeXdr": envelope, "resultXdr": b64(&result)}),
                 )
             }
             other => panic!("unexpected RPC {other}"),
@@ -2669,6 +2693,29 @@ fn a_contract_wallet_reports_the_roles_that_its_configuration_holds() {
     assert_eq!(weight(&c.wallet), 0);
     assert!(state.policy_role_weight("not an address").is_err());
 }
+/// A wallet that counts an asset other than XLM converts its whole repayment once, at the rate of
+/// the server's ceiling: a due that fills the gas cap counts the ceiling's asset units, not the
+/// rounded units of a small fee bound scaled up to the repayment.
+#[test]
+fn a_gas_due_of_another_asset_counts_units_at_the_ceiling_rate() {
+    // The ceiling prices 1,000,000 stroops at 10 asset units, over a principal of 5.
+    let ceiling = ExpenseBounds {
+        gas_units: 10,
+        spent_units: 15,
+        ..ExpenseBounds::xlm(5, 0, 1_000_000, LEDGER, NOW).unwrap()
+    };
+    let (priced, part) = ceiling
+        .with_repayment(2_000, 0, 2_000_000, 1_000_000)
+        .unwrap();
+    // Without a carry or a due the conversion is the fee bound's own.
+    assert_eq!(
+        ceiling.with_repayment(2_000, 0, 0, 1_000_000).unwrap().0,
+        ceiling.with_fee_bound(2_000).unwrap()
+    );
+    // The repayment is the bound of 2,000 and 998,000 of the due: the whole ceiling.
+    assert_eq!(part, 998_000);
+    assert_eq!((priced.gas_units, priced.spent_units, priced.max_fee_stroops), (10, 15, 2_000));
+}
 /// A fee that the server paid for the operation outside its transaction, such as the restoration
 /// of the wallet's lapsed code, joins the repayment as far as the wallet's gas cap allows, after
 /// the carry. The priced terms keep the part that the wallet repays, the wallet counts it as gas,
@@ -3165,6 +3212,72 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         assert!(m.lapsed_code.is_empty());
         assert_eq!(m.steps.last().unwrap().0, "restore before an operation");
     }
+    // A simulation that names an archived entry outside the restoration's footprint is refused
+    // before anything is signed.
+    {
+        let mut m = chain.0.lock().unwrap();
+        m.lapsed_code.insert(installed);
+        m.restore_archived = vec![1];
+    }
+    let sent = chain.0.lock().unwrap().steps.len();
+    let refused = provider
+        .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+        .unwrap_err();
+    assert!(
+        refused.message.contains("outside the read-write footprint"),
+        "{}",
+        refused.message
+    );
+    {
+        let mut m = chain.0.lock().unwrap();
+        assert_eq!(m.steps.len(), sent);
+        assert!(m.lapsed_code.contains(&installed));
+        m.restore_archived.clear();
+        // The next restoration fails when the ledger applies it.
+        m.failing_restore = true;
+    }
+    // A restoration that the ledger includes but fails leaves the code lapsed. It is an error,
+    // not a receipt of live code, and it names the transaction and the fee that the sending
+    // account paid for it, which the server accounts for.
+    chain.step("failed restoration");
+    let failed = provider
+        .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+        .unwrap_err();
+    assert!(failed.message.contains("failed on the ledger"), "{}", failed.message);
+    {
+        let m = chain.0.lock().unwrap();
+        assert!(m.lapsed_code.contains(&installed));
+        let (name, signed, ..) = m.steps.last().unwrap();
+        assert_eq!(name, "failed restoration");
+        let x::TransactionEnvelope::Tx(env) = de(signed) else {
+            panic!()
+        };
+        let details = failed.details.as_ref().expect("the failed restoration's details");
+        assert_eq!(
+            details,
+            &json!({"transactionHash": hexs(&tx_hash(&env.tx)), "nativeUnits": "100"})
+        );
+    }
+    // The upload step refuses a failed restoration too.
+    chain.step("failed restoration of the upload step");
+    assert!(
+        provider
+            .upload_code_within(&installation, &wasm, ceiling, Poll::default(), NOW)
+            .unwrap_err()
+            .message
+            .contains("failed on the ledger")
+    );
+    assert!(chain.0.lock().unwrap().lapsed_code.contains(&installed));
+    // The next restoration that the ledger applies makes the code live.
+    chain.0.lock().unwrap().failing_restore = false;
+    chain.step("restore after a failure");
+    assert!(
+        provider
+            .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+            .unwrap()
+            .is_some()
+    );
+    assert!(chain.0.lock().unwrap().lapsed_code.is_empty());
     // Code that the network does not have cannot be restored: it needs an upload.
     chain.0.lock().unwrap().code_bytes.remove(&installed);
     assert!(

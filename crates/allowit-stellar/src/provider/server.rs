@@ -427,7 +427,8 @@ impl Provider {
     /// Make wallet code live from a sending account: the code of `wasm`, or without it the
     /// installation's code. Absent code is uploaded, which needs its bytes; lapsed code is
     /// restored by its hash. A simulated fee above `max_fee_stroops` is refused before anything
-    /// is signed.
+    /// is signed. The receipt is that of a confirmed transaction: one that the ledger failed is
+    /// an error whose details name its `transactionHash` and its fee `nativeUnits`.
     fn upload(
         &self,
         i: &Installation,
@@ -495,7 +496,23 @@ impl Provider {
             &c.network,
             &p.transaction_hash,
         ))?;
-        Ok(Some(Receipt(packet(&c.network, &receipt)?)))
+        let packet = packet(&c.network, &receipt)?;
+        // A transaction that the ledger included and failed leaves the code as it was, so it is
+        // an error, never a receipt of live code. Its source still paid the fee: the error names
+        // the transaction and that fee, in stroops, for the server's accounts.
+        if receipt.status != native::OperationStatus::Confirmed {
+            let fee = receipt_info(&packet)?.fee.native_units;
+            return Err(crate::provider::failure(if state == rpc::CodeState::Lapsed {
+                "The restoration of the wallet code failed on the ledger"
+            } else {
+                "The upload of the wallet code failed on the ledger"
+            })
+            .with_details(serde_json::json!({
+                "transactionHash": native::hex(&receipt.transaction_hash),
+                "nativeUnits": fee.to_string(),
+            })));
+        }
+        Ok(Some(Receipt(packet)))
     }
     /// One owner action on a keypair wallet: a transaction from the owner's account whose
     /// operations the owner's signature authorizes alone. `Recover` without an amount closes

@@ -422,9 +422,7 @@ fn bounded(
     if terms.gas.is_some() {
         Ok((ceiling.with_fee_bound_only(fee)?, terms.gas_due))
     } else {
-        ceiling
-            .with_fee_bound(fee)?
-            .with_gas_due(terms.gas_carry, terms.gas_due, gas_cap)
+        ceiling.with_repayment(fee, terms.gas_carry, terms.gas_due, gas_cap)
     }
 }
 fn priced_terms(

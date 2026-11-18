@@ -380,9 +380,6 @@ impl ExpenseBounds {
             day: now / allowit_core::DAY,
         })
     }
-    /// These bounds with the fee bound lowered to `fee_stroops`. Gas falls pro rata and rounds
-    /// up, so it never counts less than the gas rate of these bounds prices `fee_stroops`; for
-    /// XLM it is `fee_stroops` itself. Spent units fall by the same gas.
     /// The bound of a transaction fee for terms whose gas repayment the server set itself, such
     /// as the gas that it repays after a carry: only the fee bound moves, and the gas that the
     /// wallet repays and counts stays.
@@ -432,29 +429,36 @@ impl ExpenseBounds {
             ..self.clone()
         })
     }
-    /// These bounds at their fee bound when the wallet repays the bound less `carry`, at least
-    /// zero, and also as much of `due` as fits under the gas cap `gas_cap`: stroops that the server
-    /// paid for the operation outside its transaction, such as the restoration of the wallet's
-    /// lapsed code. The gas changes in proportion to the repayment and rounds up, as for a carry,
-    /// so an XLM wallet counts exactly what it repays; spent units change by the same gas. Returns
-    /// the bounds and the part of `due` that the wallet repays.
-    pub fn with_gas_due(&self, carry: u128, due: u128, gas_cap: i128) -> Result<(Self, u128)> {
-        let base = self.repaid_after_carry(carry);
+    /// These bounds, the ceiling of the server's quote, at the transaction fee bound `fee_stroops`,
+    /// when the wallet repays that bound less `carry`, at least zero, and also as much of `due` as
+    /// fits under the gas cap `gas_cap`: stroops that the server paid for the operation outside its
+    /// transaction, such as the restoration of the wallet's lapsed code. The whole repayment converts
+    /// once, at the rate of these bounds, and rounds up, so an XLM wallet counts exactly what it
+    /// repays and another asset counts its units at the quoted rate; spent units change by the same
+    /// gas. Without a carry or a due this is [`Self::with_fee_bound`]. Returns the bounds and the part
+    /// of `due` that the wallet repays.
+    pub fn with_repayment(
+        &self,
+        fee_stroops: u32,
+        carry: u128,
+        due: u128,
+        gas_cap: i128,
+    ) -> Result<(Self, u128)> {
+        if fee_stroops == 0 || fee_stroops > self.max_fee_stroops || self.gas_units < 0 {
+            return Err("A fee bound lowers a positive fee ceiling".into());
+        }
+        let bound = i128::from(fee_stroops);
+        let base = bound - i128::try_from(carry).unwrap_or(i128::MAX).min(bound);
         let part = i128::try_from(due)
             .unwrap_or(i128::MAX)
             .min(gas_cap.saturating_sub(base).max(0));
-        if part == 0 || self.max_fee_stroops == 0 {
-            return Ok((self.with_gas_carry(carry)?, 0));
-        }
-        if self.gas_units < 0 {
-            return Err("A gas due raises nonnegative gas".into());
-        }
-        let bound = i128::from(self.max_fee_stroops);
+        let repaid = base + part;
+        let ceiling = i128::from(self.max_fee_stroops);
         let gas_units = self
             .gas_units
-            .checked_mul(base + part)
-            .and_then(|units| units.checked_add(bound - 1))
-            .map(|units| units / bound)
+            .checked_mul(repaid)
+            .and_then(|units| units.checked_add(ceiling - 1))
+            .map(|units| units / ceiling)
             .ok_or("Expense overflow")?;
         let bounds = Self {
             gas_units,
@@ -463,13 +467,14 @@ impl ExpenseBounds {
                 .checked_sub(self.gas_units)
                 .and_then(|principal| principal.checked_add(gas_units))
                 .ok_or("Expense overflow")?,
+            max_fee_stroops: fee_stroops,
             ..self.clone()
         };
-        Ok((
-            bounds,
-            u128::try_from(part).map_err(|_| "Expense overflow")?,
-        ))
+        Ok((bounds, u128::try_from(part).map_err(|_| "Expense overflow")?))
     }
+    /// These bounds with the fee bound lowered to `fee_stroops`. Gas falls pro rata and rounds
+    /// up, so it never counts less than the gas rate of these bounds prices `fee_stroops`; for
+    /// XLM it is `fee_stroops` itself. Spent units fall by the same gas.
     pub fn with_fee_bound(&self, fee_stroops: u32) -> Result<Self> {
         if fee_stroops == 0 || fee_stroops > self.max_fee_stroops || self.gas_units < 0 {
             return Err("A fee bound lowers a positive fee ceiling".into());

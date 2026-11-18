@@ -1538,6 +1538,9 @@ impl Deployer<'_> {
         {
             return Err("Restoration resources name another entry".into());
         }
+        // Archived entries are named by their index in the read-write footprint: only the code
+        // entry is there.
+        crate::rpc::archived_in_footprint(&data)?;
         let fee = response["minResourceFee"]
             .as_str()
             .ok_or("Missing restoration fee")?
