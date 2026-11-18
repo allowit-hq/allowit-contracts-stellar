@@ -649,6 +649,7 @@ pub fn revalidate_prepared(
     }
     authorization::server_signature(p, true)?;
     let mut current = trusted_state(rpc, &p.config, None)?;
+    current.source = get_account(rpc, &crate::gas_payee(&p.request, &p.terms)?)?;
     // Observation ledgers can advance without changing the transaction's authority or state.
     current.ledger = p.state.ledger;
     if current != p.state {
