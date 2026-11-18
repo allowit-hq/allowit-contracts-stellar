@@ -1581,7 +1581,8 @@ fn retained_packet_validation_does_not_recompile_source_or_grant_execution() {
 struct AdminRpc {
     base: PolicyWalletAccountRpc,
     state_contract_version: u32,
-    binding_contract_version: Option<stellar_xdr::ScVal>,
+    /// A configuration whose source hash differs from the installation's.
+    broken: bool,
     calls: Mutex<Vec<(String, Vec<stellar_xdr::ScVal>)>>,
     balance: i128,
     wrong_owner: bool,
@@ -1672,6 +1673,9 @@ impl rpc::Rpc for AdminRpc {
             } else {
                 config.owner = self.base.config.owner.clone();
             }
+            if self.broken {
+                config.source_hash[0] ^= 1;
+            }
             let mut bytes = allowit_stellar::packed::encode(&config).unwrap();
             bytes[0] = u8::try_from(self.state_contract_version).unwrap();
             storage[0].val = ScVal::Bytes(bytes.try_into().unwrap());
@@ -1751,10 +1755,7 @@ impl rpc::Rpc for AdminRpc {
         self.base.call(method, params)
     }
 }
-fn admin_fixture(
-    state_contract_version: u32,
-    binding_contract_version: Option<stellar_xdr::ScVal>,
-) -> AdminRpc {
+fn admin_fixture(state_contract_version: u32) -> AdminRpc {
     let (config, _, state) = fixture(WalletRoute::PolicyWallet, false);
     AdminRpc {
         base: PolicyWalletAccountRpc {
@@ -1763,7 +1764,7 @@ fn admin_fixture(
             paused: true,
         },
         state_contract_version,
-        binding_contract_version,
+        broken: false,
         calls: Mutex::new(vec![]),
         balance: 1234567,
         wrong_owner: false,
@@ -1779,7 +1780,7 @@ fn admin_fixture(
 fn a_retained_stop_of_a_policy_wallet_keeps_the_servers_action_names() {
     use allowit_core::admin::{Admin, DeploymentVersion};
     use allowit_stellar::{admin::OwnerAdmin, owner_intent::validate_retained_owner_transaction};
-    let rpc = admin_fixture(4, Some(stellar_xdr::ScVal::U32(4)));
+    let rpc = admin_fixture(5);
     let c = &rpc.base.config;
     let mut facade = Admin::new(OwnerAdmin {
         rpc: &rpc,
@@ -1823,8 +1824,8 @@ fn a_retained_stop_of_a_policy_wallet_keeps_the_servers_action_names() {
             source: state.source,
             paused: false,
         },
-        state_contract_version: 4,
-        binding_contract_version: Some(stellar_xdr::ScVal::U32(4)),
+        state_contract_version: 5,
+        broken: false,
         calls: Mutex::new(vec![]),
         balance: 1234567,
         wrong_owner: false,
@@ -1848,7 +1849,7 @@ fn a_retained_stop_of_a_policy_wallet_keeps_the_servers_action_names() {
 fn owner_admin_delegates_full_balance_and_versions_without_agent_or_engine_calls() {
     use allowit_core::admin::{Admin, DeploymentVersion};
     use allowit_stellar::admin::OwnerAdmin;
-    let rpc = admin_fixture(4, Some(stellar_xdr::ScVal::U32(4)));
+    let rpc = admin_fixture(5);
     let c = &rpc.base.config;
     let mut facade = Admin::new(OwnerAdmin {
         rpc: &rpc,
@@ -1860,13 +1861,18 @@ fn owner_admin_delegates_full_balance_and_versions_without_agent_or_engine_calls
     assert_eq!(recovered.deployment_version, 2);
     let calls = rpc.calls.lock().unwrap();
     let (_, args) = calls.last().unwrap();
-    assert_eq!(args.len(), 2);
+    // `recover(token, recipient, amount)`.
+    assert_eq!(args.len(), 3);
     assert_eq!(
         args[0],
-        stellar_xdr::ScVal::Address(address(&c.owner).unwrap())
+        stellar_xdr::ScVal::Address(address(&c.asset).unwrap())
     );
     assert_eq!(
         args[1],
+        stellar_xdr::ScVal::Address(address(&c.owner).unwrap())
+    );
+    assert_eq!(
+        args[2],
         stellar_xdr::ScVal::I128(stellar_xdr::Int128Parts { hi: 0, lo: 1234567 })
     );
     drop(calls);
@@ -1890,11 +1896,10 @@ fn owner_admin_fails_closed_on_release_owner_mismatch_auth_and_empty_balance() {
     use allowit_core::admin::{Admin, DeploymentVersion};
     use allowit_stellar::admin::OwnerAdmin;
     for case in ["release", "owner", "auth", "balance"] {
-        let mut rpc = admin_fixture(4, Some(stellar_xdr::ScVal::U32(4)));
+        let mut rpc = admin_fixture(5);
         match case {
             "release" => {
                 rpc.state_contract_version = 0;
-                rpc.binding_contract_version = None
             }
             "owner" => rpc.wrong_owner = true,
             "auth" => rpc.bad_auth = true,
@@ -1921,18 +1926,10 @@ fn owner_admin_fails_closed_on_release_owner_mismatch_auth_and_empty_balance() {
 #[test]
 fn contract_release_and_persisted_counter_names_are_exact() {
     use stellar_xdr::ScVal;
-    for (state, binding, works) in [
-        (4, Some(ScVal::U32(4)), true),
-        (0, Some(ScVal::U32(4)), false),
-        (1, Some(ScVal::U32(4)), false),
-        (5, Some(ScVal::U32(4)), false),
-        (4, None, false),
-        (4, Some(ScVal::U32(1)), false),
-        (4, Some(ScVal::Bool(true)), false),
-    ] {
-        let rpc = admin_fixture(state, binding);
+    for (layout, works) in [(5, true), (0, false), (1, false), (4, false), (6, false)] {
+        let rpc = admin_fixture(layout);
         let observed = rpc::trusted_state_for_discovery(&rpc, &rpc.base.config, None);
-        assert_eq!(observed.is_ok(), works);
+        assert_eq!(observed.is_ok(), works, "{layout}");
         if let Ok(observed) = observed {
             assert_eq!(observed.state.deployment_version, 2);
             assert_eq!(observed.state.contract_version, Some(CONTRACT_VERSION));
@@ -1970,7 +1967,7 @@ fn contract_release_and_persisted_counter_names_are_exact() {
 fn full_policy_deployment_uses_one_versioned_owner_flow_and_owner_handoff_authorization() {
     use allowit_core::admin::{Admin, DeploymentVersion};
     use allowit_stellar::admin::{OwnerAdmin, PolicyDeployment};
-    let rpc = admin_fixture(4, Some(stellar_xdr::ScVal::U32(4)));
+    let rpc = admin_fixture(5);
     let c = &rpc.base.config;
     let next_owner = account_for_seed(&[51; 32]);
     let artifact = PolicyDeployment {
@@ -3102,7 +3099,8 @@ fn owner_recovery_reads_only_kept_fields_and_pause_only_the_current_layout() {
     let recipient = account_for_seed(&[6; 32]);
     // A policy binding that does not verify, as after an upgrade whose source digest differs:
     // the contract still accepts recover and set_pause, so preparation must too.
-    let broken = admin_fixture(4, None);
+    let mut broken = admin_fixture(5);
+    broken.broken = true;
     let c = &broken.base.config;
     let mut admin = OwnerAdmin {
         rpc: &broken,
@@ -3140,10 +3138,10 @@ fn owner_recovery_reads_only_kept_fields_and_pause_only_the_current_layout() {
             .function,
         "set_pause"
     );
-    // An earlier readable layout keeps the owner's recovery; set_pause and deploy_policy read
-    // the current layout onchain, so they reject.
-    for layout in [1, 3] {
-        let old = admin_fixture(layout, None);
+    // A later layout keeps the fixed header and the owner's recovery; set_pause and
+    // deploy_policy read the whole configuration of this layout, so they reject.
+    for layout in [6] {
+        let old = admin_fixture(layout);
         let mut admin = OwnerAdmin {
             rpc: &old,
             config: &old.base.config,
@@ -3158,9 +3156,9 @@ fn owner_recovery_reads_only_kept_fields_and_pause_only_the_current_layout() {
                 .is_err()
         );
     }
-    // A layout this crate does not know, or no layout, still rejects.
-    for layout in [0, 5] {
-        let unknown = admin_fixture(layout, None);
+    // An earlier layout, or no layout, rejects: it has no packed header.
+    for layout in [0, 4] {
+        let unknown = admin_fixture(layout);
         let mut admin = OwnerAdmin {
             rpc: &unknown,
             config: &unknown.base.config,
@@ -3174,7 +3172,7 @@ fn owner_recovery_reads_only_kept_fields_and_pause_only_the_current_layout() {
 fn owner_deployment_binds_common_rules_to_the_installed_source_prefix() {
     use allowit_core::admin::{DeployPolicy, DeploymentVersion};
     use allowit_stellar::admin::{OwnerAdmin, PolicyDeployment};
-    let rpc = admin_fixture(4, Some(stellar_xdr::ScVal::U32(4)));
+    let rpc = admin_fixture(5);
     let mut c = rpc.base.config.clone();
     // The installed Common source has the prefix `destinations`.
     c.tier = Some(PolicyTier::Common);
@@ -3183,23 +3181,34 @@ fn owner_deployment_binds_common_rules_to_the_installed_source_prefix() {
         config: &c,
         now: 86401,
     };
-    // A packet whose digest is derived from other rules matches its own digest but not the
-    // source, so it would commit rules that differ from the installation.
-    let rules = vec!["lifetime_spending_limit".to_string()];
+    // The wallet stores the hash of the owner's whole source and the rules of its standard
+    // prefix. A packet whose rules are not that prefix would commit rules that differ from the
+    // installed source.
     let artifact = PolicyDeployment {
         owner: c.owner.clone(),
         agent: c.agent.clone(),
         server: c.server.clone(),
-        source_hash: hash(LIMITED),
+        source_hash: c.source_hash,
         gas_cap: i128::from(c.max_fee_stroops),
-        rules,
+        rules: vec!["lifetime_spending_limit".to_string()],
         params: c.params.clone(),
         wasm_hash: None,
     };
     let error = admin
-        .deploy_policy(DeploymentVersion(3), artifact)
+        .deploy_policy(DeploymentVersion(3), artifact.clone())
         .unwrap_err();
-    assert!(error.contains("standard prefix derived"), "{error}");
+    assert!(error.contains("prefix"), "{error}");
+    // Nor does a packet that names another source.
+    let error = admin
+        .deploy_policy(
+            DeploymentVersion(3),
+            PolicyDeployment {
+                source_hash: hash(LIMITED),
+                ..artifact
+            },
+        )
+        .unwrap_err();
+    assert!(error.contains("source hash differ"), "{error}");
 }
 
 #[test]
@@ -3207,7 +3216,7 @@ fn owner_deployment_binds_common_rules_to_a_target_source() {
     use allowit_core::admin::{DeployPolicy, DeploymentVersion};
     use allowit_stellar::admin::{OwnerAdmin, PolicyDeployment};
     // The installed Common wallet binds the prefix `destinations` of its source.
-    let mut rpc = admin_fixture(4, Some(stellar_xdr::ScVal::U32(4)));
+    let mut rpc = admin_fixture(5);
     let c = &mut rpc.base.config;
     c.tier = Some(PolicyTier::Common);
     c.rules = policy::tier_rules(PolicyTier::Common, &c.policy_source).unwrap();
@@ -3226,16 +3235,15 @@ fn owner_deployment_binds_common_rules_to_a_target_source() {
     // keeps the installed code.
     let (artifact, _) = PolicyDeployment::for_source(&c, LIMITED, c.params.clone()).unwrap();
     assert_eq!(artifact.rules, ["destinations", "payment_limit"]);
-    // The installed source does not bind the new prefix.
+    // The packet names the target source: the installed source does not match it.
     let error = admin
         .deploy_policy(DeploymentVersion(3), artifact.clone())
         .unwrap_err();
-    assert!(error.contains("standard prefix derived"), "{error}");
-    // Rules from another source do not bind the target source.
+    assert!(error.contains("source hash differ"), "{error}");
     let error = admin
         .deploy_policy_source(DeploymentVersion(3), artifact.clone(), PORTABLE)
         .unwrap_err();
-    assert!(error.contains("standard prefix derived"), "{error}");
+    assert!(error.contains("source hash differ"), "{error}");
     let prepared = admin
         .deploy_policy_source(DeploymentVersion(3), artifact.clone(), LIMITED)
         .unwrap();
@@ -3370,7 +3378,7 @@ fn portable_classic_custody_runs_another_source_only_with_the_servers_evaluator(
 fn owner_preparation_refuses_address_v2_entries_that_the_handoff_cannot_sign() {
     use allowit_core::admin::{DeployPolicy, DeploymentVersion};
     use allowit_stellar::admin::{OwnerAdmin, PolicyDeployment};
-    let mut rpc = admin_fixture(4, Some(stellar_xdr::ScVal::U32(4)));
+    let mut rpc = admin_fixture(5);
     rpc.address_v2 = true;
     let c = &rpc.base.config;
     let artifact = PolicyDeployment {

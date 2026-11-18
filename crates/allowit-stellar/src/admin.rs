@@ -216,11 +216,11 @@ pub struct OwnerAdmin<'a> {
 /// the contract would accept.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Reach {
-    /// `recover`: the kept fields of any readable layout and the owner-only account. A wallet
-    /// whose code, layout or policy binding is broken stays recoverable.
+    /// `recover` and `stop`: the fixed header of this or a later layout and the owner-only
+    /// account. A wallet whose code or policy binding is broken stays recoverable.
     Kept,
-    /// `set_pause` and `deploy_policy` with new code: also the exact layout 4 State, which the
-    /// contract's `load` and `kept_policy_state` require.
+    /// `set_pause` and `deploy_policy` with new code: also the whole configuration of this
+    /// layout.
     Layout,
     /// Packets bound to the installed code: also the owner-approved executable, the policy
     /// binding and the custody fields.
@@ -302,9 +302,16 @@ impl OwnerAdmin<'_> {
         else {
             return Err("Missing policy wallet configuration".into());
         };
-        // The owner calls read the fixed header, which every layout keeps; the others need the
-        // whole configuration of this layout.
+        // The owner calls read the fixed header, which every later layout keeps; the others
+        // need the whole configuration of this layout.
         let header = packed::header(raw.as_slice())?;
+        if header.layout < packed::LAYOUT {
+            return Err(format!(
+                "Unsupported policy wallet layout {}; this crate reads layout {} or a later one",
+                header.layout,
+                packed::LAYOUT
+            ));
+        }
         if header.owner != c.owner {
             return Err("Current owner differs from the bound owner".into());
         }
@@ -805,8 +812,11 @@ impl RecoverFunds for OwnerAdmin<'_> {
     /// with `set_pause` and let that transaction settle before preparing a recovery.
     fn recover_funds(&mut self, token: &str) -> Result<PreparedOwnerOperation> {
         let s = self.snapshot(Reach::Kept)?;
-        if token != self.config.asset {
-            return Err("This policy wallet profile can recover only its installed asset".into());
+        // The installed asset, or the XLM that the wallet holds for its gas.
+        if token != self.config.asset
+            && token != crate::sac_address(&self.config.network, &stellar_xdr::Asset::Native)?
+        {
+            return Err("A policy wallet recovers only its installed asset or XLM".into());
         }
         let tx = self.transaction(
             &s.owner,
