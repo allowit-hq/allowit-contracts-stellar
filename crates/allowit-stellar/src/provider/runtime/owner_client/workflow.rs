@@ -6,6 +6,21 @@ use native::{OperationStatus, WalletConfig, WalletRoute, rpc};
 
 /// The server's code for a Native draft whose wallet account the owner's setup creates first.
 const WALLET_SETUP_REQUIRED: &str = "wallet_setup_required";
+/// The draft that a Native deployment's request ID deploys. The setup of that request binds its
+/// roles and amount; this record binds the draft, so the same request ID never carries a setup
+/// into another draft.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NativeDeployment {
+    draft: String,
+}
+/// The journal key of the [`NativeDeployment`] of `request_id`, apart from its setup's record.
+fn native_deployment_key(request_id: &str) -> String {
+    format!(
+        "native-deployment-{}",
+        &native::hex(&native::hash(request_id.as_bytes()))[..32]
+    )
+}
 
 /// Caller-owned capabilities. They do not transfer keys or storage authority to the SDK.
 #[derive(Clone, Copy)]
@@ -1299,6 +1314,21 @@ impl OwnerClient {
             return Err(Error::usage(
                 "Supply unresolved owner params before deployment",
             ));
+        }
+        let marker = native_deployment_key(&request.request_id);
+        match store.load::<NativeDeployment>(&marker)? {
+            Some(saved) if saved.draft != draft.id => {
+                return Err(Error::config(
+                    "This request ID already deployed another draft; use a new request ID",
+                ));
+            }
+            Some(_) => {}
+            None => store.save(
+                &marker,
+                &NativeDeployment {
+                    draft: draft.id.clone(),
+                },
+            )?,
         }
         let prepared: Result<Value> = self.session.owner_request(
             Method::Post,

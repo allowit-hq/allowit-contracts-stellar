@@ -1269,6 +1269,19 @@ fn a_native_draft_deploys_with_one_setup_that_binds_it_to_the_new_account() {
         "{}",
         refused.message
     );
+    // The same request ID never carries its setup into another draft: nothing is signed.
+    let mut other = plan(&account(13));
+    other.policy["id"] = json!("another-native-draft");
+    let (_, refused, registrations) = run(other, &request, &signer);
+    let refused = refused.unwrap_err();
+    assert_eq!(refused.code, 3);
+    assert_eq!(
+        refused.message,
+        "This request ID already deployed another draft; use a new request ID"
+    );
+    assert!(registrations.is_empty());
+    assert_eq!(signer.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(sends(), 1);
     // A draft that names its account already is activated, not deployed.
     let mut bound = plan(&account(13));
     bound.policy = crate::test_support::server::native_bound(&bound.policy, &created);

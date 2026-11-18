@@ -154,12 +154,7 @@ fn signer_operation(wallet: &str, key: [u8; 32], weight: u32) -> Result<Operatio
     })
 }
 fn operation_count(v: &NativeSetup) -> u32 {
-    setup_operation_count(v.trustline.is_some())
-}
-/// The operations of one Native setup transaction: the account, its signers and thresholds,
-/// and a trustline when the wallet holds an issued asset.
-pub fn setup_operation_count(trustline: bool) -> u32 {
-    4 + u32::from(trustline)
+    SETUP_OPERATIONS + u32::from(v.trustline.is_some())
 }
 
 fn transaction(v: &NativeSetup) -> Result<Transaction> {
@@ -601,6 +596,11 @@ fn service_json(url: &str) -> Result<serde_json::Value> {
     }
     serde_json::from_slice(&response.body).map_err(|_| "Invalid Stellar service response".into())
 }
+
+/// The operations of a Native setup transaction without a trustline: the account's creation, the
+/// owner's and the agent's signers, and the server's signer with the thresholds. A trustline
+/// adds one.
+pub const SETUP_OPERATIONS: u32 = 4;
 
 #[cfg(test)]
 mod tests {

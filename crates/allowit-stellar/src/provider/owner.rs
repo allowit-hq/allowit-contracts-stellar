@@ -73,7 +73,7 @@ fn setup_funding(amount: &str) -> Result<i64> {
 /// allows for the whole setup transaction, within the setup's own bounds. The network charges
 /// its current fee, at most this bid.
 fn native_setup_fee(limit: u32) -> Result<u32> {
-    let operations = crate::owner::setup_operation_count(false);
+    let operations = crate::owner::SETUP_OPERATIONS;
     let minimum = u32::try_from(super::server_owner::fee_bounds().minimum)
         .map_err(|_| Error::config("Invalid rail fee bounds"))?;
     let per_operation = (limit / operations).min(100_000);
