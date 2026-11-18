@@ -42,7 +42,7 @@ impl OwnerDocuments {
     }
     pub fn install_existing(&mut self, owner: &str) -> WalletConfig {
         let config = super::existing_installation(owner, &self.policy);
-        self.installations = json!({"installations":[{"policyId":"07".repeat(32),"profile":"allowit-policy-wallet-v1","config":config}]});
+        self.installations = json!({"installations":[{"policyInstance":"07".repeat(32),"profile":"allowit-policy-wallet-v1","config":config}]});
         let b = &mut self.policy["runtime"]["instanceBinding"];
         b["template"] = json!(false);
         b["wallet"] = json!(config.wallet);
@@ -78,7 +78,7 @@ impl OwnerDocuments {
         config.tier = None;
         config.max_fee_stroops = 100_000;
         crate::validate_config(&config).unwrap();
-        self.installations = json!({"installations":[{"policyId":"07".repeat(32),"profile":"allowit-native-v1","config":config}]});
+        self.installations = json!({"installations":[{"policyInstance":"07".repeat(32),"profile":"allowit-native-v1","config":config}]});
         self.discovery["wallets"][0]["profile"] = json!("allowit-native-v1");
         self.discovery["wallets"][0]["kind"] = json!("owner-wallet");
         self.policy["runtime"]["wallet"] =
