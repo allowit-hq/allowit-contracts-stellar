@@ -2518,6 +2518,32 @@ fn an_explicit_gas_repayment_keeps_its_gas_through_pricing() {
     );
 }
 #[test]
+fn the_server_revalidates_its_own_authorized_preparation() {
+    // The engine's order: prepare, authorize as the server, then revalidate before the agent's
+    // signature joins and the sending account seals.
+    for tier in [PolicyTier::Simple, PolicyTier::Common] {
+        let wasm = wasm_for(tier);
+        let chain = ModelChain::new(BTreeMap::from([(hash(&wasm), tier)]));
+        let c = create(&chain, tier, &wasm, [0x38; 32]);
+        let state = sending_state(&chain, &c);
+        let ledger = chain.ledger();
+        let recipient = account_for_seed(&RECIPIENT);
+        let transfer = request::transfer(&c, &state, [1; 32], &recipient, 1_000_000).unwrap();
+        let prepared = rpc::prepare_with(
+            &chain,
+            &c,
+            &transfer,
+            &terms(1_000_000, ledger),
+            Some(chain.accounting()),
+            NOW,
+            NOW + 300,
+        )
+        .unwrap();
+        let served = authorize_server(&prepared, &SERVER, NOW, None).unwrap();
+        rpc::revalidate_prepared(&chain, &served, NOW).unwrap_or_else(|e| panic!("{tier:?}: {e}"));
+    }
+}
+#[test]
 fn a_contract_wallet_reports_the_roles_that_its_configuration_holds() {
     let wasm = wasm_for(PolicyTier::Common);
     let chain = ModelChain::new(BTreeMap::from([(hash(&wasm), PolicyTier::Common)]));

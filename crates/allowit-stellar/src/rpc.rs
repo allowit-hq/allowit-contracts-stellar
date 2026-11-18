@@ -737,14 +737,7 @@ pub fn revalidate_prepared(
     let required: SorobanTransactionData = read(&simulated_resources(rpc, p)?)?;
     let have = &original.resources;
     let need = &required.resources;
-    let footprint_covers =
-        need.footprint
-            .read_write
-            .iter()
-            .all(|k| have.footprint.read_write.contains(k))
-            && need.footprint.read_only.iter().all(|k| {
-                have.footprint.read_only.contains(k) || have.footprint.read_write.contains(k)
-            });
+    let footprint_covers = footprint_covers(&p.config.wallet, &have.footprint, &need.footprint)?;
     if !footprint_covers
         || have.instructions < need.instructions
         || have.disk_read_bytes < need.disk_read_bytes
@@ -757,6 +750,27 @@ pub fn revalidate_prepared(
     record_native_preflight(&mut validated)?;
     validate_prepared(&validated, now)?;
     Ok(validated)
+}
+/// Whether the footprint `have` covers `need`: every key that `need` writes, `have` writes, and
+/// every key that `need` reads, `have` reads or writes. A recording simulation draws its own nonce
+/// for the authorization of `wallet`, so two recordings name different nonce entries of the
+/// wallet; the sending account's sealing run sets the exact one. That key alone is not compared.
+fn footprint_covers(wallet: &str, have: &LedgerFootprint, need: &LedgerFootprint) -> Result<bool> {
+    let wallet = address(wallet)?;
+    let nonce = |key: &&LedgerKey| {
+        matches!(key, LedgerKey::ContractData(d)
+            if d.contract == wallet && matches!(d.key, ScVal::LedgerKeyNonce(_)))
+    };
+    Ok(need
+        .read_write
+        .iter()
+        .filter(|key| !nonce(key))
+        .all(|key| have.read_write.contains(key))
+        && need
+            .read_only
+            .iter()
+            .filter(|key| !nonce(key))
+            .all(|key| have.read_only.contains(key) || have.read_write.contains(key)))
 }
 /// The resource fee that the prepared transaction declares. It is the signed bound less the
 /// inclusion fee, so it stays above the simulated resource fee by the margin of the bound.
@@ -2005,6 +2019,66 @@ mod transport_tests {
         server.join().unwrap();
         assert_eq!(error, TRANSPORT_UNKNOWN);
         assert_eq!(crate::provider::failure(error).code, 5);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod footprint_tests {
+    use super::*;
+
+    fn nonce(contract: &str, value: i64) -> LedgerKey {
+        LedgerKey::ContractData(LedgerKeyContractData {
+            contract: address(contract).unwrap(),
+            key: ScVal::LedgerKeyNonce(ScNonceKey { nonce: value }),
+            durability: ContractDataDurability::Temporary,
+        })
+    }
+    fn entry(contract: &str, name: &str) -> LedgerKey {
+        LedgerKey::ContractData(LedgerKeyContractData {
+            contract: address(contract).unwrap(),
+            key: ScVal::Symbol(ScSymbol(name.try_into().unwrap())),
+            durability: ContractDataDurability::Persistent,
+        })
+    }
+    fn footprint(read_write: Vec<LedgerKey>, read_only: Vec<LedgerKey>) -> LedgerFootprint {
+        LedgerFootprint {
+            read_only: read_only.try_into().unwrap(),
+            read_write: read_write.try_into().unwrap(),
+        }
+    }
+
+    /// Two recordings of one operation draw two nonces for the wallet's authorization: the
+    /// prepared footprint still covers the second. Any other key that differs is not covered.
+    #[test]
+    fn a_recording_nonce_of_the_wallet_alone_may_differ() {
+        let wallet = stellar_strkey::Contract([7; 32]).to_string();
+        let token = stellar_strkey::Contract([8; 32]).to_string();
+        let have = footprint(
+            vec![entry(&token, "balance"), nonce(&wallet, 1)],
+            vec![entry(&wallet, "c")],
+        );
+        let again = footprint(
+            vec![entry(&token, "balance"), nonce(&wallet, 2)],
+            vec![entry(&wallet, "c")],
+        );
+        assert!(footprint_covers(&wallet, &have, &again).unwrap());
+        // Another contract's nonce, another written entry or another read entry is a change.
+        for changed in [
+            footprint(
+                vec![entry(&token, "balance"), nonce(&token, 2)],
+                vec![entry(&wallet, "c")],
+            ),
+            footprint(
+                vec![entry(&token, "other"), nonce(&wallet, 2)],
+                vec![entry(&wallet, "c")],
+            ),
+            footprint(
+                vec![entry(&token, "balance"), nonce(&wallet, 2)],
+                vec![entry(&wallet, "t")],
+            ),
+        ] {
+            assert!(!footprint_covers(&wallet, &have, &changed).unwrap());
+        }
     }
 }
 
