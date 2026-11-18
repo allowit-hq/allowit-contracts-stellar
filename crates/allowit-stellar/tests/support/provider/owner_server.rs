@@ -70,6 +70,14 @@ pub struct Plan {
     /// A change that the workspace shows in the bound draft, as a revision that arrived while
     /// the wallet account was registered.
     pub change_bound: Option<fn(&mut Value)>,
+    /// A change that the workspace shows in the draft before any registration, as a revision
+    /// that arrived after the owner's review.
+    pub change_draft: Option<fn(&mut Value)>,
+    /// The registration is recorded, and its reply is lost.
+    pub lose_registration: bool,
+    /// The wallet that the deployment's preparation names for a bound draft, in place of the
+    /// registered one.
+    pub prepare_wallet: Option<String>,
 }
 impl Plan {
     /// A Native draft for a new wallet account, with `server` as the server key that the
@@ -109,6 +117,9 @@ impl Plan {
             export: None,
             native_server: None,
             change_bound: None,
+            change_draft: None,
+            lose_registration: false,
+            prepare_wallet: None,
         }
     }
 }
@@ -280,11 +291,16 @@ impl Server {
                             ),
                             Some(r) => {
                                 let c = &r["configuration"];
+                                let wallet = plan
+                                    .prepare_wallet
+                                    .clone()
+                                    .map(Value::from)
+                                    .unwrap_or_else(|| c["wallet"].clone());
                                 reply(
                                     &mut stream,
                                     200,
                                     json!({"policyId":body["policyId"],"installed":true,"approved":false,"walletKind":"native",
-                                        "wallet":c["wallet"],"installation":{"wallet":c["wallet"],"agent":c["agent"],"installation":"07".repeat(32)}}),
+                                        "wallet":wallet,"installation":{"wallet":wallet,"agent":c["agent"],"installation":"07".repeat(32)}}),
                                     "",
                                 )
                             }
@@ -292,6 +308,11 @@ impl Server {
                     }
                     "/api/native/register" => {
                         captured.lock().unwrap().registrations.push(body.clone());
+                        if plan.lose_registration
+                            && captured.lock().unwrap().registrations.len() == 1
+                        {
+                            continue;
+                        }
                         let c = &body["configuration"];
                         reply(
                             &mut stream,
@@ -303,6 +324,9 @@ impl Server {
                     }
                     "/api/micro/policies" => {
                         let mut policy = plan.policy.clone();
+                        if let Some(change) = plan.change_draft {
+                            change(&mut policy);
+                        }
                         if let Some(r) = registered(&policy["id"]) {
                             policy = crate::test_support::server::native_bound(
                                 &policy,

@@ -737,12 +737,15 @@ fn validate_generated(
     }
     match &request.target {
         // A Native draft for a new wallet account names no account until its deployment.
+        // The setup funds the account in XLM and adds no trustline: the draft pays in XLM.
         Target::NewWallet
             if kind == "owner-wallet"
                 && b.template == Some(true)
                 && b.route == "native"
                 && b.wallet.is_empty()
-                && b.deployment_id.is_empty() => {}
+                && b.deployment_id.is_empty()
+                && b.asset_symbol == "XLM"
+                && b.asset_issuer.is_none() => {}
         Target::NewWallet
             if b.template == Some(true)
                 && b.route == "policyWallet"

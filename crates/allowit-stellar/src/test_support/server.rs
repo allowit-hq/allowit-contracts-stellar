@@ -145,24 +145,14 @@ pub fn native_new_wallet(policy: &mut Value) {
         &crate::asset_from_identity("XLM", None).unwrap(),
     )
     .unwrap();
-    policy["runtime"]["wallet"] = json!({"kind":"owner-wallet","profile":"allowit-native-v1"});
     policy["mint"] = json!(xlm);
     policy["token"] = json!("XLM");
     let b = policy["runtime"]["instanceBinding"]
         .as_object_mut()
         .unwrap();
-    b.remove("tier");
-    for (key, value) in [
-        ("route", json!("native")),
-        ("wallet", json!("")),
-        ("deploymentId", json!("")),
-        ("template", json!(true)),
-        ("asset", json!(xlm)),
-        ("assetSymbol", json!("XLM")),
-        ("assetIssuer", Value::Null),
-    ] {
-        b.insert(key.into(), value);
-    }
+    b.insert("asset".into(), json!(xlm));
+    b.insert("assetSymbol".into(), json!("XLM"));
+    b.insert("assetIssuer".into(), Value::Null);
     let d = b["portable"].as_object_mut().unwrap();
     d.insert(
         "asset".into(),
@@ -172,6 +162,25 @@ pub fn native_new_wallet(policy: &mut Value) {
     let params_hash =
         allowit_core::digest(&serde_json_canonicalizer::to_vec(&d["params"]).unwrap());
     d.insert("paramsHash".into(), json!(params_hash));
+    native_new_wallet_keeping_asset(policy);
+}
+/// [`native_new_wallet`] in the policy's own asset: the Native route and module identity, and no
+/// account, deployment or tier.
+pub fn native_new_wallet_keeping_asset(policy: &mut Value) {
+    policy["runtime"]["wallet"] = json!({"kind":"owner-wallet","profile":"allowit-native-v1"});
+    let b = policy["runtime"]["instanceBinding"]
+        .as_object_mut()
+        .unwrap();
+    b.remove("tier");
+    for (key, value) in [
+        ("route", json!("native")),
+        ("wallet", json!("")),
+        ("deploymentId", json!("")),
+        ("template", json!(true)),
+    ] {
+        b.insert(key.into(), value);
+    }
+    let d = &b["portable"];
     let identity = json!({"language":d["language"],"tier":d["tier"],"rules":d["rules"],"sourceHash":d["sourceHash"],"paramsHash":d["paramsHash"]});
     b.insert(
         "moduleDigest".into(),

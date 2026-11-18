@@ -1272,8 +1272,11 @@ impl OwnerClient {
     /// registers the account from the ledger and binds the draft to it. The outcome selects the
     /// bound draft, which keeps the reviewed source, params and conversation, for activation.
     ///
-    /// Resume with the same request ID: the setup signs nothing again, and a draft that a
-    /// registration already bound is read back.
+    /// Before anything is signed, the server's current draft must be the reviewed one, and the
+    /// server must be this client's pinned authority. Resume with the same request ID: a setup
+    /// that the journal holds is completed, never made again, and a draft that a registration
+    /// already bound is read back without a signature. A request ID binds one draft, and a
+    /// setup that another workflow started under it is refused.
     pub fn deploy_native(
         &self,
         runtime: &crate::provider::runtime::Runtime,
@@ -1292,6 +1295,18 @@ impl OwnerClient {
         if signer.account() != self.session.owner() || request.owner != self.session.owner() {
             return Err(Error::config(
                 "Native deployment owner differs from this owner session",
+            ));
+        }
+        // The server that co-signs the account is this client's pinned authority.
+        let authority = self.authority.as_ref().ok_or_else(|| {
+            Error::config("Native deployment requires independently configured server authority")
+        })?;
+        if authority.origin() != self.session.backend()
+            || authority.network() != crate::host::routing::normalize(&request.network)?
+            || authority.public_key() != request.server
+        {
+            return Err(Error::config(
+                "Native deployment server differs from independently configured authority",
             ));
         }
         let b = &draft.runtime.instance_binding;
@@ -1315,6 +1330,8 @@ impl OwnerClient {
                 "Supply unresolved owner params before deployment",
             ));
         }
+        // The request ID binds this draft. A setup under it that no deployment of this draft
+        // started belongs to another workflow.
         let marker = native_deployment_key(&request.request_id);
         match store.load::<NativeDeployment>(&marker)? {
             Some(saved) if saved.draft != draft.id => {
@@ -1323,6 +1340,14 @@ impl OwnerClient {
                 ));
             }
             Some(_) => {}
+            None if store
+                .load::<NativeSetupRecord>(&request.request_id)?
+                .is_some() =>
+            {
+                return Err(Error::config(
+                    "This request ID belongs to another wallet setup; use a new request ID",
+                ));
+            }
             None => store.save(
                 &marker,
                 &NativeDeployment {
@@ -1330,74 +1355,6 @@ impl OwnerClient {
                 },
             )?,
         }
-        let prepared: Result<Value> = self.session.owner_request(
-            Method::Post,
-            "/api/native/deploy/prepare",
-            Some(&json!({"policyId": draft.id, "agent": request.agent})),
-            clock()?,
-            false,
-        );
-        let setup = match prepared {
-            // The draft names no account yet: the server names the roles of the one to create.
-            Err(error) if error.api_code.as_deref() == Some(WALLET_SETUP_REQUIRED) => {
-                let details = error.details.clone().unwrap_or_default();
-                if details["policyId"] != draft.id.as_str()
-                    || details["owner"] != request.owner.as_str()
-                    || details["agent"] != request.agent.as_str()
-                    || details["server"] != request.server.as_str()
-                {
-                    return Err(Error::config(
-                        "The server named other roles for the wallet account of this draft; nothing was signed",
-                    ));
-                }
-                let configured = configure_native(runtime, store, request, signer, clock)?;
-                allowit_core::client::progress::report(
-                    "Registering the wallet account and binding the draft to it",
-                );
-                let registered = self
-                    .register_native(&configured["configuration"], Some(&draft.id), clock()?)
-                    .map_err(|error| {
-                        let mut refused = Error::api(
-                            error.status.unwrap_or(409),
-                            format!(
-                                "The wallet account {} is set up on the ledger, but the server did not bind the draft to it: {}. Run the same deployment again",
-                                configured["wallet"].as_str().unwrap_or_default(),
-                                error.message
-                            ),
-                        );
-                        refused.api_code = error.api_code;
-                        refused
-                    })?;
-                if registered["registered"] != true
-                    || registered["policyId"] != draft.id.as_str()
-                    || registered["wallet"] != configured["wallet"]
-                {
-                    return Err(Error::uncertain(
-                        "The server did not bind the draft to the new wallet account; run the same deployment again",
-                    ));
-                }
-                Some(configured)
-            }
-            Err(error) => return Err(error),
-            // An earlier run bound the draft. A setup that it made under this request ID is
-            // read back from its receipt: nothing is signed again.
-            Ok(reply) => {
-                if reply["policyId"] != draft.id.as_str()
-                    || reply["installed"] != true
-                    || reply["walletKind"] != "native"
-                    || reply["installation"]["agent"] != request.agent.as_str()
-                {
-                    return Err(Error::uncertain(
-                        "The deployment reply differs from this draft and agent",
-                    ));
-                }
-                match store.load::<NativeSetupRecord>(&request.request_id)? {
-                    Some(_) => Some(configure_native(runtime, store, request, signer, clock)?),
-                    None => None,
-                }
-            }
-        };
-        let bound = self.current_draft(&draft.id, clock()?)?;
         let reviewed = |p: &GeneratedPolicy| {
             let b = &p.runtime.instance_binding;
             serde_json::to_value((
@@ -1412,34 +1369,141 @@ impl OwnerClient {
             ))
             .map_err(|_| Error::config("Cannot compare the reviewed draft"))
         };
+        let changed = || {
+            Error::uncertain(
+                "The draft on the server differs from the reviewed draft; review the current draft",
+            )
+        };
+        // The server's draft is the reviewed one before anything is signed.
+        if reviewed(&self.current_draft(&draft.id, clock()?)?)? != reviewed(draft)? {
+            return Err(changed());
+        }
+        let prepared: Result<Value> = self.session.owner_request(
+            Method::Post,
+            "/api/native/deploy/prepare",
+            Some(&json!({"policyId": draft.id, "agent": request.agent})),
+            clock()?,
+            false,
+        );
+        // The account of this deployment, its setup's receipt and the fee bound that its
+        // registration named.
+        struct Made {
+            wallet: String,
+            receipt: Option<(String, u32)>,
+            max_fee: Option<u64>,
+        }
+        let made = match prepared {
+            // The draft names no account yet: the server names the roles of the one to create.
+            Err(error) if error.api_code.as_deref() == Some(WALLET_SETUP_REQUIRED) => {
+                let details = error.details.clone().unwrap_or_default();
+                if details["policyId"] != draft.id.as_str()
+                    || details["owner"] != request.owner.as_str()
+                    || details["agent"] != request.agent.as_str()
+                    || details["server"] != request.server.as_str()
+                {
+                    return Err(Error::config(
+                        "The server named other roles for the wallet account of this draft; nothing was signed",
+                    ));
+                }
+                let configured = configure_native(runtime, store, request, signer, clock)?;
+                let wallet = configured["wallet"].as_str().unwrap_or_default().to_owned();
+                allowit_core::client::progress::report(
+                    "Registering the wallet account and binding the draft to it",
+                );
+                let registered = self
+                    .register_native(&configured["configuration"], Some(&draft.id), clock()?)
+                    .map_err(|error| match error.status {
+                        // The server answered: its refusal stands, and nothing was bound.
+                        Some(status) => {
+                            let mut refused = Error::api(
+                                status,
+                                format!(
+                                    "The wallet account {wallet} is set up on the ledger, but the server did not bind the draft to it: {}. Run the same deployment again",
+                                    error.message
+                                ),
+                            );
+                            refused.api_code = error.api_code;
+                            refused
+                        }
+                        // No answer: the server may have bound the draft.
+                        None => Error::uncertain(format!(
+                            "The wallet account {wallet} is set up on the ledger, and the server's registration of it is unknown. Run the same deployment again"
+                        )),
+                    })?;
+                if registered["registered"] != true
+                    || registered["policyId"] != draft.id.as_str()
+                    || registered["wallet"] != wallet.as_str()
+                {
+                    return Err(Error::uncertain(
+                        "The server did not bind the draft to the new wallet account; run the same deployment again",
+                    ));
+                }
+                Made {
+                    receipt: configured["transactionHash"]
+                        .as_str()
+                        .zip(configured["ledger"].as_u64())
+                        .and_then(|(hash, ledger)| {
+                            Some((hash.to_owned(), u32::try_from(ledger).ok()?))
+                        }),
+                    max_fee: configured["configuration"]["maxFeeStroops"].as_u64(),
+                    wallet,
+                }
+            }
+            Err(error) => return Err(error),
+            // An earlier run bound the draft. Its setup's receipt is read back from the journal
+            // when the setup completed there; nothing is signed or sent.
+            Ok(reply) => {
+                let wallet = reply["wallet"].as_str().unwrap_or_default().to_owned();
+                if reply["policyId"] != draft.id.as_str()
+                    || reply["installed"] != true
+                    || reply["walletKind"] != "native"
+                    || reply["installation"]["agent"] != request.agent.as_str()
+                    || reply["installation"]["wallet"] != wallet.as_str()
+                    || wallet.is_empty()
+                {
+                    return Err(Error::uncertain(
+                        "The deployment reply differs from this draft and agent",
+                    ));
+                }
+                let identity = intent_hash(&setup_identity(request))?;
+                let receipt = store
+                    .load::<NativeSetupRecord>(&request.request_id)?
+                    .filter(|record| record.identity == identity && record.setup.wallet == wallet)
+                    .and_then(|record| {
+                        let receipt = record.receipt?;
+                        (receipt.status == OperationStatus::Confirmed)
+                            .then_some((record.setup.transaction_hash, receipt.ledger))
+                    });
+                Made {
+                    wallet,
+                    receipt,
+                    max_fee: None,
+                }
+            }
+        };
+        let bound = self.current_draft(&draft.id, clock()?)?;
         if reviewed(&bound)? != reviewed(draft)? {
-            return Err(Error::uncertain(
-                "The draft changed while its wallet account was registered; review the current draft",
-            ));
+            return Err(changed());
         }
         let selection = native_policy(bound, &request.owner, &request.agent, &request.server)?;
-        if let Some(configured) = &setup
-            && configured["wallet"] != selection.config.wallet.as_str()
+        // The bound draft names the account of this deployment, with the fee bound that its
+        // registration named.
+        if selection.config.wallet != made.wallet
+            || made
+                .max_fee
+                .is_some_and(|fee| fee != u64::from(selection.config.max_fee_stroops))
         {
             return Err(Error::uncertain(
-                "The server bound the draft to another wallet account than this setup created",
+                "The server bound the draft to another wallet account or fee bound than this deployment registered",
             ));
         }
         self.verify_binding(&selection, rpc)?;
-        let receipt = setup.as_ref().and_then(|configured| {
-            let hash = configured["transactionHash"].as_str()?.to_owned();
-            let ledger = u32::try_from(configured["ledger"].as_u64()?).ok()?;
-            Some(OwnerReceipt {
-                explorer: crate::provider::server_owner::explorer_link(
-                    &request.network,
-                    "tx",
-                    &hash,
-                ),
-                action: "native_setup".into(),
-                transaction_hash: hash,
-                status: OperationStatus::Confirmed,
-                ledger,
-            })
+        let receipt = made.receipt.map(|(hash, ledger)| OwnerReceipt {
+            explorer: crate::provider::server_owner::explorer_link(&request.network, "tx", &hash),
+            action: "native_setup".into(),
+            transaction_hash: hash,
+            status: OperationStatus::Confirmed,
+            ledger,
         });
         Ok(Outcome {
             request_id: request.request_id.clone(),
