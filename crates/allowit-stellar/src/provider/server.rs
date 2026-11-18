@@ -462,62 +462,71 @@ impl Provider {
         if state == rpc::CodeState::Live {
             return Ok(None);
         }
-        let sender = self.sender.as_ref().ok_or_else(|| {
-            Error::config("This server has no sending account to upload wallet code")
-        })?;
-        let account = sender.account()?;
-        // The server pays the upload or the restoration, a cost that the ledger consumes; the
-        // simulation sets it, within the ceiling. Lapsed code is restored, never uploaded again:
-        // the network refuses an upload of code that its archive holds.
-        let deployer = native::admin::Deployer {
-            rpc: self.rpc(),
-            network: &c.network,
-            now,
-            max_fee_stroops,
-        };
         // Code is restored or uploaded only while its last observation shows it not live. The
-        // code is observed first, again by every refusal on the way to a signature, and again
-        // just before the signature: another transaction, from another sending account or from
-        // this one, can make it live at any of these steps, and live code needs nothing. Such a
-        // transaction can still land after the last observation, until the code transaction
-        // applies: the ledger has no precondition on an entry's state, so the code transaction
-        // then applies to live code and its source pays its fee, within the ceiling.
+        // code is observed first, again by every refusal on the way to a signature, the
+        // signature included, and again just before the signature: another transaction, from
+        // another sending account or from this one, can make it live at any of these steps, and
+        // live code needs nothing. Such a transaction can still land after the last observation,
+        // until the code transaction applies: the ledger has no precondition on an entry's
+        // state, so the code transaction then applies to live code and its source pays its fee,
+        // within the ceiling.
         let live = || {
             matches!(
                 rpc::code_state(self.rpc(), &c.network, &code_hash),
                 Ok(rpc::CodeState::Live)
             )
         };
-        // A simulated restoration of the code entry decides between a restoration and an
-        // upload: it names the entry only when the network's archive holds it, which a read can
-        // miss, since an RPC can serve no archived entry. Absent code needs its bytes.
-        let prepare = || -> Result<Option<native::admin::PreparedDeployment>> {
-            Ok(match checked(deployer.restore_code(&account, code_hash))? {
-                native::admin::CodeRestoration::Prepared(p) => Some(p),
-                native::admin::CodeRestoration::Live => None,
+        // A refusal can come from the transaction that made the code live: a simulated fee above
+        // the ceiling for a write that is no longer needed, the sending account's sequence that
+        // its own upload advanced, or sending accounts that are all busy with it. Live code
+        // needs nothing; otherwise the refusal stands.
+        let unless_live = |refused: Error| if live() { Ok(None) } else { Err(refused) };
+        let prepare = || -> Result<Option<(&Sender, String, native::admin::PreparedDeployment)>> {
+            let sender = self.sender.as_ref().ok_or_else(|| {
+                Error::config("This server has no sending account to upload wallet code")
+            })?;
+            let account = sender.account()?;
+            // The server pays the upload or the restoration, a cost that the ledger consumes;
+            // the simulation sets it, within the ceiling. Lapsed code is restored, never
+            // uploaded again: the network refuses an upload of code that its archive holds.
+            let deployer = native::admin::Deployer {
+                rpc: self.rpc(),
+                network: &c.network,
+                now,
+                max_fee_stroops,
+            };
+            // A simulated restoration of the code entry decides between a restoration and an
+            // upload: it names the entry only when the network's archive holds it, which a read
+            // can miss, since an RPC can serve no archived entry. Absent code needs its bytes.
+            let p = match checked(deployer.restore_code(&account, code_hash))? {
+                native::admin::CodeRestoration::Prepared(p) => p,
+                native::admin::CodeRestoration::Live => return Ok(None),
                 native::admin::CodeRestoration::Absent => match wasm {
-                    Some(wasm) => checked(deployer.upload_wasm(&account, wasm))?,
+                    Some(wasm) => match checked(deployer.upload_wasm(&account, wasm))? {
+                        Some(p) => p,
+                        None => return Ok(None),
+                    },
                     None => {
                         return Err(Error::usage(
                             "The wallet code is not on the network: a restoration needs code that lapsed",
                         ));
                     }
                 },
-            })
+            };
+            Ok(Some((sender, account, p)))
         };
-        // A refusal can come from the transaction that made the code live: a simulated fee above
-        // the ceiling for a write that is no longer needed, or the sending account's sequence
-        // that its own upload advanced. Live code needs nothing; otherwise the refusal stands.
-        let p = match prepare() {
-            Ok(Some(p)) => p,
+        let (sender, account, p) = match prepare() {
+            Ok(Some(prepared)) => prepared,
             Ok(None) => return Ok(None),
-            Err(_) if live() => return Ok(None),
-            Err(refused) => return Err(refused),
+            Err(refused) => return unless_live(refused),
         };
         if checked(rpc::code_state(self.rpc(), &c.network, &code_hash))? == rpc::CodeState::Live {
             return Ok(None);
         }
-        let signature = sending_signature(sender, &account, &p.transaction_hash)?;
+        let signature = match sending_signature(sender, &account, &p.transaction_hash) {
+            Ok(signature) => signature,
+            Err(refused) => return unless_live(refused),
+        };
         let signed = checked(native::admin::with_source_signature(
             &c.network,
             &p.transaction_xdr,

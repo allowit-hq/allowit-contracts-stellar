@@ -3273,6 +3273,35 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
                 .to_vec())
         }
     }
+    // Sending accounts that are all leased; another account may restore the code `restores` at
+    // the same time.
+    struct Leased(Arc<ModelChain>, Option<[u8; 32]>);
+    impl SendingAccounts for Leased {
+        fn account(&self) -> allowit_core::client::error::Result<String> {
+            if let Some(code) = self.1 {
+                self.0.0.lock().unwrap().lapsed_code.remove(&code);
+            }
+            Err(allowit_core::client::error::Error::config(
+                "All sending accounts are leased",
+            ))
+        }
+        fn sign(&self, _: &str, _: &[u8; 32]) -> allowit_core::client::error::Result<Vec<u8>> {
+            panic!("a leased account signs nothing")
+        }
+    }
+    // A sending account whose signer refuses while another account restores the code.
+    struct Refusing(Arc<ModelChain>, [u8; 32]);
+    impl SendingAccounts for Refusing {
+        fn account(&self) -> allowit_core::client::error::Result<String> {
+            Ok(sender())
+        }
+        fn sign(&self, _: &str, _: &[u8; 32]) -> allowit_core::client::error::Result<Vec<u8>> {
+            self.0.0.lock().unwrap().lapsed_code.remove(&self.1);
+            Err(allowit_core::client::error::Error::config(
+                "The signer is unavailable",
+            ))
+        }
+    }
     let wasm = wasm_for(PolicyTier::Common);
     let chain = Arc::new(ModelChain::new(BTreeMap::from([(
         hash(&wasm),
@@ -3934,6 +3963,44 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
             .is_none()
     );
     assert_eq!(signatures(), signed);
+    assert!(!chain.0.lock().unwrap().lapsed_code.contains(&installed));
+    // Every sending account is leased while another account restores the code: no restoration
+    // is needed, so the allocation's refusal does not stand.
+    chain.0.lock().unwrap().lapsed_code.insert(installed);
+    let leased = |restores| {
+        allowit_stellar::PLUGIN
+            .sending_runtime(
+                NETWORK,
+                Arc::new(Wire(chain.clone())),
+                Arc::new(Leased(chain.clone(), restores)),
+            )
+            .unwrap()
+    };
+    assert!(
+        leased(Some(installed))
+            .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+            .unwrap()
+            .is_none()
+    );
+    // While the code stays lapsed, the refusal stands.
+    chain.0.lock().unwrap().lapsed_code.insert(installed);
+    let refused = leased(None)
+        .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+        .unwrap_err();
+    assert!(refused.message.contains("leased"), "{}", refused.message);
+    // The signer refuses while another account restores the code: nothing is needed.
+    assert!(
+        allowit_stellar::PLUGIN
+            .sending_runtime(
+                NETWORK,
+                Arc::new(Wire(chain.clone())),
+                Arc::new(Refusing(chain.clone(), installed)),
+            )
+            .unwrap()
+            .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+            .unwrap()
+            .is_none()
+    );
     assert!(!chain.0.lock().unwrap().lapsed_code.contains(&installed));
     // Code that the network does not have cannot be restored: it needs an upload.
     chain.0.lock().unwrap().code_bytes.remove(&installed);
