@@ -95,6 +95,43 @@ pub fn policy_signed() -> SignedOperation {
     .unwrap();
     serde_json::from_value(fixture["signed"].clone()).unwrap()
 }
+/// `signed` as its sending account seals it for settlement: the prepared resources and fee, and
+/// the account's signature. The fixture's sending account is the seed `[10; 32]`.
+pub fn policy_sealed(signed: &SignedOperation) -> SignedOperation {
+    use ed25519_dalek::Signer;
+    let x::TransactionEnvelope::Tx(mut envelope) = crate::read(&signed.transaction_xdr).unwrap()
+    else {
+        panic!()
+    };
+    let x::MuxedAccount::Ed25519(x::Uint256(key)) = envelope.tx.source_account.clone() else {
+        panic!()
+    };
+    assert_eq!(
+        crate::account_for_public_key(&key),
+        crate::account_for_seed(&[10; 32])
+    );
+    let hash = crate::transaction_hash(&signed.prepared.config.network, &envelope.tx).unwrap();
+    envelope.signatures = vec![x::DecoratedSignature {
+        hint: x::SignatureHint(key[28..].try_into().unwrap()),
+        signature: x::Signature(
+            ed25519_dalek::SigningKey::from_bytes(&[10; 32])
+                .sign(&hash)
+                .to_bytes()
+                .to_vec()
+                .try_into()
+                .unwrap(),
+        ),
+    }]
+    .try_into()
+    .unwrap();
+    let sealed = SignedOperation {
+        transaction_xdr: crate::xdr(&x::TransactionEnvelope::Tx(envelope)).unwrap(),
+        transaction_hash: hash,
+        ..signed.clone()
+    };
+    crate::validate_retained_signed(&sealed).unwrap();
+    sealed
+}
 pub fn transaction_status(signed: &SignedOperation, success: bool, ledger: u32, fee: i64) -> Value {
     let result = x::TransactionResult {
         fee_charged: fee,
@@ -221,7 +258,6 @@ pub fn agent_fixture(
         wallet: wallet.clone(),
         owner: owner.clone(),
         agent: agent.clone(),
-        fee_account: None,
         server: engine.clone(),
         route: WalletRoute::Native,
         tier: None,
@@ -277,6 +313,9 @@ pub fn agent_fixture(
         spent_daily: 0,
         spent_total: 0,
         spent_day: now / 86400,
+        volume_daily: 0,
+        unpriced_total: false,
+        unpriced_daily: false,
         calls: 0,
         ledger: 100,
         module_digest: c.module_digest,
@@ -322,7 +361,6 @@ pub fn request_config(route: WalletRoute, usdc: bool) -> WalletConfig {
         wallet,
         owner,
         agent: sdk::account_for_seed(&[2; 32]),
-        fee_account: None,
         server: sdk::account_for_seed(&[3; 32]),
         route: route.clone(),
         tier: (route == WalletRoute::PolicyWallet).then_some(sdk::PolicyTier::Simple),
@@ -419,7 +457,6 @@ pub fn approval_public_profile(fixture: &Value) -> Value {
         wallet: sdk::account_for_seed(&[8; 32]),
         owner: fixture["intent"]["owner"].as_str().unwrap().into(),
         agent: sdk::account_for_seed(&[2; 32]),
-        fee_account: None,
         server: sdk::account_for_seed(&[3; 32]),
         route: WalletRoute::Native,
         tier: None,

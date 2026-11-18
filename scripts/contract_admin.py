@@ -36,9 +36,10 @@ def writes_state(*args, **kwargs):
 
 # No transfers, token approvals, general calls or arbitrary method dispatch.
 WALLET = {
-    "deploy_policy": {"deployment"},
+    "deploy_policy": {"update"},
     "set_pause": {"paused", "deployment_version"},
-    "recover": {"recipient", "amount"},
+    "stop": {"deployment_version"},
+    "recover": {"token", "recipient", "amount"},
 }
 
 PARENT = {
@@ -87,14 +88,6 @@ def code_hash(value):
     return value
 
 
-def prefix_digest(kind, module, asset, rules):
-    """Canonical standard-prefix binding of executable, asset and ordered native rules."""
-    checks = scval.to_vec([scval.to_vec([scval.to_symbol(rule)]) for rule in rules])
-    value = scval.to_vec([scval.to_symbol("allowit_std_prefix"), scval.to_symbol(kind),
-        scval.to_bytes(bytes.fromhex(module)), scval.to_address(asset), checks])
-    return hashlib.sha256(value.to_xdr_bytes()).hexdigest()
-
-
 def plain_params(native):
     """Plain owner parameter values from decoded native AllowitValue enums."""
     def plain(value):
@@ -119,9 +112,10 @@ def pinned_wasm(path, expected_hash):
     return expected_hash
 
 
-# Custody State layout this tool encodes: key => AllowitValue params, Vec<AllowitRule> prefix and a
-# key => AllowitValue policy_state map. Versions 1 to 3 stored other encodings; none migrates.
-WALLET_CONTRACT_VERSION = 4
+# Custody layout this tool encodes: the packed configuration with the raw agent and server keys,
+# the owner's source hash and gas cap, and the figures that the checks read. Versions 1 to 4 stored
+# other encodings; none migrates.
+WALLET_CONTRACT_VERSION = 5
 
 
 CUSTODY_LAYOUT_KEY = b"allowit_custody_layout"
@@ -282,11 +276,70 @@ def params(value, tier=None):
 TIERS = ("simple", "common", "custom")
 
 
+def _uleb(value):
+    out = bytearray()
+    while True:
+        byte, value = value & 0x7F, value >> 7
+        out.append(byte | (0x80 if value else 0))
+        if not value:
+            return bytes(out)
+
+
+def _raw(address):
+    return StrKey.decode_contract(address) if StrKey.is_valid_contract(address) else StrKey.decode_ed25519_public_key(address)
+
+
+def _packed_value(value):
+    """One `AllowitValue` in the wallet's packing: a tag, then a zigzag LEB128 integer, the
+    text length and bytes, the raw 32-byte address or the items of a list."""
+    (kind, item), = value.items()
+    if kind == "Int":
+        number = int(item)
+        return b"\x00" + _uleb((number << 1) ^ (number >> 127))
+    if kind == "Bool":
+        return b"\x02" if item else b"\x01"
+    if kind == "Str":
+        text = item.encode()
+        return b"\x03" + _uleb(len(text)) + text
+    if kind == "Addr":
+        return (b"\x05" if StrKey.is_valid_contract(item) else b"\x04") + _raw(item)
+    return b"\x06" + _uleb(len(item)) + b"".join(_packed_value(entry) for entry in item)
+
+
+def installed_params(config, tier):
+    """The params that a wallet stores: a Simple or Common wallet keeps only the params of its
+    rules; a Custom wallet keeps all."""
+    if tier == "custom":
+        return dict(config["params"])
+    return {key: value for key, value in config["params"].items() if key in config["rules"]}
+
+
+def packed_config(config, tier, version=0, paused=False):
+    """The instance value `c` of a layout 5 wallet that `config` created, as the wallet packs it:
+    the layout, the flags, the deployment version, the owner, the agent and server keys, the
+    asset, the source hash, then the gas cap, the rules and the params in key order."""
+    owner_contract = StrKey.is_valid_contract(config["owner"])
+    out = bytearray([WALLET_CONTRACT_VERSION, (2 if owner_contract else 0) | (1 if paused else 0)])
+    out += version.to_bytes(4, "big")
+    for role in ("owner", "agent", "server", "asset"):
+        out += _raw(config[role])
+    out += bytes.fromhex(config["source_hash"])
+    out += _uleb(config["gas_cap"])
+    out.append(len(config["rules"]))
+    out += bytes(PARAM_KEYS.index(rule) for rule in config["rules"])
+    stored = params(installed_params(config, tier), tier)
+    out += _uleb(len(stored))
+    for key in sorted(stored, key=lambda name: name.encode()):
+        out += bytes([PARAM_KEYS.index(key)]) if key in PARAM_KEYS else b"\xff" + bytes([len(key)]) + key.encode()
+        out += _packed_value(stored[key])
+    return bytes(out)
+
+
 def policy_rules(value, tier, source_path):
     """Bind an owner packet to its authored source. Every tier requires one self-contained file that
     binds `allowit` only to the canonical crate and passes the std-only compile of the offchain
-    server. Common binds the source's standard prefix; Simple and Custom bind none. Custom also binds
-    the source bytes."""
+    server. Every tier binds the SHA-256 of the whole source; Common also binds the source's
+    standard prefix, and Simple and Custom bind no rules."""
     if tier not in TIERS or not source_path:
         raise ValueError("Owner packets require --tier (" + ", ".join(TIERS) + ") and --policy-source")
     source = Path(source_path).read_bytes()
@@ -295,11 +348,11 @@ def policy_rules(value, tier, source_path):
     expected = standard_prefix(source.decode()) if tier == "common" else []
     if value["rules"] != expected:
         raise ValueError("Rules must be the standard prefix derived from the policy source: " + json.dumps(expected))
-    if tier == "custom" and value["source_digest"] != hashlib.sha256(source).hexdigest():
-        raise ValueError("Custom source_digest must be the SHA-256 of the policy source")
-    # Simple and Common store only standard state, so their server denies every policy write.
-    if tier != "custom" and writes_state(source.decode()):
-        raise ValueError("Simple and Common cannot store allowit::set_state writes; use the custom tier")
+    if value["source_hash"] != hashlib.sha256(source).hexdigest():
+        raise ValueError("source_hash must be the SHA-256 of the policy source")
+    # A policy wallet stores no policy state on any tier, so its server denies every policy write.
+    if writes_state(source.decode()):
+        raise ValueError("A policy wallet stores no policy state; a source that calls allowit::set_state is refused")
     values = value.get("params", {})
     params(values, tier)
     # Valid configuration: the owner can set the param later without code redeployment.
@@ -310,25 +363,33 @@ def policy_rules(value, tier, source_path):
     return value
 
 
-def deployment(value):
-    fields = {"deployment_version", "owner", "agent", "server", "source_digest", "rules", "params", "x402_enabled", "wasm_hash"}
+def raw_key(value):
+    """The wallet stores the agent and the server as raw Ed25519 keys: their G addresses."""
+    return account(value)
+
+
+def update(value):
+    """Field checks of one `AllowitPolicyUpdate`."""
+    fields = {"deployment_version", "owner", "agent", "server", "source_hash", "gas_cap", "rules", "params", "wasm_hash"}
     if not isinstance(value, dict) or set(value) != fields:
-        raise ValueError("Deployment fields must exactly match the policy wallet ABI")
-    if type(value["deployment_version"]) is not int or not 0 < value["deployment_version"] < 2**64:
+        raise ValueError("Update fields must exactly match the policy wallet ABI")
+    if type(value["deployment_version"]) is not int or not 0 < value["deployment_version"] < 2**32:
         raise ValueError("Invalid deployment version")
-    for role in ("owner", "agent", "server"):
-        address(value[role])
+    address(value["owner"])
+    for role in ("agent", "server"):
+        raw_key(value[role])
+    if len({value[role] for role in ("owner", "agent", "server")}) != 3:
+        raise ValueError("Owner, agent and server must differ")
     params(value["params"])
-    code_hash(value["source_digest"])
+    code_hash(value["source_hash"])
+    if int(value["source_hash"], 16) == 0:
+        raise ValueError("The source hash must be nonzero")
+    if type(value["gas_cap"]) is not int or not 0 <= value["gas_cap"] < 2**127:
+        raise ValueError("The gas cap is a nonnegative 128-bit integer")
     if not isinstance(value["rules"], list) or any(rule not in PARAM_KEYS for rule in value["rules"]):
         raise ValueError("Rules must name canonical rules: " + ", ".join(PARAM_KEYS))
-    if type(value["x402_enabled"]) is not bool:
-        raise ValueError("x402_enabled must be boolean")
-    if value["x402_enabled"] and any(not StrKey.is_valid_ed25519_public_key(value[role]) for role in ("agent", "server")):
-        raise ValueError("x402_enabled (custom-account authorization) requires native G-agent and G-server signers")
-    for name in ("wasm_hash",):
-        if value[name] is not None:
-            code_hash(value[name])
+    if value["wasm_hash"] is not None:
+        code_hash(value["wasm_hash"])
     return value
 
 
@@ -337,10 +398,10 @@ def checked_args(method, values, family):
     if not isinstance(values, dict) or set(values) != expected:
         raise ValueError("Arguments must exactly match " + ", ".join(sorted(expected)))
     for key, value in values.items():
-        if key == "deployment":
-            deployment(value)
+        if key == "update":
+            update(value)
         elif key == "deployment_version":
-            if type(value) is not int or not 0 < value < 2**64:
+            if type(value) is not int or not 0 < value < 2**32:
                 raise ValueError("Invalid deployment version")
         elif key == "version" or key == "amount":
             if type(value) is not int or (value < 0 if key == "version" else value <= 0) or value > (2**64 - 1 if key == "version" else 2**127 - 1):
@@ -352,7 +413,7 @@ def checked_args(method, values, family):
                 raise ValueError("paused must be boolean")
         elif key in ("new_owner", "agent", "owner"):
             account(value)
-        elif key == "engine":
+        elif key in ("engine", "token"):
             contract(value)
         else:
             address(value)
@@ -360,11 +421,16 @@ def checked_args(method, values, family):
 
 
 def serialize(values):
+    """Stellar CLI arguments: an update or a config with its params in the pinned CLI spec form,
+    the agent and the server as raw key hex and the gas cap as decimal text."""
     args = []
     for key, value in values.items():
-        if key in ("deployment", "config"):
+        if key in ("update", "config"):
             value = copy.deepcopy(value)
             value["params"] = params(value["params"])
+            for role in ("agent", "server"):
+                value[role] = StrKey.decode_ed25519_public_key(value[role]).hex()
+            value["gas_cap"] = str(value["gas_cap"])
         args += ["--" + key.replace("_", "-"), json.dumps(value, separators=(",", ":")) if not isinstance(value, str) else value]
     return args
 
@@ -484,33 +550,28 @@ def command(args):
                 raise ValueError("Parent deployment source must be its native admin account")
         else:
             config = public_json(args.config)
-            fields = {"owner", "agent", "server", "asset", "policy_instance", "source_digest", "rules", "params", "x402_enabled"}
+            fields = {"owner", "agent", "server", "asset", "source_hash", "gas_cap", "rules", "params"}
             if not isinstance(config, dict) or set(config) != fields:
                 raise ValueError("Config fields must exactly match the policy wallet ABI")
-            deployment({key: config[key] for key in fields - {"asset", "policy_instance"}} | {"deployment_version": 1, "wasm_hash": None})
+            update({key: config[key] for key in fields - {"asset"}} | {"deployment_version": 1, "wasm_hash": None})
             policy_rules(config, getattr(args, "tier", None), getattr(args, "policy_source", None))
             contract(config["asset"])
-            code_hash(config["policy_instance"])
-            if int(config["policy_instance"], 16) == 0:
-                raise ValueError("Policy identity must be nonzero")
             if args.source != config["owner"]:
                 raise ValueError("Policy wallet deployment source must be its owner")
-            if len({config[key] for key in ("owner", "agent", "server")}) != 3:
-                raise ValueError("Owner, agent and server must differ")
             values = {"config": config}
         return ["contract", "deploy", "--wasm", args.wasm, "--build-only"] + base + ["--"] + serialize(values)
     address(args.contract)
     if not StrKey.is_valid_contract(args.contract):
         raise ValueError("Target must be a contract C address")
     if args.action == "read":
-        if args.method not in ("state", "engine", "policy_binding"):
-            raise ValueError("Only state, engine and policy_binding reads are supported")
+        if args.method not in ("state", "engine"):
+            raise ValueError("Only state and engine reads are supported")
         return ["contract", "invoke", "--id", args.contract, "--send=no"] + base + ["--", args.method]
     methods = WALLET if args.family == "wallet" else PARENT
     if args.method not in methods:
         raise ValueError("Method is outside the admin allowlist")
     values = checked_args(args.method, public_json(args.arguments), args.family)
     if args.method == "deploy_policy":
-        policy_rules(values["deployment"], getattr(args, "tier", None), getattr(args, "policy_source", None))
-        wallet_code(values["deployment"]["wasm_hash"], getattr(args, "wasm", None))
+        policy_rules(values["update"], getattr(args, "tier", None), getattr(args, "policy_source", None))
+        wallet_code(values["update"]["wasm_hash"], getattr(args, "wasm", None))
     return ["contract", "invoke", "--id", args.contract, "--build-only"] + base + ["--", args.method] + serialize(values)

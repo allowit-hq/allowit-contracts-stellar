@@ -14,11 +14,11 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import testnet_release as release
-from stellar_sdk import Account, Address, Keypair, Network, TransactionBuilder, scval, xdr
+from stellar_sdk import Account, Address, Keypair, Network, StrKey, TransactionBuilder, scval, xdr
 
 
 def wasm():
-    key, value = b"allowit_custody_layout", b"4"
+    key, value = b"allowit_custody_layout", b"5"
     string = lambda data: len(data).to_bytes(4, "big") + data + b"\0" * (-len(data) % 4)
     meta = (0).to_bytes(4, "big") + string(key) + string(value)
     section = bytes([len(b"contractmetav0")]) + b"contractmetav0" + meta
@@ -61,12 +61,12 @@ def constructor(config, module, salt):
         if release.ca.is_address(item):
             return scval.to_enum("Addr", scval.to_address(item))
         return scval.to_enum("Str", scval.to_string(item))
-    fields = {key: scval.to_address(config[key]) for key in ("owner", "agent", "server", "asset")}
-    fields.update(policy_instance=scval.to_bytes(bytes.fromhex(config["policy_instance"])),
-        source_digest=scval.to_bytes(bytes.fromhex(config["source_digest"])),
+    fields = {key: scval.to_address(config[key]) for key in ("owner", "asset")}
+    fields.update({role: scval.to_bytes(StrKey.decode_ed25519_public_key(config[role])) for role in ("agent", "server")})
+    fields.update(source_hash=scval.to_bytes(bytes.fromhex(config["source_hash"])),
+        gas_cap=scval.to_int128(config["gas_cap"]),
         rules=scval.to_vec([scval.to_enum(rule, None) for rule in config["rules"]]),
-        params=scval.to_struct({key: value(item) for key, item in config["params"].items()}),
-        x402_enabled=scval.to_bool(config["x402_enabled"]))
+        params=scval.to_struct({key: value(item) for key, item in config["params"].items()}))
     return xdr.CreateContractArgsV2(
         xdr.ContractIDPreimage(xdr.ContractIDPreimageType.CONTRACT_ID_PREIMAGE_FROM_ADDRESS,
             from_address=xdr.ContractIDPreimageFromAddress(Address(config["owner"]).to_xdr_sc_address(), xdr.Uint256(salt))),
@@ -203,13 +203,14 @@ class ReleaseSafety(unittest.TestCase):
         packet = constructor(self.config, self.module, self.salt)
         release.check_constructor(packet, self.config, self.module, self.salt)
         changed, salt, wallet = release.wallet_intent(self.manifest, 'common', self.owner.public_key, self.server.public_key, self.agent.public_key)
-        self.assertEqual((salt, wallet, changed['policy_instance']), (self.salt, self.wallet, self.config['policy_instance']))
+        self.assertEqual((salt, wallet, changed['source_hash']), (self.salt, self.wallet, self.config['source_hash']))
+        self.assertEqual(self.config['source_hash'], self.manifest['sample_policy']['sha256'])
         self.assertNotEqual(changed['server'], self.config['server'])
         other = {**self.manifest, 'tag':'v0.3.0'}
         self.assertNotEqual(release.wallet_intent(other, 'common', self.owner.public_key, self.agent.public_key, self.server.public_key)[2], self.wallet)
 
     def test_strict_constructor_variants_and_intent(self):
-        for field, value in [('server',self.agent.public_key),('policy_instance','11'*32),('rules',[]),('x402_enabled',True)]:
+        for field, value in [('server',self.agent.public_key),('source_hash','11'*32),('gas_cap',1),('rules',[])]:
             changed=copy.deepcopy(self.config);changed[field]=value
             with self.subTest(field=field),self.assertRaises(ValueError):
                 release.check_constructor(constructor(changed,self.module,self.salt),self.config,self.module,self.salt)

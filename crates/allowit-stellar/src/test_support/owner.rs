@@ -37,7 +37,7 @@ pub(crate) fn hash(tx: &x::Transaction) -> [u8; 32] {
 }
 pub fn wasm() -> Vec<u8> {
     let mut meta = 0u32.to_be_bytes().to_vec();
-    for bytes in [b"allowit_custody_layout".as_slice(), b"4"] {
+    for bytes in [b"allowit_custody_layout".as_slice(), b"5"] {
         meta.extend((bytes.len() as u32).to_be_bytes());
         meta.extend(bytes);
         meta.resize(meta.len().div_ceil(4) * 4, 0);
@@ -302,30 +302,55 @@ impl OwnerLedger {
                     };
                     return Ok(account_entry(&state));
                 }
+                // The fixture wallet keeps its totals in `t`, from the installed counters, and no `d`.
+                if let x::LedgerKey::ContractData(data) = &key
+                    && data.key != x::ScVal::LedgerKeyContractInstance
+                {
+                    let counters = self.installed.lock().unwrap().clone().map(|i| i.2);
+                    let total = |name: &str| match counters.as_ref().and_then(|c| c.get(name)) {
+                        Some(native::PolicyValue::Int(v)) => *v,
+                        _ => 0,
+                    };
+                    if data.key != native::value_symbol("t")? || counters.is_none() {
+                        return Ok(json!({"latestLedger":120,"entries":[]}));
+                    }
+                    let mut bytes = u64::try_from(total("spent"))
+                        .unwrap()
+                        .to_be_bytes()
+                        .to_vec();
+                    bytes.extend(u32::try_from(total("calls")).unwrap().to_be_bytes());
+                    let entry = x::LedgerEntryData::ContractData(x::ContractDataEntry {
+                        ext: x::ExtensionPoint::V0,
+                        contract: addr(&c.wallet),
+                        key: data.key.clone(),
+                        durability: x::ContractDataDurability::Persistent,
+                        val: x::ScVal::Bytes(bytes.try_into().unwrap()),
+                    });
+                    return Ok(json!({"latestLedger":120,"entries":[{"xdr":enc(&entry)}]}));
+                }
                 let (params, deployment_version, policy_state) = self
                     .installed
                     .lock()
                     .unwrap()
                     .clone()
                     .unwrap_or((c.params.clone(), 1, Default::default()));
-                let state = native::contract::CustodyState {
-                    policy_state,
-                    contract_version: native::CONTRACT_VERSION,
+                let state = native::packed::encode(&native::packed::Configuration {
+                    layout: native::packed::LAYOUT,
+                    paused: false,
+                    deployment_version: u32::try_from(deployment_version).unwrap(),
                     owner: c.owner.clone(),
-                    agent: c.agent_account().into(),
+                    agent: c.agent.clone(),
                     server: c.server.clone(),
                     asset: c.asset.clone(),
-                    policy_instance: c.policy_instance,
-                    source_digest: c.source_digest,
+                    source_hash: c.source_hash,
+                    gas_cap: i128::from(c.max_fee_stroops),
                     rules: c.rules.clone(),
-                    params,
-                    x402_enabled: false,
-                    token: c.asset_symbol.clone(),
-                    deployment_version,
-                    nonce: 0,
-                    paused: false,
-                }
-                .scval()?;
+                    params: native::installed_params(&native::WalletConfig {
+                        params,
+                        ..c.clone()
+                    }),
+                })?;
+                let _ = policy_state;
                 let data = x::LedgerEntryData::ContractData(x::ContractDataEntry {
                     ext: x::ExtensionPoint::V0,
                     contract: addr(&c.wallet),
@@ -335,8 +360,8 @@ impl OwnerLedger {
                         executable: x::ContractExecutable::Wasm(x::Hash(c.module_digest)),
                         storage: Some(
                             vec![x::ScMapEntry {
-                                key: x::ScVal::U32(0),
-                                val: state,
+                                key: native::value_symbol("c")?,
+                                val: x::ScVal::Bytes(state.try_into().unwrap()),
                             }]
                             .try_into()
                             .unwrap(),
@@ -345,23 +370,7 @@ impl OwnerLedger {
                 });
                 Ok(json!({"entries":[{"xdr":enc(&data)}]}))
             }
-            "simulateTransaction" => {
-                let b = native::contract::PolicyBinding {
-                    engine_kind: c.tier.unwrap().kind().into(),
-                    contract_version: native::CONTRACT_VERSION,
-                    policy_instance: c.policy_instance,
-                    module_digest: c.module_digest,
-                    source_digest: c.source_digest,
-                    operations: vec![
-                        native::OperationKind::Transfer,
-                        native::OperationKind::Swap,
-                        native::OperationKind::Deposit,
-                        native::OperationKind::Redeem,
-                    ],
-                }
-                .scval()?;
-                Ok(json!({"results":[{"xdr":enc(&b)}]}))
-            }
+            "simulateTransaction" => Ok(json!({"results":[{"xdr":enc(&x::ScVal::Void)}]})),
             "getTransaction" => {
                 let signed = self.direct_signed.lock().unwrap().clone().or_else(|| {
                     owner_submissions

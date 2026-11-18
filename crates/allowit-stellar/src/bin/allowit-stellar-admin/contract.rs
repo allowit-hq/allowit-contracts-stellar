@@ -18,37 +18,39 @@ use stellar_xdr::{
 pub const ACTIONS: [&str; 5] = ["upload", "deploy-parent", "deploy-wallet", "read", "admin"];
 const TIERS: [&str; 3] = ["simple", "common", "custom"];
 // No transfers, token approvals, general calls or arbitrary method dispatch.
-const WALLET: [(&str, &[&str]); 3] = [
-    ("deploy_policy", &["deployment"]),
+const WALLET: [(&str, &[&str]); 4] = [
+    ("deploy_policy", &["update"]),
     ("set_pause", &["paused", "deployment_version"]),
-    ("recover", &["recipient", "amount"]),
+    ("stop", &["deployment_version"]),
+    ("recover", &["token", "recipient", "amount"]),
 ];
 const PARENT: [(&str, &[&str]); 3] = [
     ("upgrade_engine", &["new_hash", "version"]),
     ("upgrade_parent", &["new_hash", "version"]),
     ("set_admin", &["owner", "version"]),
 ];
-const DEPLOYMENT: [&str; 9] = [
+/// `AllowitPolicyUpdate`.
+const UPDATE: [&str; 9] = [
     "deployment_version",
     "owner",
     "agent",
     "server",
-    "source_digest",
+    "source_hash",
+    "gas_cap",
     "rules",
     "params",
-    "x402_enabled",
     "wasm_hash",
 ];
-const CONFIG: [&str; 9] = [
+/// `AllowitPolicyConfig`.
+const CONFIG: [&str; 8] = [
     "owner",
     "agent",
     "server",
     "asset",
-    "policy_instance",
-    "source_digest",
+    "source_hash",
+    "gas_cap",
     "rules",
     "params",
-    "x402_enabled",
 ];
 const CORE: &str = "https://github.com/allowit-hq/allowit-core.git";
 const PORTABLE: &str = "crates/allowit-core/src/portable/";
@@ -162,9 +164,9 @@ fn code_hash(value: &Value) -> Result<&str> {
         .filter(|text| text.len() == 64 && text.bytes().all(|b| b.is_ascii_hexdigit()))
         .ok_or_else(|| "Expected 32-byte hexadecimal Wasm hash".to_string())
 }
-fn deployment_version(value: &Value) -> Result<u64> {
+fn deployment_version(value: &Value) -> Result<u32> {
     integer(value)
-        .and_then(|v| u64::try_from(v).ok())
+        .and_then(|v| u32::try_from(v).ok())
         .filter(|v| *v > 0)
         .ok_or_else(|| "Invalid deployment version".to_string())
 }
@@ -432,14 +434,14 @@ pub fn policy_rules(
             names.join(", ")
         ));
     }
-    if tier == PolicyTier::Custom && value["source_digest"] != hex(&hash(&bytes)) {
-        return Err("Custom source_digest must be the SHA-256 of the policy source".into());
+    // Every tier stores the SHA-256 of the owner's whole source.
+    if value["source_hash"] != hex(&hash(&bytes)) {
+        return Err("source_hash must be the SHA-256 of the policy source".into());
     }
     // Simple and Common store only standard state, so their server denies every policy write.
-    if tier != PolicyTier::Custom && shape.writes_state {
-        return Err(
-            "Simple and Common cannot store allowit::set_state writes; use the custom tier".into(),
-        );
+    // A policy wallet stores no policy state on any tier.
+    if shape.writes_state {
+        return Err(policy::WRITES_STATE.into());
     }
     let empty = json!({});
     let values = value.get("params").unwrap_or(&empty);
@@ -458,16 +460,30 @@ pub fn policy_rules(
     }))
 }
 
-/// Field checks of one `AllowitPolicyDeployment`.
-fn deployment(value: &Value) -> Result<()> {
-    let map = exact_keys(value, &DEPLOYMENT)
-        .ok_or("Deployment fields must exactly match the policy wallet ABI")?;
+/// Field checks of one `AllowitPolicyUpdate`. The wallet stores the agent and the server as raw
+/// Ed25519 keys, given here as their G addresses.
+fn update(value: &Value) -> Result<()> {
+    let map = exact_keys(value, &UPDATE)
+        .ok_or("Update fields must exactly match the policy wallet ABI")?;
     deployment_version(&map["deployment_version"])?;
-    for role in ["owner", "agent", "server"] {
-        address(&map[role])?;
+    address(&map["owner"])?;
+    for role in ["agent", "server"] {
+        account(&map[role])?;
+    }
+    let roles: BTreeSet<&str> = ["owner", "agent", "server"]
+        .iter()
+        .filter_map(|role| map[*role].as_str())
+        .collect();
+    if roles.len() != 3 {
+        return Err("Owner, agent and server must differ".into());
     }
     params(&map["params"], None)?;
-    code_hash(&map["source_digest"])?;
+    if code_hash(&map["source_hash"])?.bytes().all(|b| b == b'0') {
+        return Err("The source hash must be nonzero".into());
+    }
+    integer(&map["gas_cap"])
+        .filter(|v| *v >= 0)
+        .ok_or("The gas cap is a nonnegative 128-bit integer")?;
     let keys = policy::param_keys();
     let canonical = map["rules"].as_array().is_some_and(|rules| {
         rules
@@ -479,19 +495,6 @@ fn deployment(value: &Value) -> Result<()> {
             "Rules must name canonical rules: {}",
             keys.join(", ")
         ));
-    }
-    let x402 = map["x402_enabled"]
-        .as_bool()
-        .ok_or("x402_enabled must be boolean")?;
-    if x402
-        && ["agent", "server"]
-            .iter()
-            .any(|role| account(&map[*role]).is_err())
-    {
-        return Err(
-            "x402_enabled (custom-account authorization) requires native G-agent and G-server signers"
-                .into(),
-        );
     }
     if !map["wasm_hash"].is_null() {
         code_hash(&map["wasm_hash"])?;
@@ -516,7 +519,7 @@ pub fn checked_args(method: &str, values: &Value, family: &str) -> Result<()> {
     })?;
     for (key, value) in map {
         match key.as_str() {
-            "deployment" => deployment(value)?,
+            "update" => update(value)?,
             "deployment_version" => {
                 deployment_version(value)?;
             }
@@ -539,6 +542,9 @@ pub fn checked_args(method: &str, values: &Value, family: &str) -> Result<()> {
             "owner" => {
                 account(value)?;
             }
+            "token" => {
+                contract(value)?;
+            }
             _ => {
                 address(value)?;
             }
@@ -548,13 +554,20 @@ pub fn checked_args(method: &str, values: &Value, family: &str) -> Result<()> {
 }
 
 /// Stellar CLI arguments of the named values. A text value passes unchanged; any other value is
-/// compact JSON, with the params of a deployment or config in the pinned CLI spec form.
+/// compact JSON. An update or a config carries its params in the pinned CLI spec form, the agent
+/// and the server as raw key hex and the gas cap as decimal text.
 pub fn serialize(values: &Map<String, Value>) -> Result<Vec<String>> {
     let mut args = vec![];
     for (key, value) in values {
         let mut value = value.clone();
-        if key == "deployment" || key == "config" {
+        if key == "update" || key == "config" {
             value["params"] = params(&value["params"], None)?;
+            for role in ["agent", "server"] {
+                let key = allowit_stellar::account_key(account(&value[role])?)?;
+                value[role] = json!(hex(&key));
+            }
+            let gas = integer(&value["gas_cap"]).ok_or("The gas cap is an integer")?;
+            value["gas_cap"] = json!(gas.to_string());
         }
         args.push(format!("--{}", key.replace('_', "-")));
         args.push(match &value {
@@ -695,25 +708,13 @@ pub fn command(
                 .ok_or("Config fields must exactly match the policy wallet ABI")?;
             let mut packet = map.clone();
             packet.remove("asset");
-            packet.remove("policy_instance");
             packet.insert("deployment_version".into(), json!(1));
             packet.insert("wasm_hash".into(), Value::Null);
-            deployment(&Value::Object(packet))?;
+            update(&Value::Object(packet))?;
             warning = policy_rules(&config, tier, policy_source, compile)?;
             contract(&map["asset"])?;
-            let instance = code_hash(&map["policy_instance"])?;
-            if instance.bytes().all(|b| b == b'0') {
-                return Err("Policy identity must be nonzero".into());
-            }
             if map["owner"] != args.source.as_str() {
                 return Err("Policy wallet deployment source must be its owner".into());
-            }
-            let roles: BTreeSet<&str> = ["owner", "agent", "server"]
-                .iter()
-                .filter_map(|role| map[*role].as_str())
-                .collect();
-            if roles.len() != 3 {
-                return Err("Owner, agent and server must differ".into());
             }
             values.insert("config".into(), config);
         }
@@ -728,8 +729,8 @@ pub fn command(
     let target = contract(&target).map_err(|_| "Target must be a contract C address")?;
     let method = args.method.as_deref().unwrap_or_default();
     if args.action == "read" {
-        if !["state", "engine", "policy_binding"].contains(&method) {
-            return Err("Only state, engine and policy_binding reads are supported".into());
+        if !["state", "engine"].contains(&method) {
+            return Err("Only state and engine reads are supported".into());
         }
         let mut command = strings(&["contract", "invoke", "--id", target, "--send=no"]);
         command.extend(base);
@@ -740,8 +741,8 @@ pub fn command(
     checked_args(method, &values, &args.family)?;
     let mut warning = None;
     if method == "deploy_policy" {
-        warning = policy_rules(&values["deployment"], tier, policy_source, compile)?;
-        wallet_code(&values["deployment"]["wasm_hash"], args.wasm.as_deref())?;
+        warning = policy_rules(&values["update"], tier, policy_source, compile)?;
+        wallet_code(&values["update"]["wasm_hash"], args.wasm.as_deref())?;
     }
     let mut command = strings(&["contract", "invoke", "--id", target, "--build-only"]);
     command.extend(base);
@@ -935,7 +936,7 @@ pub fn run(
             .ok_or("Contract state has no owner")?;
         if family == "wallet" && method == "deploy_policy" {
             wallet_layout(&state)?;
-            let policy = &values["deployment"];
+            let policy = &values["update"];
             let roles: BTreeSet<&str> = ["owner", "agent", "server"]
                 .iter()
                 .filter_map(|role| policy[*role].as_str())
@@ -963,7 +964,7 @@ pub fn run(
             }
         } else {
             let target_version = if method == "deploy_policy" {
-                &values["deployment"]["deployment_version"]
+                &values["update"]["deployment_version"]
             } else {
                 &values["deployment_version"]
             };

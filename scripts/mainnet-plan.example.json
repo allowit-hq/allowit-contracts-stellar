@@ -1,8 +1,8 @@
 {
-  "schema": 1,
+  "schema": 2,
   "network": "mainnet",
   "network_passphrase": "Public Global Stellar Network ; September 2015",
-  "source_revision": "REPLACE_REVIEWED_LAYOUT_4_REVISION",
+  "source_revision": "REPLACE_REVIEWED_LAYOUT_5_REVISION",
   "artifact_manifest": "manifest.json",
   "artifacts": {
     "engine": {
@@ -27,8 +27,6 @@
   ],
   "agent": "REPLACE_AGENT_G_ADDRESS",
   "recipient": "REPLACE_RECIPIENT_G_ADDRESS",
-  "forbidden_recipient": "REPLACE_FORBIDDEN_G_ADDRESS",
-  "policy_instance": "REPLACE_NONZERO_64_HEX",
   "params": {
     "destinations": [
       "REPLACE_RECIPIENT_G_ADDRESS"
@@ -40,17 +38,16 @@
     "expires_at": 0
   },
   "fund_stroops": 20000,
-  "payment_stroops": 10000,
+  "gas_cap_stroops": 1000000,
   "fee_caps_stroops": {
     "upload-engine": 60000000,
     "upload-parent": 80000000,
     "upload-wallet": 260000000,
     "deploy-parent": 40000000,
     "deploy-wallet": 40000000,
-    "fund": 10000000,
-    "execute": 10000000
+    "fund": 10000000
   },
-  "total_fee_cap_stroops": 500000000,
+  "total_fee_cap_stroops": 490000000,
   "server": "REPLACE_SERVER_G_ADDRESS",
   "asset": "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA"
 }

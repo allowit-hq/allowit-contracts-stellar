@@ -116,9 +116,13 @@ class ContractAdmin(unittest.TestCase):
         self.assertEqual(ca.params(values, "common"), {"lifetime_spending_limit": {"Int": str(2**127 - 1)}, "call_limit": {"Int": "0"},
                                                        "destinations": {"List": [{"Addr": KEYS[1]}]}, "tokens": {"List": []}})
         self.assertEqual(ca.params({}, "simple"), {})
-        tagged = json.loads(ca.serialize({"deployment": {"params": values}})[1])["params"]
+        serialized = json.loads(ca.serialize({"update": {"params": values, "agent": KEYS[1], "server": KEYS[2], "gas_cap": 2**100}})[1])
+        tagged = serialized["params"]
         self.assertEqual(tagged["lifetime_spending_limit"], {"Int": str(2**127 - 1)})
         self.assertNotIn("expires_at", tagged)
+        # The wallet stores the agent and the server as raw keys; the gas cap is a decimal i128.
+        self.assertEqual(serialized["agent"], StrKey.decode_ed25519_public_key(KEYS[1]).hex())
+        self.assertEqual(serialized["gas_cap"], str(2**100))
         # Custom params: inferred or explicitly typed values within the contract's bounds.
         custom = {"vendor_limit": -5, "note": "pay invoices", "vendor": KEYS[2], "as_text": {"Str": KEYS[2]}, "urgent": True,
                   "pairs": [[1, KEYS[1]]]}
@@ -161,11 +165,14 @@ class ContractAdmin(unittest.TestCase):
         for tier, limit in (("common", 9), ("simple", 9), ("custom", 32)):
             with self.subTest(tier=tier), self.assertRaisesRegex(ValueError, "at most {} keys".format(limit)):
                 ca.params({"k" + str(i): i for i in range(limit + 1)}, tier)
-        deployment = {"deployment_version": 1, "owner": KEYS[0], "agent": KEYS[1], "server": KEYS[2], "source_digest": "22" * 32,
-                      "rules": ["lifetime_spending_limit", "destinations"], "params": values, "x402_enabled": False, "wasm_hash": None}
-        ca.deployment(deployment)
-        with self.assertRaises(ValueError):
-            ca.deployment(dict(deployment, rules=["daily_limit"]))
+        update = {"deployment_version": 1, "owner": KEYS[0], "agent": KEYS[1], "server": KEYS[2], "source_hash": "22" * 32,
+                  "gas_cap": 1_000_000, "rules": ["lifetime_spending_limit", "destinations"], "params": values, "wasm_hash": None}
+        ca.update(update)
+        for invalid in (dict(update, rules=["daily_limit"]), dict(update, deployment_version=2**32), dict(update, gas_cap=-1),
+                        dict(update, agent=StrKey.encode_contract(bytes([3]) * 32)), dict(update, server=KEYS[1]),
+                        dict(update, source_hash="00" * 32), dict(update, x402_enabled=False)):
+            with self.subTest(update=invalid), self.assertRaises((ValueError, argparse.ArgumentTypeError)):
+                ca.update(invalid)
         with self.assertRaises(ValueError):
             ca.public_json('{"custom":1,"custom":2}')
 
@@ -295,6 +302,16 @@ class ContractAdmin(unittest.TestCase):
             ca.checked_args("set_admin", {"owner": contract, "version": 0}, "parent")
         with self.assertRaises(ValueError):
             ca.checked_args("recover", {"recipient": KEYS[1], "amount": 0, "version": 0}, "wallet")
+        # The owner recovers any token the wallet holds, and stops it at the next version.
+        recover = {"token": contract, "recipient": KEYS[1], "amount": 5}
+        self.assertEqual(ca.checked_args("recover", recover, "wallet"), recover)
+        for invalid in (dict(recover, token=KEYS[1]), dict(recover, amount=0), {"recipient": KEYS[1], "amount": 5}):
+            with self.subTest(recover=invalid), self.assertRaises((ValueError, argparse.ArgumentTypeError)):
+                ca.checked_args("recover", invalid, "wallet")
+        self.assertEqual(ca.checked_args("stop", {"deployment_version": 4}, "wallet"), {"deployment_version": 4})
+        for invalid in ({"deployment_version": 0}, {"deployment_version": 2**32}, {"paused": True, "deployment_version": 4}):
+            with self.subTest(stop=invalid), self.assertRaises(ValueError):
+                ca.checked_args("stop", invalid, "wallet")
 
     def test_cli_preparation_cannot_submit(self):
         args = SimpleNamespace(network="testnet", allow_mainnet=False, action="upload", source=KEYS[0], wasm="artifact.wasm")
@@ -324,25 +341,28 @@ class ContractAdmin(unittest.TestCase):
             with self.assertRaises(ValueError):
                 ca.command(options)
 
-    def test_wallet_constructor_requires_explicit_nonzero_policy_identity(self):
+    def test_wallet_constructor_binds_the_whole_source_raw_keys_and_gas_cap(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "wallet.wasm"
             path.write_bytes(b"reviewed-artifact")
             asset = StrKey.encode_contract(bytes([2]) * 32)
-            engine = StrKey.encode_contract(bytes([3]) * 32)
             values = {"expires_at": 2000000000}
-            config = {"owner": KEYS[0], "agent": KEYS[1], "server": KEYS[2], "asset": asset,
-                "source_digest": "22" * 32, "rules": [], "params": values, "x402_enabled": False, "policy_instance": "11" * 32}
             policy = Path(directory) / "policy.rs"
             policy.write_text(source(""))
+            digest = hashlib.sha256(policy.read_bytes()).hexdigest()
+            config = {"owner": KEYS[0], "agent": KEYS[1], "server": KEYS[2], "asset": asset,
+                "source_hash": digest, "gas_cap": 1_000_000, "rules": [], "params": values}
             args = SimpleNamespace(action="deploy-wallet", network="testnet", allow_mainnet=False, tier="simple", policy_source=str(policy),
                 source=KEYS[0], config=json.dumps(config), wasm=str(path), wasm_hash=hashlib.sha256(path.read_bytes()).hexdigest())
             command = ca.command(args)
-            self.assertEqual(json.loads(command[command.index("--config") + 1])["policy_instance"], "11" * 32)
-            for identity in (None, "", "00" * 32, "not-a-policy-id"):
-                config["policy_instance"] = identity
-                args.config = json.dumps(config)
-                with self.assertRaises(ValueError):
+            packet = json.loads(command[command.index("--config") + 1])
+            self.assertEqual((packet["source_hash"], packet["gas_cap"]), (digest, "1000000"))
+            self.assertEqual(packet["server"], StrKey.decode_ed25519_public_key(KEYS[2]).hex())
+            for field, value in (("source_hash", "22" * 32), ("source_hash", "00" * 32), ("gas_cap", -1), ("agent", KEYS[0]),
+                                 ("asset", KEYS[3]), ("policy_instance", "11" * 32)):
+                changed = dict(config, **{field: value})
+                args.config = json.dumps(changed)
+                with self.subTest(field=field, value=value), self.assertRaises((ValueError, argparse.ArgumentTypeError)):
                     ca.command(args)
 
     def test_owner_packets_bind_rules_derived_from_the_policy_source(self):
@@ -351,41 +371,42 @@ class ContractAdmin(unittest.TestCase):
             text = source("    allowit::destinations(ctx, &ctx.params[allowit::DESTINATIONS])?;\n    allowit::expires_at(ctx, &ctx.params[allowit::EXPIRES_AT])?;\n")
             policy.write_text(text)
             digest = hashlib.sha256(text.encode()).hexdigest()
-            packet = {"rules": ["destinations", "expires_at"], "source_digest": "22" * 32}
+            packet = {"rules": ["destinations", "expires_at"], "source_hash": digest}
             self.assertEqual(ca.policy_rules(packet, "common", str(policy)), packet)
-            for tier, rules, source_digest in (("common", ["destinations"], "22" * 32), ("common", ["expires_at", "destinations"], "22" * 32),
-                                               ("simple", ["destinations", "expires_at"], "22" * 32), ("custom", [], "22" * 32),
-                                               (None, ["destinations", "expires_at"], "22" * 32)):
-                with self.assertRaises(ValueError):
-                    ca.policy_rules({"rules": rules, "source_digest": source_digest}, tier, str(policy))
-            self.assertEqual(ca.policy_rules({"rules": [], "source_digest": digest}, "custom", str(policy))["rules"], [])
-            self.assertEqual(ca.policy_rules({"rules": [], "source_digest": "22" * 32}, "simple", str(policy))["rules"], [])
+            # Every tier binds the SHA-256 of the whole source; Common also binds its prefix.
+            for tier, rules, source_hash in (("common", ["destinations"], digest), ("common", ["expires_at", "destinations"], digest),
+                                             ("simple", ["destinations", "expires_at"], digest), ("custom", [], "22" * 32),
+                                             ("common", ["destinations", "expires_at"], "22" * 32), ("simple", [], "22" * 32),
+                                             (None, ["destinations", "expires_at"], digest)):
+                with self.subTest(tier=tier, rules=rules, source_hash=source_hash), self.assertRaises(ValueError):
+                    ca.policy_rules({"rules": rules, "source_hash": source_hash}, tier, str(policy))
+            self.assertEqual(ca.policy_rules({"rules": [], "source_hash": digest}, "custom", str(policy))["rules"], [])
+            self.assertEqual(ca.policy_rules({"rules": [], "source_hash": digest}, "simple", str(policy))["rules"], [])
             with self.assertRaises(ValueError):
                 ca.policy_rules(packet, "common", None)
-            # Simple and Common store only standard state: a policy that writes state needs Custom.
+            # A policy wallet stores no policy state on any tier: a policy that writes state is refused.
             writer = source(CALL("destinations") + "    allowit::set_state(ctx, \"seen\", 1u64)?;\n")
             # A raw identifier names the same function and compiles on the host.
             raw = source(CALL("destinations") + "    allowit::r#set_state(ctx, \"seen\", 1u64)?;\n")
             for body in (raw, writer):
                 policy.write_text(body)
-                for tier in ("common", "simple"):
+                for tier in ("common", "simple", "custom"):
                     rules = ["destinations"] if tier == "common" else []
+                    body_hash = hashlib.sha256(body.encode()).hexdigest()
                     with self.subTest(tier=tier, source=body), self.assertRaisesRegex(ValueError, "set_state"):
-                        ca.policy_rules({"rules": rules, "source_digest": "22" * 32}, tier, str(policy))
-            writer_digest = hashlib.sha256(writer.encode()).hexdigest()
-            self.assertEqual(ca.policy_rules({"rules": [], "source_digest": writer_digest}, "custom", str(policy))["rules"], [])
+                        ca.policy_rules({"rules": rules, "source_hash": body_hash}, tier, str(policy))
             # Simple and Common admit only canonical params; Custom admits its own keys.
-            custom_key = {"rules": [], "source_digest": writer_digest, "params": {"vendor_limit": 5}}
-            self.assertEqual(ca.policy_rules(custom_key, "custom", str(policy)), custom_key)
             policy.write_text(text)
+            custom_key = {"rules": [], "source_hash": digest, "params": {"vendor_limit": 5}}
+            self.assertEqual(ca.policy_rules(custom_key, "custom", str(policy)), custom_key)
             with self.assertRaisesRegex(ValueError, "canonical keys"):
                 ca.policy_rules(dict(packet, params={"vendor_limit": 5}), "common", str(policy))
             # The admin packet path applies the same binding.
-            deployment = {"deployment_version": 1, "owner": KEYS[0], "agent": KEYS[1], "server": KEYS[2], "source_digest": "22" * 32,
-                          "rules": ["expires_at"], "params": {}, "x402_enabled": False, "wasm_hash": None}
+            deployment = {"deployment_version": 1, "owner": KEYS[0], "agent": KEYS[1], "server": KEYS[2], "source_hash": digest,
+                          "gas_cap": 0, "rules": ["expires_at"], "params": {}, "wasm_hash": None}
             args = SimpleNamespace(action="admin", network="testnet", allow_mainnet=False, source=KEYS[0], family="wallet",
                                    contract=StrKey.encode_contract(bytes([2]) * 32), method="deploy_policy", tier="common",
-                                   policy_source=str(policy), arguments=json.dumps({"deployment": deployment}))
+                                   policy_source=str(policy), arguments=json.dumps({"update": deployment}))
             with self.assertRaisesRegex(ValueError, "standard prefix"):
                 ca.command(args)
             # Every tier refuses a source that the portable gate rejects.
@@ -393,17 +414,17 @@ class ContractAdmin(unittest.TestCase):
             other = hashlib.sha256(policy.read_bytes()).hexdigest()
             for tier, rules, source_digest in (("common", ["destinations", "expires_at"], "22" * 32), ("custom", [], other), ("simple", [], "22" * 32)):
                 with self.subTest(tier=tier), self.assertRaisesRegex(ValueError, "self-contained"):
-                    ca.policy_rules({"rules": rules, "source_digest": source_digest}, tier, str(policy))
+                    ca.policy_rules({"rules": rules, "source_hash": source_digest}, tier, str(policy))
             policy.write_text(text)
             # An unset prefix field is valid configuration. Only the standard preflight skips it, so
             # the tooling warns without rejecting.
             deployment["rules"] = ["destinations", "expires_at"]
-            args.arguments = json.dumps({"deployment": deployment})
+            args.arguments = json.dumps({"update": deployment})
             with patch("sys.stderr", new=StringIO()) as stderr:
                 self.assertIn("deploy_policy", ca.command(args))
             self.assertIn("absent: destinations, expires_at", stderr.getvalue())
             deployment["params"] = {"destinations": [KEYS[3]], "expires_at": 2000000000}
-            args.arguments = json.dumps({"deployment": deployment})
+            args.arguments = json.dumps({"update": deployment})
             with patch("sys.stderr", new=StringIO()) as stderr:
                 self.assertIn("deploy_policy", ca.command(args))
             self.assertEqual(stderr.getvalue(), "")
@@ -466,7 +487,7 @@ class ContractAdmin(unittest.TestCase):
             digest = hashlib.sha256(policy.read_bytes()).hexdigest()
             for tier, rules, source_digest in (("common", [], "22" * 32), ("custom", [], digest), ("simple", [], "22" * 32)):
                 with self.subTest(tier=tier), self.assertRaisesRegex(ValueError, "std-only compile"):
-                    ca.policy_rules({"rules": rules, "source_digest": source_digest}, tier, str(policy))
+                    ca.policy_rules({"rules": rules, "source_hash": source_digest}, tier, str(policy))
 
     def test_checker_enums_name_every_core_variant(self):
         import re
@@ -480,7 +501,7 @@ class ContractAdmin(unittest.TestCase):
             with self.subTest(enum=enum):
                 self.assertEqual(tuple(names), variants)
 
-    def test_wallet_code_changes_require_custody_layout_3(self):
+    def test_wallet_code_changes_require_the_current_custody_layout(self):
         self.assertEqual(ca.custody_layout(meta_wasm((b"rsver", b"1.98.0"), (ca.CUSTODY_LAYOUT_KEY, b"3"))), 3)
         # The version 1 release declares only SDK metadata.
         self.assertIsNone(ca.custody_layout(meta_wasm((b"rsver", b"1.98.0"))))
@@ -493,8 +514,9 @@ class ContractAdmin(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             policy = Path(directory) / "policy.rs"
             policy.write_text(source("    allowit::expires_at(ctx, &ctx.params[allowit::EXPIRES_AT])?;\n"))
-            deployment = {"deployment_version": 1, "owner": KEYS[0], "agent": KEYS[1], "server": KEYS[2], "source_digest": "22" * 32,
-                          "rules": ["expires_at"], "params": {}, "x402_enabled": False, "wasm_hash": None}
+            digest = hashlib.sha256(policy.read_bytes()).hexdigest()
+            deployment = {"deployment_version": 1, "owner": KEYS[0], "agent": KEYS[1], "server": KEYS[2], "source_hash": digest,
+                          "gas_cap": 0, "rules": ["expires_at"], "params": {}, "wasm_hash": None}
             args = SimpleNamespace(action="admin", network="testnet", allow_mainnet=False, source=KEYS[0], family="wallet",
                                    contract=StrKey.encode_contract(bytes([2]) * 32), method="deploy_policy", tier="common",
                                    policy_source=str(policy), wasm=None)
@@ -503,14 +525,14 @@ class ContractAdmin(unittest.TestCase):
                 path = Path(directory) / "wallet.wasm"
                 path.write_bytes(wasm_bytes)
                 deployment["wasm_hash"] = wasm_hash or hashlib.sha256(wasm_bytes).hexdigest()
-                args.wasm, args.arguments = str(path), json.dumps({"deployment": deployment})
+                args.wasm, args.arguments = str(path), json.dumps({"update": deployment})
                 return ca.command(args)
 
-            self.assertIn("deploy_policy", prepare(meta_wasm((ca.CUSTODY_LAYOUT_KEY, b"4"))))
-            # The releases of layouts 1 to 3, a future layout and an unpinned file reject.
+            self.assertIn("deploy_policy", prepare(meta_wasm((ca.CUSTODY_LAYOUT_KEY, b"5"))))
+            # The releases of layouts 1 to 4, a future layout and an unpinned file reject.
             for wasm_bytes, wasm_hash in ((meta_wasm((b"rsver", b"1.98.0")), None), (meta_wasm((ca.CUSTODY_LAYOUT_KEY, b"1")), None),
-                                          (meta_wasm((ca.CUSTODY_LAYOUT_KEY, b"3")), None), (meta_wasm((ca.CUSTODY_LAYOUT_KEY, b"5")), None),
-                                          (meta_wasm((ca.CUSTODY_LAYOUT_KEY, b"4")), "11" * 32)):
+                                          (meta_wasm((ca.CUSTODY_LAYOUT_KEY, b"4")), None), (meta_wasm((ca.CUSTODY_LAYOUT_KEY, b"6")), None),
+                                          (meta_wasm((ca.CUSTODY_LAYOUT_KEY, b"5")), "11" * 32)):
                 with self.subTest(wasm=wasm_bytes), self.assertRaises(ValueError):
                     prepare(wasm_bytes, wasm_hash)
             args.wasm = None
@@ -518,8 +540,40 @@ class ContractAdmin(unittest.TestCase):
                 ca.command(args)
             # Unchanged code needs no Wasm.
             deployment["wasm_hash"] = None
-            args.arguments = json.dumps({"deployment": deployment})
+            args.arguments = json.dumps({"update": deployment})
             self.assertIn("deploy_policy", ca.command(args))
+
+    def test_packed_config_is_the_bytes_that_the_wallet_stores(self):
+        # The instance values `c` that the kernel stored for these configurations.
+        stored_custom = ("0502" + "00" * 35 + "01ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216"
+            "218dc8997e416bd17d93ca7be741392a6f2928aadb2e9cf26b48125b1fcabb7c1058f09247979f25a853bedc1581cd0603ce11d2a1655096145e3f6e5c4f"
+            "c2a4a6b5f8cfbb1f553051527587ad4b000c040008ff066372656469740009020090030300c002050601050000000000000000000000000000000000000000"
+            "000000000000000000000002070080dac4090100f40308060403087472616e7366657203047377617003076465706f736974030672656465656d0000c80106"
+            "0601057be741392a6f2928aadb2e9cf26b48125b1fcabb7c1058f09247979f25a853beff06757267656e7402ff0b76656e646f725f6e6f7465030c706179"
+            "20696e766f69636573")
+        stored_common = ("0502" + "00" * 35 + "01ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216"
+            "218dc8997e416bd17d93ca7be741392a6f2928aadb2e9cf26b48125b1fcabb7c1058f09247979f25a853be" + "09" * 32 + "87ad4b090001020304050607"
+            "0809040008020090030300c002050601050000000000000000000000000000000000000000000000000000000000000002070080dac4090100f403080604"
+            "03087472616e7366657203047377617003076465706f736974030672656465656d0000c801060601057be741392a6f2928aadb2e9cf26b48125b1fcabb7c"
+            "1058f09247979f25a853be")
+        owner = StrKey.encode_contract(bytes(31) + b"\x01")
+        recipient = StrKey.encode_contract(bytes(31) + b"\x02")
+        asset = "CB56OQJZFJXSSKFK3MXJZ4TLJAJFWH6KXN6BAWHQSJDZPHZFVBJ353HU"
+        values = {"payment_limit": 100, "lifetime_spending_limit": 250, "daily_spending_limit": 200, "daily_volume_limit": 160,
+                  "call_limit": 4, "destinations": [recipient], "tokens": [asset], "expires_at": 10_000_000,
+                  "operations": ["transfer", "swap", "deposit", "redeem"]}
+        base = {"owner": owner, "agent": Keypair.from_raw_ed25519_seed(bytes([7]) * 32).public_key,
+                "server": Keypair.from_raw_ed25519_seed(bytes([8]) * 32).public_key, "asset": asset, "gas_cap": 1_234_567}
+        custom = dict(base, source_hash="dc1581cd0603ce11d2a1655096145e3f6e5c4fc2a4a6b5f8cfbb1f5530515275", rules=[],
+                      params=dict(values, vendor_note="pay invoices", urgent=True, credit=-5))
+        common = dict(base, source_hash="09" * 32, rules=list(ca.PARAM_KEYS), params=values)
+        self.assertEqual(ca.packed_config(custom, "custom").hex(), stored_custom)
+        self.assertEqual(ca.packed_config(common, "common").hex(), stored_common)
+        # A Standard wallet keeps only the params of its rules; the pause flag and the version are
+        # in the header.
+        simple = ca.packed_config(dict(common, rules=[]), "simple", version=3, paused=True)
+        self.assertEqual(simple[:6], bytes([5, 3, 0, 0, 0, 3]))
+        self.assertEqual(simple[-2:], bytes([0, 0]))  # No rules and no params.
 
     @unittest.skipUnless((ROOT / "target/wasm32v1-none/release/allowit_common_policy_engine.wasm").exists(), "contracts not built")
     def test_built_wallet_wasm_declares_the_current_custody_layout(self):

@@ -162,10 +162,18 @@ fn request(
     amount: i128,
 ) -> Result<ExecutionRequest> {
     let wallet = account(&c.wallet)?;
-    let payer = if c.route == WalletRoute::Native {
-        wallet.clone()
+    // A keypair wallet pays its own fee. A policy wallet's fee is paid by the server's sending
+    // account, which the server names at preparation as the gas payee: its request names no
+    // fee payer and reads no chain state.
+    let _ = state;
+    let fee_bounds = if c.route == WalletRoute::Native {
+        Some(vec![WorkflowFeeBound {
+            payer: wallet.clone(),
+            asset: native_xlm(c)?,
+            max_fee: u64::from(c.max_fee_stroops).into(),
+        }])
     } else {
-        account(&state.source.address)?
+        None
     };
     let request = ExecutionRequest {
         operation: OperationRef {
@@ -181,11 +189,7 @@ fn request(
             min_credit: units(amount)?,
             max_burn: 0u64.into(),
         }],
-        fee_bounds: Some(vec![WorkflowFeeBound {
-            payer,
-            asset: native_xlm(c)?,
-            max_fee: u64::from(c.max_fee_stroops).into(),
-        }]),
+        fee_bounds,
         evidence: vec![],
     };
     operation_from_request(c, &request)?;

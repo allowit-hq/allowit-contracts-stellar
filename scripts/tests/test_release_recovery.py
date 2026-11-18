@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import testnet_release as r
 from test_testnet_release import constructor, ledger, make_bundle, wasm
-from stellar_sdk import Address, Keypair, SorobanServer, TransactionEnvelope, scval, xdr
+from stellar_sdk import Address, Keypair, StrKey, SorobanServer, TransactionEnvelope, scval, xdr
 from stellar_sdk.soroban_rpc import SimulateTransactionResponse, GetTransactionResponse, LedgerEntryResult, GetLedgerEntriesResponse
 
 class ReleaseReconciliation(unittest.TestCase):
@@ -23,12 +23,12 @@ class ReleaseReconciliation(unittest.TestCase):
         self.owner,self.agent,self.server=(Keypair.random() for _ in range(3))
         self.clock=2_000_000_000.0;self.entry_clock=self.clock;self.sequence=10;self.account_present=True
         self.codes={item['sha256']:wasm() for item in self.manifest['artifacts'].values()}
-        self.wallets={};self.configs={}
+        self.wallets={};self.configs={};self.kinds={}
         for kind in r.KINDS:
             config,salt,wallet=r.wallet_intent(self.manifest,kind,self.owner.public_key,self.agent.public_key,self.server.public_key)
             # Independent native constructor encoder from the original CLI/spec tests.
             self.configs[wallet]=constructor(config,self.manifest['artifacts'][kind]['sha256'],salt).constructor_args[0]
-            self.wallets[wallet]=self.manifest['artifacts'][kind]['sha256']
+            self.wallets[wallet]=self.manifest['artifacts'][kind]['sha256'];self.kinds[wallet]=kind
         self.archived=False;self.simulation_error=False;self.send_error=False;self.receipt_mode='SUCCESS';self.sent=[];self.simulated=[]
         self.asset_present=True;self.snapshots=0;self.after_snapshot=None;self.after_send=None
         self.rpc=SorobanServer(r.RPC)
@@ -64,9 +64,24 @@ class ReleaseReconciliation(unittest.TestCase):
         native=xdr.LedgerHeaderHistoryEntry(xdr.Hash(bytes.fromhex(item['hash'])),xdr.LedgerHeader.from_xdr(item['header_xdr']),xdr.LedgerHeaderHistoryEntryExt(0))
         return NS(ledgers=[NS(sequence=start_ledger,hash=item['hash'],header_xdr=native.to_xdr())])
 
+    def config_of(self,wallet):
+        """The configuration that a constructor argument carries, decoded independently."""
+        fields=scval.from_struct(self.configs[wallet])
+        def plain(item):
+            kind=item.vec.sc_vec[0].sym.sc_symbol.decode();inner=item.vec.sc_vec[1]
+            if kind=='List':return [plain(entry) for entry in inner.vec.sc_vec]
+            if kind=='Addr':return Address.from_xdr_sc_address(inner.address).address
+            if kind=='Str':return inner.str.sc_string.decode()
+            return scval.from_int128(inner)
+        return {'owner':Address.from_xdr_sc_address(fields['owner'].address).address,'asset':Address.from_xdr_sc_address(fields['asset'].address).address,
+            'agent':StrKey.encode_ed25519_public_key(fields['agent'].bytes.sc_bytes),'server':StrKey.encode_ed25519_public_key(fields['server'].bytes.sc_bytes),
+            'source_hash':fields['source_hash'].bytes.sc_bytes.hex(),'gas_cap':scval.from_int128(fields['gas_cap']),
+            'rules':[rule.vec.sc_vec[0].sym.sc_symbol.decode() for rule in fields['rules'].vec.sc_vec],
+            'params':{key:plain(value) for key,value in scval.from_struct(fields['params']).items()}}
+
     def state(self,wallet):
-        fields=scval.from_struct(self.configs[wallet]);fields.update(policy_state=scval.to_map({}),contract_version=scval.to_uint32(4),token=scval.to_string('XLM'),deployment_version=scval.to_uint64(0),nonce=scval.to_uint64(0),paused=scval.to_bool(False))
-        return scval.to_struct(fields)
+        """The packed configuration `c` of a new wallet, as the kernel stores it."""
+        return scval.to_bytes(r.ca.packed_config(self.config_of(wallet),self.kinds[wallet]))
 
     def entries(self,keys):
         self.snapshots+=1;items=[];tip=1000+int(self.clock-self.entry_clock)
@@ -82,7 +97,7 @@ class ReleaseReconciliation(unittest.TestCase):
                 if address==r.Asset.native().contract_id(r.PASSPHRASE) and self.asset_present:
                     executable=xdr.ContractExecutable(xdr.ContractExecutableType.CONTRACT_EXECUTABLE_STELLAR_ASSET);storage=[]
                 elif address in self.wallets:
-                    executable=xdr.ContractExecutable(xdr.ContractExecutableType.CONTRACT_EXECUTABLE_WASM,wasm_hash=xdr.Hash(bytes.fromhex(self.wallets[address])));storage=[xdr.SCMapEntry(scval.to_uint32(0),self.state(address))]
+                    executable=xdr.ContractExecutable(xdr.ContractExecutableType.CONTRACT_EXECUTABLE_WASM,wasm_hash=xdr.Hash(bytes.fromhex(self.wallets[address])));storage=[xdr.SCMapEntry(scval.to_symbol('c'),self.state(address))]
                 else:continue
                 data=xdr.LedgerEntryData(key.type,contract_data=xdr.ContractDataEntry(xdr.ExtensionPoint(0),key.contract_data.contract,key.contract_data.key,key.contract_data.durability,xdr.SCVal(xdr.SCValType.SCV_CONTRACT_INSTANCE,instance=xdr.SCContractInstance(executable,xdr.SCMap(storage)))))
             if data is not None:items.append(LedgerEntryResult(key=key.to_xdr(),xdr=data.to_xdr(),lastModifiedLedgerSeq=tip,liveUntilLedgerSeq=tip+5000))
@@ -162,7 +177,7 @@ class ReleaseReconciliation(unittest.TestCase):
         self.assertTrue(all(v['observation']=='observed-existing' for v in result['wallets'].values()))
 
     def test_live_config_drift_blocks_all_prerequisite_mutations(self):
-        self.codes.clear();wallet=next(iter(self.wallets));fields=scval.from_struct(self.configs[wallet]);fields['server']=scval.to_address(self.agent.public_key);self.configs[wallet]=scval.to_struct(fields)
+        self.codes.clear();wallet=next(iter(self.wallets));fields=scval.from_struct(self.configs[wallet]);fields['server']=scval.to_bytes(self.agent.raw_public_key());self.configs[wallet]=scval.to_struct(fields)
         with self.assertRaisesRegex(ValueError,'state differs'):self.driver().run()
         self.sign.assert_not_called();self.assertFalse(self.sent)
 
@@ -171,17 +186,19 @@ class ReleaseReconciliation(unittest.TestCase):
         def drift(action,snapshot):
             result=original(action,snapshot)
             if action.resource=='wallet' and result is not None and not changed:
-                changed.append(action.key);fields=scval.from_struct(self.configs[action.key]);fields['server']=scval.to_address(self.agent.public_key);self.configs[action.key]=scval.to_struct(fields)
+                changed.append(action.key);fields=scval.from_struct(self.configs[action.key]);fields['server']=scval.to_bytes(self.agent.raw_public_key());self.configs[action.key]=scval.to_struct(fields)
             return result
         driver.resource=drift
         with self.assertRaisesRegex(ValueError,'state differs'):driver.run()
         self.assertEqual(len(self.sent),1)
 
     def test_final_readback_rechecks_every_native_field_and_strict_variant(self):
-        for field,value in [('paused',scval.to_bool(True)),('nonce',scval.to_uint64(1)),('policy_state',scval.to_map({scval.to_symbol('spent'):scval.to_enum('Int',scval.to_int128(1))})),('contract_version',scval.to_uint64(4))]:
-            driver=self.driver(field);original=self.state
-            def changed(wallet):
-                fields=scval.from_struct(original(wallet));fields[field]=value;return scval.to_struct(fields)
+        variants=[('paused',lambda c,k:r.ca.packed_config(c,k,paused=True)),('version',lambda c,k:r.ca.packed_config(c,k,version=1)),
+            ('gas',lambda c,k:r.ca.packed_config(dict(c,gas_cap=c['gas_cap']+1),k)),('layout',lambda c,k:bytes([6])+r.ca.packed_config(c,k)[1:])]
+        for field,variant in variants:
+            driver=self.driver(field)
+            def changed(wallet,variant=variant):
+                return scval.to_bytes(variant(self.config_of(wallet),self.kinds[wallet]))
             plan=driver.preflight()
             with patch.object(self,'state',side_effect=changed),self.assertRaisesRegex(ValueError,'state differs'):driver.final_readback(plan)
         self.sign.assert_not_called()

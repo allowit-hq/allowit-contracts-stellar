@@ -620,10 +620,22 @@ fn validate_response_receipt(r: &Response) -> Result<()> {
         return Ok(());
     }
     if let Some(receipt) = &r.receipt {
+        // A policy wallet's settled transaction is the sealed one: the prepared transaction
+        // with both cosignatures, its final resources and the sending account's signature.
+        let expected = if p.config.route == WalletRoute::PolicyWallet {
+            r.signed_operation
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::uncertain("Stellar receipt arrived without its sealed operation")
+                })?
+                .transaction_hash
+        } else {
+            p.transaction_hash
+        };
         checked(sdk::rpc::validate_own_receipt(
             receipt,
             &p.config.network,
-            &p.transaction_hash,
+            &expected,
         ))?;
         if projected(p, receipt.status.clone()) != r.operation.status
             || r.signed_operation
@@ -822,7 +834,11 @@ impl Client {
         if r.operation.id != id
             || !config_matches(&self.bundle.config, &p.config)
             || p.request.operation.nonce != operation_nonce(&self.bundle.policy_id, id)
-            || r.operation.transaction_hash != sdk::hex(&p.transaction_hash)
+            || (r.operation.transaction_hash != sdk::hex(&p.transaction_hash)
+                && r.signed_operation.as_ref().is_none_or(|signed| {
+                    p.config.route != WalletRoute::PolicyWallet
+                        || r.operation.transaction_hash != sdk::hex(&signed.transaction_hash)
+                }))
             // A request for a payment authorization gets one, and no other request does.
             || record.is_some_and(|old| {
                 sdk::seller_settled::is_request(&old.request) != p.payment_authorization.is_some()
@@ -1647,7 +1663,6 @@ mod public_bundle_tests {
             wallet: f["intent"]["owner"].as_str().unwrap().into(),
             owner: f["intent"]["owner"].as_str().unwrap().into(),
             agent: sdk::account_for_seed(&[2; 32]),
-            fee_account: None,
             server: sdk::account_for_seed(&[3; 32]),
             route: WalletRoute::Native,
             tier: None,
@@ -1765,6 +1780,14 @@ impl Retained {
         self.0.paid_service.as_ref()
     }
 }
+/// The digest that the agent signed for `p`: a payment authorization's digest, or else the
+/// digest of the operation, which for a policy wallet is its own authorization payload.
+fn agent_signed_digest(p: &PreparedOperation) -> Result<[u8; 32]> {
+    match &p.payment_authorization {
+        Some(_) => Ok(sdk::seller_settled::signing_hash(p)),
+        None => checked(sdk::signing_digest(p)),
+    }
+}
 pub fn retained(
     journal: &Store,
     network: &str,
@@ -1802,7 +1825,7 @@ pub fn retained(
                 }
                 checked(sdk::signing::verify_digest(
                     &signature.signer,
-                    &sdk::seller_settled::signing_hash(p),
+                    &agent_signed_digest(p)?,
                     &signature.signature,
                 ))?;
             }
@@ -1913,12 +1936,14 @@ impl Bundle {
             let live = checked(sdk::rpc::trusted_state_for_discovery(rpc, c, None))?;
             if live.paused
                 || live.state.owner != c.owner
-                || live.state.agent != c.agent_account()
+                || live.state.agent != c.agent
                 || live.state.server != c.server
                 || live.state.policy_instance != c.policy_instance
                 || live.state.module_digest != c.module_digest
                 || live.state.policy_state.as_ref().is_none_or(|p| {
-                    p.params != c.params || p.rules != c.rules || p.source_digest != c.source_digest
+                    p.params != sdk::installed_params(c)
+                        || p.rules != c.rules
+                        || p.source_hash != c.source_hash
                 })
             {
                 return Err(Error::config(
@@ -1949,6 +1974,24 @@ mod native_revalidation_tests {
             "../../../tests/fixtures/provider/stellar-policy-wallet-revalidation-rpc.json"
         ))
         .unwrap()
+    }
+    /// A journaled agent signature of a policy wallet operation covers the wallet's own
+    /// authorization payload, not the prepared transaction hash; recovery checks that payload.
+    #[test]
+    fn a_retained_policy_wallet_signature_covers_the_wallet_payload() {
+        let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
+        assert_eq!(p.config.route, sdk::WalletRoute::PolicyWallet);
+        let digest = agent_signed_digest(&p).unwrap();
+        assert_eq!(digest, sdk::signing_digest(&p).unwrap());
+        assert_ne!(digest, p.transaction_hash);
+        use ed25519_dalek::Signer;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[44; 32]);
+        let agent = sdk::account_for_seed(&[44; 32]);
+        sdk::signing::verify_digest(&agent, &digest, &key.sign(&digest).to_bytes()).unwrap();
+        assert!(
+            sdk::signing::verify_digest(&agent, &digest, &key.sign(&p.transaction_hash).to_bytes())
+                .is_err()
+        );
     }
     #[test]
     fn recovery_uses_the_original_service_even_if_the_caller_changes_its_default() {
@@ -3132,10 +3175,53 @@ mod native_revalidation_tests {
         transaction: serde_json::Value,
         entries_ledger: u64,
     ) -> impl Fn(&str, &serde_json::Value) -> serde_json::Value + Send + 'static {
+        lapse_rpc_spent(transaction, entries_ledger, false)
+    }
+    /// The lapse reads: the transaction, then the wallet's nonce entry, present when `spent`,
+    /// and the network's minimum temporary lifetime of 720 ledgers.
+    fn lapse_rpc_spent(
+        transaction: serde_json::Value,
+        entries_ledger: u64,
+        spent: bool,
+    ) -> impl Fn(&str, &serde_json::Value) -> serde_json::Value + Send + 'static {
+        use stellar_xdr::{
+            ConfigSettingEntry, ContractDataEntry, ExtensionPoint, LedgerEntryData, LedgerKey,
+            Limits, ReadXdr, StateArchivalSettings, WriteXdr,
+        };
         let calls = fixture()["calls"].as_array().unwrap().clone();
         move |method, params| match method {
             "getTransaction" => transaction.clone(),
             "getLatestLedger" => json!({"sequence":130}),
+            "getLedgerEntries" if params["keys"].as_array().unwrap().len() == 2 => {
+                let mut entries = vec![];
+                for key in params["keys"].as_array().unwrap() {
+                    let entry =
+                        match LedgerKey::from_xdr_base64(key.as_str().unwrap(), Limits::none())
+                            .unwrap()
+                        {
+                            LedgerKey::ConfigSetting(_) => LedgerEntryData::ConfigSetting(
+                                ConfigSettingEntry::StateArchival(StateArchivalSettings {
+                                    min_temporary_ttl: 720,
+                                    ..Default::default()
+                                }),
+                            ),
+                            LedgerKey::ContractData(data) if spent => {
+                                LedgerEntryData::ContractData(ContractDataEntry {
+                                    ext: ExtensionPoint::V0,
+                                    contract: data.contract,
+                                    key: data.key,
+                                    durability: data.durability,
+                                    val: stellar_xdr::ScVal::Void,
+                                })
+                            }
+                            _ => continue,
+                        };
+                    entries.push(
+                        json!({"key": key, "xdr": entry.to_xdr_base64(Limits::none()).unwrap()}),
+                    );
+                }
+                json!({"latestLedger": entries_ledger, "entries": entries})
+            }
             _ => {
                 let mut result = calls
                     .iter()
@@ -3154,10 +3240,10 @@ mod native_revalidation_tests {
         // Common R4.1 on testnet: the engine released the expired operation as `failed`
         // without a receipt, and the CLI reported `submissionUnknown`.
         let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
-        assert_eq!((p.expires_at, p.state.nonce), (86700, 4));
+        assert_eq!(p.expires_at, 86700);
         let not_found =
-            json!({"status":"NOT_FOUND","latestLedger":130,"latestLedgerCloseTime":"86700"});
-        let (rpc, stop, server) = rpc_server(lapse_rpc(not_found.clone(), 130));
+            json!({"status":"NOT_FOUND","latestLedger":185,"latestLedgerCloseTime":"86700"});
+        let (rpc, stop, server) = rpc_server(lapse_rpc(not_found.clone(), 185));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let engine = reply_once(
@@ -3205,18 +3291,25 @@ mod native_revalidation_tests {
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         let methods = server.join().unwrap();
         assert_eq!(methods[0], "getTransaction");
-        assert!(methods.iter().any(|m| m == "getLedgerEntries"));
 
-        let mut advanced = p.clone();
-        advanced.state.nonce = 3;
         for (transaction, entries_ledger, packet, lapsed) in [
-            (not_found.clone(), 130, &p, true),
+            (not_found.clone(), 185, &p, true),
             (
-                json!({"status":"FAILED","latestLedger":130,"latestLedgerCloseTime":86701}),
-                131,
+                json!({"status":"FAILED","latestLedger":186,"latestLedgerCloseTime":86701}),
+                186,
                 &p,
                 true,
             ),
+            // At the expiration ledger of the wallet's authorization it can still run.
+            (
+                json!({"status":"NOT_FOUND","latestLedger":184,"latestLedgerCloseTime":"86700"}),
+                184,
+                &p,
+                false,
+            ),
+            // Past the lifetime that a spent nonce is sure to have, its absence proves nothing.
+            (not_found.clone(), 184 - 64 + 720 - 1, &p, true),
+            (not_found.clone(), 184 - 64 + 720, &p, false),
             // The closing ledger precedes the expiry: the wallet can still execute it.
             (
                 json!({"status":"NOT_FOUND","latestLedger":130,"latestLedgerCloseTime":"86699"}),
@@ -3236,10 +3329,6 @@ mod native_revalidation_tests {
                 &p,
                 false,
             ),
-            // The wallet entries predate the closing ledger.
-            (not_found.clone(), 129, &p, false),
-            // The wallet nonce moved past the packet: some operation executed.
-            (not_found.clone(), 130, &advanced, false),
         ] {
             let (rpc, stop, server) = rpc_server(lapse_rpc(transaction.clone(), entries_ledger));
             let result = sdk::rpc::operation_lapsed(&sdk::rpc::HttpRpc::new(&rpc).unwrap(), packet);
@@ -3247,38 +3336,13 @@ mod native_revalidation_tests {
             server.join().unwrap();
             assert_eq!(result, Ok(lapsed), "{transaction} at {entries_ledger}");
         }
-    }
-    /// Advance the wallet nonce in the instance entries of a `getLedgerEntries` reply, as if
-    /// the wallet executed another operation.
-    fn advance_nonce(reply: &mut serde_json::Value) {
-        use stellar_xdr::{LedgerEntryData, Limits, ReadXdr, ScVal, WriteXdr};
-        fn walk(value: &mut ScVal) {
-            let entries = match value {
-                ScVal::Map(Some(map)) => map.0.iter_mut(),
-                ScVal::ContractInstance(instance) => match &mut instance.storage {
-                    Some(map) => map.0.iter_mut(),
-                    None => return,
-                },
-                _ => return,
-            };
-            for entry in entries {
-                match (&entry.key, &mut entry.val) {
-                    (ScVal::Symbol(key), ScVal::U64(nonce)) if key.0.as_slice() == b"nonce" => {
-                        *nonce += 1
-                    }
-                    (_, val) => walk(val),
-                }
-            }
-        }
-        for entry in reply["entries"].as_array_mut().unwrap() {
-            let mut data =
-                LedgerEntryData::from_xdr_base64(entry["xdr"].as_str().unwrap(), Limits::none())
-                    .unwrap();
-            if let LedgerEntryData::ContractData(contract) = &mut data {
-                walk(&mut contract.val);
-            }
-            entry["xdr"] = json!(data.to_xdr_base64(Limits::none()).unwrap());
-        }
+        // A sealed transaction has another hash than the prepared one, so a prepared hash that
+        // the network does not know proves nothing: the spent nonce shows that the operation ran.
+        let (rpc, stop, server) = rpc_server(lapse_rpc_spent(not_found.clone(), 185, true));
+        let result = sdk::rpc::operation_lapsed(&sdk::rpc::HttpRpc::new(&rpc).unwrap(), &p);
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().unwrap();
+        assert_eq!(result, Ok(false));
     }
     #[test]
     fn proven_failure_stays_failed_after_the_nonce_moves_or_rpc_fails() {
@@ -3286,7 +3350,7 @@ mod native_revalidation_tests {
         // not repeat the lapse proof overwrote the terminal failure with `submissionUnknown`.
         let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
         let not_found =
-            json!({"status":"NOT_FOUND","latestLedger":130,"latestLedgerCloseTime":"86700"});
+            json!({"status":"NOT_FOUND","latestLedger":185,"latestLedgerCloseTime":"86700"});
         let released = serde_json::to_vec(&json!({"prepared":p,"operation":{"id":"released-001","status":OperationStatus::Failed,"transactionHash":sdk::hex(&p.transaction_hash)},"signedOperation":null,"receipt":null})).unwrap();
         // One engine status reply that releases the operation, read by a client using `rpc`.
         let query = |rpc: &str| {
@@ -3308,7 +3372,7 @@ mod native_revalidation_tests {
         let temp = tempfile::tempdir().unwrap();
         let journal = Store::open(&temp.path().canonicalize().unwrap().join("journal")).unwrap();
         let record: Record = serde_json::from_value(json!({"policyId":"engine-policy","requestId":"released-001","config":p.config,"request":p.request,"prepared":p,"agentSignature":null,"status":OperationStatus::SubmissionUnknown})).unwrap();
-        let (rpc, stop, server) = rpc_server(lapse_rpc(not_found.clone(), 130));
+        let (rpc, stop, server) = rpc_server(lapse_rpc(not_found.clone(), 185));
         let (client, mut r) = query(&rpc);
         client.settle(&mut r, Some(&record)).unwrap();
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -3321,14 +3385,10 @@ mod native_revalidation_tests {
             )
             .unwrap();
 
-        let proof = lapse_rpc(not_found, 130);
-        let (moved, stop, server) = rpc_server(move |method, params| {
-            let mut reply = proof(method, params);
-            if method == "getLedgerEntries" {
-                advance_nonce(&mut reply);
-            }
-            reply
-        });
+        // A node that answers before the authorization's expiration ledger proves no lapse.
+        let early =
+            json!({"status":"NOT_FOUND","latestLedger":150,"latestLedgerCloseTime":"86700"});
+        let (moved, stop, server) = rpc_server(lapse_rpc(early, 130));
         assert_eq!(
             sdk::rpc::operation_lapsed(&sdk::rpc::HttpRpc::new(&moved).unwrap(), &p),
             Ok(false)
@@ -3389,6 +3449,7 @@ mod native_revalidation_tests {
         let account = sdk::account_for_seed(&[42; 32]);
         let data = fixture();
         let signed: SignedOperation = serde_json::from_value(data["signed"].clone()).unwrap();
+        let signed = crate::test_support::policy_sealed(&signed);
         let result = TransactionResult {
             fee_charged: 100,
             result: TransactionResultResult::TxFailed(Default::default()),

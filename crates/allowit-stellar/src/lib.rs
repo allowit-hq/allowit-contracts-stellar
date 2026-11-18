@@ -41,30 +41,17 @@ pub use authorization::{
     authorize_server, authorize_server_using, authorize_server_with, sign_account_entry,
     validate_server_authorization,
 };
-pub use contract::{CONTRACT_VERSION, DepositReceipt, RedeemReceipt, TransferReceipt};
+pub use contract::CONTRACT_VERSION;
 pub use policy::{PolicyEngine, PolicyLanguage, PolicyParams, PolicyTier, PolicyValue};
+pub mod packed;
 pub mod rpc;
 pub mod seller_settled;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod settlement_service;
 pub mod signing;
-pub mod x402;
 pub type Result<T> = std::result::Result<T, String>;
 
 pub const PROFILE: &str = "allowit-wallet-v1";
-/// The refusal of a wallet creation whose installation names no fee account, followed by the
-/// address of the wallet. Its code is `fee_account_required`: the owner's client makes the
-/// account for that wallet and names it.
-pub const FEE_ACCOUNT_REQUIRED: &str = "A new policy wallet needs a fee account, which the owner's deployment creates and funds. The owner's client names it for the policy wallet";
-/// The refusal of a policy wallet whose agent address on the ledger is not the one of its
-/// installation: its fee account, or the agent key's own account for a wallet of an earlier
-/// release. Also the refusal of a fee account whose signers differ from its roles. Its code
-/// is `fee_account_differs`.
-pub const FEE_ACCOUNT_DIFFERS: &str =
-    "The policy wallet's agent address on the ledger differs from the one of its installation";
-/// The refusal of an operation whose fee account holds less than its network fee. Its code is
-/// `fee_account_empty`: the owner refills the account.
-pub const FEE_ACCOUNT_EMPTY: &str = "The fee account of this policy wallet holds too little XLM for the network fee. Its owner refills it by sending XLM to";
 const MAX_BYTES: usize = 1_048_576;
 
 pub fn hash(bytes: impl AsRef<[u8]>) -> [u8; 32] {
@@ -210,6 +197,12 @@ impl WalletRoute {
         }
     }
 }
+pub(crate) fn no_amount(v: &i128) -> bool {
+    *v == 0
+}
+pub(crate) fn is_false(v: &bool) -> bool {
+    !*v
+}
 fn is_zero(v: &[u8; 32]) -> bool {
     *v == [0; 32]
 }
@@ -221,12 +214,6 @@ pub struct WalletConfig {
     pub wallet: String,
     pub owner: String,
     pub agent: String,
-    /// The fee account of a policy wallet: the account that is the wallet's agent address on
-    /// the ledger, sends the agent's operations and pays their network fees. Its owner
-    /// creates and funds it; the agent key and the server sign from it only together. A
-    /// wallet of an earlier release has none: the agent key's own account sends and pays.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fee_account: Option<String>,
     #[serde(alias = "engine")]
     pub server: String,
     pub route: WalletRoute,
@@ -259,6 +246,8 @@ pub struct WalletConfig {
     /// SHA-256 of the complete policy source, which agent and server authorization cover.
     pub source_hash: [u8; 32],
     pub module_digest: [u8; 32],
+    /// The owner's fee ceiling of one operation, in stroops. For a policy wallet it is also the
+    /// owner-signed gas cap: the most that the wallet repays for one request's network fee.
     pub max_fee_stroops: u32,
 }
 fn is_legacy(language: &PolicyLanguage) -> bool {
@@ -268,11 +257,6 @@ fn policy_params_empty(params: &PolicyParams) -> bool {
     params.0.is_empty()
 }
 impl WalletConfig {
-    /// The agent address that a policy wallet holds on the ledger: its fee account, or for a
-    /// wallet of an earlier release the agent key's own account.
-    pub fn agent_account(&self) -> &str {
-        self.fee_account.as_deref().unwrap_or(&self.agent)
-    }
     /// The legacy SDK engine name of the installed tier.
     pub fn policy_engine(&self) -> Option<PolicyEngine> {
         self.tier.map(PolicyTier::engine)
@@ -399,6 +383,18 @@ impl ExpenseBounds {
     /// These bounds with the fee bound lowered to `fee_stroops`. Gas falls pro rata and rounds
     /// up, so it never counts less than the gas rate of these bounds prices `fee_stroops`; for
     /// XLM it is `fee_stroops` itself. Spent units fall by the same gas.
+    /// The bound of a transaction fee for terms whose gas repayment the server set itself, such
+    /// as the gas that it repays after a carry: only the fee bound moves, and the gas that the
+    /// wallet repays and counts stays.
+    pub fn with_fee_bound_only(&self, fee_stroops: u32) -> Result<Self> {
+        if fee_stroops == 0 || fee_stroops > self.max_fee_stroops {
+            return Err("A fee bound lowers a positive fee ceiling".into());
+        }
+        Ok(Self {
+            max_fee_stroops: fee_stroops,
+            ..self.clone()
+        })
+    }
     pub fn with_fee_bound(&self, fee_stroops: u32) -> Result<Self> {
         if fee_stroops == 0 || fee_stroops > self.max_fee_stroops || self.gas_units < 0 {
             return Err("A fee bound lowers a positive fee ceiling".into());
@@ -431,11 +427,31 @@ pub struct ExecutionTerms {
     pub args: PolicyParams,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expense: Option<ExpenseBounds>,
+    /// The XLM that a policy wallet repays for the network fee, and its payee, when the server
+    /// sets them; by default the expense's fee bound to the sending account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gas: Option<GasRepayment>,
+    /// The server's sending account of a policy wallet operation: its source, which pays the
+    /// fee and receives the gas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
 }
 impl ExecutionTerms {
     pub fn is_empty(&self) -> bool {
-        self.args.0.is_empty() && self.expense.is_none()
+        self.args.0.is_empty()
+            && self.expense.is_none()
+            && self.gas.is_none()
+            && self.sender.is_none()
     }
+}
+/// The gas that a policy wallet repays in the transaction: `stroops` of XLM to `payee`, the
+/// server's sending account, at most the owner-signed gas cap. The server signs it with the
+/// request; a repayment above the fee is carried to the wallet's next request.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GasRepayment {
+    pub stroops: i128,
+    pub payee: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -454,17 +470,9 @@ pub struct AccountState {
     pub high_threshold: u32,
     pub signers: Vec<AccountSigner>,
 }
-/// The keys that sign the transaction of an automated operation. The agent and the server
-/// sign together from a wallet account and from the fee account of a policy wallet. The agent
-/// key alone signs from its own account for a policy wallet of an earlier release.
 fn automated_roles(c: &WalletConfig) -> Vec<&str> {
     let mut roles = vec![c.agent.as_str()];
-    let together = match c.route {
-        WalletRoute::Native => true,
-        WalletRoute::PolicyWallet => c.fee_account.is_some(),
-        WalletRoute::Odc => false,
-    };
-    if together && c.server != c.agent {
+    if c.route == WalletRoute::Native && c.server != c.agent {
         roles.push(c.server.as_str());
     }
     roles
@@ -615,16 +623,6 @@ impl AccountState {
         }
         Ok(())
     }
-    /// Whether this account is a fee account of the roles of `c` although `c` names none. An
-    /// installation without a fee account never stands for a wallet that has one: that
-    /// wallet's operations need the server's signature on the transaction, which only the
-    /// installation with the fee account asks for.
-    fn stands_for_fee_account(&self, c: &WalletConfig, agent_address: &str) -> bool {
-        c.route == WalletRoute::PolicyWallet
-            && c.fee_account.is_none()
-            && agent_address != c.agent
-            && self.wallet_status(&c.owner, &c.agent, &c.server).is_ok()
-    }
     pub fn validate_wallet(&self, c: &WalletConfig) -> Result<()> {
         if self.address != c.wallet {
             return Err("Native wallet identity differs".into());
@@ -641,14 +639,110 @@ impl AccountState {
 pub struct PolicyStateSnapshot {
     /// Current owner params.
     pub params: PolicyParams,
-    /// Current free-form policy state before this operation.
-    pub state: PolicyParams,
     /// Installed ordered canonical rules.
     pub rules: Vec<String>,
-    /// Installed binding digest.
-    pub source_digest: [u8; 32],
-    /// Owner opt-in to x402.
-    pub x402_enabled: bool,
+    /// The owner-signed hash of the owner's full policy source.
+    pub source_hash: [u8; 32],
+    /// The cumulated figures that the wallet keeps, read at the snapshot's ledger.
+    pub figures: packed::Figures,
+}
+impl PolicyStateSnapshot {
+    /// Core's standard state before an operation at `now`: the totals, and the daily figures of
+    /// an open window as the figures of today. The wallet's day is the life of its daily entry,
+    /// not a UTC day, and it feeds its rules the same way.
+    pub fn standard_state(&self, now: u64) -> PolicyParams {
+        let f = &self.figures;
+        let open = f.day_ends != 0;
+        let mut state = std::collections::BTreeMap::new();
+        state.insert("calls".to_owned(), PolicyValue::Int(i128::from(f.calls)));
+        state.insert("spent".to_owned(), PolicyValue::Int(f.spent));
+        state.insert("unpriced".to_owned(), PolicyValue::Bool(f.unpriced));
+        state.insert(
+            "day".to_owned(),
+            PolicyValue::Int(i128::from(now / allowit_core::DAY)),
+        );
+        state.insert(
+            "day_spent".to_owned(),
+            PolicyValue::Int(if open { f.day_spent } else { 0 }),
+        );
+        state.insert(
+            "day_total".to_owned(),
+            PolicyValue::Int(if open { f.day_total } else { 0 }),
+        );
+        state.insert(
+            "day_unpriced".to_owned(),
+            PolicyValue::Bool(open && f.day_unpriced),
+        );
+        PolicyParams(state)
+    }
+}
+impl TrustedState {
+    /// Core's standard state of a policy wallet before an operation at `now`: each figure that
+    /// the wallet keeps comes from the wallet, and the server's accounting in this state gives
+    /// every other one, as for a keypair wallet.
+    pub fn policy_wallet_state(&self, c: &WalletConfig, now: u64) -> Result<PolicyParams> {
+        let snapshot = self
+            .policy_state
+            .as_ref()
+            .ok_or("Trusted layout 5 params and figures are required")?;
+        let kept = kept_figures(c);
+        let wallet = &snapshot.figures;
+        let open = wallet.day_ends != 0;
+        let today = now / allowit_core::DAY;
+        let server_today = self.spent_day == today;
+        let pick =
+            |figure: u8, own: i128, server: i128| if kept & figure != 0 { own } else { server };
+        let mut state = std::collections::BTreeMap::new();
+        state.insert(
+            "calls".to_owned(),
+            PolicyValue::Int(pick(
+                packed::CALLS,
+                i128::from(wallet.calls),
+                i128::from(self.calls),
+            )),
+        );
+        state.insert(
+            "spent".to_owned(),
+            PolicyValue::Int(pick(packed::SPENT, wallet.spent, self.spent_total)),
+        );
+        state.insert(
+            "unpriced".to_owned(),
+            PolicyValue::Bool(if kept & packed::SPENT != 0 {
+                wallet.unpriced
+            } else {
+                self.unpriced_total
+            }),
+        );
+        state.insert("day".to_owned(), PolicyValue::Int(i128::from(today)));
+        let server_daily = if server_today { self.spent_daily } else { 0 };
+        let server_volume = if server_today { self.volume_daily } else { 0 };
+        let own_daily = |value: i128| if open { value } else { 0 };
+        state.insert(
+            "day_spent".to_owned(),
+            PolicyValue::Int(pick(
+                packed::DAY_SPENT,
+                own_daily(wallet.day_spent),
+                server_daily,
+            )),
+        );
+        state.insert(
+            "day_total".to_owned(),
+            PolicyValue::Int(pick(
+                packed::DAY_TOTAL,
+                own_daily(wallet.day_total),
+                server_volume,
+            )),
+        );
+        state.insert(
+            "day_unpriced".to_owned(),
+            PolicyValue::Bool(if kept & (packed::DAY_SPENT | packed::DAY_TOTAL) != 0 {
+                open && wallet.day_unpriced
+            } else {
+                server_today && self.unpriced_daily
+            }),
+        );
+        Ok(PolicyParams(state))
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -667,6 +761,14 @@ pub struct TrustedState {
     pub spent_daily: i128,
     pub spent_total: i128,
     pub spent_day: u64,
+    /// The server's gross volume on `spent_day`, and its unpriced flags: figures that a policy
+    /// wallet which does not keep them reads from the server's accounting.
+    #[serde(default, skip_serializing_if = "no_amount")]
+    pub volume_daily: i128,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unpriced_total: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unpriced_daily: bool,
     pub calls: u64,
     pub ledger: u32,
     pub module_digest: [u8; 32],
@@ -824,6 +926,30 @@ pub fn max_fee_ceiling(route: &WalletRoute) -> u32 {
     }
 }
 
+/// The figures that a policy wallet keeps for its checks: a Simple or Common wallet those of its
+/// rules with params; a Custom wallet every figure that its compiled source reads, which are the
+/// only ones that the source can read on the server too.
+pub fn kept_figures(c: &WalletConfig) -> u8 {
+    if c.tier == Some(PolicyTier::Custom) {
+        return packed::ALL;
+    }
+    packed::standard_kept(&c.rules, &installed_params(c))
+}
+/// The params that a policy wallet stores: a Simple or Common wallet keeps only the params of its
+/// on-chain rules, and the server keeps the rest of the owner's params; a Custom wallet keeps all.
+pub fn installed_params(c: &WalletConfig) -> PolicyParams {
+    if c.tier == Some(PolicyTier::Custom) {
+        return c.params.clone();
+    }
+    PolicyParams(
+        c.params
+            .0
+            .iter()
+            .filter(|(key, _)| c.rules.contains(key))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
+}
 pub fn validate_config(c: &WalletConfig) -> Result<()> {
     validate_config_for(c, true)
 }
@@ -844,17 +970,6 @@ fn validate_config_for(c: &WalletConfig, admit_source: bool) -> Result<()> {
     }
     address(&c.owner)?;
     account_key(&c.agent)?;
-    if let Some(fee_account) = &c.fee_account {
-        account_key(fee_account)?;
-        // The fee account is an account of its own. No role key is its key.
-        if c.route != WalletRoute::PolicyWallet
-            || [&c.owner, &c.agent, &c.server].contains(&fee_account)
-        {
-            return Err(
-                "A fee account belongs to a policy wallet and differs from every role".into(),
-            );
-        }
-    }
     match c.route {
         WalletRoute::Native => {
             account_key(&c.wallet)?;
@@ -936,8 +1051,8 @@ fn validate_portable_install(c: &WalletConfig) -> Result<()> {
     if c.rules != expected {
         return Err("Installed rules differ from the standard prefix of the policy source".into());
     }
-    if tier.standard() && shape.writes_state {
-        return Err("Simple and Common cannot store allowit::set_state writes".into());
+    if shape.writes_state {
+        return Err(policy::WRITES_STATE.into());
     }
     let digest = policy::installed_source_digest(
         tier,
@@ -1117,6 +1232,11 @@ fn decode_operation(
     {
         return Err("Operation effects differ from approved bounds".into());
     }
+    // A policy wallet's request may name no fee payer: the server's sending account pays and
+    // the preparation names it as the gas payee.
+    if c.route == WalletRoute::PolicyWallet && r.fee_bounds.is_none() {
+        return Ok(operation);
+    }
     let fees = r
         .fee_bounds
         .as_ref()
@@ -1275,6 +1395,7 @@ fn verify_classic_portable(
         &standard,
         &request,
         evaluator,
+        false,
     )
 }
 /// The server's admission of one prepared operation of a classic account: the whole installed
@@ -1313,6 +1434,7 @@ pub fn admit_classic(
 fn validate_expense(
     c: &WalletConfig,
     expense: &ExpenseBounds,
+    repaid: i128,
     operation: &StellarOperation,
     state: &TrustedState,
     now: u64,
@@ -1328,12 +1450,12 @@ fn validate_expense(
             "Expense bounds have negative units, a future observation or another day".into(),
         );
     }
-    if (expense.max_fee_stroops == 0 && expense.gas_units != 0)
-        || (expense.max_fee_stroops > 0 && expense.gas_units <= 0)
-        || (asset_xdr(c)? == Asset::Native
-            && expense.gas_units != i128::from(expense.max_fee_stroops))
+    // As the kernel checks: the wallet counts gas exactly when it repays some, and an XLM
+    // wallet counts the repaid stroops.
+    if (repaid == 0) != (expense.gas_units == 0)
+        || (asset_xdr(c)? == Asset::Native && expense.gas_units != repaid)
     {
-        return Err("Expense gas differs from its signed fee bound".into());
+        return Err("Expense gas differs from the gas that the wallet repays".into());
     }
     let principal = match operation {
         StellarOperation::Transfer(t) => {
@@ -1368,15 +1490,22 @@ fn verify_wallet_portable(
     let snapshot = state
         .policy_state
         .as_ref()
-        .ok_or("Trusted layout 4 params and policy state are required")?;
+        .ok_or("Trusted layout 5 params and figures are required")?;
+    // The wallet stores the params of its on-chain rules; the server holds the rest of the
+    // owner's params, and the source runs over all of them.
     if state.contract_version != Some(CONTRACT_VERSION)
-        || snapshot.source_digest != c.source_digest
+        || snapshot.source_hash != c.source_hash
         || snapshot.rules != c.rules
+        || snapshot.params != installed_params(c)
     {
         return Err("Installed policy wallet binding differs from the installation".into());
     }
     if let Some(expense) = &terms.expense {
-        validate_expense(c, expense, operation, state, now)?;
+        let repaid = terms
+            .gas
+            .as_ref()
+            .map_or(i128::from(expense.max_fee_stroops), |gas| gas.stroops);
+        validate_expense(c, expense, repaid, operation, state, now)?;
     }
     let shape = policy::source_shape(&c.policy_source)?;
     let request = policy::RuleRequest::new(
@@ -1391,10 +1520,11 @@ fn verify_wallet_portable(
         tier,
         &shape,
         &c.rules,
-        &snapshot.params,
-        &snapshot.state,
+        &c.params,
+        &state.policy_wallet_state(c, now)?,
         &request,
         evaluator,
+        true,
     )
 }
 fn muxed(value: &str) -> Result<MuxedAccount> {
@@ -1459,8 +1589,52 @@ fn legacy_wallet_request(
         ("invocation", invocation),
     ])
 }
-/// The layout 4 `AllowitExecutionRequest` of one operation: the full source identity, the
-/// executable, the typed native operation, the expense and the execution args.
+/// The gas that a policy wallet repays for `r`: the explicit repayment of `terms`, else the fee
+/// bound of its expense, in stroops. The payee is the server's sending account, which `terms`
+/// or the request's fee payer names; when both name one, they agree. An unpriced request repays
+/// nothing.
+pub(crate) fn gas_repayment(r: &ExecutionRequest, terms: &ExecutionTerms) -> Result<GasRepayment> {
+    let payer = match &r.fee_bounds {
+        Some(fees) => Some(workflow_address(
+            &fees.first().ok_or("Native fee bound required")?.payer,
+        )?),
+        None => None,
+    };
+    let named = [
+        payer,
+        terms.sender.clone(),
+        terms.gas.as_ref().map(|g| g.payee.clone()),
+    ];
+    let mut sender: Option<String> = None;
+    for account in named.into_iter().flatten() {
+        if sender.as_ref().is_some_and(|s| *s != account) {
+            return Err(
+                "The request, the sending account and the gas payee name other accounts".into(),
+            );
+        }
+        sender = Some(account);
+    }
+    if let Some(gas) = &terms.gas {
+        return Ok(gas.clone());
+    }
+    Ok(GasRepayment {
+        stroops: terms
+            .expense
+            .as_ref()
+            .map_or(0, |e| i128::from(e.max_fee_stroops)),
+        payee: sender.ok_or(
+            "A policy wallet operation needs the server's sending account as its gas payee",
+        )?,
+    })
+}
+/// The sending account that a policy wallet operation names: the payee of its gas repayment and
+/// the fee payer of its request.
+pub fn gas_payee(r: &ExecutionRequest, terms: &ExecutionTerms) -> Result<String> {
+    Ok(gas_repayment(r, terms)?.payee)
+}
+/// The layout 5 `AllowitExecutionRequest` of one operation: its id, the wallet's deployment
+/// version, the expiry, the typed native operation, the expense, the gas repayment and the
+/// execution args.
 pub(crate) fn policy_wallet_request(
     c: &WalletConfig,
     r: &ExecutionRequest,
@@ -1469,16 +1643,16 @@ pub(crate) fn policy_wallet_request(
     operation: &StellarOperation,
     expires: u64,
 ) -> Result<ScVal> {
+    let gas = gas_repayment(r, terms)?;
     contract::execution_request(contract::ExecutionPacket {
-        policy_instance: &c.policy_instance,
-        source_hash: &c.source_hash,
         operation_id: &r.operation.nonce,
-        nonce: state.nonce,
-        deployment_version: state.deployment_version,
+        deployment_version: u32::try_from(state.deployment_version)
+            .map_err(|_| "Deployment version exceeds u32")?,
         expires_at: expires,
-        module_digest: &c.module_digest,
         operation: contract::operation(&c.asset, operation)?,
         expense: contract::expense(terms.expense.as_ref())?,
+        gas_stroops: gas.stroops,
+        gas_payee: &gas.payee,
         args: &terms.args,
     })
 }
@@ -1561,7 +1735,7 @@ fn build(
     {
         return Err("Trusted wallet identity differs".into());
     }
-    let mut body = match c.route {
+    let body = match c.route {
         WalletRoute::Native => {
             state.source.validate_wallet(c)?;
             let StellarOperation::Transfer(t) = &operation else {
@@ -1573,7 +1747,7 @@ fn build(
                 amount: i64::try_from(t.amount).map_err(|_| "Classic payment exceeds i64")?,
             })
         }
-        WalletRoute::PolicyWallet | WalletRoute::Odc => {
+        WalletRoute::Odc => {
             state.source.validate_structure()?;
             if state.source.signer_weight(&c.agent)? == 0 {
                 return Err("Customer is not a current policy wallet agent account signer".into());
@@ -1583,31 +1757,10 @@ fn build(
                     "policy wallet executable or current agent transaction source differs".into(),
                 );
             }
-            // A wallet with a fee account names exactly that account as its agent address.
-            if c.fee_account.as_ref().is_some_and(|f| *f != state.agent)
-                || state.source.stands_for_fee_account(c, &state.agent)
-            {
-                return Err(FEE_ACCOUNT_DIFFERS.into());
-            }
-            if c.fee_account.is_some() {
-                // The fee account holds exactly its roles: the agent key signs from it only
-                // with the server, and no other key signs from it at all.
-                state.source.validate_roles(&c.owner, &c.agent, &c.server)?;
-            }
-            let fee = &r.fee_bounds.as_ref().ok_or("Native fee bound required")?[0];
-            if workflow_address(&fee.payer)? != state.source.address {
-                return Err(
-                    "policy wallet fee payer differs from its current agent account".into(),
-                );
-            }
-            let request = if c.route == WalletRoute::Odc {
-                let StellarOperation::Transfer(t) = &operation else {
-                    return Err("Historical wallet packets hold only transfers".into());
-                };
-                legacy_wallet_request(c, r, state, t, expires, legacy_revision)?
-            } else {
-                policy_wallet_request(c, r, terms, state, &operation, expires)?
+            let StellarOperation::Transfer(t) = &operation else {
+                return Err("Historical wallet packets hold only transfers".into());
             };
+            let request = legacy_wallet_request(c, r, state, t, expires, legacy_revision)?;
             let call = InvokeContractArgs {
                 contract_address: address(&c.wallet)?,
                 function_name: ScSymbol(b"execute".to_vec().try_into().map_err(err)?),
@@ -1626,20 +1779,30 @@ fn build(
                 .map_err(err)?,
             })
         }
+        WalletRoute::PolicyWallet => {
+            // The server's sending account is the source and pays the fee. The agent holds a key
+            // and no account: it signs the wallet's own authorization with the server.
+            state.source.validate_structure()?;
+            if state.module_digest != c.module_digest {
+                return Err("policy wallet executable differs".into());
+            }
+            if gas_payee(r, terms)? != state.source.address {
+                return Err("policy wallet gas payee differs from the sending account".into());
+            }
+            let request = policy_wallet_request(c, r, terms, state, &operation, expires)?;
+            let call = InvokeContractArgs {
+                contract_address: address(&c.wallet)?,
+                function_name: ScSymbol(b"execute".to_vec().try_into().map_err(err)?),
+                args: vec![request].try_into().map_err(err)?,
+            };
+            OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function: HostFunction::InvokeContract(call.clone()),
+                auth: vec![authorization::wallet_entry(c, r, state, call)?]
+                    .try_into()
+                    .map_err(err)?,
+            })
+        }
     };
-    if c.route == WalletRoute::PolicyWallet {
-        let OperationBody::InvokeHostFunction(op) = &mut body else {
-            unreachable!()
-        };
-        let mut auth = op.auth.to_vec();
-        auth.push(authorization::server_entry(
-            c,
-            r,
-            state,
-            auth[0].root_invocation.clone(),
-        )?);
-        op.auth = auth.try_into().map_err(err)?;
-    }
     let tx = Transaction {
         source_account: muxed(&state.source.address)?,
         fee: c.max_fee_stroops,
@@ -1798,7 +1961,7 @@ pub(crate) fn prepare_for_native_preflight(
         return prepare_with(c, r, terms, state, now, expires_at);
     }
     if state.policy_state.is_none() {
-        return Err("Trusted layout 4 params and policy state are required".into());
+        return Err("Trusted layout 5 params and figures are required".into());
     }
     verify_operation(c, r, terms, state, now, expires_at, None)?;
     prepare_with_bounds(
@@ -1882,7 +2045,7 @@ pub fn validate_retained_prepared(p: &PreparedOperation) -> Result<()> {
         .payment_authorization
         .clone_from(&p.payment_authorization);
     if p.config.route == WalletRoute::PolicyWallet {
-        expected = authorization::attach(&expected, authorization::server_signature(p, false)?)?;
+        expected = authorization::attach(&expected, authorization::wallet_signature(p)?)?;
     }
     if let Some(data) = &p.simulation_data {
         let current = attach_simulation(&expected, data)?;
@@ -1981,6 +2144,15 @@ pub fn sign(p: &PreparedOperation, seed: &[u8; 32], now: u64) -> Result<Detached
 }
 /// Sign through a caller-owned key capability after native admission checks.
 /// The capability receives only the exact transaction hash and must return its Ed25519 signature.
+/// The digest that the agent signs: for a policy wallet, the payload of the wallet's own
+/// authorization entry, which the server has signed too; else the transaction hash.
+pub fn signing_digest(p: &PreparedOperation) -> Result<[u8; 32]> {
+    if p.config.route == WalletRoute::PolicyWallet {
+        authorization::wallet_payload(p)
+    } else {
+        Ok(p.transaction_hash)
+    }
+}
 pub fn sign_with(
     p: &PreparedOperation,
     signer: &str,
@@ -1999,22 +2171,19 @@ pub fn sign_with(
     if p.config.route == WalletRoute::PolicyWallet {
         authorization::server_signature(p, true)?;
     }
-    // The server signs the transaction of a policy wallet operation only after its own
-    // authorization of that exact operation, which is checked above. Its signature counts
-    // where the fee account is the source.
-    let allowed = match p.config.route {
-        WalletRoute::Native | WalletRoute::PolicyWallet => {
-            signer == p.config.agent || signer == p.config.server
-        }
-        WalletRoute::Odc => signer == p.config.agent,
+    let allowed = if p.config.route == WalletRoute::Native {
+        signer == p.config.agent || signer == p.config.server
+    } else {
+        signer == p.config.agent
     };
     if !allowed {
         return Err("Signer has no automated role".into());
     }
-    let signature = sign_hash(&p.transaction_hash)?;
+    let digest = signing_digest(p)?;
+    let signature = sign_hash(&digest)?;
     VerifyingKey::from_bytes(&account_key(signer)?)
         .map_err(err)?
-        .verify_strict(&p.transaction_hash, &EdSignature::from_bytes(&signature))
+        .verify_strict(&digest, &EdSignature::from_bytes(&signature))
         .map_err(|_| "Signing capability returned an invalid signature")?;
     Ok(DetachedSignature {
         signer: signer.into(),
@@ -2084,17 +2253,9 @@ pub fn authorize(
     validate_prepared(p, now)?;
     current_authorization_bounds(p)?;
     if p.config.route == WalletRoute::PolicyWallet {
-        authorization::server_signature(p, true)?;
+        return authorize_wallet(p, signatures);
     }
     let required = automated_roles(&p.config);
-    // A server that signs every transaction that it submits also signs for a policy wallet
-    // of an earlier release, whose agent key signs alone. That signature is not used.
-    let unused = |s: &&DetachedSignature| {
-        p.config.route == WalletRoute::PolicyWallet
-            && p.config.fee_account.is_none()
-            && s.signer == p.config.server
-    };
-    let signatures: Vec<&DetachedSignature> = signatures.iter().filter(|s| !unused(s)).collect();
     let aliased_roles = p.config.route == WalletRoute::Native && p.config.agent == p.config.server;
     if signatures.len() != required.len() && !(aliased_roles && signatures.len() == 2) {
         return Err("Exact automated signature quorum required".into());
@@ -2118,9 +2279,7 @@ pub fn authorize(
             .map_err(err)?
             .verify_strict(&p.transaction_hash, &EdSignature::from_bytes(&sig))
             .map_err(err)?;
-        proofs
-            .entry(s.signer.clone())
-            .or_insert_with(|| (*s).clone());
+        proofs.entry(s.signer.clone()).or_insert_with(|| s.clone());
         verified.insert(
             s.signer.clone(),
             DecoratedSignature {
@@ -2162,6 +2321,101 @@ pub fn authorize(
         transaction_xdr: xdr(&TransactionEnvelope::Tx(env))?,
         transaction_hash: p.transaction_hash,
         role_signatures,
+    })
+}
+/// A signed policy wallet operation: the prepared transaction with both cosignatures in the
+/// wallet's entry and, once the sending account sealed it, the final resources and fee and that
+/// account's one signature. Nothing else differs from the prepared transaction.
+fn validate_wallet_signed(s: &SignedOperation) -> Result<()> {
+    let p = &s.prepared;
+    if !s.role_signatures.is_empty() {
+        return Err("A policy wallet operation carries no role signatures".into());
+    }
+    let TransactionEnvelope::Tx(env) = read(&s.transaction_xdr)? else {
+        return Err("Unsupported signed envelope".into());
+    };
+    let TransactionEnvelope::Tx(unsigned) = read(&p.transaction_xdr)? else {
+        return Err("Unsupported unsigned envelope".into());
+    };
+    let mut assembled = p.clone();
+    assembled.transaction_xdr = xdr(&TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: env.tx.clone(),
+        signatures: VecM::default(),
+    }))?;
+    let (Some(_), Some(_)) = authorization::cosignatures(&assembled)? else {
+        return Err("The wallet's authorization lacks a cosignature".into());
+    };
+    let mut normalized = env.tx.clone();
+    normalized.fee = unsigned.tx.fee;
+    normalized.ext = unsigned.tx.ext.clone();
+    let mut operations = normalized.operations.to_vec();
+    let mut original = unsigned.tx.operations.to_vec();
+    if let (
+        Some(OperationBody::InvokeHostFunction(op)),
+        Some(OperationBody::InvokeHostFunction(prepared_op)),
+    ) = (
+        operations.first_mut().map(|o| &mut o.body),
+        original.first_mut().map(|o| &mut o.body),
+    ) {
+        op.auth = prepared_op.auth.clone();
+    }
+    normalized.operations = operations.try_into().map_err(err)?;
+    if normalized != unsigned.tx {
+        return Err("Signed transaction bytes differ".into());
+    }
+    if env.tx.fee > p.config.max_fee_stroops {
+        return Err("The sealed fee exceeds the installed fee ceiling".into());
+    }
+    if s.transaction_hash != transaction_hash(&p.config.network, &env.tx)? {
+        return Err("Signed transaction identity differs".into());
+    }
+    match env.signatures.as_slice() {
+        [] => Ok(()),
+        [signature] => {
+            let MuxedAccount::Ed25519(Uint256(key)) = &env.tx.source_account else {
+                return Err("The sending account is a plain account".into());
+            };
+            if signature.hint.0 != key[28..] {
+                return Err("The source signature is not the sending account's".into());
+            }
+            VerifyingKey::from_bytes(key)
+                .map_err(err)?
+                .verify_strict(
+                    &s.transaction_hash,
+                    &EdSignature::from_slice(signature.signature.as_slice()).map_err(err)?,
+                )
+                .map_err(|_| "Invalid sending account signature".into())
+        }
+        _ => Err("The sending account signs alone".into()),
+    }
+}
+/// The agent's step of a policy wallet operation: its one signature of the wallet's payload joins
+/// the server's in the wallet's entry. The envelope stays unsigned: the server's sending account
+/// simulates it for its final resources, signs it as the source and sends it (`rpc::seal`).
+fn authorize_wallet(
+    p: &PreparedOperation,
+    signatures: &[DetachedSignature],
+) -> Result<SignedOperation> {
+    let server =
+        authorization::server_signature(p, true)?.ok_or("Service authorization is unsigned")?;
+    let [s] = signatures else {
+        return Err("The agent's one signature of the wallet's authorization is required".into());
+    };
+    if s.signer != p.config.agent {
+        return Err("Unexpected or duplicate signature".into());
+    }
+    let agent: [u8; 64] = s
+        .signature
+        .as_slice()
+        .try_into()
+        .map_err(|_| "Invalid signature length")?;
+    signing::verify_digest(&p.config.agent, &authorization::wallet_payload(p)?, &agent)?;
+    let out = authorization::attach(p, contract::cosignatures(&agent, &server)?)?;
+    Ok(SignedOperation {
+        prepared: p.clone(),
+        transaction_xdr: out.transaction_xdr,
+        transaction_hash: out.transaction_hash,
+        role_signatures: Vec::new(),
     })
 }
 /// Check the classic automated role proofs. `required` demands one proof per role key; a
@@ -2224,7 +2478,7 @@ pub fn validate_retained_signed(s: &SignedOperation) -> Result<()> {
     }
     validate_retained_prepared(&s.prepared)?;
     if s.prepared.config.route == WalletRoute::PolicyWallet {
-        authorization::server_signature(&s.prepared, true)?;
+        return validate_wallet_signed(s);
     }
     if s.transaction_hash != s.prepared.transaction_hash {
         return Err("Signed transaction identity differs".into());
@@ -2320,11 +2574,9 @@ fn attach_resources(
     out.transaction_hash = transaction_hash(&p.config.network, &env.tx)?;
     out.transaction_xdr = xdr(&TransactionEnvelope::Tx(env))?;
     out.simulation_data = Some(data.into());
-    // An unsigned service entry has not established the final transaction hash.
-    // Exact source-account quorum is checked after that entry is signed.
-    if out.config.route != WalletRoute::PolicyWallet
-        || authorization::server_signature(&out, false)? != ScVal::Void
-    {
+    // A policy wallet's source is the server's sending account, which signs last; the agent and
+    // the server sign the wallet's own authorization instead.
+    if out.config.route != WalletRoute::PolicyWallet {
         transaction_signers(&out, &automated_roles(&out.config))?;
     }
     Ok(out)

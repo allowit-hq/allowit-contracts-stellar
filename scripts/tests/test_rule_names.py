@@ -3,7 +3,8 @@
 The limits are `payment_limit`, `lifetime_spending_limit`, `daily_spending_limit`,
 `daily_volume_limit` and `call_limit`; the lists are `destinations`, `tokens` and `operations`;
 the deadline is `expires_at`. Words such as capability, capture and capacity do not match. A
-transaction fee cap and a Stellar Core Advancement Proposal (CAP-NNNN) are not policy limits."""
+transaction fee cap, the owner's gas cap and a Stellar Core Advancement Proposal (CAP-NNNN)
+are not policy limits."""
 import re
 import subprocess
 import unittest
@@ -15,7 +16,7 @@ SKIP = (".lock", ".wasm")
 SELF = Path(__file__).resolve().relative_to(ROOT).as_posix()
 # "cap", "caps", "capped" as a word or an identifier part, in any case or in camel case.
 CAP = re.compile(r"(?<![A-Za-z])(?:cap|Cap|CAP)(?:s|S|ped|PED)?(?![a-z])|(?<=[a-z])Cap(?![a-z])")
-ALLOWED = re.compile(r"(?i)fee[ _]caps?(?![a-z])|(?<![A-Za-z])cap-\d+")
+ALLOWED = re.compile(r"(?i)(?:fee|gas)[ _]?caps?(?![a-z])|(?<![A-Za-z])cap-\d+")
 RETIRED = re.compile(
     r"allowit::(?:RECIPIENTS|EXPIRY|OPS)\b|allowit::(?:recipients|expiry|ops)\s*\(|AllowitRule::(?:recipients|expiry|ops)\b"
     r"|params\[\s*\"(?:recipients|expiry|ops)\"\s*\]|\"(?:recipients|expiry|ops)\"\s*:"
@@ -37,7 +38,7 @@ class RuleNameTests(unittest.TestCase):
                     "CAPPED", "a capped amount", "allowit::OPS", "ctx.params[\"recipients\"]", "{\"expiry\": 1}"):
             with self.subTest(bad=bad):
                 self.assertTrue(hits(bad))
-        for good in ("capability", "OwnerCapabilities", "capture", "capacity", "escape", "fee_caps_stroops", "stage fee cap",
+        for good in ("capability", "OwnerCapabilities", "capture", "capacity", "escape", "fee_caps_stroops", "stage fee cap", "gas_cap", "gasCap",
                      "CAP-15", "cap-0066.md", "call_limit", "std::ops", "\"expiry\" => changed.expires_at += 1"):
             with self.subTest(good=good):
                 self.assertFalse(hits(good))

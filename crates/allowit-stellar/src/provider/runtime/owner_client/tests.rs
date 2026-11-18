@@ -738,8 +738,7 @@ fn prepared_update(
     update: &crate::host::runtime::ParamsUpdate,
     now: u64,
 ) -> Value {
-    let deployment =
-        crate::provider::params_update::deployment(&selected.config, update, false).unwrap();
+    let deployment = crate::provider::params_update::deployment(&selected.config, update).unwrap();
     update_step(&selected.config, &deployment, 2, now)
 }
 #[test]
@@ -891,7 +890,7 @@ fn changed_update_packets_and_invalid_updates_never_reach_the_signer() {
         let value = prepared_update(&selected, &other, now);
         // Another target revision.
         let deployment =
-            crate::provider::params_update::deployment(&selected.config, &update, false).unwrap();
+            crate::provider::params_update::deployment(&selected.config, &update).unwrap();
         let version = update_step(&selected.config, &deployment, 3, now);
         // A new owner in the packet.
         let mut handoff = deployment.clone();

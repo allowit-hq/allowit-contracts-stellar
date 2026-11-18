@@ -8,7 +8,6 @@
 use crate::*;
 
 const MAX_OWNER_XDR: usize = 192 * 1024;
-const MAX_WASM: usize = 128 * 1024;
 const MAX_FOOTPRINT: usize = 256;
 
 /// Untrusted common fields of a server-prepared owner step. SDK clients parse the server's
@@ -54,7 +53,8 @@ pub fn validate_retained_owner_transaction(original: &OwnerTransaction) -> Resul
                 ..
             },
         ] => match &invoke.host_function {
-            HostFunction::UploadContractWasm(_) => original.action == "upload_wasm",
+            // The owner signs no code upload: the server uploads with its own account.
+            HostFunction::UploadContractWasm(_) => false,
             HostFunction::CreateContractV2(_) => original.action == "create_wallet",
             HostFunction::InvokeContract(call) => {
                 let function = call.function_name.0.as_slice();
@@ -63,7 +63,9 @@ pub fn validate_retained_owner_transaction(original: &OwnerTransaction) -> Resul
                 // the first argument.
                 function == original.action.as_bytes()
                     || match (original.action.as_str(), function) {
-                        ("fund", b"transfer")
+                        // A creation runs through the network's deployer.
+                        ("create_wallet", b"deploy")
+                        | ("fund", b"transfer")
                         | ("update_params", b"deploy_policy")
                         | ("withdraw", b"recover") => true,
                         ("pause" | "resume", b"set_pause") => matches!(
@@ -116,19 +118,8 @@ fn classic_action_matches(action: &str, operations: &[Operation]) -> bool {
                         )
                 })
         }
-        // A fee account: the creation of the account with its three signer operations.
-        (owner::CREATE_FEE_ACCOUNT, [create, rest @ ..]) => {
-            matches!(create.body, OperationBody::CreateAccount(_))
-                && create.source_account.is_none()
-                && rest.len() == 3
-                && rest
-                    .iter()
-                    .all(|op| wallet_sourced(op) && matches!(op.body, OperationBody::SetOptions(_)))
-        }
         ("fund", [op]) => !wallet_sourced(op) && matches!(op.body, OperationBody::Payment(_)),
-        ("withdraw" | owner::RETURN_FEES, [op]) => {
-            wallet_sourced(op) && matches!(op.body, OperationBody::Payment(_))
-        }
+        ("withdraw", [op]) => wallet_sourced(op) && matches!(op.body, OperationBody::Payment(_)),
         ("pause" | "resume", [op]) => {
             wallet_sourced(op) && matches!(op.body, OperationBody::SetOptions(_))
         }
@@ -176,41 +167,17 @@ pub fn validate_signed_owner_transaction(
     let MuxedAccount::Ed25519(key) = &unsigned.tx.source_account else {
         return Err("Expected a native G-account owner source".into());
     };
-    // The creation of a fee account also carries the one signature of the new account's own
-    // key: the network requires it for the operations that the new account is the source of.
-    let created = (original.action == owner::CREATE_FEE_ACCOUNT)
-        .then(|| match unsigned.tx.operations.first().map(|op| &op.body) {
-            Some(OperationBody::CreateAccount(create)) => {
-                let PublicKey::PublicKeyTypeEd25519(account) = &create.destination.0;
-                Ok(account.0)
-            }
-            _ => Err("The creation of a fee account names no new account".to_string()),
-        })
-        .transpose()?;
-    let verify = |signer: &[u8; 32], signature: &DecoratedSignature, what: &str| -> Result<()> {
-        if signature.hint.0 != signer[28..] {
-            return Err(format!("{what} signature hint differs"));
-        }
-        signing::verify_digest(
-            &ed25519::PublicKey(*signer).to_string(),
-            &digest,
-            signature.signature.as_slice(),
-        )
+    let [signature] = signed.signatures.as_slice() else {
+        return Err("Exactly one source-owner signature is required".into());
     };
-    match (signed.signatures.as_slice(), created) {
-        ([signature], None) => verify(&key.0, signature, "Owner")?,
-        ([signature, account_signature], Some(account)) => {
-            verify(&key.0, signature, "Owner")?;
-            verify(&account, account_signature, "Fee account")?;
-        }
-        (_, None) => return Err("Exactly one source-owner signature is required".into()),
-        (_, Some(_)) => {
-            return Err(
-                "The creation of a fee account needs the owner's signature, then the one signature of the new account's own key"
-                    .into(),
-            );
-        }
+    if signature.hint.0 != key.0[28..] {
+        return Err("Owner signature hint differs".into());
     }
+    signing::verify_digest(
+        &ed25519::PublicKey(key.0).to_string(),
+        &digest,
+        signature.signature.as_slice(),
+    )?;
     Ok(digest)
 }
 
@@ -228,15 +195,14 @@ pub struct OwnerLimits {
 /// The owner actions needed to establish, fund and renew native and policy-wallet custody.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OwnerAction {
-    /// The hash of the independently reviewed wallet executable. The packet must contain its
-    /// exact bytes and declare the supported custody layout.
-    UploadWasm { wasm_hash: [u8; 32] },
     /// The complete selected policy installation, constructor and deterministic wallet address.
     /// `config` includes the selected tier, source, params, roles, asset and executable hash.
+    /// The creation goes through the network's deployer, which holds no authority: the owner's
+    /// one signature covers exactly this creation and each `(asset, amount)` of `funding`.
     CreateWallet {
         config: Box<WalletConfig>,
         salt: [u8; 32],
-        x402_enabled: bool,
+        funding: Vec<(String, i128)>,
     },
     /// Exactly one SEP-41 transfer from the selected owner to the selected policy wallet.
     Fund {
@@ -273,16 +239,6 @@ pub enum OwnerAction {
         trustline: Option<owner::Trustline>,
         created_at: u64,
     },
-    /// The exact creation of the fee account of one policy wallet, reconstructed from the
-    /// caller-observed owner account and the caller's own roles. The packet chooses only its
-    /// fee, within the caller's fee limit, and its expiry.
-    FeeAccountSetup {
-        state: AccountState,
-        account: String,
-        agent: String,
-        engine: String,
-        request_id: String,
-    },
     /// One owner action on a wallet account (fund, pause, resume, withdraw or close),
     /// reconstructed from the caller-observed owner and wallet accounts and the selected roles.
     /// The packet chooses only its fee, within the caller's fee limit, and its expiry.
@@ -299,13 +255,11 @@ pub enum OwnerAction {
 impl OwnerAction {
     fn name(&self) -> &'static str {
         match self {
-            Self::UploadWasm { .. } => "upload_wasm",
             Self::CreateWallet { .. } => "create_wallet",
             Self::Fund { .. } => "fund",
             Self::Extend { .. } => "extend",
             Self::UpdatePolicy { .. } => "update_params",
             Self::NativeSetup { .. } => "native_setup",
-            Self::FeeAccountSetup { .. } => owner::CREATE_FEE_ACCOUNT,
             Self::Wallet { action, .. } => action.name(),
         }
     }
@@ -460,44 +414,6 @@ pub fn validate_owner_transaction(
                 return Err("Native setup differs from the exact caller-selected template".into());
             }
         }
-        OwnerAction::FeeAccountSetup {
-            state,
-            account,
-            agent,
-            engine,
-            request_id,
-        } => {
-            if state.address != limits.owner {
-                return Err("Fee account setup source differs from caller intent".into());
-            }
-            // The fee and the expiry are the packet's own, within the limits checked above.
-            // Every operation, the starting balance and the roles are the caller's.
-            let count = u32::try_from(tx.operations.len()).map_err(err)?;
-            if count == 0 || !tx.fee.is_multiple_of(count) {
-                return Err("Fee account setup fee is not a whole fee per operation".into());
-            }
-            let created_at = packet
-                .expires_at
-                .checked_sub(300)
-                .ok_or("Fee account setup expiry is invalid")?;
-            let exact = owner::setup_transaction(&owner::prepare_fee_account_setup(
-                state,
-                &owner::FeeAccountTerms {
-                    account,
-                    agent,
-                    engine,
-                    request_id,
-                    network: &limits.network,
-                    fee_per_operation: tx.fee / count,
-                },
-                created_at,
-            )?)?;
-            if packet != &exact {
-                return Err(
-                    "Fee account setup differs from the exact caller-selected roles".into(),
-                );
-            }
-        }
         OwnerAction::Wallet {
             owner_state,
             wallet_state,
@@ -604,12 +520,14 @@ fn validate_resources(tx: &Transaction) -> Result<()> {
     let TransactionExt::V1(data) = &tx.ext else {
         return Err("Owner host-function transaction needs simulation resources".into());
     };
+    // Archived entries of the read-write footprint restore in the same transaction, at the
+    // owner's fee: a wallet whose entries lapsed returns its funds with one owner signature.
     if data.resource_fee < 0
         || u64::try_from(data.resource_fee)
             .map_err(err)?
             .checked_add(100)
             != Some(u64::from(tx.fee))
-        || matches!(&data.ext, SorobanTransactionDataExt::V1(v) if !v.archived_soroban_entries.is_empty())
+        || crate::rpc::archived_in_footprint(data).is_err()
     {
         return Err("Owner resource fee or restoration scope is invalid".into());
     }
@@ -648,27 +566,15 @@ fn validate_host(
     invoke: &InvokeHostFunctionOp,
 ) -> Result<()> {
     match action {
-        OwnerAction::UploadWasm { wasm_hash } => {
-            let HostFunction::UploadContractWasm(wasm) = &invoke.host_function else {
-                return Err("Expected the caller-selected Wasm upload".into());
-            };
-            if wasm.len() > MAX_WASM
-                || *wasm_hash == [0; 32]
-                || admin::check_wallet_code(wasm)? != *wasm_hash
-                || !invoke.auth.is_empty()
-            {
-                return Err("Owner upload differs from the reviewed executable".into());
-            }
-        }
         OwnerAction::CreateWallet {
             config,
             salt,
-            x402_enabled,
+            funding,
         } => {
             if config.network != limits.network || config.owner != limits.owner {
                 return Err("Wallet configuration differs from caller network or owner".into());
             }
-            let constructor = admin::PolicyConfig::for_policy(config, *x402_enabled)?;
+            let constructor = admin::PolicyConfig::for_policy(config)?;
             let wallet = admin::wallet_address(&limits.network, &limits.owner, salt)?;
             if wallet != config.wallet
                 || [&config.owner, &config.agent, &config.server].contains(&&wallet)
@@ -677,16 +583,49 @@ fn validate_host(
                     "Wallet address differs from the caller-selected creation preimage".into(),
                 );
             }
-            let exact = HostFunction::CreateContractV2(CreateContractArgsV2 {
-                contract_id_preimage: ContractIdPreimage::Address(ContractIdPreimageFromAddress {
-                    address: address(&limits.owner)?,
-                    salt: Uint256(*salt),
-                }),
-                executable: ContractExecutable::Wasm(Hash(config.module_digest)),
-                constructor_args: constructor.constructor_args()?.try_into().map_err(err)?,
+            // The deployer is the contract that the transaction calls; it holds no authority, so
+            // only the exact creation and funding below can run under the owner's signature.
+            let HostFunction::InvokeContract(call) = &invoke.host_function else {
+                return Err("Owner creation goes through the deployer".into());
+            };
+            if call.contract_address != address(&admin::deployer_address(&limits.network)?)? {
+                return Err(
+                    "Owner creation goes through another contract than the network's deployer"
+                        .into(),
+                );
+            }
+            let mut items = Vec::new();
+            for (asset, amount) in funding {
+                Contract::from_string(asset).map_err(err)?;
+                if *amount <= 0 {
+                    return Err("A funding amount is positive".into());
+                }
+                items.push(ScVal::Vec(Some(
+                    vec![ScVal::Address(address(asset)?), i128_value(*amount)]
+                        .try_into()
+                        .map_err(err)?,
+                )));
+            }
+            let exact = HostFunction::InvokeContract(InvokeContractArgs {
+                contract_address: call.contract_address.clone(),
+                function_name: ScSymbol("deploy".try_into().map_err(err)?),
+                args: vec![
+                    ScVal::Address(address(&limits.owner)?),
+                    value_bytes(&config.module_digest)?,
+                    value_bytes(salt)?,
+                    ScVal::Vec(Some(
+                        constructor.constructor_args()?.try_into().map_err(err)?,
+                    )),
+                    ScVal::Vec(Some(items.try_into().map_err(err)?)),
+                ]
+                .try_into()
+                .map_err(err)?,
             });
             if invoke.host_function != exact || invoke.auth.len() != 1 {
-                return Err("Owner creation differs from the complete selected constructor".into());
+                return Err(
+                    "Owner creation differs from the complete selected constructor and funding"
+                        .into(),
+                );
             }
             admin::validate_auth(&limits.network, &exact, &invoke.auth, None)?;
         }
@@ -745,7 +684,6 @@ fn validate_host(
             admin::validate_auth(&limits.network, &exact, &invoke.auth, None)?;
         }
         OwnerAction::NativeSetup { .. }
-        | OwnerAction::FeeAccountSetup { .. }
         | OwnerAction::Wallet { .. }
         | OwnerAction::Extend { .. } => unreachable!(),
     }
@@ -753,18 +691,17 @@ fn validate_host(
 }
 
 /// Validate every deployment metadata field as well as its complete transaction. This adapter
-/// accepts only upload/create intent, so unrelated prepared-operation metadata cannot be reused.
+/// accepts only creation intent, so unrelated prepared-operation metadata cannot be reused.
 pub fn validate_deployment(
     packet: &admin::PreparedDeployment,
     expected: &ExpectedOwnerIntent,
     now: u64,
 ) -> Result<ValidatedOwnerTransaction> {
     let (wasm, wallet) = match &expected.action {
-        OwnerAction::UploadWasm { wasm_hash } => (*wasm_hash, None),
         OwnerAction::CreateWallet { config, .. } => {
             (config.module_digest, Some(config.wallet.clone()))
         }
-        _ => return Err("Expected upload or wallet-creation intent".into()),
+        _ => return Err("Expected wallet-creation intent".into()),
     };
     if packet.source != expected.limits.owner
         || packet.wasm_hash != wasm

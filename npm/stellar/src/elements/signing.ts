@@ -1,24 +1,11 @@
 import {canonicalNetwork, networkPassphrase, strkey} from '../plugin.js';
 import {base, emit, expiry, h, type Data} from './base.js';
 import {link} from './display.js';
-import {CREATE_FEE_ACCOUNT} from '../fee-account.js';
 import {APPROVE_POLICY, SET_UP_WALLET, WALLET_FEE_FLOAT, WALLET_RESERVE, approvalMessage, nativeSetupOf, policyApproval} from '../native-wallet.js';
 
 /** XLM text of stroops, without trailing zeros. */
 const xlm = (units: bigint) => `${units / 10_000_000n}${units % 10_000_000n ? `.${(units % 10_000_000n).toString().padStart(7, '0').replace(/0+$/, '')}` : ''} XLM`;
 
-/**
- * What the creation of a fee account does, read from the transaction itself: the new account and the XLM that the
- * owner's account sends to it. Null when the first operation creates no account.
- */
-export async function feeAccountCreation(payload: string, network: string): Promise<{account: string; funding: string} | null> {
-  try {
-    const {TransactionBuilder} = await import('@stellar/stellar-sdk/base');
-    const tx = TransactionBuilder.fromXDR(payload, networkPassphrase(network));
-    const first = 'innerTransaction' in tx ? undefined : tx.operations[0];
-    return first?.type === 'createAccount' ? {account: first.destination, funding: `${first.startingBalance.replace(/\.?0+$/, '')} XLM`} : null;
-  } catch {return null;}
-}
 
 type Failure = {code: string; message: string};
 const failure = (error: unknown, code: string): Failure => ({code: String((error as {code?: unknown})?.code ?? code), message: error instanceof Error ? error.message : String(error)});
@@ -166,17 +153,6 @@ export function ownerSignElement() {
       rows.push(h('dt', {}, 'Transaction'), h('dd', {}, link(id, 'tx', step.hash, `${step.hash.slice(0, 8)}…`)));
       rows.push(h('dt', {}, 'Expires'), h('dd', {}, expiry(step.expiresAt)));
       const list = h('dl', {class: 'owner-step'}, ...rows);
-      if (step.action === CREATE_FEE_ACCOUNT) {
-        // The owner reads what this step funds before the wallet opens: the account that pays the agent's
-        // network fees, and the XLM that it starts with.
-        void feeAccountCreation(step.payload, id).then(created => {
-          if (!created || !list.isConnected) return;
-          list.append(
-            h('dt', {}, 'Fee account'), h('dd', {}, link(id, 'address', created.account, created.account)),
-            h('dt', {}, 'You fund it with'), h('dd', {}, `${created.funding}: its reserve and the float that pays your agent's network fees. Only you can take it back.`),
-          );
-        });
-      }
       const status = h('p', {class: 'status', role: 'status'});
       const sign = button('Sign in wallet', async () => {
         sign.disabled = true; status.textContent = 'Checking the transaction…';
@@ -201,73 +177,6 @@ export function ownerSignElement() {
         } finally {sign.disabled = false;}
       });
       this.replaceChildren(list, h('div', {class: 'actions'}, sign, cancel), status);
-    }
-  };
-}
-
-/** The fields of a custom build attestation message. */
-export interface BuildAttestation {network: string; policy: string; sourceHash: string; codeHash: string; server: string; presignature: string; owner: string}
-const ATTESTATION_TITLE = 'Allowit custom build attestation v1';
-const ATTESTATION_KEYS = ['network', 'policy', 'source-sha256', 'code-sha256', 'server', 'presignature', 'owner'] as const;
-/**
- * Reads the exact text of a custom build attestation: its title line, then one `key: value` line for each field in
- * order. Any other text is null. A value is printable ASCII without a space; hashes and the presignature are
- * lowercase hexadecimal.
- */
-export function buildAttestation(message: unknown): BuildAttestation | null {
-  if (typeof message !== 'string') return null;
-  const lines = message.split('\n');
-  if (lines.length !== ATTESTATION_KEYS.length + 1 || lines[0] !== ATTESTATION_TITLE) return null;
-  const values: string[] = [];
-  for (const [index, key] of ATTESTATION_KEYS.entries()) {
-    const prefix = `${key}: `, line = lines[index + 1];
-    if (!line.startsWith(prefix)) return null;
-    const value = line.slice(prefix.length);
-    if (!/^[\x21-\x7e]{1,128}$/.test(value) && key !== 'presignature') return null;
-    values.push(value);
-  }
-  const [network, policy, sourceHash, codeHash, server, presignature, owner] = values;
-  if (!/^[0-9a-f]{64}$/.test(sourceHash) || !/^[0-9a-f]{64}$/.test(codeHash) || !/^([0-9a-f]{2}){1,512}$/.test(presignature)) return null;
-  return {network, policy, sourceHash, codeHash, server, presignature, owner};
-}
-
-/**
- * Signs the owner's attestation of a custom wallet build with the wallet's message signature. It signs only an
- * attestation message of this network whose owner is the wallet account, and shows what the owner attests.
- */
-export function buildAttestElement() {
-  return class extends base() {
-    render(): void {
-      const data = (this.data ?? {}) as Data;
-      // The text that was validated and shown is the text that the wallet signs: a later change of `data` is not.
-      const message = typeof data.message === 'string' ? data.message : null;
-      const id = canonicalNetwork(data.network), fields = buildAttestation(message);
-      if (!id || message === null || !fields || fields.network !== id || !strkey(fields.owner) || !strkey(fields.server)) {
-        this.replaceChildren(h('p', {class: 'invalid'}, 'This build attestation is invalid.'));
-        return;
-      }
-      const summary = Array.isArray(data.summary) ? data.summary as {label?: unknown; value?: unknown}[] : [];
-      const rows = summary.flatMap(row => [h('dt', {}, String(row.label ?? '')), h('dd', {}, String(row.value ?? ''))]);
-      rows.push(h('dt', {}, 'Policy source hash'), h('dd', {class: 'mono'}, fields.sourceHash));
-      rows.push(h('dt', {}, 'Wallet code hash'), h('dd', {class: 'mono'}, fields.codeHash));
-      rows.push(h('dt', {}, 'Server'), h('dd', {}, link(id, 'address', fields.server, fields.server)));
-      const status = h('p', {class: 'status', role: 'status'});
-      const sign = button('Sign the build attestation', async () => {
-        sign.disabled = true; status.textContent = 'Waiting for the wallet…';
-        try {
-          const {connectWallet, signWalletMessage} = await import('./wallet.js');
-          const address = await connectWallet(id);
-          if (address !== fields.owner) throw Object.assign(new Error('The wallet account is not the owner of this policy. Nothing was signed.'), {code: 'mismatch'});
-          const signature = await signWalletMessage(message, address, id);
-          status.textContent = 'Signed.';
-          emit(this, 'allowit-signed', {signature: hex(Uint8Array.from(atob(signature), c => c.charCodeAt(0))), codeHash: fields.codeHash});
-        } catch (error) {
-          status.textContent = error instanceof Error ? error.message : String(error);
-          emit(this, 'allowit-error', failure(error, 'sign'));
-        } finally {sign.disabled = false;}
-      });
-      const cancel = button('Cancel', () => emit(this, 'allowit-cancel'));
-      this.replaceChildren(h('dl', {class: 'owner-step'}, ...rows), h('div', {class: 'actions'}, sign, cancel), status);
     }
   };
 }

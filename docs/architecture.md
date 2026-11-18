@@ -10,7 +10,7 @@ wallet code, the agent, an independent server signer and the params. Delegated o
 the agent and the server. The owner needs nobody. The server signer is a plain co-signer; it is not
 a shared checker contract or that contract's parent administrator. Shared checkers have no custody.
 
-`AllowitSimplePolicyEngine` relies on agent/server authorization. `AllowitCommonPolicyEngine` is
+`AllowitSimplePolicyEngine` relies on the agent's and the server's signatures and runs no rule onchain. `AllowitCommonPolicyEngine` is
 the standard implementation for an owner-approved initial preflight prefix. `AllowitCustomPolicy`
 compiles a complete authored policy into its contract. All three are built from the same custody
 core in `crates/policy-wallet`. The `policy_wallet!` macro attaches the complete owner and
@@ -21,16 +21,15 @@ expose identical entrypoints and differ only in their `AllowitPolicy` logic.
 
 Every public type that authored policy, SDK integrations or contract specs name carries the
 `Allowit` prefix: `AllowitContext`, `AllowitEnv`, `AllowitParams`, `AllowitArgs`, `AllowitValue`, `AllowitRule`,
-`AllowitError`, `AllowitExecutionRequest`, `AllowitPolicyDeployment`, `AllowitState` and the others. The contract
+`AllowitError`, `AllowitExecutionRequest`, `AllowitPolicyUpdate`, `AllowitState` and the others. The contract
 structs and their generated clients carry it too: `AllowitSimplePolicyEngine`,
 `AllowitCommonPolicyEngine`, `AllowitCustomPolicy`, `AllowitEngine`, `AllowitEngineParent`, and
 `AllowitEngineClient` and the other `*Client` types. Namespaced items keep their short names, such
 as `allowit::Result`, `allowit::lifetime_spending_limit` and `allowit::PAYMENT_LIMIT`.
 
 Encodings carry struct field names and enum variant symbols, not type names. The prefix therefore
-leaves signed encodings, the standard prefix digest and the stored layout unchanged.
-Type names are in the Wasm contract spec, so rebuilt Wasm has new module hashes and, because the
-standard `source_digest` hashes the module, new prefix-binding digests.
+leaves signed encodings and the stored layout unchanged. Type names are in the Wasm contract spec,
+so rebuilt Wasm has new module hashes.
 
 ## One portable policy source
 
@@ -212,29 +211,22 @@ The portability test, `crates/policy-wallet/src/portability_tests.rs`, runs one 
    `ctx.params[key]` reports its `MissingParam` abort as the host reports its caught panic. The
    real custom Wasm must then return the mapped policy result, or the abort's own error code.
    A fixture Wasm built with the `test-catching` feature compiles `src/catching_policy.rs`
-   instead, and must return the mapped catching result. That policy catches a daily spending limit error,
-   counts it in its own state key and continues, at most twice. When the agent's args name an
-   `invoice`, it also limits the payment with the custom `invoice_limit` param.
+   instead. That policy catches a daily spending limit error, counts it in its own state key and
+   continues, at most twice. When the agent's args name an `invoice`, it also limits the payment
+   with the custom `invoice_limit` param. The wallet stores no policy state, so it denies that
+   write as the server's evaluation does.
 3. `AllowitCommonPolicyEngine`: the real standard Wasm, bound to the sample policy's prefix, must
-   return the mapped first prefix preflight error. It skips absent params and rejects a custom
-   param with `InvalidParam`.
-4. `AllowitSimplePolicyEngine`: the real simple Wasm runs no rules and also rejects a custom param.
+   return the mapped first prefix preflight error. It skips absent params.
+4. `AllowitSimplePolicyEngine`: the real simple Wasm runs no rules.
 
-Every contract then returns the shared post-flight result. Each vector holds the current state
-before the operation. The test seeds each Wasm with the vector's params, args and that state, and
-checks that each success stores exactly the post-flight state that the host computed. Both backends
-also agree that the standard post-flight denies the catching policy's write with `Unsupported`,
-that a write past `MAX_STATE_KEYS` keys or `MAX_STATE_BYTES` bytes is `InvalidState`, that
-`evaluate` denies more than 16 args with `InvalidParam`, and that a standard `evaluate` rejects a
-custom param with `InvalidParam`.
-Separate tests check that every tier stores exactly the state that the server's `evaluate`
-returned, and that execution params reach the Custom policy, fail authorization when changed after
-signing, reject beyond their bounds and leave the standard tiers unaffected. Vectors that the
-kernel cannot produce through a transfer `execute`, such as a deposit, swap or redeem, a negative
-limit, an invalid `operations` value or more than 16 args, run only on the two backends. The swap and
-redeem tests in `src/swap_redeem_tests.rs` run those operations through every contract. Kernel violations
-(another asset, payment to the wallet, request expiry, stale nonce, replay and pause) reject with the
-same kernel error in every contract.
+Each vector holds the current state before the operation. The test seeds each Wasm with the
+vector's params and figures, runs a transfer signed by the agent and the server, and checks that
+each success stores exactly the figures of the host's post-flight that the wallet keeps. A vector
+whose state no wallet stores (a policy key, a backward day or a total beyond the width of `t`) runs
+on the two backends only, as do a deposit, swap or redeem, a negative limit, an invalid
+`operations` value or more than 16 args. Kernel violations (another asset, payment to the wallet,
+request expiry, stale version, a spent authorization and pause) reject with the same kernel error
+in every contract.
 
 `scripts/build-contracts.sh` builds in the Cargo target directory, so a shared target directory
 reuses compiled dependencies across worktrees. The tests read every Wasm from `./target`, so the
@@ -347,16 +339,12 @@ So no write outlives its evaluation, also when the server reuses an `AllowitEnv`
 wallet runs `post_flight` after its own policy check, and a denied transaction rolls the temporary
 buffer back.
 
-`AllowitTier` selects what a wallet stores. Custom compiles its whole policy, so its
-`AllowitTier::Custom` post-flight applies every write. Simple and Common run only the standard
-prefix onchain, which never writes, so they never add or change a policy key. Policy keys left by
-earlier Custom code stay unchanged and still count toward the bounds. Their
-`AllowitTier::Standard` post-flight therefore denies any policy write with `Unsupported`, on the
-host as onchain: the server never approves an operation whose state the chain would drop. For every
-tier, the state that `evaluate` returns is exactly the state the wallet stores, and the wallet's
-`policy_state` alone is the server's next `ctx.state`. `allowit-stellar-admin` rejects a Simple
-or Common packet whose source calls `allowit::set_state`, also through the raw identifier
-`allowit::r#set_state`; such a policy needs Custom.
+A policy wallet stores no policy state of its own. Every tier runs the standard post-flight,
+which denies a policy write with `Unsupported`, on the host as onchain: the server never approves
+an operation whose state the chain would drop. A Custom wallet still admits its own params, so the
+server evaluates its source with the Custom params check and the standard post-flight. The
+figures that the wallet keeps are the server's next `ctx.state`. `allowit-stellar-admin` refuses
+a source that calls `allowit::set_state`, also through the raw identifier `allowit::r#set_state`.
 
 The server-only enrichment functions exist only in the host backend. Each takes the context and an
 owner-written request and returns its passing constraint:
@@ -431,54 +419,44 @@ caught panic. A policy may also return it; onchain it is then a rule denial. A
 failed call rolls back its events, so a standard wallet's specific rule error comes only from the
 host evaluator and the shared engine.
 
-`AllowitState.policy_state` records every delegated success independently of selected or unset
-rules. With cost bounds it records conservative expenses and gas. Without them it records raw gross
-and calls plus an unpriced liability. Rollover clears only daily liability. No owner reconciliation
-or refund method clears the standard keys. The kernel's single-use `operation_id`, execution nonce
-and expense day checks reject replays and changed facts before rules run; a backward ledger day
-fails the daily rules and `post_flight` with `InvalidState`.
+A wallet stores no policy state of its own, only the cumulated figures that its checks read:
+spent and calls in the persistent entry `t`, and the day's spent and total in the temporary entry
+`d`. A Standard wallet keeps the figure of each rule that has its param set; a Custom wallet keeps
+the figures that its build finds in its source. With cost bounds a figure counts the conservative
+expense and gas; without them it counts the raw gross and calls and sets the unpriced flag. No
+owner reconciliation or refund method clears a figure. The day is the life of `d`: its first write
+sets its end ledger, one day of ledgers later, and the entry expires with it. The kernel checks the
+signed expiry, the configuration version and the expense bounds before the rules run; the host's
+authorization nonce makes each signed operation run once.
 
-After the policy approves, the wallet writes the post-flight state, the next nonce and the replay
-marker before it calls the token, the router or the vault. Soroban transactions are atomic, so a
-later failed effect check rolls all of it back. Soroban also refuses a call into a contract that is
-already on the call stack, so a hostile vault or router cannot call `execute` or reach the wallet's
-`__check_auth` while the wallet's operation runs; the transaction fails and no state changes.
-
-In an intercepted operation, `__check_auth` writes the post-flight state, nonce and replay marker
-when the host verifies the whole signed tree at the wallet's first `require_auth`. For the
-Soroswap router and SEP-56 reference vaults, that is before any debit. Atomicity rolls them back on
-any later failure, such as a router's minimum-output check.
+After the policy approves, the wallet writes the figures before it calls the token, the router or
+the vault. Soroban transactions are atomic, so a later failed effect check rolls all of it back.
+Soroban also refuses a call into a contract that is already on the call stack, so a hostile vault
+or router cannot call `execute` or reach the wallet's `__check_auth` while the wallet's operation
+runs; the transaction fails and no state changes.
 
 ## Debits, re-entry and panics
 
 Two rules from [Allowit core](https://github.com/allowit-hq/allowit-core#operations) hold on every
 rail: a custom call never moves wallet funds, and a policy never re-enters the wallet. Stellar
-admits no custom call. Each delegated transfer, deposit, swap and redeem authorizes exactly one
-debit, and the canonical rules check it: transfer and deposit one `transfer` of the asset; swap one
-`transfer` of the first path token from the wallet to the first pair for exactly `amount_in`. An
-intercepted redeem authorizes only the call `redeem(shares, wallet, wallet, wallet)`; the vault's
-own code decides the burn and the payout, and only `execute` checks the share debit, the underlying
-asset and `min_assets`.
+admits no custom call. Each delegated transfer, deposit, swap and redeem runs through `execute`
+and authorizes exactly one debit, which the canonical rules check: transfer and deposit one
+`transfer` of the asset; swap one `transfer` of the first path token from the wallet to the first
+pair for exactly `amount_in`; redeem the vault's own burn of `shares`, which needs no token
+authorization.
 
 On Stellar the wallet's authorization enforces both rules:
 
-- An agent deposit grants exactly one nested authorization: the asset `transfer` of the checked
-  amount from the wallet to the vault. An agent swap grants exactly the signed `transfer`
-  sub-invocation. An agent redeem grants only the `redeem` call, and the burn needs no token
-  authorization.
-- An intercepted transfer, swap or redeem runs the policy in the wallet's `__check_auth`, which the
-  host calls while the token, router or vault, not the wallet, is on the call stack. This is not
-  re-entry. That `__check_auth` makes no contract call into the router or vault (the host refuses
-  re-entry into a contract on the stack); it reads only signed arguments, host functions and its own
-  storage. A `__check_auth` that a callee triggers during the wallet's own `execute` is refused.
-- A nested `__check_auth` of the wallet during its own operation calls a contract that is already
-  on the call stack. The Soroban host refuses that re-entry from a callee, and the transaction
-  fails. The host does allow an immediate re-entry: the wallet's own frame calls `require_auth` on
-  the wallet's address, and the host runs its `__check_auth`. The rule holds because the wallet
-  never does that; it calls `require_auth` only on the owner, agent and server.
-- No agent operation approves a spender, so the policy leaves no standing allowance. Each debit is
-  one exact `transfer` authorization. Tests check that no transfer, x402 transfer, deposit, swap or
-  redeem leaves an allowance, also for a vault that tries to approve itself.
+- `execute` authorizes its debit with `authorize_as_current_contract`: exactly one nested
+  `transfer` for a transfer, deposit or swap, and none for a redeem.
+- The wallet's `__check_auth` admits only one context: this wallet's own `execute`. Any other
+  call that names the wallet's address, such as a plain token transfer or router call, fails
+  authorization. The wallet calls `require_auth` on its own address once, at the start of
+  `execute`, and the host runs `__check_auth` there. A nested `__check_auth` during the operation
+  calls a contract that is already on the call stack, which the host refuses.
+- No agent operation approves a spender, so the policy leaves no standing allowance. Tests check
+  that no transfer, deposit, swap or redeem leaves an allowance, also for a vault that tries to
+  approve itself.
 - The owner-signed `invoke(contract, function, args, auth)` passthrough is outside the policy. It
   authorizes the scopes that the owner signs and can call any contract, `token.approve` included.
   An allowance that it leaves is the owner's choice.
@@ -502,59 +480,42 @@ process keeps running.
 
 ## Source and configuration binding
 
-Fixed standard `source_digest` is SHA-256 of the canonical XDR vector of the domain
-`allowit_std_prefix`, the implementation kind, the actual module hash, the immutable SAC and the
-ordered `Vec<AllowitRule>`. Each unit variant encodes as a one-symbol vector of its rule name; the
-param it reads is always its canonical key. It excludes param values and full source. The module
-hash fixes the operations that the code runs. The constructor and binding getter check the digest
-against the actual runtime module.
+The wallet stores `source_hash`, the SHA-256 of the owner's whole policy source, for every tier.
+The owner signs the configuration that names it, then the deployment that names the code hash; the
+owner's client derives and builds the code and compares the hash. A Common wallet also stores the
+ordered `Vec<AllowitRule>` of the source's standard prefix. Each unit variant encodes as a
+one-symbol vector of its rule name; the param it reads is always its canonical key. The code hash
+fixes the operations that the wallet runs.
 
-Custom `source_digest` is the plain SHA-256 of the exact bytes of `contracts/allowit-custom-policy/policy/policy.rs`.
-`build.rs` computes `SOURCE_HASH` from the file that the contract compiles verbatim, so they
-cannot drift. `AllowitCustom::OPERATIONS` lists transfer, swap and redeem; Custom runs no deposit.
-The compiled policy's `operations` rule selects among them. The contract does not depend on
-SDK-generated code. `scripts/check-policy-bindings.py` checks that the contract compiles and hashes
-its source verbatim.
+A Custom wallet compiles `contracts/allowit-custom-policy/policy/policy.rs` verbatim, and its
+`build.rs` hashes that file into `SOURCE_HASH`: construction and `deploy_policy` refuse another
+`source_hash`. `AllowitCustom::OPERATIONS` lists transfer, swap, deposit and redeem, and the
+compiled policy's `operations` rule selects among them. `scripts/check-policy-bindings.py` checks
+that the contract compiles and hashes its source verbatim. [The kernel interface for Custom
+sources](custom-policy-kernel.md) gives the details.
 
-Every digest is computed from its definition, never typed in as a constant: `build.rs` hashes the
-policy source at build time, the wallet hashes the prefix tuple when the owner configures it and on
-every binding check, and the host reports the module hash. Tests recompute each digest from the
-same definition.
-
-The complete source has separate offline owner authorization, scoped to wallet, network, policy,
-prefix and monotonic source revision. Changing only that offchain suffix needs no chain call.
-Each execution separately carries `source_hash`, covered by agent/server authorization and the x402
-digest. Offline updates do not replace already signed operation bytes or their recovery identity.
-
-`deploy_policy` changes owner configuration at exactly the next `deployment_version`.
-With `wasm_hash=None`, params change without code redeployment. Prefix, policy state, custody,
-execution nonce and pause remain intact when only params change. The new revision rejects old
-inflight packets. A changed prefix or executable requires a new owner binding.
+`deploy_policy` changes the owner configuration at exactly the next `deployment_version`. With
+`wasm_hash=None`, params change without code redeployment. The kept figures, pause and asset
+remain; `t` follows the totals that the new configuration keeps. The new version refuses earlier
+signed requests. A changed prefix or executable needs a new owner signature.
 
 Owner packets bind their exact meaning. Struct decoding ignores extra keys and reads absent
 `Option` keys as `None`, so the constructor and `deploy_policy` require owner authorization for
 the canonical re-encoding of the decoded packet. A params map decodes as sent, so an absent key is
-unset. A packet with legacy, extra or absent keys fails
-authorization unless the owner signed that canonical form.
+unset. A Standard wallet stores only the params of its rules; the server holds the rest of the
+owner's params, and the source runs over all of them.
 
-`contract_version` 4 stores `params` and the free-form `policy_state` as key => `AllowitValue`
-maps, and `Vec<AllowitRule>`. Version 3 stored the canonical params as a typed struct and policy
-state of raw values, version 2 a typed accounting history struct, and version 1 a text-keyed params
-map and symbol rules. Execution, `state()`, `policy_state()` and `set_pause` accept only the exact
-canonical encoding of version 4. Owner `recover` and `invoke`
-decode a typed struct of only the fields they keep, so an in-place upgrade from an earlier layout
-never locks recovery. `deploy_policy` carries `policy_state` over; an earlier layout stores none or stores
-other values, so `deploy_policy` rejects it with `InvalidState`. No layout migrates implicitly: recover funds from an
-earlier layout and deploy a new wallet. A complete typed `deploy_policy` packet replaces params,
-rules and roles, keeps policy state, nonce, pause and asset, and writes version 4. Later versions
-reject even owner calls, because their kept fields may change meaning. New source hashes need new
-owner bindings.
+Custody layout 5 packs the configuration into the instance value `c`: a fixed header (layout,
+flags, deployment version, owner, the agent's and the server's raw Ed25519 keys, asset and source
+hash), then the gas cap, the rules and the params. `t` is 12 bytes; `d` holds its end ledger and
+the kept daily figures. Execution, `state()` and `set_pause` read only layout 5. `recover` and
+`stop` read only the header, which later layouts keep, so a code change never locks recovery. No
+layout migrates implicitly: recover funds from an earlier layout and deploy a new wallet.
 
-Earlier code reads State only in its own layout, so a `deploy_policy` code change from version 4
-to an earlier release permanently locks custody. Each
-wallet Wasm declares `allowit_custody_layout` metadata equal to `CONTRACT_VERSION`.
-`allowit-stellar-admin` refuses a code change to Wasm that declares another layout or none. Recover
-funds before any change across layouts. Every later layout bump needs the same rule.
+Earlier code reads the configuration only in its own layout, so a `deploy_policy` code change to
+an earlier release locks custody. Each wallet Wasm declares `allowit_custody_layout` metadata equal
+to `CONTRACT_VERSION`. `allowit-stellar-admin` refuses a code change to Wasm that declares another
+layout or none. Recover funds before any change across layouts.
 
 ## Shared engine
 
@@ -580,41 +541,31 @@ callers first.
 
 ## Typed operations
 
-`execute` and the intercepted door take one `AllowitExecutionRequest`. Its `operation` is an
-`AllowitStellarOperation`, whose variants carry named arguments:
+`execute` takes one `AllowitExecutionRequest`, a positional tuple: operation id, deployment
+version, expiry, operation, expense, gas, gas payee and args. Its `operation` is an
+`AllowitStellarOperation`, whose variants carry positional arguments:
 
 | Variant | Arguments | Native call |
 | --- | --- | --- |
-| `Transfer` | `token`, `to`, `amount` | SEP-41 `token.transfer(wallet, to, amount)` |
-| `Swap` | `router`, `amount_in`, `amount_out_min`, `path`, `deadline` | `router.swap_exact_tokens_for_tokens(amount_in, amount_out_min, path, wallet, deadline)` |
-| `Deposit` | `vault`, `assets`, `min_shares` | SEP-56 `vault.deposit(assets, wallet, wallet, wallet)` |
-| `Redeem` | `vault`, `shares`, `min_assets` | SEP-56 `vault.redeem(shares, wallet, wallet, wallet)` |
+| `Transfer` | token, to, amount | SEP-41 `token.transfer(wallet, to, amount)` |
+| `Swap` | router, amount in, minimum out, path, deadline | `router.swap_exact_tokens_for_tokens(amount_in, amount_out_min, path, wallet, deadline)` |
+| `Deposit` | vault, assets, minimum shares | SEP-56 `vault.deposit(assets, wallet, wallet, wallet)` |
+| `Redeem` | vault, shares, minimum assets | SEP-56 `vault.redeem(shares, wallet, wallet, wallet)` |
 
 The wallet is the source, owner, receiver and operator of every native call, so no argument names
 it. Soroban decodes the request as typed values: a wrong type, a missing argument or an unknown
-variant fails before the wallet runs. Struct decoding ignores an extra key, so agent and server
-sign the canonical encoding of the decoded request: through `require_auth_for_args` on `execute`
-and in `__check_auth`. A request with an extra key, such as a foreign `from`, fails authorization
-unless they signed its canonical form.
+variant fails before the wallet runs.
 
 `to_core()` maps each variant onto the general `AllowitOperation` that rules read: `transfer`,
 `swap`, `deposit` or `redeem`. The rail-neutral policy core never sees a SEP or router name. Each
-tier lists the operations it runs in `AllowitPolicy::OPERATIONS`, and `policy_binding().operations`
-reports them; a request for another operation is `UnsupportedOperation`. Simple and Common run all
-four; Custom runs transfer, swap and redeem.
+tier lists the operations it runs in `AllowitPolicy::OPERATIONS`; a request for another operation
+is `UnsupportedOperation`. Every tier runs all four.
 
-The request also carries `module_digest`, the wallet's Wasm SHA-256, so agent and server approve
-one exact executable, and `expense`, which is `Unpriced` or `Priced(AllowitExpenseBounds)`. In
-Stellar CLI JSON a transfer request is:
-
-```json
-{
-  "policy_instance": "0101…01", "source_hash": "0909…09", "operation_id": "0000…01",
-  "nonce": 0, "deployment_version": 0, "expires_at": 1767225600, "module_digest": "<wallet Wasm SHA-256>",
-  "operation": {"Transfer": {"token": "<asset SAC>", "to": "<recipient>", "amount": "100"}},
-  "expense": "Unpriced", "args": {}
-}
-```
+The agent and the server sign the payload of the wallet's own authorization entry, which covers
+the `execute` invocation with the whole request, the host nonce and the signature's expiration
+ledger. The entry's signature is `AllowitCosignatures(agent, server)`, two raw Ed25519 signatures,
+and `__check_auth` verifies them against the keys that the wallet stores. Neither the agent nor the
+server needs an account: the server's sending account is the transaction source and pays the fee.
 
 ## Expenses and native effects
 
@@ -623,66 +574,44 @@ Its conversion cost plus attributable gas counts toward spent limits. Daily tota
 plus separate gas; embedded conversion fees are not counted twice. Underlying units use seven
 decimals. Share units retain their independent native scale.
 
-`AllowitExecutionRequest.expense` is `Unpriced` or `Priced(AllowitExpenseBounds)`. The bounds hold
-gas units, conversion units, spent units, attributable fee ceiling, observation ledger and UTC day
-as typed fields, all in units of the wallet's installed asset. The server approves exact conservative economic ceilings. The kernel checks day,
-ledger, operation class, nonnegative units and the fee/gas identity. It cannot observe final
-transaction gas. XLM/stroop identity conversion is intrinsic; other gas conversions need an
-admitted trusted source. Onchain counters retain ceilings. The server separately settles actual
-expenses and temporary loss. No automatic onchain refund authority follows from that accounting.
+`AllowitExecutionRequest.expense` is `Unpriced` or `Priced(gas units, conversion units, spent
+units, observed ledger)`, all in units of the wallet's installed asset. The server approves exact
+conservative economic ceilings. The kernel checks the ledger, the operation class, nonnegative
+units and the spent identity. It cannot observe final transaction gas. XLM/stroop identity
+conversion is intrinsic; other gas conversions need an admitted trusted source.
 
-The attributable fee ceiling of a request is the fee that its transaction can be charged, not the
-installed fee bound. The rail simulates the exact invocation and signs the simulated resource fee
-plus the inclusion fee plus a 1% margin, and the transaction declares no higher fee. The gas that
-the counters retain is therefore never below the fee charged, and exceeds it by the fee refund
-and the margin. The [rail guide](../crates/allowit-stellar/README.md) gives the steps.
+The request names the gas that the wallet repays in XLM and its payee, the server's sending
+account. The repayment is at most the owner-signed gas cap; a wallet without XLM repays zero. For
+an XLM wallet the gas units equal the repaid stroops and count against the limits. The rail signs
+the fee bound of the simulated resource fee plus the inclusion fee plus a 1% margin as the gas; the
+sending account declares that bound as the fee while the final simulation fits it. A repayment
+above the fee charged is carried to the wallet's next request. The [rail
+guide](../crates/allowit-stellar/README.md) gives the steps.
 
-`execute` and the owner-enabled intercepted door require agent and server authority. The kernel
-checks the operation that the tier runs, policy identity, source and module, immutable asset,
-amounts, positive debit, pause, expiry, configuration version, execution nonce, single-use
-operation ID and the execution params' bounds independently of business checks.
-The intercepted door validates the same typed operation as `execute` and admits a transfer, swap
-or redeem, each only with its exact signed tree.
-State, effects and receipts commit atomically. Denials and native failures roll them back.
+`execute` checks the operation that the tier runs, the immutable asset, amounts, positive debit,
+pause, expiry, configuration version, the gas against the gas cap and the execution args' bounds
+independently of business checks. Figures and effects commit atomically; denials and native
+failures roll them back. Each `execute` emits one event, `allowit` with the operation id as its
+topic and the operation's output as its data: a transfer's amount, a swap's observed output, a
+deposit's minted shares or a redeem's paid assets. The wallet stores no receipt; the settled
+transaction and its event are the record.
 
 SEP-56 deposits name vault, assets and minimum shares; the wallet is source, operator and share
-receiver.
-Ordinary `destinations` controls destination vaults; no separate vault list or code-hash pin applies.
-The vault must report the immutable underlying SAC. Custody authorizes one exact deeper
-`transfer(wallet, vault, assets)`. Extra debits, including a second debit later refunded, lack authority.
-Returned shares must match the observed balance credit and meet the minimum. Any conversion-loss
-ceiling also checks `preview_redeem(actual_shares)`. Foreign reads precede final balances.
-The immutable SAC balance read is last. A vault getter cannot mutate already-checked effects.
-
-`AllowitTransferReceipt` retains the underlying leg. `deposit_receipt(operation_id)` and `sep56_deposit`
-record the observed share output. Vault code can misreport ownership, valuation or redeemability.
-The wrapper bounds SAC spending and interface observations; it cannot prove investment value.
-Owner `invoke` can redeem shares independently, and the agent can redeem them under the policy.
+receiver. Ordinary `destinations` controls destination vaults; no separate vault list or code-hash
+pin applies. The vault must report the immutable underlying SAC. Custody authorizes one exact
+deeper `transfer(wallet, vault, assets)`. Extra debits, including a second debit later refunded,
+lack authority. Returned shares must match the observed balance credit and meet the minimum. Any
+conversion-loss ceiling also checks `preview_redeem(actual_shares)`. Foreign reads precede final
+balances. The immutable SAC balance read is last. A vault getter cannot mutate already-checked
+effects. Vault code can misreport ownership, valuation or redeemability; the wallet bounds SAC
+spending and interface observations, and cannot prove investment value. Owner `invoke` can redeem
+shares independently, and the agent can redeem them under the policy.
 
 ## Swaps and redeems
 
 A swap trades the asset for another token, or back, through an exact-input router such as
-Soroswap. A redeem burns SEP-56 vault shares for the asset. Both have two doors, and both doors run
-the same `validate_operation` and `admit`: the same invariants, rules, `post_flight` and state
-writes.
-
-- **Intercepted.** The agent sends the plain call that a simple wallet would sign, and the wallet
-  intercepts it in `__check_auth`:
-  `router.swap_exact_tokens_for_tokens(amount_in, amount_out_min, path, wallet, deadline)` or
-  `vault.redeem(shares, wallet, wallet, wallet)`. The custom-account signature is an
-  `AllowitPolicyAuthorization`, as for an x402 transfer. `x402_enabled` enables this door.
-- **`execute`.** The agent and server authorize `execute` with the same request. The wallet calls
-  the router or vault itself, observes the effects and stores a receipt, which
-  `swap_receipt(operation_id)` and `redeem_receipt(operation_id)` return with the `swap` and
-  `sep56_redeem` events. Only this door can check a redeem's output.
-
-| | Intercepted | `execute` |
-| --- | --- | --- |
-| Agent transaction | The plain router or vault call | `wallet.execute(request)` |
-| Swap minimum output | The router enforces the signed `amount_out_min` | The router check, and the wallet checks the credit |
-| Redeem minimum output | None: SEP-56 `redeem` has no argument for it, and `__check_auth` cannot call the vault | The wallet checks the credit against `min_assets` |
-| Output receipt | None; the router, token and vault events | Stored receipt and event |
-| Debit authority | Exactly the signed tree | One exact `transfer`, by `authorize_as_current_contract` |
+Soroswap. A redeem burns SEP-56 vault shares for the asset. Both run through `execute`: the wallet
+calls the router or vault itself, observes the effects and emits the event with the output.
 
 ### Arguments and invariants
 
@@ -701,50 +630,6 @@ asset leaves through transfers, deposits and forward swaps. A swap's other endpo
 Stellar Asset Contract, which keeps the `execute` balance reads trusted. Common and Custom can
 restrict it with `tokens`; Simple relies on the server.
 
-### The intercepted authorization tree
-
-`__check_auth` receives every node of the signed tree in host preorder and accepts only these exact
-shapes, compared with the decoded request:
-
-- Transfer: `[asset.transfer(wallet, to, amount)]`.
-- Swap: `[router.swap_exact_tokens_for_tokens(amount_in, amount_out_min, path, wallet, deadline),
-  path[0].transfer(wallet, pair, amount_in)]`. The pair is a contract other than the wallet and the
-  router. The kernel does not recompute it: the router pays its own pair, so another pair fails the
-  host's authorization matching.
-- Redeem: `[vault.redeem(shares, wallet, wallet, wallet)]`.
-
-Any other node count is `InvalidInvocation`, another call `UnsupportedOperation`, and other
-arguments `InvalidInvocation`. A deposit has no intercepted form.
-
-The host calls `__check_auth` once per authorization entry, at the first `require_auth` that matches
-it: the router's `to.require_auth()` or the vault's `operator.require_auth()`. The later debit in
-the same tree matches its node without another call. The intercepted door does not support a vault
-that calls `require_auth` for the wallet twice in one call. With one signed entry, the second
-`require_auth` finds no unmatched entry and the transaction fails. The host then tries the next
-entry for the wallet, so a client can supply a second entry with the same `redeem` root and its own
-signed execution (the next nonce and a new `operation_id`). `__check_auth` admits each signed entry
-as a separate operation: it consumes its own nonce and the policy charges it separately, so the one
-real redeem counts twice. Recording-mode simulation of such a vault returns both entries; the
-server co-signs at most one wallet entry per intercepted transaction. Such a vault must use the
-`execute` door, where the wallet is the vault's direct invoker and authorizes the call once.
-
-```
-agent tx: router.swap_exact_tokens_for_tokens(in, min, [asset, X], wallet, deadline)
-  router: wallet.require_auth()  ->  wallet.__check_auth(payload, signature, [swap, transfer])
-            validate_operation -> match_contexts -> agent and server signatures -> admit
-            (binding, replay, pause, nonce, version, expiry, expense, policy, post_flight)
-            store state, nonce + 1 and the replay marker
-  router: amounts.last() >= min, else the whole transaction rolls back
-  router: asset.transfer(wallet, pair, in)  (matches the signed sub-node)
-  pair:   X.transfer(pair, wallet, out)
-```
-
-The client simulates the call in recording mode to get the wallet's entry, signs the host payload
-and the request, and simulates again with the signed entry in enforcing mode. Recording mode does
-not run `__check_auth`, so only the second simulation finds the wallet's own storage footprint.
-Replay protection has four layers: the host authorization nonce, the strict execution nonce, the
-persistent `operation_id` marker, and `expires_at` with `deployment_version`.
-
 ### Request facts and accounting
 
 | Op | `recipient` | `amount` (asset units) | `token_in` / `amount_in` | `token_out` / `min_out` |
@@ -761,7 +646,7 @@ their limits on reverse swaps and redeems are floors. Swaps and redeems follow t
 model: `conversion_units` is the loss ceiling, and `spent_units` equals it plus `gas_units`. A
 forward swap's loss cannot exceed `amount_in`. An `execute` redeem checks its loss against the
 vault's `preview_redeem`. The wallet cannot price a swap's other token, so agent and server attest
-a swap's `conversion_units`, and on the intercepted door also a redeem's. Custom policy can add its own params, such as a
+a swap's `conversion_units`. Custom policy can add its own params, such as a
 `swap_limit`, in a `match` arm of `operations`.
 
 ### Observed effects in `execute`
@@ -779,27 +664,26 @@ requires `preview - min(preview, assets) <= conversion_units`. The final read is
 
 ### Limits
 
-- An intercepted redeem has no onchain output floor. The vault allowlist, the server's
-  `preview_redeem` check before it signs and short expiries bound it; use `execute` when a redeem
-  needs a floor.
-- An intercepted redeem does not check the vault's underlying asset or the burned share amount.
-- The intercepted door stores no output receipt. The server reconciles from the router `swap`,
-  token `transfer` and vault `withdraw` events.
 - An allowlisted router that misbehaves can lose up to `amount_in`, never more.
-- Another contract can wrap the agent's entry and move the pool or vault price earlier in the same
-  transaction. `amount_out_min` bounds a swap's loss and `min_assets` an `execute` redeem's; an
-  intercepted redeem's loss has no onchain bound.
-- The strict execution nonce orders every operation across both doors.
+- Another contract can move the pool or vault price earlier in the same transaction.
+  `amount_out_min` bounds a swap's loss and `min_assets` a redeem's.
 - Testnet resets change router and token addresses: update `destinations` and `tokens` with
   `deploy_policy`.
 
 ## Owner authority and public metadata
 
-Owner pause, configuration, recovery, upgrades and exact `invoke` bypass agent/server business checks
-and never call an engine. Owner authorization binds exact target, arguments and supplied subtrees.
-`policy_binding()` reports the executable, the source binding and the operations that the wallet
-runs. `state()` returns the custody State, and `policy_state()` the current policy
-state map. Unknown stored layouts reject. Upgrades do not migrate state.
+Owner pause, stop, configuration, recovery, upgrades and exact `invoke` bypass agent/server
+business checks and never call an engine. Owner authorization binds exact target, arguments and
+supplied subtrees. `stop` pauses the wallet at the next version and returns its asset and XLM to
+the owner in one call. The owner acts alone: a wallet whose `t` has lapsed restores it in the same
+transaction. `state()` returns the configuration, the kept figure set and the figures. Unknown
+stored layouts reject. Upgrades do not migrate state.
+
+The owner creates and funds a wallet with one signature through the stateless deployer contract:
+`deploy(owner, wasm_hash, salt, constructor_args, funding)` creates the wallet at the owner's
+address and salt and moves each funding amount from the owner to it. The deployer holds no funds
+and no authority; the owner's signature covers exactly the creation and its transfers. The server
+uploads the wallet code and pays only the fees of what it submits.
 
 Classic G-address multisig has no contract prefix enforcement. Owner-selected signer thresholds
 control native transactions. Its policy source and economic checks run offchain before signing.

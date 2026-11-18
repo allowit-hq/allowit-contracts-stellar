@@ -2,12 +2,12 @@
 //! The server prepares the update and the owner client reconstructs it from its own document
 //! and its own RPC, so both sides derive the same `deploy_policy` packet.
 use crate::admin::PolicyDeployment;
-use crate::contract::CustodyState;
 use crate::host::{
     error::{Error, Result},
     owner::{Comparison, Counters, StateReadback, Verification},
     runtime::ParamsUpdate,
 };
+use crate::packed::Configuration;
 use crate::{self as native, PolicyParams, PolicyTier, WalletConfig, WalletRoute, rpc};
 use allowit_core::admin::DeploymentVersion;
 use allowit_core::vendor::kinds::WalletKind;
@@ -91,29 +91,24 @@ pub fn updated_config(c: &WalletConfig, update: &ParamsUpdate) -> Result<WalletC
     checked(native::validate_config(&next))?;
     Ok(next)
 }
-/// The exact owner packet of an update: the installed roles, source binding and x402 choice
-/// with the new params. It installs no code and changes no role.
-pub fn deployment(
-    c: &WalletConfig,
-    update: &ParamsUpdate,
-    x402_enabled: bool,
-) -> Result<PolicyDeployment> {
+/// The exact owner packet of an update: the installed roles, source and gas cap with the new
+/// params. It installs no code and changes no role.
+pub fn deployment(c: &WalletConfig, update: &ParamsUpdate) -> Result<PolicyDeployment> {
     let (deployment, _) = checked(PolicyDeployment::for_source(
         c,
         &c.policy_source,
         next_params(c, update)?,
-        x402_enabled,
     ))?;
     Ok(deployment)
 }
-/// What the ledger holds for the update: the revision it replaces and the x402 choice it keeps.
+/// What the ledger holds for the update: the revision it replaces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Installed {
     pub revision: u64,
-    pub x402_enabled: bool,
 }
 /// Read the installed revision and check that the wallet still holds this installation: its
-/// code, source binding, rules, roles, asset, policy instance and params. The read is the
+/// code, source, rules, roles, asset, gas cap and params. An update writes the installation's
+/// gas cap, so a gas cap that the owner changed on the ledger is not overwritten. The read is the
 /// wallet instance alone, so an update needs no account of the agent or the server.
 /// A wallet at another revision than the expected one is refused.
 pub fn installed(rpc: &dyn rpc::Rpc, c: &WalletConfig, update: &ParamsUpdate) -> Result<Installed> {
@@ -132,20 +127,20 @@ pub fn installed(rpc: &dyn rpc::Rpc, c: &WalletConfig, update: &ParamsUpdate) ->
     }
     let (module, state) = wallet_instance(rpc, &c.wallet)?;
     if module != c.module_digest
-        || state.source_digest != c.source_digest
+        || state.source_hash != c.source_hash
         || state.rules != c.rules
         || state.owner != c.owner
-        || state.agent != c.agent_account()
+        || state.agent != c.agent
         || state.server != c.server
         || state.asset != c.asset
-        || state.policy_instance != c.policy_instance
-        || state.params != c.params
+        || state.gas_cap != i128::from(c.max_fee_stroops)
+        || state.params != native::installed_params(c)
     {
         return Err(Error::config(
-            "The wallet's code, roles or params differ from this installation. Verify the installation first.",
+            "The wallet's code, roles, gas cap or params differ from this installation. Verify the installation first.",
         ));
     }
-    let revision = state.deployment_version;
+    let revision = u64::from(state.deployment_version);
     if update
         .expected_revision
         .is_some_and(|expected| expected != revision)
@@ -154,10 +149,7 @@ pub fn installed(rpc: &dyn rpc::Rpc, c: &WalletConfig, update: &ParamsUpdate) ->
             "The wallet is at configuration revision {revision}, not the expected revision"
         )));
     }
-    Ok(Installed {
-        revision,
-        x402_enabled: state.x402_enabled,
-    })
+    Ok(Installed { revision })
 }
 /// The target revision of an update over `revision`.
 pub fn next_version(revision: u64) -> Result<DeploymentVersion> {
@@ -183,7 +175,7 @@ fn ledger_height(rpc: &dyn rpc::Rpc) -> Result<u64> {
 }
 /// The executable hash and the decoded state of the wallet instance, read without trusting
 /// the document: a difference is a result of verification, not a failure of the read.
-fn wallet_instance(rpc: &dyn rpc::Rpc, wallet: &str) -> Result<([u8; 32], CustodyState)> {
+fn wallet_instance(rpc: &dyn rpc::Rpc, wallet: &str) -> Result<([u8; 32], Configuration)> {
     let contract = checked(native::address(wallet))?;
     let key = LedgerKey::ContractData(LedgerKeyContractData {
         contract: contract.clone(),
@@ -221,12 +213,18 @@ fn wallet_instance(rpc: &dyn rpc::Rpc, wallet: &str) -> Result<([u8; 32], Custod
         ));
     };
     let storage = instance.storage.ok_or_else(missing)?;
-    let raw = storage
+    let key = checked(native::value_symbol("c"))?;
+    let Some(ScVal::Bytes(raw)) = storage
         .iter()
-        .find(|entry| entry.key == ScVal::U32(0))
+        .find(|entry| entry.key == key)
         .map(|entry| &entry.val)
-        .ok_or_else(missing)?;
-    Ok((module.0, checked(CustodyState::from_scval(raw))?))
+    else {
+        return Err(missing());
+    };
+    Ok((
+        module.0,
+        checked(native::packed::configuration(raw.as_slice()))?,
+    ))
 }
 /// Compare the owner's installation document with the ledger and read the wallet state back.
 /// The read uses the owner's RPC only. A difference is reported, not raised.
@@ -280,9 +278,8 @@ pub fn verify(rpc: &dyn rpc::Rpc, policy_id: &str, c: &WalletConfig) -> Result<V
     }
     let (module, state) = wallet_instance(rpc, &c.wallet)?;
     let params = |params: &PolicyParams| serde_json::to_value(params).unwrap_or(json!(null));
-    let bound = module == c.module_digest
-        && state.source_digest == c.source_digest
-        && state.rules == c.rules;
+    let bound =
+        module == c.module_digest && state.source_hash == c.source_hash && state.rules == c.rules;
     let comparisons = vec![
         Comparison::new(
             "executable",
@@ -291,11 +288,15 @@ pub fn verify(rpc: &dyn rpc::Rpc, policy_id: &str, c: &WalletConfig) -> Result<V
         ),
         Comparison::new(
             "source",
-            json!(native::hex(&c.source_digest)),
-            json!(native::hex(&state.source_digest)),
+            json!(native::hex(&c.source_hash)),
+            json!(native::hex(&state.source_hash)),
         ),
         Comparison::new("rules", json!(c.rules), json!(state.rules)),
-        Comparison::new("params", params(&c.params), params(&state.params)),
+        Comparison::new(
+            "params",
+            params(&native::installed_params(c)),
+            params(&state.params),
+        ),
         // The executable, the source binding and the rules select the wallet kind.
         Comparison::new(
             "walletKind",
@@ -303,27 +304,18 @@ pub fn verify(rpc: &dyn rpc::Rpc, policy_id: &str, c: &WalletConfig) -> Result<V
             json!(bound.then_some(kind).flatten()),
         ),
         Comparison::new("owner", json!(c.owner), json!(state.owner)),
-        // The wallet's agent address: the fee account of the installation when it has one.
-        Comparison::new("agent", json!(c.agent_account()), json!(state.agent)),
+        Comparison::new("agent", json!(c.agent), json!(state.agent)),
         Comparison::new("server", json!(c.server), json!(state.server)),
         Comparison::new("asset", json!(c.asset), json!(state.asset)),
         Comparison::new(
-            "policyInstance",
-            json!(native::hex(&c.policy_instance)),
-            json!(native::hex(&state.policy_instance)),
+            "gasCap",
+            json!(c.max_fee_stroops.to_string()),
+            json!(state.gas_cap.to_string()),
         ),
     ];
-    let counter = |key: &str| match state.policy_state.0.get(key) {
-        Some(native::PolicyValue::Int(value)) => Ok(*value),
-        None => Ok(0),
-        _ => Err(Error::config(format!(
-            "The wallet holds an invalid counter `{key}`"
-        ))),
-    };
-    let count = |key: &str| {
-        u64::try_from(counter(key)?)
-            .map_err(|_| Error::config(format!("The wallet holds an invalid counter `{key}`")))
-    };
+    let ledger = u32::try_from(observed_height)
+        .map_err(|_| Error::config("The RPC reported an invalid ledger height"))?;
+    let figures = checked(rpc::figures(rpc, c, ledger))?;
     Ok(Verification::new(
         policy_id.into(),
         c.network.clone(),
@@ -331,17 +323,21 @@ pub fn verify(rpc: &dyn rpc::Rpc, policy_id: &str, c: &WalletConfig) -> Result<V
         StateReadback {
             wallet: c.wallet.clone(),
             wallet_kind: kind,
-            revision: state.deployment_version,
+            revision: u64::from(state.deployment_version),
             paused: state.paused,
-            // Every policy wallet tier commits its usage with each operation, also a Simple
-            // wallet, whose rules the server evaluates: the counters are the ledger's.
+            // A policy wallet keeps only the figures that its on-chain checks read; the server
+            // keeps the account of the rest, as it does for a Native or Simple wallet.
             counters_from: "ledger".into(),
             counters: Some(Counters {
-                spent_total: counter("spent")?,
-                spent_daily: counter("day_spent")?,
-                spent_day: count("day")?,
-                calls: count("calls")?,
-                nonce: state.nonce,
+                spent_total: figures.spent,
+                spent_daily: if figures.day_ends != 0 {
+                    figures.day_spent
+                } else {
+                    0
+                },
+                spent_day: 0,
+                calls: figures.calls,
+                nonce: 0,
             }),
             params: core_params(&state.params)?,
             observed_height,

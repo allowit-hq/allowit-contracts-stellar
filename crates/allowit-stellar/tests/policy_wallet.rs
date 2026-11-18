@@ -1,19 +1,21 @@
 //! End-to-end policy wallet workflows of all three tiers through the public API, against a
-//! model Stellar RPC: upload, create, discover, transfer, deposit, redeem, receipts, pause,
-//! params update and recovery. The run records `fixtures/policy-wallet-vectors.txt`, which
+//! model Stellar RPC: code upload by the server, the owner's one creation and funding through the
+//! deployer, discovery, transfer, deposit, redeem, pause, params update, recovery and the stop.
+//! The run records `fixtures/policy-wallet-vectors.txt`, which
 //! `crates/policy-wallet/src/core_vectors_tests.rs` executes on the Soroban host with the real
-//! wallet Wasm.
+//! wallet and deployer Wasm.
 //!
 //! Regenerate after a contract or encoding change: run `scripts/build-contracts.sh`, then
 //! `ALLOWIT_UPDATE_VECTORS=1 cargo test --test policy_wallet` in `crates/allowit-stellar`.
 use allowit_core::AllowitTier;
 use allowit_core::admin::{Admin, DeploymentVersion};
 use allowit_stellar::admin::*;
-use allowit_stellar::contract::{CustodyState, PolicyBinding};
+use allowit_stellar::packed::{self, CALLS, DAY_SPENT, DAY_TOTAL, SPENT};
 use allowit_stellar::workflow::*;
 use allowit_stellar::*;
+use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use stellar_strkey::Contract;
 use stellar_xdr as x;
@@ -27,14 +29,18 @@ const OWNER: [u8; 32] = [1; 32];
 const AGENT: [u8; 32] = [2; 32];
 const SERVER: [u8; 32] = [3; 32];
 const RECIPIENT: [u8; 32] = [6; 32];
+/// The server's sending account: the source of every agent operation, which pays its fee and
+/// receives the wallet's gas repayment. It also uploads the wallet code.
+const SENDER: [u8; 32] = [10; 32];
+/// The installed fee ceiling and the owner-signed gas cap.
 const MAX_FEE: u32 = 1_000_000;
-/// The resource fee of a recording simulation. It prices the server's authorization nonce at
-/// the longest entry lifetime, so it is above the enforce-mode fee of the signed entry.
+/// The resource fee of a recording simulation.
 const RECORD_FEE: i64 = 1_500;
+/// The resource fee of the sending account's enforcing simulation.
 const ENFORCE_FEE: i64 = 1_000;
-/// The gas that a wallet counts for one operation: `fee_bound(RECORD_FEE)`, the resource fee,
-/// the 100-stroop inclusion fee and the 1% margin.
-const GAS: i128 = 1_615;
+/// The XLM that the owner's creation moves into the wallet.
+const FUNDING: i128 = 500_000_000;
+const DAY_LEDGERS: u32 = 17_280;
 const SOURCE: &str = include_str!("../../../contracts/allowit-custom-policy/policy/policy.rs");
 const VECTORS: &str = "tests/fixtures/policy-wallet-vectors.txt";
 
@@ -43,6 +49,17 @@ fn vault() -> String {
 }
 fn xlm() -> String {
     sac_address(NETWORK, &x::Asset::Native).unwrap()
+}
+fn deployer() -> String {
+    admin::deployer_address(NETWORK).unwrap()
+}
+fn sender() -> String {
+    account_for_seed(&SENDER)
+}
+/// The gas that a wallet repays and counts for one operation: the fee bound of the recording
+/// simulation's resource fee.
+fn gas() -> i128 {
+    i128::from(fee_bound(RECORD_FEE).unwrap())
 }
 fn b64<T: WriteXdr>(v: &T) -> String {
     v.to_xdr_base64(Limits::none()).unwrap()
@@ -53,6 +70,10 @@ fn de<T: ReadXdr>(v: &str) -> T {
 fn hexs(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
+fn items(v: &x::ScVal) -> &[x::ScVal] {
+    let x::ScVal::Vec(Some(v)) = v else { panic!() };
+    v.as_slice()
+}
 fn field<'a>(v: &'a x::ScVal, name: &str) -> &'a x::ScVal {
     let x::ScVal::Map(Some(m)) = v else { panic!() };
     &m.iter()
@@ -60,9 +81,19 @@ fn field<'a>(v: &'a x::ScVal, name: &str) -> &'a x::ScVal {
         .unwrap()
         .val
 }
+fn symbol(v: &x::ScVal) -> String {
+    let x::ScVal::Symbol(s) = v else { panic!() };
+    String::from_utf8(s.0.to_vec()).unwrap()
+}
 fn int(v: &x::ScVal) -> i128 {
     let x::ScVal::I128(p) = v else { panic!() };
     (i128::from(p.hi) << 64) | i128::from(p.lo)
+}
+fn wide(v: i128) -> x::ScVal {
+    x::ScVal::I128(x::Int128Parts {
+        hi: (v >> 64) as i64,
+        lo: v as u64,
+    })
 }
 fn addr(v: &x::ScVal) -> String {
     let x::ScVal::Address(a) = v else { panic!() };
@@ -72,18 +103,202 @@ fn digest(v: &x::ScVal) -> [u8; 32] {
     let x::ScVal::Bytes(b) = v else { panic!() };
     b.as_slice().try_into().unwrap()
 }
+fn bytes(v: &[u8]) -> x::ScVal {
+    x::ScVal::Bytes(x::ScBytes(v.to_vec().try_into().unwrap()))
+}
+fn sc_map(fields: Vec<(&str, x::ScVal)>) -> x::ScVal {
+    let mut entries: Vec<_> = fields
+        .into_iter()
+        .map(|(name, val)| x::ScMapEntry {
+            key: x::ScVal::Symbol(x::ScSymbol(name.as_bytes().to_vec().try_into().unwrap())),
+            val,
+        })
+        .collect();
+    entries.sort_by(|a, b| a.key.cmp(&b.key));
+    x::ScVal::Map(Some(entries.try_into().unwrap()))
+}
+fn leb(mut v: u128, out: &mut Vec<u8>) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
 
-type Step = (String, String, x::ScVal, Option<x::ScVal>);
+/// (name, signed envelope, settlement ledger, host result, wallet state after it)
+type Step = (String, String, u32, x::ScVal, Option<x::ScVal>);
+/// What the wallet stores besides its configuration, as the kernel writes it.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Stored {
+    /// `t`: spent, calls and the unpriced flag.
+    total: Option<(u64, u32, bool)>,
+    /// `d`: end ledger, kept daily set, unpriced flag, day spent and day total.
+    daily: Option<(u32, u8, bool, i128, i128)>,
+}
 /// The wallet a model chain holds.
 struct Wallet {
     address: String,
     tier: PolicyTier,
-    module: [u8; 32],
-    state: CustodyState,
+    config: packed::Configuration,
+    stored: Stored,
+    /// The server's account of every execution, from its receipts: every standard figure, as
+    /// Core's post-flight computes it.
+    served: packed::Figures,
+    /// XLM: the asset, and the gas the wallet repays.
     balance: i128,
     shares: i128,
-    /// Stored receipts by ledger key variant (`Operation`, `Deposit` or `Redeem`) and operation.
-    receipts: BTreeMap<(String, [u8; 32]), x::ScVal>,
+}
+/// The figures that the wallet's checks read: the standard rules with their params set, or the
+/// figures the Custom build finds in its source.
+fn kept(tier: PolicyTier, c: &packed::Configuration) -> u8 {
+    if tier == PolicyTier::Custom {
+        custom_figures(SOURCE)
+    } else {
+        packed::standard_kept(&c.rules, &c.params)
+    }
+}
+/// The Custom build's scan of the source (`contracts/allowit-custom-policy/build.rs`): the
+/// figures of each limit rule it names, or all of them when it reads the whole state.
+fn custom_figures(source: &str) -> u8 {
+    let words: BTreeSet<&str> = source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .flat_map(|line| line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')))
+        .filter(|word| !word.is_empty())
+        .collect();
+    if words.iter().any(|word| {
+        word.contains("state")
+            || [
+                "preflight",
+                "RULES",
+                "AllowitRule",
+                "AllowitStandardState",
+                "evaluate",
+            ]
+            .contains(word)
+    }) {
+        return SPENT | CALLS | DAY_SPENT | DAY_TOTAL;
+    }
+    [
+        ("lifetime_spending_limit", SPENT),
+        ("call_limit", CALLS),
+        ("daily_spending_limit", DAY_SPENT),
+        ("daily_volume_limit", DAY_TOTAL),
+    ]
+    .iter()
+    .filter(|(word, _)| words.contains(word))
+    .fold(0, |kept, (_, figure)| kept | figure)
+}
+impl Wallet {
+    fn kept(&self) -> u8 {
+        kept(self.tier, &self.config)
+    }
+    /// The figures that `kept` reads at `ledger`, as the kernel's `read_figures` reads them.
+    fn figures(&self, kept: u8, ledger: u32) -> packed::Figures {
+        let mut f = packed::Figures::default();
+        if kept & (SPENT | CALLS) != 0
+            && let Some((spent, calls, unpriced)) = self.stored.total
+        {
+            if kept & SPENT != 0 {
+                f.spent = i128::from(spent);
+                f.unpriced = unpriced;
+            }
+            if kept & CALLS != 0 {
+                f.calls = u64::from(calls);
+            }
+        }
+        if kept & (DAY_SPENT | DAY_TOTAL) != 0
+            && let Some((end, mask, unpriced, day_spent, day_total)) = self.stored.daily
+            && ledger <= end
+        {
+            f.day_ends = end;
+            f.day_unpriced = unpriced;
+            if mask & DAY_SPENT != 0 {
+                f.day_spent = day_spent;
+            }
+            if mask & DAY_TOTAL != 0 {
+                f.day_total = day_total;
+            }
+        }
+        f
+    }
+    fn write_total(&mut self, kept: u8, f: &packed::Figures) {
+        let spent = kept & SPENT != 0;
+        self.stored.total = Some((
+            if spent { f.spent as u64 } else { 0 },
+            if kept & CALLS != 0 { f.calls as u32 } else { 0 },
+            spent && f.unpriced,
+        ));
+    }
+    fn t_bytes(&self) -> Option<Vec<u8>> {
+        let (spent, calls, unpriced) = self.stored.total?;
+        let mut out = spent.to_be_bytes().to_vec();
+        out.extend((calls | if unpriced { 1 << 31 } else { 0 }).to_be_bytes());
+        Some(out)
+    }
+    fn d_bytes(&self) -> Option<Vec<u8>> {
+        let (end, mask, unpriced, day_spent, day_total) = self.stored.daily?;
+        let mut out = end.to_be_bytes().to_vec();
+        out.push(mask);
+        out.push(u8::from(unpriced));
+        if mask & DAY_SPENT != 0 {
+            leb(day_spent as u128, &mut out);
+        }
+        if mask & DAY_TOTAL != 0 {
+            leb(day_total as u128, &mut out);
+        }
+        Some(out)
+    }
+    /// The wallet's `state` view at `ledger`.
+    fn view(&self, ledger: u32) -> x::ScVal {
+        let c = &self.config;
+        let kept = self.kept();
+        let f = self.figures(kept, ledger);
+        sc_map(vec![
+            ("contract_version", x::ScVal::U32(u32::from(packed::LAYOUT))),
+            ("owner", x::ScVal::Address(address(&c.owner).unwrap())),
+            ("agent", bytes(&account_key(&c.agent).unwrap())),
+            ("server", bytes(&account_key(&c.server).unwrap())),
+            ("asset", x::ScVal::Address(address(&c.asset).unwrap())),
+            ("deployment_version", x::ScVal::U32(c.deployment_version)),
+            ("paused", x::ScVal::Bool(c.paused)),
+            ("source_hash", bytes(&c.source_hash)),
+            ("gas_cap", wide(c.gas_cap)),
+            ("kept", x::ScVal::U32(u32::from(kept))),
+            ("rules", policy::rules_scval(&c.rules).unwrap()),
+            ("params", c.params.scval().unwrap()),
+            (
+                "figures",
+                sc_map(vec![
+                    ("calls", x::ScVal::U64(f.calls)),
+                    ("spent", wide(f.spent)),
+                    ("unpriced", x::ScVal::Bool(f.unpriced)),
+                    ("day_spent", wide(f.day_spent)),
+                    ("day_total", wide(f.day_total)),
+                    ("day_unpriced", x::ScVal::Bool(f.day_unpriced)),
+                    ("day_ends", x::ScVal::U32(f.day_ends)),
+                ]),
+            ),
+        ])
+    }
+}
+/// A Standard wallet keeps only the params of its rules.
+fn installed_params(tier: PolicyTier, rules: &[String], params: &PolicyParams) -> PolicyParams {
+    if tier == PolicyTier::Custom {
+        return params.clone();
+    }
+    PolicyParams(
+        params
+            .0
+            .iter()
+            .filter(|(key, _)| rules.contains(key))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
 }
 #[derive(Default)]
 struct Model {
@@ -91,18 +306,24 @@ struct Model {
     now: u64,
     accounts: BTreeMap<String, AccountState>,
     code: BTreeMap<[u8; 32], PolicyTier>,
+    /// The uploaded code by its hash.
+    code_bytes: BTreeMap<[u8; 32], Vec<u8>>,
     tiers: BTreeMap<[u8; 32], PolicyTier>,
     wallet: Option<Wallet>,
     settled: BTreeMap<String, String>,
-    /// (name, signed envelope, expected host result, wallet State after it) of each settled
-    /// transaction.
     steps: Vec<Step>,
     pending_name: String,
-    /// The resource fee of the next enforce-mode simulations.
+    /// The resource fee of the next enforcing simulations.
     enforce_fee: i64,
+    /// The wallet's consumed authorization nonces.
+    nonces: BTreeSet<i64>,
+    /// The wallet's `allowit` events: ledger, operation id and transaction hash.
+    events: Vec<(u32, x::ScVal, String)>,
 }
-/// A model of Stellar RPC and the layout 4 wallet. It records authorization like Stellar RPC,
-/// applies settled effects and computes post-flight state with the `allowit` host backend.
+/// A model of Stellar RPC, the deployer and the layout 5 wallet. It records authorization like
+/// Stellar RPC, verifies the agent's and the server's signatures where the wallet's
+/// `__check_auth` runs, applies settled effects and computes the kept figures with Core's
+/// post-flight, as the kernel does.
 struct ModelChain(Mutex<Model>);
 impl ModelChain {
     fn new(tiers: BTreeMap<[u8; 32], PolicyTier>) -> Self {
@@ -113,7 +334,7 @@ impl ModelChain {
             enforce_fee: ENFORCE_FEE,
             ..Default::default()
         };
-        for seed in [OWNER, AGENT, SERVER, RECIPIENT, [51; 32]] {
+        for seed in [OWNER, AGENT, SERVER, RECIPIENT, SENDER, [51; 32]] {
             let address = account_for_seed(&seed);
             model.accounts.insert(
                 address.clone(),
@@ -133,47 +354,47 @@ impl ModelChain {
     fn step(&self, name: &str) {
         self.0.lock().unwrap().pending_name = name.into();
     }
-    fn fund(&self, amount: i128) {
-        self.0.lock().unwrap().wallet.as_mut().unwrap().balance += amount;
+    fn ledger(&self) -> u32 {
+        self.0.lock().unwrap().ledger
     }
-    fn state(&self) -> CustodyState {
+    /// The server's accounting of the wallet: the figures of every execution, which a Simple
+    /// or Common wallet does not keep.
+    fn accounting(&self) -> rpc::NativeAccounting {
+        let m = self.0.lock().unwrap();
+        let f = m
+            .wallet
+            .as_ref()
+            .map(|w| w.served.clone())
+            .unwrap_or_default();
+        rpc::NativeAccounting {
+            spent_daily: f.day_spent,
+            spent_total: f.spent,
+            spent_day: NOW / 86_400,
+            volume_daily: f.day_total,
+            unpriced_total: f.unpriced,
+            unpriced_daily: f.day_unpriced,
+            calls: f.calls,
+            ..Default::default()
+        }
+    }
+    fn figures(&self) -> packed::Figures {
+        let m = self.0.lock().unwrap();
+        let w = m.wallet.as_ref().unwrap();
+        w.figures(w.kept(), m.ledger)
+    }
+    fn config(&self) -> packed::Configuration {
         self.0
             .lock()
             .unwrap()
             .wallet
             .as_ref()
             .unwrap()
-            .state
+            .config
             .clone()
     }
-}
-/// The binding of `w`: Simple and Common run every operation, Custom no deposit.
-fn binding(w: &Wallet) -> x::ScVal {
-    use OperationKind::*;
-    PolicyBinding {
-        engine_kind: w.tier.kind().into(),
-        contract_version: CONTRACT_VERSION,
-        policy_instance: w.state.policy_instance,
-        module_digest: w.module,
-        source_digest: w.state.source_digest,
-        operations: if w.tier == PolicyTier::Custom {
-            vec![Transfer, Swap, Redeem]
-        } else {
-            vec![Transfer, Swap, Deposit, Redeem]
-        },
+    fn balance(&self) -> i128 {
+        self.0.lock().unwrap().wallet.as_ref().unwrap().balance
     }
-    .scval()
-    .unwrap()
-}
-/// The variant name and arguments of the request's `AllowitStellarOperation`.
-fn operation(request: &x::ScVal) -> (String, &x::ScVal) {
-    let x::ScVal::Vec(Some(v)) = field(request, "operation") else {
-        panic!()
-    };
-    let [x::ScVal::Symbol(name), args] = v.as_slice() else {
-        panic!()
-    };
-    (String::from_utf8(name.0.to_vec()).unwrap(), args)
 }
 fn account_entry(a: &AccountState) -> x::LedgerEntryData {
     x::LedgerEntryData::Account(x::AccountEntry {
@@ -208,6 +429,110 @@ fn host_op(tx: &x::Transaction) -> &x::InvokeHostFunctionOp {
     };
     op
 }
+fn tx_hash(tx: &x::Transaction) -> [u8; 32] {
+    hash(
+        x::TransactionSignaturePayload {
+            network_id: x::Hash(network_id(NETWORK).unwrap()),
+            tagged_transaction: x::TransactionSignaturePayloadTaggedTransaction::Tx(tx.clone()),
+        }
+        .to_xdr(Limits::none())
+        .unwrap(),
+    )
+}
+/// The owner's authorization tree of `deployer.deploy`: the creation with its constructor, then
+/// one transfer per funding item.
+fn deploy_tree(call: &x::InvokeContractArgs) -> (String, Vec<x::SorobanAuthorizedInvocation>) {
+    let [owner, wasm, salt, constructor, funding] = call.args.as_slice() else {
+        panic!()
+    };
+    let owner = addr(owner);
+    let salt = digest(salt);
+    let wallet = admin::wallet_address(NETWORK, &owner, &salt).unwrap();
+    let args: x::VecM<x::ScVal> = items(constructor).to_vec().try_into().unwrap();
+    let create = x::CreateContractArgsV2 {
+        contract_id_preimage: x::ContractIdPreimage::Address(x::ContractIdPreimageFromAddress {
+            address: address(&owner).unwrap(),
+            salt: x::Uint256(salt),
+        }),
+        executable: x::ContractExecutable::Wasm(x::Hash(digest(wasm))),
+        constructor_args: args.clone(),
+    };
+    let mut subs = vec![x::SorobanAuthorizedInvocation {
+        function: x::SorobanAuthorizedFunction::CreateContractV2HostFn(create),
+        sub_invocations: vec![x::SorobanAuthorizedInvocation {
+            function: x::SorobanAuthorizedFunction::ContractFn(x::InvokeContractArgs {
+                contract_address: address(&wallet).unwrap(),
+                function_name: x::ScSymbol(b"__constructor".to_vec().try_into().unwrap()),
+                args,
+            }),
+            sub_invocations: Default::default(),
+        }]
+        .try_into()
+        .unwrap(),
+    }];
+    for item in items(funding) {
+        let [asset, amount] = items(item) else {
+            panic!()
+        };
+        subs.push(x::SorobanAuthorizedInvocation {
+            function: x::SorobanAuthorizedFunction::ContractFn(x::InvokeContractArgs {
+                contract_address: address(&addr(asset)).unwrap(),
+                function_name: x::ScSymbol(b"transfer".to_vec().try_into().unwrap()),
+                args: vec![
+                    x::ScVal::Address(address(&owner).unwrap()),
+                    x::ScVal::Address(address(&wallet).unwrap()),
+                    amount.clone(),
+                ]
+                .try_into()
+                .unwrap(),
+            }),
+            sub_invocations: Default::default(),
+        });
+    }
+    (wallet, subs)
+}
+/// The agent's and the server's signatures in the wallet's entry, checked against its payload.
+fn verify_cosignatures(m: &Model, entry: &x::SorobanAuthorizationEntry) -> Result<()> {
+    let w = m.wallet.as_ref().ok_or("no wallet")?;
+    let x::SorobanCredentials::Address(c) = &entry.credentials else {
+        return Err("the wallet authorizes with address credentials".into());
+    };
+    if c.address != address(&w.address)? {
+        return Err("another address".into());
+    }
+    if m.nonces.contains(&c.nonce) {
+        return Err("nonce already used".into());
+    }
+    if c.signature_expiration_ledger < m.ledger {
+        return Err("signature expired".into());
+    }
+    let payload = hash(
+        x::HashIdPreimage::SorobanAuthorization(x::HashIdPreimageSorobanAuthorization {
+            network_id: x::Hash(network_id(NETWORK)?),
+            nonce: c.nonce,
+            signature_expiration_ledger: c.signature_expiration_ledger,
+            invocation: entry.root_invocation.clone(),
+        })
+        .to_xdr(Limits::none())
+        .unwrap(),
+    );
+    let parts = items(&c.signature);
+    if parts.len() != 2 {
+        return Err("two cosignatures".into());
+    }
+    for (part, key) in parts.iter().zip([&w.config.agent, &w.config.server]) {
+        let x::ScVal::Bytes(sig) = part else {
+            return Err("a cosignature is bytes".into());
+        };
+        let sig =
+            ed25519_dalek::Signature::from_slice(sig.as_slice()).map_err(|e| e.to_string())?;
+        VerifyingKey::from_bytes(&account_key(key)?)
+            .unwrap()
+            .verify(&payload, &sig)
+            .map_err(|_| "invalid cosignature".to_string())?;
+    }
+    Ok(())
+}
 impl rpc::Rpc for ModelChain {
     fn call(&self, method: &str, params: Value) -> Result<Value> {
         let mut m = self.0.lock().unwrap();
@@ -227,28 +552,45 @@ impl rpc::Rpc for ModelChain {
                         if data.contract != address(&w.address).unwrap() {
                             return None;
                         }
-                        let val = if data.key == x::ScVal::LedgerKeyContractInstance {
-                            x::ScVal::ContractInstance(x::ScContractInstance {
-                                executable: x::ContractExecutable::Wasm(x::Hash(w.module)),
-                                storage: Some(
-                                    vec![x::ScMapEntry {
-                                        key: x::ScVal::U32(0),
-                                        val: w.state.scval().unwrap(),
-                                    }]
-                                    .try_into()
-                                    .unwrap(),
-                                ),
-                            })
-                        } else {
-                            let x::ScVal::Vec(Some(parts)) = &data.key else {
-                                return None;
-                            };
-                            let id = digest(&parts[1]);
-                            let x::ScVal::Symbol(variant) = &parts[0] else {
-                                return None;
-                            };
-                            let variant = String::from_utf8(variant.0.to_vec()).ok()?;
-                            w.receipts.get(&(variant, id))?.clone()
+                        let val = match &data.key {
+                            x::ScVal::LedgerKeyContractInstance => {
+                                x::ScVal::ContractInstance(x::ScContractInstance {
+                                    executable: x::ContractExecutable::Wasm(x::Hash(
+                                        *m.code
+                                            .iter()
+                                            .find(|(_, tier)| **tier == w.tier)
+                                            .unwrap()
+                                            .0,
+                                    )),
+                                    storage: Some(
+                                        vec![x::ScMapEntry {
+                                            key: x::ScVal::Symbol(x::ScSymbol(
+                                                b"c".to_vec().try_into().unwrap(),
+                                            )),
+                                            val: bytes(&packed::encode(&w.config).unwrap()),
+                                        }]
+                                        .try_into()
+                                        .unwrap(),
+                                    ),
+                                })
+                            }
+                            x::ScVal::Symbol(s)
+                                if s.0.as_slice() == b"t"
+                                    && data.durability == x::ContractDataDurability::Persistent =>
+                            {
+                                bytes(&w.t_bytes()?)
+                            }
+                            x::ScVal::Symbol(s)
+                                if s.0.as_slice() == b"d"
+                                    && data.durability == x::ContractDataDurability::Temporary =>
+                            {
+                                // A temporary entry lives through its window's end ledger.
+                                if m.ledger > w.stored.daily?.0 {
+                                    return None;
+                                }
+                                bytes(&w.d_bytes()?)
+                            }
+                            _ => return None,
                         };
                         Some(x::LedgerEntryData::ContractData(x::ContractDataEntry {
                             ext: x::ExtensionPoint::V0,
@@ -258,6 +600,15 @@ impl rpc::Rpc for ModelChain {
                             val,
                         }))
                     }),
+                    x::LedgerKey::ContractCode(code) => {
+                        m.code_bytes.get(&code.hash.0).map(|bytes| {
+                            x::LedgerEntryData::ContractCode(x::ContractCodeEntry {
+                                ext: x::ContractCodeEntryExt::V0,
+                                hash: code.hash.clone(),
+                                code: bytes.clone().try_into().unwrap(),
+                            })
+                        })
+                    }
                     _ => None,
                 };
                 let entries: Vec<Value> = entry
@@ -279,64 +630,45 @@ impl rpc::Rpc for ModelChain {
                         json!({"error": "cannot set authMode to 'record' with an auth footprint"}),
                     );
                 }
-                let entry =
-                    |who: &str,
-                     function: x::SorobanAuthorizedFunction,
-                     subs: Vec<x::SorobanAuthorizedInvocation>| {
-                        x::SorobanAuthorizationEntry {
-                            credentials: if who == source {
-                                x::SorobanCredentials::SourceAccount
-                            } else {
-                                x::SorobanCredentials::Address(x::SorobanAddressCredentials {
-                                    address: address(who).unwrap(),
-                                    nonce: 4242,
-                                    signature_expiration_ledger: 0,
-                                    signature: x::ScVal::Void,
-                                })
-                            },
-                            root_invocation: x::SorobanAuthorizedInvocation {
-                                function,
-                                sub_invocations: subs.try_into().unwrap(),
-                            },
-                        }
-                    };
+                let entry = |who: &str, root: x::SorobanAuthorizedFunction, subs| {
+                    x::SorobanAuthorizationEntry {
+                        credentials: if who == source {
+                            x::SorobanCredentials::SourceAccount
+                        } else {
+                            x::SorobanCredentials::Address(x::SorobanAddressCredentials {
+                                address: address(who).unwrap(),
+                                nonce: 4242,
+                                signature_expiration_ledger: 0,
+                                signature: x::ScVal::Void,
+                            })
+                        },
+                        root_invocation: x::SorobanAuthorizedInvocation {
+                            function: root,
+                            sub_invocations: subs,
+                        },
+                    }
+                };
+                let mut wallet_call = false;
                 let (result, required): (x::ScVal, Vec<x::SorobanAuthorizationEntry>) = match &op
                     .host_function
                 {
-                    x::HostFunction::UploadContractWasm(code) => (
-                        x::ScVal::Bytes(x::ScBytes(
-                            hash(code.as_slice()).to_vec().try_into().unwrap(),
-                        )),
-                        vec![],
-                    ),
-                    x::HostFunction::CreateContractV2(args) => {
-                        let x::ContractIdPreimage::Address(from) = &args.contract_id_preimage
-                        else {
-                            panic!()
-                        };
-                        let derived = admin::wallet_address(
-                            NETWORK,
-                            &address_text(&from.address)?,
-                            &from.salt.0,
-                        )?;
-                        let child = x::SorobanAuthorizedInvocation {
-                            function: x::SorobanAuthorizedFunction::ContractFn(
-                                x::InvokeContractArgs {
-                                    contract_address: address(&derived)?,
-                                    function_name: x::ScSymbol(
-                                        b"__constructor".to_vec().try_into().unwrap(),
-                                    ),
-                                    args: args.constructor_args.clone(),
-                                },
-                            ),
-                            sub_invocations: Default::default(),
-                        };
+                    x::HostFunction::UploadContractWasm(code) => {
+                        (bytes(&hash(code.as_slice())), vec![])
+                    }
+                    x::HostFunction::InvokeContract(call)
+                        if call.contract_address == address(&deployer())? =>
+                    {
+                        assert_eq!(call.function_name.0.as_slice(), b"deploy");
+                        let (wallet, subs) = deploy_tree(call);
+                        if !m.code.contains_key(&digest(&call.args[1])) {
+                            return Ok(json!({"error": "the code is not uploaded"}));
+                        }
                         (
-                            x::ScVal::Address(address(&derived)?),
+                            x::ScVal::Address(address(&wallet)?),
                             vec![entry(
-                                &source,
-                                x::SorobanAuthorizedFunction::CreateContractV2HostFn(args.clone()),
-                                vec![child],
+                                &addr(&call.args[0]),
+                                x::SorobanAuthorizedFunction::ContractFn(call.clone()),
+                                subs.try_into().unwrap(),
                             )],
                         )
                     }
@@ -350,37 +682,34 @@ impl rpc::Rpc for ModelChain {
                         };
                         if call.contract_address != address(&w.address)? {
                             assert_eq!(function, "balance");
-                            return Ok(
-                                json!({"results":[{"xdr": b64(&x::ScVal::I128(x::Int128Parts{hi:(w.balance>>64) as i64, lo: w.balance as u64}))}]}),
-                            );
+                            return Ok(json!({"results":[{"xdr": b64(&wide(w.balance))}]}));
                         }
+                        wallet_call = true;
+                        let owner = w.config.owner.clone();
                         match function.as_str() {
-                            "policy_binding" => (binding(w), vec![]),
                             "execute" => {
-                                let request = &call.args[0];
-                                if w.state.paused {
+                                if w.config.paused {
                                     return Ok(json!({"error": "HostError: Error(Contract, #6)"}));
                                 }
-                                let receipt = receipt_of(w, request);
+                                let wallet = w.address.clone();
                                 (
-                                    receipt,
-                                    vec![
-                                        entry(&w.state.agent, root.clone(), vec![]),
-                                        entry(&w.state.server, root, vec![]),
-                                    ],
+                                    x::ScVal::Void,
+                                    vec![entry(&wallet, root, Default::default())],
                                 )
                             }
                             "deploy_policy" => {
                                 let next = addr(field(&call.args[0], "owner"));
-                                let mut auth = vec![entry(&w.state.owner, root.clone(), vec![])];
-                                if next != w.state.owner {
-                                    auth.push(entry(&next, root, vec![]));
+                                let mut auth =
+                                    vec![entry(&owner, root.clone(), Default::default())];
+                                if next != owner {
+                                    auth.push(entry(&next, root, Default::default()));
                                 }
                                 (x::ScVal::Void, auth)
                             }
-                            "set_pause" | "recover" => {
-                                (x::ScVal::Void, vec![entry(&w.state.owner, root, vec![])])
-                            }
+                            "set_pause" | "recover" | "stop" => (
+                                x::ScVal::Void,
+                                vec![entry(&owner, root, Default::default())],
+                            ),
                             other => panic!("unexpected wallet call {other}"),
                         }
                     }
@@ -390,22 +719,33 @@ impl rpc::Rpc for ModelChain {
                     required
                 } else {
                     for need in &required {
-                        let who = match &need.credentials {
-                            x::SorobanCredentials::Address(c) => Some(&c.address),
-                            _ => None,
-                        };
-                        let present = op.auth.iter().any(|e| match (&e.credentials, who) {
-                            (x::SorobanCredentials::SourceAccount, None) => true,
-                            (x::SorobanCredentials::Address(c), Some(w)) => {
-                                &c.address == w && c.signature != x::ScVal::Void
-                            }
-                            _ => false,
-                        });
+                        let present =
+                            op.auth
+                                .iter()
+                                .any(|e| match (&e.credentials, &need.credentials) {
+                                    (
+                                        x::SorobanCredentials::SourceAccount,
+                                        x::SorobanCredentials::SourceAccount,
+                                    ) => true,
+                                    (
+                                        x::SorobanCredentials::Address(c),
+                                        x::SorobanCredentials::Address(n),
+                                    ) => c.address == n.address && c.signature != x::ScVal::Void,
+                                    _ => false,
+                                });
                         if !present {
                             return Ok(
                                 json!({"error": "require_auth has no matching signed entry"}),
                             );
                         }
+                    }
+                    // The wallet's `__check_auth` runs in enforce mode.
+                    if wallet_call
+                        && let x::HostFunction::InvokeContract(call) = &op.host_function
+                        && call.function_name.0.as_slice() == b"execute"
+                        && let Err(e) = verify_cosignatures(&m, &op.auth[0])
+                    {
+                        return Ok(json!({ "error": e }));
                     }
                     op.auth.to_vec()
                 };
@@ -422,31 +762,60 @@ impl rpc::Rpc for ModelChain {
                 let x::TransactionEnvelope::Tx(env) = de(&signed) else {
                     panic!()
                 };
-                assert!(!env.signatures.is_empty());
-                let tx_hash = hexs(&hash(
-                    x::TransactionSignaturePayload {
-                        network_id: x::Hash(network_id(NETWORK)?),
-                        tagged_transaction: x::TransactionSignaturePayloadTaggedTransaction::Tx(
-                            env.tx.clone(),
-                        ),
-                    }
-                    .to_xdr(Limits::none())
-                    .unwrap(),
-                ));
+                let digest = tx_hash(&env.tx);
+                let tx_hash = hexs(&digest);
                 if m.settled.contains_key(&tx_hash) {
                     return Ok(json!({"hash": tx_hash, "status": "DUPLICATE"}));
                 }
+                // The source signs alone.
                 let source = source_of(&env.tx);
+                let [signature] = env.signatures.as_slice() else {
+                    panic!("one source signature")
+                };
+                VerifyingKey::from_bytes(&account_key(&source)?)
+                    .unwrap()
+                    .verify(
+                        &digest,
+                        &ed25519_dalek::Signature::from_slice(signature.signature.as_slice())
+                            .unwrap(),
+                    )
+                    .expect("the source's signature");
                 let account = m.accounts.get_mut(&source).unwrap();
                 assert_eq!(env.tx.seq_num.0, account.sequence + 1, "sequence");
                 account.sequence += 1;
+                let ledger = m.ledger;
                 let result = apply(&mut m, &env.tx);
+                // An execution publishes `allowit` with its operation id.
+                if let x::HostFunction::InvokeContract(call) = &host_op(&env.tx).host_function
+                    && call.function_name.0.as_slice() == b"execute"
+                {
+                    m.events
+                        .push((ledger, items(&call.args[0])[0].clone(), tx_hash.clone()));
+                }
                 let name = std::mem::take(&mut m.pending_name);
-                let state = m.wallet.as_ref().map(|w| w.state.scval().unwrap());
-                m.steps.push((name, signed.clone(), result, state));
+                let state = m.wallet.as_ref().map(|w| w.view(ledger));
+                m.steps.push((name, signed.clone(), ledger, result, state));
                 m.settled.insert(tx_hash.clone(), signed);
                 m.ledger += 1;
                 Ok(json!({"hash": tx_hash, "status": "PENDING"}))
+            }
+            "getEvents" => {
+                let start = params["startLedger"].as_u64().unwrap() as u32;
+                let filter = &params["filters"][0];
+                let wallet = m.wallet.as_ref().map(|w| w.address.clone());
+                assert_eq!(filter["contractIds"][0].as_str(), wallet.as_deref());
+                let topics = &filter["topics"][0];
+                assert_eq!(
+                    topics[0],
+                    json!(b64(&x::ScVal::Symbol("allowit".try_into().unwrap())))
+                );
+                let events: Vec<Value> = m
+                    .events
+                    .iter()
+                    .filter(|(ledger, id, _)| *ledger >= start && json!(b64(id)) == topics[1])
+                    .map(|(ledger, _, hash)| json!({"ledger": ledger, "txHash": hash}))
+                    .collect();
+                Ok(json!({"events": events, "latestLedger": m.ledger}))
             }
             "getTransaction" => {
                 let tx_hash = params["hash"].as_str().unwrap();
@@ -466,43 +835,6 @@ impl rpc::Rpc for ModelChain {
         }
     }
 }
-/// The receipt `execute` returns for `request` on `w`.
-fn receipt_of(w: &Wallet, request: &x::ScVal) -> x::ScVal {
-    let asset = w.state.asset.clone();
-    let (token, to, amount) = match operation(request) {
-        (name, args) if name == "Transfer" => {
-            (asset, addr(field(args, "to")), int(field(args, "amount")))
-        }
-        (name, args) if name == "Deposit" => (
-            asset,
-            addr(field(args, "vault")),
-            int(field(args, "assets")),
-        ),
-        // A redeem debits the vault's shares at the vault.
-        (name, args) if name == "Redeem" => {
-            let vault = addr(field(args, "vault"));
-            (vault.clone(), vault, int(field(args, "shares")))
-        }
-        _ => panic!(),
-    };
-    let x::ScVal::U64(nonce) = field(request, "nonce") else {
-        panic!()
-    };
-    let x::ScVal::U64(version) = field(request, "deployment_version") else {
-        panic!()
-    };
-    TransferReceipt {
-        operation_id: digest(field(request, "operation_id")),
-        token,
-        from: w.address.clone(),
-        to,
-        amount,
-        nonce: *nonce,
-        deployment_version: *version,
-    }
-    .scval()
-    .unwrap()
-}
 /// Apply one settled transaction to the model and return the host result it produces.
 fn apply(m: &mut Model, tx: &x::Transaction) -> x::ScVal {
     let op = host_op(tx);
@@ -511,84 +843,116 @@ fn apply(m: &mut Model, tx: &x::Transaction) -> x::ScVal {
             let h = hash(code.as_slice());
             let tier = m.tiers[&h];
             m.code.insert(h, tier);
-            x::ScVal::Bytes(x::ScBytes(h.to_vec().try_into().unwrap()))
+            m.code_bytes.insert(h, code.to_vec());
+            bytes(&h)
         }
-        x::HostFunction::CreateContractV2(args) => {
-            let x::ContractExecutable::Wasm(module) = &args.executable else {
-                panic!()
-            };
-            let tier = m.code[&module.0];
-            let x::ContractIdPreimage::Address(from) = &args.contract_id_preimage else {
-                panic!()
-            };
-            let wallet =
-                admin::wallet_address(NETWORK, &address_text(&from.address).unwrap(), &from.salt.0)
-                    .unwrap();
-            let config = &args.constructor_args[0];
-            let x::ScVal::Bool(x402_enabled) = field(config, "x402_enabled") else {
-                panic!()
-            };
-            let state = CustodyState {
-                policy_state: PolicyParams::default(),
-                contract_version: CONTRACT_VERSION,
-                owner: addr(field(config, "owner")),
-                agent: addr(field(config, "agent")),
-                server: addr(field(config, "server")),
-                asset: addr(field(config, "asset")),
-                policy_instance: digest(field(config, "policy_instance")),
-                source_digest: digest(field(config, "source_digest")),
-                rules: policy::rules_from_scval(field(config, "rules")).unwrap(),
-                params: PolicyParams::from_scval(field(config, "params")).unwrap(),
-                x402_enabled: *x402_enabled,
-                token: "XLM".into(),
-                deployment_version: 0,
-                nonce: 0,
-                paused: false,
-            };
-            m.wallet = Some(Wallet {
+        x::HostFunction::InvokeContract(call)
+            if call.contract_address == address(&deployer()).unwrap() =>
+        {
+            let (wallet, _) = deploy_tree(call);
+            let tier = m.code[&digest(&call.args[1])];
+            let config = &items(&call.args[3])[0];
+            let rules = policy::rules_from_scval(field(config, "rules")).unwrap();
+            let raw = |name| account_for_public_key(&digest(field(config, name)));
+            let mut w = Wallet {
                 address: wallet.clone(),
                 tier,
-                module: module.0,
-                state,
+                config: packed::Configuration {
+                    layout: packed::LAYOUT,
+                    paused: false,
+                    deployment_version: 0,
+                    owner: addr(field(config, "owner")),
+                    agent: raw("agent"),
+                    server: raw("server"),
+                    asset: addr(field(config, "asset")),
+                    source_hash: digest(field(config, "source_hash")),
+                    gas_cap: int(field(config, "gas_cap")),
+                    params: installed_params(
+                        tier,
+                        &rules,
+                        &PolicyParams::from_scval(field(config, "params")).unwrap(),
+                    ),
+                    rules,
+                },
+                stored: Stored::default(),
+                served: packed::Figures::default(),
                 balance: 0,
                 shares: 0,
-                receipts: BTreeMap::new(),
-            });
+            };
+            // `t` exists from the deployment when a check reads a total.
+            let kept = w.kept();
+            if kept & (SPENT | CALLS) != 0 {
+                w.write_total(kept, &packed::Figures::default());
+            }
+            for item in items(&call.args[4]) {
+                let [asset, amount] = items(item) else {
+                    panic!()
+                };
+                assert_eq!(addr(asset), xlm());
+                w.balance += int(amount);
+            }
+            m.wallet = Some(w);
             x::ScVal::Address(address(&wallet).unwrap())
         }
         x::HostFunction::InvokeContract(call) => {
-            let now = m.now;
+            let (now, ledger) = (m.now, m.ledger);
+            if call.function_name.0.as_slice() == b"execute" {
+                let x::SorobanCredentials::Address(c) = &op.auth[0].credentials else {
+                    panic!()
+                };
+                verify_cosignatures(m, &op.auth[0]).unwrap();
+                m.nonces.insert(c.nonce);
+            }
             let w = m.wallet.as_mut().unwrap();
+            let next = |w: &Wallet, v: &x::ScVal| {
+                let x::ScVal::U32(version) = v else { panic!() };
+                assert_eq!(*version, w.config.deployment_version + 1);
+                *version
+            };
             match call.function_name.0.as_slice() {
-                b"execute" => execute(w, &call.args[0], now),
+                b"execute" => execute(w, &call.args[0], now, ledger, &source_of(tx)),
                 b"set_pause" => {
-                    let (x::ScVal::Bool(paused), x::ScVal::U64(version)) =
-                        (&call.args[0], &call.args[1])
-                    else {
+                    let x::ScVal::Bool(paused) = &call.args[0] else {
                         panic!()
                     };
-                    assert_eq!(*version, w.state.deployment_version + 1);
-                    w.state.paused = *paused;
-                    w.state.deployment_version = *version;
+                    w.config.deployment_version = next(w, &call.args[1]);
+                    w.config.paused = *paused;
+                    x::ScVal::Void
+                }
+                b"stop" => {
+                    w.config.deployment_version = next(w, &call.args[0]);
+                    w.config.paused = true;
+                    w.balance = 0;
                     x::ScVal::Void
                 }
                 b"deploy_policy" => {
                     let d = &call.args[0];
-                    let x::ScVal::U64(version) = field(d, "deployment_version") else {
-                        panic!()
-                    };
-                    assert_eq!(*version, w.state.deployment_version + 1);
-                    w.state.deployment_version = *version;
-                    w.state.owner = addr(field(d, "owner"));
-                    w.state.agent = addr(field(d, "agent"));
-                    w.state.server = addr(field(d, "server"));
-                    w.state.source_digest = digest(field(d, "source_digest"));
-                    w.state.rules = policy::rules_from_scval(field(d, "rules")).unwrap();
-                    w.state.params = PolicyParams::from_scval(field(d, "params")).unwrap();
+                    w.config.deployment_version = next(w, field(d, "deployment_version"));
+                    assert_eq!(field(d, "wasm_hash"), &x::ScVal::Void);
+                    w.config.owner = addr(field(d, "owner"));
+                    w.config.agent = account_for_public_key(&digest(field(d, "agent")));
+                    w.config.server = account_for_public_key(&digest(field(d, "server")));
+                    w.config.source_hash = digest(field(d, "source_hash"));
+                    w.config.gas_cap = int(field(d, "gas_cap"));
+                    w.config.rules = policy::rules_from_scval(field(d, "rules")).unwrap();
+                    w.config.params = installed_params(
+                        w.tier,
+                        &w.config.rules,
+                        &PolicyParams::from_scval(field(d, "params")).unwrap(),
+                    );
+                    // `t` follows the totals that the new configuration keeps.
+                    let kept = w.kept();
+                    let totals = w.figures(SPENT | CALLS, ledger);
+                    if kept & (SPENT | CALLS) != 0 {
+                        w.write_total(kept, &totals);
+                    } else {
+                        w.stored.total = None;
+                    }
                     x::ScVal::Void
                 }
                 b"recover" => {
-                    w.balance -= int(&call.args[1]);
+                    assert_eq!(addr(&call.args[0]), xlm());
+                    w.balance -= int(&call.args[2]);
                     x::ScVal::Void
                 }
                 other => panic!("unexpected {other:?}"),
@@ -597,124 +961,195 @@ fn apply(m: &mut Model, tx: &x::Transaction) -> x::ScVal {
         _ => panic!(),
     }
 }
-/// Admit one execution as the kernel does and apply its effects and post-flight state.
-fn execute(w: &mut Wallet, request: &x::ScVal, now: u64) -> x::ScVal {
-    let receipt = receipt_of(w, request);
-    let x::ScVal::U64(nonce) = field(request, "nonce") else {
+/// Run one execution as the kernel does: the checks, the kept figures, the effects and the gas
+/// repayment to the sending account.
+fn execute(w: &mut Wallet, request: &x::ScVal, now: u64, ledger: u32, source: &str) -> x::ScVal {
+    let [_, version, expires_at, operation, expense, gas, payee, args] = items(request) else {
         panic!()
     };
-    assert_eq!(*nonce, w.state.nonce, "stale nonce");
-    let x::ScVal::U64(expires_at) = field(request, "expires_at") else {
+    let x::ScVal::U32(version) = version else {
         panic!()
     };
-    let (spent, gas, unpriced) = match field(request, "expense") {
-        x::ScVal::Vec(Some(v)) if v.len() == 2 => (
-            int(field(&v[1], "spent_units")),
-            int(field(&v[1], "gas_units")),
-            false,
-        ),
-        _ => (0, 0, true),
+    assert_eq!(*version, w.config.deployment_version, "stale request");
+    assert!(!w.config.paused);
+    let x::ScVal::U64(expires_at) = expires_at else {
+        panic!()
     };
-    let args = PolicyParams::from_scval(field(request, "args")).unwrap();
-    let (name, operation_args) = operation(request);
-    let asset = allowit_core::Address::new(w.state.asset.clone());
-    let debit = int(field(&receipt, "amount"));
-    let minimum = |key| int(field(operation_args, key));
-    let vault = || allowit_core::Address::new(addr(field(operation_args, "vault")));
-    // The wallet's facts: a redeem's gross amount is its minimum asset output.
-    let (op, amount, token_out, min_out) = match name.as_str() {
-        "Transfer" => (allowit_core::AllowitOperation::transfer, debit, None, 0),
-        "Deposit" => (
-            allowit_core::AllowitOperation::deposit,
-            debit,
-            Some(vault()),
-            minimum("min_shares"),
-        ),
-        "Redeem" => (
-            allowit_core::AllowitOperation::redeem,
-            minimum("min_assets"),
-            Some(asset.clone()),
-            minimum("min_assets"),
-        ),
+    assert!(*expires_at > now);
+    let (spent, gas_units, unpriced) = match items(expense) {
+        [name, gas, _, spent, _] if symbol(name) == "Priced" => (int(spent), int(gas), false),
+        [name] if symbol(name) == "Unpriced" => (0, 0, true),
         _ => panic!(),
     };
-    let ctx = allowit_core::AllowitContext {
-        env: allowit_core::AllowitEnv::new(),
-        params: w.state.params.allowit().into(),
-        state: w.state.policy_state.allowit(),
-        request: allowit_core::AllowitRequest {
-            operation: op,
-            asset,
-            recipient: allowit_core::Address::new(addr(field(&receipt, "to"))),
-            amount,
-            token_in: allowit_core::Address::new(addr(field(&receipt, "token"))),
-            amount_in: debit,
-            token_out,
-            min_out,
-            now,
-            expires_at: *expires_at,
-            spent_units: spent,
-            gas_units: gas,
-            unpriced,
-            args: args.allowit().into(),
-        },
-    };
-    let tier = if w.tier == PolicyTier::Custom {
-        AllowitTier::Custom
-    } else {
-        AllowitTier::Standard
-    };
-    w.state.policy_state =
-        PolicyParams::from_allowit(&allowit_core::post_flight(&ctx, tier).unwrap());
-    w.state.nonce += 1;
-    let id = digest(field(request, "operation_id"));
-    let vault = addr(field(&receipt, "to"));
-    // The model vault converts one to one.
-    let sep56 = match name.as_str() {
-        "Transfer" => {
-            w.balance -= debit;
-            None
+    let gas = int(gas);
+    assert!(gas >= 0 && gas <= w.config.gas_cap);
+    // As the kernel checks: gas is counted exactly when some is repaid, and an XLM wallet counts
+    // the repaid stroops.
+    assert_eq!(gas == 0, gas_units == 0, "counted gas");
+    if w.config.asset == xlm() {
+        assert_eq!(gas_units, gas, "an XLM wallet counts the repaid stroops");
+    }
+    // The sending account receives the repayment.
+    assert_eq!(addr(payee), source);
+    let operation = items(operation);
+    let asset = w.config.asset.clone();
+    let (kind, recipient, amount, token_in, amount_in, token_out, min_out) =
+        match symbol(&operation[0]).as_str() {
+            "Transfer" => {
+                let amount = int(&operation[3]);
+                (
+                    allowit_core::AllowitOperation::transfer,
+                    addr(&operation[2]),
+                    amount,
+                    addr(&operation[1]),
+                    amount,
+                    None,
+                    0,
+                )
+            }
+            "Deposit" => {
+                let vault = addr(&operation[1]);
+                let assets = int(&operation[2]);
+                (
+                    allowit_core::AllowitOperation::deposit,
+                    vault.clone(),
+                    assets,
+                    asset.clone(),
+                    assets,
+                    Some(vault),
+                    int(&operation[3]),
+                )
+            }
+            "Redeem" => {
+                let vault = addr(&operation[1]);
+                let min_assets = int(&operation[3]);
+                (
+                    allowit_core::AllowitOperation::redeem,
+                    vault.clone(),
+                    min_assets,
+                    vault,
+                    int(&operation[2]),
+                    Some(asset.clone()),
+                    min_assets,
+                )
+            }
+            _ => panic!(),
+        };
+    // Every standard figure after this execution, from the figures before it, as Core's
+    // post-flight computes them.
+    let advance = |w: &Wallet, before: &packed::Figures| -> packed::Figures {
+        let state = PolicyStateSnapshot {
+            params: w.config.params.clone(),
+            rules: w.config.rules.clone(),
+            source_hash: w.config.source_hash,
+            figures: before.clone(),
         }
-        "Deposit" => {
-            w.balance -= debit;
-            w.shares += debit;
-            let deposit = DepositReceipt {
-                operation_id: id,
-                vault,
-                asset: w.state.asset.clone(),
-                from: w.address.clone(),
-                receiver: w.address.clone(),
-                operator: w.address.clone(),
-                assets: debit,
-                shares: debit,
-                nonce: *nonce,
-                deployment_version: w.state.deployment_version,
+        .standard_state(now);
+        let ctx = allowit_core::AllowitContext {
+            env: allowit_core::AllowitEnv::new(),
+            params: w.config.params.allowit().into(),
+            state: state.allowit(),
+            request: allowit_core::AllowitRequest {
+                operation: kind.clone(),
+                asset: allowit_core::Address::new(asset.clone()),
+                recipient: allowit_core::Address::new(recipient.clone()),
+                amount,
+                token_in: allowit_core::Address::new(token_in.clone()),
+                amount_in,
+                token_out: token_out.clone().map(allowit_core::Address::new),
+                min_out,
+                now,
+                expires_at: *expires_at,
+                spent_units: spent,
+                gas_units,
+                unpriced,
+                args: PolicyParams::from_scval(args).unwrap().allowit().into(),
+            },
+        };
+        let after = PolicyParams::from_allowit(
+            &allowit_core::post_flight(&ctx, AllowitTier::Standard).unwrap(),
+        );
+        let number = |key: &str| match after.get(key) {
+            Some(PolicyValue::Int(v)) => *v,
+            other => panic!("{key}: {other:?}"),
+        };
+        let flag = |key: &str| matches!(after.get(key), Some(PolicyValue::Bool(true)));
+        packed::Figures {
+            calls: number("calls") as u64,
+            spent: number("spent"),
+            unpriced: flag("unpriced"),
+            day_spent: number("day_spent"),
+            day_total: number("day_total"),
+            day_unpriced: flag("day_unpriced"),
+            day_ends: before.day_ends,
+        }
+    };
+    // The server counts every execution; its day stays open for the whole model run.
+    let served = advance(
+        w,
+        &packed::Figures {
+            day_ends: u32::MAX,
+            ..w.served.clone()
+        },
+    );
+    let kept = w.kept();
+    let runs = w.tier == PolicyTier::Custom || !w.config.rules.is_empty();
+    if runs && kept != 0 {
+        let before = w.figures(kept, ledger);
+        let figures = advance(w, &before);
+        let totals = |f: &packed::Figures| {
+            (
+                if kept & SPENT != 0 { f.spent } else { 0 },
+                if kept & CALLS != 0 { f.calls } else { 0 },
+                kept & SPENT != 0 && f.unpriced,
+            )
+        };
+        if kept & (SPENT | CALLS) != 0
+            && (w.stored.total.is_none() || totals(&figures) != totals(&before))
+        {
+            w.write_total(kept, &figures);
+        }
+        if kept & (DAY_SPENT | DAY_TOTAL) != 0
+            && (figures.day_spent, figures.day_total, figures.day_unpriced)
+                != (before.day_spent, before.day_total, before.day_unpriced)
+        {
+            let end = if before.day_ends != 0 {
+                before.day_ends
+            } else {
+                ledger + DAY_LEDGERS - 1
             };
-            Some(("Deposit", deposit.scval().unwrap()))
+            w.stored.daily = Some((
+                end,
+                kept & (DAY_SPENT | DAY_TOTAL),
+                figures.day_unpriced,
+                if kept & DAY_SPENT != 0 {
+                    figures.day_spent
+                } else {
+                    0
+                },
+                if kept & DAY_TOTAL != 0 {
+                    figures.day_total
+                } else {
+                    0
+                },
+            ));
+        }
+    }
+    // The model vault converts one to one.
+    match symbol(&operation[0]).as_str() {
+        "Transfer" => w.balance -= amount_in,
+        "Deposit" => {
+            w.balance -= amount_in;
+            w.shares += amount_in;
         }
         _ => {
-            w.shares -= debit;
-            w.balance += debit;
-            let redeem = RedeemReceipt {
-                operation_id: id,
-                vault,
-                asset: w.state.asset.clone(),
-                owner: w.address.clone(),
-                receiver: w.address.clone(),
-                operator: w.address.clone(),
-                shares: debit,
-                assets: debit,
-                nonce: *nonce,
-                deployment_version: w.state.deployment_version,
-            };
-            Some(("Redeem", redeem.scval().unwrap()))
+            w.shares -= amount_in;
+            w.balance += amount_in;
         }
-    };
-    w.receipts.insert(("Operation".into(), id), receipt.clone());
-    if let Some((variant, value)) = sep56 {
-        w.receipts.insert((variant.into(), id), value);
     }
-    receipt
+    w.balance -= gas;
+    w.served = served;
+    x::ScVal::Void
 }
 
 /// A chain whose wallet policy reads the gas of a request, as a Custom policy that reads
@@ -736,10 +1171,10 @@ impl rpc::Rpc for ReadsGas<'_> {
             };
             if let x::HostFunction::InvokeContract(call) = &host_op(&env.tx).host_function
                 && call.function_name.0.as_slice() == b"execute"
-                && let x::ScVal::Vec(Some(expense)) = field(&call.args[0], "expense")
-                && expense.len() == 2
+                && let [name, units, ..] = items(&items(&call.args[0])[4])
+                && symbol(name) == "Priced"
             {
-                gas = Some(int(field(&expense[1], "gas_units")));
+                gas = Some(int(units));
             }
             if gas.is_some_and(|gas| self.refused.contains(&gas)) {
                 return Ok(json!({"error": "the policy refuses this gas"}));
@@ -767,33 +1202,42 @@ fn terms(principal: i128, ledger: u32) -> ExecutionTerms {
     ExecutionTerms {
         args: PolicyParams::default(),
         expense: Some(ExpenseBounds::xlm(principal, 0, MAX_FEE, ledger - 1, NOW).unwrap()),
+        gas: None,
+        sender: Some(sender()),
     }
 }
-/// Agent and service run one operation: prepare, service authorization, enforce simulation,
-/// agent signature, submission and receipt.
+fn seal(chain: &ModelChain, authorized: &SignedOperation) -> Result<SignedOperation> {
+    rpc::seal(chain, authorized, |hash| {
+        Ok(SigningKey::from_bytes(&SENDER).sign(hash).to_bytes())
+    })
+}
+/// The server prepares and signs, the agent signs, and the sending account seals and submits.
+fn authorized(
+    chain: &ModelChain,
+    c: &WalletConfig,
+    r: &ExecutionRequest,
+    t: &ExecutionTerms,
+) -> Result<SignedOperation> {
+    let prepared = rpc::prepare_with(chain, c, r, t, Some(chain.accounting()), NOW, NOW + 300)?;
+    let served = authorize_server(&prepared, &SERVER, NOW, None)?;
+    let simulated = rpc::simulate(chain, &served)?;
+    let proof = sign(&simulated, &AGENT, NOW)?;
+    authorize(&simulated, &[proof], NOW)
+}
 fn run(
     chain: &ModelChain,
     c: &WalletConfig,
     r: &ExecutionRequest,
     t: &ExecutionTerms,
     name: &str,
-) -> Result<rpc::ExecutionReceipt> {
-    let prepared = rpc::prepare_with(chain, c, r, t, None, NOW, NOW + 300)?;
-    let served = authorize_server(&prepared, &SERVER, NOW, None)?;
-    let simulated = rpc::simulate(chain, &served)?;
-    let proof = sign(&simulated, &AGENT, NOW)?;
-    let signed = authorize(&simulated, &[proof], NOW)?;
-    // The signed expense holds the fee bound of this operation, not the caller's ceiling. For
-    // XLM the gas is that bound, and the transaction declares exactly that bound: its resource
-    // fee has the margin of the bound above the simulated fee.
-    let bound = simulated.terms.expense.as_ref().ok_or("no expense")?;
-    let x::TransactionEnvelope::Tx(envelope) = de(&signed.transaction_xdr) else {
-        panic!()
-    };
-    assert_eq!(bound.max_fee_stroops, fee_bound(RECORD_FEE)?);
+) -> Result<SignedOperation> {
+    let signed = authorized(chain, c, r, t)?;
+    // The signed expense holds the fee bound of this operation, not the caller's ceiling; for
+    // XLM the gas that the wallet repays to the sending account is that bound.
+    let bound = signed.prepared.terms.expense.as_ref().ok_or("no expense")?;
     assert_eq!(
         (bound.gas_units, i128::from(bound.max_fee_stroops)),
-        (GAS, GAS)
+        (gas(), gas())
     );
     assert_eq!(
         bound.spent_units - bound.gas_units,
@@ -801,41 +1245,37 @@ fn run(
             .as_ref()
             .map_or(0, |e| e.spent_units - e.gas_units)
     );
-    assert_eq!(envelope.tx.fee, bound.max_fee_stroops);
-    let x::TransactionExt::V1(resources) = &envelope.tx.ext else {
+    let sealed = seal(chain, &signed)?;
+    // The sending account declares the bound: the enforcing simulation needs less.
+    let x::TransactionEnvelope::Tx(envelope) = de(&sealed.transaction_xdr) else {
         panic!()
     };
-    assert_eq!(
-        resources.resource_fee,
-        i64::from(bound.max_fee_stroops - INCLUSION_FEE_STROOPS)
-    );
-    assert!(resources.resource_fee > ENFORCE_FEE);
+    assert_eq!(i128::from(envelope.tx.fee), gas());
+    assert_eq!(source_of(&envelope.tx), sender());
     chain.step(name);
     assert_eq!(
-        rpc::broadcast(chain, &signed, NOW)?,
+        rpc::broadcast(chain, &sealed, NOW)?,
         rpc::Broadcast::Submitted
     );
     assert_eq!(
-        rpc::status_by_hash(chain, &c.network, &signed.transaction_hash)?,
+        rpc::status_by_hash(chain, &c.network, &sealed.transaction_hash)?,
         OperationStatus::Confirmed
     );
-    let receipt = rpc::operation_receipt(chain, c, &r.operation.nonce)?.ok_or("no receipt")?;
-    assert_eq!(receipt.transfer, rpc::expected_receipt(&simulated)?);
-    // The settled transaction reports the gas that the wallet counted for it.
     let settled =
-        rpc::receipt_by_hash(chain, &c.network, &signed.transaction_hash)?.ok_or("no receipt")?;
-    assert_eq!(rpc::counted_gas_units(&settled)?, GAS);
-    // A failed transaction counts nothing.
+        rpc::receipt_by_hash(chain, &c.network, &sealed.transaction_hash)?.ok_or("no receipt")?;
+    rpc::validate_settled_policy_packet(&sealed, &settled)?;
+    // The settled transaction reports the gas that the wallet counted for it.
+    assert_eq!(rpc::counted_gas_units(&settled)?, gas());
     let failed = rpc::VerifiedReceipt {
         status: OperationStatus::Failed,
         ..settled
     };
     assert_eq!(rpc::counted_gas_units(&failed)?, 0);
-    Ok(receipt)
+    Ok(sealed)
 }
-fn owner_submit(chain: &ModelChain, name: &str, xdr: &str) {
+fn submit(chain: &ModelChain, name: &str, xdr: &str, seed: &[u8; 32]) {
     chain.step(name);
-    let signed = sign_owner_transaction(NETWORK, xdr, &OWNER).unwrap();
+    let signed = sign_owner_transaction(NETWORK, xdr, seed).unwrap();
     assert_eq!(
         rpc::send_transaction(chain, NETWORK, &signed).unwrap(),
         rpc::Broadcast::Submitted
@@ -845,8 +1285,11 @@ fn owner_submit(chain: &ModelChain, name: &str, xdr: &str) {
         .unwrap()
         .unwrap();
     assert_eq!(receipt.status, OperationStatus::Confirmed);
-    // An owner transaction is no wallet execution: no spending limit counts gas for it.
+    // An owner or upload transaction is no wallet execution: no limit counts gas for it.
     assert_eq!(rpc::counted_gas_units(&receipt).unwrap(), 0);
+}
+fn owner_submit(chain: &ModelChain, name: &str, xdr: &str) {
+    submit(chain, name, xdr, &OWNER);
 }
 fn params() -> PolicyParams {
     policy::params_from_json(
@@ -865,10 +1308,10 @@ fn params() -> PolicyParams {
     )
     .unwrap()
 }
-/// Synthetic policy wallet code for one tier: a Wasm module that declares custody layout 4.
+/// Synthetic policy wallet code for one tier: a Wasm module that declares custody layout 5.
 fn stand_in_wasm(tier: PolicyTier) -> Vec<u8> {
     let mut meta = 0u32.to_be_bytes().to_vec();
-    for text in [b"allowit_custody_layout".as_slice(), b"4"] {
+    for text in [b"allowit_custody_layout".as_slice(), b"5"] {
         meta.extend((text.len() as u32).to_be_bytes());
         meta.extend(text);
         meta.resize(meta.len().div_ceil(4) * 4, 0);
@@ -915,9 +1358,8 @@ impl rpc::Rpc for DeploymentLedgerClock {
         if method == "simulateTransaction" {
             *elapsed = Some(0);
         } else if let Some(calls) = elapsed.as_mut() {
-            // The next ledger closes after two RPC round trips. The original builder
-            // spent those on redundant checks before requesting the owner's entry. A slow
-            // account read lands past the five-ledger observation window.
+            // The next ledger closes after two RPC round trips. A slow account read lands past
+            // the five-ledger observation window.
             let ledger = LEDGER
                 + if self.slow_account {
                     6
@@ -938,7 +1380,7 @@ impl rpc::Rpc for DeploymentLedgerClock {
                         let mut entry: x::LedgerEntryData =
                             de(response["entries"][0]["xdr"].as_str().unwrap());
                         let x::LedgerEntryData::Account(account) = &mut entry else {
-                            panic!("expected the owner account entry");
+                            panic!("expected the source account entry");
                         };
                         account.seq_num.0 += 1;
                         response["entries"][0]["xdr"] = json!(b64(&entry));
@@ -952,10 +1394,9 @@ impl rpc::Rpc for DeploymentLedgerClock {
 }
 
 #[test]
-fn custom_upload_checks_owner_before_the_next_ledger() {
+fn custom_upload_checks_its_source_before_the_next_ledger() {
     let wasm = stand_in_wasm(PolicyTier::Custom);
     let module = hash(&wasm);
-    let owner = account_for_seed(&OWNER);
     for (slow_account, changed_owner, wrong_network) in [
         (false, false, false),
         (true, false, false),
@@ -975,51 +1416,36 @@ fn custom_upload_checks_owner_before_the_next_ledger() {
             now: NOW,
             max_fee_stroops: MAX_FEE,
         };
-        let prepared = deployer.upload_wasm(&owner, &wasm);
+        let prepared = deployer.upload_wasm(&sender(), &wasm);
         if slow_account || changed_owner || wrong_network {
             assert!(
                 prepared.is_err(),
-                "stale, changed or wrong-network owner observation"
+                "stale, changed or wrong-network source observation"
             );
         } else {
             let packet = prepared.unwrap();
             assert_eq!(packet.wasm_hash, module);
-            assert_eq!(packet.source, owner);
+            assert_eq!(packet.source, sender());
         }
     }
 }
 
-/// The complete workflow of one tier; returns the recorded steps.
-fn workflow(tier: PolicyTier) -> Vec<Step> {
-    let wasm = wasm_for(tier);
-    let module = hash(&wasm);
-    let chain = ModelChain::new(BTreeMap::from([(module, tier)]));
+/// The installation of a tier's wallet, before its creation.
+fn installation(tier: PolicyTier, module: [u8; 32], salt: [u8; 32]) -> WalletConfig {
     let owner = account_for_seed(&OWNER);
-    let deployer = Deployer {
-        rpc: &chain,
-        network: NETWORK,
-        now: NOW,
-        max_fee_stroops: MAX_FEE,
-    };
-    // 1. Upload the tier's wallet code.
-    let upload = deployer.upload_wasm(&owner, &wasm).unwrap();
-    assert_eq!(upload.wasm_hash, module);
-    owner_submit(&chain, "upload", &upload.transaction_xdr);
-    // 2. Install: derive the wallet, bind the portable source to the tier and create it.
-    let salt = [tier as u8 + 0x11; 32];
+    let rules = policy::tier_rules(tier, SOURCE).unwrap();
     let mut c = WalletConfig {
         network: NETWORK.into(),
         policy_instance: [7; 32],
         wallet: admin::wallet_address(NETWORK, &owner, &salt).unwrap(),
-        owner: owner.clone(),
+        owner,
         agent: account_for_seed(&AGENT),
-        fee_account: None,
         server: account_for_seed(&SERVER),
         route: WalletRoute::PolicyWallet,
         tier: Some(tier),
         language: PolicyLanguage::Portable,
-        rules: policy::tier_rules(tier, SOURCE).unwrap(),
         params: params(),
+        rules,
         source_digest: [0; 32],
         asset: xlm(),
         asset_symbol: "XLM".into(),
@@ -1031,81 +1457,54 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
     };
     c.source_digest =
         policy::installed_source_digest(tier, &module, &c.asset, &c.rules, SOURCE).unwrap();
-    let config = PolicyConfig::for_policy(&c, false).unwrap();
-    let created = deployer.create_wallet(&config, &wasm, salt).unwrap();
+    c
+}
+/// The server uploads the code; the owner creates and funds the wallet with one signature.
+fn create(chain: &ModelChain, tier: PolicyTier, wasm: &[u8], salt: [u8; 32]) -> WalletConfig {
+    let module = hash(wasm);
+    let d = Deployer {
+        rpc: chain,
+        network: NETWORK,
+        now: NOW,
+        max_fee_stroops: MAX_FEE,
+    };
+    let upload = d.upload_wasm(&sender(), wasm).unwrap();
+    assert_eq!(upload.wasm_hash, module);
+    submit(chain, "upload", &upload.transaction_xdr, &SENDER);
+    let c = installation(tier, module, salt);
+    let config = PolicyConfig::for_policy(&c).unwrap();
+    let created = d
+        .deploy_and_fund(&deployer(), &config, wasm, salt, &[(xlm(), FUNDING)])
+        .unwrap();
     assert_eq!(created.wallet.as_deref(), Some(c.wallet.as_str()));
-    owner_submit(&chain, "create", &created.transaction_xdr);
-    chain.fund(1_000_000_000);
-    // 3. Discovery reads the live binding, params and state.
+    assert_eq!(created.function, "create_wallet");
+    owner_submit(chain, "create", &created.transaction_xdr);
+    assert_eq!(chain.balance(), FUNDING);
+    c
+}
+/// The trusted state with the server's sending account as the source of the next operation.
+fn sending_state(chain: &ModelChain, c: &WalletConfig) -> TrustedState {
+    let mut state = rpc::trusted_state(chain, c, Some(chain.accounting())).unwrap();
+    state.source = rpc::get_account(chain, &sender()).unwrap();
+    state
+}
+
+/// The complete workflow of one tier; returns the recorded steps.
+fn workflow(tier: PolicyTier) -> Vec<Step> {
+    let wasm = wasm_for(tier);
+    let module = hash(&wasm);
+    let chain = ModelChain::new(BTreeMap::from([(module, tier)]));
+    // 1. The server uploads the code; the owner creates and funds the wallet.
+    let c = create(&chain, tier, &wasm, [tier as u8 + 0x11; 32]);
+    // 2. Discovery reads the live configuration and figures.
     let found = rpc::trusted_state_for_discovery(&chain, &c, None).unwrap();
     assert!(!found.paused);
     assert_eq!(found.state.contract_version, Some(CONTRACT_VERSION));
-    // 4. A transfer, priced with server-attested gas in XLM.
+    // 3. A transfer, priced with server-attested gas in XLM.
     let recipient = account_for_seed(&RECIPIENT);
-    let ledger = chain.0.lock().unwrap().ledger;
-    let transfer = request::transfer(&c, &found.state, [1; 32], &recipient, 10_000_000).unwrap();
-    // A final simulation that needs more than the signed fee bound is refused, so no
-    // transaction declares, or pays, a fee above the gas that its wallet counts. The bound
-    // itself is admitted.
-    for (enforce_fee, admitted) in [(GAS as i64 - 99, false), (GAS as i64 - 100, true)] {
-        chain.0.lock().unwrap().enforce_fee = enforce_fee;
-        let prepared = rpc::prepare_with(
-            &chain,
-            &c,
-            &transfer,
-            &terms(10_000_000, ledger),
-            None,
-            NOW,
-            NOW + 300,
-        )
-        .unwrap();
-        let served = authorize_server(&prepared, &SERVER, NOW, None).unwrap();
-        match rpc::simulate(&chain, &served) {
-            Ok(simulated) => {
-                let x::TransactionEnvelope::Tx(envelope) = de(&simulated.transaction_xdr) else {
-                    panic!()
-                };
-                assert!(admitted && i128::from(envelope.tx.fee) == GAS);
-            }
-            Err(e) => assert!(!admitted && e.contains("exceeds approved fee bound"), "{e}"),
-        }
-    }
-    chain.0.lock().unwrap().enforce_fee = ENFORCE_FEE;
-    // The network's resource fee rises between preparation and the server's simulation at
-    // execution. The prepared transaction declares its signed bound, so its resource fee
-    // still covers the new simulation and the unchanged transaction proceeds. A release that
-    // declared the simulated fee itself refused the first step here. Only a rise above the
-    // signed bound is refused.
-    let prepared = rpc::prepare_with(
-        &chain,
-        &c,
-        &transfer,
-        &terms(10_000_000, ledger),
-        None,
-        NOW,
-        NOW + 300,
-    )
-    .unwrap();
-    let served = authorize_server(&prepared, &SERVER, NOW, None).unwrap();
-    let simulated = rpc::simulate(&chain, &served).unwrap();
-    let retained: PreparedOperation =
-        serde_json::from_str(&serde_json::to_string(&simulated).unwrap()).unwrap();
-    for (enforce_fee, covered) in [
-        (ENFORCE_FEE + 2, true),
-        (GAS as i64 - 100, true),
-        (GAS as i64 - 99, false),
-    ] {
-        chain.0.lock().unwrap().enforce_fee = enforce_fee;
-        match rpc::revalidate_prepared(&chain, &retained, NOW + 1) {
-            Ok(validated) => {
-                assert!(covered, "a fee of {enforce_fee} is above the signed bound");
-                assert_eq!(validated.transaction_hash, retained.transaction_hash);
-                assert_eq!(validated.transaction_xdr, retained.transaction_xdr);
-            }
-            Err(e) => assert!(!covered && e.contains("do not cover"), "{enforce_fee}: {e}"),
-        }
-    }
-    chain.0.lock().unwrap().enforce_fee = ENFORCE_FEE;
+    let state = sending_state(&chain, &c);
+    let ledger = chain.ledger();
+    let transfer = request::transfer(&c, &state, [1; 32], &recipient, 10_000_000).unwrap();
     // A policy can refuse the lowest fee bound alone. The fee is then simulated at the ceiling,
     // and the signed bound is the same. A refusal of both is the refusal of the lowest bound.
     let priced = |refused: &[i128], cost: Option<fn(i128) -> i64>| {
@@ -1118,7 +1517,7 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
             &c,
             &transfer,
             &terms(10_000_000, ledger),
-            None,
+            Some(chain.accounting()),
             NOW,
             NOW + 300,
         )
@@ -1127,9 +1526,9 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
     let bound = priced(&[lowest], None).unwrap().terms.expense.unwrap();
     assert_eq!(
         (bound.gas_units, bound.spent_units),
-        (GAS, 10_000_000 + GAS)
+        (gas(), 10_000_000 + gas())
     );
-    for refused in [&[lowest, i128::from(MAX_FEE)][..], &[GAS][..]] {
+    for refused in [&[lowest, i128::from(MAX_FEE)][..], &[gas()][..]] {
         assert!(
             priced(refused, None)
                 .unwrap_err()
@@ -1137,22 +1536,13 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
         );
     }
     // A policy can need more resources with the priced gas than with the lowest bound. The
-    // operation is then priced from its own simulation: 3,000 + 100 + 30. It declares that
-    // bound as its fee.
+    // operation is then priced from its own simulation: 3,000 + 100 + 30.
     let repriced = priced(&[], Some(|_| 3_000)).unwrap();
     let bound = repriced.terms.expense.as_ref().unwrap();
-    let x::TransactionEnvelope::Tx(envelope) = de(&repriced.transaction_xdr) else {
-        panic!()
-    };
-    assert_eq!(
-        (bound.gas_units, bound.max_fee_stroops, envelope.tx.fee),
-        (3_130, 3_130, 3_130)
-    );
+    assert_eq!((bound.gas_units, bound.max_fee_stroops), (3_130, 3_130));
     // A resource fee inside the margin of the signed bound prices nothing again.
-    let inside = priced(&[], Some(|_| GAS as i64 - 100)).unwrap();
-    assert_eq!(inside.terms.expense.as_ref().unwrap().gas_units, GAS);
-    // A policy whose cost always exceeds its bound is refused after the pricing rounds, and
-    // one that needs more than the ceiling is refused at the ceiling.
+    let inside = priced(&[], Some(|_| gas() as i64 - 100)).unwrap();
+    assert_eq!(inside.terms.expense.as_ref().unwrap().gas_units, gas());
     for cost in [(|gas| gas as i64) as fn(i128) -> i64, |_| {
         i64::from(MAX_FEE)
     }] {
@@ -1162,7 +1552,47 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
                 .contains("exceeds approved fee bound")
         );
     }
-    let receipt = run(
+    // The sending account's enforcing simulation sets the final fee: the signed bound while the
+    // fee fits it, the higher required fee up to the installed ceiling, and no seal above it.
+    // The wallet repays the signed gas either way; the server carries a difference.
+    let signed = authorized(&chain, &c, &transfer, &terms(10_000_000, ledger)).unwrap();
+    for (enforce_fee, fee) in [
+        (ENFORCE_FEE, Some(gas() as u32)),
+        (gas() as i64, Some(gas() as u32 + 100)),
+        (i64::from(MAX_FEE) - 99, None),
+    ] {
+        chain.0.lock().unwrap().enforce_fee = enforce_fee;
+        match seal(&chain, &signed) {
+            Ok(sealed) => {
+                let x::TransactionEnvelope::Tx(envelope) = de(&sealed.transaction_xdr) else {
+                    panic!()
+                };
+                assert_eq!(Some(envelope.tx.fee), fee);
+            }
+            Err(e) => assert!(fee.is_none(), "{enforce_fee}: {e}"),
+        }
+    }
+    chain.0.lock().unwrap().enforce_fee = ENFORCE_FEE;
+    // A tampered cosignature fails the wallet's check in the enforcing simulation.
+    let mut forged = signed.clone();
+    let x::TransactionEnvelope::Tx(mut envelope) = de(&forged.transaction_xdr) else {
+        panic!()
+    };
+    let mut operations = envelope.tx.operations.to_vec();
+    let x::OperationBody::InvokeHostFunction(op) = &mut operations[0].body else {
+        panic!()
+    };
+    let mut auth = op.auth.to_vec();
+    let x::SorobanCredentials::Address(credentials) = &mut auth[0].credentials else {
+        panic!()
+    };
+    credentials.signature = contract::cosignatures(&[9; 64], &[9; 64]).unwrap();
+    op.auth = auth.try_into().unwrap();
+    envelope.tx.operations = operations.try_into().unwrap();
+    forged.transaction_xdr = b64(&x::TransactionEnvelope::Tx(envelope));
+    assert!(seal(&chain, &forged).is_err());
+    let before = chain.balance();
+    run(
         &chain,
         &c,
         &transfer,
@@ -1170,18 +1600,45 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
         "transfer",
     )
     .unwrap();
-    assert_eq!(receipt.transfer.to, recipient);
-    assert!(receipt.deposit.is_none());
-    let standard = chain.state().policy_state;
-    assert_eq!(standard.get("calls"), Some(&PolicyValue::Int(1)));
+    assert_eq!(chain.balance(), before - 10_000_000 - gas());
+    let figures = chain.figures();
+    let kept = kept(tier, &chain.config());
     assert_eq!(
-        standard.get("spent"),
-        Some(&PolicyValue::Int(10_000_000 + GAS))
+        (figures.calls, figures.spent),
+        (
+            if kept & CALLS != 0 { 1 } else { 0 },
+            if kept & SPENT != 0 {
+                10_000_000 + gas()
+            } else {
+                0
+            }
+        )
     );
-    // A transfer over the payment limit is denied on the host before any signature.
-    let ledger = chain.0.lock().unwrap().ledger;
-    let over = request::transfer(&c, &found.state, [9; 32], &recipient, 60_000_000).unwrap();
+    // The same authorization runs once.
+    assert!(seal(&chain, &signed).is_err());
+    // A transfer over the payment limit is denied before any signature: by the server's
+    // evaluation over its accounting, and for Common and Custom on the host too. Simple runs no
+    // rule on chain; Custom runs its source, not prefix rules.
+    let state = sending_state(&chain, &c);
+    let ledger = chain.ledger();
+    let over = request::transfer(&c, &state, [9; 32], &recipient, 60_000_000).unwrap();
+    assert_eq!(c.rules.is_empty(), tier != PolicyTier::Common);
     assert!(
+        rpc::prepare_with(
+            &chain,
+            &c,
+            &over,
+            &terms(60_000_000, ledger),
+            Some(chain.accounting()),
+            NOW,
+            NOW + 300
+        )
+        .unwrap_err()
+        .contains("PaymentLimitExceeded")
+    );
+    // Without the server's accounting, a Simple or Common wallet is not authorized.
+    let needs = kept != packed::ALL;
+    assert_eq!(
         rpc::prepare_with(
             &chain,
             &c,
@@ -1192,47 +1649,23 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
             NOW + 300
         )
         .unwrap_err()
-        .contains("PaymentLimitExceeded")
+        .contains("needs the server's accounting"),
+        needs
     );
-    // 5. A SEP-56 deposit, then a redeem of part of its shares: Simple and Common run both,
-    // Custom's code runs no deposit.
-    let ledger = chain.0.lock().unwrap().ledger;
-    let deposit =
-        request::deposit(&c, &found.state, [2; 32], &vault(), 5_000_000, 5_000_000).unwrap();
-    let priced = ExecutionTerms {
+    // 4. A SEP-56 deposit, then a redeem of part of its shares.
+    let ledger = chain.ledger();
+    let deposit = request::deposit(&c, &state, [2; 32], &vault(), 5_000_000, 5_000_000).unwrap();
+    let priced = |ledger: u32| ExecutionTerms {
         args: PolicyParams::default(),
         expense: Some(ExpenseBounds::xlm(0, 0, MAX_FEE, ledger - 1, NOW).unwrap()),
+        gas: None,
+        sender: Some(sender()),
     };
-    if tier == PolicyTier::Custom {
-        assert!(
-            run(&chain, &c, &deposit, &priced, "deposit")
-                .unwrap_err()
-                .contains("does not run deposit")
-        );
-    } else {
-        let receipt = run(&chain, &c, &deposit, &priced, "deposit").unwrap();
-        let shares = receipt.deposit.unwrap();
-        assert_eq!(
-            (shares.vault.as_str(), shares.assets, shares.shares),
-            (vault().as_str(), 5_000_000, 5_000_000)
-        );
-        let ledger = chain.0.lock().unwrap().ledger;
-        let redeem =
-            request::redeem(&c, &found.state, [5; 32], &vault(), 2_000_000, 2_000_000).unwrap();
-        let priced = ExecutionTerms {
-            args: PolicyParams::default(),
-            expense: Some(ExpenseBounds::xlm(0, 0, MAX_FEE, ledger - 1, NOW).unwrap()),
-        };
-        let receipt = run(&chain, &c, &redeem, &priced, "redeem").unwrap();
-        assert_eq!(
-            (receipt.transfer.token.as_str(), receipt.transfer.amount),
-            (vault().as_str(), 2_000_000)
-        );
-        let assets = receipt.redeem.unwrap();
-        assert_eq!((assets.shares, assets.assets), (2_000_000, 2_000_000));
-        assert!(receipt.deposit.is_none());
-    }
-    // 6. The owner pauses and resumes at the next deployment versions.
+    run(&chain, &c, &deposit, &priced(ledger), "deposit").unwrap();
+    let ledger = chain.ledger();
+    let redeem = request::redeem(&c, &state, [5; 32], &vault(), 2_000_000, 2_000_000).unwrap();
+    run(&chain, &c, &redeem, &priced(ledger), "redeem").unwrap();
+    // 5. The owner pauses and resumes at the next deployment versions.
     let mut owner_admin = Admin::new(OwnerAdmin {
         rpc: &chain,
         config: &c,
@@ -1252,49 +1685,58 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
     );
     let resumed = owner_admin.set_pause(false, DeploymentVersion(2)).unwrap();
     owner_submit(&chain, "resume", &resumed.transaction_xdr);
-    // 7. Params update without new code: a lower payment limit.
+    // 6. Params update without new code: a lower payment limit.
     let mut lower = params();
     lower
         .0
         .insert("payment_limit".into(), PolicyValue::Int(20_000_000));
     // The daily limit leaves room for 15,001,000 more units.
-    let Some(PolicyValue::Int(day_spent)) = chain.state().policy_state.get("day_spent").cloned()
-    else {
-        panic!()
-    };
+    // The server's accounting counts every execution; a wallet that keeps the day's spent
+    // agrees with it.
+    let day_spent = chain.accounting().spent_daily;
+    if kept & DAY_SPENT != 0 {
+        assert_eq!(chain.figures().day_spent, day_spent);
+    }
     lower.0.insert(
         "daily_spending_limit".into(),
         PolicyValue::Int(day_spent + 15_001_000),
     );
-    let (deployment, check) =
-        PolicyDeployment::for_source(&c, SOURCE, lower.clone(), false).unwrap();
+    let (deployment, check) = PolicyDeployment::for_source(&c, SOURCE, lower.clone()).unwrap();
     assert!(check.warnings.is_empty());
     let updated = owner_admin
         .deploy_policy(DeploymentVersion(3), deployment)
         .unwrap();
     owner_submit(&chain, "params", &updated.transaction_xdr);
-    assert_eq!(chain.state().params, lower);
-    let ledger = chain.0.lock().unwrap().ledger;
-    // A debit that fits the daily limit with the lowest fee, and not with the fee bound that the
-    // wallet would count, is denied on the host before any signature.
-    let over = request::transfer(&c, &found.state, [8; 32], &recipient, 15_000_000).unwrap();
-    assert!(
-        rpc::prepare_with(
-            &chain,
-            &c,
-            &over,
-            &terms(15_000_000, ledger),
-            None,
-            NOW,
-            NOW + 300
-        )
-        .unwrap_err()
-        .contains("DailySpendingLimitExceeded")
+    assert_eq!(
+        chain.config().params,
+        installed_params(tier, &c.rules, &lower)
     );
+    let c = WalletConfig { params: lower, ..c };
+    let state = sending_state(&chain, &c);
+    let ledger = chain.ledger();
+    let has = |rule: &str| tier == PolicyTier::Custom || c.rules.iter().any(|r| r == rule);
+    // A debit that fits the daily limit with the lowest fee, and not with the fee bound that the
+    // wallet counts, is denied on the host before any signature.
+    let over = request::transfer(&c, &state, [8; 32], &recipient, 15_000_000).unwrap();
+    if has("daily_spending_limit") {
+        assert!(
+            rpc::prepare_with(
+                &chain,
+                &c,
+                &over,
+                &terms(15_000_000, ledger),
+                Some(chain.accounting()),
+                NOW,
+                NOW + 300
+            )
+            .unwrap_err()
+            .contains("DailySpendingLimitExceeded")
+        );
+    }
     // A debit that fits with the counted fee bound runs. The caller's fee ceiling would not fit.
-    let again = request::transfer(&c, &found.state, [3; 32], &recipient, 14_999_000).unwrap();
-    assert!(14_999_000 + GAS <= 15_001_000 && 14_999_000 + i128::from(MAX_FEE) > 15_001_000);
-    let receipt = run(
+    let again = request::transfer(&c, &state, [3; 32], &recipient, 14_999_000).unwrap();
+    assert!(14_999_000 + gas() <= 15_001_000 && 14_999_000 + i128::from(MAX_FEE) > 15_001_000);
+    let sealed = run(
         &chain,
         &c,
         &again,
@@ -1302,85 +1744,58 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
         "transfer_v3",
     )
     .unwrap();
-    assert_eq!(receipt.transfer.deployment_version, 3);
-    let ledger = chain.0.lock().unwrap().ledger;
-    let blocked = request::transfer(&c, &found.state, [4; 32], &recipient, 25_000_000).unwrap();
-    assert!(
-        rpc::prepare_with(
-            &chain,
-            &c,
-            &blocked,
-            &terms(25_000_000, ledger),
-            None,
-            NOW,
-            NOW + 300
-        )
-        .unwrap_err()
-        .contains("PaymentLimitExceeded")
-    );
-    // 8. Recovery of part of the balance to the owner.
-    let recovered = owner_admin.vendor().config.owner.clone();
+    let x::TransactionEnvelope::Tx(envelope) = de(&sealed.transaction_xdr) else {
+        panic!()
+    };
+    let x::HostFunction::InvokeContract(call) = &host_op(&envelope.tx).host_function else {
+        panic!()
+    };
+    assert_eq!(items(&call.args[0])[1], x::ScVal::U32(3));
+    let ledger = chain.ledger();
+    let blocked = request::transfer(&c, &state, [4; 32], &recipient, 25_000_000).unwrap();
+    if has("payment_limit") {
+        assert!(
+            rpc::prepare_with(
+                &chain,
+                &c,
+                &blocked,
+                &terms(25_000_000, ledger),
+                Some(chain.accounting()),
+                NOW,
+                NOW + 300
+            )
+            .unwrap_err()
+            .contains("PaymentLimitExceeded")
+        );
+    }
+    // 7. Recovery of part of the balance to the owner, then the owner's stop: one call that
+    // pauses the wallet and returns the rest.
     let mut admin = OwnerAdmin {
         rpc: &chain,
         config: &c,
         now: NOW,
     };
-    let recovery = admin.recover_to(&recovered, 100_000_000).unwrap();
+    let recovery = admin.recover_to(&c.owner, 100_000_000).unwrap();
     owner_submit(&chain, "recover", &recovery.transaction_xdr);
+    let stop = admin.stop(DeploymentVersion(4)).unwrap();
+    owner_submit(&chain, "stop", &stop.transaction_xdr);
+    assert_eq!(chain.balance(), 0);
+    assert!(chain.config().paused);
     let model = chain.0.lock().unwrap();
     model.steps.clone()
 }
 
-/// The fee bound is integer money logic that rounds up: it covers the declared fee of every
-/// resource fee, and lowered gas never prices the fee below its rate.
 /// A tier's wallet on a model chain after one settled transfer, with its installation.
 fn wallet_with_usage(tier: PolicyTier) -> (ModelChain, WalletConfig) {
     let wasm = wasm_for(tier);
     let module = hash(&wasm);
     let chain = ModelChain::new(BTreeMap::from([(module, tier)]));
-    let owner = account_for_seed(&OWNER);
-    let deployer = Deployer {
-        rpc: &chain,
-        network: NETWORK,
-        now: NOW,
-        max_fee_stroops: MAX_FEE,
-    };
-    let upload = deployer.upload_wasm(&owner, &wasm).unwrap();
-    owner_submit(&chain, "upload", &upload.transaction_xdr);
-    let salt = [tier as u8 + 0x21; 32];
-    let mut c = WalletConfig {
-        network: NETWORK.into(),
-        policy_instance: [7; 32],
-        wallet: admin::wallet_address(NETWORK, &owner, &salt).unwrap(),
-        owner: owner.clone(),
-        agent: account_for_seed(&AGENT),
-        fee_account: None,
-        server: account_for_seed(&SERVER),
-        route: WalletRoute::PolicyWallet,
-        tier: Some(tier),
-        language: PolicyLanguage::Portable,
-        rules: policy::tier_rules(tier, SOURCE).unwrap(),
-        params: params(),
-        source_digest: [0; 32],
-        asset: xlm(),
-        asset_symbol: "XLM".into(),
-        asset_issuer: None,
-        policy_source: SOURCE.into(),
-        source_hash: hash(SOURCE),
-        module_digest: module,
-        max_fee_stroops: MAX_FEE,
-    };
-    c.source_digest =
-        policy::installed_source_digest(tier, &module, &c.asset, &c.rules, SOURCE).unwrap();
-    let config = PolicyConfig::for_policy(&c, false).unwrap();
-    let created = deployer.create_wallet(&config, &wasm, salt).unwrap();
-    owner_submit(&chain, "create", &created.transaction_xdr);
-    chain.fund(1_000_000_000);
-    let found = rpc::trusted_state_for_discovery(&chain, &c, None).unwrap();
-    let ledger = chain.0.lock().unwrap().ledger;
+    let c = create(&chain, tier, &wasm, [tier as u8 + 0x21; 32]);
+    let state = sending_state(&chain, &c);
+    let ledger = chain.ledger();
     let transfer = request::transfer(
         &c,
-        &found.state,
+        &state,
         [1; 32],
         &account_for_seed(&RECIPIENT),
         10_000_000,
@@ -1397,8 +1812,8 @@ fn wallet_with_usage(tier: PolicyTier) -> (ModelChain, WalletConfig) {
     (chain, c)
 }
 /// The server's owner step of a params update is the packet that the owner reconstructs from
-/// the installation alone. The settled update keeps the recorded usage and the nonce, moves
-/// the configuration revision by one, and is refused at any other revision.
+/// the installation alone. The settled update keeps the recorded figures, moves the
+/// configuration revision by one, and is refused at any other revision.
 #[test]
 fn owner_params_update_step_matches_the_owner_reconstruction_and_keeps_usage() {
     use allowit_core::AllowitValue as V;
@@ -1418,11 +1833,12 @@ fn owner_params_update_step_matches_the_owner_reconstruction_and_keeps_usage() {
                 .map_err(allowit_core::client::error::Error::config)
         }
     }
-    for tier in [PolicyTier::Simple, PolicyTier::Common, PolicyTier::Custom] {
+    for tier in [PolicyTier::Common, PolicyTier::Custom] {
         let (chain, c) = wallet_with_usage(tier);
         let chain = Arc::new(chain);
-        let before = chain.state();
-        assert_eq!(before.nonce, 1, "{tier:?}");
+        let before = chain.config();
+        let figures = chain.figures();
+        assert_eq!(figures.calls, 1, "{tier:?}");
         let verified = params_update::verify(&*chain, "policy", &c).unwrap();
         assert!(verified.matches, "{tier:?} {:?}", verified.comparisons);
         let change = |units: i128, expected_revision| ParamsUpdate {
@@ -1430,7 +1846,34 @@ fn owner_params_update_step_matches_the_owner_reconstruction_and_keeps_usage() {
             expected_revision,
             changes: [("daily_spending_limit".to_owned(), CoreValue(V::Int(units)))].into(),
         };
-        let update = change(250_000_000, Some(before.deployment_version));
+        let revision = u64::from(before.deployment_version);
+        let update = change(250_000_000, Some(revision));
+        // The owner changed the gas cap on the ledger: an update from this installation would
+        // write the old gas cap back, so it is refused, and verification names the difference.
+        let other_gas_cap = WalletConfig {
+            max_fee_stroops: MAX_FEE - 1,
+            ..c.clone()
+        };
+        assert!(
+            params_update::installed(&*chain, &other_gas_cap, &update)
+                .unwrap_err()
+                .to_string()
+                .contains("gas cap")
+        );
+        let differs = params_update::verify(&*chain, "policy", &other_gas_cap).unwrap();
+        assert!(!differs.matches);
+        let gas_cap_row = serde_json::to_value(&differs.comparisons)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row.to_string().contains("gasCap"))
+            .cloned()
+            .unwrap();
+        assert!(
+            gas_cap_row.to_string().contains(&(MAX_FEE - 1).to_string()),
+            "{gas_cap_row}"
+        );
         let owners = allowit_stellar::PLUGIN.owner_runtime();
         let document = owners
             .configuration(NETWORK, &serde_json::to_vec(&c).unwrap())
@@ -1461,14 +1904,14 @@ fn owner_params_update_step_matches_the_owner_reconstruction_and_keeps_usage() {
         // packet exists. A standard tier also refuses a value outside the rule's range; a
         // Custom wallet takes any typed value, and the server checks the range of a rule.
         let mut refusals = vec![
-            change(250_000_000, Some(before.deployment_version + 1)),
+            change(250_000_000, Some(revision + 1)),
             ParamsUpdate {
                 changes: [("vendor_limit".to_owned(), CoreValue(V::Int(1)))].into(),
                 ..update.clone()
             },
         ];
         if tier != PolicyTier::Custom {
-            refusals.push(change(-1, Some(before.deployment_version)));
+            refusals.push(change(-1, Some(revision)));
         }
         for refused in refusals {
             assert!(
@@ -1516,11 +1959,11 @@ fn owner_params_update_step_matches_the_owner_reconstruction_and_keeps_usage() {
             },
             action: OwnerAction::UpdatePolicy {
                 wallet: c.wallet.clone(),
-                deployment: Box::new(params_update::deployment(&c, update, false).unwrap()),
+                deployment: Box::new(params_update::deployment(&c, update).unwrap()),
                 version,
             },
         };
-        let next_version = before.deployment_version + 1;
+        let next_version = revision + 1;
         validate_owner_transaction(&transaction, &intent(&update, next_version), NOW).unwrap();
         // Another value, another revision or another wallet is not the owner's intent.
         assert!(
@@ -1541,16 +1984,15 @@ fn owner_params_update_step_matches_the_owner_reconstruction_and_keeps_usage() {
         }
         assert!(validate_owner_transaction(&transaction, &elsewhere, NOW).is_err());
         owner_submit(&chain, "update_params", &step.payload);
-        // Usage and nonce carry over; only the params and the revision changed.
-        let after = chain.state();
+        // The figures carry over; only the params and the revision changed.
+        let after = chain.config();
         let next = params_update::updated_config(&c, &update).unwrap();
         assert_eq!(after.params, next.params, "{tier:?}");
-        assert_eq!(after.deployment_version, next_version);
-        assert_eq!(after.nonce, before.nonce);
-        assert_eq!(after.policy_state, before.policy_state);
+        assert_eq!(u64::from(after.deployment_version), next_version);
+        assert_eq!(chain.figures(), figures);
         assert_eq!(
-            (&after.source_digest, &after.rules, &after.owner),
-            (&before.source_digest, &before.rules, &before.owner)
+            (&after.source_hash, &after.rules, &after.owner),
+            (&before.source_hash, &before.rules, &before.owner)
         );
         // The stored installation after the update is the one that the ledger now matches.
         let stored = owners.with_params(&document, &update).unwrap();
@@ -1562,8 +2004,6 @@ fn owner_params_update_step_matches_the_owner_reconstruction_and_keeps_usage() {
         assert!(fresh.matches, "{tier:?} {:?}", fresh.comparisons);
         assert_eq!(fresh.state.revision, next_version);
         assert_eq!(fresh.state.counters, verified.state.counters);
-        assert_eq!(fresh.state.counters.as_ref().unwrap().nonce, 1);
-        // Each tier commits its usage on the ledger, also Simple.
         assert_eq!(fresh.state.counters_from, "ledger");
         assert_eq!(fresh.state.counters.as_ref().unwrap().calls, 1, "{tier:?}");
         let stale = params_update::verify(&*chain, "policy", &c).unwrap();
@@ -1584,7 +2024,7 @@ fn a_fee_bound_covers_the_declared_fee_and_lowers_gas_rounded_up() {
         (1, 102),
         (100, 201),
         (101, 203),
-        (RECORD_FEE, GAS as u32),
+        (RECORD_FEE, 1_615),
         (2_644_142, 2_670_684),
     ] {
         assert_eq!(fee_bound(resource).unwrap(), bound, "{resource}");
@@ -1637,22 +2077,32 @@ fn a_fee_bound_covers_the_declared_fee_and_lowers_gas_rounded_up() {
 #[test]
 fn simple_common_and_custom_wallets_run_the_complete_workflow() {
     let mut lines = vec![
-        "# Recorded by stellar/core tests/policy_wallet.rs; executed by crates/policy-wallet/src/core_vectors_tests.rs.".to_string(),
+        "# Recorded by crates/allowit-stellar/tests/policy_wallet.rs; executed by crates/policy-wallet/src/core_vectors_tests.rs.".to_string(),
         format!("network {}", hexs(&network_id(NETWORK).unwrap())),
         format!("timestamp {NOW}"),
-        format!("ledger {LEDGER}"),
         format!("vault {}", hexs(&address(&vault()).unwrap().to_xdr(Limits::none()).unwrap())),
+        format!("deployer {}", hexs(&address(&deployer()).unwrap().to_xdr(Limits::none()).unwrap())),
     ];
     for tier in [PolicyTier::Simple, PolicyTier::Common, PolicyTier::Custom] {
         let steps = workflow(tier);
         let names: Vec<_> = steps.iter().map(|s| s.0.as_str()).collect();
-        let mut expected = vec!["upload", "create", "transfer"];
-        if tier != PolicyTier::Custom {
-            expected.extend(["deposit", "redeem"]);
-        }
-        expected.extend(["pause", "resume", "params", "transfer_v3", "recover"]);
-        assert_eq!(names, expected);
-        for (name, envelope, result, state) in steps {
+        assert_eq!(
+            names,
+            [
+                "upload",
+                "create",
+                "transfer",
+                "deposit",
+                "redeem",
+                "pause",
+                "resume",
+                "params",
+                "transfer_v3",
+                "recover",
+                "stop"
+            ]
+        );
+        for (name, envelope, ledger, result, state) in steps {
             if name == "upload" {
                 continue;
             }
@@ -1660,9 +2110,10 @@ fn simple_common_and_custom_wallets_run_the_complete_workflow() {
                 panic!()
             };
             lines.push(format!(
-                "{} {} {} {} {}",
+                "{} {} {} {} {} {}",
                 tier.kind(),
                 name,
+                ledger,
                 hexs(&env.tx.to_xdr(Limits::none()).unwrap()),
                 hexs(&result.to_xdr(Limits::none()).unwrap()),
                 hexs(&state.unwrap().to_xdr(Limits::none()).unwrap()),
@@ -1687,42 +2138,570 @@ fn simple_common_and_custom_wallets_run_the_complete_workflow() {
 
 #[test]
 fn recorded_vectors_decode_to_the_exact_workflow_packets() {
-    // Every recorded transaction is a canonical layout 4 packet that this crate built: the
-    // constructor and owner packets decode with the contract encoders, and each execution
-    // carries the full source identity of the shared policy source.
+    // Every recorded transaction is a layout 5 packet that this crate built: the creation goes
+    // through the deployer with the owner's whole tree, and each execution carries the wallet's
+    // own authorization with both cosignatures and is sent from the server's sending account.
     let recorded = std::fs::read_to_string(VECTORS).unwrap();
     let mut executions = 0;
     for line in recorded.lines().filter(|l| !l.starts_with('#')) {
         let parts: Vec<_> = line.split(' ').collect();
-        if parts.len() != 5 {
+        if parts.len() != 6 {
             continue;
         }
-        let bytes = (0..parts[2].len())
+        let bytes = (0..parts[3].len())
             .step_by(2)
-            .map(|i| u8::from_str_radix(&parts[2][i..i + 2], 16).unwrap())
+            .map(|i| u8::from_str_radix(&parts[3][i..i + 2], 16).unwrap())
             .collect::<Vec<_>>();
         let tx = x::Transaction::from_xdr(&bytes, Limits::none()).unwrap();
         let op = host_op(&tx);
-        match (&op.host_function, parts[1]) {
-            (x::HostFunction::CreateContractV2(args), "create") => {
+        let x::HostFunction::InvokeContract(call) = &op.host_function else {
+            panic!("unexpected recorded step {}", parts[1])
+        };
+        match parts[1] {
+            "create" => {
+                assert_eq!(call.contract_address, address(&deployer()).unwrap());
                 admin::validate_auth(NETWORK, &op.host_function, &op.auth, None).unwrap();
-                let config = &args.constructor_args[0];
-                assert_eq!(
-                    PolicyParams::from_scval(field(config, "params")).unwrap(),
-                    params()
-                );
+                let config = &items(&call.args[3])[0];
+                assert_eq!(digest(field(config, "source_hash")), hash(SOURCE));
+                assert_eq!(source_of(&tx), account_for_seed(&OWNER));
             }
-            (x::HostFunction::InvokeContract(call), name)
-                if name.starts_with("transfer") || name == "deposit" || name == "redeem" =>
-            {
+            name if name.starts_with("transfer") || name == "deposit" || name == "redeem" => {
                 assert_eq!(call.function_name.0.as_slice(), b"execute");
-                assert_eq!(digest(field(&call.args[0], "source_hash")), hash(SOURCE));
-                assert_eq!(op.auth.len(), 2);
+                assert_eq!(source_of(&tx), sender());
+                let [entry] = op.auth.as_slice() else {
+                    panic!()
+                };
+                let x::SorobanCredentials::Address(c) = &entry.credentials else {
+                    panic!()
+                };
+                assert_eq!(items(&c.signature).len(), 2);
+                assert_eq!(addr(&items(&call.args[0])[6]), sender());
                 executions += 1;
             }
-            (x::HostFunction::InvokeContract(_), _) => {}
-            _ => panic!("unexpected recorded step {}", parts[1]),
+            _ => assert_eq!(source_of(&tx), account_for_seed(&OWNER)),
         }
     }
-    assert_eq!(executions, 10);
+    assert_eq!(executions, 12);
+}
+#[test]
+fn the_sending_account_is_the_gas_payee_and_the_gas_follows_the_priced_expense() {
+    let wasm = wasm_for(PolicyTier::Simple);
+    let chain = ModelChain::new(BTreeMap::from([(hash(&wasm), PolicyTier::Simple)]));
+    let c = create(&chain, PolicyTier::Simple, &wasm, [0x31; 32]);
+    let state = sending_state(&chain, &c);
+    let r = request::transfer(&c, &state, [1; 32], &account_for_seed(&RECIPIENT), 1).unwrap();
+    // A policy wallet request names no fee payer; the terms name the sending account.
+    assert!(r.fee_bounds.is_none());
+    let mut t = terms(1, chain.ledger());
+    assert_eq!(gas_payee(&r, &t).unwrap(), sender());
+    // Preparation repays the priced fee bound, not the caller's ceiling.
+    let prepared =
+        rpc::prepare_with(&chain, &c, &r, &t, Some(chain.accounting()), NOW, NOW + 300).unwrap();
+    let bound = prepared.terms.expense.as_ref().unwrap();
+    assert_eq!(bound.gas_units, i128::from(bound.max_fee_stroops));
+    assert!(bound.max_fee_stroops < MAX_FEE);
+    // An explicit repayment to another account conflicts with the sending account.
+    t.gas = Some(GasRepayment {
+        stroops: 1,
+        payee: account_for_seed(&RECIPIENT),
+    });
+    assert!(
+        gas_payee(&r, &t)
+            .unwrap_err()
+            .contains("name other accounts")
+    );
+    // Without a sending account the operation has no gas payee.
+    t.gas = None;
+    t.sender = None;
+    assert!(
+        gas_payee(&r, &t)
+            .unwrap_err()
+            .contains("needs the server's sending account")
+    );
+}
+#[test]
+fn a_simple_wallet_counts_the_gross_volume_of_a_lossless_deposit() {
+    let wasm = wasm_for(PolicyTier::Simple);
+    let chain = ModelChain::new(BTreeMap::from([(hash(&wasm), PolicyTier::Simple)]));
+    let mut c = create(&chain, PolicyTier::Simple, &wasm, [0x32; 32]);
+    // A Simple wallet stores no params: the server holds them and evaluates its limits.
+    c.params
+        .0
+        .insert("daily_volume_limit".into(), PolicyValue::Int(6_000_000));
+    let state = sending_state(&chain, &c);
+    let ledger = chain.ledger();
+    let deposit = request::deposit(&c, &state, [2; 32], &vault(), 5_000_000, 5_000_000).unwrap();
+    let lossless = ExecutionTerms {
+        args: PolicyParams::default(),
+        expense: Some(ExpenseBounds::xlm(0, 0, MAX_FEE, ledger - 1, NOW).unwrap()),
+        gas: None,
+        sender: Some(sender()),
+    };
+    run(&chain, &c, &deposit, &lossless, "deposit").unwrap();
+    // The deposit spent only its gas; its gross amount fills the day's volume.
+    let account = chain.accounting();
+    assert_eq!(
+        (account.spent_daily, account.volume_daily),
+        (gas(), 5_000_000 + gas())
+    );
+    let state = sending_state(&chain, &c);
+    let ledger = chain.ledger();
+    let recipient = account_for_seed(&RECIPIENT);
+    let headroom = 6_000_000 - account.volume_daily - gas();
+    let over = request::transfer(&c, &state, [3; 32], &recipient, headroom + 1).unwrap();
+    assert!(
+        rpc::prepare_with(
+            &chain,
+            &c,
+            &over,
+            &terms(headroom + 1, ledger),
+            Some(chain.accounting()),
+            NOW,
+            NOW + 300
+        )
+        .unwrap_err()
+        .contains("DailyVolumeLimitExceeded")
+    );
+    let within = request::transfer(&c, &state, [4; 32], &recipient, headroom).unwrap();
+    run(&chain, &c, &within, &terms(headroom, ledger), "transfer").unwrap();
+    assert_eq!(chain.accounting().volume_daily, 6_000_000);
+}
+/// A chain whose wallet entry `t` lapsed, and with `instance` the wallet's instance too: the
+/// ledger reports them no longer live, and each simulation restores them in place. With
+/// `preamble`, a simulation asks for a separate restoration first.
+struct Lapsed<'a> {
+    chain: &'a ModelChain,
+    preamble: bool,
+    instance: bool,
+}
+impl rpc::Rpc for Lapsed<'_> {
+    fn call(&self, method: &str, params: Value) -> Result<Value> {
+        let mut reply = self.chain.call(method, params)?;
+        if method == "getLedgerEntries" && self.instance {
+            for entry in reply["entries"].as_array_mut().unwrap() {
+                let data: x::LedgerEntryData = de(entry["xdr"].as_str().unwrap());
+                if matches!(data, x::LedgerEntryData::ContractData(_)) {
+                    entry["liveUntilLedgerSeq"] = json!(0);
+                }
+            }
+        }
+        if method == "simulateTransaction"
+            && reply.get("error").is_none()
+            && let Some(data) = reply["transactionData"].as_str()
+        {
+            if self.preamble {
+                reply["restorePreamble"] =
+                    json!({"minResourceFee": "1000", "transactionData": data});
+            } else {
+                let wallet = self
+                    .chain
+                    .0
+                    .lock()
+                    .unwrap()
+                    .wallet
+                    .as_ref()
+                    .unwrap()
+                    .address
+                    .clone();
+                let mut data: x::SorobanTransactionData = de(data);
+                let entry = |key: x::ScVal| {
+                    x::LedgerKey::ContractData(x::LedgerKeyContractData {
+                        contract: address(&wallet).unwrap(),
+                        key,
+                        durability: x::ContractDataDurability::Persistent,
+                    })
+                };
+                let mut lapsed = vec![entry(x::ScVal::Symbol("t".try_into().unwrap()))];
+                if self.instance {
+                    lapsed.push(entry(x::ScVal::LedgerKeyContractInstance));
+                }
+                let archived: Vec<u32> = (0..lapsed.len() as u32).collect();
+                data.resources.footprint.read_write = lapsed.try_into().unwrap();
+                data.ext = x::SorobanTransactionDataExt::V1(x::SorobanResourcesExtV0 {
+                    archived_soroban_entries: archived.try_into().unwrap(),
+                });
+                reply["transactionData"] = json!(b64(&data));
+            }
+        }
+        Ok(reply)
+    }
+}
+#[test]
+fn a_lapsed_entry_restores_in_the_operation_that_needs_it() {
+    let wasm = wasm_for(PolicyTier::Common);
+    let chain = ModelChain::new(BTreeMap::from([(hash(&wasm), PolicyTier::Common)]));
+    let c = create(&chain, PolicyTier::Common, &wasm, [0x33; 32]);
+    let state = sending_state(&chain, &c);
+    let ledger = chain.ledger();
+    let recipient = account_for_seed(&RECIPIENT);
+    let transfer = request::transfer(&c, &state, [1; 32], &recipient, 1_000_000).unwrap();
+    let lapsed = Lapsed {
+        chain: &chain,
+        preamble: false,
+        instance: false,
+    };
+    let prepared = rpc::prepare_with(
+        &lapsed,
+        &c,
+        &transfer,
+        &terms(1_000_000, ledger),
+        Some(chain.accounting()),
+        NOW,
+        NOW + 300,
+    )
+    .unwrap();
+    let served = authorize_server(&prepared, &SERVER, NOW, None).unwrap();
+    let simulated = rpc::simulate(&lapsed, &served).unwrap();
+    let proof = sign(&simulated, &AGENT, NOW).unwrap();
+    let signed = authorize(&simulated, &[proof], NOW).unwrap();
+    let sealed = rpc::seal(&lapsed, &signed, |hash| {
+        Ok(SigningKey::from_bytes(&SENDER).sign(hash).to_bytes())
+    })
+    .unwrap();
+    // The sealed transaction restores `t` itself, and its fee pays for that.
+    let x::TransactionEnvelope::Tx(envelope) = de(&sealed.transaction_xdr) else {
+        panic!()
+    };
+    let x::TransactionExt::V1(data) = &envelope.tx.ext else {
+        panic!()
+    };
+    assert!(matches!(
+        &data.ext,
+        x::SorobanTransactionDataExt::V1(ext) if ext.archived_soroban_entries.as_slice() == [0]
+    ));
+    chain.step("transfer");
+    assert_eq!(
+        rpc::broadcast(&chain, &sealed, NOW).unwrap(),
+        rpc::Broadcast::Submitted
+    );
+    // An entry that needs a separate restoration first prepares nothing.
+    let preamble = Lapsed {
+        chain: &chain,
+        preamble: true,
+        instance: false,
+    };
+    let state = sending_state(&chain, &c);
+    let ledger = chain.ledger();
+    let again = request::transfer(&c, &state, [2; 32], &recipient, 1_000_000).unwrap();
+    assert!(
+        rpc::prepare_with(
+            &preamble,
+            &c,
+            &again,
+            &terms(1_000_000, ledger),
+            Some(chain.accounting()),
+            NOW,
+            NOW + 300
+        )
+        .unwrap_err()
+        .contains("separate restoration")
+    );
+}
+#[test]
+fn an_explicit_gas_repayment_keeps_its_gas_through_pricing() {
+    let wasm = wasm_for(PolicyTier::Common);
+    let chain = ModelChain::new(BTreeMap::from([(hash(&wasm), PolicyTier::Common)]));
+    let c = create(&chain, PolicyTier::Common, &wasm, [0x34; 32]);
+    let recipient = account_for_seed(&RECIPIENT);
+    // The server repays the whole gas cap once, and later less after a carry.
+    for (id, repaid) in [(1u8, i128::from(MAX_FEE)), (2, 500)] {
+        let state = sending_state(&chain, &c);
+        let ledger = chain.ledger();
+        let transfer = request::transfer(&c, &state, [id; 32], &recipient, 1_000_000).unwrap();
+        let explicit = ExecutionTerms {
+            expense: Some(ExpenseBounds {
+                gas_units: repaid,
+                spent_units: 1_000_000 + repaid,
+                ..ExpenseBounds::xlm(1_000_000, 0, MAX_FEE, ledger - 1, NOW).unwrap()
+            }),
+            gas: Some(GasRepayment {
+                stroops: repaid,
+                payee: sender(),
+            }),
+            ..terms(1_000_000, ledger)
+        };
+        let prepared = rpc::prepare_with(
+            &chain,
+            &c,
+            &transfer,
+            &explicit,
+            Some(chain.accounting()),
+            NOW,
+            NOW + 300,
+        )
+        .unwrap();
+        // Only the transaction's fee bound moved.
+        let expense = prepared.terms.expense.as_ref().unwrap();
+        assert_eq!(
+            (
+                expense.gas_units,
+                expense.spent_units,
+                expense.max_fee_stroops
+            ),
+            (repaid, 1_000_000 + repaid, gas() as u32)
+        );
+        let before = chain.balance();
+        let served = authorize_server(&prepared, &SERVER, NOW, None).unwrap();
+        let simulated = rpc::simulate(&chain, &served).unwrap();
+        let proof = sign(&simulated, &AGENT, NOW).unwrap();
+        let signed = authorize(&simulated, &[proof], NOW).unwrap();
+        let sealed = seal(&chain, &signed).unwrap();
+        chain.step("transfer");
+        assert_eq!(
+            rpc::broadcast(&chain, &sealed, NOW).unwrap(),
+            rpc::Broadcast::Submitted
+        );
+        assert_eq!(chain.balance(), before - 1_000_000 - repaid);
+    }
+    // Counted gas that differs from the repayment is refused before any signature.
+    let state = sending_state(&chain, &c);
+    let ledger = chain.ledger();
+    let transfer = request::transfer(&c, &state, [3; 32], &recipient, 1_000_000).unwrap();
+    let mismatched = ExecutionTerms {
+        gas: Some(GasRepayment {
+            stroops: 500,
+            payee: sender(),
+        }),
+        ..terms(1_000_000, ledger)
+    };
+    assert!(
+        rpc::prepare_with(
+            &chain,
+            &c,
+            &transfer,
+            &mismatched,
+            Some(chain.accounting()),
+            NOW,
+            NOW + 300
+        )
+        .unwrap_err()
+        .contains("differs from the gas that the wallet repays")
+    );
+}
+#[test]
+fn recovery_finds_a_policy_wallet_execution_by_its_event() {
+    use allowit_stellar::provider::runtime::Runtime;
+    let wasm = wasm_for(PolicyTier::Common);
+    let chain = std::sync::Arc::new(ModelChain::new(BTreeMap::from([(
+        hash(&wasm),
+        PolicyTier::Common,
+    )])));
+    let c = create(&chain, PolicyTier::Common, &wasm, [0x35; 32]);
+    let state = sending_state(&chain, &c);
+    let ledger = chain.ledger();
+    let recipient = account_for_seed(&RECIPIENT);
+    let transfer = request::transfer(&c, &state, [1; 32], &recipient, 1_000_000).unwrap();
+    let signed = run(&chain, &c, &transfer, &terms(1_000_000, ledger), "transfer").unwrap();
+    let prepared = &signed.prepared;
+    // The sealed transaction is another one than the prepared transaction.
+    assert_ne!(signed.transaction_hash, prepared.transaction_hash);
+    let runtime = Runtime::from_rpc(chain.clone());
+    let observed = runtime.observe_authorizations([prepared]);
+    assert_eq!(observed.len(), 1);
+    let found = &observed[0];
+    assert_eq!(found.receipt.transaction_hash, signed.transaction_hash);
+    assert_eq!(found.signed.transaction_xdr, signed.transaction_xdr);
+    // An operation that never ran has no event.
+    let state = sending_state(&chain, &c);
+    let other = request::transfer(&c, &state, [2; 32], &recipient, 1_000_000).unwrap();
+    let unsent = authorized(&chain, &c, &other, &terms(1_000_000, chain.ledger())).unwrap();
+    assert!(
+        runtime
+            .observe_authorizations([&unsent.prepared])
+            .is_empty()
+    );
+}
+#[test]
+fn a_creation_funds_the_asset_and_the_gas_and_recovery_returns_both() {
+    let mut c = installation(PolicyTier::Common, [1; 32], [2; 32]);
+    let xlm = xlm();
+    // An XLM wallet takes one amount: its gas is its asset.
+    assert_eq!(
+        admin::creation_funding(&c, 5, 0).unwrap(),
+        vec![(xlm.clone(), 5)]
+    );
+    assert!(
+        admin::creation_funding(&c, 5, 7)
+            .unwrap_err()
+            .contains("XLM")
+    );
+    // A wallet of another asset also takes the XLM from which it repays network fees.
+    c.asset = Contract([77; 32]).to_string();
+    assert_eq!(
+        admin::creation_funding(&c, 5, 7).unwrap(),
+        vec![(c.asset.clone(), 5), (xlm.clone(), 7)]
+    );
+    assert_eq!(
+        admin::creation_funding(&c, 0, 7).unwrap(),
+        vec![(xlm.clone(), 7)]
+    );
+    assert!(admin::creation_funding(&c, -1, 0).is_err());
+    // A recovery of everything returns the asset, then the XLM, then nothing.
+    assert_eq!(
+        admin::next_recovery(&c.asset, &xlm, 3, 9),
+        Some(c.asset.as_str())
+    );
+    assert_eq!(
+        admin::next_recovery(&c.asset, &xlm, 0, 9),
+        Some(xlm.as_str())
+    );
+    assert_eq!(admin::next_recovery(&c.asset, &xlm, 0, 0), None);
+    assert_eq!(admin::next_recovery(&xlm, &xlm, 0, 0), None);
+}
+/// A diagnostic session of a server provider sends and signs with the provider's own sending
+/// accounts: a code upload through the session reaches them.
+#[test]
+fn a_diagnostic_session_keeps_the_sending_accounts() {
+    use allowit_core::vendor::RuntimeProvider;
+    use allowit_core::vendor::plugin::RailPlugin;
+    use allowit_core::vendor::profiles::Description;
+    use allowit_core::vendor::runtime::{Installation, Poll, Transport};
+    use allowit_stellar::provider::server::{Provider, SendingAccounts};
+    use std::sync::Arc;
+    struct Wire(Arc<ModelChain>);
+    impl Transport for Wire {
+        fn call(&self, method: &str, params: Value) -> allowit_core::client::error::Result<Value> {
+            rpc::Rpc::call(&*self.0, method, params)
+                .map_err(allowit_core::client::error::Error::config)
+        }
+    }
+    struct Sending;
+    impl SendingAccounts for Sending {
+        fn account(&self) -> Result<String> {
+            Ok(sender())
+        }
+        fn sign(&self, account: &str, hash: &[u8; 32]) -> Result<[u8; 64]> {
+            assert_eq!(account, sender());
+            Ok(SigningKey::from_bytes(&SENDER).sign(hash).to_bytes())
+        }
+    }
+    let wasm = wasm_for(PolicyTier::Common);
+    let chain = Arc::new(ModelChain::new(BTreeMap::from([(
+        hash(&wasm),
+        PolicyTier::Common,
+    )])));
+    let c = create(&chain, PolicyTier::Common, &wasm, [0x36; 32]);
+    let owners = allowit_stellar::PLUGIN.owner_runtime();
+    let document = owners
+        .configuration(NETWORK, &serde_json::to_vec(&c).unwrap())
+        .unwrap();
+    let installation = Installation {
+        description: Description {
+            network: NETWORK.into(),
+            wallet: c.wallet.clone(),
+            agent: c.agent.clone(),
+            policy_id: "policy".into(),
+            owner: c.owner.clone(),
+            server: c.server.clone(),
+            asset: c.asset.clone(),
+            asset_symbol: c.asset_symbol.clone(),
+            source: c.policy_source.clone(),
+            source_hash: hex(&c.source_hash),
+            module_digest: hex(&c.module_digest),
+            params: document.params.clone(),
+        },
+        config: document.document().to_owned(),
+        export: None,
+        authority: None,
+    };
+    let provider = Provider::with_transport(NETWORK, Arc::new(Wire(chain.clone())))
+        .unwrap()
+        .with_sender(Arc::new(Sending));
+    let session = provider.diagnostic_session(&installation).unwrap().unwrap();
+    // Code that the ledger does not hold yet: the session's sending account uploads it.
+    let other = wasm_for(PolicyTier::Simple);
+    chain
+        .0
+        .lock()
+        .unwrap()
+        .tiers
+        .insert(hash(&other), PolicyTier::Simple);
+    chain.step("upload");
+    let receipt = session
+        .provider
+        .upload_code(&installation, &other, Poll::default(), NOW)
+        .unwrap();
+    assert!(receipt.is_some());
+    assert!(chain.0.lock().unwrap().code.contains_key(&hash(&other)));
+    // The ledger holds it now: nothing is sent.
+    assert!(
+        session
+            .provider
+            .upload_code(&installation, &other, Poll::default(), NOW)
+            .unwrap()
+            .is_none()
+    );
+}
+/// A wallet whose instance and `t` lapsed: the ledger still gives their values, so the server
+/// reads the wallet and the agent's payment restores both in place; the owner's stop then
+/// restores them too and returns everything with one signature.
+#[test]
+fn a_lapsed_instance_restores_in_the_payment_and_in_the_owners_stop() {
+    let wasm = wasm_for(PolicyTier::Common);
+    let chain = ModelChain::new(BTreeMap::from([(hash(&wasm), PolicyTier::Common)]));
+    let c = create(&chain, PolicyTier::Common, &wasm, [0x37; 32]);
+    let lapsed = Lapsed {
+        chain: &chain,
+        preamble: false,
+        instance: true,
+    };
+    let mut state = rpc::trusted_state(&lapsed, &c, Some(chain.accounting())).unwrap();
+    state.source = rpc::get_account(&lapsed, &sender()).unwrap();
+    let ledger = chain.ledger();
+    let recipient = account_for_seed(&RECIPIENT);
+    let transfer = request::transfer(&c, &state, [1; 32], &recipient, 1_000_000).unwrap();
+    let prepared = rpc::prepare_with(
+        &lapsed,
+        &c,
+        &transfer,
+        &terms(1_000_000, ledger),
+        Some(chain.accounting()),
+        NOW,
+        NOW + 300,
+    )
+    .unwrap();
+    let served = authorize_server(&prepared, &SERVER, NOW, None).unwrap();
+    let simulated = rpc::simulate(&lapsed, &served).unwrap();
+    let proof = sign(&simulated, &AGENT, NOW).unwrap();
+    let signed = authorize(&simulated, &[proof], NOW).unwrap();
+    let sealed = rpc::seal(&lapsed, &signed, |hash| {
+        Ok(SigningKey::from_bytes(&SENDER).sign(hash).to_bytes())
+    })
+    .unwrap();
+    let x::TransactionEnvelope::Tx(envelope) = de(&sealed.transaction_xdr) else {
+        panic!()
+    };
+    let x::TransactionExt::V1(data) = &envelope.tx.ext else {
+        panic!()
+    };
+    assert!(matches!(
+        &data.ext,
+        x::SorobanTransactionDataExt::V1(ext) if ext.archived_soroban_entries.as_slice() == [0, 1]
+    ));
+    chain.step("transfer");
+    assert_eq!(
+        rpc::broadcast(&chain, &sealed, NOW).unwrap(),
+        rpc::Broadcast::Submitted
+    );
+    // The owner alone: the stop reads the lapsed instance and restores it in the same call.
+    let mut owner = OwnerAdmin {
+        rpc: &lapsed,
+        config: &c,
+        now: NOW,
+    };
+    let version = owner.deployment_version().unwrap().0 + 1;
+    let stop = owner.stop(DeploymentVersion(version)).unwrap();
+    let x::TransactionEnvelope::Tx(envelope) = de(&stop.transaction_xdr) else {
+        panic!()
+    };
+    let x::TransactionExt::V1(data) = &envelope.tx.ext else {
+        panic!()
+    };
+    assert!(matches!(
+        &data.ext,
+        x::SorobanTransactionDataExt::V1(ext) if ext.archived_soroban_entries.len() == 2
+    ));
+    owner_submit(&chain, "stop", &stop.transaction_xdr);
+    assert_eq!(chain.balance(), 0);
+    assert!(chain.config().paused);
 }

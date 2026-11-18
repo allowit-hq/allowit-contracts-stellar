@@ -139,7 +139,7 @@ fn base(
 /// This synthetic Wasm declares the required custody layout; no Wasm execution is claimed.
 fn wasm() -> Vec<u8> {
     let mut meta = 0u32.to_be_bytes().to_vec();
-    for text in [b"allowit_custody_layout".as_slice(), b"4"] {
+    for text in [b"allowit_custody_layout".as_slice(), b"5"] {
         meta.extend((text.len() as u32).to_be_bytes());
         meta.extend(text);
         meta.resize(meta.len().div_ceil(4) * 4, 0);
@@ -152,21 +152,12 @@ fn wasm() -> Vec<u8> {
     wasm.extend(section);
     wasm
 }
-fn upload() -> (OwnerTransaction, ExpectedOwnerIntent) {
-    let wasm = wasm();
-    let expected = ExpectedOwnerIntent {
-        limits: limits(),
-        action: OwnerAction::UploadWasm {
-            wasm_hash: hash(&wasm),
-        },
-    };
-    (
-        base(
-            x::HostFunction::UploadContractWasm(wasm.try_into().unwrap()),
-            vec![],
-            "upload_wasm",
-        ),
-        expected,
+/// A code upload for the owner to sign. The owner signs none: the server uploads the code.
+fn upload() -> OwnerTransaction {
+    base(
+        x::HostFunction::UploadContractWasm(wasm().try_into().unwrap()),
+        vec![],
+        "upload_wasm",
     )
 }
 fn fund() -> (OwnerTransaction, ExpectedOwnerIntent) {
@@ -211,7 +202,6 @@ fn config(tier: PolicyTier, salt: &[u8; 32]) -> WalletConfig {
         wallet: admin::wallet_address("stellar:testnet", &owner(), salt).unwrap(),
         owner: owner(),
         agent: account(12),
-        fee_account: None,
         server: account(13),
         route: WalletRoute::PolicyWallet,
         tier: Some(tier),
@@ -235,12 +225,21 @@ fn config(tier: PolicyTier, salt: &[u8; 32]) -> WalletConfig {
             .unwrap();
     c
 }
+/// The fixture network's deployer, which the owner's client pins.
+fn deployer() -> String {
+    admin::deployer_address("stellar:testnet").unwrap()
+}
+/// The owner's one creation through the deployer, with one funding transfer.
 fn create(tier: PolicyTier) -> (OwnerTransaction, ExpectedOwnerIntent) {
     let salt = [8; 32];
     let c = config(tier, &salt);
+    // `AllowitPolicyConfig`: the agent and server keys raw, the owner's source hash and the
+    // gas cap; the fixture's own encoder is the contract's field order.
+    let raw_key = |account: &str| bytes(&allowit_stellar::account_key(account).unwrap());
     let constructor = scmap(vec![
-        ("agent", x::ScVal::Address(address(&c.agent).unwrap())),
+        ("agent", raw_key(&c.agent)),
         ("asset", x::ScVal::Address(address(&c.asset).unwrap())),
+        ("gas_cap", amount(i128::from(c.max_fee_stroops))),
         ("owner", x::ScVal::Address(address(&c.owner).unwrap())),
         (
             "params",
@@ -253,7 +252,6 @@ fn create(tier: PolicyTier) -> (OwnerTransaction, ExpectedOwnerIntent) {
                 )),
             )]),
         ),
-        ("policy_instance", bytes(&c.policy_instance)),
         (
             "rules",
             x::ScVal::Vec(Some(
@@ -269,10 +267,34 @@ fn create(tier: PolicyTier) -> (OwnerTransaction, ExpectedOwnerIntent) {
                     .unwrap(),
             )),
         ),
-        ("server", x::ScVal::Address(address(&c.server).unwrap())),
-        ("source_digest", bytes(&c.source_digest)),
-        ("x402_enabled", x::ScVal::Bool(false)),
+        ("server", raw_key(&c.server)),
+        ("source_hash", bytes(&c.source_hash)),
     ]);
+    let funding = vec![(c.asset.clone(), 10_000_000i128)];
+    let call = x::InvokeContractArgs {
+        contract_address: address(&deployer()).unwrap(),
+        function_name: symbol("deploy"),
+        args: vec![
+            x::ScVal::Address(address(&owner()).unwrap()),
+            bytes(&c.module_digest),
+            bytes(&salt),
+            x::ScVal::Vec(Some(vec![constructor.clone()].try_into().unwrap())),
+            x::ScVal::Vec(Some(
+                vec![x::ScVal::Vec(Some(
+                    vec![
+                        x::ScVal::Address(address(&c.asset).unwrap()),
+                        amount(10_000_000),
+                    ]
+                    .try_into()
+                    .unwrap(),
+                ))]
+                .try_into()
+                .unwrap(),
+            )),
+        ]
+        .try_into()
+        .unwrap(),
+    };
     let create = x::CreateContractArgsV2 {
         contract_id_preimage: x::ContractIdPreimage::Address(x::ContractIdPreimageFromAddress {
             address: address(&owner()).unwrap(),
@@ -281,7 +303,7 @@ fn create(tier: PolicyTier) -> (OwnerTransaction, ExpectedOwnerIntent) {
         executable: x::ContractExecutable::Wasm(x::Hash(c.module_digest)),
         constructor_args: vec![constructor].try_into().unwrap(),
     };
-    let child = x::SorobanAuthorizedInvocation {
+    let constructor_child = x::SorobanAuthorizedInvocation {
         function: x::SorobanAuthorizedFunction::ContractFn(x::InvokeContractArgs {
             contract_address: address(&c.wallet).unwrap(),
             function_name: symbol("__constructor"),
@@ -289,16 +311,38 @@ fn create(tier: PolicyTier) -> (OwnerTransaction, ExpectedOwnerIntent) {
         }),
         sub_invocations: x::VecM::default(),
     };
+    let transfer = x::SorobanAuthorizedInvocation {
+        function: x::SorobanAuthorizedFunction::ContractFn(x::InvokeContractArgs {
+            contract_address: address(&c.asset).unwrap(),
+            function_name: symbol("transfer"),
+            args: vec![
+                x::ScVal::Address(address(&owner()).unwrap()),
+                x::ScVal::Address(address(&c.wallet).unwrap()),
+                amount(10_000_000),
+            ]
+            .try_into()
+            .unwrap(),
+        }),
+        sub_invocations: x::VecM::default(),
+    };
     let auth = x::SorobanAuthorizationEntry {
         credentials: x::SorobanCredentials::SourceAccount,
         root_invocation: x::SorobanAuthorizedInvocation {
-            function: x::SorobanAuthorizedFunction::CreateContractV2HostFn(create.clone()),
-            sub_invocations: vec![child].try_into().unwrap(),
+            function: x::SorobanAuthorizedFunction::ContractFn(call.clone()),
+            sub_invocations: vec![
+                x::SorobanAuthorizedInvocation {
+                    function: x::SorobanAuthorizedFunction::CreateContractV2HostFn(create),
+                    sub_invocations: vec![constructor_child].try_into().unwrap(),
+                },
+                transfer,
+            ]
+            .try_into()
+            .unwrap(),
         },
     };
     (
         base(
-            x::HostFunction::CreateContractV2(create),
+            x::HostFunction::InvokeContract(call),
             vec![auth],
             "create_wallet",
         ),
@@ -307,7 +351,7 @@ fn create(tier: PolicyTier) -> (OwnerTransaction, ExpectedOwnerIntent) {
             action: OwnerAction::CreateWallet {
                 config: Box::new(c),
                 salt,
-                x402_enabled: false,
+                funding,
             },
         },
     )
@@ -375,7 +419,6 @@ fn assert_refused(packet: &OwnerTransaction, expected: &ExpectedOwnerIntent, lab
 #[test]
 fn four_owner_intents_sign_only_the_validated_digest_once() {
     for (packet, expected) in [
-        upload(),
         fund(),
         create(PolicyTier::Simple),
         create(PolicyTier::Common),
@@ -383,6 +426,16 @@ fn four_owner_intents_sign_only_the_validated_digest_once() {
         native(),
     ] {
         let proof = validate_owner_transaction(&packet, &expected, NOW).unwrap();
+        // The retained packet describes its own transaction, so it can be restored and
+        // signed later; a packet under another action name cannot.
+        validate_retained_owner_transaction(&packet).unwrap();
+        let mut relabelled = packet.clone();
+        relabelled.action = if packet.action == "fund" {
+            "pause".into()
+        } else {
+            "fund".into()
+        };
+        assert!(validate_retained_owner_transaction(&relabelled).is_err());
         assert_eq!(proof.transaction_hash(), packet.transaction_hash);
         assert_eq!(proof.unsigned_xdr(), packet.transaction_xdr);
         let calls = Cell::new(0);
@@ -495,24 +548,11 @@ fn envelope_metadata_and_nonbusiness_fields_cannot_bypass_consent() {
 }
 #[test]
 fn upload_and_funding_business_values_and_auth_are_exact() {
-    let (packet, expected) = upload();
-    let mut p = packet.clone();
-    modify_host(&mut p, |host| {
-        let x::HostFunction::UploadContractWasm(code) = &mut host.host_function else {
-            panic!()
-        };
-        let mut altered = code.to_vec();
-        altered.push(0);
-        *code = altered.try_into().unwrap();
-    });
-    assert_refused(&p, &expected, "upload hash");
-    let mut p = packet;
-    modify_host(&mut p, |host| {
-        host.auth = vec![x::SorobanAuthorizationEntry::default()]
-            .try_into()
-            .unwrap()
-    });
-    assert_refused(&p, &expected, "upload hidden auth");
+    // The owner signs no code upload, whatever the intent; the server uploads with its own
+    // account.
+    for (_, expected) in [fund(), create(PolicyTier::Custom)] {
+        assert_refused(&upload(), &expected, "owner upload");
+    }
     let (packet, expected) = fund();
     for field in 0..5 {
         let mut p = packet.clone();
@@ -585,13 +625,46 @@ fn upload_and_funding_business_values_and_auth_are_exact() {
         assert_refused(&p, &expected, "fund auth scope");
     }
 }
-fn replace_constructor_field(packet: &mut OwnerTransaction, key: &str, value: x::ScVal) {
+/// Rebuild the deployer call, its creation child and constructor child from `f`'s changes to
+/// the call, so that only the caller-owned intent can refuse the packet.
+fn modify_deploy(packet: &mut OwnerTransaction, f: impl FnOnce(&mut Vec<x::ScVal>)) {
     modify_host(packet, |host| {
-        let x::HostFunction::CreateContractV2(create) = &mut host.host_function else {
+        let x::HostFunction::InvokeContract(call) = &mut host.host_function else {
             panic!()
         };
-        let mut args = create.constructor_args.to_vec();
-        let x::ScVal::Map(Some(entries)) = &mut args[0] else {
+        let mut args = call.args.to_vec();
+        f(&mut args);
+        call.args = args.clone().try_into().unwrap();
+        let mut auth = host.auth.to_vec();
+        auth[0].root_invocation.function = x::SorobanAuthorizedFunction::ContractFn(call.clone());
+        let mut children = auth[0].root_invocation.sub_invocations.to_vec();
+        let x::SorobanAuthorizedFunction::CreateContractV2HostFn(create) =
+            &mut children[0].function
+        else {
+            panic!()
+        };
+        let x::ScVal::Vec(Some(constructor)) = &args[3] else {
+            panic!()
+        };
+        create.constructor_args = constructor.0.to_vec().try_into().unwrap();
+        let constructor_args = create.constructor_args.clone();
+        let mut grandchildren = children[0].sub_invocations.to_vec();
+        let x::SorobanAuthorizedFunction::ContractFn(child) = &mut grandchildren[0].function else {
+            panic!()
+        };
+        child.args = constructor_args;
+        children[0].sub_invocations = grandchildren.try_into().unwrap();
+        auth[0].root_invocation.sub_invocations = children.try_into().unwrap();
+        host.auth = auth.try_into().unwrap();
+    });
+}
+fn replace_constructor_field(packet: &mut OwnerTransaction, key: &str, value: x::ScVal) {
+    modify_deploy(packet, |args| {
+        let x::ScVal::Vec(Some(constructor)) = &mut args[3] else {
+            panic!()
+        };
+        let mut list = constructor.0.to_vec();
+        let x::ScVal::Map(Some(entries)) = &mut list[0] else {
             panic!()
         };
         let mut values = entries.0.to_vec();
@@ -601,24 +674,14 @@ fn replace_constructor_field(packet: &mut OwnerTransaction, key: &str, value: x:
             .unwrap()
             .val = value;
         entries.0 = values.try_into().unwrap();
-        create.constructor_args = args.try_into().unwrap();
-        // Make the complete auth tree internally consistent so only caller-owned intent can refuse it.
-        let mut auth = host.auth.to_vec();
-        auth[0].root_invocation.function =
-            x::SorobanAuthorizedFunction::CreateContractV2HostFn(create.clone());
-        let mut children = auth[0].root_invocation.sub_invocations.to_vec();
-        let x::SorobanAuthorizedFunction::ContractFn(child) = &mut children[0].function else {
-            panic!()
-        };
-        child.args = create.constructor_args.clone();
-        auth[0].root_invocation.sub_invocations = children.try_into().unwrap();
-        host.auth = auth.try_into().unwrap();
+        *constructor = list.try_into().unwrap();
     });
 }
 #[test]
 fn creation_checks_whole_constructor_target_executable_and_auth_tree() {
     let (packet, expected) = create(PolicyTier::Common);
-    for role in ["owner", "agent", "server", "asset"] {
+    validate_owner_transaction(&packet, &expected, NOW).unwrap();
+    for role in ["owner", "asset"] {
         let mut p = packet.clone();
         replace_constructor_field(
             &mut p,
@@ -628,8 +691,10 @@ fn creation_checks_whole_constructor_target_executable_and_auth_tree() {
         assert_refused(&p, &expected, role);
     }
     for (key, value) in [
-        ("policy_instance", bytes(&[99; 32])),
-        ("source_digest", bytes(&[99; 32])),
+        ("agent", bytes(&[99; 32])),
+        ("server", bytes(&[99; 32])),
+        ("source_hash", bytes(&[99; 32])),
+        ("gas_cap", amount(1)),
         ("params", scmap(vec![("payment_limit", amount(501))])),
         (
             "rules",
@@ -639,49 +704,72 @@ fn creation_checks_whole_constructor_target_executable_and_auth_tree() {
                     .unwrap(),
             )),
         ),
-        ("x402_enabled", x::ScVal::Bool(true)),
     ] {
         let mut p = packet.clone();
         replace_constructor_field(&mut p, key, value);
         assert_refused(&p, &expected, key);
     }
-    for mode in 0..5 {
+    // The deployer call: its owner, code, salt and funding.
+    for (index, value) in [
+        (0, x::ScVal::Address(address(&account(14)).unwrap())),
+        (1, bytes(&[99; 32])),
+        (2, bytes(&[99; 32])),
+        (4, x::ScVal::Vec(Some(x::ScVec(x::VecM::default())))),
+    ] {
+        let mut p = packet.clone();
+        modify_deploy(&mut p, |args| args[index] = value);
+        assert_refused(&p, &expected, "deployer call");
+    }
+    for mode in 0..6 {
         let mut p = packet.clone();
         modify_host(&mut p, |host| {
-            let x::HostFunction::CreateContractV2(create) = &mut host.host_function else {
-                panic!()
-            };
+            let mut auth = host.auth.to_vec();
+            let mut children = auth[0].root_invocation.sub_invocations.to_vec();
             match mode {
-                0 => create.executable = x::ContractExecutable::Wasm(x::Hash([99; 32])),
+                0 => {
+                    let x::HostFunction::InvokeContract(call) = &mut host.host_function else {
+                        panic!()
+                    };
+                    call.contract_address = address(&Contract([99; 32]).to_string()).unwrap();
+                    auth[0].root_invocation.function =
+                        x::SorobanAuthorizedFunction::ContractFn(call.clone());
+                }
                 1 => {
-                    let x::ContractIdPreimage::Address(pre) = &mut create.contract_id_preimage
+                    let x::SorobanAuthorizedFunction::CreateContractV2HostFn(create) =
+                        &mut children[0].function
                     else {
                         panic!()
                     };
-                    pre.salt = x::Uint256([99; 32]);
+                    create.executable = x::ContractExecutable::Wasm(x::Hash([99; 32]));
                 }
-                2 => host.auth = x::VecM::default(),
+                2 => {
+                    auth.clear();
+                    children.clear();
+                }
                 3 => {
-                    let mut auth = host.auth.to_vec();
-                    let mut children = auth[0].root_invocation.sub_invocations.to_vec();
-                    let x::SorobanAuthorizedFunction::ContractFn(call) = &mut children[0].function
+                    let x::SorobanAuthorizedFunction::ContractFn(call) = &mut children[1].function
                     else {
                         panic!()
                     };
                     call.contract_address = address(&Contract([99; 32]).to_string()).unwrap();
-                    auth[0].root_invocation.sub_invocations = children.try_into().unwrap();
-                    host.auth = auth.try_into().unwrap();
                 }
+                4 => children.push(children[1].clone()),
                 _ => {
-                    let mut auth = host.auth.to_vec();
-                    let mut children = auth[0].root_invocation.sub_invocations.to_vec();
-                    children.push(children[0].clone());
-                    auth[0].root_invocation.sub_invocations = children.try_into().unwrap();
-                    host.auth = auth.try_into().unwrap();
+                    let x::SorobanAuthorizedFunction::ContractFn(call) = &mut children[1].function
+                    else {
+                        panic!()
+                    };
+                    let mut args = call.args.to_vec();
+                    args[2] = amount(10_000_001);
+                    call.args = args.try_into().unwrap();
                 }
             }
+            if let Some(entry) = auth.first_mut() {
+                entry.root_invocation.sub_invocations = children.try_into().unwrap();
+            }
+            host.auth = auth.try_into().unwrap();
         });
-        assert_refused(&p, &expected, "create target/auth/code");
+        assert_refused(&p, &expected, &format!("create target/auth/code {mode}"));
     }
 }
 #[test]
@@ -914,9 +1002,8 @@ fn assert_validation_refused(result: Result<ValidatedOwnerTransaction>, label: &
 }
 #[test]
 fn deployment_and_setup_adapters_validate_all_public_metadata() {
-    for (packet, expected) in [upload(), create(PolicyTier::Common)] {
+    for (packet, expected) in [create(PolicyTier::Common)] {
         let (wasm_hash, wallet) = match &expected.action {
-            OwnerAction::UploadWasm { wasm_hash } => (*wasm_hash, None),
             OwnerAction::CreateWallet { config, .. } => {
                 (config.module_digest, Some(config.wallet.clone()))
             }
@@ -1090,14 +1177,45 @@ fn simulation_resources_are_bounded_without_becoming_business_intent() {
                         .unwrap()
                 }
                 _ => {
+                    // An archived entry outside the read-write footprint.
+                    let outside = data.resources.footprint.read_write.len() as u32;
                     data.ext = x::SorobanTransactionDataExt::V1(x::SorobanResourcesExtV0 {
-                        archived_soroban_entries: vec![0].try_into().unwrap(),
+                        archived_soroban_entries: vec![outside].try_into().unwrap(),
                     })
                 }
             }
         });
         assert_refused(&p, &expected, "resource scope");
     }
+    // An archived entry of the read-write footprint restores in the same transaction: a wallet
+    // whose entries lapsed returns its funds with one owner signature. Each entry is named once.
+    let mut restoring = valid.clone();
+    modify_tx(&mut restoring, |tx| {
+        let x::TransactionExt::V1(data) = &mut tx.ext else {
+            panic!()
+        };
+        data.resources.footprint.read_write =
+            vec![x::LedgerKey::ContractData(x::LedgerKeyContractData {
+                contract: address(&Contract([34; 32]).to_string()).unwrap(),
+                key: x::ScVal::Symbol(symbol("t")),
+                durability: x::ContractDataDurability::Persistent,
+            })]
+            .try_into()
+            .unwrap();
+        data.ext = x::SorobanTransactionDataExt::V1(x::SorobanResourcesExtV0 {
+            archived_soroban_entries: vec![0].try_into().unwrap(),
+        });
+    });
+    validate_owner_transaction(&restoring, &expected, NOW).unwrap();
+    modify_tx(&mut restoring, |tx| {
+        let x::TransactionExt::V1(data) = &mut tx.ext else {
+            panic!()
+        };
+        data.ext = x::SorobanTransactionDataExt::V1(x::SorobanResourcesExtV0 {
+            archived_soroban_entries: vec![0, 0].try_into().unwrap(),
+        });
+    });
+    assert_refused(&restoring, &expected, "resource scope");
     assert_validation_refused(
         validate_owner_transaction(&packet, &expected, u64::MAX),
         "validity overflow",

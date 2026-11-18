@@ -104,18 +104,20 @@ Restore archived dependencies through separate reviewed transactions.
 Prepare `deploy-wallet --source "$OWNER" --config JSON --wasm PATH --wasm-hash HASH --tier TIER --policy-source FILE`.
 Select `allowit_simple_policy_engine.wasm`, `allowit_common_policy_engine.wasm`, or a reviewed
 `allowit_custom_policy.wasm`. Config contains exactly `owner`, `agent`, `server`, `asset`,
-`policy_instance`, `source_digest`, `rules`, `params`, and `x402_enabled`.
-The asset is an immutable native SAC. `policy_instance` and `source_digest` are 32-byte hex
-strings, and `policy_instance` is nonzero.
+`source_hash`, `gas_cap`, `rules` and `params`. The agent and the server are G addresses; the
+wallet stores their raw Ed25519 keys, and the tool hands them to the Stellar CLI as hex. The asset
+is an immutable native SAC. `source_hash` is the SHA-256 of the `--policy-source` file, for every
+tier. `gas_cap` is the most XLM, in stroops, that the wallet repays for one operation.
 `rules` contains the ordered standard prefix of canonical rule names. The tool derives it from the
 authored `--policy-source` file and rejects any other list: Common binds the source's prefix,
-Simple and Custom bind an empty list. `--tier custom` also requires `source_digest` to be the
-SHA-256 of that file. Owner `deploy_policy` packets take the same two options for the target tier.
+Simple and Custom bind an empty list. Owner `deploy_policy` packets take the same two options for
+the target tier. This direct creation needs a separate funding transfer; the rail's owner flow
+creates and funds a wallet with one signature through the deployer contract.
 Every tier requires one self-contained, portable source file. The tooling rejects every
 construct listed in [One portable policy source](architecture.md#one-portable-policy-source), such
 as macros other than the assertion and `matches!` macros, writes to `ctx.env`, the map inside params
-and args, list methods, indexing other than `ctx.params[key]` and pointer-width methods. Simple and Common store only standard
-state, so the tool rejects their packets when the source calls `allowit::set_state`. It also runs the std-only
+and args, list methods, indexing other than `ctx.params[key]` and pointer-width methods. A wallet
+stores no policy state, so the tool rejects a source that calls `allowit::set_state`. It also runs the std-only
 compile described there, so it needs `rustc`. For `--tier custom`, also build the
 reviewed custom Wasm from the same file, which is the Soroban compile:
 
@@ -125,12 +127,13 @@ scripts/build-custom-policy.sh POLICY.rs OUT_DIR
 
 The script builds the committed tree with `POLICY.rs` as `contracts/allowit-custom-policy/policy/policy.rs`
 and leaves the checkout unchanged. It prints one JSON line with `source_digest` (the SHA-256 of
-`POLICY.rs`, the wallet `source_digest`), `wasm_hash` (the SHA-256 of the Wasm, the `--wasm-hash`)
+`POLICY.rs`, the wallet's `source_hash`), `wasm_hash` (the SHA-256 of the Wasm, the `--wasm-hash`)
 and the `wasm` path. The same revision, source, Rust toolchain and Stellar CLI give the same Wasm.
 
 An owner builds the Wasm of a Custom policy with `allowit policy build`, which runs the same build through the
 rail's build hook ([Custom wallet build](../crates/allowit-stellar/README.md#custom-wallet-build)). The script
-rebuilds a policy independently: its `wasm_hash` equals the code hash that the owner attested.
+rebuilds a policy independently: its `wasm_hash` equals the code hash that the owner's client
+compares before it signs the deployment.
 
 Params JSON is an object of key => value, at most 32 keys of 1 to 32 ASCII letters, digits or
 underscores. An absent key is unset. The tool infers each value's `AllowitValue` type: an integer is
@@ -142,39 +145,39 @@ every other canonical param and 28 `operations` entries of the longest form. Sim
 `lifetime_spending_limit`, `daily_spending_limit`, `daily_volume_limit` (nonnegative integers), `call_limit`, `expires_at`
 (unsigned 64-bit integers), `destinations` and `tokens` (address lists), and `operations` (`"*"` or
 a list of op names, such as `["transfer"]`). Custom admits its policy's
-own keys, such as `vendor_limit`. A Custom policy state holds at most 39 keys, the seven standard keys
-and 32 policy keys, and 16 KiB counted the same way. No call deletes a state key, and
-`deploy_policy` keeps the state, so a policy write past either bound denies every operation that
-makes it. The standard
+own keys, such as `vendor_limit`. A Simple or Common wallet stores only the params of its rules;
+the server keeps the rest of the owner's params. The standard
 preflight skips an absent selected rule; full policy code stops with `MissingParam` when it reads it. The tool accepts such a packet and prints a warning.
 Legacy names such as `per_transfer`, `daily_limit` or `max_calls` reject on the standard tiers.
 Negative limits reject at standard configuration. Code changes defer the new tier validation to
 delegated admission.
-Duplicate JSON keys reject. Fund the wallet only with its
-installed asset. `recover` transfers only that asset. A forward swap can leave the wallet holding
-another Stellar Asset Contract token. Common and Custom can restrict that token with `tokens`;
-Simple relies on the server. Only a reverse swap or an owner `invoke` of that token's `transfer`
-moves it; `recover` cannot.
+Duplicate JSON keys reject. Fund the wallet with its installed asset and with XLM for the gas
+that it repays. `recover` transfers any token that the wallet holds. A forward swap can leave the
+wallet holding another Stellar Asset Contract token. Common and Custom can restrict that token
+with `tokens`; Simple relies on the server.
 
 `admin --family wallet --contract ADDRESS --source "$OWNER" --method METHOD --arguments JSON` admits
-`deploy_policy`, `set_pause` and `recover`. Parent administration uses `--family parent`, its native
-admin source and three `--member` values.
+`deploy_policy`, `set_pause`, `stop` and `recover`. Parent administration uses `--family parent`,
+its native admin source and three `--member` values.
 
-A deployment argument contains exactly `deployment_version`, `owner`, `agent`, `server`,
-`source_digest`, `rules`, `params`, `x402_enabled`, and `wasm_hash`. The target version is current plus
-one. Use null for unchanged code. A non-null `wasm_hash` also requires `--wasm PATH` with that hash;
-the tool refuses Wasm without `allowit_custody_layout` metadata equal to 4. Code for another custody
-layout cannot read the stored State, so such a change, including a rollback to an earlier release,
-locks custody permanently. Recover funds before any change across layouts. Deployment preserves
-pause and policy state. A changed owner must also authorize. `x402_enabled` enables custom-account authorization: the agent can then send a plain x402 `asset.transfer`, a plain `router.swap_exact_tokens_for_tokens` or a plain `vault.redeem`, and the wallet's `__check_auth` applies the policy to it. Enable it for payments only when swaps and redeems are also acceptable. On Common and Custom the `operations` and `destinations` rules can still deny them; on Simple only the server's offchain policy does. Enabled custom-account authorization requires distinct G-agent and G-server keys and both signatures.
-False disables all three plain calls without changing direct two-role execution authorization. Classic signer rotation and `shutdown-wallet` do not revoke raw-key delegation. The contract wallet owner must disable `x402_enabled`, pause, or replace the agent/server address through `deploy_policy`.
+An update argument, `{"update": {...}}`, contains exactly `deployment_version`, `owner`, `agent`,
+`server`, `source_hash`, `gas_cap`, `rules`, `params` and `wasm_hash`. The target version is
+current plus one. Use null for unchanged code. A non-null `wasm_hash` also requires `--wasm PATH`
+with that hash; the tool refuses Wasm without `allowit_custody_layout` metadata equal to 5. Code
+for another custody layout cannot read the stored configuration, so such a change, including a
+rollback to an earlier release, locks custody permanently. Recover funds before any change across
+layouts. Deployment preserves pause and the kept figures. A changed owner must also authorize. To
+revoke the agent or the server, replace its key through `deploy_policy`, pause, or stop the
+wallet.
 
 Owner passthrough uses `invoke(contract, function, args, auth)`. Prepare this exact call with the
 native CLI and inspect every nested authorization entry. This general owner operation is outside
 the restricted admin tool's method allowlist. Only the current owner can authorize it.
 
-`set_pause` takes `paused` and the next `deployment_version`. `recover` takes `recipient` and positive
-native `amount`, with no configuration version or usage update. Parent methods use their separate current `version`. `set_admin` takes the candidate `owner`. Argument fields must match the chosen method. The tool admits native owner
+`set_pause` takes `paused` and the next `deployment_version`. `stop` takes the next
+`deployment_version`: it pauses the wallet and returns its asset and XLM to the owner. `recover`
+takes a `token` contract, a `recipient` and a positive `amount`, with no configuration version or
+usage update. Parent methods use their separate current `version`. `set_admin` takes the candidate `owner`. Argument fields must match the chosen method. The tool admits native owner
 accounts with only their active master signer and satisfiable thresholds. Parent `set_admin` checks
 its candidate's exact 2-of-3 membership. Other owner authorization schemes require their own adapter.
 
@@ -185,23 +188,21 @@ children, resource fee and footprint. `--max-fee` bounds total/resource fees in 
 envelopes expire after five minutes. Save signed bytes before broadcast and reconcile the original
 hash after an uncertain response. The tool never signs, submits, restores or retries automatically.
 
-Use `read --contract POLICY_WALLET_ADDRESS --source "$OWNER" --method policy_binding` to inspect the contract
-release, policy instance, module/source digests and the operations that the wallet runs. `state` returns the custody
-State, including `params` and `policy_state`; `policy_state` returns the current policy state map
-alone. Archived data requires native restoration and is never reinitialized.
-The SDK rejects unavailable or ambiguous state observations before new signing. Owner pause,
-deployment and recovery do not depend on shared engine availability.
+Use `read --contract POLICY_WALLET_ADDRESS --source "$OWNER" --method state` to inspect the
+wallet: its layout, owner, agent and server keys, asset, deployment version, pause, source hash,
+gas cap, rules, params, the figures that its checks keep, and the figures. Archived data requires
+native restoration and is never reinitialized; the owner's calls restore a lapsed `t` in the same
+transaction. The SDK rejects unavailable or ambiguous state observations before new signing. Owner
+pause, deployment and recovery do not depend on shared engine availability.
 
-Wallets with layout `contract_version` 1 (text-keyed params map), 2 (accounting history struct) or
-3 (typed canonical params and raw state values) cannot execute under layout 4, and their accounting
-does not migrate. Owner `recover` and `invoke` still work after an in-place upgrade, because they
-read only the fields they keep; `deploy_policy` rejects an earlier layout with `InvalidState`. Drain
-such a wallet with `recover` and deploy a new one. The tool builds `deploy_policy`
-packets only for layout 4; read an earlier state with that release's tooling. `recover` does not read `state()`, so the tool also drains an upgraded wallet.
+Wallets of an earlier layout (`contract_version` 1 to 4) cannot execute under layout 5, and their
+accounting does not migrate. Owner `recover` and `invoke` of an earlier layout use that release's
+tooling. Drain such a wallet and deploy a new one. The tool builds owner packets only for layout 5;
+`recover` and `stop` read only the fixed header, which later layouts keep.
 
 Normal operations do not migrate state. An incompatible change uses this explicit maintenance
 sequence: pause, deploy and run a migration contract, deploy the new contract using the migrated
-state, then unpause. Compatible code updates retain the installed format, policy state and replay records.
+state, then unpause. Compatible code updates retain the installed format and the kept figures.
 
 The parent stores `owner`, `version` and `engine`. Wallet deployment and contract release versions remain separate.
 Older parent state uses different field names. Migrate that state explicitly before installing this parent executable on an existing address.

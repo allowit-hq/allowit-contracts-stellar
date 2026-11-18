@@ -10,7 +10,7 @@ test('plugin identity, networks and element tags follow the SDK contract', () =>
   assert.equal(plugin.id, 'stellar');
   assert.deepEqual(plugin.networks.map(n => n.id), ['stellar:testnet', 'stellar:pubnet']);
   assert.equal(plugin.networks.find(n => n.id === plugin.test.network)?.testnet, true);
-  assert.deepEqual(Object.keys(plugin.elements).sort(), ['address', 'amount', 'binding-review', 'build-attest', 'explorer-link', 'owner-answer', 'owner-sign', 'receipt', 'wallet-sign-in']);
+  assert.deepEqual(Object.keys(plugin.elements).sort(), ['address', 'amount', 'binding-review', 'explorer-link', 'owner-answer', 'owner-sign', 'receipt', 'wallet-sign-in']);
   for (const tag of Object.values(plugin.elements)) assert.match(tag, /^allowit-stellar-[a-z-]+$/);
   assert.equal(canonicalNetwork('stellar:mainnet'), 'stellar:pubnet');
   assert.equal(canonicalNetwork('other:testnet'), null);

@@ -163,7 +163,7 @@ pub fn execute(ctx: &AllowitContext) -> allowit::Result {
 - A rule takes the param value, so it may read any key, such as `&ctx.params["vendor_limit"]`.
 - Only an error that the policy returns denies. A policy may catch a rule error and continue.
 - `allowit::param(ctx, key)` and `allowit::arg(ctx, key)` return the typed value of an owner param or an agent arg. They panic when the key is missing or mistyped. A panic denies the run and discards its writes.
-- After approval the wallet and the server run the same `allowit::post_flight`. It updates the standard state keys and applies the policy's `allowit::set_state` writes. Simple and Common never add or change a policy key, so their post-flight denies every policy write, on the server as onchain. Policy keys left by earlier Custom code stay unchanged.
+- After approval the wallet and the server run the same standard `allowit::post_flight`. It updates the cumulated figures that the wallet's checks read. A wallet stores no policy state of its own, so the post-flight denies every `allowit::set_state` write, on the server as onchain.
 
 `scripts/policy_source.py` admits policy code through an allowlist, so the same file behaves the same offchain and onchain. The admin binary `allowit-stellar-admin` derives the standard `rules` from the source file. The server uses `allowit = { default-features = false, features = ["std"] }` and builds with `overflow-checks = true`. The full authoring rules are in [docs/architecture.md](docs/architecture.md).
 
@@ -171,9 +171,9 @@ pub fn execute(ctx: &AllowitContext) -> allowit::Result {
 
 A wallet knows three addresses, and they must all be different.
 
-- **Owner.** Creates the wallet and signs every configuration change. The owner alone can `deploy_policy`, `set_pause`, `recover` funds and `invoke` any contract call through the wallet. None of these need the agent or the server.
-- **Agent.** The AI agent, or whatever acts for you. It co-signs delegated operations, through `execute` or an intercepted authorization, and nothing else.
-- **Server.** An independent signer that co-signs every delegated operation. It is a second pair of eyes, not a shared checker contract and not an administrator.
+- **Owner.** Creates and funds the wallet with one signature and signs every configuration change. The owner alone can `deploy_policy`, `set_pause`, `stop`, `recover` funds and `invoke` any contract call through the wallet. None of these need the agent or the server.
+- **Agent.** The AI agent, or whatever acts for you. It holds an Ed25519 key and no account, and co-signs each delegated operation through `execute`, and nothing else.
+- **Server.** An independent signer that co-signs every delegated operation with its own key. It is a second pair of eyes, not a shared checker contract and not an administrator. Its sending account is the transaction source, pays the fee and receives the gas that the wallet repays.
 
 A separate **engine parent** contract can manage the code of a shared rule-checking engine. It holds no custody authority: it cannot touch a wallet's funds, configuration or signers. See [docs/engine-parent.md](docs/engine-parent.md).
 
@@ -182,15 +182,11 @@ A separate **engine parent** contract can manage the code of a shared rule-check
 
 ## How an operation happens
 
-1. The agent builds an `AllowitExecutionRequest`: the wallet's policy identity, source hash and module hash, a fresh operation id, the wallet's current nonce and deployment version, an expiry, the typed `operation` with its named arguments, expense bounds or `Unpriced`, and its per-call `args`. The operation is a `Transfer` (`token`, `to`, `amount`), a `Swap` (`router`, `amount_in`, `amount_out_min`, `path`, `deadline`), a `Deposit` (`vault`, `assets`, `min_shares`) or a `Redeem` (`vault`, `shares`, `min_assets`). The wallet is always the source, receiver and operator, so no argument names it.
-2. Agent and server both authorize `execute`.
-3. The wallet checks everything before it runs the policy: an operation that this wallet runs; the policy identity and installed module; the installed asset; well-formed vaults, routers and paths; no replay of the operation id; not paused; nonce and deployment version current; not expired; positive amount; recipient is neither the wallet nor the issuer. Rules see only the general operation `transfer`, `swap`, `deposit` or `redeem`.
-4. The wallet runs its local policy (custody checks only on Simple, the standard prefix on Common, the compiled file on Custom) against the params and the current policy state.
-5. The post-flight state, the next nonce and the replay marker are written, then the token transfer, vault deposit or redeem, or router swap runs. A deposit grants the vault exactly one `transfer` of the checked amount and checks the returned shares. A swap grants the router exactly one `transfer` of `amount_in` to its pair and checks both token balances. A redeem checks the burned shares and the asset credit against `min_assets`. Everything commits together and a receipt comes back. If anything fails, nothing moves.
-
-### Intercepted transfers, swaps and redeems
-
-The owner can enable custom-account authorization with `x402_enabled`. The agent and the server must then be G-addresses. The agent then sends the plain call that a simple wallet would sign: `asset.transfer(wallet, to, amount)` (x402), `router.swap_exact_tokens_for_tokens(amount_in, amount_out_min, path, wallet, deadline)` or `vault.redeem(shares, wallet, wallet, wallet)`. The host asks the wallet's `__check_auth` to authorize it. The wallet verifies both Ed25519 signatures over the host payload and the execution request, requires that the signed authorization tree is exactly that call, and applies the same policy, replay and usage checks as a direct `execute`. A swap's tree also holds its one `transfer` of the first path token to the router's pair. The router enforces the signed `amount_out_min`; an intercepted redeem has no onchain output floor, so use `execute` when a redeem needs one. See [docs/architecture.md](docs/architecture.md#swaps-and-redeems).
+1. The server prepares an `AllowitExecutionRequest`: a fresh operation id, the wallet's deployment version, an expiry, the typed operation, expense bounds or `Unpriced`, the XLM gas that the wallet repays and its payee, and the per-call `args`. The operation is a `Transfer` (token, to, amount), a `Swap` (router, amount in, minimum out, path, deadline), a `Deposit` (vault, assets, minimum shares) or a `Redeem` (vault, shares, minimum assets). The wallet is always the source, receiver and operator, so no argument names it.
+2. The server and then the agent sign the payload of the wallet's own authorization entry for `execute`. The server's sending account simulates the transaction, signs it as the source and sends it.
+3. The wallet's `__check_auth` verifies both signatures against the keys it stores and admits only its own `execute`. The wallet then checks everything before it runs the policy: an operation that this wallet runs; the installed asset; well-formed vaults, routers and paths; not paused; deployment version current; not expired; positive amount; recipient is neither the wallet nor the issuer; the gas within the owner's gas cap. The host's authorization nonce makes each signed operation run once. Rules see only the general operation `transfer`, `swap`, `deposit` or `redeem`.
+4. The wallet runs its local policy (custody checks only on Simple, the standard prefix on Common, the compiled file on Custom) against the params and the figures that its checks read.
+5. The figures are written, then the token transfer, vault deposit or redeem, or router swap runs, and the wallet repays the gas. A deposit grants the vault exactly one `transfer` of the checked amount and checks the returned shares. A swap grants the router exactly one `transfer` of `amount_in` to its pair and checks both token balances. A redeem checks the burned shares and the asset credit against the minimum assets. Everything commits together and one `allowit` event names the operation and its output. If anything fails, nothing moves.
 
 ## Quick start
 
@@ -216,6 +212,7 @@ The build leaves these contracts in `target/wasm32v1-none/release/`, plus the `a
 allowit_simple_policy_engine.wasm
 allowit_common_policy_engine.wasm
 allowit_custom_policy.wasm
+allowit_deployer.wasm
 allowit_wallet_engine.wasm
 allowit_engine_parent.wasm
 ```
@@ -253,24 +250,22 @@ The owner interface is the same on all three wallets:
 ```
 __constructor(config)                         owner
 state()                                       anyone
-policy_state()                                anyone
-policy_binding()                              anyone
-deposit_receipt(operation_id)                 anyone
-swap_receipt(operation_id)                    anyone
-redeem_receipt(operation_id)                  anyone
-execute(execution)                            agent and server
-deploy_policy(deployment)                     owner, plus the new owner if it changes
+execute(execution)                            the wallet's own authorization: agent and server
+deploy_policy(update)                         owner, plus the new owner if it changes
 set_pause(paused, deployment_version)         owner
-recover(recipient, amount)                    owner
+stop(deployment_version)                      owner
+recover(token, recipient, amount)             owner
 invoke(contract, function, args, auth)        owner
 ```
 
-`AllowitPolicyConfig` names the `owner`, `agent`, `server`, `asset`, `policy_instance`, `source_digest`, ordered `rules`, `params` and `x402_enabled`. The asset and the policy identity are fixed for the life of the wallet. Everything else changes through `deploy_policy`, which also accepts an optional new Wasm hash. With no new Wasm hash, params change without code redeployment. Both `deploy_policy` and `set_pause` must target exactly the next `deployment_version`. Pause, policy state and the execution nonce survive every deployment.
+`AllowitPolicyConfig` names the `owner`, the `agent` and `server` keys, the `asset`, the `source_hash` of the owner's whole source, the `gas_cap`, ordered `rules` and `params`. The asset is fixed for the life of the wallet. Everything else changes through `deploy_policy`, which also accepts an optional new Wasm hash. With no new Wasm hash, params change without code redeployment. `deploy_policy`, `set_pause` and `stop` must target exactly the next `deployment_version`. Pause and the kept figures survive every deployment. `stop` pauses the wallet and returns its asset and XLM to the owner in one call.
 
-`allowit-stellar-admin` prepares unsigned transactions for `upload`, `deploy-parent`, `deploy-wallet` and `admin`. It simulates, assembles fees and authorization entries, and hands you XDR to review and sign with your own keys. Its `read` action runs a read-only simulation of `state`, `engine` or `policy_binding`. It never signs, submits or retries. The same binary prepares and verifies classic-account multisig (`inspect`, `verify-admin`, `setup-admin` and the owner actions on a per-agent Native wallet, `verify-agent-wallet` through `close-agent-wallet`) and also never signs or submits. The binary needs no Python environment. Save signed bytes before broadcast and reconcile the original transaction hash after uncertainty.
+The owner creates and funds a wallet with one signature through the stateless deployer contract (`contracts/allowit-deployer`). The server uploads the wallet code.
+
+`allowit-stellar-admin` prepares unsigned transactions for `upload`, `deploy-parent`, `deploy-wallet` and `admin`. It simulates, assembles fees and authorization entries, and hands you XDR to review and sign with your own keys. Its `read` action runs a read-only simulation of `state` or `engine`. It never signs, submits or retries. The same binary prepares and verifies classic-account multisig (`inspect`, `verify-admin`, `setup-admin` and the owner actions on a per-agent Native wallet, `verify-agent-wallet` through `close-agent-wallet`) and also never signs or submits. The binary needs no Python environment. Save signed bytes before broadcast and reconcile the original transaction hash after uncertainty.
 
 ```sh
-crates/allowit-stellar/target/release/allowit-stellar-admin read --network testnet --contract "$WALLET" --source "$OWNER" --method policy_binding
+crates/allowit-stellar/target/release/allowit-stellar-admin read --network testnet --contract "$WALLET" --source "$OWNER" --method state
 ```
 
 The step-by-step guide, including params encoding and owner handoffs, is in [docs/admin.md](docs/admin.md). Release packets for mainnet are covered in [docs/mainnet.md](docs/mainnet.md).
@@ -282,11 +277,12 @@ contracts/
   allowit-simple-policy-engine/  AllowitSimplePolicyEngine contract
   allowit-common-policy-engine/  AllowitCommonPolicyEngine contract
   allowit-custom-policy/         AllowitCustomPolicy contract and sample policy source
+  allowit-deployer/              Stateless deployer: the owner's one-signature creation and funding
   allowit-wallet-engine/         Standalone shared rule engine contract
   allowit-engine-parent/         EngineParent contract for the standalone checker
 crates/
   allowit-stellar/          Off-chain Stellar SDK; separate Cargo workspace
-  protocol/                Shared request, receipt and binding types
+  protocol/                Shared request, operation, expense and event types
   policy/                  Soroban policy bindings
   policy-wallet/           Custody core, owner operations and policy_wallet! macro
   test-vault/              SEP-56 vault for tests
@@ -304,7 +300,8 @@ docs/                     Architecture, engine parent, administration, mainnet
 
 ## Documentation
 
-- [Architecture and authoring](docs/architecture.md): wallets, policy source, rules, configuration, intercepted authorization, deposits, swaps, redeems and owner operations.
+- [Architecture and authoring](docs/architecture.md): wallets, policy source, rules, configuration, the wallet's own authorization, deposits, swaps, redeems and owner operations.
+- [Kernel interface for Custom sources](docs/custom-policy-kernel.md): what a compiled source reads and the figures it keeps.
 - [Engine parent](docs/engine-parent.md): shared engine state, calls and lifetime.
 - [Setup and administration](docs/admin.md): preparing, reviewing and signing wallet transactions.
 - [Mainnet preparation](docs/mainnet.md): bounded, unsigned release packets.

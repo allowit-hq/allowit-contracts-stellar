@@ -36,14 +36,13 @@ struct Selection {
     params: PolicyParams,
     wasm_hash: String,
     wallet: Option<String>,
-    /// The fee account that the owner's client made for this wallet: the account that sends
-    /// the agent's operations. The creation and every update name it as the agent address.
-    #[serde(default)]
-    fee_account: Option<String>,
     asset: String,
     max_fee_stroops: u32,
     policy_max_fee_stroops: u32,
     amount: String,
+    /// The XLM that a creation moves into a wallet of another asset for its network fees.
+    #[serde(default)]
+    fee_asset_amount: Option<String>,
     next_sequence: String,
     valid_until: u64,
     /// The params update that the owner reviewed. `params` then holds the complete new params.
@@ -52,12 +51,11 @@ struct Selection {
 }
 
 /// The facts of a params update that the host read from the installation: the configuration
-/// revision that the update writes and the x402 choice that it keeps.
+/// revision that the update writes.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Update {
     deployment_version: String,
-    x402_enabled: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -155,7 +153,6 @@ fn verify(input: Input) -> Result<()> {
             wallet: wallet.into(),
             owner: expected.owner.clone(),
             agent: expected.agent.clone(),
-            fee_account: expected.fee_account.clone(),
             server: expected.server.clone(),
             route: WalletRoute::PolicyWallet,
             tier: Some(tier),
@@ -176,36 +173,28 @@ fn verify(input: Input) -> Result<()> {
     if expected.update.is_some() && step.action != "update_params" {
         return Err("The owner selection reviews a params update only".into());
     }
-    let next_sequence: i64 = expected.next_sequence.parse().map_err(crate::err)?;
     let action = match step.action.as_str() {
-        "upload_wasm" => OwnerAction::UploadWasm { wasm_hash },
-        // The creation of the fee account that the owner selected, for this agent and server.
-        // The browser has no RPC to read the owner's account: the owner's key signs alone,
-        // and the step takes the sequence that the host read.
-        crate::owner::CREATE_FEE_ACCOUNT if expected.fee_account.is_some() => {
-            OwnerAction::FeeAccountSetup {
-                state: crate::AccountState {
-                    address: expected.owner.clone(),
-                    sequence: next_sequence
-                        .checked_sub(1)
-                        .ok_or("Invalid owner sequence")?,
-                    master_weight: 1,
-                    low_threshold: 0,
-                    medium_threshold: 0,
-                    high_threshold: 0,
-                    signers: vec![],
-                },
-                account: expected.fee_account.clone().ok_or("Missing fee account")?,
-                agent: expected.agent.clone(),
-                engine: expected.server.clone(),
-                request_id: crate::owner::fee_account_request_id(&instance),
+        // The owner signs no code upload: the server uploads with its own account.
+        "create_wallet" => {
+            let config = installation(&expected, &wallet)?;
+            let units = |amount: &str| {
+                if amount.is_empty() {
+                    Ok(0)
+                } else {
+                    stroops(amount)
+                }
+            };
+            let funding = crate::admin::creation_funding(
+                &config,
+                units(&expected.amount)?,
+                units(expected.fee_asset_amount.as_deref().unwrap_or(""))?,
+            )?;
+            OwnerAction::CreateWallet {
+                config: Box::new(config),
+                salt,
+                funding,
             }
         }
-        "create_wallet" => OwnerAction::CreateWallet {
-            config: Box::new(installation(&expected, &wallet)?),
-            salt,
-            x402_enabled: false,
-        },
         // The packet keeps the installed roles, source binding and code and holds the complete
         // new params at the revision that the host read.
         "update_params" if expected.wallet.is_some() && expected.update.is_some() => {
@@ -215,7 +204,6 @@ fn verify(input: Input) -> Result<()> {
                 &config,
                 &config.policy_source,
                 config.params.clone(),
-                update.x402_enabled,
             )?;
             OwnerAction::UpdatePolicy {
                 wallet,
@@ -254,7 +242,7 @@ fn verify(input: Input) -> Result<()> {
         limits: OwnerLimits {
             network: NETWORK.into(),
             owner: expected.owner,
-            next_sequence,
+            next_sequence: expected.next_sequence.parse().map_err(crate::err)?,
             max_fee_stroops: expected.max_fee_stroops,
             valid_until: expected.valid_until,
         },
@@ -331,7 +319,7 @@ mod tests {
             "asset": crate::sac_address(NETWORK, &stellar_xdr::Asset::Native).unwrap(),
             "maxFeeStroops": 10_000, "policyMaxFeeStroops": 1_000_000, "amount": "1",
             "nextSequence": "42", "validUntil": NOW + 300,
-            "update": {"deploymentVersion": version, "x402Enabled": false},
+            "update": {"deploymentVersion": version},
         })
     }
     /// The step that a server prepares for that selection.
@@ -343,7 +331,6 @@ mod tests {
             wallet: expected.wallet.clone().unwrap(),
             owner: expected.owner.clone(),
             agent: expected.agent.clone(),
-            fee_account: None,
             server: expected.server.clone(),
             route: WalletRoute::PolicyWallet,
             tier: Some(PolicyTier::Common),
@@ -360,7 +347,7 @@ mod tests {
             max_fee_stroops: 1_000_000,
         };
         let (deployment, _) =
-            crate::admin::PolicyDeployment::for_source(&config, CODE, config.params.clone(), false)
+            crate::admin::PolicyDeployment::for_source(&config, CODE, config.params.clone())
                 .unwrap();
         let step = update_step(&config, &deployment, version, NOW);
         serde_json::json!({
@@ -380,12 +367,9 @@ mod tests {
     #[test]
     fn the_browser_verifier_binds_a_params_update_to_the_reviewed_values_and_revision() {
         check(step(20_000_000, 2), selection(20_000_000, "2")).unwrap();
-        // Another value, another revision, another x402 choice or another wallet differs.
+        // Another value, another revision or another wallet differs.
         assert!(check(step(90_000_000, 2), selection(20_000_000, "2")).is_err());
         assert!(check(step(20_000_000, 3), selection(20_000_000, "2")).is_err());
-        let mut x402 = selection(20_000_000, "2");
-        x402["update"]["x402Enabled"] = true.into();
-        assert!(check(step(20_000_000, 2), x402).is_err());
         let mut other = selection(20_000_000, "2");
         other["policyInstance"] = crate::hex(&[5; 32]).into();
         other["wallet"] = serde_json::Value::Null;
@@ -409,7 +393,6 @@ mod tests {
             wallet: expected.wallet.clone().unwrap(),
             owner: expected.owner.clone(),
             agent: expected.agent.clone(),
-            fee_account: None,
             server: expected.server.clone(),
             route: WalletRoute::PolicyWallet,
             tier: Some(PolicyTier::Common),
@@ -435,131 +418,5 @@ mod tests {
         assert!(check(funding.clone(), reviewed.clone()).is_err());
         reviewed.as_object_mut().unwrap().remove("update");
         check(funding, reviewed).unwrap();
-    }
-    /// The selection of a wallet with a fee account, and the config that the server holds.
-    fn fee_selection(fee_account: Option<&str>) -> serde_json::Value {
-        let mut selection = selection(20_000_000, "2");
-        if let Some(account) = fee_account {
-            selection["feeAccount"] = account.into();
-        }
-        selection
-    }
-    fn as_step(step: &serde_json::Value) -> serde_json::Value {
-        serde_json::json!({
-            "network": step["network"], "action": step["action"],
-            "transactionXdr": step["payload"], "transactionHash": step["transactionHash"],
-            "expiresAt": step["expiresAt"],
-        })
-    }
-    #[test]
-    fn the_browser_verifier_binds_the_fee_account_of_a_setup_and_of_an_update() {
-        let fee_account = account(77);
-        let expected: Selection =
-            serde_json::from_value(fee_selection(Some(&fee_account))).unwrap();
-        // The step that a server prepares for the creation of that fee account.
-        let setup = |account: &str, agent: &str, sequence: i64| {
-            let owner = crate::AccountState {
-                address: expected.owner.clone(),
-                sequence,
-                master_weight: 1,
-                low_threshold: 0,
-                medium_threshold: 0,
-                high_threshold: 0,
-                signers: vec![],
-            };
-            let setup = crate::owner::prepare_fee_account_setup(
-                &owner,
-                &crate::owner::FeeAccountTerms {
-                    account,
-                    agent,
-                    engine: &expected.server,
-                    request_id: &crate::owner::fee_account_request_id(&[4; 32]),
-                    network: NETWORK,
-                    fee_per_operation: 100,
-                },
-                NOW,
-            )
-            .unwrap();
-            let packet = crate::owner::setup_transaction(&setup).unwrap();
-            serde_json::json!({
-                "network": packet.network, "action": packet.action,
-                "transactionXdr": packet.transaction_xdr,
-                "transactionHash": crate::hex(&packet.transaction_hash),
-                "expiresAt": packet.expires_at,
-            })
-        };
-        let mut creation = fee_selection(Some(&fee_account));
-        creation.as_object_mut().unwrap().remove("update");
-        check(setup(&fee_account, &expected.agent, 41), creation.clone()).unwrap();
-        // Another account, another agent or another sequence is not the selected setup, and a
-        // selection without a fee account admits no such step.
-        assert!(check(setup(&account(78), &expected.agent, 41), creation.clone()).is_err());
-        assert!(check(setup(&fee_account, &account(79), 41), creation.clone()).is_err());
-        assert!(check(setup(&fee_account, &expected.agent, 42), creation.clone()).is_err());
-        let mut without = creation.clone();
-        without.as_object_mut().unwrap().remove("feeAccount");
-        assert!(check(setup(&fee_account, &expected.agent, 41), without).is_err());
-
-        // An update of a wallet with a fee account keeps the fee account as its agent address.
-        let config = |fee: Option<&str>| WalletConfig {
-            network: NETWORK.into(),
-            policy_instance: [4; 32],
-            wallet: expected.wallet.clone().unwrap(),
-            owner: expected.owner.clone(),
-            agent: expected.agent.clone(),
-            fee_account: fee.map(str::to_owned),
-            server: expected.server.clone(),
-            route: WalletRoute::PolicyWallet,
-            tier: Some(PolicyTier::Common),
-            language: PolicyLanguage::Portable,
-            rules: crate::policy::tier_rules(PolicyTier::Common, CODE).unwrap(),
-            params: expected.params.clone(),
-            source_digest: [0; 32],
-            asset: expected.asset.clone(),
-            asset_symbol: "XLM".into(),
-            asset_issuer: None,
-            policy_source: CODE.into(),
-            source_hash: crate::hash(CODE.as_bytes()),
-            module_digest: crate::unhex(COMMON_WASM_HASH).unwrap(),
-            max_fee_stroops: 1_000_000,
-        };
-        let update = |fee: Option<&str>| {
-            let config = config(fee);
-            let (deployment, _) = crate::admin::PolicyDeployment::for_source(
-                &config,
-                CODE,
-                config.params.clone(),
-                false,
-            )
-            .unwrap();
-            assert_eq!(deployment.agent, fee.unwrap_or(&expected.agent));
-            as_step(&update_step(&config, &deployment, 2, NOW))
-        };
-        check(
-            update(Some(&fee_account)),
-            fee_selection(Some(&fee_account)),
-        )
-        .unwrap();
-        // The step of another fee account, or of none, is not the reviewed update, and a
-        // selection without the fee account does not admit the step that keeps it.
-        assert!(
-            check(
-                update(Some(&account(78))),
-                fee_selection(Some(&fee_account))
-            )
-            .is_err()
-        );
-        assert!(check(update(None), fee_selection(Some(&fee_account))).is_err());
-        assert!(check(update(Some(&fee_account)), fee_selection(None)).is_err());
-        // A fee account takes no x402 authorization.
-        assert!(
-            crate::admin::PolicyDeployment::for_source(
-                &config(Some(&fee_account)),
-                CODE,
-                expected.params.clone(),
-                true
-            )
-            .is_err()
-        );
     }
 }

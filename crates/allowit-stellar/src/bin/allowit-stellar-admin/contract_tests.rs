@@ -1,7 +1,8 @@
 //! Guards of contract administration. `tests/fixtures/contract_admin_vectors.json` records what
-//! the Python command line `scripts/contract_admin.py` returned at revision `d0cf4e0` for each
-//! case: argument checks, Stellar CLI commands, assembly checks and complete runs with every
-//! CLI call.
+//! the Python module `scripts/contract_admin.py` returns for each case: argument checks and
+//! Stellar CLI commands (re-recorded for the wallet ABI of custody layout 5), assembly checks
+//! and complete runs of uploads and of the parent family with every CLI call (recorded at
+//! revision `d0cf4e0`). The wallet runs are the tests at the end of this file.
 use super::contract::*;
 use super::{Result, public};
 use base64::Engine;
@@ -141,7 +142,7 @@ fn argument_checks_match_the_recorded_vectors() {
         let admitted = checked_args(method, &values, family).is_ok();
         assert_eq!(admitted, case["ok"] == true, "{case}");
     }
-    assert_eq!(cases.iter().filter(|case| case["ok"] == true).count(), 13);
+    assert_eq!(cases.iter().filter(|case| case["ok"] == true).count(), 12);
 }
 
 #[test]
@@ -177,7 +178,7 @@ fn commands_match_the_recorded_vectors_and_never_submit() {
         }
         prepared += 1;
     }
-    assert_eq!(prepared, 24);
+    assert_eq!(prepared, 26);
 }
 
 #[test]
@@ -222,7 +223,7 @@ fn complete_runs_match_the_recorded_vectors() {
     let vectors = vectors();
     let directory = files(&vectors);
     let cases = vectors["runs"].as_array().unwrap();
-    assert_eq!(cases.len(), 58);
+    assert_eq!(cases.len(), 19);
     let mut completed = 0;
     for case in cases {
         let argv: Vec<String> = case["argv"]
@@ -271,7 +272,7 @@ fn complete_runs_match_the_recorded_vectors() {
         replay.finish(case);
         completed += 1;
     }
-    assert_eq!(completed, 17);
+    assert_eq!(completed, 5);
 }
 
 #[test]
@@ -293,16 +294,22 @@ fn owner_packets_pass_the_std_only_compile_of_the_offchain_server() {
     let failing = |_: &str| -> Result<()> { Err("std-only compile".into()) };
     std::fs::write(&path, cases[0]["source"].as_str().unwrap()).unwrap();
     let digest = allowit_stellar::hex(&allowit_stellar::hash(std::fs::read(&path).unwrap()));
-    for (tier, rules, source_digest) in [
-        (
-            "common",
-            json!(["destinations", "expires_at"]),
-            "22".repeat(32),
-        ),
-        ("custom", json!([]), digest),
-        ("simple", json!([]), "22".repeat(32)),
+    for (tier, rules) in [
+        ("common", json!(["destinations", "expires_at"])),
+        ("custom", json!([])),
+        ("simple", json!([])),
     ] {
-        let packet = json!({"rules": rules, "source_digest": source_digest});
+        // Every tier stores the SHA-256 of the whole source.
+        let packet = json!({"rules": rules, "source_hash": digest});
+        assert!(
+            policy_rules(
+                &json!({"rules": rules, "source_hash": "22".repeat(32)}),
+                Some(tier),
+                path.to_str(),
+                &no_compile
+            )
+            .is_err()
+        );
         let source = path.to_str();
         assert!(policy_rules(&packet, Some(tier), source, &no_compile).is_ok());
         assert!(policy_rules(&packet, Some(tier), source, &failing).is_err());
@@ -429,4 +436,451 @@ fn the_command_line_takes_only_public_values() {
         (parsed.network.as_str(), parsed.max_fee),
         ("testnet", 10_000_000)
     );
+}
+
+/// A Stellar CLI and RPC for a policy wallet of layout 5: it reads the wallet's `state` view,
+/// builds the exact invocation or creation of the named arguments, and simulates it with the
+/// owner's source authorization, and a new owner's address authorization, as the pinned CLI and
+/// RPC record them.
+struct WalletCli {
+    state: Value,
+    candidate: Option<String>,
+    calls: RefCell<Vec<Vec<String>>>,
+}
+impl WalletCli {
+    fn new(state: Value) -> Self {
+        Self {
+            state,
+            candidate: None,
+            calls: RefCell::new(vec![]),
+        }
+    }
+    fn call(&self, args: &[String], input: Option<&str>) -> Result<String> {
+        self.calls.borrow_mut().push(args.to_vec());
+        if args.iter().any(|arg| arg == "--send=no") {
+            assert_eq!(args.last().map(String::as_str), Some("state"));
+            return Ok(self.state.to_string());
+        }
+        if args[..2] == ["tx", "simulate"] {
+            return self.simulate(input.unwrap());
+        }
+        self.build(args)
+    }
+    fn build(&self, args: &[String]) -> Result<String> {
+        use stellar_xdr::*;
+        let at = |flag: &str| args[args.iter().position(|arg| arg == flag).unwrap() + 1].clone();
+        let source = at("--source-account");
+        let tail = &args[args.iter().position(|arg| arg == "--").unwrap() + 1..];
+        let named = |flag: &str| {
+            tail.iter()
+                .position(|arg| arg == flag)
+                .map(|i| tail[i + 1].clone())
+                .unwrap()
+        };
+        let update = |text: &str| -> ScVal {
+            let u: serde_json::Value = serde_json::from_str(text).unwrap();
+            let raw = |role: &str| {
+                allowit_stellar::account_for_public_key(
+                    &allowit_stellar::unhex::<32>(u[role].as_str().unwrap()).unwrap(),
+                )
+            };
+            let rules: Vec<String> = serde_json::from_value(u["rules"].clone()).unwrap();
+            let params = serde_json::from_value(u["params"].clone()).unwrap();
+            let source_hash =
+                allowit_stellar::unhex::<32>(u["source_hash"].as_str().unwrap()).unwrap();
+            let gas_cap = u["gas_cap"].as_str().unwrap().parse().unwrap();
+            if u.get("asset").is_some() {
+                return allowit_stellar::contract::policy_config(
+                    allowit_stellar::contract::PolicyConfig {
+                        owner: u["owner"].as_str().unwrap(),
+                        agent: &raw("agent"),
+                        server: &raw("server"),
+                        asset: u["asset"].as_str().unwrap(),
+                        source_hash: &source_hash,
+                        gas_cap,
+                        rules: &rules,
+                        params: &params,
+                    },
+                )
+                .unwrap();
+            }
+            let wasm = u["wasm_hash"]
+                .as_str()
+                .map(|h| allowit_stellar::unhex::<32>(h).unwrap());
+            allowit_stellar::contract::policy_update(allowit_stellar::contract::PolicyUpdate {
+                deployment_version: u["deployment_version"].as_u64().unwrap() as u32,
+                owner: u["owner"].as_str().unwrap(),
+                agent: &raw("agent"),
+                server: &raw("server"),
+                source_hash: &source_hash,
+                gas_cap,
+                rules: &rules,
+                params: &params,
+                wasm_hash: wasm.as_ref(),
+            })
+            .unwrap()
+        };
+        let address = |text: &str| allowit_stellar::address(text).unwrap();
+        let host_function = if args[1] == "deploy" {
+            let wasm = std::fs::read(at("--wasm")).unwrap();
+            HostFunction::CreateContractV2(CreateContractArgsV2 {
+                contract_id_preimage: ContractIdPreimage::Address(ContractIdPreimageFromAddress {
+                    address: address(&source),
+                    salt: Uint256([5; 32]),
+                }),
+                executable: ContractExecutable::Wasm(Hash(allowit_stellar::hash(&wasm))),
+                constructor_args: vec![update(&named("--config"))].try_into().unwrap(),
+            })
+        } else {
+            let method = tail[0].clone();
+            let call_args = match method.as_str() {
+                "set_pause" => vec![
+                    ScVal::Bool(named("--paused") == "true"),
+                    ScVal::U32(named("--deployment-version").parse().unwrap()),
+                ],
+                "stop" => vec![ScVal::U32(named("--deployment-version").parse().unwrap())],
+                "recover" => vec![
+                    ScVal::Address(address(&named("--token"))),
+                    ScVal::Address(address(&named("--recipient"))),
+                    {
+                        let amount: i128 = named("--amount").parse().unwrap();
+                        ScVal::I128(Int128Parts {
+                            hi: (amount >> 64) as i64,
+                            lo: amount as u64,
+                        })
+                    },
+                ],
+                "deploy_policy" => vec![update(&named("--update"))],
+                other => panic!("unexpected method {other}"),
+            };
+            HostFunction::InvokeContract(InvokeContractArgs {
+                contract_address: address(&at("--id")),
+                function_name: ScSymbol(method.as_bytes().to_vec().try_into().unwrap()),
+                args: call_args.try_into().unwrap(),
+            })
+        };
+        let tx = Transaction {
+            source_account: MuxedAccount::Ed25519(Uint256(public(&source).unwrap())),
+            fee: 100,
+            seq_num: SequenceNumber(43),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                    host_function,
+                    auth: VecM::default(),
+                }),
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V0,
+        };
+        allowit_stellar::xdr(&TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: VecM::default(),
+        }))
+    }
+    fn simulate(&self, input: &str) -> Result<String> {
+        use stellar_xdr::*;
+        let TransactionEnvelope::Tx(mut envelope) = allowit_stellar::read(input).unwrap() else {
+            panic!()
+        };
+        let mut operations = envelope.tx.operations.to_vec();
+        let OperationBody::InvokeHostFunction(op) = &mut operations[0].body else {
+            panic!()
+        };
+        let root = match &op.host_function {
+            HostFunction::InvokeContract(call) => SorobanAuthorizedInvocation {
+                function: SorobanAuthorizedFunction::ContractFn(call.clone()),
+                sub_invocations: VecM::default(),
+            },
+            HostFunction::CreateContractV2(create) => {
+                let wallet = admin_wallet(create);
+                SorobanAuthorizedInvocation {
+                    function: SorobanAuthorizedFunction::CreateContractV2HostFn(create.clone()),
+                    sub_invocations: vec![SorobanAuthorizedInvocation {
+                        function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                            contract_address: allowit_stellar::address(&wallet).unwrap(),
+                            function_name: ScSymbol(b"__constructor".to_vec().try_into().unwrap()),
+                            args: create.constructor_args.clone(),
+                        }),
+                        sub_invocations: VecM::default(),
+                    }]
+                    .try_into()
+                    .unwrap(),
+                }
+            }
+            _ => panic!(),
+        };
+        let mut auth = vec![SorobanAuthorizationEntry {
+            credentials: SorobanCredentials::SourceAccount,
+            root_invocation: root.clone(),
+        }];
+        if let Some(candidate) = &self.candidate {
+            auth.push(SorobanAuthorizationEntry {
+                credentials: SorobanCredentials::Address(SorobanAddressCredentials {
+                    address: allowit_stellar::address(candidate).unwrap(),
+                    nonce: 7,
+                    signature_expiration_ledger: 0,
+                    signature: ScVal::Void,
+                }),
+                root_invocation: root,
+            });
+        }
+        op.auth = auth.try_into().unwrap();
+        envelope.tx.operations = operations.try_into().unwrap();
+        envelope.tx.ext = TransactionExt::V1(SorobanTransactionData {
+            resource_fee: 1000,
+            ..Default::default()
+        });
+        envelope.tx.fee += 1000;
+        allowit_stellar::xdr(&TransactionEnvelope::Tx(envelope))
+    }
+}
+/// The wallet that a creation's preimage derives on Testnet.
+fn admin_wallet(create: &stellar_xdr::CreateContractArgsV2) -> String {
+    let stellar_xdr::ContractIdPreimage::Address(from) = &create.contract_id_preimage else {
+        panic!()
+    };
+    allowit_stellar::admin::wallet_address(
+        "stellar:testnet",
+        &allowit_stellar::address_text(&from.address).unwrap(),
+        &from.salt.0,
+    )
+    .unwrap()
+}
+const WALLET: &str = "CAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQTD2L";
+const COMMON: &str = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::destinations(ctx, &ctx.params[allowit::DESTINATIONS])?;\n    allowit::expires_at(ctx, &ctx.params[allowit::EXPIRES_AT])?;\n    Ok(())\n}\n";
+fn owner_account(account: &str) -> Value {
+    json!({"account_id": account, "sequence": "42",
+        "signers": [{"key": account, "weight": 1, "type": "ed25519_public_key"}],
+        "thresholds": {"low_threshold": 0, "med_threshold": 0, "high_threshold": 0}})
+}
+/// One run of `argv` against `cli`, with every named account an owner-only account.
+fn wallet_run(cli: &WalletCli, argv: &[String]) -> Result<String> {
+    let get = |url: &str| -> Result<Value> { Ok(owner_account(url.rsplit('/').next().unwrap())) };
+    let args = parse(argv)?;
+    run(&args, &get, &|a, i| cli.call(a, i), &no_compile, 1000).map(|(out, _)| out)
+}
+fn assembled_auth(output: &str) -> Vec<stellar_xdr::SorobanAuthorizationEntry> {
+    let stellar_xdr::TransactionEnvelope::Tx(envelope) = allowit_stellar::read(output).unwrap()
+    else {
+        panic!()
+    };
+    let stellar_xdr::OperationBody::InvokeHostFunction(op) = &envelope.tx.operations[0].body else {
+        panic!()
+    };
+    op.auth.to_vec()
+}
+
+#[test]
+fn the_owner_pauses_stops_and_recovers_a_wallet_at_its_next_version() {
+    let owner = super::tests::key(1);
+    let argv = |method: &str, arguments: Value, source: &str| -> Vec<String> {
+        [
+            "admin",
+            "--contract",
+            WALLET,
+            "--method",
+            method,
+            "--arguments",
+            &arguments.to_string(),
+            "--source",
+            source,
+        ]
+        .map(String::from)
+        .to_vec()
+    };
+    let state = json!({"owner": owner, "deployment_version": 2, "contract_version": 5});
+    for (method, arguments) in [
+        (
+            "set_pause",
+            json!({"paused": true, "deployment_version": 3}),
+        ),
+        ("stop", json!({"deployment_version": 3})),
+    ] {
+        let cli = WalletCli::new(state.clone());
+        let output = wallet_run(&cli, &argv(method, arguments.clone(), &owner)).unwrap();
+        // The state read, the build and the simulation; only the owner authorizes.
+        assert_eq!(cli.calls.borrow().len(), 3, "{method}");
+        let auth = assembled_auth(&output);
+        assert_eq!(auth.len(), 1);
+        assert_eq!(
+            auth[0].credentials,
+            stellar_xdr::SorobanCredentials::SourceAccount
+        );
+        // Another version than the next one, or another source than the owner, prepares nothing.
+        let mut stale = arguments.clone();
+        stale["deployment_version"] = json!(4);
+        assert!(wallet_run(&WalletCli::new(state.clone()), &argv(method, stale, &owner)).is_err());
+        let other = super::tests::key(9);
+        assert!(
+            wallet_run(
+                &WalletCli::new(state.clone()),
+                &argv(method, arguments, &other)
+            )
+            .unwrap_err()
+            .contains("current owner")
+        );
+    }
+    // A recovery reads no state: it runs under any layout that keeps the owner's header.
+    let token = "CABQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGCK3";
+    let recover = json!({"token": token, "recipient": owner, "amount": 5});
+    let cli = WalletCli::new(json!({}));
+    wallet_run(&cli, &argv("recover", recover.clone(), &owner)).unwrap();
+    assert_eq!(cli.calls.borrow().len(), 2);
+    let mut account_token = recover.clone();
+    account_token["token"] = json!(owner);
+    assert!(
+        wallet_run(
+            &WalletCli::new(json!({})),
+            &argv("recover", account_token, &owner)
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn an_owner_update_binds_the_source_and_a_new_owner_cosigns() {
+    let directory = tempfile::tempdir().unwrap();
+    let policy = directory.path().join("policy.rs");
+    std::fs::write(&policy, COMMON).unwrap();
+    let source_hash = allowit_stellar::hex(&allowit_stellar::hash(COMMON.as_bytes()));
+    let (owner, agent, server) = (
+        super::tests::key(1),
+        super::tests::key(2),
+        super::tests::key(3),
+    );
+    let update = |next_owner: &str| {
+        json!({"update": {"deployment_version": 3, "owner": next_owner, "agent": agent, "server": server,
+            "source_hash": source_hash, "gas_cap": 1000000, "rules": ["destinations", "expires_at"],
+            "params": {"destinations": [super::tests::key(4)], "expires_at": 2000000000}, "wasm_hash": null}})
+    };
+    let argv = |arguments: Value| -> Vec<String> {
+        [
+            "admin",
+            "--contract",
+            WALLET,
+            "--method",
+            "deploy_policy",
+            "--tier",
+            "common",
+            "--policy-source",
+            policy.to_str().unwrap(),
+            "--arguments",
+            &arguments.to_string(),
+            "--source",
+            &owner,
+        ]
+        .map(String::from)
+        .to_vec()
+    };
+    let state = json!({"owner": owner, "deployment_version": 2, "contract_version": 5});
+    let cli = WalletCli::new(state.clone());
+    let output = wallet_run(&cli, &argv(update(&owner))).unwrap();
+    assert_eq!(assembled_auth(&output).len(), 1);
+    // The CLI receives the agent and the server as raw keys and the gas cap as decimal text.
+    let build = cli.calls.borrow()[1].clone();
+    let sent: Value =
+        serde_json::from_str(&build[build.iter().position(|a| a == "--update").unwrap() + 1])
+            .unwrap();
+    assert_eq!(
+        sent["agent"],
+        json!(allowit_stellar::hex(&public(&agent).unwrap()))
+    );
+    assert_eq!(sent["gas_cap"], json!("1000000"));
+    // A new owner authorizes the update too, by its own address entry.
+    let next = super::tests::key(5);
+    let mut cli = WalletCli::new(state.clone());
+    cli.candidate = Some(next.clone());
+    let output = wallet_run(&cli, &argv(update(&next))).unwrap();
+    let auth = assembled_auth(&output);
+    assert_eq!(auth.len(), 2);
+    assert!(
+        matches!(&auth[1].credentials, stellar_xdr::SorobanCredentials::Address(c)
+        if c.address == allowit_stellar::address(&next).unwrap())
+    );
+    // An earlier layout, another source hash, roles that repeat or name the wallet prepare nothing.
+    let earlier = json!({"owner": owner, "deployment_version": 2, "contract_version": 4});
+    assert!(
+        wallet_run(&WalletCli::new(earlier), &argv(update(&owner)))
+            .unwrap_err()
+            .contains("layout version 5")
+    );
+    let mut other = update(&owner);
+    other["update"]["source_hash"] = json!("22".repeat(32));
+    assert!(wallet_run(&WalletCli::new(state.clone()), &argv(other)).is_err());
+    let mut repeated = update(&owner);
+    repeated["update"]["server"] = json!(agent);
+    assert!(wallet_run(&WalletCli::new(state.clone()), &argv(repeated)).is_err());
+    let mut wallet_owner = update(&owner);
+    wallet_owner["update"]["owner"] = json!(WALLET);
+    assert!(wallet_run(&WalletCli::new(state), &argv(wallet_owner)).is_err());
+}
+
+#[test]
+fn the_owner_creates_a_wallet_with_its_config_and_constructor_authorization() {
+    let directory = tempfile::tempdir().unwrap();
+    let policy = directory.path().join("policy.rs");
+    std::fs::write(&policy, COMMON).unwrap();
+    let wasm = directory.path().join("wallet.wasm");
+    // A module that declares custody layout 5.
+    let mut meta = 0u32.to_be_bytes().to_vec();
+    for text in [b"allowit_custody_layout".as_slice(), b"5"] {
+        meta.extend((text.len() as u32).to_be_bytes());
+        meta.extend(text);
+        meta.resize(meta.len().div_ceil(4) * 4, 0);
+    }
+    let mut module = b"\0asm\x01\0\0\0".to_vec();
+    let mut payload = vec![14u8];
+    payload.extend(b"contractmetav0");
+    payload.extend(&meta);
+    module.extend([0, payload.len() as u8]);
+    module.extend(payload);
+    std::fs::write(&wasm, &module).unwrap();
+    let owner = super::tests::key(1);
+    let config = json!({"owner": owner, "agent": super::tests::key(2), "server": super::tests::key(3),
+        "asset": "CABQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGCK3",
+        "source_hash": allowit_stellar::hex(&allowit_stellar::hash(COMMON.as_bytes())), "gas_cap": 1000000,
+        "rules": ["destinations", "expires_at"], "params": {"destinations": [super::tests::key(4)], "expires_at": 2000000000}});
+    let argv = |config: &Value| -> Vec<String> {
+        [
+            "deploy-wallet",
+            "--wasm",
+            wasm.to_str().unwrap(),
+            "--wasm-hash",
+            &allowit_stellar::hex(&allowit_stellar::hash(&module)),
+            "--config",
+            &config.to_string(),
+            "--tier",
+            "common",
+            "--policy-source",
+            policy.to_str().unwrap(),
+            "--source",
+            &owner,
+        ]
+        .map(String::from)
+        .to_vec()
+    };
+    let cli = WalletCli::new(json!({}));
+    let output = wallet_run(&cli, &argv(&config)).unwrap();
+    let auth = assembled_auth(&output);
+    assert_eq!(auth.len(), 1);
+    assert!(matches!(
+        auth[0].root_invocation.function,
+        stellar_xdr::SorobanAuthorizedFunction::CreateContractV2HostFn(_)
+    ));
+    for (field, value) in [
+        ("policy_instance", json!("11".repeat(32))),
+        ("gas_cap", json!(-1)),
+        ("agent", json!(owner)),
+    ] {
+        let mut changed = config.clone();
+        changed[field] = value;
+        assert!(
+            wallet_run(&WalletCli::new(json!({})), &argv(&changed)).is_err(),
+            "{field}"
+        );
+    }
 }

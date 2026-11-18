@@ -36,8 +36,6 @@ impl PolicyInstallation {
             )?,
             owner: self.owner.clone(),
             agent: self.agent.clone(),
-            // The owner's client derives the fee account and names it before the creation.
-            fee_account: None,
             server: self.server.clone(),
             route: WalletRoute::PolicyWallet,
             tier: Some(self.tier),
@@ -59,7 +57,7 @@ impl PolicyInstallation {
             module_digest: self.module_digest,
             max_fee_stroops: self.max_fee_stroops,
         };
-        PolicyConfig::for_policy(&config, false)?;
+        PolicyConfig::for_policy(&config)?;
         Ok(config)
     }
 }

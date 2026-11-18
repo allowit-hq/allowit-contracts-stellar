@@ -176,6 +176,9 @@ fn accounting(a: Option<&Accounting>) -> Option<rpc::NativeAccounting> {
         spent_daily: a.spent_daily,
         spent_total: a.spent_total,
         spent_day: a.spent_day,
+        volume_daily: a.volume_daily,
+        unpriced_total: a.unpriced_total,
+        unpriced_daily: a.unpriced_daily,
         calls: a.calls,
     })
 }
@@ -372,6 +375,19 @@ pub struct Provider {
     network: String,
     runtime: crate::provider::runtime::Runtime,
     transport: std::sync::Arc<dyn rpc::Rpc>,
+    sender: Option<Sender>,
+}
+/// The signing capability of the server's sending accounts: it signs a transaction hash with the
+/// key of the named account. A policy wallet operation is sent from one of them, which pays its
+/// fee; the wallet repays the gas to it.
+pub type Sender = std::sync::Arc<dyn SendingAccounts>;
+/// The server's sending accounts: the account that sends the next policy wallet operation, pays
+/// its fee and receives its gas, and the signature of a transaction hash with an account's key.
+pub trait SendingAccounts: Send + Sync {
+    /// The account for the next policy wallet operation.
+    fn account(&self) -> native::Result<String>;
+    /// The signature of `hash` by the key of `account`.
+    fn sign(&self, account: &str, hash: &[u8; 32]) -> native::Result<[u8; 64]>;
 }
 impl Provider {
     /// One owner action on a keypair wallet: a transaction from the owner's account whose
@@ -437,7 +453,7 @@ impl Provider {
                     recipient: Some(recipient),
                 }
             }
-            OwnerAction::Upload { .. } | OwnerAction::Create { .. } | OwnerAction::Extend => {
+            OwnerAction::Create { .. } | OwnerAction::Extend => {
                 return Err(Error::unsupported(
                     "A keypair wallet has no code: its owner creates it with the wallet setup",
                 ));
@@ -464,12 +480,8 @@ impl Provider {
             fee_per_operation,
             now,
         ))?;
-        Self::within_fee_limit(&p, fee_limit)?;
-        Ok(OwnerPacket(packet(&c.network, &p)?))
-    }
-    /// A fee limit below the minimum fee of every operation prepares nothing: the declared fee
-    /// of a classic owner transaction never exceeds the caller's limit.
-    fn within_fee_limit(p: &native::owner_intent::OwnerTransaction, fee_limit: u64) -> Result<()> {
+        // A fee limit below the minimum fee of every operation prepares nothing: the declared
+        // fee never exceeds the caller's limit.
         let stellar_xdr::TransactionEnvelope::Tx(envelope) = checked(native::read::<
             stellar_xdr::TransactionEnvelope,
         >(&p.transaction_xdr))?
@@ -483,83 +495,6 @@ impl Provider {
                 envelope.tx.operations.len()
             )));
         }
-        Ok(())
-    }
-    /// The fee of one classic operation of an owner action: an equal share of the caller's
-    /// fee limit, within the bounds of one operation.
-    fn classic_fee(fee_limit: u64) -> Result<u32> {
-        u32::try_from((fee_limit / 6).clamp(100, 10_000))
-            .map_err(|_| Error::usage("Invalid owner fee limit"))
-    }
-    /// The owner step that creates the fee account of a policy wallet: one transaction from
-    /// the owner's account that creates the account with its reserve and the fee float, adds
-    /// the owner, agent and server signers and takes every authority from the account's own
-    /// key. The owner signs it, and the account's own key signs it once.
-    fn prepare_fee_account(
-        &self,
-        c: &WalletConfig,
-        fee_account: &str,
-        fee_limit: u64,
-        now: u64,
-    ) -> Result<OwnerPacket> {
-        let owner_state = checked(rpc::get_account(self.rpc(), &c.owner))?;
-        let setup = checked(native::owner::prepare_fee_account_setup(
-            &owner_state,
-            &native::owner::FeeAccountTerms {
-                account: fee_account,
-                agent: &c.agent,
-                engine: &c.server,
-                request_id: &native::owner::fee_account_request_id(&c.policy_instance),
-                network: &c.network,
-                fee_per_operation: Self::classic_fee(fee_limit)?,
-            },
-            now,
-        ))?;
-        let p = checked(native::owner::setup_transaction(&setup))?;
-        Self::within_fee_limit(&p, fee_limit)?;
-        Ok(OwnerPacket(packet(&c.network, &p)?))
-    }
-    /// The owner step that returns the float of a fee account to the owner. The account stays
-    /// with its reserve, so the owner can refill it and resume the wallet. A fee account that
-    /// holds nothing above its reserve, or that its owner closed, has nothing to return.
-    fn prepare_fee_return(
-        &self,
-        c: &WalletConfig,
-        fee_limit: u64,
-        now: u64,
-    ) -> Result<OwnerPacket> {
-        let nothing = || checked(Err(super::diagnostics::NOTHING_TO_RETURN.into()));
-        let Some(fee_account) = c.fee_account.as_deref() else {
-            return nothing();
-        };
-        let Some(account) = checked(rpc::find_account(self.rpc(), fee_account))? else {
-            return nothing();
-        };
-        // An account without its agent signer keeps the reserve of that signer.
-        let paused = checked(account.wallet_status(&c.owner, &c.agent, &c.server))?
-            == native::owner::WalletStatus::Paused;
-        let spendable =
-            checked(rpc::native_balance(self.rpc(), fee_account))?.spendable(i64::from(paused));
-        if spendable <= 0 {
-            return nothing();
-        }
-        let owner_state = checked(rpc::get_account(self.rpc(), &c.owner))?;
-        let p = checked(native::owner::prepare_wallet_action(
-            &owner_state,
-            &account,
-            native::owner::WalletRoles {
-                wallet: fee_account,
-                owner: &c.owner,
-                agent: &c.agent,
-                engine: &c.server,
-            },
-            &native::owner::WalletAction::ReturnFees { units: spendable },
-            &stellar_xdr::Asset::Native,
-            &c.network,
-            Self::classic_fee(fee_limit)?,
-            now,
-        ))?;
-        Self::within_fee_limit(&p, fee_limit)?;
         Ok(OwnerPacket(packet(&c.network, &p)?))
     }
     pub fn new(network: &str, endpoint: &str) -> Result<Self> {
@@ -573,7 +508,20 @@ impl Provider {
             network: network.into(),
             runtime: super::runtime::Runtime::from_rpc(inner.clone()),
             transport: inner,
+            sender: None,
         }
+    }
+    /// This provider with the signing capability of the server's sending accounts.
+    pub fn with_sender(mut self, sender: Sender) -> Self {
+        self.sender = Some(sender);
+        self
+    }
+    /// The sending account for the next policy wallet operation.
+    fn sending_account(&self) -> Result<String> {
+        let sender = self.sender.as_ref().ok_or_else(|| {
+            Error::config("This server has no sending account for policy wallet operations")
+        })?;
+        checked(sender.account())
     }
     #[cfg(test)]
     pub fn from_rpc(network: &str, rpc: std::sync::Arc<dyn rpc::Rpc>) -> Self {
@@ -747,7 +695,9 @@ impl crate::host::vendors::RuntimeProvider for Provider {
             wallet: config.wallet,
             captured: captured.clone(),
         });
-        let provider = Self::from_rpc_inner(&self.network, probe);
+        // The session sends and signs as this provider does: it keeps the sending accounts.
+        let mut provider = Self::from_rpc_inner(&self.network, probe);
+        provider.sender = self.sender.clone();
         Ok(Some(DiagnosticSession {
             provider: Box::new(provider),
             classify: Box::new(move |error| {
@@ -929,11 +879,19 @@ impl crate::host::vendors::RuntimeProvider for Provider {
     }
     fn redeemable(&self, i: &Installation, vault: &str, shares: i128) -> Result<i128> {
         let c = self.fresh(i)?;
-        let s = checked(rpc::trusted_state_for_discovery(self.rpc(), &c, None))?;
+        // The read simulates from an account that exists: the sending account of a policy
+        // wallet, or the keypair wallet itself.
+        let source = if c.route == WalletRoute::PolicyWallet {
+            checked(rpc::get_account(self.rpc(), &self.sending_account()?))?
+        } else {
+            checked(rpc::trusted_state_for_discovery(self.rpc(), &c, None))?
+                .state
+                .source
+        };
         checked(rpc::vault_redeemable(
             self.rpc(),
             &c,
-            &s.state.source,
+            &source,
             vault,
             shares,
         ))
@@ -987,9 +945,17 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                     })
                 })
                 .transpose()?,
+            gas: None,
+            sender: None,
         };
         let accounting = accounting(a);
         let request: native::workflow::ExecutionRequest = decode_packet(&r.0)?;
+        // A policy wallet operation is sent by one of the server's sending accounts, which pays
+        // its fee and receives the gas: the priced expense's fee bound.
+        let mut terms = terms;
+        if c.route == WalletRoute::PolicyWallet && !native::seller_settled::is_request(&request) {
+            terms.sender = Some(self.sending_account()?);
+        }
         if native::seller_settled::is_request(&request) {
             return self.packet(&checked(native::seller_settled::prepare(
                 self.rpc(),
@@ -1143,6 +1109,21 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         } else {
             checked(native::authorize(&p, &s, now))?
         };
+        // A policy wallet operation leaves this step final: the sending account that the request
+        // names as its fee payer seals it, so the retained packet is the transaction the network
+        // gets.
+        let signed =
+            if p.config.route == WalletRoute::PolicyWallet && p.payment_authorization.is_none() {
+                let sender = self.sender.as_ref().ok_or_else(|| {
+                    Error::config("This server has no sending account for policy wallet operations")
+                })?;
+                let source = checked(native::gas_payee(&p.request, &p.terms))?;
+                checked(rpc::seal(self.rpc(), &signed, |hash| {
+                    sender.sign(&source, hash)
+                }))?
+            } else {
+                signed
+            };
         Ok(Signed(packet(&p.config.network, &signed)?))
     }
     fn validate_signed(&self, p: &Signed, now: u64) -> Result<()> {
@@ -1268,40 +1249,18 @@ impl crate::host::vendors::RuntimeProvider for Provider {
             max_fee_stroops: fee(fee_limit)?,
         };
         let p = match a {
-            OwnerAction::Upload { wasm } => {
-                let p = checked(d.upload_wasm(&c.owner, &wasm))?;
-                native::owner_intent::OwnerTransaction {
-                    network: p.network,
-                    action: p.function,
-                    transaction_xdr: p.transaction_xdr,
-                    transaction_hash: p.transaction_hash,
-                    expires_at: p.expires_at,
-                }
-            }
-            OwnerAction::Create { wasm } => {
-                // The owner's deployment creates the fee account before the wallet: the wallet
-                // names it as its agent address. A fee account that the ledger already holds
-                // has exactly its roles, or nothing is created.
-                let Some(fee_account) = c.fee_account.as_deref() else {
-                    return checked(Err(format!(
-                        "{} {}",
-                        native::FEE_ACCOUNT_REQUIRED,
-                        c.wallet
-                    )));
-                };
-                match checked(rpc::find_account(self.rpc(), fee_account))? {
-                    None => return self.prepare_fee_account(&c, fee_account, fee_limit, now),
-                    Some(account) => checked(
-                        account
-                            .validate_roles(&c.owner, &c.agent, &c.server)
-                            .map_err(|_| native::FEE_ACCOUNT_DIFFERS.to_string()),
-                    )?,
-                }
-                let config = checked(native::admin::PolicyConfig::for_policy(&c, false))?;
-                let p = checked(d.create_wallet(
+            OwnerAction::Create {
+                wasm,
+                units,
+                fee_asset_units,
+            } => {
+                let config = checked(native::admin::PolicyConfig::for_policy(&c))?;
+                let p = checked(d.deploy_and_fund(
+                    &checked(native::admin::deployer_address(&c.network))?,
                     &config,
                     &wasm,
                     native::admin::wallet_salt(&c.policy_instance),
+                    &checked(native::admin::creation_funding(&c, units, fee_asset_units))?,
                 ))?;
                 native::owner_intent::OwnerTransaction {
                     network: p.network,
@@ -1328,24 +1287,15 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 )?
             }
             OwnerAction::Recover { units, recipient } => {
-                use allowit_core::admin::RecoverFunds;
                 let mut admin = native::admin::OwnerAdmin {
                     rpc: self.rpc(),
                     config: &c,
                     now,
                 };
                 let prepared = match (units, recipient) {
-                    // Everything returns: the wallet's balance first, and when the wallet
-                    // holds nothing, the float of its fee account.
-                    (None, None) => match admin.recover_funds(&c.asset) {
-                        Err(nothing)
-                            if nothing == super::diagnostics::NOTHING_TO_RECOVER
-                                && c.fee_account.is_some() =>
-                        {
-                            return self.prepare_fee_return(&c, fee_limit, now);
-                        }
-                        prepared => checked(prepared)?,
-                    },
+                    // Everything returns, one balance per call: the asset, then the XLM that a
+                    // wallet of another asset holds for its gas.
+                    (None, None) => checked(admin.recover_all())?,
                     (Some(units), recipient) => {
                         checked(admin.recover_to(recipient.as_deref().unwrap_or(&c.owner), units))?
                     }
@@ -1398,7 +1348,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         use super::params_update;
         let c = self.config(i)?;
         let installed = params_update::installed(self.rpc(), &c, update)?;
-        let deployment = params_update::deployment(&c, update, installed.x402_enabled)?;
+        let deployment = params_update::deployment(&c, update)?;
         // The preparation refuses a simulated fee above its configured ceiling.
         let mut bounded = c.clone();
         bounded.max_fee_stroops = bounded
@@ -1437,6 +1387,58 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 signed_payload: signed_payload.into(),
             },
         )?))
+    }
+    fn upload_code(
+        &self,
+        i: &Installation,
+        wasm: &[u8],
+        poll: Poll,
+        now: u64,
+    ) -> Result<Option<Receipt>> {
+        let c = self.config(i)?;
+        if c.route != WalletRoute::PolicyWallet {
+            return Err(Error::unsupported(
+                "A keypair wallet has no code: its owner creates it with the wallet setup",
+            ));
+        }
+        let code_hash = checked(native::admin::check_wallet_code(wasm))?;
+        if checked(rpc::code_uploaded(self.rpc(), &c.network, &code_hash))? {
+            return Ok(None);
+        }
+        let sender = self.sender.as_ref().ok_or_else(|| {
+            Error::config("This server has no sending account to upload wallet code")
+        })?;
+        let account = checked(sender.account())?;
+        // The server pays the upload, a cost that the ledger consumes; the simulation sets it.
+        let p = checked(
+            native::admin::Deployer {
+                rpc: self.rpc(),
+                network: &c.network,
+                now,
+                max_fee_stroops: u32::MAX,
+            }
+            .upload_wasm(&account, wasm),
+        )?;
+        let signature = checked(sender.sign(&account, &p.transaction_hash))?;
+        let signed = checked(native::admin::with_source_signature(
+            &c.network,
+            &p.transaction_xdr,
+            &signature,
+        ))?;
+        let receipt = checked(self.runtime.send_and_poll(
+            &c.network,
+            &signed,
+            crate::provider::runtime::Poll {
+                attempts: poll.attempts,
+                interval: poll.interval,
+            },
+        ))?;
+        checked(rpc::validate_receipt(
+            &receipt,
+            &c.network,
+            &p.transaction_hash,
+        ))?;
+        Ok(Some(Receipt(packet(&c.network, &receipt)?)))
     }
     fn submit_owner<'a>(
         &self,
@@ -1550,6 +1552,13 @@ pub fn signed_preparation(p: &Packet) -> Result<Prepared> {
     )?))
 }
 
+/// The server's clock in Unix seconds.
+fn unix_now() -> Result<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|_| Error::config("The server's clock is before 1970"))
+}
 fn snapshot_from(network: &str, live: rpc::DiscoveredState) -> Result<Snapshot> {
     let s = &live.state;
     let convert = |v: &native::PolicyParams| {
@@ -1564,6 +1573,9 @@ fn snapshot_from(network: &str, live: rpc::DiscoveredState) -> Result<Snapshot> 
             spent_daily: s.spent_daily,
             spent_total: s.spent_total,
             spent_day: s.spent_day,
+            volume_daily: s.volume_daily,
+            unpriced_total: s.unpriced_total,
+            unpriced_daily: s.unpriced_daily,
             calls: s.calls,
         },
         observed_height: u64::from(s.ledger),
@@ -1574,10 +1586,12 @@ fn snapshot_from(network: &str, live: rpc::DiscoveredState) -> Result<Snapshot> 
             .map(|p| convert(&p.params))
             .transpose()?
             .unwrap_or_default(),
+        // The wallet's daily figures count while its daily entry's window is open, whatever the
+        // UTC day; the snapshot states them as today's, as the wallet feeds its own rules.
         state: s
             .policy_state
             .as_ref()
-            .map(|p| convert(&p.state))
+            .map(|p| convert(&p.standard_state(unix_now()?)))
             .transpose()?
             .unwrap_or_default(),
         evidence: packet(network, &live)?,
@@ -1609,22 +1623,12 @@ pub fn authority_document(s: &Snapshot) -> Result<serde_json::Value> {
 
 /// Parse retained signed identity without granting new submission authority. Chain-only recovery
 /// can retain an included envelope whose signature roles rotated; broadcast validates signatures again.
+/// A retained signed packet: for a policy wallet, the prepared transaction with both
+/// cosignatures and, once sealed, its final resources, fee and source signature; the hash is
+/// that of the transaction it carries.
 fn retained_signed_shape(s: &SignedOperation) -> Result<()> {
     checked(native::validate_retained_prepared(&s.prepared))?;
-    if s.prepared.config.route != WalletRoute::PolicyWallet
-        || s.prepared.payment_authorization.is_some()
-    {
-        return checked(native::validate_retained_signed(s));
-    }
-    checked(native::validate_server_authorization(&s.prepared))?;
-    let hash = checked(rpc::signed_transaction_hash(
-        &s.prepared.config.network,
-        &s.transaction_xdr,
-    ))?;
-    if hash != s.transaction_hash || hash != s.prepared.transaction_hash {
-        return Err(Error::config("Retained signed identity differs"));
-    }
-    Ok(())
+    checked(native::validate_retained_signed(s))
 }
 pub fn validate_signed(p: &Packet) -> Result<()> {
     let signed: SignedOperation = decode_packet(p)?;
@@ -1785,16 +1789,13 @@ mod receipt_fee_tests {
                 panic!()
             };
             let mut args = call.args.to_vec();
-            let ScVal::Map(Some(request)) = &args[0] else {
+            // The positional request holds its expense as field 4.
+            let ScVal::Vec(Some(request)) = &args[0] else {
                 panic!()
             };
             let mut fields = request.to_vec();
-            let field = fields
-                .iter_mut()
-                .find(|e| matches!(&e.key, ScVal::Symbol(key) if key.0.as_slice() == b"expense"))
-                .unwrap();
-            field.val = native::contract::expense(Some(expense)).unwrap();
-            args[0] = ScVal::Map(Some(stellar_xdr::ScMap(fields.try_into().unwrap())));
+            fields[4] = native::contract::expense(Some(expense)).unwrap();
+            args[0] = ScVal::Vec(Some(fields.try_into().unwrap()));
             call.args = args.try_into().unwrap();
             envelope.tx.operations = operations.try_into().unwrap();
         }
@@ -2662,8 +2663,11 @@ mod keypair_wallet_owner_tests {
         // A wallet that is not paused takes no resume, and a keypair wallet has no code.
         assert!(prepare(OwnerAction::SetPause { paused: false }).is_err());
         for action in [
-            OwnerAction::Upload { wasm: vec![] },
-            OwnerAction::Create { wasm: vec![] },
+            OwnerAction::Create {
+                wasm: vec![],
+                units: 1,
+                fee_asset_units: 0,
+            },
             OwnerAction::Extend,
         ] {
             assert!(prepare(action).is_err());
@@ -2682,12 +2686,8 @@ mod keypair_wallet_owner_tests {
             super::super::server_owner::configuration(&c.network, &serde_json::to_vec(&c).unwrap())
                 .unwrap();
         let usage = Accounting {
-            nonce: 0,
             deployment_version: 1,
-            spent_daily: 0,
-            spent_total: 0,
-            spent_day: 0,
-            calls: 0,
+            ..Accounting::default()
         };
         assert!(
             provider
@@ -2704,12 +2704,8 @@ mod keypair_wallet_owner_tests {
             super::super::server_owner::configuration(&c.network, &serde_json::to_vec(&c).unwrap())
                 .unwrap();
         let usage = Accounting {
-            nonce: 0,
             deployment_version: 1,
-            spent_daily: 0,
-            spent_total: 0,
-            spent_day: 0,
-            calls: 0,
+            ..Accounting::default()
         };
         provider
             .discover_snapshot(&configuration, Some(&usage))
@@ -2745,280 +2741,6 @@ mod keypair_wallet_owner_tests {
                     )
                     .is_err()
             );
-        }
-    }
-}
-
-#[cfg(test)]
-mod fee_account_owner_tests {
-    use super::*;
-    use crate::host::vendors::RuntimeProvider;
-    use crate::test_support::owner::{OwnerLedger, account, selection, wasm};
-    use ed25519_dalek::{Signer as _, SigningKey};
-    use std::sync::{Arc, Mutex};
-
-    const NOW: u64 = 1_800_000_000;
-    /// The setup key of a fee account.
-    fn account_key() -> SigningKey {
-        SigningKey::from_bytes(&[77; 32])
-    }
-    /// A ledger with the owner's account, and the fee account once a test puts one there.
-    struct Ledger(OwnerLedger, Mutex<Option<native::AccountState>>);
-    impl rpc::Rpc for Ledger {
-        fn call(
-            &self,
-            method: &str,
-            params: serde_json::Value,
-        ) -> native::Result<serde_json::Value> {
-            use stellar_xdr as x;
-            if method == "getLedgerEntries"
-                && let Ok(x::LedgerKey::Account(key)) =
-                    native::read::<x::LedgerKey>(params["keys"][0].as_str().unwrap())
-                && let Some(state) = self.1.lock().unwrap().clone()
-            {
-                let x::PublicKey::PublicKeyTypeEd25519(key) = key.account_id.0;
-                if native::account_for_public_key(&key.0) == state.address {
-                    return Ok(crate::test_support::owner::account_entry(&state));
-                }
-            }
-            self.0.call(method, params, &[])
-        }
-    }
-    /// The policy wallet of the owner fixture, with `fee_account` in its installation.
-    fn fixture(fee_account: Option<&str>) -> (WalletConfig, Arc<Ledger>, Provider, Installation) {
-        let mut c = selection().config;
-        c.fee_account = fee_account.map(str::to_owned);
-        let ledger = Arc::new(Ledger(OwnerLedger::new(c.clone()), Mutex::new(None)));
-        let configuration =
-            super::super::server_owner::configuration(&c.network, &serde_json::to_vec(&c).unwrap())
-                .unwrap();
-        let provider = Provider::from_rpc(&c.network, ledger.clone());
-        (c, ledger, provider, installation(&configuration))
-    }
-    fn create(provider: &Provider, i: &Installation) -> Result<OwnerPacket> {
-        provider.prepare_owner(i, OwnerAction::Create { wasm: wasm() }, 1_000_000, NOW)
-    }
-    fn transaction(packet: &OwnerPacket) -> stellar_xdr::Transaction {
-        let payload = String::from_utf8(packet.info().unwrap().signing_payload).unwrap();
-        let stellar_xdr::TransactionEnvelope::Tx(envelope) = native::read(&payload).unwrap() else {
-            panic!()
-        };
-        assert!(envelope.signatures.is_empty());
-        envelope.tx
-    }
-    fn signed(tx: &stellar_xdr::Transaction, network: &str, keys: &[&SigningKey]) -> Vec<u8> {
-        use stellar_xdr as x;
-        let digest = native::transaction_hash(network, tx).unwrap();
-        native::xdr(&x::TransactionEnvelope::Tx(x::TransactionV1Envelope {
-            tx: tx.clone(),
-            signatures: keys
-                .iter()
-                .map(|key| x::DecoratedSignature {
-                    hint: x::SignatureHint(
-                        key.verifying_key().to_bytes()[28..].try_into().unwrap(),
-                    ),
-                    signature: x::Signature(
-                        key.sign(&digest).to_bytes().to_vec().try_into().unwrap(),
-                    ),
-                })
-                .collect::<Vec<_>>()
-                .try_into()
-                .unwrap(),
-        }))
-        .unwrap()
-        .into_bytes()
-    }
-
-    #[test]
-    fn a_wallet_without_a_fee_account_in_its_installation_is_not_created() {
-        let (_, _, provider, i) = fixture(None);
-        let (c, _, provider, i) = (selection().config, (), provider, i);
-        let refused = create(&provider, &i).unwrap_err();
-        let problem = provider.problem(&refused);
-        assert_eq!(
-            (problem.status, problem.code),
-            (409, "fee_account_required")
-        );
-        // The refusal names the wallet, so the owner's client makes the account for it.
-        assert_eq!(
-            problem.details,
-            Some(serde_json::json!({"wallet": c.wallet}))
-        );
-    }
-
-    #[test]
-    fn the_creation_of_a_wallet_creates_and_funds_its_fee_account_first() {
-        use stellar_xdr as x;
-        let fee_account = native::account_for_public_key(&account_key().verifying_key().to_bytes());
-        let (c, ledger, provider, i) = fixture(Some(&fee_account));
-        // A fee limit below the minimum fee of the four operations prepares nothing.
-        assert!(
-            provider
-                .prepare_owner(&i, OwnerAction::Create { wasm: wasm() }, 399, NOW)
-                .is_err()
-        );
-        // The ledger holds no fee account yet: the step creates it, and no wallet.
-        let packet = create(&provider, &i).unwrap();
-        assert_eq!(
-            packet.info().unwrap().action,
-            native::owner::CREATE_FEE_ACCOUNT
-        );
-        let tx = transaction(&packet);
-        let owner = x::MuxedAccount::Ed25519(x::Uint256(native::account_key(&c.owner).unwrap()));
-        assert_eq!(tx.source_account, owner);
-        let [create_account, signers @ ..] = tx.operations.as_slice() else {
-            panic!()
-        };
-        let x::OperationBody::CreateAccount(created) = &create_account.body else {
-            panic!("the first operation creates the fee account")
-        };
-        // The owner's account pays the reserve and the fee float in the creation itself.
-        assert_eq!(create_account.source_account, None);
-        assert_eq!(
-            created.starting_balance,
-            native::owner::fee_account_starting_balance()
-        );
-        assert_eq!(
-            created.destination,
-            x::AccountId(x::PublicKey::PublicKeyTypeEd25519(x::Uint256(
-                native::account_key(&fee_account).unwrap()
-            )))
-        );
-        assert_eq!(signers.len(), 3);
-        // The owner's own intent, built from the owner's values alone, is this exact step.
-        let owner_state = rpc::get_account(ledger.as_ref(), &c.owner).unwrap();
-        let original: native::owner_intent::OwnerTransaction = decode_packet(&packet.0).unwrap();
-        use native::owner_intent::{ExpectedOwnerIntent, OwnerAction as Intent, OwnerLimits};
-        let limits = OwnerLimits {
-            network: c.network.clone(),
-            owner: c.owner.clone(),
-            next_sequence: owner_state.sequence + 1,
-            max_fee_stroops: 1_000_000,
-            valid_until: NOW + 300,
-        };
-        let intent = |account: &str, agent: &str, engine: &str, request_id: String| {
-            Intent::FeeAccountSetup {
-                state: owner_state.clone(),
-                account: account.into(),
-                agent: agent.into(),
-                engine: engine.into(),
-                request_id,
-            }
-        };
-        let request_id = native::owner::fee_account_request_id(&c.policy_instance);
-        let validate = |limits: &OwnerLimits, action: Intent| {
-            native::owner_intent::validate_owner_transaction(
-                &original,
-                &ExpectedOwnerIntent {
-                    limits: limits.clone(),
-                    action,
-                },
-                NOW,
-            )
-            .map(drop)
-        };
-        validate(
-            &limits,
-            intent(&fee_account, &c.agent, &c.server, request_id.clone()),
-        )
-        .unwrap();
-        // Another account, agent, server or wallet, or a fee, sequence or lifetime outside the
-        // owner's limits, is not the step that this owner selected.
-        let other = account(90);
-        for action in [
-            intent(&other, &c.agent, &c.server, request_id.clone()),
-            intent(&fee_account, &other, &c.server, request_id.clone()),
-            intent(&fee_account, &c.agent, &other, request_id.clone()),
-            intent(
-                &fee_account,
-                &c.agent,
-                &c.server,
-                native::owner::fee_account_request_id(&[9; 32]),
-            ),
-        ] {
-            assert!(validate(&limits, action).is_err());
-        }
-        type Limit = fn(&mut OwnerLimits);
-        let narrower: [Limit; 3] = [
-            |l| l.max_fee_stroops = 399,
-            |l| l.next_sequence += 1,
-            |l| l.valid_until = NOW + 299,
-        ];
-        for narrow in narrower {
-            let mut changed = limits.clone();
-            narrow(&mut changed);
-            assert!(
-                validate(
-                    &changed,
-                    intent(&fee_account, &c.agent, &c.server, request_id.clone())
-                )
-                .is_err()
-            );
-        }
-        // The step takes the owner's signature, then the one signature of the new account's
-        // own key. One signature, another order or another key is refused.
-        let owner_key = SigningKey::from_bytes(&[11; 32]);
-        assert_eq!(
-            native::account_for_public_key(&owner_key.verifying_key().to_bytes()),
-            c.owner
-        );
-        let (own, stranger) = (account_key(), SigningKey::from_bytes(&[78; 32]));
-        provider
-            .read_owner_signed(&packet, &signed(&tx, &c.network, &[&owner_key, &own]))
-            .unwrap();
-        for keys in [
-            vec![&owner_key],
-            vec![&own],
-            vec![&own, &owner_key],
-            vec![&owner_key, &stranger],
-            vec![&owner_key, &own, &stranger],
-            vec![],
-        ] {
-            assert!(
-                provider
-                    .read_owner_signed(&packet, &signed(&tx, &c.network, &keys))
-                    .is_err()
-            );
-        }
-
-        // A fee account with another signer, another weight or another threshold creates no
-        // wallet: the wallet would name an account that others control.
-        let exact =
-            crate::test_support::wallet_account(&fee_account, &c.owner, &c.agent, &c.server, 0);
-        exact.validate_roles(&c.owner, &c.agent, &c.server).unwrap();
-        type Change = fn(&mut native::AccountState);
-        let changes: [Change; 5] = [
-            |a| {
-                a.signers.push(native::AccountSigner {
-                    key: account(90),
-                    weight: 1,
-                })
-            },
-            |a| {
-                a.signers
-                    .iter_mut()
-                    .for_each(|s| s.weight = s.weight.max(2))
-            },
-            |a| a.high_threshold = 2,
-            |a| a.master_weight = 1,
-            |a| {
-                a.signers.retain(|s| s.weight == 3);
-            },
-        ];
-        for change in changes {
-            let mut foreign = exact.clone();
-            change(&mut foreign);
-            *ledger.1.lock().unwrap() = Some(foreign);
-            let refused = create(&provider, &i).unwrap_err();
-            assert_eq!(provider.problem(&refused).code, "fee_account_differs");
-        }
-        // With the exact fee account on the ledger the next step is the wallet itself.
-        *ledger.1.lock().unwrap() = Some(exact);
-        match create(&provider, &i) {
-            Ok(packet) => assert_eq!(packet.info().unwrap().action, "create_wallet"),
-            // The test ledger simulates no contract creation. The refusal is not one of the
-            // fee account.
-            Err(refused) => assert!(!provider.problem(&refused).code.starts_with("fee_account")),
         }
     }
 }

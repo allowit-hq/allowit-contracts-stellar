@@ -7,7 +7,7 @@ use serde_json::json;
 /// reads that code as a step that the ledger already shows.
 pub const NOTHING_TO_RETURN: &str = "This wallet holds no funds to return";
 /// The same refusal as `admin::OwnerAdmin::recover_funds` words it for a policy wallet.
-pub(crate) const NOTHING_TO_RECOVER: &str = "Selected token has no recoverable balance";
+const NOTHING_TO_RECOVER: &str = "Selected token has no recoverable balance";
 fn fail(message: impl Into<String>) -> Problem {
     Problem {
         status: 409,
@@ -67,7 +67,7 @@ fn wallet_error_code(name: &str) -> &'static str {
     match name {
         "Paused" => "wallet_paused",
         "InsufficientFunds" => "insufficient_funds",
-        "Replay" | "StaleRequest" => "stale_request",
+        "StaleRequest" => "stale_request",
         _ => "wallet_rejected",
     }
 }
@@ -105,21 +105,6 @@ pub fn denial(message: &str, contract: Option<&ContractFault>, wallet: &str) -> 
     }
     if contract.is_none() && [NOTHING_TO_RETURN, NOTHING_TO_RECOVER].contains(&message) {
         return coded(409, "nothing_to_return", message);
-    }
-    if contract.is_none() {
-        // The refusals of a fee account, each with what its owner does next.
-        if let Some(wallet) = message.strip_prefix(crate::FEE_ACCOUNT_REQUIRED) {
-            return coded(409, "fee_account_required", message)
-                .with_details(json!({"wallet": wallet.trim()}));
-        }
-        if message == crate::FEE_ACCOUNT_DIFFERS {
-            return coded(409, "fee_account_differs", message);
-        }
-        if let Some(account) = message.strip_prefix(crate::FEE_ACCOUNT_EMPTY) {
-            let account = account.trim();
-            return coded(409, "fee_account_empty", message)
-                .with_details(json!({"feeAccount": account}));
-        }
     }
     if contract.is_none() && message == crate::rpc::EXECUTABLE_DIFFERS {
         return coded(
@@ -276,7 +261,7 @@ mod tests {
             assert_eq!(other.details.unwrap()["contractError"], code);
         }
         // A code that the wallet's enum does not define is a plain conflict.
-        assert_eq!(classify(20, &[error_event(WALLET, 20)]).code, "");
+        assert_eq!(classify(19, &[error_event(WALLET, 19)]).code, "");
         // The same code from another contract is a rejection: raised by it alone, relayed
         // through the wallet, or without events.
         for events in [

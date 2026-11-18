@@ -125,26 +125,15 @@ pub fn rebuild(
     Ok(typed)
 }
 
-/// The chain state that the builders read: the fee payer. A policy wallet pays
-/// fees from its current agent account, which Stellar RPC reports. Classic
-/// custody pays them from the wallet and the builders read no state for it, so
-/// the profile fills it; the engine checks every request against its own.
+/// The state that the builders read. A keypair wallet pays its own fee and a policy wallet's fee
+/// is paid by the server's sending account, which the server names at preparation, so neither
+/// request reads chain state; the engine checks every request against its own.
 pub fn state(c: &WalletConfig, rpc_url: Option<&str>) -> Result<TrustedState> {
-    if c.route == WalletRoute::Native {
-        return Ok(profile_state(c));
-    }
-    let url = rpc_url.filter(|u| !u.is_empty()).ok_or_else(|| {
-        Error::config(
-            "a policy wallet request names its current agent account from Stellar RPC; pass --rpc-url URL or set rpc_url for this rail",
-        )
-    })?;
-    let rpc = sdk::rpc::HttpRpc::new(url).map_err(crate::provider::failure)?;
-    sdk::rpc::trusted_state_for_discovery(&rpc, c, None)
-        .map(|found| found.state)
-        .map_err(crate::provider::failure)
+    let _ = rpc_url;
+    Ok(profile_state(c))
 }
 
-/// The profile's view of the state: the configured agent account pays.
+/// The profile's view of the state: the request builders read no field of it.
 fn profile_state(c: &WalletConfig) -> TrustedState {
     TrustedState {
         contract_version: None,
@@ -163,6 +152,9 @@ fn profile_state(c: &WalletConfig) -> TrustedState {
         spent_daily: 0,
         spent_total: 0,
         spent_day: 0,
+        volume_daily: 0,
+        unpriced_total: false,
+        unpriced_daily: false,
         calls: 0,
         ledger: 0,
         module_digest: c.module_digest,

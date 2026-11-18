@@ -70,7 +70,7 @@ test('browser verifier binds a lifetime renewal to the selected wallet and code'
   await assert.rejects(verifyAdkOwnerStep(renewal.step, other), /differs from the reviewed owner action/);
 });
 
-test('browser verifier admits the built Common Wasm upload', async t => {
+test('browser verifier refuses a code upload: the server uploads the code', async t => {
   t.mock.method(Date, 'now', () => 1_800_000_000_000);
   t.mock.method(globalThis, 'fetch', async () => new Response(await readFile(wasmUrl)));
   // XDR: the funding envelope type, owner source, fee 100, sequence, time bounds, no memo and
@@ -82,12 +82,12 @@ test('browser verifier admits the built Common Wasm upload', async t => {
     u32(1), Buffer.alloc(32),
     u32(0),
   ]);
-  await verifyAdkOwnerStep({
+  await assert.rejects(verifyAdkOwnerStep({
     ...step,
     action: 'upload_wasm',
     transactionXdr: envelope.toString('base64'),
     transactionHash: sha256(network, envelope.subarray(0, -4)).toString('hex'),
-  }, selection);
+  }, selection));
 });
 
 // The renewal footprint names the Common code that the fixture recorded. Put the built Common hash

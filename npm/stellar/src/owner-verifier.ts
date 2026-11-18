@@ -1,6 +1,6 @@
 export interface AdkOwnerStep {
   network: string;
-  action: 'create_fee_account' | 'upload_wasm' | 'create_wallet' | 'extend' | 'fund' | 'update_params';
+  action: 'create_wallet' | 'extend' | 'fund' | 'update_params';
   transactionXdr: string;
   transactionHash: string;
   expiresAt: number;
@@ -16,24 +16,20 @@ export interface AdkOwnerSelection {
   params: Record<string, unknown>;
   wasmHash: string;
   wallet?: string;
-  /**
-   * The fee account that the owner's client made for this wallet. With it the verifier admits the
-   * `create_fee_account` step of exactly that account, and reconstructs the creation and every update with the fee
-   * account as the wallet's agent address.
-   */
-  feeAccount?: string;
   asset: string;
   maxFeeStroops: number;
   policyMaxFeeStroops: number;
+  /** The installed asset that a creation or a funding moves into the wallet, as decimal text. */
   amount: string;
+  /** The XLM that a creation moves into a wallet of another asset for the network fees that it repays. */
+  feeAssetAmount?: string;
   nextSequence: string;
   validUntil: number;
   /**
    * The params update that the owner reviewed, for an `update_params` step. `params` then holds the complete new
-   * params. `deploymentVersion` is the configuration revision that the update writes, in canonical decimal text,
-   * and `x402Enabled` is the installed x402 choice, which the update keeps.
+   * params. `deploymentVersion` is the configuration revision that the update writes, in canonical decimal text.
    */
-  update?: {deploymentVersion: string; x402Enabled: boolean};
+  update?: {deploymentVersion: string};
 }
 
 type Verifier = {
@@ -44,7 +40,7 @@ type Verifier = {
 };
 
 const inputLimit = 512 * 1024;
-const verifierHash = 'f7cc4be218016666b5c03cc493b7135701820510cc7be76f9112d63356d8081d';
+const verifierHash = '62312e97bf7ae5bf57d5279d23b425e4198232885e5695fe4483539e523e511e';
 let verifier: Promise<Verifier> | undefined;
 
 async function loadVerifier(): Promise<Verifier> {
