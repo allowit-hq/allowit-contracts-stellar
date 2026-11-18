@@ -1738,6 +1738,15 @@ fn current_wallet_state(
     verify_binding(c, &config)?;
     if require_customer_quorum {
         verify_configuration(c, &config)?;
+        // An operation repays gas under the wallet's current gas cap, which the owner can change
+        // on the ledger. An installation with another gas cap would price repayments that the
+        // wallet refuses, so it is verified again first. Owner actions do not depend on it.
+        if config.gas_cap != i128::from(c.max_fee_stroops) {
+            return Err(
+                "The wallet's gas cap differs from this installation. Verify the installation first."
+                    .into(),
+            );
+        }
     }
     let figures = figures(rpc, c, ledger)?;
     // A wallet that keeps every figure needs no account of the server's.

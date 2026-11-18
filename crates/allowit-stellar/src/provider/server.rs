@@ -416,6 +416,16 @@ pub struct Provider {
 /// signature of a transaction hash with an account's key.
 pub type Sender = std::sync::Arc<dyn SendingAccounts>;
 pub use crate::host::runtime::SendingAccounts;
+/// The fee that the signed transaction envelope `xdr` declares, in stroops: the most that the
+/// ledger charges its source.
+fn declared_fee(xdr: &str) -> Result<u32> {
+    match checked(native::read::<stellar_xdr::TransactionEnvelope>(xdr))? {
+        stellar_xdr::TransactionEnvelope::Tx(envelope) => Ok(envelope.tx.fee),
+        _ => Err(Error::config(
+            "A wallet code transaction is a plain transaction",
+        )),
+    }
+}
 /// The Ed25519 transaction signature of `hash` by the sending account `account`.
 fn sending_signature(sender: &Sender, account: &str, hash: &[u8; 32]) -> Result<[u8; 64]> {
     sender
@@ -501,11 +511,18 @@ impl Provider {
             &p.transaction_hash,
         ))?;
         let packet = packet(&c.network, &receipt)?;
+        // The ledger charges a transaction at most the fee that it declares: a receipt that
+        // reports more is refused, and names no fee to charge.
+        let fee = receipt_info(&packet)?.fee.native_units;
+        if fee > u128::from(declared_fee(&signed)?) {
+            return Err(crate::provider::failure(
+                "The receipt reports a fee above the fee of its transaction",
+            ));
+        }
         // A transaction that the ledger included and failed leaves the code as it was, so it is
         // an error, never a receipt of live code. Its source still paid the fee: the error names
         // the transaction and that fee, in stroops, for the server's accounts.
         if receipt.status != native::OperationStatus::Confirmed {
-            let fee = receipt_info(&packet)?.fee.native_units;
             return Err(
                 crate::provider::failure(if state == rpc::CodeState::Lapsed {
                     "The restoration of the wallet code failed on the ledger"

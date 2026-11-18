@@ -325,6 +325,8 @@ struct Model {
     restored_meanwhile: bool,
     /// That transaction came from the restoration's own source, whose sequence it advanced.
     restored_by_source: bool,
+    /// The fee that the next receipts report as charged, when not the usual 100 stroops.
+    charged_fee: Option<i64>,
     tiers: BTreeMap<[u8; 32], PolicyTier>,
     wallet: Option<Wallet>,
     settled: BTreeMap<String, String>,
@@ -920,7 +922,7 @@ impl rpc::Rpc for ModelChain {
                 };
                 let failed = m.failed.contains(tx_hash);
                 let result = x::TransactionResult {
-                    fee_charged: 100,
+                    fee_charged: m.charged_fee.unwrap_or(100),
                     result: if failed {
                         x::TransactionResultResult::TxFailed(Default::default())
                     } else {
@@ -2901,6 +2903,24 @@ fn a_gas_due_joins_the_repayment_within_the_gas_cap() {
         .unwrap_err()
         .to_string();
     assert!(refused.contains("gas cap"), "{refused}");
+    // The owner changed the gas cap on the ledger: an installation with another gas cap would
+    // price repayments that the wallet refuses, so its operations are refused until it is
+    // verified again.
+    let stale = WalletConfig {
+        max_fee_stroops: c.max_fee_stroops + 1,
+        ..c.clone()
+    };
+    let refused = rpc::prepare_with(
+        &chain,
+        &stale,
+        &transfer,
+        &terms(1_000_000, chain.ledger()),
+        Some(chain.accounting()),
+        NOW,
+        NOW + 300,
+    )
+    .unwrap_err();
+    assert!(refused.contains("gas cap"), "{refused}");
     // An explicit repayment takes no due, priced or not: an unpriced operation does not drop it.
     let unpriced = ExecutionTerms {
         expense: None,
@@ -3116,6 +3136,9 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         }
     }
     struct Sending;
+    // Every signature that a sending account gives: a refusal before signing gives none.
+    static SIGNATURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let signatures = || SIGNATURES.load(std::sync::atomic::Ordering::SeqCst);
     impl SendingAccounts for Sending {
         fn account(&self) -> allowit_core::client::error::Result<String> {
             Ok(sender())
@@ -3126,6 +3149,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
             hash: &[u8; 32],
         ) -> allowit_core::client::error::Result<Vec<u8>> {
             assert_eq!(account, sender());
+            SIGNATURES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(SigningKey::from_bytes(&SENDER)
                 .sign(hash)
                 .to_bytes()
@@ -3187,6 +3211,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         .insert(hash(&other), PolicyTier::Simple);
     // The server pays the upload, within its fee ceiling: a ceiling below the simulated fee
     // refuses it before anything is signed or sent.
+    let signed = signatures();
     let refused = session
         .provider
         .upload_code_within(&installation, &other, 100, Poll::default(), NOW)
@@ -3206,6 +3231,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
             .upload_code_within(&installation, &other, u64::MAX, Poll::default(), NOW)
             .is_err()
     );
+    assert_eq!(signatures(), signed);
     chain.step("upload");
     let receipt = session
         .provider
@@ -3246,6 +3272,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     let installed = c.module_digest;
     chain.0.lock().unwrap().lapsed_code.insert(installed);
     assert!(!provider.resources(&installation).unwrap().code_present);
+    let signed = signatures();
     let refused = provider
         .upload_code_within(&installation, &wasm, 100, Poll::default(), NOW)
         .unwrap_err();
@@ -3257,6 +3284,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         refused.message
     );
     assert!(chain.0.lock().unwrap().lapsed_code.contains(&installed));
+    assert_eq!(signatures(), signed);
     chain.step("restore");
     let restored = provider
         .upload_code_within(
@@ -3315,6 +3343,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
             .is_none()
     );
     chain.0.lock().unwrap().lapsed_code.insert(installed);
+    let signed = signatures();
     assert!(
         plain
             .restore_code_within(&installation, ceiling, Poll::default(), NOW)
@@ -3329,6 +3358,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
             .message
             .contains("exceeds the explicitly selected ceiling")
     );
+    assert_eq!(signatures(), signed);
     chain.step("restore before an operation");
     assert!(
         provider
@@ -3349,9 +3379,11 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         m.restore_archived = vec![1];
     }
     let sent = chain.0.lock().unwrap().steps.len();
+    let signed = signatures();
     let refused = provider
         .restore_code_within(&installation, ceiling, Poll::default(), NOW)
         .unwrap_err();
+    assert_eq!(signatures(), signed);
     assert!(
         refused.message.contains("outside the read-write footprint"),
         "{}",
@@ -3404,6 +3436,22 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
             .contains("failed on the ledger")
     );
     assert!(chain.0.lock().unwrap().lapsed_code.contains(&installed));
+    // A receipt that reports a fee above the fee that its transaction declared is refused, and
+    // names no fee to charge.
+    chain.0.lock().unwrap().charged_fee = Some(i64::from(u32::MAX));
+    chain.step("failed restoration with an inflated fee");
+    let inflated = provider
+        .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+        .unwrap_err();
+    assert!(
+        inflated
+            .message
+            .contains("above the fee of its transaction"),
+        "{}",
+        inflated.message
+    );
+    assert!(inflated.details.is_none());
+    chain.0.lock().unwrap().charged_fee = None;
     // The next restoration that the ledger applies makes the code live.
     chain.0.lock().unwrap().failing_restore = false;
     chain.step("restore after a failure");
@@ -3426,6 +3474,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
             m.restored_by_source = by_source;
         }
         let sent = chain.0.lock().unwrap().steps.len();
+        let signed = signatures();
         assert!(
             provider
                 .restore_code_within(&installation, ceiling, Poll::default(), NOW)
@@ -3433,6 +3482,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
                 .is_none(),
             "{by_source}"
         );
+        assert_eq!(signatures(), signed);
         let mut m = chain.0.lock().unwrap();
         assert_eq!(m.steps.len(), sent);
         assert!(m.lapsed_code.is_empty());
@@ -3441,6 +3491,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     }
     // Code that the network does not have cannot be restored: it needs an upload.
     chain.0.lock().unwrap().code_bytes.remove(&installed);
+    let signed = signatures();
     assert!(
         provider
             .restore_code_within(&installation, ceiling, Poll::default(), NOW)
@@ -3448,6 +3499,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
             .message
             .contains("not on the network")
     );
+    assert_eq!(signatures(), signed);
 }
 /// A wallet whose instance and `t` lapsed: the ledger still gives their values, so the server
 /// reads the wallet and the agent's payment restores both in place; the owner's stop then
