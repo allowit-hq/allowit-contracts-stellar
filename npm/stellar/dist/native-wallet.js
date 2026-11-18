@@ -9,7 +9,7 @@
  */
 import { Account, Keypair, Memo, Operation, StrKey, TransactionBuilder } from '@stellar/stellar-sdk/base';
 import { sha256 } from '@noble/hashes/sha256';
-import { canonicalNetwork, networkPassphrase } from './plugin.js';
+import { canonicalNetwork, networkPassphrase } from './networks.js';
 import { ChainUnchecked, expiredRecord, horizonGet, horizonOrigin } from './chain-record.js';
 import { stellarAssetContract } from './stellar-asset.js';
 /** The action of the owner step that creates the agent's wallet account. */

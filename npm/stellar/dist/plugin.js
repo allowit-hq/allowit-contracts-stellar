@@ -5,27 +5,13 @@
  */
 import { stellarExplorerUrl } from './explorer.js';
 import { StrKey } from '@stellar/stellar-sdk/base';
-import { STELLAR_NETWORKS, stellarAssetContract } from './stellar-asset.js';
+import { stellarAssetContract } from './stellar-asset.js';
 import { defineElements, ELEMENTS } from './elements/index.js';
 import { ADK_OWNER_FRAGMENT, adkParamLines, parseReviewLink, reviewAgentPrompt } from './adk-owner-link.js';
-import { installAndFund, updateParams } from './owner-flow.js';
+import { ownerChain } from './owner-chain.js';
+import { NETWORKS, canonicalNetwork, networkPassphrase } from './networks.js';
+export { NETWORKS, canonicalNetwork, networkPassphrase } from './networks.js';
 const TESTNET = 'stellar:testnet', PUBNET = 'stellar:pubnet';
-export const NETWORKS = Object.freeze([
-    { id: TESTNET, label: 'Stellar Testnet', testnet: true, aliases: Object.freeze(['stellar-testnet']) },
-    { id: PUBNET, label: 'Stellar Mainnet', testnet: false, aliases: Object.freeze(['stellar:mainnet', 'stellar-mainnet']) },
-]);
-/** The canonical network id for an id or alias, or null. */
-export function canonicalNetwork(network) {
-    if (typeof network !== 'string')
-        return null;
-    return NETWORKS.find(n => n.id === network || n.aliases.includes(network))?.id ?? null;
-}
-export function networkPassphrase(network) {
-    const id = canonicalNetwork(network);
-    if (!id)
-        throw new Error('Select a supported Stellar network.');
-    return STELLAR_NETWORKS[id].passphrase;
-}
 /** StrKey decoding with its checksum, through the Stellar SDK. Returns the version byte and the 32-byte key, or null. */
 export function strkey(text) {
     if (typeof text !== 'string')
@@ -132,8 +118,11 @@ const plugin = Object.freeze({
     assetDisplay,
     /** Review and sign links: the fragment, its parser, the agent prompt and the owner-readable params. */
     review: Object.freeze({ fragment: ADK_OWNER_FRAGMENT, parseLink: parseReviewLink, agentPrompt: reviewAgentPrompt, paramLines: adkParamLines }),
-    /** The owner workflows that a host runs after the review: install and fund, and the signed update of installed params. */
-    ownerWorkflow: Object.freeze({ installAndFund, updateParams }),
+    /**
+     * What the SDK's owner workflows read from Stellar and check with its keys: transaction records, the record of an
+     * expired step, the Native wallet's setup and the owner's approval. The SDK holds the workflows and their journal.
+     */
+    ownerChain,
     test: Object.freeze({
         network: TESTNET,
         skips: Object.freeze({ swap: 'Stellar has no swap venue in the minimal path' }),

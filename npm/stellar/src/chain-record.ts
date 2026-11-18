@@ -3,7 +3,7 @@
  * whose result they do not know: a signed step is replaced only when the chain proves that it can never apply.
  */
 import {TransactionBuilder} from '@stellar/stellar-sdk/base';
-import {canonicalNetwork, networkPassphrase} from './plugin.js';
+import {canonicalNetwork, networkPassphrase} from './networks.js';
 
 const HORIZON: Readonly<Record<string, string>> = {
   'stellar:testnet': 'https://horizon-testnet.stellar.org',

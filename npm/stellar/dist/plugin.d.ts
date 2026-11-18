@@ -6,7 +6,6 @@
 import { type ExplorerKind } from './explorer.js';
 import { defineElements } from './elements/index.js';
 import { adkParamLines, parseReviewLink, reviewAgentPrompt } from './adk-owner-link.js';
-import { installAndFund, updateParams } from './owner-flow.js';
 export type ElementKind = 'address' | 'explorer-link' | 'amount' | 'wallet-sign-in' | 'owner-sign' | 'owner-answer' | 'receipt' | 'binding-review';
 export type Feature = 'transfer' | 'swap' | 'deposit' | 'redeem' | 'owner-setup' | 'deploy' | 'fund' | 'activate' | 'binding-review' | 'explorer-links';
 export interface RailNetwork {
@@ -23,10 +22,7 @@ export interface AssetInfo {
     stablecoin: boolean;
     label: string;
 }
-export declare const NETWORKS: readonly RailNetwork[];
-/** The canonical network id for an id or alias, or null. */
-export declare function canonicalNetwork(network: unknown): string | null;
-export declare function networkPassphrase(network: string): string;
+export { NETWORKS, canonicalNetwork, networkPassphrase } from './networks.js';
 /** StrKey decoding with its checksum, through the Stellar SDK. Returns the version byte and the 32-byte key, or null. */
 export declare function strkey(text: unknown): {
     version: number;
@@ -86,10 +82,33 @@ declare const plugin: Readonly<{
         agentPrompt: typeof reviewAgentPrompt;
         paramLines: typeof adkParamLines;
     }>;
-    /** The owner workflows that a host runs after the review: install and fund, and the signed update of installed params. */
-    ownerWorkflow: Readonly<{
-        installAndFund: typeof installAndFund;
-        updateParams: typeof updateParams;
+    /**
+     * What the SDK's owner workflows read from Stellar and check with its keys: transaction records, the record of an
+     * expired step, the Native wallet's setup and the owner's approval. The SDK holds the workflows and their journal.
+     */
+    ownerChain: Readonly<{
+        transaction: (network: string, hash: string) => Promise<import("./owner-chain.js").TransactionRecord>;
+        expiredRecord: typeof import("./chain-record.js").expiredRecord;
+        keypairSetup: Readonly<{
+            run: (input: import("./native-wallet.js").NativeWalletSetupInput) => Promise<import("./native-wallet.js").NativeWalletSetup>;
+            of: (signedPayload: string, network: string) => {
+                wallet: string;
+                agent: string;
+            } | null;
+            pending: (error: unknown) => boolean;
+        }>;
+        approval: Readonly<{
+            read: (message: unknown, network: string) => import("./native-wallet.js").PolicyApproval | null;
+            holds: (fields: import("./native-wallet.js").PolicyApproval, wallet: string, reviewed: import("./native-wallet.js").ReviewedPolicy) => boolean;
+            step: (message: string) => {
+                action: string;
+                payload: string;
+                hash: string;
+                expiresAt: number;
+            };
+            walletOwner: (network: string, account: string) => Promise<string | null>;
+            signedBy: (signer: string, hash: string, signature: number[]) => boolean;
+        }>;
     }>;
     test: Readonly<{
         network: "stellar:testnet";

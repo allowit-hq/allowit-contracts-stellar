@@ -26,30 +26,30 @@ returns `native`, `simple`, `standard` or `custom`; the tier `common` is the `st
 `parseLink` returns the proposal, which has exactly eight keys, the work prompt, and the values that the chat
 collected beside the proposal: `agent`, `amount` and `walletKind`. Each is null when the link does not carry it.
 `walletKind` is a kind id; the host checks it against `walletKinds(network)` before it offers that kind.
-`ownerWorkflow.installAndFund` installs and funds the reviewed wallet. One workflow runs per journal key.
-It settles a saved signed step first. A confirmation or `owner_transaction_settled` completes it once Horizon holds
-that successful transaction; every Horizon read ends after 15 s. On `owner_transaction_expired`
-Horizon decides: a transaction that applied completes the step, proof that it never applied archives its signed
-bytes and lets the owner sign a new step, and an unreadable chain keeps the step. `owner_transaction_failed` archives the step when Horizon holds that failed transaction. `owner_transaction_pending`
-and `network_unavailable` keep the step for a retry (`OwnerFlowError.retry`). A saved step and the funded marker name
-the policy, agent key and amount; a resume with other inputs is refused.
+The owner workflows, `installAndFund` and `updateParams`, are the SDK's: it holds their journal, their recovery of a
+signed step whose result is unknown and their typed errors. `ownerChain` supplies what only Stellar can answer:
 
-`ownerWorkflow.updateParams` changes installed params on an active wallet with one owner signature. The host passes
-each changed param with its complete typed value, such as `{daily_spending_limit: {Int: '50000000'}}`, and one journal
-key per change. The service checks the values and prepares the `update_params` step: one call that writes the next
-configuration revision of the wallet and keeps its recorded usage and request nonce. The workflow settles a saved
-signed step first, as `installAndFund` does, and never prepares or signs a confirmed change again under its key.
-A refusal keeps the typed code of the service in `OwnerFlowError.code`: `param_invalid`, `param_out_of_range`,
-`update_unavailable` or `revision_changed`.
+- `transaction(network, hash)`: the Horizon record of a transaction, `'missing'`, or null when Horizon gives no clear
+  answer. Every Horizon read ends after 15 s.
+- `expiredRecord(network, hash, signedPayload)`: for a signed step past its time bound, its ledger when it applied, or
+  null when it can never apply. The signed bytes decide the time bound. The step never applied only when Horizon has
+  read past that bound and holds the failed transaction, or holds none while the source sequence is still below the
+  transaction's. Anything else rejects, and the SDK keeps the step.
+- `keypairSetup`: `run` sets up a Native wallet account (below), `of` reads the wallet and agent of a signed setup, and
+  `pending` names a setup that stays saved for a resume.
+- `approval`: `read` reads the exact approval message of a network, `holds` checks it against the reviewed policy and
+  the wallet's own configuration, `step` makes the `approve_policy` step, `walletOwner` reads the account's one signer
+  of the owner's weight, and `signedBy` checks an Ed25519 signature over the step's digest.
+
 The `owner-sign` element checks an `update_params` step of a Standard wallet against `data.expected` like an install
 step: the selection holds the complete new params and `update: {deploymentVersion, x402Enabled}`. The verifier
 reconstructs the exact policy packet, so a step with another value, revision, wallet or code is not signed.
 
 ### Native wallet
 
-A Native policy needs the wallet account of its agent: a new classic account, one for each agent. `installAndFund`
-deploys it without a server step. The service answers the deployment of such a draft with `wallet_setup_required` and
-the roles `{owner, agent, server}`. The workflow then:
+A Native policy needs the wallet account of its agent: a new classic account, one for each agent. The SDK's
+`installAndFund` deploys it without a server step. The service answers the deployment of such a draft with
+`wallet_setup_required` and the roles `{owner, agent, server}`. The workflow then, with these hooks:
 
 1. Builds the setup from the owner's own sequence (`native-wallet.ts`): one transaction that creates the account with
    its starting balance, adds the owner signer (weight 3), the agent signer (1) and the server signer (1), sets the
@@ -60,8 +60,8 @@ the roles `{owner, agent, server}`. The workflow then:
    wallet account, the agent and the funding, and it refuses any transaction that is not exactly this setup.
 3. Sends the signed bytes to Horizon itself. They stay in the journal under `<key>:wallet-setup` until the service has
    registered the wallet, so a run that stops in between names the same account again and signs no second setup. A
-   result that is unknown is settled as a refill is: done when Horizon holds it as successful, sent again while its
-   time bound lasts, and replaced only when Horizon holds it as failed or has read past its time bound without it.
+   result that is unknown is settled first: done when Horizon holds it as successful, sent again while its time bound
+   lasts, and replaced only when Horizon holds it as failed or has read past its time bound without it.
 4. Registers the account for the policy (`native/register` with the installation document and the `policyId`).
 5. Asks for the owner's approval of the policy (`native/approval`) and has `sign` sign it as the step `approve_policy`:
    a message, never a transaction. The payload is the base64 UTF-8 text of the message, and the hash its SEP-53 digest.
@@ -74,7 +74,7 @@ the roles `{owner, agent, server}`. The workflow then:
    made it, and confirms the approval with `micro/allocation/confirm`.
 
 So a Native deployment takes two owner signatures: the setup, which also funds the wallet, and the approval. No
-funding step follows. `updateParams` on a Native wallet is one `approve_policy` signature and no transaction: the
+funding step follows. The SDK's `updateParams` on a Native wallet is one `approve_policy` signature and no transaction: the
 account holds no values, so the service answers the change with the approval message of the new values. The host
 passes `installed: {wallet, source, rules, params, tier}`, the policy that the owner reviewed. The workflow signs
 only an approval of that policy with the changed params replaced, checked as for the deployment's approval; any

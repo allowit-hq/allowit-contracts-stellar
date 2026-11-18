@@ -9,7 +9,7 @@
  */
 import {Account, Keypair, Memo, Operation, StrKey, TransactionBuilder, type Transaction} from '@stellar/stellar-sdk/base';
 import {sha256} from '@noble/hashes/sha256';
-import {canonicalNetwork, networkPassphrase} from './plugin.js';
+import {canonicalNetwork, networkPassphrase} from './networks.js';
 import {ChainUnchecked, expiredRecord, horizonGet, horizonOrigin} from './chain-record.js';
 import {stellarAssetContract} from './stellar-asset.js';
 
