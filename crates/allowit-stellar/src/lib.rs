@@ -856,13 +856,14 @@ pub struct TrustedState {
 impl TrustedState {
     /// The weight of `signer` in a policy wallet, as a keypair wallet's account weighs its
     /// signers: the owner acts alone (3), the agent and the server only together (1 each), and
-    /// any other key has none. A policy wallet has no account signers; the configuration that
-    /// it holds on chain names its owner, agent and server, which this state carries.
+    /// any other address has none. A policy wallet has no account signers; the configuration
+    /// that it holds on chain names its owner, an account or a contract, and its agent and
+    /// server keys, which this state carries.
     pub fn policy_role_weight(&self, signer: &str) -> Result<u32> {
         if self.policy_state.is_none() {
             return Err("Only a policy wallet weighs its configured roles".into());
         }
-        account_key(signer)?;
+        address(signer)?;
         Ok(if signer == self.owner {
             3
         } else if signer == self.agent || signer == self.server {

@@ -331,9 +331,11 @@ fn decode_observation(packet: &Packet) -> Result<rpc::DiscoveredState> {
     let value: rpc::DiscoveredState = decode(packet.document())?;
     let s = &value.state;
     if s.policy_state.is_some() {
-        // A policy wallet has no account: its configuration on chain names its roles.
-        for role in [&s.owner, &s.agent, &s.server] {
-            checked(native::account_key(role))?;
+        // A policy wallet has no account: its configuration on chain names its roles. Its owner
+        // is an account or a contract; its agent and server are keys.
+        checked(native::address(&s.owner))?;
+        for key in [&s.agent, &s.server] {
+            checked(native::account_key(key))?;
         }
     } else {
         checked(s.source.validate_structure())?;
@@ -1840,6 +1842,24 @@ mod role_weight_tests {
                 "paused={paused}"
             );
         }
+        // An owner that is another contract acts alone, as an owner account does.
+        let mut owned = contract.clone();
+        owned.owner = stellar_strkey::Contract([5; 32]).to_string();
+        let snapshot = snapshot_from(
+            &c.network,
+            rpc::DiscoveredState {
+                state: owned.clone(),
+                paused: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                signer_weight(&snapshot, &owned.owner).unwrap(),
+                signer_weight(&snapshot, &owned.agent).unwrap()
+            ),
+            (3, 1)
+        );
         let snapshot = snapshot_from(
             &c.network,
             rpc::DiscoveredState {

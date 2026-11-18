@@ -2566,8 +2566,9 @@ fn a_contract_wallet_reports_the_roles_that_its_configuration_holds() {
         ),
         (3, 1, 1, 0)
     );
-    // The wallet's own address is no key.
-    assert!(state.policy_role_weight(&c.wallet).is_err());
+    // The wallet's own address has no role, and text that is no address is refused.
+    assert_eq!(weight(&c.wallet), 0);
+    assert!(state.policy_role_weight("not an address").is_err());
 }
 #[test]
 fn a_gas_carry_lowers_the_repayment_and_the_gas_that_the_wallet_counts() {
