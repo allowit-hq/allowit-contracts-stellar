@@ -2166,6 +2166,9 @@ pub fn authorize(
 /// account's one signature. Nothing else differs from the prepared transaction.
 fn validate_wallet_signed(s: &SignedOperation) -> Result<()> {
     let p = &s.prepared;
+    if !s.role_signatures.is_empty() {
+        return Err("A policy wallet operation carries no role signatures".into());
+    }
     let TransactionEnvelope::Tx(env) = read(&s.transaction_xdr)? else {
         return Err("Unsupported signed envelope".into());
     };

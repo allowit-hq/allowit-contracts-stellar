@@ -1012,8 +1012,14 @@ pub fn validate_settled_policy_packet(
     if prepared.config.route != WalletRoute::PolicyWallet {
         return Err("Chain-only recovery requires a policy wallet packet".into());
     }
-    // The settled transaction is the signed one: the prepared transaction with both
+    // The settled transaction is the sealed one: the prepared transaction with both
     // cosignatures, its final resources and the sending account's signature.
+    let TransactionEnvelope::Tx(envelope) = read(&signed.transaction_xdr)? else {
+        return Err("Unsupported settled envelope".into());
+    };
+    if envelope.signatures.len() != 1 {
+        return Err("The packet is unsigned by its sending account".into());
+    }
     crate::validate_retained_signed(signed)?;
     validate_receipt(receipt, &prepared.config.network, &signed.transaction_hash)?;
     if signed.transaction_xdr != receipt.envelope_xdr {
@@ -1316,9 +1322,8 @@ pub fn trusted_state_for_discovery(
     trusted_state_inner(rpc, c, accounting, false)
 }
 /// The agent address that the policy wallet of `c` names on the ledger, or `None` while the
-/// ledger holds no such wallet. For a wallet with a fee account that address is the fee
-/// account. The read reports; it authorizes nothing, and a caller verifies the wallet's whole
-/// binding before it relies on the address.
+/// ledger holds no such wallet. The read reports; it authorizes nothing, and a caller verifies
+/// the wallet's whole binding before it relies on the address.
 pub fn installed_agent_address(rpc: &dyn Rpc, c: &WalletConfig) -> Result<Option<String>> {
     if c.route != WalletRoute::PolicyWallet {
         return Ok(None);
@@ -1481,7 +1486,11 @@ fn current_wallet_state(
     if require_customer_quorum && config.paused {
         return Err("policy wallet automation is paused".into());
     }
-    verify_configuration(c, &config)?;
+    // Discovery reports the installed roles; only an execution requires the configured ones.
+    verify_binding(c, &config)?;
+    if require_customer_quorum {
+        verify_configuration(c, &config)?;
+    }
     let figures = figures(rpc, c, ledger)?;
     Ok(DiscoveredState {
         state: TrustedState {
@@ -1543,6 +1552,14 @@ pub fn figures(rpc: &dyn Rpc, c: &WalletConfig, ledger: u32) -> Result<packed::F
         packed::daily(raw.as_slice(), ledger, &mut figures)?;
     }
     Ok(figures)
+}
+/// Check the wallet's binding against the installation: its rules, asset and the owner's source
+/// hash. The roles may differ.
+fn verify_binding(c: &WalletConfig, config: &packed::Configuration) -> Result<()> {
+    if config.rules != c.rules || config.asset != c.asset || config.source_hash != c.source_hash {
+        return Err("Installed policy rules, asset or source differs".into());
+    }
+    Ok(())
 }
 /// Check a decoded configuration against the installation: rules, agent, server, asset and the
 /// owner's source hash.

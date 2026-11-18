@@ -624,16 +624,17 @@ fn odc_uses_execute_and_exact_module_schema_payload() {
     };
     assert_eq!(tx.tx.memo, stellar_xdr::Memo::None);
     assert_eq!(call.function_name.0.as_slice(), b"execute");
-    let stellar_xdr::ScVal::Map(Some(fields)) = &call.args[0] else {
+    // The request is positional; its first field is the operation id.
+    let stellar_xdr::ScVal::Vec(Some(fields)) = &call.args[0] else {
         panic!()
     };
-    let operation = fields.iter().find(|field| matches!(&field.key, stellar_xdr::ScVal::Symbol(key) if key.0.as_slice() == b"operation_id")).unwrap();
-    let stellar_xdr::ScVal::Bytes(value) = &operation.val else {
+    let stellar_xdr::ScVal::Bytes(value) = &fields[0] else {
         panic!()
     };
     assert_eq!(value.0.as_slice(), &r.operation.nonce);
     assert_eq!(call.args.len(), 1);
-    assert_eq!(op.auth.len(), 2);
+    // One entry: the wallet's own authorization, which carries both cosignatures.
+    assert_eq!(op.auth.len(), 1);
     let mut changed = s.clone();
     changed.module_digest[0] ^= 1;
     assert!(prepare(&c, &r, &changed, 86401, 86700).is_err());
@@ -1319,71 +1320,6 @@ fn current_exact_preauthorization_does_not_add_unused_ed25519_signatures() {
     );
 }
 #[test]
-fn odc_current_agent_account_may_have_a_different_customer_signer() {
-    let (mut c, r, mut s) = fixture(WalletRoute::PolicyWallet, false);
-    let actual_agent = s.agent.clone();
-    c.agent = account_for_seed(&[4; 32]);
-    s.source.master_weight = 0;
-    s.source.low_threshold = 2;
-    s.source.medium_threshold = 3;
-    s.source.high_threshold = 5;
-    s.source.signers = vec![
-        AccountSigner {
-            key: c.agent.clone(),
-            weight: 3,
-        },
-        AccountSigner {
-            key: stellar_strkey::HashX([22; 32]).to_string(),
-            weight: 1,
-        },
-    ];
-    assert_eq!(s.source.address, actual_agent);
-    // A built request names the agent account, not the customer signer, as its fee payer.
-    let built = request::transfer(&c, &s, [8; 32], &account_for_seed(&[6; 32]), 1).unwrap();
-    prepare(&c, &built, &s, 86401, 86700).unwrap();
-    let mut p = prepare(&c, &r, &s, 86401, 86700).unwrap();
-    let resource = SorobanTransactionData {
-        ext: stellar_xdr::SorobanTransactionDataExt::V0,
-        resources: stellar_xdr::SorobanResources {
-            footprint: stellar_xdr::LedgerFootprint {
-                read_only: Default::default(),
-                read_write: Default::default(),
-            },
-            instructions: 1,
-            disk_read_bytes: 0,
-            write_bytes: 0,
-        },
-        resource_fee: 1000,
-    };
-    // The fixture's admitted fee bound is high enough for this explicit resource data.
-    p = attach_simulation(&p, &resource.to_xdr_base64(Limits::none()).unwrap()).unwrap();
-    let p = server_ready(&p);
-    let out = authorize(&p, &[sign(&p, &[4; 32], 86401).unwrap()], 86401).unwrap();
-    validate_signed(&out, 86401).unwrap();
-    let TransactionEnvelope::Tx(env) =
-        TransactionEnvelope::from_xdr_base64(&out.transaction_xdr, Limits::none()).unwrap()
-    else {
-        panic!()
-    };
-    assert_eq!(
-        env.tx.source_account,
-        stellar_xdr::MuxedAccount::Ed25519(stellar_xdr::Uint256(
-            account_key(&actual_agent).unwrap()
-        ))
-    );
-    s.source.signers[0].weight = 2;
-    let mut underweight = p.clone();
-    underweight.state.source = s.source;
-    assert!(
-        attach_simulation(
-            &underweight,
-            &resource.to_xdr_base64(Limits::none()).unwrap()
-        )
-        .is_err()
-    );
-}
-
-#[test]
 fn rpc_decodes_known_additional_signer_types_without_an_offline_allowlist() {
     let (c, _, mut state) = fixture(WalletRoute::Native, false);
     for key in [
@@ -1526,41 +1462,28 @@ impl rpc::Rpc for PolicyWalletAccountRpc {
     }
 }
 #[test]
-fn odc_discovery_reads_current_grant_source_and_does_not_lock_to_old_roles() {
-    let (mut c, mut r, mut s) = fixture(WalletRoute::PolicyWallet, false);
+fn discovery_reads_the_installed_roles_and_does_not_lock_to_old_ones() {
+    let (mut c, _, s) = fixture(WalletRoute::PolicyWallet, false);
     let obsolete = c.clone();
+    // The owner rotated the agent's key; the wallet holds the new one.
     c.agent = account_for_seed(&[4; 32]);
-    s.source.address = account_for_seed(&[9; 32]);
-    s.source.master_weight = 0;
-    s.source.low_threshold = 2;
-    s.source.medium_threshold = 3;
-    s.source.high_threshold = 5;
-    s.source.signers = vec![
-        AccountSigner {
-            key: c.agent.clone(),
-            weight: 3,
-        },
-        AccountSigner {
-            key: stellar_strkey::PreAuthTx([44; 32]).to_string(),
-            weight: 1,
-        },
-    ];
-    r.fee_bounds.as_mut().unwrap()[0].payer = wf(&s.source.address);
     let rpc = PolicyWalletAccountRpc {
         config: c.clone(),
         source: s.source.clone(),
         paused: false,
     };
     let discovery = rpc::trusted_state_for_discovery(&rpc, &obsolete, None).unwrap();
-    assert_eq!(discovery.state.agent, s.source.address);
+    assert_eq!(discovery.state.agent, c.agent);
     assert_eq!(discovery.state.owner, Contract([33; 32]).to_string());
     assert_eq!(discovery.state.server, c.server);
+    // An execution requires the configured roles.
     assert!(rpc::trusted_state(&rpc, &obsolete, None).is_err());
     let live = rpc::trusted_state(&rpc, &c, None).unwrap();
-    assert_eq!(live.source, s.source);
-    assert!(prepare(&c, &r, &live, 86401, 86700).is_ok());
-    r.fee_bounds.as_mut().unwrap()[0].payer = wf(&c.agent);
-    assert!(prepare(&c, &r, &live, 86401, 86700).is_err());
+    assert_eq!(live.agent, c.agent);
+    // Discovery still requires the wallet's binding: its rules, asset and source.
+    let mut other = c.clone();
+    other.source_hash[0] ^= 1;
+    assert!(rpc::trusted_state_for_discovery(&rpc, &other, None).is_err());
 }
 
 #[test]
@@ -1622,51 +1545,6 @@ fn paused_odc_remains_discoverable_but_cannot_authorize_execution() {
     assert!(discovered.paused);
     assert_eq!(discovered.state.policy_instance, c.policy_instance);
     assert!(rpc::trusted_state(&rpc, &c, None).is_err());
-}
-
-#[test]
-fn odc_exact_resource_bound_preauthorization_completes_current_customer_quorum() {
-    let (c, r, mut state) = fixture(WalletRoute::PolicyWallet, false);
-    let resource = SorobanTransactionData {
-        resource_fee: 1000,
-        ..Default::default()
-    };
-    let data = resource.to_xdr_base64(Limits::none()).unwrap();
-    let base = prepare(&c, &r, &state, 86401, 86700).unwrap();
-    let final_hash = server_ready(&attach_simulation(&base, &data).unwrap()).transaction_hash;
-    state.source.low_threshold = 2;
-    state.source.medium_threshold = 2;
-    let insufficient = prepare(&c, &r, &state, 86401, 86700).unwrap();
-    assert!(
-        sign(
-            &attach_simulation(&insufficient, &data).unwrap(),
-            &[2; 32],
-            86401
-        )
-        .is_err()
-    );
-    state.source.signers.push(AccountSigner {
-        key: stellar_strkey::PreAuthTx(final_hash).to_string(),
-        weight: 1,
-    });
-    let before_simulation = prepare(&c, &r, &state, 86401, 86700).unwrap();
-    assert!(sign(&before_simulation, &[2; 32], 86401).is_err());
-    let prepared = server_ready(&attach_simulation(&before_simulation, &data).unwrap());
-    assert_eq!(prepared.transaction_hash, final_hash);
-    let signed = authorize(
-        &prepared,
-        &[sign(&prepared, &[2; 32], 86401).unwrap()],
-        86401,
-    )
-    .unwrap();
-    validate_signed(&signed, 86401).unwrap();
-    let altered = SorobanTransactionData {
-        resource_fee: 1001,
-        ..Default::default()
-    }
-    .to_xdr_base64(Limits::none())
-    .unwrap();
-    assert!(attach_simulation(&prepared, &altered).is_err());
 }
 
 #[test]
@@ -2631,41 +2509,6 @@ fn local_revalidation_preserves_existing_unsigned_identity_and_checks_current_au
     }
 }
 #[test]
-fn revalidation_keeps_an_exact_hash_preauthorization_when_fresh_resources_are_smaller() {
-    // The original packet carries a 1001 stroop resource fee; fresh simulation needs only 1000.
-    // The source meets its threshold only with a preauthorization of the original hash.
-    let mut rpc = preflight_fixture();
-    let p = rpc::prepare(&rpc, &rpc.base.config, &rpc.request, None, 86401, 86700).unwrap();
-    let data = SorobanTransactionData {
-        resource_fee: 1001,
-        ..Default::default()
-    }
-    .to_xdr_base64(Limits::none())
-    .unwrap();
-    let mut p = attach_simulation(&p, &data).unwrap();
-    let final_hash = server_ready(&p).transaction_hash;
-    rpc.base.source.low_threshold = 2;
-    rpc.base.source.medium_threshold = 2;
-    rpc.base.source.signers.push(AccountSigner {
-        key: stellar_strkey::PreAuthTx(final_hash).to_string(),
-        weight: 1,
-    });
-    p.state.source = rpc.base.source.clone();
-    let p = server_ready(&p);
-    assert_eq!(p.transaction_hash, final_hash);
-    sign(&p, &[2; 32], 86401).unwrap();
-    let validated = rpc::revalidate_prepared(&rpc, &p, 86402).unwrap();
-    assert_eq!(validated.transaction_hash, final_hash);
-    assert_eq!(validated.transaction_xdr, p.transaction_xdr);
-    sign(&validated, &[2; 32], 86402).unwrap();
-    // Without the preauthorization the same original packet cannot meet the threshold.
-    let mut locked = rpc;
-    locked.base.source.signers.pop();
-    let mut stale = p.clone();
-    stale.state.source = locked.base.source.clone();
-    assert!(rpc::revalidate_prepared(&locked, &stale, 86402).is_err());
-}
-#[test]
 fn native_failure_or_wrong_auth_receipt_fee_and_restore_never_approve() {
     for failure in ["deny", "auth", "receipt", "fee", "restore"] {
         let mut rpc = preflight_fixture();
@@ -2718,9 +2561,24 @@ fn first_simulation_records_without_auth_entries_and_signed_simulation_enforces(
     let signed = authorize_server(&prepared, &[3; 32], 86401, None).unwrap();
     let ready = rpc::simulate(&modes, &signed).unwrap();
     assert!(ready.native_preflight.is_some());
+    // The wallet's `__check_auth` runs only on an entry that both keys signed: the sending
+    // account's enforcing simulation, with that one entry.
+    let authorized = authorize(&ready, &[sign(&ready, &[2; 32], 86401).unwrap()], 86401).unwrap();
+    let sealed = rpc::seal(&modes, &authorized, |hash| {
+        use ed25519_dalek::Signer;
+        Ok(ed25519_dalek::SigningKey::from_bytes(&[10; 32])
+            .sign(hash)
+            .to_bytes())
+    })
+    .unwrap();
+    validate_retained_signed(&sealed).unwrap();
     assert_eq!(
         *modes.seen.lock().unwrap(),
-        vec![(json!("record"), 0), (json!("enforce"), 2)]
+        vec![
+            (json!("record"), 0),
+            (json!("record"), 0),
+            (json!("enforce"), 1)
+        ]
     );
 }
 #[test]
@@ -2728,6 +2586,7 @@ fn odc_cannot_authorize_from_forged_classic_zero_usage() {
     let rpc = preflight_fixture();
     let c = &rpc.base.config;
     let mut state = rpc::trusted_state(&rpc, c, None).unwrap();
+    state.source = rpc.base.source.clone();
     state.spent_daily = 0;
     state.spent_total = 0;
     state.spent_day = 1;
@@ -2987,34 +2846,18 @@ fn common_installed_rules_cannot_omit_or_reorder_authored_checks() {
                         panic!()
                     };
                     let mut storage = instance.storage.as_ref().unwrap().to_vec();
-                    let state = storage.iter_mut().find(|e| e.key == ScVal::U32(0)).unwrap();
-                    let ScVal::Map(Some(fields)) = &state.val else {
-                        panic!()
-                    };
-                    let mut fields = fields.to_vec();
-                    fields
+                    let state = storage
                         .iter_mut()
                         .find(|e| {
-                            e.key == ScVal::Symbol(ScSymbol(b"rules".to_vec().try_into().unwrap()))
+                            e.key == ScVal::Symbol(ScSymbol(b"c".to_vec().try_into().unwrap()))
                         })
-                        .unwrap()
-                        .val = ScVal::Vec(Some(
-                        self.rules
-                            .iter()
-                            .map(|name| {
-                                ScVal::Vec(Some(
-                                    vec![ScVal::Symbol(ScSymbol(
-                                        name.as_bytes().to_vec().try_into().unwrap(),
-                                    ))]
-                                    .try_into()
-                                    .unwrap(),
-                                ))
-                            })
-                            .collect::<Vec<_>>()
-                            .try_into()
-                            .unwrap(),
-                    ));
-                    state.val = ScVal::Map(Some(fields.try_into().unwrap()));
+                        .unwrap();
+                    let ScVal::Bytes(raw) = &state.val else {
+                        panic!()
+                    };
+                    let mut config = packed::configuration(raw.as_slice()).unwrap();
+                    config.rules = self.rules.iter().map(|rule| rule.to_string()).collect();
+                    state.val = ScVal::Bytes(packed::encode(&config).unwrap().try_into().unwrap());
                     instance.storage = Some(storage.try_into().unwrap());
                     response["entries"][0]["xdr"] =
                         json!(entry.to_xdr_base64(Limits::none()).unwrap());
@@ -3139,61 +2982,6 @@ fn policy_wallet_packets_omit_the_lower_bound_and_the_expiry_second() {
 }
 
 #[test]
-fn direct_server_account_must_exist_and_authorize_its_current_threshold() {
-    struct ServerRpc {
-        base: PreflightRpc,
-        missing: bool,
-    }
-    impl rpc::Rpc for ServerRpc {
-        fn call(&self, method: &str, params: Value) -> Result<Value> {
-            use stellar_xdr::*;
-            if method == "getLedgerEntries" {
-                let key =
-                    LedgerKey::from_xdr_base64(params["keys"][0].as_str().unwrap(), Limits::none())
-                        .unwrap();
-                if let LedgerKey::Account(account) = key
-                    && account.account_id
-                        == stellar_xdr::AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
-                            allowit_stellar::account_key(&self.base.base.config.server)?,
-                        )))
-                {
-                    if self.missing {
-                        return Ok(json!({"entries":[]}));
-                    }
-                    let entry = LedgerEntryData::Account(AccountEntry {
-                        account_id: account.account_id,
-                        thresholds: Thresholds([1, 1, 2, 2]),
-                        ..Default::default()
-                    });
-                    return Ok(
-                        json!({"entries":[{"xdr":entry.to_xdr_base64(Limits::none()).unwrap()}]}),
-                    );
-                }
-            }
-            self.base.call(method, params)
-        }
-    }
-    for missing in [false, true] {
-        let rpc = ServerRpc {
-            base: preflight_fixture(),
-            missing,
-        };
-        assert!(
-            rpc::prepare(
-                &rpc,
-                &rpc.base.base.config,
-                &rpc.base.request,
-                None,
-                86401,
-                86700
-            )
-            .is_err()
-        );
-        assert!(rpc::trusted_state_for_discovery(&rpc, &rpc.base.base.config, None).is_ok());
-    }
-}
-
-#[test]
 fn malformed_retained_policy_wallet_envelopes_return_errors() {
     let (c, r, s) = fixture(WalletRoute::PolicyWallet, true);
     let mut p = prepare(&c, &r, &s, 86401, 86700).unwrap();
@@ -3278,9 +3066,9 @@ fn historical_signed_issuer_payment_remains_read_only() {
 }
 
 #[test]
-fn service_auth_nonce_is_scoped_to_the_policy_wallet() {
+fn wallet_auth_nonce_is_scoped_to_the_policy_wallet() {
     use stellar_xdr::*;
-    let service_nonce = |contract: [u8; 32]| {
+    let wallet_nonce = |contract: [u8; 32]| {
         let (c, r, s) = fixture_with_wallet(WalletRoute::PolicyWallet, false, contract);
         let p = prepare(&c, &r, &s, 86401, 86700).unwrap();
         let TransactionEnvelope::Tx(envelope) =
@@ -3291,16 +3079,20 @@ fn service_auth_nonce_is_scoped_to_the_policy_wallet() {
         let OperationBody::InvokeHostFunction(op) = &envelope.tx.operations[0].body else {
             panic!()
         };
-        let SorobanCredentials::Address(credentials) = &op.auth[1].credentials else {
+        // The wallet's own entry, the only one; it carries the agent's and the server's
+        // signatures, so it is valid once, at its nonce, in the wallet's nonce space.
+        let [entry] = op.auth.as_slice() else {
             panic!()
         };
-        assert_eq!(credentials.address, address(&c.server).unwrap());
+        let SorobanCredentials::Address(credentials) = &entry.credentials else {
+            panic!()
+        };
+        assert_eq!(credentials.address, address(&c.wallet).unwrap());
         credentials.nonce
     };
-    // Same service signer, operation nonce and deployment version; only the wallet differs.
-    // Soroban tracks nonces per signer address, so equal nonces would block the second wallet.
-    assert_ne!(service_nonce([4; 32]), service_nonce([14; 32]));
-    assert_eq!(service_nonce([4; 32]), service_nonce([4; 32]));
+    // Same keys and operation id; only the wallet differs.
+    assert_ne!(wallet_nonce([4; 32]), wallet_nonce([14; 32]));
+    assert_eq!(wallet_nonce([4; 32]), wallet_nonce([4; 32]));
 }
 
 #[test]
@@ -3636,7 +3428,15 @@ fn chain_receipt_recovers_the_exact_policy_packet_without_new_signing_admission(
         "fixtures/stellar-policy-wallet-revalidation-rpc.json"
     ))
     .unwrap();
-    let signed: SignedOperation = serde_json::from_value(fixture["signed"].clone()).unwrap();
+    // The agent's authorized packet, then the sending account's sealed one.
+    let authorized: SignedOperation = serde_json::from_value(fixture["signed"].clone()).unwrap();
+    let signed = rpc::seal(&preflight_fixture(), &authorized, |hash| {
+        use ed25519_dalek::Signer;
+        Ok(ed25519_dalek::SigningKey::from_bytes(&[10; 32])
+            .sign(hash)
+            .to_bytes())
+    })
+    .unwrap();
     let chain = FakeRpc {
         calls: Mutex::new(vec![]),
         signed: signed.clone(),
@@ -3654,6 +3454,24 @@ fn chain_receipt_recovers_the_exact_policy_packet_without_new_signing_admission(
     let mut changed = signed.clone();
     changed.transaction_hash[0] ^= 1;
     assert!(rpc::validate_settled_policy_packet(&changed, &receipt).is_err());
+    // The network settles only a sealed packet.
+    let chain = FakeRpc {
+        calls: Mutex::new(vec![]),
+        signed: authorized.clone(),
+        fail_send: false,
+    };
+    let receipt = rpc::receipt_by_hash(
+        &chain,
+        &authorized.prepared.config.network,
+        &authorized.transaction_hash,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        rpc::validate_settled_policy_packet(&authorized, &receipt)
+            .unwrap_err()
+            .contains("unsigned")
+    );
     let (config, request, state) = self::fixture(WalletRoute::PolicyWallet, false);
     let unsigned = prepare(&config, &request, &state, 86401, 86700).unwrap();
     let unsigned = SignedOperation {
