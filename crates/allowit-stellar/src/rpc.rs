@@ -421,6 +421,7 @@ fn priced_terms(
             args: terms.args.clone(),
             expense: Some(ceiling.with_fee_bound(fee.min(ceiling.max_fee_stroops))?),
             gas: terms.gas.clone(),
+            sender: terms.sender.clone(),
         })
     };
     let resource_fee = |fee: u32| -> Result<i64> {
@@ -653,7 +654,17 @@ pub fn revalidate_prepared(
         );
     }
     authorization::server_signature(p, true)?;
-    let mut current = trusted_state(rpc, &p.config, None)?;
+    // The server's accounting of the figures that the wallet does not keep is the one that the
+    // preparation retained; the ledger gives the rest.
+    let accounting = (crate::kept_figures(&p.config) != packed::ALL).then_some(NativeAccounting {
+        nonce: p.state.nonce,
+        deployment_version: p.state.deployment_version,
+        spent_daily: p.state.spent_daily,
+        spent_total: p.state.spent_total,
+        spent_day: p.state.spent_day,
+        calls: p.state.calls,
+    });
+    let mut current = trusted_state(rpc, &p.config, accounting)?;
     current.source = get_account(rpc, &crate::gas_payee(&p.request, &p.terms)?)?;
     // Observation ledgers can advance without changing the transaction's authority or state.
     current.ledger = p.state.ledger;
@@ -772,36 +783,68 @@ pub fn status_by_hash(
     let v = rpc.call("getTransaction", json!({"hash":hex(transaction_hash)}))?;
     verify_settlement(&v, network, transaction_hash)
 }
-/// Whether the policy wallet operation `p` lapsed without executing: the network holds no
-/// successful transaction of its hash, a ledger closed at or after its `expires_at` (the wallet
-/// refuses it then), and the ledger is past the expiration ledger of the wallet's authorization,
-/// so no resubmission of that authorization can run. Another preparation of the same operation
-/// has its own transaction; the server never prepares one while an earlier one can still run.
-/// `false` means not proven.
+/// Whether the policy wallet operation `p` lapsed without executing. Every preparation of the
+/// operation carries the same nonce in the wallet's authorization. When the ledger runs one, the
+/// host keeps that nonce in a temporary entry of the wallet, and the entry lives at least the
+/// network's minimum temporary lifetime from the ledger that ran it, which is no earlier than
+/// `WALLET_AUTH_LEDGERS` before the authorization's expiration ledger. The operation lapsed when
+/// a ledger closed at or after its `expires_at`, the ledger is past that expiration ledger (no
+/// submission of this authorization can run), and inside the lifetime that a spent nonce is sure
+/// to have, the wallet holds no such nonce. `false` means not proven: before the expiration
+/// ledger, after that lifetime, or when the RPC does not show it.
 pub fn operation_lapsed(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<bool> {
     if p.config.route != WalletRoute::PolicyWallet {
         return Ok(false);
     }
     let reply = rpc.call("getTransaction", json!({"hash":hex(&p.transaction_hash)}))?;
-    let number = |key: &str| {
-        reply[key]
-            .as_u64()
-            .or_else(|| reply[key].as_str()?.parse().ok())
-    };
-    let (Some(latest), Some(closed)) = (number("latestLedger"), number("latestLedgerCloseTime"))
-    else {
-        return Ok(false);
-    };
-    if !matches!(reply["status"].as_str(), Some("NOT_FOUND" | "FAILED")) || closed < p.expires_at {
+    let closed = reply["latestLedgerCloseTime"]
+        .as_u64()
+        .or_else(|| reply["latestLedgerCloseTime"].as_str()?.parse().ok());
+    if reply["status"].as_str() == Some("SUCCESS") || closed.is_none_or(|t| t < p.expires_at) {
         return Ok(false);
     }
-    // Past the expiration ledger of the wallet's authorization, neither this transaction nor any
-    // resubmission of that authorization can run: the ledger refuses an expired signature.
     let entry = authorization::wallet_authorization(p)?;
     let SorobanCredentials::Address(credentials) = &entry.credentials else {
         return Ok(false);
     };
-    Ok(latest > u64::from(credentials.signature_expiration_ledger))
+    let expiration = u64::from(credentials.signature_expiration_ledger);
+    let nonce = LedgerKey::ContractData(LedgerKeyContractData {
+        contract: address(&p.config.wallet)?,
+        key: ScVal::LedgerKeyNonce(ScNonceKey {
+            nonce: credentials.nonce,
+        }),
+        durability: ContractDataDurability::Temporary,
+    });
+    let archival = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+        config_setting_id: ConfigSettingId::StateArchival,
+    });
+    let entries = rpc.call(
+        "getLedgerEntries",
+        json!({"keys":[xdr(&nonce)?, xdr(&archival)?]}),
+    )?;
+    let Some(observed) = entries["latestLedger"].as_u64() else {
+        return Ok(false);
+    };
+    let mut lifetime = None;
+    for item in entries["entries"]
+        .as_array()
+        .ok_or("Missing ledger entries")?
+    {
+        match read::<LedgerEntryData>(item["xdr"].as_str().ok_or("Missing entry XDR")?)? {
+            LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(settings)) => {
+                lifetime = Some(u64::from(settings.min_temporary_ttl));
+            }
+            // The wallet's nonce entry: the ledger ran the operation.
+            _ => return Ok(false),
+        }
+    }
+    let Some(lifetime) = lifetime else {
+        return Ok(false);
+    };
+    // A nonce spent at any ledger that this authorization could run in is live through here.
+    let live_through =
+        (expiration + lifetime).saturating_sub(u64::from(authorization::WALLET_AUTH_LEDGERS) + 1);
+    Ok(observed > expiration && observed <= live_through)
 }
 /// Verify a terminal CAP-15 wrapper before retaining the original inner transaction.
 /// This accepts settlement evidence only; owner intent signing still rejects fee-bump envelopes.
@@ -1464,19 +1507,29 @@ fn trusted_state_inner(
         .map(|e| &e.val)
         .ok_or("Missing policy wallet custody state")?;
     if c.route == WalletRoute::PolicyWallet {
-        return current_wallet_state(rpc, c, state, module.0, ledger, require_customer_quorum);
+        return current_wallet_state(
+            rpc,
+            c,
+            state,
+            module.0,
+            ledger,
+            accounting,
+            require_customer_quorum,
+        );
     }
     historical_wallet_state(rpc, c, state, module.0, ledger, require_customer_quorum)
 }
 /// Layout 5 discovery: decode the packed configuration, check it against the installation, and
 /// read the figures from `t` and an open `d`. The transaction source is the server's sending
 /// account, which `prepare_with` reads; discovery leaves it empty.
+#[allow(clippy::too_many_arguments)]
 fn current_wallet_state(
     rpc: &dyn Rpc,
     c: &WalletConfig,
     raw: &ScVal,
     module: [u8; 32],
     ledger: u32,
+    accounting: Option<NativeAccounting>,
     require_customer_quorum: bool,
 ) -> Result<DiscoveredState> {
     let ScVal::Bytes(bytes) = raw else {
@@ -1492,6 +1545,17 @@ fn current_wallet_state(
         verify_configuration(c, &config)?;
     }
     let figures = figures(rpc, c, ledger)?;
+    // A wallet that keeps every figure needs no account of the server's.
+    let accounting = accounting.filter(|_| crate::kept_figures(c) != packed::ALL);
+    // The server's account of the figures that the wallet does not keep: a Simple wallet keeps
+    // none, a Common wallet those of its rules with params. An execution needs it; discovery
+    // reports the wallet's own figures without it.
+    if require_customer_quorum && accounting.is_none() && crate::kept_figures(c) != packed::ALL {
+        return Err(
+            "A Simple or Common wallet needs the server's accounting of the figures that it does not keep"
+                .into(),
+        );
+    }
     Ok(DiscoveredState {
         state: TrustedState {
             contract_version: Some(u32::from(config.layout)),
@@ -1512,14 +1576,17 @@ fn current_wallet_state(
             },
             nonce: 0,
             deployment_version: u64::from(config.deployment_version),
-            spent_daily: if figures.day_ends != 0 {
-                figures.day_spent
-            } else {
-                0
-            },
-            spent_total: figures.spent,
-            spent_day: 0,
-            calls: figures.calls,
+            spent_daily: accounting.as_ref().map_or(
+                if figures.day_ends != 0 {
+                    figures.day_spent
+                } else {
+                    0
+                },
+                |a| a.spent_daily,
+            ),
+            spent_total: accounting.as_ref().map_or(figures.spent, |a| a.spent_total),
+            spent_day: accounting.as_ref().map_or(0, |a| a.spent_day),
+            calls: accounting.as_ref().map_or(figures.calls, |a| a.calls),
             ledger,
             module_digest: module,
             source_hash: config.source_hash,

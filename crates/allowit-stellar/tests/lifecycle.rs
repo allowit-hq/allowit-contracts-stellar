@@ -192,6 +192,17 @@ fn fixture_with_wallet(
     };
     (c, request, state)
 }
+/// The server's accounting of the figures that a Simple or Common wallet does not keep.
+fn server_accounting() -> rpc::NativeAccounting {
+    rpc::NativeAccounting {
+        nonce: 0,
+        deployment_version: 0,
+        spent_daily: 0,
+        spent_total: 0,
+        spent_day: 0,
+        calls: 0,
+    }
+}
 fn sign_native(p: &PreparedOperation) -> SignedOperation {
     let a = sign(p, &[2; 32], 86401).unwrap();
     let e = sign(p, &[3; 32], 86401).unwrap();
@@ -1478,7 +1489,7 @@ fn discovery_reads_the_installed_roles_and_does_not_lock_to_old_ones() {
     assert_eq!(discovery.state.server, c.server);
     // An execution requires the configured roles.
     assert!(rpc::trusted_state(&rpc, &obsolete, None).is_err());
-    let live = rpc::trusted_state(&rpc, &c, None).unwrap();
+    let live = rpc::trusted_state(&rpc, &c, Some(server_accounting())).unwrap();
     assert_eq!(live.agent, c.agent);
     // Discovery still requires the wallet's binding: its rules, asset and source.
     let mut other = c.clone();
@@ -2688,6 +2699,38 @@ fn preflight_rpc(c: &WalletConfig, r: &ExecutionRequest, s: &TrustedState) -> Pr
 const LIMITED: &str = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::destinations(ctx, &ctx.params[allowit::DESTINATIONS])?;\n    allowit::payment_limit(ctx, &ctx.params[allowit::PAYMENT_LIMIT])?;\n    Ok(())\n}\n";
 const SUFFIXED: &str = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::destinations(ctx, &ctx.params[allowit::DESTINATIONS])?;\n    let limit: i128 = allowit::param(ctx, \"payment_limit\");\n    if ctx.request.amount > limit {\n        return Err(AllowitError::PaymentLimitExceeded);\n    }\n    Ok(())\n}\n";
 
+/// A Simple wallet keeps no figure on chain, so the server's accounting gives the figures that its
+/// policy reads: a call limit counts the calls that the server recorded, and an execution without
+/// that accounting is refused instead of counting from zero.
+#[test]
+fn a_simple_wallet_counts_with_the_servers_accounting() {
+    let (mut c, r, s) = fixture(WalletRoute::PolicyWallet, true);
+    let recipient = account_for_seed(&[6; 32]);
+    install(
+        &mut c,
+        PolicyTier::Simple,
+        "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::destinations(ctx, &ctx.params[allowit::DESTINATIONS])?;\n    allowit::call_limit(ctx, &ctx.params[allowit::CALL_LIMIT])?;\n    Ok(())\n}\n",
+        json!({"destinations": [recipient], "call_limit": 1}),
+    );
+    assert_eq!(kept_figures(&c), 0);
+    let rpc = preflight_rpc(&c, &r, &s);
+    assert!(
+        rpc::prepare(&rpc, &c, &r, None, 86401, 86700)
+            .unwrap_err()
+            .contains("server's accounting")
+    );
+    rpc::prepare(&rpc, &c, &r, Some(server_accounting()), 86401, 86700).unwrap();
+    let one_call = rpc::NativeAccounting {
+        calls: 1,
+        ..server_accounting()
+    };
+    assert!(
+        rpc::prepare(&rpc, &c, &r, Some(one_call), 86401, 86700)
+            .unwrap_err()
+            .contains("CallLimitExceeded")
+    );
+}
+
 #[test]
 fn simple_service_authorization_evaluates_the_full_policy() {
     let (mut c, r, s) = fixture(WalletRoute::PolicyWallet, true);
@@ -2701,7 +2744,7 @@ fn simple_service_authorization_evaluates_the_full_policy() {
     );
     let rpc = preflight_rpc(&c, &r, &s);
     assert!(
-        rpc::prepare(&rpc, &c, &r, None, 86401, 86700)
+        rpc::prepare(&rpc, &c, &r, Some(server_accounting()), 86401, 86700)
             .unwrap_err()
             .contains("denied")
     );
@@ -2713,7 +2756,7 @@ fn simple_service_authorization_evaluates_the_full_policy() {
         json!({"destinations": [recipient], "payment_limit": 1}),
     );
     let rpc = preflight_rpc(&c, &r, &s);
-    let prepared = rpc::prepare(&rpc, &c, &r, None, 86401, 86700).unwrap();
+    let prepared = rpc::prepare(&rpc, &c, &r, Some(server_accounting()), 86401, 86700).unwrap();
     let usage = rpc::NativeAccounting {
         nonce: prepared.state.nonce,
         deployment_version: prepared.state.deployment_version,
@@ -2761,7 +2804,7 @@ fn simple_service_authorization_evaluates_the_full_policy() {
         json!({"destinations": [recipient], "payment_limit": 100_000_000}),
     );
     let rpc = preflight_rpc(&c, &r, &s);
-    let prepared = rpc::prepare(&rpc, &c, &r, None, 86401, 86700).unwrap();
+    let prepared = rpc::prepare(&rpc, &c, &r, Some(server_accounting()), 86401, 86700).unwrap();
     let seeded = authorize_server_with(&prepared, &[3; 32], 86401, &compiled).unwrap();
     let external = authorize_server_using(&prepared, &c.server, 86401, Some(&compiled), |digest| {
         use ed25519_dalek::{Signer, SigningKey};
@@ -2798,7 +2841,7 @@ fn selected_implementations_bind_constructor_and_both_authorities() {
         assert_eq!(config.source_hash, hash(&c.policy_source));
         assert_eq!(config.constructor_args().unwrap().len(), 1);
         let rpc = preflight_rpc(&c, &r, &s);
-        let unsigned = rpc::prepare(&rpc, &c, &r, None, 86401, 86700).unwrap();
+        let unsigned = rpc::prepare(&rpc, &c, &r, Some(server_accounting()), 86401, 86700).unwrap();
         assert!(sign(&unsigned, &[2; 32], 86401).is_err());
         let signed = server_ready(&unsigned);
         assert!(authorize(&signed, &[], 86401).is_err());
@@ -2871,7 +2914,7 @@ fn common_installed_rules_cannot_omit_or_reorder_authored_checks() {
             rules,
         };
         assert!(
-            rpc::prepare(&rpc, &c, &r, None, 86401, 86700)
+            rpc::prepare(&rpc, &c, &r, Some(server_accounting()), 86401, 86700)
                 .unwrap_err()
                 .contains("rules")
         );

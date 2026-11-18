@@ -22,6 +22,8 @@ pub const SPENT: u8 = 1;
 pub const CALLS: u8 = 2;
 pub const DAY_SPENT: u8 = 4;
 pub const DAY_TOTAL: u8 = 8;
+/// Every figure.
+pub const ALL: u8 = SPENT | CALLS | DAY_SPENT | DAY_TOTAL;
 
 /// The decoded configuration of a policy wallet.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

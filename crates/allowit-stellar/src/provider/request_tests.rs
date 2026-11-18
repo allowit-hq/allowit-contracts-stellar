@@ -63,10 +63,9 @@ mod tests {
     fn exec_flags_build_requests_that_decode_to_the_same_operation() {
         let to = sdk::account_for_seed(&[6; 32]);
         let usdc = config(WalletRoute::PolicyWallet, true);
-        // The policy wallet's current agent account differs from the profile
-        // agent; it pays the fee.
-        let mut state = state(&config(WalletRoute::Native, false), None).unwrap();
-        state.source.address = sdk::account_for_seed(&[8; 32]);
+        // No request reads chain state: a keypair wallet pays its own fee, and the server's
+        // sending account pays a policy wallet's, named at preparation.
+        let state = state(&config(WalletRoute::Native, false), None).unwrap();
         let cases = [
             (
                 config(WalletRoute::Native, false),
@@ -107,15 +106,14 @@ mod tests {
                 sdk::operation_from_request(&c, &typed.request).unwrap(),
                 expected
             );
-            let payer = if c.route == WalletRoute::Native {
-                &c.wallet
+            if c.route == WalletRoute::Native {
+                assert_eq!(
+                    fee_payer(&typed.request),
+                    sdk::request::account(&c.wallet).unwrap()
+                );
             } else {
-                &state.source.address
-            };
-            assert_eq!(
-                fee_payer(&typed.request),
-                sdk::request::account(payer).unwrap()
-            );
+                assert!(typed.request.fee_bounds.is_none());
+            }
             assert_eq!(
                 typed.request.operation.nonce,
                 operation_nonce("policy-1", "request-0001")
@@ -130,10 +128,9 @@ mod tests {
     fn a_retry_keeps_the_retained_fee_payer() {
         let c = config(WalletRoute::PolicyWallet, true);
         let r = request("deposit", &vault(1), "USDC:5", Some("4900000"));
-        let mut first = state(&config(WalletRoute::Native, false), None).unwrap();
-        first.source.address = sdk::account_for_seed(&[8; 32]);
+        let first = state(&config(WalletRoute::Native, false), None).unwrap();
         let old = build("policy-1", &c, &r, || Ok(first)).unwrap().request;
-        // The agent account changed since; the same flags rebuild the same request.
+        // The same flags rebuild the same request.
         assert_eq!(rebuild("policy-1", &c, &r, &old).unwrap().request, old);
         let more = request("deposit", &vault(1), "USDC:6", Some("4900000"));
         assert_ne!(rebuild("policy-1", &c, &more, &old).unwrap().request, old);

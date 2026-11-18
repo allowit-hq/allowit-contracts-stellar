@@ -145,6 +145,9 @@ struct Wallet {
     tier: PolicyTier,
     config: packed::Configuration,
     stored: Stored,
+    /// The server's account of every execution, from its receipts: spent, calls and the day's
+    /// spent.
+    served: (i128, u64, i128),
     /// XLM: the asset, and the gas the wallet repays.
     balance: i128,
     shares: i128,
@@ -349,6 +352,20 @@ impl ModelChain {
     }
     fn ledger(&self) -> u32 {
         self.0.lock().unwrap().ledger
+    }
+    /// The server's accounting of the wallet: the figures of every execution, which a Simple
+    /// or Common wallet does not keep.
+    fn accounting(&self) -> rpc::NativeAccounting {
+        let m = self.0.lock().unwrap();
+        let (spent_total, calls, spent_daily) = m.wallet.as_ref().map_or((0, 0, 0), |w| w.served);
+        rpc::NativeAccounting {
+            nonce: 0,
+            deployment_version: 0,
+            spent_daily,
+            spent_total,
+            spent_day: NOW / 86_400,
+            calls,
+        }
     }
     fn figures(&self) -> packed::Figures {
         let m = self.0.lock().unwrap();
@@ -813,6 +830,7 @@ fn apply(m: &mut Model, tx: &x::Transaction) -> x::ScVal {
                     rules,
                 },
                 stored: Stored::default(),
+                served: (0, 0, 0),
                 balance: 0,
                 shares: 0,
             };
@@ -1066,6 +1084,7 @@ fn execute(w: &mut Wallet, request: &x::ScVal, now: u64, ledger: u32, source: &s
         }
     }
     w.balance -= gas;
+    w.served = (w.served.0 + spent, w.served.1 + 1, w.served.2 + spent);
     x::ScVal::Void
 }
 
@@ -1120,6 +1139,7 @@ fn terms(principal: i128, ledger: u32) -> ExecutionTerms {
         args: PolicyParams::default(),
         expense: Some(ExpenseBounds::xlm(principal, 0, MAX_FEE, ledger - 1, NOW).unwrap()),
         gas: None,
+        sender: Some(sender()),
     }
 }
 fn seal(chain: &ModelChain, authorized: &SignedOperation) -> Result<SignedOperation> {
@@ -1134,7 +1154,7 @@ fn authorized(
     r: &ExecutionRequest,
     t: &ExecutionTerms,
 ) -> Result<SignedOperation> {
-    let prepared = rpc::prepare_with(chain, c, r, t, None, NOW, NOW + 300)?;
+    let prepared = rpc::prepare_with(chain, c, r, t, Some(chain.accounting()), NOW, NOW + 300)?;
     let served = authorize_server(&prepared, &SERVER, NOW, None)?;
     let simulated = rpc::simulate(chain, &served)?;
     let proof = sign(&simulated, &AGENT, NOW)?;
@@ -1400,7 +1420,7 @@ fn create(chain: &ModelChain, tier: PolicyTier, wasm: &[u8], salt: [u8; 32]) -> 
 }
 /// The trusted state with the server's sending account as the source of the next operation.
 fn sending_state(chain: &ModelChain, c: &WalletConfig) -> TrustedState {
-    let mut state = rpc::trusted_state(chain, c, None).unwrap();
+    let mut state = rpc::trusted_state(chain, c, Some(chain.accounting())).unwrap();
     state.source = rpc::get_account(chain, &sender()).unwrap();
     state
 }
@@ -1433,7 +1453,7 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
             &c,
             &transfer,
             &terms(10_000_000, ledger),
-            None,
+            Some(chain.accounting()),
             NOW,
             NOW + 300,
         )
@@ -1532,28 +1552,42 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
     );
     // The same authorization runs once.
     assert!(seal(&chain, &signed).is_err());
-    // A transfer over the payment limit is denied on the host before any signature.
+    // A transfer over the payment limit is denied before any signature: by the server's
+    // evaluation over its accounting, and for Common and Custom on the host too. Simple runs no
+    // rule on chain; Custom runs its source, not prefix rules.
     let state = sending_state(&chain, &c);
     let ledger = chain.ledger();
     let over = request::transfer(&c, &state, [9; 32], &recipient, 60_000_000).unwrap();
-    if tier == PolicyTier::Simple {
-        // Simple runs no rule on chain; the server's accounting checks its params.
-        assert!(c.rules.is_empty());
-    } else {
-        assert!(
-            rpc::prepare_with(
-                &chain,
-                &c,
-                &over,
-                &terms(60_000_000, ledger),
-                None,
-                NOW,
-                NOW + 300
-            )
-            .unwrap_err()
-            .contains("PaymentLimitExceeded")
-        );
-    }
+    assert_eq!(c.rules.is_empty(), tier != PolicyTier::Common);
+    assert!(
+        rpc::prepare_with(
+            &chain,
+            &c,
+            &over,
+            &terms(60_000_000, ledger),
+            Some(chain.accounting()),
+            NOW,
+            NOW + 300
+        )
+        .unwrap_err()
+        .contains("PaymentLimitExceeded")
+    );
+    // Without the server's accounting, a Simple or Common wallet is not authorized.
+    let needs = kept != packed::ALL;
+    assert_eq!(
+        rpc::prepare_with(
+            &chain,
+            &c,
+            &over,
+            &terms(60_000_000, ledger),
+            None,
+            NOW,
+            NOW + 300
+        )
+        .unwrap_err()
+        .contains("needs the server's accounting"),
+        needs
+    );
     // 4. A SEP-56 deposit, then a redeem of part of its shares.
     let ledger = chain.ledger();
     let deposit = request::deposit(&c, &state, [2; 32], &vault(), 5_000_000, 5_000_000).unwrap();
@@ -1561,6 +1595,7 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
         args: PolicyParams::default(),
         expense: Some(ExpenseBounds::xlm(0, 0, MAX_FEE, ledger - 1, NOW).unwrap()),
         gas: None,
+        sender: Some(sender()),
     };
     run(&chain, &c, &deposit, &priced(ledger), "deposit").unwrap();
     let ledger = chain.ledger();
@@ -1592,7 +1627,12 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
         .0
         .insert("payment_limit".into(), PolicyValue::Int(20_000_000));
     // The daily limit leaves room for 15,001,000 more units.
-    let day_spent = chain.figures().day_spent;
+    // The server's accounting counts every execution; a wallet that keeps the day's spent
+    // agrees with it.
+    let day_spent = chain.accounting().spent_daily;
+    if kept & DAY_SPENT != 0 {
+        assert_eq!(chain.figures().day_spent, day_spent);
+    }
     lower.0.insert(
         "daily_spending_limit".into(),
         PolicyValue::Int(day_spent + 15_001_000),
@@ -1621,7 +1661,7 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
                 &c,
                 &over,
                 &terms(15_000_000, ledger),
-                None,
+                Some(chain.accounting()),
                 NOW,
                 NOW + 300
             )
@@ -1656,7 +1696,7 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
                 &c,
                 &blocked,
                 &terms(25_000_000, ledger),
-                None,
+                Some(chain.accounting()),
                 NOW,
                 NOW + 300
             )
@@ -2052,4 +2092,40 @@ fn recorded_vectors_decode_to_the_exact_workflow_packets() {
         }
     }
     assert_eq!(executions, 12);
+}
+#[test]
+fn the_sending_account_is_the_gas_payee_and_the_gas_follows_the_priced_expense() {
+    let wasm = wasm_for(PolicyTier::Simple);
+    let chain = ModelChain::new(BTreeMap::from([(hash(&wasm), PolicyTier::Simple)]));
+    let c = create(&chain, PolicyTier::Simple, &wasm, [0x31; 32]);
+    let state = sending_state(&chain, &c);
+    let r = request::transfer(&c, &state, [1; 32], &account_for_seed(&RECIPIENT), 1).unwrap();
+    // A policy wallet request names no fee payer; the terms name the sending account.
+    assert!(r.fee_bounds.is_none());
+    let mut t = terms(1, chain.ledger());
+    assert_eq!(gas_payee(&r, &t).unwrap(), sender());
+    // Preparation repays the priced fee bound, not the caller's ceiling.
+    let prepared =
+        rpc::prepare_with(&chain, &c, &r, &t, Some(chain.accounting()), NOW, NOW + 300).unwrap();
+    let bound = prepared.terms.expense.as_ref().unwrap();
+    assert_eq!(bound.gas_units, i128::from(bound.max_fee_stroops));
+    assert!(bound.max_fee_stroops < MAX_FEE);
+    // An explicit repayment to another account conflicts with the sending account.
+    t.gas = Some(GasRepayment {
+        stroops: 1,
+        payee: account_for_seed(&RECIPIENT),
+    });
+    assert!(
+        gas_payee(&r, &t)
+            .unwrap_err()
+            .contains("name other accounts")
+    );
+    // Without a sending account the operation has no gas payee.
+    t.gas = None;
+    t.sender = None;
+    assert!(
+        gas_payee(&r, &t)
+            .unwrap_err()
+            .contains("needs the server's sending account")
+    );
 }

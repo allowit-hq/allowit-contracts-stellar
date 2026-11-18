@@ -409,13 +409,21 @@ pub struct ExecutionTerms {
     pub args: PolicyParams,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expense: Option<ExpenseBounds>,
-    /// The XLM that a policy wallet repays for the network fee, and its payee.
+    /// The XLM that a policy wallet repays for the network fee, and its payee, when the server
+    /// sets them; by default the expense's fee bound to the sending account.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gas: Option<GasRepayment>,
+    /// The server's sending account of a policy wallet operation: its source, which pays the
+    /// fee and receives the gas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
 }
 impl ExecutionTerms {
     pub fn is_empty(&self) -> bool {
-        self.args.0.is_empty() && self.expense.is_none() && self.gas.is_none()
+        self.args.0.is_empty()
+            && self.expense.is_none()
+            && self.gas.is_none()
+            && self.sender.is_none()
     }
 }
 /// The gas that a policy wallet repays in the transaction: `stroops` of XLM to `payee`, the
@@ -650,6 +658,67 @@ impl PolicyStateSnapshot {
         PolicyParams(state)
     }
 }
+impl TrustedState {
+    /// Core's standard state of a policy wallet before an operation at `now`: each figure that
+    /// the wallet keeps comes from the wallet, and the server's accounting in this state gives
+    /// every other one, as for a keypair wallet.
+    pub fn policy_wallet_state(&self, c: &WalletConfig, now: u64) -> Result<PolicyParams> {
+        let snapshot = self
+            .policy_state
+            .as_ref()
+            .ok_or("Trusted layout 5 params and figures are required")?;
+        let kept = kept_figures(c);
+        let wallet = &snapshot.figures;
+        let open = wallet.day_ends != 0;
+        let today = now / allowit_core::DAY;
+        let server_today = self.spent_day == today;
+        let pick =
+            |figure: u8, own: i128, server: i128| if kept & figure != 0 { own } else { server };
+        let mut state = std::collections::BTreeMap::new();
+        state.insert(
+            "calls".to_owned(),
+            PolicyValue::Int(pick(
+                packed::CALLS,
+                i128::from(wallet.calls),
+                i128::from(self.calls),
+            )),
+        );
+        state.insert(
+            "spent".to_owned(),
+            PolicyValue::Int(pick(packed::SPENT, wallet.spent, self.spent_total)),
+        );
+        state.insert(
+            "unpriced".to_owned(),
+            PolicyValue::Bool(kept & packed::SPENT != 0 && wallet.unpriced),
+        );
+        state.insert("day".to_owned(), PolicyValue::Int(i128::from(today)));
+        let server_daily = if server_today { self.spent_daily } else { 0 };
+        let own_daily = |value: i128| if open { value } else { 0 };
+        state.insert(
+            "day_spent".to_owned(),
+            PolicyValue::Int(pick(
+                packed::DAY_SPENT,
+                own_daily(wallet.day_spent),
+                server_daily,
+            )),
+        );
+        state.insert(
+            "day_total".to_owned(),
+            PolicyValue::Int(pick(
+                packed::DAY_TOTAL,
+                own_daily(wallet.day_total),
+                server_daily,
+            )),
+        );
+        state.insert(
+            "day_unpriced".to_owned(),
+            PolicyValue::Bool(
+                kept & (packed::DAY_SPENT | packed::DAY_TOTAL) != 0 && open && wallet.day_unpriced,
+            ),
+        );
+        Ok(PolicyParams(state))
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TrustedState {
@@ -824,6 +893,15 @@ pub fn max_fee_ceiling(route: &WalletRoute) -> u32 {
     }
 }
 
+/// The figures that a policy wallet keeps for its checks: a Simple or Common wallet those of its
+/// rules with params; a Custom wallet every figure that its compiled source reads, which are the
+/// only ones that the source can read on the server too.
+pub fn kept_figures(c: &WalletConfig) -> u8 {
+    if c.tier == Some(PolicyTier::Custom) {
+        return packed::ALL;
+    }
+    packed::standard_kept(&c.rules, &installed_params(c))
+}
 /// The params that a policy wallet stores: a Simple or Common wallet keeps only the params of its
 /// on-chain rules, and the server keeps the rest of the owner's params; a Custom wallet keeps all.
 pub fn installed_params(c: &WalletConfig) -> PolicyParams {
@@ -1121,6 +1199,11 @@ fn decode_operation(
     {
         return Err("Operation effects differ from approved bounds".into());
     }
+    // A policy wallet's request may name no fee payer: the server's sending account pays and
+    // the preparation names it as the gas payee.
+    if c.route == WalletRoute::PolicyWallet && r.fee_bounds.is_none() {
+        return Ok(operation);
+    }
     let fees = r
         .fee_bounds
         .as_ref()
@@ -1400,7 +1483,7 @@ fn verify_wallet_portable(
         &shape,
         &c.rules,
         &c.params,
-        &snapshot.standard_state(now),
+        &state.policy_wallet_state(c, now)?,
         &request,
         evaluator,
         true,
@@ -1469,19 +1552,41 @@ fn legacy_wallet_request(
     ])
 }
 /// The gas that a policy wallet repays for `r`: the explicit repayment of `terms`, else the fee
-/// bound of its expense, in stroops, to the request's fee payer, the server's sending account. An
-/// unpriced request repays nothing.
+/// bound of its expense, in stroops. The payee is the server's sending account, which `terms`
+/// or the request's fee payer names; when both name one, they agree. An unpriced request repays
+/// nothing.
 pub(crate) fn gas_repayment(r: &ExecutionRequest, terms: &ExecutionTerms) -> Result<GasRepayment> {
+    let payer = match &r.fee_bounds {
+        Some(fees) => Some(workflow_address(
+            &fees.first().ok_or("Native fee bound required")?.payer,
+        )?),
+        None => None,
+    };
+    let named = [
+        payer,
+        terms.sender.clone(),
+        terms.gas.as_ref().map(|g| g.payee.clone()),
+    ];
+    let mut sender: Option<String> = None;
+    for account in named.into_iter().flatten() {
+        if sender.as_ref().is_some_and(|s| *s != account) {
+            return Err(
+                "The request, the sending account and the gas payee name other accounts".into(),
+            );
+        }
+        sender = Some(account);
+    }
     if let Some(gas) = &terms.gas {
         return Ok(gas.clone());
     }
-    let fee = &r.fee_bounds.as_ref().ok_or("Native fee bound required")?[0];
     Ok(GasRepayment {
         stroops: terms
             .expense
             .as_ref()
             .map_or(0, |e| i128::from(e.max_fee_stroops)),
-        payee: workflow_address(&fee.payer)?,
+        payee: sender.ok_or(
+            "A policy wallet operation needs the server's sending account as its gas payee",
+        )?,
     })
 }
 /// The sending account that a policy wallet operation names: the payee of its gas repayment and
@@ -1643,9 +1748,8 @@ fn build(
             if state.module_digest != c.module_digest {
                 return Err("policy wallet executable differs".into());
             }
-            let fee = &r.fee_bounds.as_ref().ok_or("Native fee bound required")?[0];
-            if workflow_address(&fee.payer)? != state.source.address {
-                return Err("policy wallet fee payer differs from the sending account".into());
+            if gas_payee(r, terms)? != state.source.address {
+                return Err("policy wallet gas payee differs from the sending account".into());
             }
             let request = policy_wallet_request(c, r, terms, state, &operation, expires)?;
             let call = InvokeContractArgs {

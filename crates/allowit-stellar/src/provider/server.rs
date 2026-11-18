@@ -377,7 +377,15 @@ pub struct Provider {
 /// The signing capability of the server's sending accounts: it signs a transaction hash with the
 /// key of the named account. A policy wallet operation is sent from one of them, which pays its
 /// fee; the wallet repays the gas to it.
-pub type Sender = std::sync::Arc<dyn Fn(&str, &[u8; 32]) -> native::Result<[u8; 64]> + Send + Sync>;
+pub type Sender = std::sync::Arc<dyn SendingAccounts>;
+/// The server's sending accounts: the account that sends the next policy wallet operation, pays
+/// its fee and receives its gas, and the signature of a transaction hash with an account's key.
+pub trait SendingAccounts: Send + Sync {
+    /// The account for the next policy wallet operation.
+    fn account(&self) -> native::Result<String>;
+    /// The signature of `hash` by the key of `account`.
+    fn sign(&self, account: &str, hash: &[u8; 32]) -> native::Result<[u8; 64]>;
+}
 impl Provider {
     /// One owner action on a keypair wallet: a transaction from the owner's account whose
     /// operations the owner's signature authorizes alone. `Recover` without an amount closes
@@ -504,6 +512,13 @@ impl Provider {
     pub fn with_sender(mut self, sender: Sender) -> Self {
         self.sender = Some(sender);
         self
+    }
+    /// The sending account for the next policy wallet operation.
+    fn sending_account(&self) -> Result<String> {
+        let sender = self.sender.as_ref().ok_or_else(|| {
+            Error::config("This server has no sending account for policy wallet operations")
+        })?;
+        checked(sender.account())
     }
     #[cfg(test)]
     pub fn from_rpc(network: &str, rpc: std::sync::Arc<dyn rpc::Rpc>) -> Self {
@@ -859,11 +874,19 @@ impl crate::host::vendors::RuntimeProvider for Provider {
     }
     fn redeemable(&self, i: &Installation, vault: &str, shares: i128) -> Result<i128> {
         let c = self.fresh(i)?;
-        let s = checked(rpc::trusted_state_for_discovery(self.rpc(), &c, None))?;
+        // The read simulates from an account that exists: the sending account of a policy
+        // wallet, or the keypair wallet itself.
+        let source = if c.route == WalletRoute::PolicyWallet {
+            checked(rpc::get_account(self.rpc(), &self.sending_account()?))?
+        } else {
+            checked(rpc::trusted_state_for_discovery(self.rpc(), &c, None))?
+                .state
+                .source
+        };
         checked(rpc::vault_redeemable(
             self.rpc(),
             &c,
-            &s.state.source,
+            &source,
             vault,
             shares,
         ))
@@ -917,11 +940,17 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                     })
                 })
                 .transpose()?,
-            // The repayment follows from the expense and the request's fee payer.
             gas: None,
+            sender: None,
         };
         let accounting = accounting(a);
         let request: native::workflow::ExecutionRequest = decode_packet(&r.0)?;
+        // A policy wallet operation is sent by one of the server's sending accounts, which pays
+        // its fee and receives the gas: the priced expense's fee bound.
+        let mut terms = terms;
+        if c.route == WalletRoute::PolicyWallet && !native::seller_settled::is_request(&request) {
+            terms.sender = Some(self.sending_account()?);
+        }
         if native::seller_settled::is_request(&request) {
             return self.packet(&checked(native::seller_settled::prepare(
                 self.rpc(),
@@ -1084,7 +1113,9 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                     Error::config("This server has no sending account for policy wallet operations")
                 })?;
                 let source = checked(native::gas_payee(&p.request, &p.terms))?;
-                checked(rpc::seal(self.rpc(), &signed, |hash| sender(&source, hash)))?
+                checked(rpc::seal(self.rpc(), &signed, |hash| {
+                    sender.sign(&source, hash)
+                }))?
             } else {
                 signed
             };

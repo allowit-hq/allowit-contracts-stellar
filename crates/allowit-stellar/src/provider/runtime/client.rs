@@ -3149,10 +3149,53 @@ mod native_revalidation_tests {
         transaction: serde_json::Value,
         entries_ledger: u64,
     ) -> impl Fn(&str, &serde_json::Value) -> serde_json::Value + Send + 'static {
+        lapse_rpc_spent(transaction, entries_ledger, false)
+    }
+    /// The lapse reads: the transaction, then the wallet's nonce entry, present when `spent`,
+    /// and the network's minimum temporary lifetime of 720 ledgers.
+    fn lapse_rpc_spent(
+        transaction: serde_json::Value,
+        entries_ledger: u64,
+        spent: bool,
+    ) -> impl Fn(&str, &serde_json::Value) -> serde_json::Value + Send + 'static {
+        use stellar_xdr::{
+            ConfigSettingEntry, ContractDataEntry, ExtensionPoint, LedgerEntryData, LedgerKey,
+            Limits, ReadXdr, StateArchivalSettings, WriteXdr,
+        };
         let calls = fixture()["calls"].as_array().unwrap().clone();
         move |method, params| match method {
             "getTransaction" => transaction.clone(),
             "getLatestLedger" => json!({"sequence":130}),
+            "getLedgerEntries" if params["keys"].as_array().unwrap().len() == 2 => {
+                let mut entries = vec![];
+                for key in params["keys"].as_array().unwrap() {
+                    let entry =
+                        match LedgerKey::from_xdr_base64(key.as_str().unwrap(), Limits::none())
+                            .unwrap()
+                        {
+                            LedgerKey::ConfigSetting(_) => LedgerEntryData::ConfigSetting(
+                                ConfigSettingEntry::StateArchival(StateArchivalSettings {
+                                    min_temporary_ttl: 720,
+                                    ..Default::default()
+                                }),
+                            ),
+                            LedgerKey::ContractData(data) if spent => {
+                                LedgerEntryData::ContractData(ContractDataEntry {
+                                    ext: ExtensionPoint::V0,
+                                    contract: data.contract,
+                                    key: data.key,
+                                    durability: data.durability,
+                                    val: stellar_xdr::ScVal::Void,
+                                })
+                            }
+                            _ => continue,
+                        };
+                    entries.push(
+                        json!({"key": key, "xdr": entry.to_xdr_base64(Limits::none()).unwrap()}),
+                    );
+                }
+                json!({"latestLedger": entries_ledger, "entries": entries})
+            }
             _ => {
                 let mut result = calls
                     .iter()
@@ -3174,7 +3217,7 @@ mod native_revalidation_tests {
         assert_eq!(p.expires_at, 86700);
         let not_found =
             json!({"status":"NOT_FOUND","latestLedger":185,"latestLedgerCloseTime":"86700"});
-        let (rpc, stop, server) = rpc_server(lapse_rpc(not_found.clone(), 130));
+        let (rpc, stop, server) = rpc_server(lapse_rpc(not_found.clone(), 185));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let engine = reply_once(
@@ -3224,20 +3267,23 @@ mod native_revalidation_tests {
         assert_eq!(methods[0], "getTransaction");
 
         for (transaction, entries_ledger, packet, lapsed) in [
-            (not_found.clone(), 130, &p, true),
+            (not_found.clone(), 185, &p, true),
             (
                 json!({"status":"FAILED","latestLedger":186,"latestLedgerCloseTime":86701}),
-                131,
+                186,
                 &p,
                 true,
             ),
             // At the expiration ledger of the wallet's authorization it can still run.
             (
                 json!({"status":"NOT_FOUND","latestLedger":184,"latestLedgerCloseTime":"86700"}),
-                130,
+                184,
                 &p,
                 false,
             ),
+            // Past the lifetime that a spent nonce is sure to have, its absence proves nothing.
+            (not_found.clone(), 184 - 64 + 720 - 1, &p, true),
+            (not_found.clone(), 184 - 64 + 720, &p, false),
             // The closing ledger precedes the expiry: the wallet can still execute it.
             (
                 json!({"status":"NOT_FOUND","latestLedger":130,"latestLedgerCloseTime":"86699"}),
@@ -3264,6 +3310,13 @@ mod native_revalidation_tests {
             server.join().unwrap();
             assert_eq!(result, Ok(lapsed), "{transaction} at {entries_ledger}");
         }
+        // A sealed transaction has another hash than the prepared one, so a prepared hash that
+        // the network does not know proves nothing: the spent nonce shows that the operation ran.
+        let (rpc, stop, server) = rpc_server(lapse_rpc_spent(not_found.clone(), 185, true));
+        let result = sdk::rpc::operation_lapsed(&sdk::rpc::HttpRpc::new(&rpc).unwrap(), &p);
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().unwrap();
+        assert_eq!(result, Ok(false));
     }
     #[test]
     fn proven_failure_stays_failed_after_the_nonce_moves_or_rpc_fails() {
@@ -3293,7 +3346,7 @@ mod native_revalidation_tests {
         let temp = tempfile::tempdir().unwrap();
         let journal = Store::open(&temp.path().canonicalize().unwrap().join("journal")).unwrap();
         let record: Record = serde_json::from_value(json!({"policyId":"engine-policy","requestId":"released-001","config":p.config,"request":p.request,"prepared":p,"agentSignature":null,"status":OperationStatus::SubmissionUnknown})).unwrap();
-        let (rpc, stop, server) = rpc_server(lapse_rpc(not_found.clone(), 130));
+        let (rpc, stop, server) = rpc_server(lapse_rpc(not_found.clone(), 185));
         let (client, mut r) = query(&rpc);
         client.settle(&mut r, Some(&record)).unwrap();
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
