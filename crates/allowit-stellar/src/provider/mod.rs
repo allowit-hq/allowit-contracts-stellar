@@ -30,11 +30,12 @@ pub(crate) const NETWORK_UNAVAILABLE: i32 = 7;
 /// The checked shape of a policy's source for its wallet. The server evaluates the source of
 /// a classic account, so that source is server policy source: it can read owner text for a
 /// server function. A contract compiles the source of a policy wallet, which stays portable.
-/// The contract of a Custom wallet compiles the on-chain part of its source, so the one source
-/// of such a wallet may have a server part that is server policy source. The installation
-/// binding admits that source only for a Custom wallet (`policy::wallet_shape`).
+/// The contract of a Custom wallet (`custom`) compiles the on-chain part of its source, so the
+/// one source of such a wallet may have a server part that is server policy source
+/// (`policy::custom_parts`). No other policy wallet holds such a source.
 pub(crate) fn source_shape(
     classic: bool,
+    custom: bool,
     source: &str,
 ) -> crate::host::error::Result<crate::policy::SourceShape> {
     if classic {
@@ -43,7 +44,7 @@ pub(crate) fn source_shape(
     crate::host::authoring::check(source).or_else(|portable| {
         crate::policy::custom_parts(source)
             .ok()
-            .filter(|parts| parts.server_part)
+            .filter(|parts| custom && parts.server_part)
             .map(|parts| parts.shape)
             .ok_or(portable)
     })
@@ -397,3 +398,30 @@ pub mod diagnostics;
 mod request_proof_tests;
 #[cfg(test)]
 mod request_tests;
+
+#[cfg(test)]
+mod source_shape_tests {
+    use super::source_shape;
+
+    /// Server policy source, with owner text read by `as_str()`, belongs to a classic account
+    /// and to a Custom wallet, whose contract compiles the on-chain part. No other policy wallet
+    /// holds it. Portable source passes for every wallet.
+    #[test]
+    fn only_a_classic_account_and_a_custom_wallet_hold_server_policy_source() {
+        const SERVER: &str = "use allowit::prelude::*;\nuse allowit::AllowitDecision;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::payment_limit(ctx, &ctx.params[allowit::PAYMENT_LIMIT])?;\n    let question: String = allowit::param(ctx, \"question\");\n    allowit::decision(ctx, &AllowitDecision { id: \"research\", query: question.as_str(), deny_below: 3000, allow_above: 8000 })?;\n    Ok(())\n}\n";
+        const PORTABLE: &str = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::payment_limit(ctx, &ctx.params[allowit::PAYMENT_LIMIT])?;\n    Ok(())\n}\n";
+        assert!(source_shape(true, false, SERVER).is_ok());
+        assert!(source_shape(false, true, SERVER).is_ok());
+        assert!(source_shape(false, false, SERVER).is_err());
+        for (classic, custom) in [(true, false), (false, true), (false, false)] {
+            assert!(source_shape(classic, custom, PORTABLE).is_ok());
+        }
+        // A Custom wallet's source whose on-chain part cannot be derived keeps the portable
+        // gate's refusal.
+        let dynamic = SERVER.replace(
+            "    Ok(())",
+            "    allowit::set_state(ctx, question.as_str(), 1u32)?;\n    Ok(())",
+        );
+        assert!(source_shape(false, true, &dynamic).is_err());
+    }
+}
