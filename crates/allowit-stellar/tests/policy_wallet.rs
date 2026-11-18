@@ -2365,6 +2365,55 @@ impl rpc::Rpc for Lapsed<'_> {
         Ok(reply)
     }
 }
+/// What a confirmed operation adds to the figures that the server keeps for a Simple wallet is
+/// what the wallet counts for it: one call, its signed spent units, and its gross amount with its
+/// gas in the day's volume. A lossless deposit spends only its gas.
+#[test]
+fn the_usage_of_an_operation_is_what_the_wallet_counts() {
+    let wasm = wasm_for(PolicyTier::Simple);
+    let chain = ModelChain::new(BTreeMap::from([(hash(&wasm), PolicyTier::Simple)]));
+    let c = create(&chain, PolicyTier::Simple, &wasm, [0x37; 32]);
+    let recipient = account_for_seed(&RECIPIENT);
+    for (id, name) in [(1u8, "transfer"), (2, "deposit")] {
+        let state = sending_state(&chain, &c);
+        let ledger = chain.ledger();
+        let (request, t) = if name == "transfer" {
+            (
+                request::transfer(&c, &state, [id; 32], &recipient, 1_000_000).unwrap(),
+                terms(1_000_000, ledger),
+            )
+        } else {
+            (
+                request::deposit(&c, &state, [id; 32], &vault(), 5_000_000, 5_000_000).unwrap(),
+                ExecutionTerms {
+                    expense: Some(ExpenseBounds::xlm(0, 0, MAX_FEE, ledger - 1, NOW).unwrap()),
+                    ..terms(0, ledger)
+                },
+            )
+        };
+        let before = chain.accounting();
+        let signed = run(&chain, &c, &request, &t, name).unwrap();
+        let usage = operation_usage(&signed.prepared).unwrap().unwrap();
+        let after = chain.accounting();
+        assert!(usage.gas_units > 0 && !usage.unpriced, "{name}");
+        assert_eq!(after.calls, before.calls + 1, "{name}");
+        assert_eq!(
+            after.spent_total - before.spent_total,
+            usage.spent_units,
+            "{name}"
+        );
+        assert_eq!(
+            after.spent_daily - before.spent_daily,
+            usage.spent_units,
+            "{name}"
+        );
+        assert_eq!(
+            after.volume_daily - before.volume_daily,
+            usage.amount_units + usage.gas_units,
+            "{name}"
+        );
+    }
+}
 #[test]
 fn a_lapsed_entry_restores_in_the_operation_that_needs_it() {
     let wasm = wasm_for(PolicyTier::Common);
