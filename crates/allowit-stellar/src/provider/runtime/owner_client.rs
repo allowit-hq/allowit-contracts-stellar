@@ -541,6 +541,11 @@ impl OwnerClient {
             false,
         )
     }
+    /// The owner's signed-in session, after [`Self::authenticate`]. The SDK sends the owner
+    /// routes that need no rail step under it.
+    pub fn into_session(self) -> crate::host::owner_session::Client {
+        self.session
+    }
     /// Change typed params of an unsigned draft. The server checks each value against the
     /// param's type and range; the reply holds exactly the values that were sent.
     pub fn edit_params(

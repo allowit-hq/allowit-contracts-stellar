@@ -4,8 +4,9 @@
  * key and the server pay from it only together. The account's own key is random, signs the creation once and then
  * has weight 0. The agent holds a key and no account.
  *
- * This module builds the setup from the owner's own sequence, sends the signed bytes to the public network itself
- * and returns the installation document that the server registers. The server takes no part in the setup.
+ * This module builds the setup from the owner's own sequence, reads and sends the signed bytes, and returns the
+ * installation document that the server registers. The SDK's owner workflow keeps the signed setup and decides when to
+ * send it again or replace it. The server takes no part in the setup.
  */
 import { type Transaction } from '@stellar/stellar-sdk/base';
 /** The action of the owner step that creates the agent's wallet account. */
@@ -67,12 +68,8 @@ export declare function nativeSetupOf(payload: string, network: string): {
     server: string;
     startingBalance: bigint;
 } | null;
-export interface SetupJournal {
-    get(key: string): string | null;
-    set(key: string, value: string): void;
-    remove(key: string): void;
-}
-export interface NativeWalletSetupInput {
+/** The roles and funding of a Native wallet account's setup. */
+export interface NativeSetupInput {
     network: string;
     /** The owner's account. It pays for the setup and signs it. */
     owner: string;
@@ -82,48 +79,44 @@ export interface NativeWalletSetupInput {
     server: string;
     /** The XLM that the wallet holds for the agent's payments, as decimal text with at most seven decimals. */
     amount: string;
-    /** Shows the setup in the `owner-sign` element and resolves with the exact signed payload. */
-    sign: (step: {
+    fetch?: typeof fetch;
+}
+/** A setup prepared for the owner's signature. */
+export interface PreparedNativeSetup {
+    /** The account that the setup creates. */
+    wallet: string;
+    /** The step that the owner's wallet signs: the exact setup transaction. */
+    step: {
         action: string;
         payload: string;
         hash: string;
         expiresAt: number;
-    }) => Promise<string>;
-    onStep: (text: string) => void;
-    /** Keeps the signed setup until the network settles it, so an uncertain send never creates a second wallet. */
-    journal: SetupJournal;
-    /** The journal key of this wallet setup. */
-    key: string;
+    };
     /**
-     * Keeps the signed setup in the journal after the network confirmed it. The caller removes it when the server
-     * has registered the wallet, so a run that stops in between finds the same wallet again and creates no second one.
+     * Checks that `ownerSigned` is this transaction with the owner's one signature, and adds the new account's own
+     * signature. Returns the signed bytes to send. The account's key lives in this object only and is never stored.
      */
-    retain?: boolean;
-    fetch?: typeof fetch;
-}
-/** A wallet account that the network holds, with its installation document for the server. */
-export interface NativeWalletSetup {
-    wallet: string;
-    transactionHash: string;
-    ledger: number;
-    configuration: Record<string, unknown>;
-}
-/** An uncertain setup: the signed transaction stays saved, and the next call settles it before it signs anything. */
-export declare class WalletSetupPendingError extends Error {
-    readonly retry = true;
-    constructor(message: string, cause?: unknown);
+    complete(ownerSigned: string): string;
 }
 /**
- * Sets up the wallet account of an agent: one transaction that the owner's wallet signs. The account's own key is
- * random and lives in this call only; it signs the creation once, beside the owner.
- *
- * The signed bytes are saved before they are sent. A send whose result is unknown keeps them, and the next call
- * settles that setup first: it is done when the network holds it as successful, it is sent again while its time
- * bound lasts, and it is dropped only when the network holds it as failed or has read past its time bound without
- * it. Only then is a new setup prepared, so one call never creates two wallets. A setup that stopped before the
- * owner signed names a new account on its next run: nothing was signed for the earlier one.
+ * Prepares the setup of the wallet account of an agent: one transaction from the owner's own sequence. The account's
+ * own key is random; it signs the creation once, beside the owner, in `complete`.
  */
-export declare function setUpNativeWallet(input: NativeWalletSetupInput): Promise<NativeWalletSetup>;
+export declare function prepareNativeSetup({ network, owner, agent, server, amount, fetch: send }: NativeSetupInput): Promise<PreparedNativeSetup>;
+/**
+ * What signed setup bytes are: their hash, their roles and their own time bound. Null for bytes that are no setup of
+ * this network. The signed bytes decide; saved metadata is unsigned.
+ */
+export declare function signedNativeSetupOf(signedPayload: string, network: string): {
+    hash: string;
+    owner: string;
+    wallet: string;
+    agent: string;
+    server: string;
+    validUntil: number;
+} | null;
+/** Sends signed setup bytes to Horizon. The ledger of the successful transaction, or null without a certain answer. */
+export declare function sendNativeSetup(network: string, signedPayload: string, hash: string, send?: typeof fetch): Promise<number | null>;
 /** The SEP-53 digest of a wallet message, as lowercase hexadecimal. */
 export declare function messageDigest(message: string): string;
 /** What a policy approval message approves: the policy and its revision, the wallet account, the source and the values. */

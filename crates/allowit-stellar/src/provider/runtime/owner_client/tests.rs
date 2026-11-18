@@ -1073,3 +1073,50 @@ fn a_returned_owner_wallet_policy_that_writes_state_is_refused() {
     let refused = returned(&writes).unwrap_err();
     assert_eq!(refused.message, "Returned native policy identity differs");
 }
+
+#[test]
+fn the_owner_session_carries_the_signed_in_owner_to_the_routes_that_the_sdk_sends() {
+    use allowit_core::transport::http::Method;
+    let server = wire::Server::new(wire::Plan::new(&account(11)));
+    let now = wire::now();
+    let client = |signed: bool| {
+        let mut client = OwnerClient::with_authority(
+            &authority(&server.url),
+            "http://localhost:5173",
+            &account(11),
+        )
+        .unwrap();
+        if signed {
+            client.authenticate(&key(), now).unwrap();
+        }
+        client.into_session()
+    };
+    // A session that never signed in sends nothing.
+    let unsigned = client(false);
+    let error = unsigned
+        .owner_request::<Value>(
+            Method::Post,
+            "/api/native/templates",
+            Some(&json!({})),
+            now,
+            false,
+        )
+        .unwrap_err();
+    assert_eq!(error.message, "Authenticate the selected owner first");
+    assert_eq!(server.calls("/api/native/templates"), 0);
+    // The signed-in session sends the owner's cookie; the fake server checks it on every owner route.
+    let session = client(true);
+    assert_eq!(session.owner(), account(11));
+    let reply: Value = session
+        .owner_request(
+            Method::Post,
+            "/api/native/templates",
+            Some(&json!({})),
+            now,
+            false,
+        )
+        .unwrap();
+    assert_eq!(reply, wire::Plan::new(&account(11)).templates);
+    assert_eq!(server.calls("/api/auth/verify"), 1);
+    assert_eq!(server.calls("/api/native/templates"), 1);
+}
