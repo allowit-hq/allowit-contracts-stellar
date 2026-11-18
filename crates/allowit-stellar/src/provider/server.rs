@@ -1252,6 +1252,17 @@ impl crate::host::vendors::RuntimeProvider for Provider {
             })
             .collect()
     }
+    fn lapsed(&self, p: &Prepared) -> Result<bool> {
+        self.network(p.network())?;
+        let p = prepared(p)?;
+        // The same proofs as the agent client's: a payment authorization lapses when no
+        // transaction settled it by its expiry ledger, a policy wallet operation when its
+        // authorization can no longer run and its nonce is not on the ledger.
+        if p.payment_authorization.is_some() {
+            return checked(native::seller_settled::lapsed(self.rpc(), &p));
+        }
+        checked(rpc::operation_lapsed(self.rpc(), &p))
+    }
     fn prepare_owner(
         &self,
         i: &Installation,
@@ -2033,6 +2044,92 @@ mod capability_tests {
             assert_eq!(expected["params"], params);
             Ok(expected["result"].clone())
         }
+    }
+    /// The server proves a lapse as the agent client does (`rpc::operation_lapsed`): a ledger
+    /// closed at or after the expiry, past the authorization's expiration ledger, and inside the
+    /// lifetime that a spent nonce is sure to have, the wallet holds no such nonce.
+    #[test]
+    fn the_server_proves_a_lapse_as_the_agent_client_does() {
+        use stellar_xdr::{
+            ConfigSettingEntry, ContractDataEntry, ExtensionPoint, LedgerEntryData, LedgerKey,
+            Limits, ReadXdr, StateArchivalSettings, WriteXdr,
+        };
+        struct Ledger {
+            closed: u64,
+            sequence: u64,
+            spent: bool,
+        }
+        impl rpc::Rpc for Ledger {
+            fn call(
+                &self,
+                method: &str,
+                params: serde_json::Value,
+            ) -> native::Result<serde_json::Value> {
+                Ok(match method {
+                    "getTransaction" => serde_json::json!({
+                        "status": "NOT_FOUND",
+                        "latestLedger": self.sequence,
+                        "latestLedgerCloseTime": self.closed.to_string(),
+                    }),
+                    "getLedgerEntries" => {
+                        let mut entries = vec![];
+                        for key in params["keys"].as_array().unwrap() {
+                            let key = key.as_str().unwrap();
+                            let entry =
+                                match LedgerKey::from_xdr_base64(key, Limits::none()).unwrap() {
+                                    LedgerKey::ConfigSetting(_) => LedgerEntryData::ConfigSetting(
+                                        ConfigSettingEntry::StateArchival(StateArchivalSettings {
+                                            min_temporary_ttl: 720,
+                                            ..Default::default()
+                                        }),
+                                    ),
+                                    LedgerKey::ContractData(data) if self.spent => {
+                                        LedgerEntryData::ContractData(ContractDataEntry {
+                                            ext: ExtensionPoint::V0,
+                                            contract: data.contract,
+                                            key: data.key,
+                                            durability: data.durability,
+                                            val: stellar_xdr::ScVal::Void,
+                                        })
+                                    }
+                                    _ => continue,
+                                };
+                            entries.push(serde_json::json!({
+                                "key": key,
+                                "xdr": entry.to_xdr_base64(Limits::none()).unwrap(),
+                            }));
+                        }
+                        serde_json::json!({"latestLedger": self.sequence, "entries": entries})
+                    }
+                    other => panic!("unexpected {other}"),
+                })
+            }
+        }
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/provider/stellar-policy-wallet-revalidation-rpc.json"
+        ))
+        .unwrap();
+        let p: PreparedOperation = serde_json::from_value(fixture["prepared"].clone()).unwrap();
+        let lapsed = |closed, sequence, spent| {
+            let provider = Provider::from_rpc(
+                "stellar:testnet",
+                Arc::new(Ledger {
+                    closed,
+                    sequence,
+                    spent,
+                }),
+            );
+            provider.lapsed(&provider.packet(&p).unwrap()).unwrap()
+        };
+        // The authorization of the fixture expires at ledger 184.
+        assert!(lapsed(p.expires_at, 185, false));
+        // A spent nonce shows that the operation ran, in whatever envelope.
+        assert!(!lapsed(p.expires_at, 185, true));
+        // At its expiration ledger, or before the expiry time, the authorization can still run.
+        assert!(!lapsed(p.expires_at, 184, false));
+        assert!(!lapsed(p.expires_at - 1, 185, false));
+        // Past the lifetime that a spent nonce is sure to have, its absence proves nothing.
+        assert!(!lapsed(p.expires_at, 184 - 64 + 720, false));
     }
     #[test]
     fn genuine_preflight_survives_carrier_but_not_serialization_or_document_changes() {
