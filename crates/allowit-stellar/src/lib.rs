@@ -824,6 +824,21 @@ pub fn max_fee_ceiling(route: &WalletRoute) -> u32 {
     }
 }
 
+/// The params that a policy wallet stores: a Simple or Common wallet keeps only the params of its
+/// on-chain rules, and the server keeps the rest of the owner's params; a Custom wallet keeps all.
+pub fn installed_params(c: &WalletConfig) -> PolicyParams {
+    if c.tier == Some(PolicyTier::Custom) {
+        return c.params.clone();
+    }
+    PolicyParams(
+        c.params
+            .0
+            .iter()
+            .filter(|(key, _)| c.rules.contains(key))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
+}
 pub fn validate_config(c: &WalletConfig) -> Result<()> {
     validate_config_for(c, true)
 }
@@ -1358,9 +1373,12 @@ fn verify_wallet_portable(
         .policy_state
         .as_ref()
         .ok_or("Trusted layout 5 params and figures are required")?;
+    // The wallet stores the params of its on-chain rules; the server holds the rest of the
+    // owner's params, and the source runs over all of them.
     if state.contract_version != Some(CONTRACT_VERSION)
         || snapshot.source_hash != c.source_hash
         || snapshot.rules != c.rules
+        || snapshot.params != installed_params(c)
     {
         return Err("Installed policy wallet binding differs from the installation".into());
     }
@@ -1380,7 +1398,7 @@ fn verify_wallet_portable(
         tier,
         &shape,
         &c.rules,
-        &snapshot.params,
+        &c.params,
         &snapshot.standard_state(now),
         &request,
         evaluator,
@@ -1799,7 +1817,7 @@ pub(crate) fn prepare_for_native_preflight(
         return prepare_with(c, r, terms, state, now, expires_at);
     }
     if state.policy_state.is_none() {
-        return Err("Trusted layout 4 params and policy state are required".into());
+        return Err("Trusted layout 5 params and figures are required".into());
     }
     verify_operation(c, r, terms, state, now, expires_at, None)?;
     prepare_with_bounds(

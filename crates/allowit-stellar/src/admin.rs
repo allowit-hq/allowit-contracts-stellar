@@ -1494,33 +1494,6 @@ impl Deployer<'_> {
         if value != ScVal::Address(address(&wallet)?) {
             return Err("Creation simulation returned another wallet address".into());
         }
-        self.prepared(&account, "deploy_wallet", wasm_hash, Some(wallet), tx)
-    }
-    /// Prepare `CreateContractV2` of a policy wallet: the owner deploys `wasm` (already
-    /// uploaded) with the exact constructor packet and authorizes the constructor as the
-    /// transaction source. The wallet address derives from the owner and `salt`.
-    pub fn create_wallet(
-        &self,
-        config: &PolicyConfig,
-        wasm: &[u8],
-        salt: [u8; 32],
-    ) -> Result<PreparedDeployment> {
-        let wasm_hash = check_wallet_code(wasm)?;
-        let account = self.account(&config.owner)?;
-        account.validate_owner_only()?;
-        let wallet = wallet_address(self.network, &config.owner, &salt)?;
-        if [&config.owner, &config.agent, &config.server].contains(&&wallet) {
-            return Err("Owner, agent, server and policy wallet must be distinct".into());
-        }
-        let host = HostFunction::CreateContractV2(CreateContractArgsV2 {
-            contract_id_preimage: preimage(&config.owner, &salt)?,
-            executable: ContractExecutable::Wasm(Hash(wasm_hash)),
-            constructor_args: config.constructor_args()?.try_into().map_err(err)?,
-        });
-        let (tx, value) = self.assemble(&account, host, Some(wasm_hash))?;
-        if value != ScVal::Address(address(&wallet)?) {
-            return Err("Creation simulation returned another wallet address".into());
-        }
         self.prepared(&account, "create_wallet", wasm_hash, Some(wallet), tx)
     }
 }

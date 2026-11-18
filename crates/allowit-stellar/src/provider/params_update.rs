@@ -132,7 +132,7 @@ pub fn installed(rpc: &dyn rpc::Rpc, c: &WalletConfig, update: &ParamsUpdate) ->
         || state.agent != c.agent
         || state.server != c.server
         || state.asset != c.asset
-        || state.params != c.params
+        || state.params != native::installed_params(c)
     {
         return Err(Error::config(
             "The wallet's code, roles or params differ from this installation. Verify the installation first.",
@@ -290,7 +290,11 @@ pub fn verify(rpc: &dyn rpc::Rpc, policy_id: &str, c: &WalletConfig) -> Result<V
             json!(native::hex(&state.source_hash)),
         ),
         Comparison::new("rules", json!(c.rules), json!(state.rules)),
-        Comparison::new("params", params(&c.params), params(&state.params)),
+        Comparison::new(
+            "params",
+            params(&native::installed_params(c)),
+            params(&state.params),
+        ),
         // The executable, the source binding and the rules select the wallet kind.
         Comparison::new(
             "walletKind",

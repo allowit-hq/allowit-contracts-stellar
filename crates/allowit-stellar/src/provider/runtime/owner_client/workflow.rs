@@ -1198,7 +1198,9 @@ impl OwnerClient {
             || live.state.policy_instance != c.policy_instance
             || live.state.module_digest != c.module_digest
             || live.state.policy_state.as_ref().is_none_or(|s| {
-                s.params != c.params || s.rules != c.rules || s.source_hash != c.source_hash
+                s.params != native::installed_params(c)
+                    || s.rules != c.rules
+                    || s.source_hash != c.source_hash
             })
         {
             return Err(Error::config(
