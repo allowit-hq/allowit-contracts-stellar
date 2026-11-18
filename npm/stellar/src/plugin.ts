@@ -10,6 +10,7 @@ import {defineElements, ELEMENTS} from './elements/index.js';
 import {ADK_OWNER_FRAGMENT, adkParamLines, parseReviewLink, reviewAgentPrompt} from './adk-owner-link.js';
 import {ownerChain} from './owner-chain.js';
 import {NETWORKS, canonicalNetwork, networkPassphrase} from './networks.js';
+import type {AssetDisplay, WalletKindId} from '@allowit/core';
 
 export type ElementKind = 'address'|'explorer-link'|'amount'|'wallet-sign-in'|'owner-sign'|'owner-answer'|'receipt'|'binding-review';
 export type Feature = 'transfer'|'swap'|'deposit'|'redeem'|'owner-setup'|'deploy'|'fund'|'activate'|'binding-review'|'explorer-links';
@@ -49,9 +50,6 @@ export function assets(network: string): readonly AssetInfo[] {
   return list;
 }
 
-/** The selection ids of the wallet kinds. `standard` is the tier that technical names call Common. */
-export type WalletKindId = 'native' | 'simple' | 'standard' | 'custom';
-export interface AssetDisplay {symbol: string; decimals: number; name: string; native: boolean}
 const KINDS: readonly WalletKindId[] = Object.freeze(['native', 'simple', 'standard', 'custom']);
 /** Every Stellar network offers the four kinds: a native account and the three policy wallet tiers. */
 export function walletKinds(network: string): readonly WalletKindId[] {

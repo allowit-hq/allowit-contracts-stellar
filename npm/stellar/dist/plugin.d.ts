@@ -6,6 +6,7 @@
 import { type ExplorerKind } from './explorer.js';
 import { defineElements } from './elements/index.js';
 import { adkParamLines, parseReviewLink, reviewAgentPrompt } from './adk-owner-link.js';
+import type { AssetDisplay, WalletKindId } from '@allowit/core';
 export type ElementKind = 'address' | 'explorer-link' | 'amount' | 'wallet-sign-in' | 'owner-sign' | 'owner-answer' | 'receipt' | 'binding-review';
 export type Feature = 'transfer' | 'swap' | 'deposit' | 'redeem' | 'owner-setup' | 'deploy' | 'fund' | 'activate' | 'binding-review' | 'explorer-links';
 export interface RailNetwork {
@@ -29,14 +30,6 @@ export declare function strkey(text: unknown): {
     key: Uint8Array;
 } | null;
 export declare function assets(network: string): readonly AssetInfo[];
-/** The selection ids of the wallet kinds. `standard` is the tier that technical names call Common. */
-export type WalletKindId = 'native' | 'simple' | 'standard' | 'custom';
-export interface AssetDisplay {
-    symbol: string;
-    decimals: number;
-    name: string;
-    native: boolean;
-}
 /** Every Stellar network offers the four kinds: a native account and the three policy wallet tiers. */
 export declare function walletKinds(network: string): readonly WalletKindId[];
 /**
