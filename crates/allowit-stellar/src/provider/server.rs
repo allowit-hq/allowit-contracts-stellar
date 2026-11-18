@@ -377,17 +377,17 @@ pub struct Provider {
     transport: std::sync::Arc<dyn rpc::Rpc>,
     sender: Option<Sender>,
 }
-/// The signing capability of the server's sending accounts: it signs a transaction hash with the
-/// key of the named account. A policy wallet operation is sent from one of them, which pays its
-/// fee; the wallet repays the gas to it.
+/// The server's sending accounts (Core's `SendingAccounts`): the account that sends the next
+/// policy wallet operation or code upload, pays its fee and receives its gas, and the
+/// signature of a transaction hash with an account's key.
 pub type Sender = std::sync::Arc<dyn SendingAccounts>;
-/// The server's sending accounts: the account that sends the next policy wallet operation, pays
-/// its fee and receives its gas, and the signature of a transaction hash with an account's key.
-pub trait SendingAccounts: Send + Sync {
-    /// The account for the next policy wallet operation.
-    fn account(&self) -> native::Result<String>;
-    /// The signature of `hash` by the key of `account`.
-    fn sign(&self, account: &str, hash: &[u8; 32]) -> native::Result<[u8; 64]>;
+pub use crate::host::runtime::SendingAccounts;
+/// The Ed25519 transaction signature of `hash` by the sending account `account`.
+fn sending_signature(sender: &Sender, account: &str, hash: &[u8; 32]) -> Result<[u8; 64]> {
+    sender
+        .sign(account, hash)?
+        .try_into()
+        .map_err(|_| Error::config("A sending account returned a signature of another size"))
 }
 impl Provider {
     /// One owner action on a keypair wallet: a transaction from the owner's account whose
@@ -521,7 +521,7 @@ impl Provider {
         let sender = self.sender.as_ref().ok_or_else(|| {
             Error::config("This server has no sending account for policy wallet operations")
         })?;
-        checked(sender.account())
+        sender.account()
     }
     #[cfg(test)]
     pub fn from_rpc(network: &str, rpc: std::sync::Arc<dyn rpc::Rpc>) -> Self {
@@ -1119,7 +1119,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 })?;
                 let source = checked(native::gas_payee(&p.request, &p.terms))?;
                 checked(rpc::seal(self.rpc(), &signed, |hash| {
-                    sender.sign(&source, hash)
+                    sending_signature(sender, &source, hash).map_err(|e| e.message)
                 }))?
             } else {
                 signed
@@ -1408,7 +1408,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         let sender = self.sender.as_ref().ok_or_else(|| {
             Error::config("This server has no sending account to upload wallet code")
         })?;
-        let account = checked(sender.account())?;
+        let account = sender.account()?;
         // The server pays the upload, a cost that the ledger consumes; the simulation sets it.
         let p = checked(
             native::admin::Deployer {
@@ -1419,7 +1419,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
             }
             .upload_wasm(&account, wasm),
         )?;
-        let signature = checked(sender.sign(&account, &p.transaction_hash))?;
+        let signature = sending_signature(sender, &account, &p.transaction_hash)?;
         let signed = checked(native::admin::with_source_signature(
             &c.network,
             &p.transaction_xdr,

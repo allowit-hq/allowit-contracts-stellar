@@ -221,6 +221,18 @@ impl RailPlugin for Plugin {
             network, transport,
         )?))
     }
+    /// The server's runtime: its sending accounts send each policy wallet operation and code
+    /// upload, pay the fee and receive the gas.
+    fn sending_runtime(
+        &self,
+        network: &str,
+        transport: Arc<dyn Transport>,
+        sender: Arc<dyn crate::host::runtime::SendingAccounts>,
+    ) -> Result<Box<dyn RuntimeProvider>> {
+        Ok(Box::new(
+            server::Provider::with_transport(network, transport)?.with_sender(sender),
+        ))
+    }
     fn install(&self, installation: PolicyInstallation) -> Result<Installation> {
         server::policy(installation)
     }
