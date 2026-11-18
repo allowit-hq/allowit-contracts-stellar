@@ -35,7 +35,7 @@ jobs:
           allowit_src=$(python3 scripts/core_sources.py --portable-lib)
           rustc --edition=2024 -Coverflow-checks=on --crate-type=rlib --crate-name=allowit --cfg 'feature="std"' "$allowit_src" -o "$RUNNER_TEMP/liballowit.rlib"
           rustc --edition=2024 -Coverflow-checks=on --test --extern allowit="$RUNNER_TEMP/liballowit.rlib" scripts/policy-smoke.rs -o "$RUNNER_TEMP/policy-smoke"
-          "$RUNNER_TEMP/policy-smoke" "${{ matrix.flow }}" --nocapture | tee "$RUNNER_TEMP/policy.log"
+          scripts/no-network.sh "$RUNNER_TEMP/policy-smoke" "${{ matrix.flow }}" --nocapture | tee "$RUNNER_TEMP/policy.log"
           grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed' "$RUNNER_TEMP/policy.log"
   # The hermetic tests: no socket, no network. scripts/no-network.sh runs them in a unit that
   # may create no IP socket, so a test that needs one fails here.
@@ -75,7 +75,7 @@ jobs:
         with:
           node-version: '24'
       - name: Verify browser owner transaction admission
-        run: node --test npm/stellar/tests/owner-verifier.test.mjs
+        run: scripts/no-network.sh node --test npm/stellar/tests/owner-verifier.test.mjs
       - name: Native administration and release automation regressions
         run: |
           python3 -m venv "$RUNNER_TEMP/wallet-admin"
