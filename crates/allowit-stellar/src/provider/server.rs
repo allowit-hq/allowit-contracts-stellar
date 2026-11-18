@@ -502,15 +502,17 @@ impl Provider {
         // the transaction and that fee, in stroops, for the server's accounts.
         if receipt.status != native::OperationStatus::Confirmed {
             let fee = receipt_info(&packet)?.fee.native_units;
-            return Err(crate::provider::failure(if state == rpc::CodeState::Lapsed {
-                "The restoration of the wallet code failed on the ledger"
-            } else {
-                "The upload of the wallet code failed on the ledger"
-            })
-            .with_details(serde_json::json!({
-                "transactionHash": native::hex(&receipt.transaction_hash),
-                "nativeUnits": fee.to_string(),
-            })));
+            return Err(
+                crate::provider::failure(if state == rpc::CodeState::Lapsed {
+                    "The restoration of the wallet code failed on the ledger"
+                } else {
+                    "The upload of the wallet code failed on the ledger"
+                })
+                .with_details(serde_json::json!({
+                    "transactionHash": native::hex(&receipt.transaction_hash),
+                    "nativeUnits": fee.to_string(),
+                })),
+            );
         }
         Ok(Some(Receipt(packet)))
     }

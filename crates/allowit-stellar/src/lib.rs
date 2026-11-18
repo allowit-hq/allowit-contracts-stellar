@@ -470,7 +470,10 @@ impl ExpenseBounds {
             max_fee_stroops: fee_stroops,
             ..self.clone()
         };
-        Ok((bounds, u128::try_from(part).map_err(|_| "Expense overflow")?))
+        Ok((
+            bounds,
+            u128::try_from(part).map_err(|_| "Expense overflow")?,
+        ))
     }
     /// These bounds with the fee bound lowered to `fee_stroops`. Gas falls pro rata and rounds
     /// up, so it never counts less than the gas rate of these bounds prices `fee_stroops`; for

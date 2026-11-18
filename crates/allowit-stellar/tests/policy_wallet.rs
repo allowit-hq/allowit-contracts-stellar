@@ -649,7 +649,11 @@ impl rpc::Rpc for ModelChain {
                     };
                     if !m.restore_archived.is_empty() {
                         data.ext = x::SorobanTransactionDataExt::V1(x::SorobanResourcesExtV0 {
-                            archived_soroban_entries: m.restore_archived.clone().try_into().unwrap(),
+                            archived_soroban_entries: m
+                                .restore_archived
+                                .clone()
+                                .try_into()
+                                .unwrap(),
                         });
                     }
                     return Ok(json!({
@@ -2714,7 +2718,10 @@ fn a_gas_due_of_another_asset_counts_units_at_the_ceiling_rate() {
     );
     // The repayment is the bound of 2,000 and 998,000 of the due: the whole ceiling.
     assert_eq!(part, 998_000);
-    assert_eq!((priced.gas_units, priced.spent_units, priced.max_fee_stroops), (10, 15, 2_000));
+    assert_eq!(
+        (priced.gas_units, priced.spent_units, priced.max_fee_stroops),
+        (10, 15, 2_000)
+    );
 }
 /// A fee that the server paid for the operation outside its transaction, such as the restoration
 /// of the wallet's lapsed code, joins the repayment as far as the wallet's gas cap allows, after
@@ -3243,7 +3250,11 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     let failed = provider
         .restore_code_within(&installation, ceiling, Poll::default(), NOW)
         .unwrap_err();
-    assert!(failed.message.contains("failed on the ledger"), "{}", failed.message);
+    assert!(
+        failed.message.contains("failed on the ledger"),
+        "{}",
+        failed.message
+    );
     {
         let m = chain.0.lock().unwrap();
         assert!(m.lapsed_code.contains(&installed));
@@ -3252,7 +3263,10 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         let x::TransactionEnvelope::Tx(env) = de(signed) else {
             panic!()
         };
-        let details = failed.details.as_ref().expect("the failed restoration's details");
+        let details = failed
+            .details
+            .as_ref()
+            .expect("the failed restoration's details");
         assert_eq!(
             details,
             &json!({"transactionHash": hexs(&tx_hash(&env.tx)), "nativeUnits": "100"})
