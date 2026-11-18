@@ -175,6 +175,7 @@ fn verify(input: Input) -> Result<()> {
         "create_wallet" => OwnerAction::CreateWallet {
             config: Box::new(installation(&expected, &wallet)?),
             salt,
+            funding: Vec::new(),
         },
         // The packet keeps the installed roles, source binding and code and holds the complete
         // new params at the revision that the host read.

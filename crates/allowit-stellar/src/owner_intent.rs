@@ -198,9 +198,12 @@ pub enum OwnerAction {
     UploadWasm { wasm_hash: [u8; 32] },
     /// The complete selected policy installation, constructor and deterministic wallet address.
     /// `config` includes the selected tier, source, params, roles, asset and executable hash.
+    /// The creation goes through the network's deployer, which holds no authority: the owner's
+    /// one signature covers exactly this creation and each `(asset, amount)` of `funding`.
     CreateWallet {
         config: Box<WalletConfig>,
         salt: [u8; 32],
+        funding: Vec<(String, i128)>,
     },
     /// Exactly one SEP-41 transfer from the selected owner to the selected policy wallet.
     Fund {
@@ -575,7 +578,11 @@ fn validate_host(
                 return Err("Owner upload differs from the reviewed executable".into());
             }
         }
-        OwnerAction::CreateWallet { config, salt } => {
+        OwnerAction::CreateWallet {
+            config,
+            salt,
+            funding,
+        } => {
             if config.network != limits.network || config.owner != limits.owner {
                 return Err("Wallet configuration differs from caller network or owner".into());
             }
@@ -588,16 +595,38 @@ fn validate_host(
                     "Wallet address differs from the caller-selected creation preimage".into(),
                 );
             }
-            let exact = HostFunction::CreateContractV2(CreateContractArgsV2 {
-                contract_id_preimage: ContractIdPreimage::Address(ContractIdPreimageFromAddress {
-                    address: address(&limits.owner)?,
-                    salt: Uint256(*salt),
-                }),
-                executable: ContractExecutable::Wasm(Hash(config.module_digest)),
-                constructor_args: constructor.constructor_args()?.try_into().map_err(err)?,
+            // The deployer is the contract that the transaction calls; it holds no authority, so
+            // only the exact creation and funding below can run under the owner's signature.
+            let HostFunction::InvokeContract(call) = &invoke.host_function else {
+                return Err("Owner creation goes through the deployer".into());
+            };
+            let mut items = Vec::new();
+            for (asset, amount) in funding {
+                Contract::from_string(asset).map_err(err)?;
+                if *amount <= 0 {
+                    return Err("A funding amount is positive".into());
+                }
+                items.push(ScVal::Vec(Some(
+                    vec![ScVal::Address(address(asset)?), i128_value(*amount)]
+                        .try_into()
+                        .map_err(err)?,
+                )));
+            }
+            let exact = HostFunction::InvokeContract(InvokeContractArgs {
+                contract_address: call.contract_address.clone(),
+                function_name: ScSymbol("deploy".try_into().map_err(err)?),
+                args: vec![
+                    ScVal::Address(address(&limits.owner)?),
+                    value_bytes(&config.module_digest)?,
+                    value_bytes(salt)?,
+                    ScVal::Vec(Some(constructor.constructor_args()?.try_into().map_err(err)?)),
+                    ScVal::Vec(Some(items.try_into().map_err(err)?)),
+                ]
+                .try_into()
+                .map_err(err)?,
             });
             if invoke.host_function != exact || invoke.auth.len() != 1 {
-                return Err("Owner creation differs from the complete selected constructor".into());
+                return Err("Owner creation differs from the complete selected constructor and funding".into());
             }
             admin::validate_auth(&limits.network, &exact, &invoke.auth, None)?;
         }

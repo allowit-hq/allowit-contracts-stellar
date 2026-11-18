@@ -1051,6 +1051,16 @@ pub fn validate_auth(
     }
     Ok(())
 }
+/// The deployer contract of `network`: stateless, with no funds and no authority. The owner's
+/// signature binds only the creation and funding that the owner's client checks, so the address
+/// is public configuration, not trust.
+pub fn deployer_address(network: &str) -> Result<String> {
+    if passphrase(network)? == passphrase("stellar:testnet")? {
+        Ok("CDQZA6UPOF6CH7H45GTBNH2O3AO7DH3CDD2JJNHHBO4GT4WJEQ7GUY5P".into())
+    } else {
+        Err(format!("No policy wallet deployer is installed on {network}"))
+    }
+}
 /// The owner's authorization of `deployer.deploy(owner, wasm_hash, salt, [config], funding)`: the
 /// call itself, then exactly the creation of the wallet at the owner's address and salt with the
 /// pinned code and the constructor's argument, and one transfer from the owner to that wallet for

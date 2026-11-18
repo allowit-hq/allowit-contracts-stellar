@@ -1227,10 +1227,12 @@ impl crate::host::vendors::RuntimeProvider for Provider {
             }
             OwnerAction::Create { wasm } => {
                 let config = checked(native::admin::PolicyConfig::for_policy(&c))?;
-                let p = checked(d.create_wallet(
+                let p = checked(d.deploy_and_fund(
+                    &checked(native::admin::deployer_address(&c.network))?,
                     &config,
                     &wasm,
                     native::admin::wallet_salt(&c.policy_instance),
+                    &[],
                 ))?;
                 native::owner_intent::OwnerTransaction {
                     network: p.network,
