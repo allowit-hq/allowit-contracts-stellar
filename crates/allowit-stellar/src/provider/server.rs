@@ -475,29 +475,45 @@ impl Provider {
             now,
             max_fee_stroops,
         };
+        // Code is restored or uploaded only while its last observation shows it not live. The
+        // code is observed first, again by every refusal on the way to a signature, and again
+        // just before the signature: another transaction, from another sending account or from
+        // this one, can make it live at any of these steps, and live code needs nothing. Such a
+        // transaction can still land after the last observation, until the code transaction
+        // applies: the ledger has no precondition on an entry's state, so the code transaction
+        // then applies to live code and its source pays its fee, within the ceiling.
+        let live = || {
+            matches!(
+                rpc::code_state(self.rpc(), &c.network, &code_hash),
+                Ok(rpc::CodeState::Live)
+            )
+        };
         // A simulated restoration of the code entry decides between a restoration and an
         // upload: it names the entry only when the network's archive holds it, which a read can
         // miss, since an RPC can serve no archived entry. Absent code needs its bytes.
-        let p = match checked(deployer.restore_code(&account, code_hash))? {
-            native::admin::CodeRestoration::Prepared(p) => p,
-            native::admin::CodeRestoration::Live => return Ok(None),
-            native::admin::CodeRestoration::Absent => match wasm {
-                // Another transaction can upload the code after it was read: nothing is sent.
-                Some(wasm) => match checked(deployer.upload_wasm(&account, wasm))? {
-                    Some(p) => p,
-                    None => return Ok(None),
+        let prepare = || -> Result<Option<native::admin::PreparedDeployment>> {
+            Ok(match checked(deployer.restore_code(&account, code_hash))? {
+                native::admin::CodeRestoration::Prepared(p) => Some(p),
+                native::admin::CodeRestoration::Live => None,
+                native::admin::CodeRestoration::Absent => match wasm {
+                    Some(wasm) => checked(deployer.upload_wasm(&account, wasm))?,
+                    None => {
+                        return Err(Error::usage(
+                            "The wallet code is not on the network: a restoration needs code that lapsed",
+                        ));
+                    }
                 },
-                None => {
-                    return Err(Error::usage(
-                        "The wallet code is not on the network: a restoration needs code that lapsed",
-                    ));
-                }
-            },
+            })
         };
-        // Another sending account can make the code live after the simulation, which the
-        // simulation's checks do not see, and a simulation that writes the entry does not prove
-        // that the code is absent. The code is read again just before the signature: live code
-        // needs nothing, and nothing is signed or paid.
+        // A refusal can come from the transaction that made the code live: a simulated fee above
+        // the ceiling for a write that is no longer needed, or the sending account's sequence
+        // that its own upload advanced. Live code needs nothing; otherwise the refusal stands.
+        let p = match prepare() {
+            Ok(Some(p)) => p,
+            Ok(None) => return Ok(None),
+            Err(_) if live() => return Ok(None),
+            Err(refused) => return Err(refused),
+        };
         if checked(rpc::code_state(self.rpc(), &c.network, &code_hash))? == rpc::CodeState::Live {
             return Ok(None);
         }

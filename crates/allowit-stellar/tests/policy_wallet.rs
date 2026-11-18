@@ -345,6 +345,9 @@ struct Model {
     restored_after_simulation: bool,
     /// Another sending account uploads the code just after the next upload's simulation.
     uploaded_after_simulation: bool,
+    /// The upload of `uploaded_meanwhile` came from the upload's own source, whose sequence it
+    /// advanced.
+    uploaded_by_source: bool,
     tiers: BTreeMap<[u8; 32], PolicyTier>,
     wallet: Option<Wallet>,
     settled: BTreeMap<String, String>,
@@ -807,6 +810,9 @@ impl rpc::Rpc for ModelChain {
                             let tier = m.tiers[&code_hash];
                             m.code.insert(code_hash, tier);
                             m.code_bytes.insert(code_hash, code.to_vec());
+                            if m.uploaded_by_source {
+                                m.accounts.get_mut(&source).unwrap().sequence += 1;
+                            }
                         }
                         // As the host: an upload reads the entry of code that the network holds
                         // and writes it otherwise.
@@ -3419,6 +3425,47 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         m.code.remove(&hash(&other));
         m.code_bytes.remove(&hash(&other));
     }
+    // So with a fee ceiling below the upload's fee: no upload is needed, so no ceiling refuses it.
+    chain.0.lock().unwrap().uploaded_after_simulation = true;
+    assert!(
+        session
+            .provider
+            .upload_code_within(&installation, &other, 100, Poll::default(), NOW)
+            .unwrap()
+            .is_none()
+    );
+    {
+        let mut m = chain.0.lock().unwrap();
+        m.code.remove(&hash(&other));
+        m.code_bytes.remove(&hash(&other));
+    }
+    // The sending account's own upload lands during the simulation, which then sees its sequence
+    // change and refuses: the code, read again, is live, and nothing is needed.
+    {
+        let mut m = chain.0.lock().unwrap();
+        m.uploaded_meanwhile = true;
+        m.uploaded_by_source = true;
+    }
+    assert!(
+        session
+            .provider
+            .upload_code_within(
+                &installation,
+                &other,
+                u64::from(u32::MAX),
+                Poll::default(),
+                NOW,
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(signatures(), signed);
+    {
+        let mut m = chain.0.lock().unwrap();
+        m.uploaded_by_source = false;
+        m.code.remove(&hash(&other));
+        m.code_bytes.remove(&hash(&other));
+    }
     // The server pays the upload, within its fee ceiling: a ceiling below the simulated fee
     // refuses it before anything is signed or sent.
     let refused = session
@@ -3873,6 +3920,21 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         assert!(!m.restored_after_simulation);
         assert!(!m.lapsed_code.contains(&installed));
     }
+    // So with a fee ceiling below the restoration's fee: no restoration is needed, so no ceiling
+    // refuses it.
+    {
+        let mut m = chain.0.lock().unwrap();
+        m.lapsed_code.insert(installed);
+        m.restored_after_simulation = true;
+    }
+    assert!(
+        provider
+            .restore_code_within(&installation, 100, Poll::default(), NOW)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(signatures(), signed);
+    assert!(!chain.0.lock().unwrap().lapsed_code.contains(&installed));
     // Code that the network does not have cannot be restored: it needs an upload.
     chain.0.lock().unwrap().code_bytes.remove(&installed);
     let signed = signatures();
