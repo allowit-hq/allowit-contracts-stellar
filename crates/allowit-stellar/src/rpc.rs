@@ -452,6 +452,78 @@ pub(crate) fn reject_restoration(value: &Value) -> Result<()> {
     }
     Ok(())
 }
+/// The sending account's last step of a policy wallet operation that the agent and the server
+/// authorized: simulate it in enforce mode, where the wallet's `__check_auth` runs, set the final
+/// resources and fee, and sign it as the source with `sign`. Archived entries that it touches,
+/// such as a lapsed `t`, are restored in the same transaction. The wallet's authorization stays
+/// valid: its payload does not cover the resources.
+pub fn seal(
+    rpc: &dyn Rpc,
+    s: &SignedOperation,
+    sign: impl FnOnce(&[u8; 32]) -> Result<[u8; 64]>,
+) -> Result<SignedOperation> {
+    let p = &s.prepared;
+    if p.config.route != WalletRoute::PolicyWallet {
+        return Err("Only a policy wallet operation is sealed by its sending account".into());
+    }
+    crate::validate_retained_signed(s)?;
+    let TransactionEnvelope::Tx(mut env) = read(&s.transaction_xdr)? else {
+        return Err("Unsupported signed envelope".into());
+    };
+    if !env.signatures.is_empty() {
+        return Err("The operation is sealed already".into());
+    }
+    if rpc.call("getNetwork", json!({}))?["passphrase"] != passphrase(&p.config.network)? {
+        return Err("Simulation network differs from installation".into());
+    }
+    let v = rpc.call(
+        "simulateTransaction",
+        json!({"transaction":s.transaction_xdr,"authMode":"enforce"}),
+    )?;
+    if v.get("error").is_some_and(|value| !value.is_null()) {
+        return Err("policy wallet simulation rejected the authorized operation".into());
+    }
+    if v.get("restorePreamble").is_some_and(|value| !value.is_null()) {
+        return Err("The operation needs a separate restoration first".into());
+    }
+    if readonly_result(&v)? != ScVal::Void {
+        return Err("Native simulation returned a value from execute".into());
+    }
+    let mut data: SorobanTransactionData =
+        read(v["transactionData"].as_str().ok_or("Missing simulated resources")?)?;
+    let required = u32::try_from(data.resource_fee)
+        .map_err(|_| "Invalid resource fee")?
+        .checked_add(crate::INCLUSION_FEE_STROOPS)
+        .ok_or("Resource fee overflow")?;
+    let bound = p.terms.expense.as_ref().map_or(0, |e| e.max_fee_stroops);
+    let declared = required.max(bound.min(p.config.max_fee_stroops));
+    if declared > p.config.max_fee_stroops {
+        return Err("Simulation resource fee exceeds the installed fee ceiling".into());
+    }
+    data.resource_fee = i64::from(declared - crate::INCLUSION_FEE_STROOPS);
+    env.tx.ext = TransactionExt::V1(data);
+    env.tx.fee = declared;
+    let hash = crate::transaction_hash(&p.config.network, &env.tx)?;
+    let MuxedAccount::Ed25519(Uint256(key)) = env.tx.source_account.clone() else {
+        return Err("The sending account is a plain account".into());
+    };
+    let signature = sign(&hash)?;
+    signing::verify_digest(&crate::account_for_public_key(&key), &hash, &signature)?;
+    env.signatures = vec![DecoratedSignature {
+        hint: SignatureHint(key[28..].try_into().map_err(err)?),
+        signature: stellar_xdr::Signature(signature.to_vec().try_into().map_err(err)?),
+    }]
+    .try_into()
+    .map_err(err)?;
+    let sealed = SignedOperation {
+        prepared: p.clone(),
+        transaction_xdr: xdr(&TransactionEnvelope::Tx(env))?,
+        transaction_hash: hash,
+        role_signatures: Vec::new(),
+    };
+    crate::validate_retained_signed(&sealed)?;
+    Ok(sealed)
+}
 /// Simulate an original unsigned policy wallet intent and bind successful native validation to it.
 /// Supplied resource XDR or JSON booleans alone never create a signing approval.
 pub fn simulate(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<PreparedOperation> {
@@ -957,36 +1029,12 @@ pub fn validate_settled_policy_packet(
     if prepared.config.route != WalletRoute::PolicyWallet {
         return Err("Chain-only recovery requires a policy wallet packet".into());
     }
-    validate_retained_prepared(prepared)?;
-    validate_receipt(
-        receipt,
-        &prepared.config.network,
-        &prepared.transaction_hash,
-    )?;
-    if signed.transaction_hash != prepared.transaction_hash
-        || signed.transaction_xdr != receipt.envelope_xdr
-    {
+    // The settled transaction is the signed one: the prepared transaction with both
+    // cosignatures, its final resources and the sending account's signature.
+    crate::validate_retained_signed(signed)?;
+    validate_receipt(receipt, &prepared.config.network, &signed.transaction_hash)?;
+    if signed.transaction_xdr != receipt.envelope_xdr {
         return Err("The settlement envelope differs from the verified receipt".into());
-    }
-    let (TransactionEnvelope::Tx(envelope), TransactionEnvelope::Tx(unsigned)) = (
-        read(&signed.transaction_xdr)?,
-        read(&prepared.transaction_xdr)?,
-    ) else {
-        return Err("Unsupported settlement envelope".into());
-    };
-    if envelope.tx != unsigned.tx {
-        return Err("The settlement transaction differs from its original packet".into());
-    }
-    let Some(OperationBody::InvokeHostFunction(op)) =
-        unsigned.tx.operations.first().map(|op| &op.body)
-    else {
-        return Err("The policy invocation is missing".into());
-    };
-    // Retained preparation validates the exact server scope/signature when present.
-    // Settlement recovery additionally requires that authorization to be present.
-    if !matches!(op.auth.get(1).map(|entry| &entry.credentials), Some(SorobanCredentials::Address(credentials)) if credentials.signature != ScVal::Void)
-    {
-        return Err("The original server authorization is unsigned".into());
     }
     Ok(())
 }
@@ -1010,18 +1058,16 @@ pub fn counted_gas_units(receipt: &VerifiedReceipt) -> Result<i128> {
     let HostFunction::InvokeContract(call) = &op.host_function else {
         return Ok(0);
     };
-    let Some(expense) = call
+    // The positional request: its expense is field 4, `Priced(gas, conversion, spent, observed)`.
+    let Some(ScVal::Vec(Some(request))) = call
         .args
         .first()
         .filter(|_| call.function_name.0.as_slice() == b"execute")
-        .and_then(|request| map_field(request, "expense").ok())
     else {
         return Ok(0);
     };
-    match expense {
-        ScVal::Vec(Some(variant)) if variant.len() == 2 => {
-            wide(map_field(&variant[1], "gas_units")?)
-        }
+    match request.get(4) {
+        Some(ScVal::Vec(Some(variant))) if variant.len() == 5 => wide(&variant[1]),
         _ => Ok(0),
     }
 }

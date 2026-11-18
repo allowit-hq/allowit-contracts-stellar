@@ -49,7 +49,6 @@ pub mod seller_settled;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod settlement_service;
 pub mod signing;
-pub mod x402;
 pub type Result<T> = std::result::Result<T, String>;
 
 pub const PROFILE: &str = "allowit-wallet-v1";
@@ -1568,7 +1567,7 @@ fn build(
     {
         return Err("Trusted wallet identity differs".into());
     }
-    let mut body = match c.route {
+    let body = match c.route {
         WalletRoute::Native => {
             state.source.validate_wallet(c)?;
             let StellarOperation::Transfer(t) = &operation else {
@@ -1978,6 +1977,15 @@ pub fn sign(p: &PreparedOperation, seed: &[u8; 32], now: u64) -> Result<Detached
 }
 /// Sign through a caller-owned key capability after native admission checks.
 /// The capability receives only the exact transaction hash and must return its Ed25519 signature.
+/// The digest that the agent signs: for a policy wallet, the payload of the wallet's own
+/// authorization entry, which the server has signed too; else the transaction hash.
+pub fn signing_digest(p: &PreparedOperation) -> Result<[u8; 32]> {
+    if p.config.route == WalletRoute::PolicyWallet {
+        authorization::wallet_payload(p)
+    } else {
+        Ok(p.transaction_hash)
+    }
+}
 pub fn sign_with(
     p: &PreparedOperation,
     signer: &str,
@@ -2004,10 +2012,11 @@ pub fn sign_with(
     if !allowed {
         return Err("Signer has no automated role".into());
     }
-    let signature = sign_hash(&p.transaction_hash)?;
+    let digest = signing_digest(p)?;
+    let signature = sign_hash(&digest)?;
     VerifyingKey::from_bytes(&account_key(signer)?)
         .map_err(err)?
-        .verify_strict(&p.transaction_hash, &EdSignature::from_bytes(&signature))
+        .verify_strict(&digest, &EdSignature::from_bytes(&signature))
         .map_err(|_| "Signing capability returned an invalid signature")?;
     Ok(DetachedSignature {
         signer: signer.into(),
@@ -2077,7 +2086,7 @@ pub fn authorize(
     validate_prepared(p, now)?;
     current_authorization_bounds(p)?;
     if p.config.route == WalletRoute::PolicyWallet {
-        authorization::server_signature(p, true)?;
+        return authorize_wallet(p, signatures);
     }
     let required = automated_roles(&p.config);
     let aliased_roles = p.config.route == WalletRoute::Native && p.config.agent == p.config.server;
@@ -2147,6 +2156,98 @@ pub fn authorize(
         role_signatures,
     })
 }
+/// A signed policy wallet operation: the prepared transaction with both cosignatures in the
+/// wallet's entry and, once the sending account sealed it, the final resources and fee and that
+/// account's one signature. Nothing else differs from the prepared transaction.
+fn validate_wallet_signed(s: &SignedOperation) -> Result<()> {
+    let p = &s.prepared;
+    let TransactionEnvelope::Tx(env) = read(&s.transaction_xdr)? else {
+        return Err("Unsupported signed envelope".into());
+    };
+    let TransactionEnvelope::Tx(unsigned) = read(&p.transaction_xdr)? else {
+        return Err("Unsupported unsigned envelope".into());
+    };
+    let mut assembled = p.clone();
+    assembled.transaction_xdr = xdr(&TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: env.tx.clone(),
+        signatures: VecM::default(),
+    }))?;
+    let (Some(_), Some(_)) = authorization::cosignatures(&assembled)? else {
+        return Err("The wallet's authorization lacks a cosignature".into());
+    };
+    let mut normalized = env.tx.clone();
+    normalized.fee = unsigned.tx.fee;
+    normalized.ext = unsigned.tx.ext.clone();
+    let mut operations = normalized.operations.to_vec();
+    let mut original = unsigned.tx.operations.to_vec();
+    if let (
+        Some(OperationBody::InvokeHostFunction(op)),
+        Some(OperationBody::InvokeHostFunction(prepared_op)),
+    ) = (
+        operations.first_mut().map(|o| &mut o.body),
+        original.first_mut().map(|o| &mut o.body),
+    ) {
+        op.auth = prepared_op.auth.clone();
+    }
+    normalized.operations = operations.try_into().map_err(err)?;
+    if normalized != unsigned.tx {
+        return Err("Signed transaction bytes differ".into());
+    }
+    if env.tx.fee > p.config.max_fee_stroops {
+        return Err("The sealed fee exceeds the installed fee ceiling".into());
+    }
+    if s.transaction_hash != transaction_hash(&p.config.network, &env.tx)? {
+        return Err("Signed transaction identity differs".into());
+    }
+    match env.signatures.as_slice() {
+        [] => Ok(()),
+        [signature] => {
+            let MuxedAccount::Ed25519(Uint256(key)) = &env.tx.source_account else {
+                return Err("The sending account is a plain account".into());
+            };
+            if signature.hint.0 != key[28..] {
+                return Err("The source signature is not the sending account's".into());
+            }
+            VerifyingKey::from_bytes(key)
+                .map_err(err)?
+                .verify_strict(
+                    &s.transaction_hash,
+                    &EdSignature::from_slice(signature.signature.as_slice()).map_err(err)?,
+                )
+                .map_err(|_| "Invalid sending account signature".into())
+        }
+        _ => Err("The sending account signs alone".into()),
+    }
+}
+/// The agent's step of a policy wallet operation: its one signature of the wallet's payload joins
+/// the server's in the wallet's entry. The envelope stays unsigned: the server's sending account
+/// simulates it for its final resources, signs it as the source and sends it (`rpc::seal`).
+fn authorize_wallet(
+    p: &PreparedOperation,
+    signatures: &[DetachedSignature],
+) -> Result<SignedOperation> {
+    let server = authorization::server_signature(p, true)?
+        .ok_or("Service authorization is unsigned")?;
+    let [s] = signatures else {
+        return Err("The agent's one signature of the wallet's authorization is required".into());
+    };
+    if s.signer != p.config.agent {
+        return Err("Unexpected or duplicate signature".into());
+    }
+    let agent: [u8; 64] = s
+        .signature
+        .as_slice()
+        .try_into()
+        .map_err(|_| "Invalid signature length")?;
+    signing::verify_digest(&p.config.agent, &authorization::wallet_payload(p)?, &agent)?;
+    let out = authorization::attach(p, contract::cosignatures(&agent, &server)?)?;
+    Ok(SignedOperation {
+        prepared: p.clone(),
+        transaction_xdr: out.transaction_xdr,
+        transaction_hash: out.transaction_hash,
+        role_signatures: Vec::new(),
+    })
+}
 /// Check the classic automated role proofs. `required` demands one proof per role key; a
 /// retained record from before role proofs existed may carry none.
 fn validate_role_signatures(s: &SignedOperation, required: bool) -> Result<()> {
@@ -2207,7 +2308,7 @@ pub fn validate_retained_signed(s: &SignedOperation) -> Result<()> {
     }
     validate_retained_prepared(&s.prepared)?;
     if s.prepared.config.route == WalletRoute::PolicyWallet {
-        authorization::server_signature(&s.prepared, true)?;
+        return validate_wallet_signed(s);
     }
     if s.transaction_hash != s.prepared.transaction_hash {
         return Err("Signed transaction identity differs".into());

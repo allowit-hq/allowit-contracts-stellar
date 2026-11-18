@@ -13,56 +13,6 @@ pub const CONTRACT_VERSION: u32 = packed::LAYOUT as u32;
 pub(crate) fn struct_value(entries: Vec<(&str, ScVal)>) -> Result<ScVal> {
     value_map(entries)
 }
-fn string(value: &ScVal) -> Result<String> {
-    match value {
-        ScVal::String(v) => String::from_utf8(v.0.to_vec()).map_err(err),
-        _ => Err("Expected contract string".into()),
-    }
-}
-fn boolean(value: &ScVal) -> Result<bool> {
-    match value {
-        ScVal::Bool(v) => Ok(*v),
-        _ => Err("Expected contract boolean".into()),
-    }
-}
-fn u32_field(value: &ScVal) -> Result<u32> {
-    match value {
-        ScVal::U32(v) => Ok(*v),
-        _ => Err("Expected contract u32".into()),
-    }
-}
-fn u64_field(value: &ScVal) -> Result<u64> {
-    match value {
-        ScVal::U64(v) => Ok(*v),
-        _ => Err("Expected contract u64".into()),
-    }
-}
-fn symbol_text(value: &ScVal) -> Result<String> {
-    match value {
-        ScVal::Symbol(v) => String::from_utf8(v.0.to_vec()).map_err(err),
-        _ => Err("Expected contract symbol".into()),
-    }
-}
-/// Require exactly these struct keys, so a value of another layout cannot decode.
-fn exact_keys(value: &ScVal, keys: &[&str]) -> Result<()> {
-    let ScVal::Map(Some(map)) = value else {
-        return Err("Expected contract record".into());
-    };
-    let mut sorted: Vec<&str> = keys.to_vec();
-    sorted.sort_unstable();
-    let actual: Vec<_> = map
-        .iter()
-        .map(|e| match &e.key {
-            ScVal::Symbol(k) => Ok(k.0.as_slice()),
-            _ => Err("Contract record keys must be symbols".to_string()),
-        })
-        .collect::<Result<_>>()?;
-    if actual.len() != sorted.len() || actual.iter().zip(&sorted).any(|(a, b)| *a != b.as_bytes()) {
-        return Err("Contract record fields differ from layout 4".into());
-    }
-    Ok(())
-}
-
 /// One enum variant with its fields: `[Symbol(variant), field, ...]`.
 fn variant(name: &str, fields: Vec<ScVal>) -> Result<ScVal> {
     let mut items = vec![value_symbol(name)?];
