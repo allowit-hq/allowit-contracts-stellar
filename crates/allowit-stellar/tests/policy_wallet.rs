@@ -321,6 +321,8 @@ struct Model {
     restore_archived: Vec<u32>,
     /// The transactions that the ledger included and failed.
     failed: BTreeSet<String>,
+    /// Another transaction restores lapsed code just before the next restoration's simulation.
+    restored_meanwhile: bool,
     tiers: BTreeMap<[u8; 32], PolicyTier>,
     wallet: Option<Wallet>,
     settled: BTreeMap<String, String>,
@@ -643,10 +645,29 @@ impl rpc::Rpc for ModelChain {
                     let x::TransactionExt::V1(data) = &env.tx.ext else {
                         return Ok(json!({"error": "a restoration names its footprint"}));
                     };
+                    if m.restored_meanwhile {
+                        for key in data.resources.footprint.read_write.iter() {
+                            if let x::LedgerKey::ContractCode(code) = key {
+                                m.lapsed_code.remove(&code.hash.0);
+                            }
+                        }
+                    }
                     let mut data = x::SorobanTransactionData {
                         resource_fee: RESTORE_FEE,
                         ..data.clone()
                     };
+                    // As Stellar RPC, the simulation restores only entries that are archived.
+                    let archived: Vec<x::LedgerKey> = data
+                        .resources
+                        .footprint
+                        .read_write
+                        .iter()
+                        .filter(|key| {
+                            matches!(key, x::LedgerKey::ContractCode(code) if m.lapsed_code.contains(&code.hash.0))
+                        })
+                        .cloned()
+                        .collect();
+                    data.resources.footprint.read_write = archived.try_into().unwrap();
                     if !m.restore_archived.is_empty() {
                         data.ext = x::SorobanTransactionDataExt::V1(x::SorobanResourcesExtV0 {
                             archived_soroban_entries: m
@@ -2845,6 +2866,36 @@ fn a_gas_due_joins_the_repayment_within_the_gas_cap() {
             (repaid as u128, repaid)
         );
     }
+    // A due of any size repays what fits under the gas cap.
+    let state = sending_state(&chain, &c);
+    let transfer = request::transfer(&c, &state, [4; 32], &recipient, 1_000_000).unwrap();
+    let unbounded = ExecutionTerms {
+        gas_due: u128::MAX,
+        ..terms(1_000_000, chain.ledger())
+    };
+    let prepared = rpc::prepare_with(
+        &chain,
+        &c,
+        &transfer,
+        &unbounded,
+        Some(chain.accounting()),
+        NOW,
+        NOW + 300,
+    )
+    .unwrap();
+    assert_eq!(prepared.terms.repaid_stroops().unwrap(), gas_cap);
+    // Local preparation admits no repayment above the gas cap, as the wallet does not.
+    let ledger = chain.ledger();
+    let mut over = terms(1_000_000, ledger);
+    over.gas_due = 500;
+    let expense = over.expense.as_mut().unwrap();
+    expense.gas_units = gas_cap + 500;
+    expense.spent_units = 1_000_000 + gas_cap + 500;
+    assert_eq!(over.repaid_stroops().unwrap(), gas_cap + 500);
+    let refused = allowit_stellar::prepare_with(&c, &transfer, &over, &state, NOW, NOW + 300)
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("gas cap"), "{refused}");
     // An explicit repayment takes no due.
     let explicit = ExecutionTerms {
         gas: Some(GasRepayment {
@@ -3337,6 +3388,26 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
             .is_some()
     );
     assert!(chain.0.lock().unwrap().lapsed_code.is_empty());
+    // Another request restores the code after this one read it as lapsed: the simulation of the
+    // restoration names no entry, the code is live, and nothing is sent.
+    {
+        let mut m = chain.0.lock().unwrap();
+        m.lapsed_code.insert(installed);
+        m.restored_meanwhile = true;
+    }
+    let sent = chain.0.lock().unwrap().steps.len();
+    assert!(
+        provider
+            .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+            .unwrap()
+            .is_none()
+    );
+    {
+        let mut m = chain.0.lock().unwrap();
+        assert_eq!(m.steps.len(), sent);
+        assert!(m.lapsed_code.is_empty());
+        m.restored_meanwhile = false;
+    }
     // Code that the network does not have cannot be restored: it needs an upload.
     chain.0.lock().unwrap().code_bytes.remove(&installed);
     assert!(

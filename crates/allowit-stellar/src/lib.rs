@@ -1695,8 +1695,14 @@ fn verify_wallet_portable(
     {
         return Err("Installed policy wallet binding differs from the installation".into());
     }
+    // As the wallet checks (`ExcessGas`): it repays at most its gas cap, the installed fee
+    // ceiling, whatever the terms add to the fee bound.
+    let repaid = terms.repaid_stroops()?;
+    if repaid > i128::from(c.max_fee_stroops) {
+        return Err("The gas repayment exceeds the wallet's gas cap".into());
+    }
     if let Some(expense) = &terms.expense {
-        validate_expense(c, expense, terms.repaid_stroops()?, operation, state, now)?;
+        validate_expense(c, expense, repaid, operation, state, now)?;
     }
     let shape = policy::source_shape(&c.policy_source)?;
     let request = policy::RuleRequest::new(
@@ -1793,6 +1799,22 @@ fn legacy_wallet_request(
 /// server's sending account, which `terms` or the request's fee payer names; when both name one,
 /// they agree. An unpriced request repays nothing.
 pub(crate) fn gas_repayment(r: &ExecutionRequest, terms: &ExecutionTerms) -> Result<GasRepayment> {
+    if let Some(gas) = &terms.gas {
+        terms.repaid_stroops()?;
+        named_sender(r, terms)?;
+        return Ok(gas.clone());
+    }
+    let payee = named_sender(r, terms)?
+        .ok_or("A policy wallet operation needs the server's sending account as its gas payee")?;
+    Ok(GasRepayment {
+        stroops: terms.repaid_stroops()?,
+        payee,
+    })
+}
+/// The one sending account that a request and its terms name: the payer of the request's fee
+/// bound, the terms' sending account and the payee of an explicit repayment, when they name one.
+/// It does not depend on how much the wallet repays.
+fn named_sender(r: &ExecutionRequest, terms: &ExecutionTerms) -> Result<Option<String>> {
     let payer = match &r.fee_bounds {
         Some(fees) => Some(workflow_address(
             &fees.first().ok_or("Native fee bound required")?.payer,
@@ -1813,21 +1835,14 @@ pub(crate) fn gas_repayment(r: &ExecutionRequest, terms: &ExecutionTerms) -> Res
         }
         sender = Some(account);
     }
-    let stroops = terms.repaid_stroops()?;
-    if let Some(gas) = &terms.gas {
-        return Ok(gas.clone());
-    }
-    Ok(GasRepayment {
-        stroops,
-        payee: sender.ok_or(
-            "A policy wallet operation needs the server's sending account as its gas payee",
-        )?,
-    })
+    Ok(sender)
 }
 /// The sending account that a policy wallet operation names: the payee of its gas repayment and
 /// the fee payer of its request.
 pub fn gas_payee(r: &ExecutionRequest, terms: &ExecutionTerms) -> Result<String> {
-    Ok(gas_repayment(r, terms)?.payee)
+    named_sender(r, terms)?.ok_or_else(|| {
+        "A policy wallet operation needs the server's sending account as its gas payee".into()
+    })
 }
 /// The layout 5 `AllowitExecutionRequest` of one operation: its id, the wallet's deployment
 /// version, the expiry, the typed native operation, the expense, the gas repayment and the

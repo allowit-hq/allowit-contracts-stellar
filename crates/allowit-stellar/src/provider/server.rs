@@ -472,11 +472,15 @@ impl Provider {
             now,
             max_fee_stroops,
         };
-        let p = checked(if state == rpc::CodeState::Lapsed {
-            deployer.restore_code(&account, code_hash)
+        let p = if state == rpc::CodeState::Lapsed {
+            match checked(deployer.restore_code(&account, code_hash))? {
+                Some(p) => p,
+                // Another transaction restored the code since it was read: it is live.
+                None => return Ok(None),
+            }
         } else {
-            deployer.upload_wasm(&account, wasm)
-        })?;
+            checked(deployer.upload_wasm(&account, wasm))?
+        };
         let signature = sending_signature(sender, &account, &p.transaction_hash)?;
         let signed = checked(native::admin::with_source_signature(
             &c.network,

@@ -356,7 +356,7 @@ pub fn prepare_with(
     }
     // The server's sending account is the source and pays the fee; the wallet repays its gas
     // to that same account.
-    state.source = get_account(rpc, &super::gas_repayment(request, terms)?.payee)?;
+    state.source = get_account(rpc, &super::gas_payee(request, terms)?)?;
     let ceiling = terms.expense.as_ref();
     let mut terms = priced_terms(rpc, c, request, terms, &state, now, expires_at)?;
     // The invocation that carries the priced expense is simulated on its own. A policy that

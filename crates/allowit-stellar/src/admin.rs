@@ -1484,7 +1484,12 @@ impl Deployer<'_> {
     }
     /// Prepare `RestoreFootprint` of the lapsed code entry `wasm_hash` from `source`. It names
     /// that entry alone and gives no authority; the simulation sets its fee, within the ceiling.
-    pub fn restore_code(&self, source: &str, wasm_hash: [u8; 32]) -> Result<PreparedDeployment> {
+    /// `None` when the code is live again: another transaction restored it since it was read.
+    pub fn restore_code(
+        &self,
+        source: &str,
+        wasm_hash: [u8; 32],
+    ) -> Result<Option<PreparedDeployment>> {
         let account = self.account(source)?;
         let key = LedgerKey::ContractCode(LedgerKeyContractCode {
             hash: Hash(wasm_hash),
@@ -1533,6 +1538,17 @@ impl Deployer<'_> {
                 .as_str()
                 .ok_or("Missing restoration resources")?,
         )?;
+        // The simulation restores only archived entries. Another transaction can restore the
+        // code after it was read as lapsed: the simulation then names no entry, and the code,
+        // read again, is live.
+        if data.resources.footprint.read_only.is_empty()
+            && data.resources.footprint.read_write.is_empty()
+        {
+            return match crate::rpc::code_state(self.rpc, self.network, &wasm_hash)? {
+                crate::rpc::CodeState::Live => Ok(None),
+                _ => Err("The restoration simulation names no entry".into()),
+            };
+        }
         if !data.resources.footprint.read_only.is_empty()
             || data.resources.footprint.read_write.as_slice() != [key]
         {
@@ -1559,6 +1575,7 @@ impl Deployer<'_> {
         tx.fee = fee;
         tx.ext = TransactionExt::V1(data);
         self.prepared(&account, "restore_code", wasm_hash, None, tx)
+            .map(Some)
     }
     /// Prepare the owner's one transaction that creates the policy wallet of `wasm` (uploaded by
     /// the server) through `deployer` and funds it with each `(asset, amount)` of `funding`. The
