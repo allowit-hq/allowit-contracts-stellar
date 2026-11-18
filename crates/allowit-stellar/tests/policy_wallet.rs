@@ -327,6 +327,8 @@ struct Model {
     restored_by_source: bool,
     /// The fee that the next receipts report as charged, when not the usual 100 stroops.
     charged_fee: Option<i64>,
+    /// The RPC serves no archived entry: a read of lapsed code finds nothing.
+    hide_archived: bool,
     tiers: BTreeMap<[u8; 32], PolicyTier>,
     wallet: Option<Wallet>,
     settled: BTreeMap<String, String>,
@@ -619,6 +621,11 @@ impl rpc::Rpc for ModelChain {
                             val,
                         }))
                     }),
+                    x::LedgerKey::ContractCode(code)
+                        if m.hide_archived && m.lapsed_code.contains(&code.hash.0) =>
+                    {
+                        None
+                    }
                     x::LedgerKey::ContractCode(code) => {
                         m.code_bytes.get(&code.hash.0).map(|bytes| {
                             x::LedgerEntryData::ContractCode(x::ContractCodeEntry {
@@ -3489,6 +3496,46 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         m.restored_meanwhile = false;
         m.restored_by_source = false;
     }
+    // An RPC that serves no archived entry reads lapsed code as absent. A simulated restoration
+    // of the code entry tells them apart: the step before an operation restores the code, and
+    // the upload step restores it instead of uploading it again, which the network refuses.
+    {
+        let mut m = chain.0.lock().unwrap();
+        m.lapsed_code.insert(installed);
+        m.hide_archived = true;
+    }
+    assert_eq!(
+        rpc::code_state(&*chain, NETWORK, &installed).unwrap(),
+        rpc::CodeState::Absent
+    );
+    for (name, upload) in [
+        ("restore of unread code", false),
+        ("upload step of unread code", true),
+    ] {
+        chain.0.lock().unwrap().lapsed_code.insert(installed);
+        chain.step(name);
+        let restored = if upload {
+            provider.upload_code_within(&installation, &wasm, ceiling, Poll::default(), NOW)
+        } else {
+            provider.restore_code_within(&installation, ceiling, Poll::default(), NOW)
+        };
+        assert!(restored.unwrap().is_some(), "{name}");
+        let m = chain.0.lock().unwrap();
+        assert!(m.lapsed_code.is_empty(), "{name}");
+        let (step, signed, ..) = m.steps.last().unwrap();
+        assert_eq!(step, name);
+        let x::TransactionEnvelope::Tx(env) = de(signed) else {
+            panic!()
+        };
+        assert!(matches!(
+            env.tx.operations.as_slice(),
+            [x::Operation {
+                body: x::OperationBody::RestoreFootprint(_),
+                ..
+            }]
+        ));
+    }
+    chain.0.lock().unwrap().hide_archived = false;
     // Code that the network does not have cannot be restored: it needs an upload.
     chain.0.lock().unwrap().code_bytes.remove(&installed);
     let signed = signatures();

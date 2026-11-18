@@ -1557,7 +1557,10 @@ impl Deployer<'_> {
         {
             return match crate::rpc::code_state(self.rpc, self.network, &wasm_hash)? {
                 crate::rpc::CodeState::Live => Ok(None),
-                _ => Err("The restoration simulation names no entry".into()),
+                _ => Err(
+                    "The wallet code is not on the network: a restoration needs code that lapsed"
+                        .into(),
+                ),
             };
         }
         if !data.resources.footprint.read_only.is_empty()
