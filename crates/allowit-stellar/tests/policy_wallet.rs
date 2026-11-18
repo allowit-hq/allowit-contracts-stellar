@@ -365,6 +365,12 @@ struct Model {
     /// The heads that the next `getLatestLedger` calls answer, as nodes behind a load balancer
     /// that do not agree.
     heads: std::collections::VecDeque<u32>,
+    /// The ledgers at which replicas that trail answer the next reads of code entries: they serve
+    /// the code as lapsed.
+    replica_code_reads: std::collections::VecDeque<u32>,
+    /// The `heads` and `replica_code_reads` that the answer `TRY_AGAIN_LATER` starts.
+    heads_on_retry_later: Vec<u32>,
+    replica_reads_on_retry_later: Vec<u32>,
     tiers: BTreeMap<[u8; 32], PolicyTier>,
     wallet: Option<Wallet>,
     settled: BTreeMap<String, String>,
@@ -604,6 +610,20 @@ impl rpc::Rpc for ModelChain {
                 let key: x::LedgerKey = de(encoded);
                 if m.failing_code_reads && matches!(key, x::LedgerKey::ContractCode(_)) {
                     return Err("The RPC is unreachable".into());
+                }
+                if let x::LedgerKey::ContractCode(code) = &key
+                    && let Some(bytes) = m.code_bytes.get(&code.hash.0).cloned()
+                    && let Some(ledger) = m.replica_code_reads.pop_front()
+                {
+                    let entry = x::LedgerEntryData::ContractCode(x::ContractCodeEntry {
+                        ext: x::ContractCodeEntryExt::V0,
+                        hash: code.hash.clone(),
+                        code: bytes.try_into().unwrap(),
+                    });
+                    return Ok(json!({
+                        "latestLedger": ledger,
+                        "entries": [{"key": encoded, "xdr": b64(&entry), "liveUntilLedgerSeq": 0}],
+                    }));
                 }
                 if m.stale_code_reads > 0
                     && let x::LedgerKey::ContractCode(code) = &key
@@ -1005,6 +1025,9 @@ impl rpc::Rpc for ModelChain {
                 if let Some(code) = m.retry_later_restores.take() {
                     m.lapsed_code.remove(&code);
                     m.stale_code_reads = std::mem::take(&mut m.stale_reads_on_retry_later);
+                    m.heads = std::mem::take(&mut m.heads_on_retry_later).into();
+                    m.replica_code_reads =
+                        std::mem::take(&mut m.replica_reads_on_retry_later).into();
                     return Ok(json!({"hash": tx_hash, "status": "TRY_AGAIN_LATER"}));
                 }
                 // The source signs alone.
@@ -4174,12 +4197,60 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         let head = m.ledger;
         m.heads = [head, head + 1, head, head].into();
     }
-    let refused = rpc::current_code_state(&*chain, NETWORK, &installed).unwrap_err();
+    let refused =
+        rpc::current_code_state(&*chain, NETWORK, &installed, &Default::default()).unwrap_err();
+    assert!(refused.contains("trails"), "{refused}");
+    assert!(chain.0.lock().unwrap().heads.is_empty());
+    // The first reply trails its own heads (H+1) and the read taken again comes wholly from a
+    // replica at H: the heads of the first reply count, so its negative answer does not decide.
+    {
+        let mut m = chain.0.lock().unwrap();
+        let head = m.ledger;
+        m.heads = [head + 1, head + 1, head, head].into();
+        m.replica_code_reads = [head, head].into();
+    }
+    let refused =
+        rpc::current_code_state(&*chain, NETWORK, &installed, &Default::default()).unwrap_err();
+    assert!(refused.contains("trails"), "{refused}");
+    // The highest ledger seen holds across the reads of one decision: a later read from a
+    // replica behind it does not decide.
+    let seen = std::cell::Cell::new(0);
+    assert_eq!(
+        rpc::current_code_state(&*chain, NETWORK, &installed, &seen).unwrap(),
+        rpc::CodeState::Lapsed
+    );
+    {
+        let mut m = chain.0.lock().unwrap();
+        let behind = m.ledger - 1;
+        m.heads = [behind; 4].into();
+        m.replica_code_reads = [behind, behind].into();
+    }
+    let refused = rpc::current_code_state(&*chain, NETWORK, &installed, &seen).unwrap_err();
     assert!(refused.contains("trails"), "{refused}");
     {
         let mut m = chain.0.lock().unwrap();
-        assert!(m.heads.is_empty());
+        assert!(m.heads.is_empty() && m.replica_code_reads.is_empty());
         m.lapsed_code.remove(&installed);
+    }
+    // So across the sends of one code transaction: after TRY_AGAIN_LATER another account
+    // restores the code, and the check before the repeated send reads from a replica behind
+    // the checks before it. Nothing is sent again.
+    {
+        let mut m = chain.0.lock().unwrap();
+        m.lapsed_code.insert(installed);
+        m.retry_later_restores = Some(installed);
+        let behind = m.ledger - 1;
+        m.heads_on_retry_later = vec![behind; 4];
+        m.replica_reads_on_retry_later = vec![behind, behind];
+    }
+    let refused = provider
+        .restore_code_within(&installation, ceiling, quick, NOW)
+        .unwrap_err();
+    assert!(refused.message.contains("trails"), "{}", refused.message);
+    {
+        let m = chain.0.lock().unwrap();
+        assert!(m.heads.is_empty() && m.replica_code_reads.is_empty());
+        assert!(!m.lapsed_code.contains(&installed));
     }
     // Another account restores the code while the sending account signs: the restoration is
     // not sent.

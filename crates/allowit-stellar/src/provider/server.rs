@@ -520,8 +520,15 @@ impl Provider {
             Ok(None) => return Ok(None),
             Err(refused) => return unless_live(refused),
         };
-        // A negative read that decides a paid transaction is dated at the closing head.
-        match checked(rpc::current_code_state(self.rpc(), &c.network, &code_hash)) {
+        // A negative read that decides a paid transaction is dated at the highest ledger that the
+        // decision has seen, here and before every send.
+        let seen = std::cell::Cell::new(0);
+        match checked(rpc::current_code_state(
+            self.rpc(),
+            &c.network,
+            &code_hash,
+            &seen,
+        )) {
             Ok(rpc::CodeState::Live) => return Ok(None),
             Ok(_) => {}
             Err(refused) => return unless_live(refused),
@@ -538,8 +545,8 @@ impl Provider {
                 Err(refused) => return unless_live(refused),
             };
         // Each send until the network accepts one, the first included, goes out only while a read
-        // dated at the closing head shows the code not live: another transaction can restore or
-        // upload it while the transaction is signed or waits.
+        // dated at the highest ledger seen shows the code not live: another transaction can
+        // restore or upload it while the transaction is signed or waits.
         let Some(receipt) = checked(self.runtime.send_and_poll_while(
             &c.network,
             &signed,
@@ -548,8 +555,10 @@ impl Provider {
                 interval: poll.interval,
             },
             &|| {
-                Ok(rpc::current_code_state(self.rpc(), &c.network, &code_hash)?
-                    != rpc::CodeState::Live)
+                Ok(
+                    rpc::current_code_state(self.rpc(), &c.network, &code_hash, &seen)?
+                        != rpc::CodeState::Live,
+                )
             },
         ))?
         else {
