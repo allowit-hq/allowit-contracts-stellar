@@ -1263,6 +1263,17 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         }
         checked(rpc::operation_lapsed(self.rpc(), &p))
     }
+    fn usage(&self, p: &Prepared) -> Result<Option<Usage>> {
+        self.network(p.network())?;
+        Ok(
+            checked(native::operation_usage(&prepared(p)?))?.map(|u| Usage {
+                amount_units: u.amount_units,
+                gas_units: u.gas_units,
+                spent_units: u.spent_units,
+                unpriced: u.unpriced,
+            }),
+        )
+    }
     fn prepare_owner(
         &self,
         i: &Installation,

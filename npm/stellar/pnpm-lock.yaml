@@ -167,8 +167,8 @@ importers:
   .:
     dependencies:
       '@allowit/core':
-        specifier: github:allowit-hq/allowit-core#e8f0a1100c2d1c76973f8591afa00bdba7ef37ac
-        version: https://codeload.github.com/allowit-hq/allowit-core/tar.gz/e8f0a1100c2d1c76973f8591afa00bdba7ef37ac
+        specifier: github:allowit-hq/allowit-core#36696910ea5696794c5d413223489ca7af2f7493
+        version: https://codeload.github.com/allowit-hq/allowit-core/tar.gz/36696910ea5696794c5d413223489ca7af2f7493
       '@noble/curves':
         specifier: 1.9.7
         version: 1.9.7
@@ -188,8 +188,8 @@ importers:
 
 packages:
 
-  '@allowit/core@https://codeload.github.com/allowit-hq/allowit-core/tar.gz/e8f0a1100c2d1c76973f8591afa00bdba7ef37ac':
-    resolution: {gitHosted: true, integrity: sha512-9xfW4IjB77IoAAbWYrFEnL9YM1gLae39bSag90OEvEYWh88JMjJW6LiURp0AGagAc+INLRBUnxLB4O3Z4iKMTQ==, tarball: https://codeload.github.com/allowit-hq/allowit-core/tar.gz/e8f0a1100c2d1c76973f8591afa00bdba7ef37ac}
+  '@allowit/core@https://codeload.github.com/allowit-hq/allowit-core/tar.gz/36696910ea5696794c5d413223489ca7af2f7493':
+    resolution: {gitHosted: true, integrity: sha512-A9GTxh00ieDbcFlvUnLO9FnLGS5GAz8FmiK3QkoKBpAAbNaTT8RfllrdmhEUliRvK94nI6SoEYwMiI4bwWsQAw==, tarball: https://codeload.github.com/allowit-hq/allowit-core/tar.gz/36696910ea5696794c5d413223489ca7af2f7493}
     version: 0.12.1
 
   '@exodus/bytes@1.16.0':
@@ -396,7 +396,7 @@ packages:
 
 snapshots:
 
-  '@allowit/core@https://codeload.github.com/allowit-hq/allowit-core/tar.gz/e8f0a1100c2d1c76973f8591afa00bdba7ef37ac': {}
+  '@allowit/core@https://codeload.github.com/allowit-hq/allowit-core/tar.gz/36696910ea5696794c5d413223489ca7af2f7493': {}
 
   '@exodus/bytes@1.16.0(@noble/hashes@2.4.0)':
     optionalDependencies:

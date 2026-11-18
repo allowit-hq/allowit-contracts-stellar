@@ -1171,6 +1171,40 @@ pub fn transfer_from_request(c: &WalletConfig, r: &ExecutionRequest) -> Result<T
         _ => Err("This profile admits only a transfer".into()),
     }
 }
+/// What one policy wallet operation adds to the wallet's figures when it executes, as the wallet
+/// counts it: `spent_units` to the spent totals, `amount_units` and `gas_units` to the day's
+/// gross volume, one call, and the unpriced mark of a request without an expense.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OperationUsage {
+    pub amount_units: i128,
+    pub gas_units: i128,
+    pub spent_units: i128,
+    pub unpriced: bool,
+}
+/// The usage of the signed request of `p`: its expense, and the gross amount of its operation as
+/// the wallet's own facts build it. `None` for a keypair account, which keeps no figures of a
+/// policy, and for a payment authorization, which a policy wallet never signs.
+pub fn operation_usage(p: &PreparedOperation) -> Result<Option<OperationUsage>> {
+    if p.config.route != WalletRoute::PolicyWallet || p.payment_authorization.is_some() {
+        return Ok(None);
+    }
+    let operation = operation_from_request(&p.config, &p.request)?;
+    let facts = policy::RuleRequest::new(
+        &operation,
+        &p.config.asset,
+        p.created_at,
+        p.expires_at,
+        p.terms.expense.clone(),
+        p.terms.args.clone(),
+    );
+    let expense = p.terms.expense.as_ref();
+    Ok(Some(OperationUsage {
+        amount_units: facts.amount,
+        gas_units: expense.map_or(0, |e| e.gas_units),
+        spent_units: expense.map_or(0, |e| e.spent_units),
+        unpriced: expense.is_none(),
+    }))
+}
 /// Decode one admitted native operation: a SEP-41 transfer, or a SEP-56 deposit or redeem for
 /// policy wallets, with exact effect and fee bounds.
 pub fn operation_from_request(c: &WalletConfig, r: &ExecutionRequest) -> Result<StellarOperation> {
