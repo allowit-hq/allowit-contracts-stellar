@@ -384,9 +384,16 @@ struct Model {
     replica_on_retry_later: bool,
     /// The replica serves the code as live until its own ledger, its last live ledger.
     replica_serves_live: bool,
-    /// A replica that predates the upload of this code answers the simulations of its
-    /// restoration and its upload, and the next reads of it, as if the network never had it.
+    /// A replica that predates the upload of this code answers the next reads of it, and the
+    /// next `predating_simulations` simulations of its restoration or its upload, as if the
+    /// network never had it.
     predating_replica: Option<([u8; 32], u32)>,
+    predating_simulations: u32,
+    /// The `heads` and `restore_simulation_ledgers` that the next upload's simulation starts.
+    heads_on_upload_simulation: Vec<u32>,
+    restore_ledgers_on_upload_simulation: Vec<u32>,
+    /// The ledgers at which the next restoration simulations answer, from a replica that trails.
+    restore_simulation_ledgers: std::collections::VecDeque<u32>,
     tiers: BTreeMap<[u8; 32], PolicyTier>,
     wallet: Option<Wallet>,
     settled: BTreeMap<String, String>,
@@ -794,6 +801,19 @@ impl rpc::Rpc for ModelChain {
                             m.accounts.get_mut(&source_of(&env.tx)).unwrap().sequence += 1;
                         }
                     }
+                    let hidden = match m.predating_replica {
+                        Some((predated, _))
+                            if m.predating_simulations > 0
+                                && data.resources.footprint.read_write.iter().any(|key| {
+                                    matches!(key, x::LedgerKey::ContractCode(code) if code.hash.0 == predated)
+                                }) =>
+                        {
+                            m.predating_simulations -= 1;
+                            Some(predated)
+                        }
+                        _ => None,
+                    };
+                    let answered = m.restore_simulation_ledgers.pop_front().unwrap_or(m.ledger);
                     let mut data = x::SorobanTransactionData {
                         resource_fee: RESTORE_FEE,
                         ..data.clone()
@@ -806,7 +826,7 @@ impl rpc::Rpc for ModelChain {
                         .iter()
                         .filter(|key| {
                             matches!(key, x::LedgerKey::ContractCode(code) if m.lapsed_code.contains(&code.hash.0)
-                                && m.predating_replica.is_none_or(|(predated, _)| predated != code.hash.0))
+                                && hidden != Some(code.hash.0))
                         })
                         .cloned()
                         .collect();
@@ -835,17 +855,26 @@ impl rpc::Rpc for ModelChain {
                         });
                     }
                     return Ok(json!({
-                        "latestLedger": m.ledger,
+                        "latestLedger": answered,
                         "minResourceFee": RESTORE_FEE.to_string(),
                         "transactionData": b64(&data),
                     }));
                 }
                 let op = host_op(&env.tx);
-                let predated =
-                    |code: &[u8; 32]| m.predating_replica.is_some_and(|(p, _)| p == *code);
+                let upload_predated = if let x::HostFunction::UploadContractWasm(code) =
+                    &op.host_function
+                    && let Some((predated, _)) = m.predating_replica
+                    && predated == hash(code.as_slice())
+                    && m.predating_simulations > 0
+                {
+                    m.predating_simulations -= 1;
+                    true
+                } else {
+                    false
+                };
                 if let x::HostFunction::UploadContractWasm(code) = &op.host_function
                     && m.lapsed_code.contains(&hash(code.as_slice()))
-                    && !predated(&hash(code.as_slice()))
+                    && !upload_predated
                 {
                     if !m.upload_restores_in_place {
                         return Ok(
@@ -929,8 +958,12 @@ impl rpc::Rpc for ModelChain {
                             })]
                             .try_into()
                             .unwrap();
-                        let predated = m.predating_replica.is_some_and(|(p, _)| p == code_hash);
-                        if m.code_bytes.contains_key(&code_hash) && !predated {
+                        if !m.heads_on_upload_simulation.is_empty() {
+                            m.heads = std::mem::take(&mut m.heads_on_upload_simulation).into();
+                            m.restore_simulation_ledgers =
+                                std::mem::take(&mut m.restore_ledgers_on_upload_simulation).into();
+                        }
+                        if m.code_bytes.contains_key(&code_hash) && !upload_predated {
                             footprint.read_only = key;
                         } else {
                             footprint.read_write = key;
@@ -3662,6 +3695,64 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         m.code.remove(&hash(&other));
         m.code_bytes.remove(&hash(&other));
     }
+    // Just before an upload is signed, the archive-aware restoration simulation is taken again,
+    // and it counts only when it is dated at the highest ledger seen. A replica that trails by
+    // one ledger answers it once: it is taken once more, and the upload goes on.
+    let lagged_restoration = |times: usize| {
+        let mut m = chain.0.lock().unwrap();
+        let head = m.ledger;
+        // The upload's own closing head, then for each restoration: its account observation (two
+        // heads), its simulation's opening head from the replica and closing head, and the read
+        // after a simulation that names no entry (two heads).
+        let mut heads = vec![head];
+        for _ in 0..times {
+            heads.extend([head, head, head - 1, head, head, head]);
+        }
+        m.heads_on_upload_simulation = heads;
+        m.restore_ledgers_on_upload_simulation = vec![head - 1; times];
+    };
+    lagged_restoration(1);
+    chain.step("upload after a restoration simulation that trails once");
+    assert!(
+        session
+            .provider
+            .upload_code_within(
+                &installation,
+                &other,
+                u64::from(u32::MAX),
+                Poll::default(),
+                NOW,
+            )
+            .unwrap()
+            .is_some()
+    );
+    {
+        let mut m = chain.0.lock().unwrap();
+        assert!(m.heads.is_empty() && m.restore_simulation_ledgers.is_empty());
+        m.code.remove(&hash(&other));
+        m.code_bytes.remove(&hash(&other));
+    }
+    // The replica answers it twice: the upload is refused, and nothing is signed.
+    lagged_restoration(2);
+    let before = signatures();
+    let refused = session
+        .provider
+        .upload_code_within(
+            &installation,
+            &other,
+            u64::from(u32::MAX),
+            Poll::default(),
+            NOW,
+        )
+        .unwrap_err();
+    assert!(refused.message.contains("trails"), "{}", refused.message);
+    assert_eq!(signatures(), before);
+    {
+        let mut m = chain.0.lock().unwrap();
+        assert!(m.heads.is_empty() && m.restore_simulation_ledgers.is_empty());
+        assert!(!m.code.contains_key(&hash(&other)));
+    }
+    let signed = signatures();
     // The server pays the upload, within its fee ceiling: a ceiling below the simulated fee
     // refuses it before anything is signed or sent.
     let refused = session
@@ -4348,6 +4439,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         let mut m = chain.0.lock().unwrap();
         m.lapsed_code.insert(installed);
         m.predating_replica = Some((installed, 2));
+        m.predating_simulations = 2;
     }
     let signed = signatures();
     let refused = session
@@ -4360,6 +4452,29 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         let mut m = chain.0.lock().unwrap();
         assert_eq!(m.predating_replica, Some((installed, 0)));
         m.predating_replica = None;
+        assert!(m.lapsed_code.remove(&installed));
+    }
+    // So when a newer RPC that serves no archived entry reads the code as absent at the highest
+    // ledger seen: the archive-aware restoration simulation, taken again just before the
+    // signature, finds the code in the archive, so nothing is signed.
+    {
+        let mut m = chain.0.lock().unwrap();
+        m.lapsed_code.insert(installed);
+        m.hide_archived = true;
+        m.predating_replica = Some((installed, 2));
+        m.predating_simulations = 2;
+    }
+    let refused = session
+        .provider
+        .upload_code_within(&installation, &wasm, ceiling, Poll::default(), NOW)
+        .unwrap_err();
+    assert!(refused.message.contains("lapsed"), "{}", refused.message);
+    assert_eq!(signatures(), signed);
+    {
+        let mut m = chain.0.lock().unwrap();
+        assert_eq!(m.predating_simulations, 0);
+        m.predating_replica = None;
+        m.hide_archived = false;
         assert!(m.lapsed_code.remove(&installed));
     }
     // The sending accounts are all leased, and a replica at the code's last live ledger then

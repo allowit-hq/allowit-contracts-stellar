@@ -529,6 +529,51 @@ impl Provider {
             }
             Err(refused) => return unless_live(refused),
         };
+        // An upload needs code that the network's archive does not hold. A replica that trails can
+        // predate the code's upload and simulate as if the network never had it, and an RPC that
+        // serves no archived entry reads lapsed code as absent. So the archive-aware restoration
+        // simulation is taken again just before the signature. Its answer counts only when the
+        // simulation is dated at the highest ledger seen; one that is not is taken once more,
+        // and a second one is refused. An archive that holds the code refuses the upload.
+        if p.function == "upload_wasm" {
+            let deployer = native::admin::Deployer {
+                rpc: &mark,
+                network: &c.network,
+                now,
+                max_fee_stroops,
+            };
+            let dated = || {
+                mark.simulated.load(std::sync::atomic::Ordering::SeqCst)
+                    >= mark.seen.load(std::sync::atomic::Ordering::SeqCst)
+            };
+            let mut answer = None;
+            for _ in 0..2 {
+                let restoration = checked(deployer.restore_code(&account, code_hash));
+                if dated() {
+                    answer = Some(restoration);
+                    break;
+                }
+            }
+            match answer {
+                Some(Ok(native::admin::CodeRestoration::Absent)) => {}
+                Some(Ok(native::admin::CodeRestoration::Prepared(_))) => {
+                    return Err(crate::provider::failure(
+                        "The network's archive holds the wallet code: lapsed code is restored, not uploaded",
+                    ));
+                }
+                Some(Ok(native::admin::CodeRestoration::Live)) => {
+                    return unless_live(crate::provider::failure(
+                        "The wallet code is live, but not at the highest ledger seen",
+                    ));
+                }
+                Some(Err(refused)) => return unless_live(refused),
+                None => {
+                    return unless_live(crate::provider::failure(
+                        "The simulated restoration of the wallet code trails the network's head",
+                    ));
+                }
+            }
+        }
         // The state that the prepared transaction needs, from a read dated at the highest ledger
         // that the decision has seen, here and before every send. Live code needs nothing. A
         // restoration needs code that is not live: an RPC that serves no archived entry reads

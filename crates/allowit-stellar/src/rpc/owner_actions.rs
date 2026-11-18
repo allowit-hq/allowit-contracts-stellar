@@ -81,16 +81,19 @@ pub fn code_live_at(
 /// An RPC transport that keeps the highest ledger that its replies name: the sequence of
 /// `getLatestLedger` and the `latestLedger` of every other reply. A decision that makes all its
 /// calls through it, its preparation and its sends included, passes `seen` to
-/// `current_code_state`, so no ledger that any of its replies named is forgotten.
+/// `current_code_state`, so no ledger that any of its replies named is forgotten. `simulated` is
+/// the ledger of the last `simulateTransaction` reply, which dates that simulation.
 pub struct LedgerMark<'a> {
     rpc: &'a dyn Rpc,
     pub seen: std::sync::atomic::AtomicU32,
+    pub simulated: std::sync::atomic::AtomicU32,
 }
 impl<'a> LedgerMark<'a> {
     pub fn new(rpc: &'a dyn Rpc) -> Self {
         Self {
             rpc,
             seen: std::sync::atomic::AtomicU32::new(0),
+            simulated: std::sync::atomic::AtomicU32::new(0),
         }
     }
 }
@@ -102,8 +105,12 @@ impl Rpc for LedgerMark<'_> {
         } else {
             &value["latestLedger"]
         };
-        if let Some(ledger) = named.as_u64().and_then(|v| u32::try_from(v).ok()) {
+        let ledger = named.as_u64().and_then(|v| u32::try_from(v).ok());
+        if let Some(ledger) = ledger {
             self.seen.fetch_max(ledger, Ordering::SeqCst);
+        }
+        if method == "simulateTransaction" {
+            self.simulated.store(ledger.unwrap_or(0), Ordering::SeqCst);
         }
         Ok(value)
     }
