@@ -444,7 +444,7 @@ fn priced_terms(
         });
     };
     // The wallet's gas cap is the installed fee ceiling, which its creation set. The fee bound
-    // stays within the quote and within the cap: the wallet repays no more than its cap, and the
+    // stays within the quote and within the gas cap: the wallet repays no more than its gas cap, and the
     // sending account declares no fee above it.
     let gas_cap = i128::from(c.max_fee_stroops);
     let limit = ceiling.max_fee_stroops.min(c.max_fee_stroops);

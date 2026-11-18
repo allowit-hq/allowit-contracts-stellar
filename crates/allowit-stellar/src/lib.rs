@@ -436,7 +436,7 @@ impl ExpenseBounds {
     /// once, at the rate of these bounds, and rounds up, so an XLM wallet counts exactly what it
     /// repays and another asset counts its units at the quoted rate; spent units change by the same
     /// gas. Without a carry or a due this is [`Self::with_fee_bound`]. A bound that, less the carry,
-    /// is above the gas cap is refused: the wallet repays at most its cap. Returns the bounds and
+    /// is above the gas cap is refused: the wallet repays at most its gas cap. Returns the bounds and
     /// the part of `due` that the wallet repays.
     pub fn with_repayment(
         &self,

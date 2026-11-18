@@ -1625,14 +1625,14 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
     // A resource fee inside the margin of the signed bound prices nothing again.
     let inside = priced(&[], Some(|_| gas() as i64 - 100)).unwrap();
     assert_eq!(inside.terms.expense.as_ref().unwrap().gas_units, gas());
-    // A quote above the wallet's gas cap is priced within the cap: a fee that fits the cap is
+    // A quote above the wallet's gas cap is priced within the gas cap: a fee that fits it is
     // not raised above it by the margin of the bound, which the wallet would refuse to repay.
     // 995,000 + 100 fits 1,000,000; with the margin the bound would be 1,005,050.
     let quoted = ExecutionTerms {
         expense: Some(ExpenseBounds::xlm(10_000_000, 0, MAX_FEE * 2, ledger - 1, NOW).unwrap()),
         ..terms(10_000_000, ledger)
     };
-    let capped = rpc::prepare_with(
+    let within = rpc::prepare_with(
         &ReadsGas {
             chain: &chain,
             refused: &[],
@@ -1646,13 +1646,13 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
         NOW + 300,
     )
     .unwrap();
-    let bound = capped.terms.expense.as_ref().unwrap();
+    let bound = within.terms.expense.as_ref().unwrap();
     assert_eq!(
         (bound.gas_units, bound.max_fee_stroops),
         (i128::from(MAX_FEE), MAX_FEE)
     );
     assert_eq!(
-        capped.terms.repaid_stroops().unwrap(),
+        within.terms.repaid_stroops().unwrap(),
         i128::from(c.max_fee_stroops)
     );
     for cost in [(|gas| gas as i64) as fn(i128) -> i64, |_| {
@@ -2741,7 +2741,7 @@ fn a_repayment_never_exceeds_the_gas_cap() {
             "{due}"
         );
     }
-    // After a carry the repayment fits, and the due fills the rest of the cap.
+    // After a carry the repayment fits, and the due fills the rest of the gas cap.
     let (bounds, part) = ceiling.with_repayment(1_009, 100, 500, 1_000).unwrap();
     assert_eq!((part, bounds.gas_units), (91, 1_000));
 }
