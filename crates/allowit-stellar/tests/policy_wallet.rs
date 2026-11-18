@@ -2518,6 +2518,59 @@ fn an_explicit_gas_repayment_keeps_its_gas_through_pricing() {
     );
 }
 #[test]
+fn the_server_revalidates_its_own_authorized_preparation() {
+    // The engine's order: prepare, authorize as the server, then revalidate before the agent's
+    // signature joins and the sending account seals.
+    for tier in [PolicyTier::Simple, PolicyTier::Common] {
+        let wasm = wasm_for(tier);
+        let chain = ModelChain::new(BTreeMap::from([(hash(&wasm), tier)]));
+        let c = create(&chain, tier, &wasm, [0x38; 32]);
+        let state = sending_state(&chain, &c);
+        let ledger = chain.ledger();
+        let recipient = account_for_seed(&RECIPIENT);
+        let transfer = request::transfer(&c, &state, [1; 32], &recipient, 1_000_000).unwrap();
+        let prepared = rpc::prepare_with(
+            &chain,
+            &c,
+            &transfer,
+            &terms(1_000_000, ledger),
+            Some(chain.accounting()),
+            NOW,
+            NOW + 300,
+        )
+        .unwrap();
+        let served = authorize_server(&prepared, &SERVER, NOW, None).unwrap();
+        rpc::revalidate_prepared(&chain, &served, NOW).unwrap_or_else(|e| panic!("{tier:?}: {e}"));
+    }
+}
+#[test]
+fn a_contract_wallet_reports_the_roles_that_its_configuration_holds() {
+    let wasm = wasm_for(PolicyTier::Common);
+    let chain = ModelChain::new(BTreeMap::from([(hash(&wasm), PolicyTier::Common)]));
+    let c = create(&chain, PolicyTier::Common, &wasm, [0x37; 32]);
+    // A contract wallet has no account signers: discovery names the owner, agent and server
+    // that its configuration holds on chain, and weighs them as a keypair wallet's account does.
+    let live = rpc::trusted_state_for_discovery(&chain, &c, Some(chain.accounting())).unwrap();
+    let state = &live.state;
+    assert_eq!(
+        (&state.owner, &state.agent, &state.server),
+        (&c.owner, &c.agent, &c.server)
+    );
+    let weight = |key: &str| state.policy_role_weight(key).unwrap();
+    assert_eq!(
+        (
+            weight(&c.owner),
+            weight(&c.agent),
+            weight(&c.server),
+            weight(&account_for_seed(&RECIPIENT))
+        ),
+        (3, 1, 1, 0)
+    );
+    // The wallet's own address has no role, and text that is no address is refused.
+    assert_eq!(weight(&c.wallet), 0);
+    assert!(state.policy_role_weight("not an address").is_err());
+}
+#[test]
 fn a_gas_carry_lowers_the_repayment_and_the_gas_that_the_wallet_counts() {
     let wasm = wasm_for(PolicyTier::Common);
     let chain = ModelChain::new(BTreeMap::from([(hash(&wasm), PolicyTier::Common)]));

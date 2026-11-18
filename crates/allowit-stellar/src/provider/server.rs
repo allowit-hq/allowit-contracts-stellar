@@ -329,7 +329,17 @@ pub fn owner_info(p: &Packet) -> Result<OwnerInfo> {
 fn decode_observation(packet: &Packet) -> Result<rpc::DiscoveredState> {
     crate::host::routing::normalize(packet.network())?;
     let value: rpc::DiscoveredState = decode(packet.document())?;
-    checked(value.state.source.validate_structure())?;
+    let s = &value.state;
+    if s.policy_state.is_some() {
+        // A policy wallet has no account: its configuration on chain names its roles. Its owner
+        // is an account or a contract; its agent and server are keys.
+        checked(native::address(&s.owner))?;
+        for key in [&s.agent, &s.server] {
+            checked(native::account_key(key))?;
+        }
+    } else {
+        checked(s.source.validate_structure())?;
+    }
     Ok(value)
 }
 pub fn same_snapshot(a: &Snapshot, b: &Snapshot) -> Result<bool> {
@@ -1630,6 +1640,10 @@ pub fn verify_consent(s: &Snapshot, message: &str, signatures: &[Signature]) -> 
 }
 pub fn signer_weight(s: &Snapshot, identity: &str) -> Result<u32> {
     let live: rpc::DiscoveredState = decode_observation(&s.evidence)?;
+    // A contract wallet has no account signers: its configuration on chain names its roles.
+    if live.state.policy_state.is_some() {
+        return checked(live.state.policy_role_weight(identity));
+    }
     checked(live.state.source.signer_weight(identity))
 }
 pub fn authority_document(s: &Snapshot) -> Result<serde_json::Value> {
@@ -1777,6 +1791,90 @@ fn retained(value: &serde_json::Value) -> Prepared {
         .unwrap(),
     )
 }
+#[cfg(test)]
+mod role_weight_tests {
+    use super::*;
+
+    /// The provider weighs a contract wallet's signers from the roles that its configuration
+    /// holds on chain, paused or not: discovery gives such a wallet no account. A keypair
+    /// wallet's account still weighs its own signers.
+    #[test]
+    fn a_contract_wallet_weighs_the_roles_of_its_configuration() {
+        let (c, _, keypair, _) = crate::test_support::agent_fixture("policy", "request", 86_401);
+        let mut contract = keypair.clone();
+        contract.contract_version = Some(native::contract::CONTRACT_VERSION);
+        contract.policy_state = Some(native::PolicyStateSnapshot {
+            custom: Default::default(),
+            params: Default::default(),
+            rules: vec![],
+            source_hash: contract.source_hash,
+            figures: Default::default(),
+        });
+        // As discovery reports a contract wallet: no source account.
+        contract.source = native::AccountState {
+            address: String::new(),
+            sequence: 0,
+            master_weight: 0,
+            low_threshold: 0,
+            medium_threshold: 0,
+            high_threshold: 0,
+            signers: vec![],
+        };
+        let stranger = native::account_for_seed(&[9; 32]);
+        for paused in [false, true] {
+            let snapshot = snapshot_from(
+                &c.network,
+                rpc::DiscoveredState {
+                    state: contract.clone(),
+                    paused,
+                },
+            )
+            .unwrap();
+            let weight = |key: &str| signer_weight(&snapshot, key).unwrap();
+            assert_eq!(
+                (
+                    weight(&contract.owner),
+                    weight(&contract.agent),
+                    weight(&contract.server),
+                    weight(&stranger)
+                ),
+                (3, 1, 1, 0),
+                "paused={paused}"
+            );
+        }
+        // An owner that is another contract acts alone, as an owner account does.
+        let mut owned = contract.clone();
+        owned.owner = stellar_strkey::Contract([5; 32]).to_string();
+        let snapshot = snapshot_from(
+            &c.network,
+            rpc::DiscoveredState {
+                state: owned.clone(),
+                paused: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                signer_weight(&snapshot, &owned.owner).unwrap(),
+                signer_weight(&snapshot, &owned.agent).unwrap()
+            ),
+            (3, 1)
+        );
+        let snapshot = snapshot_from(
+            &c.network,
+            rpc::DiscoveredState {
+                state: keypair.clone(),
+                paused: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            signer_weight(&snapshot, &keypair.agent).unwrap(),
+            keypair.source.signer_weight(&keypair.agent).unwrap()
+        );
+    }
+}
+
 #[cfg(test)]
 mod receipt_fee_tests {
     use super::*;
