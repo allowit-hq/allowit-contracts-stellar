@@ -106,14 +106,14 @@ It reads the direct order book only: no path through another asset and no liquid
   CLI release is a `custom_toolchain_missing` refusal that says what to install. A failed compile is
   `custom_build_failed`.
 - `code_hash` is the SHA-256 of a wallet Wasm of the current custody layout: the hash of the code on the ledger.
-- The server builds the code of a Custom policy from the source that the owner's policy signature binds, and
-  uploads it from its sending account with `RuntimeProvider::upload_code`; an upload gives no authority. The owner's
-  one creation signature names the code by its hash. A client that builds the same source gets the same hash and
-  compares it (`check_code_hash`) before the owner signs.
+- The owner's client builds the code of a Custom policy from the source that the owner's policy signature binds
+  and hands it to the server, which uploads it from its sending account with `RuntimeProvider::upload_code` when the
+  owner deploys; an upload gives no authority. The owner's one creation signature names the code by its hash. A
+  client that builds compares its own build with that hash (`check_code_hash`).
 
 The rail reports a wallet whose code on the ledger differs from the code of its configuration with the problem code
 `custom_code_hash_mismatch`. `OwnerProvider::custom_build` reads the owner's view of a build from the server: the
-admitted source and the code hash of the server's build.
+build ticket, the hash of the source that the owner signed and the build that the server holds.
 
 ## Wallet kinds, units and settlement reports
 
