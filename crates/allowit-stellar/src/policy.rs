@@ -878,17 +878,25 @@ pub fn evaluate(
     let next = PolicyParams::from_allowit(
         &full.map_err(|e| format!("Authored policy denied this exact operation: {e:?}"))?,
     );
-    // The wallet stores only the standard figures and the declared keys.
+    // The wallet stores only the standard figures and the declared keys, each declared value
+    // within its packed bound.
     if let (true, Some(declared)) = (keeps_state, wallet) {
         let standard = crate::state_keys::STANDARD.map(|(key, _)| key);
-        if let Some(key) = next
-            .0
-            .keys()
-            .find(|key| !standard.contains(&key.as_str()) && !declared.contains(key))
-        {
-            return Err(format!(
-                "The policy wrote the state key {key:?}, which its build does not declare"
-            ));
+        for (key, value) in &next.0 {
+            if standard.contains(&key.as_str()) {
+                continue;
+            }
+            if !declared.contains(key) {
+                return Err(format!(
+                    "The policy wrote the state key {key:?}, which its build does not declare"
+                ));
+            }
+            if crate::packed::state_value_bytes(value)? > crate::state_keys::MAX_STATE_VALUE {
+                return Err(format!(
+                    "The policy's state value of {key:?} is longer than {} packed bytes",
+                    crate::state_keys::MAX_STATE_VALUE
+                ));
+            }
         }
     }
     Ok(Evaluation::Full(next))
@@ -960,6 +968,28 @@ mod tests {
             panic!()
         };
         assert!(!stored.0.contains_key("seen"));
+        // A declared value over the wallet's packed bound is refused, as the wallet refuses it:
+        // 62 text bytes pack into 64, 63 into 65.
+        let fits: PortableEvaluator = &|ctx| {
+            allowit_core::set_state(
+                ctx,
+                "seen",
+                allowit_core::AllowitValue::Str("x".repeat(62).as_str().into()),
+            )
+        };
+        let long: PortableEvaluator = &|ctx| {
+            allowit_core::set_state(
+                ctx,
+                "seen",
+                allowit_core::AllowitValue::Str("x".repeat(63).as_str().into()),
+            )
+        };
+        assert!(run(PolicyTier::Custom, fits, Some(&declared)).is_ok());
+        assert!(
+            run(PolicyTier::Custom, long, Some(&declared))
+                .unwrap_err()
+                .contains("longer than 64")
+        );
     }
 
     #[test]

@@ -2006,6 +2006,15 @@ mod custom_state_tests {
             ("allowit::get_state(ctx, \"a-b\")?;", "not 1 to 32"),
             ("allowit::get_state(ctx, \"\")?;", "not 1 to 32"),
             ("let s = \"unterminated;", "unterminated"),
+            // A key is the literal alone: an expression that starts with one is no key.
+            (
+                "allowit::get_state(ctx, \"day_spent\".max(\"spent\"))?;",
+                "string literal",
+            ),
+            (
+                "allowit::set_state(ctx, \"note\".to_owned() + \"x\", 1)?;",
+                "string literal",
+            ),
         ] {
             let error = declared(source, |name| crate::hash(name)).unwrap_err();
             assert!(error.contains(refused), "{source}: {error}");

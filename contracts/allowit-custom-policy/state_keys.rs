@@ -6,6 +6,8 @@
 
 /// Most state entries of one policy: `allowit_policy_wallet::MAX_POLICY_STATE`.
 pub const MAX_POLICY_STATE: usize = 8;
+/// Most packed bytes of one state value: `allowit_policy_wallet::MAX_STATE_VALUE`.
+pub const MAX_STATE_VALUE: usize = 64;
 
 /// The standard figures by key, and the figures that a `get_state` read of each keeps: `SPENT`
 /// (1), `CALLS` (2), `DAY_SPENT` (4), `DAY_TOTAL` (8). A policy never writes one.
@@ -270,8 +272,9 @@ fn calls(code: &str) -> Result<Vec<(bool, String)>, String> {
             }
             i += 1;
         }
-        let key = match tokens.get(i + 1) {
-            Some(Token::Str(key)) => key.clone(),
+        // The key argument is the literal alone: the next token ends the argument.
+        let key = match (tokens.get(i + 1), tokens.get(i + 2)) {
+            (Some(Token::Str(key)), Some(Token::Punct(',' | ')'))) => key.clone(),
             _ => {
                 return Err(format!(
                     "a state key is a string literal: the wallet must know each key of `{name}` before it runs"

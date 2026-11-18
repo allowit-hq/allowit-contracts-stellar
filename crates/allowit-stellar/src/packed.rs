@@ -141,6 +141,12 @@ fn value(r: &mut Reader) -> Result<PolicyValue> {
     })
 }
 
+/// The packed size of a Custom policy's state value, as the wallet stores it.
+pub fn state_value_bytes(value: &PolicyValue) -> Result<usize> {
+    let mut out = Vec::new();
+    put_value(&mut out, value)?;
+    Ok(out.len())
+}
 /// The value of a Custom policy's state entry at `ledger`, or `None`. A daily entry holds its
 /// window's end ledger first and reads as absent after it; a persistent entry without bytes holds
 /// no value. The value is packed as the configuration's params are.
