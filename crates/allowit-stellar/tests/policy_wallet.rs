@@ -944,6 +944,12 @@ fn execute(w: &mut Wallet, request: &x::ScVal, now: u64, ledger: u32, source: &s
     };
     let gas = int(gas);
     assert!(gas >= 0 && gas <= w.config.gas_cap);
+    // As the kernel checks: gas is counted exactly when some is repaid, and an XLM wallet counts
+    // the repaid stroops.
+    assert_eq!(gas == 0, gas_units == 0, "counted gas");
+    if w.config.asset == xlm() {
+        assert_eq!(gas_units, gas, "an XLM wallet counts the repaid stroops");
+    }
     // The sending account receives the repayment.
     assert_eq!(addr(payee), source);
     let operation = items(operation);
@@ -2333,5 +2339,86 @@ fn a_lapsed_entry_restores_in_the_operation_that_needs_it() {
         )
         .unwrap_err()
         .contains("separate restoration")
+    );
+}
+#[test]
+fn an_explicit_gas_repayment_keeps_its_gas_through_pricing() {
+    let wasm = wasm_for(PolicyTier::Common);
+    let chain = ModelChain::new(BTreeMap::from([(hash(&wasm), PolicyTier::Common)]));
+    let c = create(&chain, PolicyTier::Common, &wasm, [0x34; 32]);
+    let recipient = account_for_seed(&RECIPIENT);
+    // The server repays the whole gas cap once, and later less after a carry.
+    for (id, repaid) in [(1u8, i128::from(MAX_FEE)), (2, 500)] {
+        let state = sending_state(&chain, &c);
+        let ledger = chain.ledger();
+        let transfer = request::transfer(&c, &state, [id; 32], &recipient, 1_000_000).unwrap();
+        let explicit = ExecutionTerms {
+            expense: Some(ExpenseBounds {
+                gas_units: repaid,
+                spent_units: 1_000_000 + repaid,
+                ..ExpenseBounds::xlm(1_000_000, 0, MAX_FEE, ledger - 1, NOW).unwrap()
+            }),
+            gas: Some(GasRepayment {
+                stroops: repaid,
+                payee: sender(),
+            }),
+            ..terms(1_000_000, ledger)
+        };
+        let prepared = rpc::prepare_with(
+            &chain,
+            &c,
+            &transfer,
+            &explicit,
+            Some(chain.accounting()),
+            NOW,
+            NOW + 300,
+        )
+        .unwrap();
+        // Only the transaction's fee bound moved.
+        let expense = prepared.terms.expense.as_ref().unwrap();
+        assert_eq!(
+            (
+                expense.gas_units,
+                expense.spent_units,
+                expense.max_fee_stroops
+            ),
+            (repaid, 1_000_000 + repaid, gas() as u32)
+        );
+        let before = chain.balance();
+        let served = authorize_server(&prepared, &SERVER, NOW, None).unwrap();
+        let simulated = rpc::simulate(&chain, &served).unwrap();
+        let proof = sign(&simulated, &AGENT, NOW).unwrap();
+        let signed = authorize(&simulated, &[proof], NOW).unwrap();
+        let sealed = seal(&chain, &signed).unwrap();
+        chain.step("transfer");
+        assert_eq!(
+            rpc::broadcast(&chain, &sealed, NOW).unwrap(),
+            rpc::Broadcast::Submitted
+        );
+        assert_eq!(chain.balance(), before - 1_000_000 - repaid);
+    }
+    // Counted gas that differs from the repayment is refused before any signature.
+    let state = sending_state(&chain, &c);
+    let ledger = chain.ledger();
+    let transfer = request::transfer(&c, &state, [3; 32], &recipient, 1_000_000).unwrap();
+    let mismatched = ExecutionTerms {
+        gas: Some(GasRepayment {
+            stroops: 500,
+            payee: sender(),
+        }),
+        ..terms(1_000_000, ledger)
+    };
+    assert!(
+        rpc::prepare_with(
+            &chain,
+            &c,
+            &transfer,
+            &mismatched,
+            Some(chain.accounting()),
+            NOW,
+            NOW + 300
+        )
+        .unwrap_err()
+        .contains("differs from the gas that the wallet repays")
     );
 }

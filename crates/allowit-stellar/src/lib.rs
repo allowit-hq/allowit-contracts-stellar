@@ -383,6 +383,18 @@ impl ExpenseBounds {
     /// These bounds with the fee bound lowered to `fee_stroops`. Gas falls pro rata and rounds
     /// up, so it never counts less than the gas rate of these bounds prices `fee_stroops`; for
     /// XLM it is `fee_stroops` itself. Spent units fall by the same gas.
+    /// The bound of a transaction fee for terms whose gas repayment the server set itself, such
+    /// as the gas that it repays after a carry: only the fee bound moves, and the gas that the
+    /// wallet repays and counts stays.
+    pub fn with_fee_bound_only(&self, fee_stroops: u32) -> Result<Self> {
+        if fee_stroops == 0 || fee_stroops > self.max_fee_stroops {
+            return Err("A fee bound lowers a positive fee ceiling".into());
+        }
+        Ok(Self {
+            max_fee_stroops: fee_stroops,
+            ..self.clone()
+        })
+    }
     pub fn with_fee_bound(&self, fee_stroops: u32) -> Result<Self> {
         if fee_stroops == 0 || fee_stroops > self.max_fee_stroops || self.gas_units < 0 {
             return Err("A fee bound lowers a positive fee ceiling".into());
@@ -1422,6 +1434,7 @@ pub fn admit_classic(
 fn validate_expense(
     c: &WalletConfig,
     expense: &ExpenseBounds,
+    repaid: i128,
     operation: &StellarOperation,
     state: &TrustedState,
     now: u64,
@@ -1437,12 +1450,12 @@ fn validate_expense(
             "Expense bounds have negative units, a future observation or another day".into(),
         );
     }
-    if (expense.max_fee_stroops == 0 && expense.gas_units != 0)
-        || (expense.max_fee_stroops > 0 && expense.gas_units <= 0)
-        || (asset_xdr(c)? == Asset::Native
-            && expense.gas_units != i128::from(expense.max_fee_stroops))
+    // As the kernel checks: the wallet counts gas exactly when it repays some, and an XLM
+    // wallet counts the repaid stroops.
+    if (repaid == 0) != (expense.gas_units == 0)
+        || (asset_xdr(c)? == Asset::Native && expense.gas_units != repaid)
     {
-        return Err("Expense gas differs from its signed fee bound".into());
+        return Err("Expense gas differs from the gas that the wallet repays".into());
     }
     let principal = match operation {
         StellarOperation::Transfer(t) => {
@@ -1488,7 +1501,11 @@ fn verify_wallet_portable(
         return Err("Installed policy wallet binding differs from the installation".into());
     }
     if let Some(expense) = &terms.expense {
-        validate_expense(c, expense, operation, state, now)?;
+        let repaid = terms
+            .gas
+            .as_ref()
+            .map_or(i128::from(expense.max_fee_stroops), |gas| gas.stroops);
+        validate_expense(c, expense, repaid, operation, state, now)?;
     }
     let shape = policy::source_shape(&c.policy_source)?;
     let request = policy::RuleRequest::new(

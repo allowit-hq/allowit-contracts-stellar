@@ -377,7 +377,7 @@ pub fn prepare_with(
                     .resource_fee
                     .saturating_add(i64::from(INCLUSION_FEE_STROOPS));
                 (declared > i64::from(signed.max_fee_stroops) && bound > signed.max_fee_stroops)
-                    .then(|| ceiling.with_fee_bound(bound))
+                    .then(|| bounded(&terms, ceiling, bound))
             }
             _ => None,
         };
@@ -404,6 +404,15 @@ const REPRICE_ROUNDS: u8 = 2;
 /// first refusal is the answer. The caller then simulates the operation again with the returned
 /// terms, which decides the policy and the declared fee, and prices it again when that
 /// simulation needs a higher bound.
+/// The expense of `terms` at the fee bound `fee`: the default repayment follows the bound, and
+/// an explicit repayment keeps its gas.
+fn bounded(terms: &ExecutionTerms, ceiling: &ExpenseBounds, fee: u32) -> Result<ExpenseBounds> {
+    if terms.gas.is_some() {
+        ceiling.with_fee_bound_only(fee)
+    } else {
+        ceiling.with_fee_bound(fee)
+    }
+}
 fn priced_terms(
     rpc: &dyn Rpc,
     c: &WalletConfig,
@@ -419,7 +428,7 @@ fn priced_terms(
     let with_bound = |fee: u32| -> Result<ExecutionTerms> {
         Ok(ExecutionTerms {
             args: terms.args.clone(),
-            expense: Some(ceiling.with_fee_bound(fee.min(ceiling.max_fee_stroops))?),
+            expense: Some(bounded(terms, ceiling, fee.min(ceiling.max_fee_stroops))?),
             gas: terms.gas.clone(),
             sender: terms.sender.clone(),
         })
