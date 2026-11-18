@@ -792,7 +792,11 @@ impl OwnerClient {
                     && saved.request_id == id
                     && saved.backend == self.session.backend()
                     && saved.origin == self.session.origin()
-                    && saved.intent_hash == identity =>
+                    // The saved content must still have the identity it was saved under: a record
+                    // whose work or selection was edited does not resume.
+                    && saved.intent_hash == identity
+                    && workflow_identity(&saved.selection, &saved.work, saved.max_fee_stroops)?
+                        == identity =>
             {
                 saved
             }

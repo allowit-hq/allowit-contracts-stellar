@@ -302,6 +302,29 @@ impl OwnerLedger {
                     };
                     return Ok(account_entry(&state));
                 }
+                // The fixture wallet keeps its totals in `t`, from the installed counters, and no `d`.
+                if let x::LedgerKey::ContractData(data) = &key
+                    && data.key != x::ScVal::LedgerKeyContractInstance
+                {
+                    let counters = self.installed.lock().unwrap().clone().map(|i| i.2);
+                    let total = |name: &str| match counters.as_ref().and_then(|c| c.get(name)) {
+                        Some(native::PolicyValue::Int(v)) => *v,
+                        _ => 0,
+                    };
+                    if data.key != native::value_symbol("t")? || counters.is_none() {
+                        return Ok(json!({"latestLedger":120,"entries":[]}));
+                    }
+                    let mut bytes = u64::try_from(total("spent")).unwrap().to_be_bytes().to_vec();
+                    bytes.extend(u32::try_from(total("calls")).unwrap().to_be_bytes());
+                    let entry = x::LedgerEntryData::ContractData(x::ContractDataEntry {
+                        ext: x::ExtensionPoint::V0,
+                        contract: addr(&c.wallet),
+                        key: data.key.clone(),
+                        durability: x::ContractDataDurability::Persistent,
+                        val: x::ScVal::Bytes(bytes.try_into().unwrap()),
+                    });
+                    return Ok(json!({"latestLedger":120,"entries":[{"xdr":enc(&entry)}]}));
+                }
                 let (params, deployment_version, policy_state) = self
                     .installed
                     .lock()
