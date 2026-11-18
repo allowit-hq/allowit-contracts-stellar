@@ -17,7 +17,7 @@
     }
   },
   "dependencies": {
-    "@allowit/core": "github:allowit-hq/allowit-core#36696910ea5696794c5d413223489ca7af2f7493",
+    "@allowit/core": "github:allowit-hq/allowit-core#b722a0e8ed8f8db9dab135a258b64a50d032bacc",
     "@noble/curves": "1.9.7",
     "@noble/hashes": "1.8.0",
     "@stellar/freighter-api": "6.0.1",
