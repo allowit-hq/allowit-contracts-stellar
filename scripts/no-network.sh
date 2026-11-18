@@ -5,7 +5,10 @@
 #   cargo test --locked --no-run && scripts/no-network.sh cargo test --locked --offline
 # Linux: a systemd unit that may create no IP socket (needs sudo and systemd), as this user.
 #   It passes HOME, PATH and the Cargo and rustup settings; pass others with `env NAME=VALUE`.
-# macOS: the built-in sandbox with network access denied.
+# macOS: the built-in sandbox with network access denied. A sandbox cannot start inside another
+#   one, such as a review sandbox; that one denies the network already.
+# Both run without a rustc wrapper: a compiler cache such as sccache reaches its server over a
+# local socket, which the guard denies. Cargo's build hashes do not depend on the wrapper.
 set -eu
 if [ "$#" -eq 0 ]; then
   echo "usage: $0 command [argument...]" >&2
@@ -13,7 +16,7 @@ if [ "$#" -eq 0 ]; then
 fi
 case "$(uname -s)" in
 Linux)
-  set -- --setenv=HOME="$HOME" --setenv=PATH="$PATH" -- "$@"
+  set -- --setenv=HOME="$HOME" --setenv=PATH="$PATH" --setenv=RUSTC_WRAPPER= -- "$@"
   for name in CARGO_HOME CARGO_INCREMENTAL CARGO_TARGET_DIR CARGO_TERM_COLOR RUSTFLAGS RUSTUP_HOME RUSTUP_TOOLCHAIN; do
     eval "value=\${$name-}"
     if [ -n "$value" ]; then
@@ -24,7 +27,11 @@ Linux)
     --property=PrivateNetwork=yes --property=RestrictAddressFamilies=AF_UNIX "$@"
   ;;
 Darwin)
-  exec sandbox-exec -p '(version 1)(allow default)(deny network*)' "$@"
+  if ! sandbox-exec -p '(version 1)(allow default)' /usr/bin/true 2>/dev/null; then
+    echo "$0: cannot start the macOS sandbox here: a sandbox cannot start inside another one" >&2
+    exit 71
+  fi
+  exec env RUSTC_WRAPPER= sandbox-exec -p '(version 1)(allow default)(deny network*)' "$@"
   ;;
 *)
   echo "$0: no network guard for $(uname -s)" >&2
