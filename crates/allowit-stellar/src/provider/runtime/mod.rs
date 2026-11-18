@@ -107,6 +107,18 @@ impl Runtime {
     ) -> Vec<ObservedAuthorization> {
         let mut observed = Vec::new();
         for prepared in packets {
+            // A policy wallet operation settles in its sealed transaction, which its event
+            // names; another settles under its prepared hash.
+            if prepared.config.route == WalletRoute::PolicyWallet
+                && prepared.payment_authorization.is_none()
+            {
+                if let Ok(Some((signed, receipt))) =
+                    rpc::policy_wallet_settlement(self.rpc(), prepared)
+                {
+                    observed.push(ObservedAuthorization { signed, receipt });
+                }
+                continue;
+            }
             let Ok(Some(receipt)) = rpc::receipt_by_hash(
                 self.rpc(),
                 &prepared.config.network,

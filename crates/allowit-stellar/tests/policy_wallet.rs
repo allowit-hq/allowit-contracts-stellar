@@ -315,6 +315,8 @@ struct Model {
     enforce_fee: i64,
     /// The wallet's consumed authorization nonces.
     nonces: BTreeSet<i64>,
+    /// The wallet's `allowit` events: ledger, operation id and transaction hash.
+    events: Vec<(u32, x::ScVal, String)>,
 }
 /// A model of Stellar RPC, the deployer and the layout 5 wallet. It records authorization like
 /// Stellar RPC, verifies the agent's and the server's signatures where the wallet's
@@ -772,12 +774,37 @@ impl rpc::Rpc for ModelChain {
                 account.sequence += 1;
                 let ledger = m.ledger;
                 let result = apply(&mut m, &env.tx);
+                // An execution publishes `allowit` with its operation id.
+                if let x::HostFunction::InvokeContract(call) = &host_op(&env.tx).host_function
+                    && call.function_name.0.as_slice() == b"execute"
+                {
+                    m.events
+                        .push((ledger, items(&call.args[0])[0].clone(), tx_hash.clone()));
+                }
                 let name = std::mem::take(&mut m.pending_name);
                 let state = m.wallet.as_ref().map(|w| w.view(ledger));
                 m.steps.push((name, signed.clone(), ledger, result, state));
                 m.settled.insert(tx_hash.clone(), signed);
                 m.ledger += 1;
                 Ok(json!({"hash": tx_hash, "status": "PENDING"}))
+            }
+            "getEvents" => {
+                let start = params["startLedger"].as_u64().unwrap() as u32;
+                let filter = &params["filters"][0];
+                let wallet = m.wallet.as_ref().map(|w| w.address.clone());
+                assert_eq!(filter["contractIds"][0].as_str(), wallet.as_deref());
+                let topics = &filter["topics"][0];
+                assert_eq!(
+                    topics[0],
+                    json!(b64(&x::ScVal::Symbol("allowit".try_into().unwrap())))
+                );
+                let events: Vec<Value> = m
+                    .events
+                    .iter()
+                    .filter(|(ledger, id, _)| *ledger >= start && json!(b64(id)) == topics[1])
+                    .map(|(ledger, _, hash)| json!({"ledger": ledger, "txHash": hash}))
+                    .collect();
+                Ok(json!({"events": events, "latestLedger": m.ledger}))
             }
             "getTransaction" => {
                 let tx_hash = params["hash"].as_str().unwrap();
@@ -2420,5 +2447,38 @@ fn an_explicit_gas_repayment_keeps_its_gas_through_pricing() {
         )
         .unwrap_err()
         .contains("differs from the gas that the wallet repays")
+    );
+}
+#[test]
+fn recovery_finds_a_policy_wallet_execution_by_its_event() {
+    use allowit_stellar::provider::runtime::Runtime;
+    let wasm = wasm_for(PolicyTier::Common);
+    let chain = std::sync::Arc::new(ModelChain::new(BTreeMap::from([(
+        hash(&wasm),
+        PolicyTier::Common,
+    )])));
+    let c = create(&chain, PolicyTier::Common, &wasm, [0x35; 32]);
+    let state = sending_state(&chain, &c);
+    let ledger = chain.ledger();
+    let recipient = account_for_seed(&RECIPIENT);
+    let transfer = request::transfer(&c, &state, [1; 32], &recipient, 1_000_000).unwrap();
+    let signed = run(&chain, &c, &transfer, &terms(1_000_000, ledger), "transfer").unwrap();
+    let prepared = &signed.prepared;
+    // The sealed transaction is another one than the prepared transaction.
+    assert_ne!(signed.transaction_hash, prepared.transaction_hash);
+    let runtime = Runtime::from_rpc(chain.clone());
+    let observed = runtime.observe_authorizations([prepared]);
+    assert_eq!(observed.len(), 1);
+    let found = &observed[0];
+    assert_eq!(found.receipt.transaction_hash, signed.transaction_hash);
+    assert_eq!(found.signed.transaction_xdr, signed.transaction_xdr);
+    // An operation that never ran has no event.
+    let state = sending_state(&chain, &c);
+    let other = request::transfer(&c, &state, [2; 32], &recipient, 1_000_000).unwrap();
+    let unsent = authorized(&chain, &c, &other, &terms(1_000_000, chain.ledger())).unwrap();
+    assert!(
+        runtime
+            .observe_authorizations([&unsent.prepared])
+            .is_empty()
     );
 }

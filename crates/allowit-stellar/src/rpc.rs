@@ -887,6 +887,50 @@ pub fn operation_lapsed(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<bool> {
         (expiration + lifetime).saturating_sub(u64::from(authorization::WALLET_AUTH_LEDGERS) + 1);
     Ok(observed > expiration && observed <= live_through)
 }
+/// The settlement of the policy wallet operation `p`, found by the wallet's `allowit` event of
+/// its operation id. The settled transaction is the sealed one, so its hash is not the prepared
+/// hash: the event names it. The read starts at the ledger of the preparation. `None` when the
+/// endpoint holds no such event, or no successful transaction of `p` carries it.
+pub fn policy_wallet_settlement(
+    rpc: &dyn Rpc,
+    p: &PreparedOperation,
+) -> Result<Option<(SignedOperation, VerifiedReceipt)>> {
+    if p.config.route != WalletRoute::PolicyWallet || p.payment_authorization.is_some() {
+        return Err("Only a policy wallet operation settles with its own event".into());
+    }
+    let topics = [
+        xdr(&value_symbol("allowit")?)?,
+        xdr(&value_bytes(&p.request.operation.nonce)?)?,
+    ];
+    let reply = rpc.call(
+        "getEvents",
+        json!({
+            "startLedger": p.state.ledger,
+            "filters": [{"type": "contract", "contractIds": [p.config.wallet], "topics": [topics]}],
+            "pagination": {"limit": 10},
+        }),
+    )?;
+    for event in reply["events"].as_array().ok_or("Missing ledger events")? {
+        let hash = unhex::<32>(
+            event["txHash"]
+                .as_str()
+                .ok_or("Invalid event transaction")?,
+        )?;
+        let Some(receipt) = receipt_by_hash(rpc, &p.config.network, &hash)? else {
+            continue;
+        };
+        let signed = SignedOperation {
+            prepared: p.clone(),
+            transaction_xdr: receipt.envelope_xdr.clone(),
+            transaction_hash: receipt.transaction_hash,
+            role_signatures: Vec::new(),
+        };
+        if validate_settled_policy_packet(&signed, &receipt).is_ok() {
+            return Ok(Some((signed, receipt)));
+        }
+    }
+    Ok(None)
+}
 /// Verify a terminal CAP-15 wrapper before retaining the original inner transaction.
 /// This accepts settlement evidence only; owner intent signing still rejects fee-bump envelopes.
 fn settlement_reply<'a>(

@@ -1780,6 +1780,14 @@ impl Retained {
         self.0.paid_service.as_ref()
     }
 }
+/// The digest that the agent signed for `p`: a payment authorization's digest, or else the
+/// digest of the operation, which for a policy wallet is its own authorization payload.
+fn agent_signed_digest(p: &PreparedOperation) -> Result<[u8; 32]> {
+    match &p.payment_authorization {
+        Some(_) => Ok(sdk::seller_settled::signing_hash(p)),
+        None => checked(sdk::signing_digest(p)),
+    }
+}
 pub fn retained(
     journal: &Store,
     network: &str,
@@ -1817,7 +1825,7 @@ pub fn retained(
                 }
                 checked(sdk::signing::verify_digest(
                     &signature.signer,
-                    &sdk::seller_settled::signing_hash(p),
+                    &agent_signed_digest(p)?,
                     &signature.signature,
                 ))?;
             }
@@ -1966,6 +1974,24 @@ mod native_revalidation_tests {
             "../../../tests/fixtures/provider/stellar-policy-wallet-revalidation-rpc.json"
         ))
         .unwrap()
+    }
+    /// A journaled agent signature of a policy wallet operation covers the wallet's own
+    /// authorization payload, not the prepared transaction hash; recovery checks that payload.
+    #[test]
+    fn a_retained_policy_wallet_signature_covers_the_wallet_payload() {
+        let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
+        assert_eq!(p.config.route, sdk::WalletRoute::PolicyWallet);
+        let digest = agent_signed_digest(&p).unwrap();
+        assert_eq!(digest, sdk::signing_digest(&p).unwrap());
+        assert_ne!(digest, p.transaction_hash);
+        use ed25519_dalek::Signer;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[44; 32]);
+        let agent = sdk::account_for_seed(&[44; 32]);
+        sdk::signing::verify_digest(&agent, &digest, &key.sign(&digest).to_bytes()).unwrap();
+        assert!(
+            sdk::signing::verify_digest(&agent, &digest, &key.sign(&p.transaction_hash).to_bytes())
+                .is_err()
+        );
     }
     #[test]
     fn recovery_uses_the_original_service_even_if_the_caller_changes_its_default() {
