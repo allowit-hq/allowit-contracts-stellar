@@ -1589,23 +1589,6 @@ struct AdminRpc {
     bad_auth: bool,
     address_v2: bool,
 }
-fn replace_field(value: &mut stellar_xdr::ScVal, name: &str, new: stellar_xdr::ScVal) {
-    let stellar_xdr::ScVal::Map(Some(map)) = value else {
-        panic!()
-    };
-    let mut fields = map.to_vec();
-    fields.retain(
-        |e| !matches!(&e.key,stellar_xdr::ScVal::Symbol(s) if s.0.as_slice()==name.as_bytes()),
-    );
-    fields.push(stellar_xdr::ScMapEntry {
-        key: stellar_xdr::ScVal::Symbol(stellar_xdr::ScSymbol(
-            name.as_bytes().to_vec().try_into().unwrap(),
-        )),
-        val: new,
-    });
-    fields.sort_by(|a, b| a.key.cmp(&b.key));
-    *map = fields.try_into().unwrap();
-}
 impl rpc::Rpc for AdminRpc {
     fn call(&self, method: &str, params: Value) -> Result<Value> {
         use stellar_xdr::*;
@@ -1925,7 +1908,6 @@ fn owner_admin_fails_closed_on_release_owner_mismatch_auth_and_empty_balance() {
 }
 #[test]
 fn contract_release_and_persisted_counter_names_are_exact() {
-    use stellar_xdr::ScVal;
     for (layout, works) in [(5, true), (0, false), (1, false), (4, false), (6, false)] {
         let rpc = admin_fixture(layout);
         let observed = rpc::trusted_state_for_discovery(&rpc, &rpc.base.config, None);
@@ -3140,8 +3122,8 @@ fn owner_recovery_reads_only_kept_fields_and_pause_only_the_current_layout() {
     );
     // A later layout keeps the fixed header and the owner's recovery; set_pause and
     // deploy_policy read the whole configuration of this layout, so they reject.
-    for layout in [6] {
-        let old = admin_fixture(layout);
+    {
+        let old = admin_fixture(6);
         let mut admin = OwnerAdmin {
             rpc: &old,
             config: &old.base.config,
