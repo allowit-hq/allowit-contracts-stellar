@@ -377,8 +377,7 @@ pub struct Provider {
 /// The signing capability of the server's sending accounts: it signs a transaction hash with the
 /// key of the named account. A policy wallet operation is sent from one of them, which pays its
 /// fee; the wallet repays the gas to it.
-pub type Sender =
-    std::sync::Arc<dyn Fn(&str, &[u8; 32]) -> native::Result<[u8; 64]> + Send + Sync>;
+pub type Sender = std::sync::Arc<dyn Fn(&str, &[u8; 32]) -> native::Result<[u8; 64]> + Send + Sync>;
 impl Provider {
     /// One owner action on a keypair wallet: a transaction from the owner's account whose
     /// operations the owner's signature authorizes alone. `Recover` without an amount closes
@@ -1079,17 +1078,16 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         // A policy wallet operation leaves this step final: the sending account that the request
         // names as its fee payer seals it, so the retained packet is the transaction the network
         // gets.
-        let signed = if p.config.route == WalletRoute::PolicyWallet
-            && p.payment_authorization.is_none()
-        {
-            let sender = self.sender.as_ref().ok_or_else(|| {
-                Error::config("This server has no sending account for policy wallet operations")
-            })?;
-            let source = checked(native::gas_payee(&p.request, &p.terms))?;
-            checked(rpc::seal(self.rpc(), &signed, |hash| sender(&source, hash)))?
-        } else {
-            signed
-        };
+        let signed =
+            if p.config.route == WalletRoute::PolicyWallet && p.payment_authorization.is_none() {
+                let sender = self.sender.as_ref().ok_or_else(|| {
+                    Error::config("This server has no sending account for policy wallet operations")
+                })?;
+                let source = checked(native::gas_payee(&p.request, &p.terms))?;
+                checked(rpc::seal(self.rpc(), &signed, |hash| sender(&source, hash)))?
+            } else {
+                signed
+            };
         Ok(Signed(packet(&p.config.network, &signed)?))
     }
     fn validate_signed(&self, p: &Signed, now: u64) -> Result<()> {
@@ -1539,22 +1537,12 @@ pub fn authority_document(s: &Snapshot) -> Result<serde_json::Value> {
 
 /// Parse retained signed identity without granting new submission authority. Chain-only recovery
 /// can retain an included envelope whose signature roles rotated; broadcast validates signatures again.
+/// A retained signed packet: for a policy wallet, the prepared transaction with both
+/// cosignatures and, once sealed, its final resources, fee and source signature; the hash is
+/// that of the transaction it carries.
 fn retained_signed_shape(s: &SignedOperation) -> Result<()> {
     checked(native::validate_retained_prepared(&s.prepared))?;
-    if s.prepared.config.route != WalletRoute::PolicyWallet
-        || s.prepared.payment_authorization.is_some()
-    {
-        return checked(native::validate_retained_signed(s));
-    }
-    checked(native::validate_server_authorization(&s.prepared))?;
-    let hash = checked(rpc::signed_transaction_hash(
-        &s.prepared.config.network,
-        &s.transaction_xdr,
-    ))?;
-    if hash != s.transaction_hash || hash != s.prepared.transaction_hash {
-        return Err(Error::config("Retained signed identity differs"));
-    }
-    Ok(())
+    checked(native::validate_retained_signed(s))
 }
 pub fn validate_signed(p: &Packet) -> Result<()> {
     let signed: SignedOperation = decode_packet(p)?;

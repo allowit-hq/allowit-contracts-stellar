@@ -1058,7 +1058,9 @@ pub fn deployer_address(network: &str) -> Result<String> {
     if passphrase(network)? == passphrase("stellar:testnet")? {
         Ok("CDQZA6UPOF6CH7H45GTBNH2O3AO7DH3CDD2JJNHHBO4GT4WJEQ7GUY5P".into())
     } else {
-        Err(format!("No policy wallet deployer is installed on {network}"))
+        Err(format!(
+            "No policy wallet deployer is installed on {network}"
+        ))
     }
 }
 /// The owner's authorization of `deployer.deploy(owner, wasm_hash, salt, [config], funding)`: the

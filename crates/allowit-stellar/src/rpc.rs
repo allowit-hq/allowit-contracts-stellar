@@ -483,14 +483,19 @@ pub fn seal(
     if v.get("error").is_some_and(|value| !value.is_null()) {
         return Err("policy wallet simulation rejected the authorized operation".into());
     }
-    if v.get("restorePreamble").is_some_and(|value| !value.is_null()) {
+    if v.get("restorePreamble")
+        .is_some_and(|value| !value.is_null())
+    {
         return Err("The operation needs a separate restoration first".into());
     }
     if readonly_result(&v)? != ScVal::Void {
         return Err("Native simulation returned a value from execute".into());
     }
-    let mut data: SorobanTransactionData =
-        read(v["transactionData"].as_str().ok_or("Missing simulated resources")?)?;
+    let mut data: SorobanTransactionData = read(
+        v["transactionData"]
+            .as_str()
+            .ok_or("Missing simulated resources")?,
+    )?;
     let required = u32::try_from(data.resource_fee)
         .map_err(|_| "Invalid resource fee")?
         .checked_add(crate::INCLUSION_FEE_STROOPS)

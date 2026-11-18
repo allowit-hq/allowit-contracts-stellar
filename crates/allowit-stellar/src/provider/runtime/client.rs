@@ -625,7 +625,9 @@ fn validate_response_receipt(r: &Response) -> Result<()> {
         let expected = if p.config.route == WalletRoute::PolicyWallet {
             r.signed_operation
                 .as_ref()
-                .ok_or_else(|| Error::uncertain("Stellar receipt arrived without its sealed operation"))?
+                .ok_or_else(|| {
+                    Error::uncertain("Stellar receipt arrived without its sealed operation")
+                })?
                 .transaction_hash
         } else {
             p.transaction_hash

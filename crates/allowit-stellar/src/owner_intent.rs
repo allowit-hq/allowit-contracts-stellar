@@ -619,14 +619,19 @@ fn validate_host(
                     ScVal::Address(address(&limits.owner)?),
                     value_bytes(&config.module_digest)?,
                     value_bytes(salt)?,
-                    ScVal::Vec(Some(constructor.constructor_args()?.try_into().map_err(err)?)),
+                    ScVal::Vec(Some(
+                        constructor.constructor_args()?.try_into().map_err(err)?,
+                    )),
                     ScVal::Vec(Some(items.try_into().map_err(err)?)),
                 ]
                 .try_into()
                 .map_err(err)?,
             });
             if invoke.host_function != exact || invoke.auth.len() != 1 {
-                return Err("Owner creation differs from the complete selected constructor and funding".into());
+                return Err(
+                    "Owner creation differs from the complete selected constructor and funding"
+                        .into(),
+                );
             }
             admin::validate_auth(&limits.network, &exact, &invoke.auth, None)?;
         }

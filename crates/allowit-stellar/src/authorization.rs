@@ -159,7 +159,9 @@ pub fn wallet_payload(p: &PreparedOperation) -> Result<[u8; 32]> {
 }
 /// The agent's and the server's signatures in the wallet's entry, verified; a placeholder of
 /// zeros stands for a part that is not signed yet.
-pub(crate) fn cosignatures(p: &PreparedOperation) -> Result<(Option<[u8; 64]>, Option<[u8; 64]>)> {
+/// The agent's and the server's signatures, each present or not.
+pub(crate) type Cosignatures = (Option<[u8; 64]>, Option<[u8; 64]>);
+pub(crate) fn cosignatures(p: &PreparedOperation) -> Result<Cosignatures> {
     let entry = wallet_authorization(p)?;
     let SorobanCredentials::Address(credentials) = &entry.credentials else {
         return Err("Expected the wallet's address authorization".into());

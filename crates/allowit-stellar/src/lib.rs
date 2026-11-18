@@ -2231,8 +2231,8 @@ fn authorize_wallet(
     p: &PreparedOperation,
     signatures: &[DetachedSignature],
 ) -> Result<SignedOperation> {
-    let server = authorization::server_signature(p, true)?
-        .ok_or("Service authorization is unsigned")?;
+    let server =
+        authorization::server_signature(p, true)?.ok_or("Service authorization is unsigned")?;
     let [s] = signatures else {
         return Err("The agent's one signature of the wallet's authorization is required".into());
     };

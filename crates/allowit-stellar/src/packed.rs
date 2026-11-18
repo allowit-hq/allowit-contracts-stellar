@@ -279,7 +279,7 @@ pub fn encode(c: &Configuration) -> Result<Vec<u8>> {
     let owner_contract = c.owner.starts_with('C');
     let mut out = vec![
         c.layout,
-        u8::from(c.paused) * PAUSED | if owner_contract { OWNER_CONTRACT } else { 0 },
+        (u8::from(c.paused) * PAUSED) | if owner_contract { OWNER_CONTRACT } else { 0 },
     ];
     out.extend(c.deployment_version.to_be_bytes());
     for address in [&c.owner, &c.agent, &c.server, &c.asset] {

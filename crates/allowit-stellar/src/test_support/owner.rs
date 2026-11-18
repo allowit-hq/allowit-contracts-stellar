@@ -314,7 +314,10 @@ impl OwnerLedger {
                     if data.key != native::value_symbol("t")? || counters.is_none() {
                         return Ok(json!({"latestLedger":120,"entries":[]}));
                     }
-                    let mut bytes = u64::try_from(total("spent")).unwrap().to_be_bytes().to_vec();
+                    let mut bytes = u64::try_from(total("spent"))
+                        .unwrap()
+                        .to_be_bytes()
+                        .to_vec();
                     bytes.extend(u32::try_from(total("calls")).unwrap().to_be_bytes());
                     let entry = x::LedgerEntryData::ContractData(x::ContractDataEntry {
                         ext: x::ExtensionPoint::V0,

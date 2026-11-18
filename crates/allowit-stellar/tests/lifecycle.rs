@@ -2087,7 +2087,6 @@ fn contract_release_and_persisted_counter_names_are_exact() {
     }
 }
 
-
 /// Sign the new owner's recorded entry as a native wallet does.
 #[test]
 fn full_policy_deployment_uses_one_versioned_owner_flow_and_owner_handoff_authorization() {
@@ -2132,8 +2131,11 @@ fn full_policy_deployment_uses_one_versioned_owner_flow_and_owner_handoff_author
     );
     // The unsigned transaction carries the recorded entries of both owners.
     let stellar_xdr::TransactionEnvelope::Tx(envelope) =
-        stellar_xdr::TransactionEnvelope::from_xdr_base64(&prepared.transaction_xdr, Limits::none())
-            .unwrap()
+        stellar_xdr::TransactionEnvelope::from_xdr_base64(
+            &prepared.transaction_xdr,
+            Limits::none(),
+        )
+        .unwrap()
     else {
         panic!()
     };
@@ -2160,7 +2162,10 @@ fn full_policy_deployment_uses_one_versioned_owner_flow_and_owner_handoff_author
     // `AllowitPolicyUpdate`: agent, deployment version, gas cap, owner, params, rules, server,
     // source hash and code.
     assert_eq!(fields.len(), 9);
-    assert!(fields.iter().any(|e|matches!(&e.key,stellar_xdr::ScVal::Symbol(k) if k.0.as_slice()==b"deployment_version") && e.val==stellar_xdr::ScVal::U32(3)));
+    assert!(fields.iter().any(
+        |e| matches!(&e.key,stellar_xdr::ScVal::Symbol(k) if k.0.as_slice()==b"deployment_version")
+            && e.val == stellar_xdr::ScVal::U32(3)
+    ));
     assert!(!fields.iter().any(|e| matches!(&e.key,stellar_xdr::ScVal::Symbol(k) if [b"x402_enabled".as_slice(),b"policy_version".as_slice()].contains(&k.0.as_slice()))));
     drop(calls);
     owner_handoff_completes_with_the_new_owner_signature(&rpc, &prepared, &op.auth[1]);
@@ -2338,7 +2343,6 @@ fn canonical_main_revision_packet_is_status_only_and_preserves_signed_bytes() {
     changed.prepared.state.contract_version = Some(99);
     assert!(validate_retained_signed(&changed).is_err());
 }
-
 
 #[test]
 fn explicit_engine_release_query_distinguishes_legacy_absence_from_failures() {
@@ -2572,13 +2576,7 @@ fn native_preflight_binds_new_signing_and_json_cannot_restore_it() {
             "expires_at" => changed.expires_at -= 1,
             "source" => changed.config.policy_source.push(' '),
             "spent" => {
-                changed
-                    .state
-                    .policy_state
-                    .as_mut()
-                    .unwrap()
-                    .figures
-                    .calls = 1;
+                changed.state.policy_state.as_mut().unwrap().figures.calls = 1;
             }
             _ => unreachable!(),
         };
@@ -3194,8 +3192,6 @@ fn direct_server_account_must_exist_and_authorize_its_current_threshold() {
         assert!(rpc::trusted_state_for_discovery(&rpc, &rpc.base.base.config, None).is_ok());
     }
 }
-
-
 
 #[test]
 fn malformed_retained_policy_wallet_envelopes_return_errors() {
