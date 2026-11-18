@@ -529,23 +529,6 @@ impl OwnerClient {
         }
         Ok(next)
     }
-    /// The owner's view of the build of a Custom policy: the build ticket, the hash of the source
-    /// that the owner signed and the build that the server holds. The owner's client builds that
-    /// source and hands the code to the server, which uploads it at deployment.
-    pub fn custom_build(&self, policy_id: &str, now: u64) -> Result<Value> {
-        self.session.owner_request(
-            Method::Post,
-            "/api/native/custom/build",
-            Some(&json!({ "policyId": policy_id })),
-            now,
-            false,
-        )
-    }
-    /// The owner's signed-in session, after [`Self::authenticate`]. The SDK sends the owner
-    /// routes that need no rail step under it.
-    pub fn into_session(self) -> crate::host::owner_session::Client {
-        self.session
-    }
     /// Change typed params of an unsigned draft. The server checks each value against the
     /// param's type and range; the reply holds exactly the values that were sent.
     pub fn edit_params(

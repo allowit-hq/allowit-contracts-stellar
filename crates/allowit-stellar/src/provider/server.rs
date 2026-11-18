@@ -343,12 +343,24 @@ pub fn same_snapshot(a: &Snapshot, b: &Snapshot) -> Result<bool> {
     b.state.ledger = 0;
     Ok(a == b)
 }
+/// The gas carry of an operation: only a policy wallet operation that repays its gas takes one,
+/// and a carry for any other operation is the caller's error.
+fn gas_carry(repays_gas: bool, carry: u128) -> Result<u128> {
+    match (repays_gas, carry) {
+        (true, carry) => Ok(carry),
+        (false, 0) => Ok(0),
+        (false, _) => Err(Error::usage(
+            "Only a policy wallet operation that repays its gas takes a gas carry",
+        )),
+    }
+}
 pub fn receipt_info(p: &Packet) -> Result<ReceiptInfo> {
     let r: rpc::VerifiedReceipt = decode_packet(p)?;
     let result: stellar_xdr::TransactionResult = checked(native::read(&r.result_xdr))?;
     // A policy wallet counts the gas units of its signed expense. A keypair account has no
     // counters: the engine prices its fee through ServerHooks::charged_fee.
     let charged_units = checked(rpc::counted_gas_units(&r))?;
+    let repaid_native_units = checked(rpc::repaid_gas_stroops(&r))?;
     Ok(ReceiptInfo {
         // The settlement of a payment authorization keeps the identity of the retained
         // operation, and names the transaction that settled it apart.
@@ -365,6 +377,7 @@ pub fn receipt_info(p: &Packet) -> Result<ReceiptInfo> {
                     .map_err(|_| Error::config("Invalid Stellar receipt fee"))?
             },
             charged_units,
+            repaid_native_units,
         },
         // The prepared operation carries its debits; the receipt adds only the fee.
         debits: Vec::new(),
@@ -947,15 +960,19 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 .transpose()?,
             gas: None,
             sender: None,
+            gas_carry: 0,
         };
         let accounting = accounting(a);
         let request: native::workflow::ExecutionRequest = decode_packet(&r.0)?;
         // A policy wallet operation is sent by one of the server's sending accounts, which pays
         // its fee and receives the gas: the priced expense's fee bound.
         let mut terms = terms;
-        if c.route == WalletRoute::PolicyWallet && !native::seller_settled::is_request(&request) {
+        let repays_gas =
+            c.route == WalletRoute::PolicyWallet && !native::seller_settled::is_request(&request);
+        if repays_gas {
             terms.sender = Some(self.sending_account()?);
         }
+        terms.gas_carry = gas_carry(repays_gas, t.gas_carry_units)?;
         if native::seller_settled::is_request(&request) {
             return self.packet(&checked(native::seller_settled::prepare(
                 self.rpc(),
@@ -1789,12 +1806,14 @@ mod receipt_fee_tests {
                 panic!()
             };
             let mut args = call.args.to_vec();
-            // The positional request holds its expense as field 4.
+            // The positional request holds its expense as field 4 and the repaid stroops as
+            // field 5: for XLM, the counted gas.
             let ScVal::Vec(Some(request)) = &args[0] else {
                 panic!()
             };
             let mut fields = request.to_vec();
             fields[4] = native::contract::expense(Some(expense)).unwrap();
+            fields[5] = native::i128_value(expense.gas_units);
             args[0] = ScVal::Vec(Some(fields.try_into().unwrap()));
             call.args = args.try_into().unwrap();
             envelope.tx.operations = operations.try_into().unwrap();
@@ -1824,9 +1843,25 @@ mod receipt_fee_tests {
         receipt_info(&packet(network, &receipt).unwrap()).unwrap()
     }
 
+    /// Only an operation that repays its gas takes a gas carry.
+    #[test]
+    fn only_an_operation_that_repays_its_gas_takes_a_gas_carry() {
+        assert_eq!(gas_carry(true, 5).unwrap(), 5);
+        assert_eq!(gas_carry(true, 0).unwrap(), 0);
+        assert_eq!(gas_carry(false, 0).unwrap(), 0);
+        assert!(
+            gas_carry(false, 1)
+                .unwrap_err()
+                .message
+                .contains("takes a gas carry")
+        );
+    }
+
     /// A policy wallet receipt reports the fee paid and, beside it, the gas units that the
-    /// wallet counted: the signed expense, never less than the fee that its bound admits. A
-    /// failed transaction, an unpriced request and a keypair account report no counted units.
+    /// wallet counted and the stroops that it repaid: without a carry, the signed expense, never
+    /// less than the fee that its bound admits. A failed transaction, an unpriced request and a
+    /// keypair account report no counted units, and a failed transaction and a keypair account
+    /// no repayment.
     #[test]
     fn a_receipt_reports_the_fee_paid_and_the_gas_that_its_wallet_counted() {
         let wallet = crate::test_support::policy_signed();
@@ -1836,19 +1871,41 @@ mod receipt_fee_tests {
             .unwrap();
         let info = settled(&wallet, Some(&expense), true, 2_202_952);
         assert_eq!(
-            (info.fee.native_units, info.fee.charged_units),
-            (2_202_952, 2_670_684)
+            (
+                info.fee.native_units,
+                info.fee.charged_units,
+                info.fee.repaid_native_units
+            ),
+            (2_202_952, 2_670_684, 2_670_684)
         );
         assert!(info.fee.charged_units >= info.fee.native_units as i128);
+        // With a carry the wallet repays and counts less than the bound.
+        let carried = expense.with_gas_carry(1_000_000).unwrap();
+        let info = settled(&wallet, Some(&carried), true, 2_202_952);
+        assert_eq!(
+            (info.fee.charged_units, info.fee.repaid_native_units),
+            (1_670_684, 1_670_684)
+        );
         let failed = settled(&wallet, Some(&expense), false, 2_202_952);
         assert_eq!(
-            (failed.fee.native_units, failed.fee.charged_units),
-            (2_202_952, 0)
+            (
+                failed.fee.native_units,
+                failed.fee.charged_units,
+                failed.fee.repaid_native_units
+            ),
+            (2_202_952, 0, 0)
         );
         assert_eq!(settled(&wallet, None, true, 100).fee.charged_units, 0);
         let account = crate::test_support::native_signed();
         let info = settled(&account, None, true, 100);
-        assert_eq!((info.fee.native_units, info.fee.charged_units), (100, 0));
+        assert_eq!(
+            (
+                info.fee.native_units,
+                info.fee.charged_units,
+                info.fee.repaid_native_units
+            ),
+            (100, 0, 0)
+        );
     }
 }
 

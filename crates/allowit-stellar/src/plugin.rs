@@ -877,6 +877,7 @@ mod tests {
             fee: allowit_core::vendor::runtime::Fee {
                 native_units,
                 charged_units: 0,
+                repaid_native_units: 0,
             },
             debits: Vec::new(),
             settlement_hash: None,
