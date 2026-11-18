@@ -1442,6 +1442,67 @@ pub(crate) fn readonly_result(value: &Value) -> Result<ScVal> {
     }
     read(results[0]["xdr"].as_str().ok_or("Missing binding XDR")?)
 }
+/// The simulation source of [`contract_read`]: the account of the all-zero key. A simulation
+/// needs a source account in its envelope; the network neither loads nor charges it, and nobody
+/// holds its key.
+pub const NULL_ACCOUNT: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+/// Read one value of `contract` on `network` with a simulation that authorizes nothing, writes
+/// nothing and needs no account: a read that anyone can make. `rpc` must serve `network`. A call
+/// that asks for an authorization, needs an archived entry restored or fails is an error, never
+/// a value. Returns the value and the ledger that the simulation read.
+pub fn contract_read(
+    rpc: &dyn Rpc,
+    network: &str,
+    contract: &str,
+    function: &str,
+    args: Vec<ScVal>,
+) -> Result<(ScVal, u32)> {
+    Contract::from_string(contract).map_err(err)?;
+    owner_observation::network(rpc, network)?;
+    let call = InvokeContractArgs {
+        contract_address: address(contract)?,
+        function_name: ScSymbol(function.as_bytes().to_vec().try_into().map_err(err)?),
+        args: args.try_into().map_err(err)?,
+    };
+    let tx = Transaction {
+        source_account: muxed(NULL_ACCOUNT)?,
+        fee: 100,
+        seq_num: SequenceNumber(1),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function: HostFunction::InvokeContract(call),
+                auth: VecM::default(),
+            }),
+        }]
+        .try_into()
+        .map_err(err)?,
+        ext: TransactionExt::V0,
+    };
+    let response = rpc.call(
+        "simulateTransaction",
+        json!({"transaction": xdr(&TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: VecM::default(),
+        }))?}),
+    )?;
+    if response.get("error").is_some_and(|value| !value.is_null()) {
+        return Err(format!("The contract read {function} failed"));
+    }
+    reject_restoration(&response)?;
+    let auth = response["results"][0]["auth"]
+        .as_array()
+        .ok_or("Missing contract read authorization result")?;
+    if !auth.is_empty() {
+        return Err(format!(
+            "The contract read {function} asks for an authorization"
+        ));
+    }
+    let ledger = owner_observation::ledger(&response["latestLedger"])?;
+    Ok((readonly_result(&response)?, ledger))
+}
 /// Read an explicitly selected shared checker's executable release metadata without authorizing a call.
 /// `None` requires a host diagnostic that the selected engine has no `engine_version` export.
 /// Transport failures, unavailable diagnostics and malformed metadata are errors. This query
