@@ -137,7 +137,8 @@ pub fn generated_policy_reply(policy: &Value, prompt: &Value) -> Value {
 
 /// Turn a generated policy into the server's Native draft for a new wallet account: XLM, the
 /// Native route and module identity, and no account, deployment or tier until the owner's setup
-/// creates the account and its registration binds the draft.
+/// creates the account and its registration binds the draft. It keeps the network template's fee
+/// bound, as the server's draft does.
 pub fn native_new_wallet(policy: &mut Value) {
     let xlm = crate::sac_address(
         "stellar:testnet",
@@ -159,7 +160,6 @@ pub fn native_new_wallet(policy: &mut Value) {
         ("asset", json!(xlm)),
         ("assetSymbol", json!("XLM")),
         ("assetIssuer", Value::Null),
-        ("maxFeeUnits", json!(100_000)),
     ] {
         b.insert(key.into(), value);
     }
@@ -188,5 +188,7 @@ pub fn native_bound(policy: &Value, wallet: &str) -> Value {
     b.remove("template");
     b.insert("wallet".into(), json!(wallet));
     b.insert("deploymentId".into(), json!("07".repeat(32)));
+    // The account's own fee bound, as the setup states it.
+    b.insert("maxFeeUnits".into(), json!(100_000));
     bound
 }

@@ -691,13 +691,16 @@ fn validate_generated(
         .map_err(|_| Error::uncertain("Invalid returned canonical rules"))?;
     let asset = native::asset_from_identity(&b.asset_symbol, b.asset_issuer.as_deref())
         .map_err(crate::provider::failure)?;
+    // A Native draft for a new wallet holds the network template's fee bound. Its deployment
+    // replaces it with the account's own, which the bound draft states and which is checked then.
+    let fee_route = if kind == "contract-wallet" || b.template == Some(true) {
+        native::WalletRoute::PolicyWallet
+    } else {
+        native::WalletRoute::Native
+    };
     if native::sac_address(network, &asset).map_err(crate::provider::failure)? != b.asset
         || !(super::super::server_owner::fee_bounds().minimum
-            ..=u64::from(native::max_fee_ceiling(&if kind == "contract-wallet" {
-                native::WalletRoute::PolicyWallet
-            } else {
-                native::WalletRoute::Native
-            })))
+            ..=u64::from(native::max_fee_ceiling(&fee_route)))
             .contains(&u64::from(b.max_fee_stroops))
     {
         return Err(Error::uncertain(
