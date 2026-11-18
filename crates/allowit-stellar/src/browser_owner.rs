@@ -301,7 +301,7 @@ mod tests {
             "asset": crate::sac_address(NETWORK, &stellar_xdr::Asset::Native).unwrap(),
             "maxFeeStroops": 10_000, "policyMaxFeeStroops": 1_000_000, "amount": "1",
             "nextSequence": "42", "validUntil": NOW + 300,
-            "update": {"deploymentVersion": version, "x402Enabled": false},
+            "update": {"deploymentVersion": version},
         })
     }
     /// The step that a server prepares for that selection.
@@ -349,12 +349,9 @@ mod tests {
     #[test]
     fn the_browser_verifier_binds_a_params_update_to_the_reviewed_values_and_revision() {
         check(step(20_000_000, 2), selection(20_000_000, "2")).unwrap();
-        // Another value, another revision, another x402 choice or another wallet differs.
+        // Another value, another revision or another wallet differs.
         assert!(check(step(90_000_000, 2), selection(20_000_000, "2")).is_err());
         assert!(check(step(20_000_000, 3), selection(20_000_000, "2")).is_err());
-        let mut x402 = selection(20_000_000, "2");
-        x402["update"]["x402Enabled"] = true.into();
-        assert!(check(step(20_000_000, 2), x402).is_err());
         let mut other = selection(20_000_000, "2");
         other["policyInstance"] = crate::hex(&[5; 32]).into();
         other["wallet"] = serde_json::Value::Null;

@@ -1715,16 +1715,13 @@ mod receipt_fee_tests {
                 panic!()
             };
             let mut args = call.args.to_vec();
-            let ScVal::Map(Some(request)) = &args[0] else {
+            // The positional request holds its expense as field 4.
+            let ScVal::Vec(Some(request)) = &args[0] else {
                 panic!()
             };
             let mut fields = request.to_vec();
-            let field = fields
-                .iter_mut()
-                .find(|e| matches!(&e.key, ScVal::Symbol(key) if key.0.as_slice() == b"expense"))
-                .unwrap();
-            field.val = native::contract::expense(Some(expense)).unwrap();
-            args[0] = ScVal::Map(Some(stellar_xdr::ScMap(fields.try_into().unwrap())));
+            fields[4] = native::contract::expense(Some(expense)).unwrap();
+            args[0] = ScVal::Vec(Some(fields.try_into().unwrap()));
             call.args = args.try_into().unwrap();
             envelope.tx.operations = operations.try_into().unwrap();
         }

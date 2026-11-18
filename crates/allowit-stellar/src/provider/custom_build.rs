@@ -50,7 +50,8 @@ static TREE: &[(&str, &[u8])] = tree![
     "crates/policy/src/lib.rs",
     "crates/policy-wallet/Cargo.toml",
     "crates/policy-wallet/src/lib.rs",
-    "crates/policy-wallet/src/persistent.rs",
+    "crates/policy-wallet/src/ops.rs",
+    "crates/policy-wallet/src/pack.rs",
     "crates/protocol/Cargo.toml",
     "crates/protocol/src/lib.rs",
 ];
@@ -58,6 +59,7 @@ static TREE: &[(&str, &[u8])] = tree![
 /// workspace and its lock file; the build compiles none of them, so each gets an empty library.
 static OTHER_MEMBERS: &[(&str, &[u8])] = tree![
     "contracts/allowit-common-policy-engine/Cargo.toml",
+    "contracts/allowit-deployer/Cargo.toml",
     "contracts/allowit-engine-parent/Cargo.toml",
     "contracts/allowit-simple-policy-engine/Cargo.toml",
     "contracts/allowit-wallet-engine/Cargo.toml",
