@@ -333,6 +333,10 @@ struct Model {
     upload_restores_in_place: bool,
     /// A read that finds no entry omits the entry list.
     omit_empty_entries: bool,
+    /// The network refuses the simulation of the next restorations.
+    refused_restore: bool,
+    /// Reads of code entries fail, as a broken transport does.
+    failing_code_reads: bool,
     tiers: BTreeMap<[u8; 32], PolicyTier>,
     wallet: Option<Wallet>,
     settled: BTreeMap<String, String>,
@@ -567,6 +571,9 @@ impl rpc::Rpc for ModelChain {
             "getLedgerEntries" => {
                 let encoded = params["keys"][0].as_str().unwrap();
                 let key: x::LedgerKey = de(encoded);
+                if m.failing_code_reads && matches!(key, x::LedgerKey::ContractCode(_)) {
+                    return Err("The RPC is unreachable".into());
+                }
                 let entry = match &key {
                     x::LedgerKey::Account(a) => {
                         let x::PublicKey::PublicKeyTypeEd25519(k) = &a.account_id.0;
@@ -663,6 +670,12 @@ impl rpc::Rpc for ModelChain {
                     let x::TransactionExt::V1(data) = &env.tx.ext else {
                         return Ok(json!({"error": "a restoration names its footprint"}));
                     };
+                    if m.refused_restore {
+                        return Ok(json!({
+                            "latestLedger": m.ledger,
+                            "error": "the restoration cannot be simulated",
+                        }));
+                    }
                     if m.restored_meanwhile {
                         for key in data.resources.footprint.read_write.iter() {
                             if let x::LedgerKey::ContractCode(code) = key {
@@ -3643,6 +3656,38 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         rpc::CodeState::Absent
     );
     chain.0.lock().unwrap().omit_empty_entries = false;
+    // A restoration whose simulation the network refuses restores nothing, and the code is read
+    // again. A read that fails is an error, not absent code that an upload would replace.
+    {
+        let mut m = chain.0.lock().unwrap();
+        m.refused_restore = true;
+        m.failing_code_reads = true;
+    }
+    let refused = deployer
+        .restore_code(&sender(), installed)
+        .expect_err("a failed read is an error");
+    assert!(refused.contains("unreachable"), "{refused}");
+    // Code that the read finds lapsed has an archived entry that the restoration did not name:
+    // that is refused too, never read as absent.
+    chain.0.lock().unwrap().failing_code_reads = false;
+    chain.0.lock().unwrap().lapsed_code.insert(installed);
+    let refused = deployer
+        .restore_code(&sender(), installed)
+        .expect_err("lapsed code that a restoration does not name is an error");
+    assert!(refused.contains("lapsed"), "{refused}");
+    let signed = signatures();
+    let refused = provider
+        .upload_code_within(&installation, &wasm, ceiling, Poll::default(), NOW)
+        .unwrap_err();
+    assert!(refused.message.contains("lapsed"), "{}", refused.message);
+    assert_eq!(signatures(), signed);
+    // Live code needs nothing, whatever the simulation answers.
+    chain.0.lock().unwrap().lapsed_code.remove(&installed);
+    assert!(matches!(
+        deployer.restore_code(&sender(), installed).unwrap(),
+        CodeRestoration::Live
+    ));
+    chain.0.lock().unwrap().refused_restore = false;
     // Code that the network does not have cannot be restored: it needs an upload.
     chain.0.lock().unwrap().code_bytes.remove(&installed);
     let signed = signatures();

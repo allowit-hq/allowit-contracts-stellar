@@ -1506,8 +1506,9 @@ impl Deployer<'_> {
     }
     /// Prepare `RestoreFootprint` of the code entry `wasm_hash` from `source` when the network's
     /// archive holds it. It names that entry alone and gives no authority; the simulation sets
-    /// its fee, within the ceiling. A simulation that names no entry, or that refuses the
-    /// restoration, leaves code that is live, read again, or absent.
+    /// its fee, within the ceiling. After a simulation that names no entry, or that refuses the
+    /// restoration, the code is read again: live or absent code is the answer, and lapsed code
+    /// is refused.
     pub fn restore_code(&self, source: &str, wasm_hash: [u8; 32]) -> Result<CodeRestoration> {
         let account = self.account(source)?;
         let key = LedgerKey::ContractCode(LedgerKeyContractCode {
@@ -1548,20 +1549,28 @@ impl Deployer<'_> {
             tx: tx.clone(),
             signatures: VecM::default(),
         }))?;
-        // Code that is live, read again, needs nothing: another transaction restored or uploaded
-        // it since it was read, from this account too, which then changed during the simulation.
-        let live_or_absent = || match crate::rpc::code_state(self.rpc, self.network, &wasm_hash) {
-            Ok(crate::rpc::CodeState::Live) => CodeRestoration::Live,
-            _ => CodeRestoration::Absent,
+        // A simulation that restores nothing leaves the code to a second read. Live code needs
+        // nothing: another transaction restored or uploaded it since it was read, from this
+        // account too, which then changed during the simulation. Lapsed code has an archived
+        // entry that this restoration did not name, and an upload does not replace it: that is
+        // refused. A read that fails is an error.
+        let read_again = || -> Result<CodeRestoration> {
+            match crate::rpc::code_state(self.rpc, self.network, &wasm_hash)? {
+                crate::rpc::CodeState::Live => Ok(CodeRestoration::Live),
+                crate::rpc::CodeState::Absent => Ok(CodeRestoration::Absent),
+                crate::rpc::CodeState::Lapsed => {
+                    Err("The wallet code lapsed, but no restoration of it can be prepared".into())
+                }
+            }
         };
         let response = match self.simulate(&account, &raw, false) {
             Ok(response) if response.get("error").is_none_or(|v| v.is_null()) => response,
             // A refused restoration restores nothing. An upload of code that the archive holds
             // is refused in its own simulation.
-            Ok(_) => return Ok(live_or_absent()),
+            Ok(_) => return read_again(),
             Err(error) => {
-                return match live_or_absent() {
-                    CodeRestoration::Live => Ok(CodeRestoration::Live),
+                return match read_again() {
+                    Ok(CodeRestoration::Live) => Ok(CodeRestoration::Live),
                     _ => Err(error),
                 };
             }
@@ -1576,7 +1585,7 @@ impl Deployer<'_> {
         if data.resources.footprint.read_only.is_empty()
             && data.resources.footprint.read_write.is_empty()
         {
-            return Ok(live_or_absent());
+            return read_again();
         }
         if !data.resources.footprint.read_only.is_empty()
             || data.resources.footprint.read_write.as_slice() != [key]
