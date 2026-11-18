@@ -54,7 +54,7 @@ Mutable agent and server configuration does not change the target.
 A configuration change therefore fails at the existing target instead of selecting a replacement wallet.
 Before mutation, the controller inspects all currently live code, wallets and configuration in one bounded native ledger-entry batch.
 It checks exact executable bytes, native value variants, roles, parameters, lifetimes and pristine wallet state.
-Pristine state includes the expected custody version, deployment version, nonce, pause flag, policy state and native token label.
+Pristine state is the packed configuration of custody layout 5 at deployment version 0 and not paused: the owner, the agent and server keys, the asset, the source hash of the sample policy, the gas cap, the rules and the params that the wallet keeps.
 
 A wholly read-only run can finish without a signing delay.
 A run that needs mutation waits after acquisition of the workflow's global exclusive signer slot.
