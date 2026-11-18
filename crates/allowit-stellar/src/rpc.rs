@@ -436,6 +436,10 @@ fn priced_terms(
     now: u64,
     expires_at: u64,
 ) -> Result<ExecutionTerms> {
+    // An explicit repayment takes no carry and no due, priced or not.
+    if terms.gas.is_some() {
+        terms.repaid_stroops()?;
+    }
     let Some(ceiling) = terms.expense.as_ref().filter(|e| e.max_fee_stroops > 0) else {
         // An unpriced operation repays nothing: the server charges a gas due to the request.
         return Ok(ExecutionTerms {

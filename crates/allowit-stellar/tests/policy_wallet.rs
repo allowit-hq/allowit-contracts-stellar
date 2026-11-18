@@ -323,6 +323,8 @@ struct Model {
     failed: BTreeSet<String>,
     /// Another transaction restores lapsed code just before the next restoration's simulation.
     restored_meanwhile: bool,
+    /// That transaction came from the restoration's own source, whose sequence it advanced.
+    restored_by_source: bool,
     tiers: BTreeMap<[u8; 32], PolicyTier>,
     wallet: Option<Wallet>,
     settled: BTreeMap<String, String>,
@@ -650,6 +652,9 @@ impl rpc::Rpc for ModelChain {
                             if let x::LedgerKey::ContractCode(code) = key {
                                 m.lapsed_code.remove(&code.hash.0);
                             }
+                        }
+                        if m.restored_by_source {
+                            m.accounts.get_mut(&source_of(&env.tx)).unwrap().sequence += 1;
                         }
                     }
                     let mut data = x::SorobanTransactionData {
@@ -2896,6 +2901,27 @@ fn a_gas_due_joins_the_repayment_within_the_gas_cap() {
         .unwrap_err()
         .to_string();
     assert!(refused.contains("gas cap"), "{refused}");
+    // An explicit repayment takes no due, priced or not: an unpriced operation does not drop it.
+    let unpriced = ExecutionTerms {
+        expense: None,
+        gas: Some(GasRepayment {
+            stroops: 0,
+            payee: sender(),
+        }),
+        gas_due: 500,
+        ..terms(1_000_000, chain.ledger())
+    };
+    let refused = rpc::prepare_with(
+        &chain,
+        &c,
+        &transfer,
+        &unpriced,
+        Some(chain.accounting()),
+        NOW,
+        NOW + 300,
+    )
+    .unwrap_err();
+    assert!(refused.contains("takes no gas due"), "{refused}");
     // An explicit repayment takes no due.
     let explicit = ExecutionTerms {
         gas: Some(GasRepayment {
@@ -3389,24 +3415,29 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     );
     assert!(chain.0.lock().unwrap().lapsed_code.is_empty());
     // Another request restores the code after this one read it as lapsed: the simulation of the
-    // restoration names no entry, the code is live, and nothing is sent.
-    {
-        let mut m = chain.0.lock().unwrap();
-        m.lapsed_code.insert(installed);
-        m.restored_meanwhile = true;
-    }
-    let sent = chain.0.lock().unwrap().steps.len();
-    assert!(
-        provider
-            .restore_code_within(&installation, ceiling, Poll::default(), NOW)
-            .unwrap()
-            .is_none()
-    );
-    {
+    // restoration names no entry, the code is live, and nothing is sent. When that request sent
+    // from the same account, the account changed during the simulation: the code, read again,
+    // is live all the same.
+    for by_source in [false, true] {
+        {
+            let mut m = chain.0.lock().unwrap();
+            m.lapsed_code.insert(installed);
+            m.restored_meanwhile = true;
+            m.restored_by_source = by_source;
+        }
+        let sent = chain.0.lock().unwrap().steps.len();
+        assert!(
+            provider
+                .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+                .unwrap()
+                .is_none(),
+            "{by_source}"
+        );
         let mut m = chain.0.lock().unwrap();
         assert_eq!(m.steps.len(), sent);
         assert!(m.lapsed_code.is_empty());
         m.restored_meanwhile = false;
+        m.restored_by_source = false;
     }
     // Code that the network does not have cannot be restored: it needs an upload.
     chain.0.lock().unwrap().code_bytes.remove(&installed);

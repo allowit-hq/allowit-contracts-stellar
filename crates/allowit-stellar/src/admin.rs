@@ -1529,10 +1529,21 @@ impl Deployer<'_> {
             tx: tx.clone(),
             signatures: VecM::default(),
         }))?;
-        let response = self.simulate(&account, &raw, false)?;
-        if response.get("error").is_some_and(|v| !v.is_null()) {
-            return Err("Code restoration simulation failed".into());
-        }
+        // A restoration that cannot be simulated may have lost to another transaction that
+        // restored the code since it was read, from this account too, which then changed during
+        // the simulation. Code that is live again needs nothing; anything else is refused.
+        let live_again = || {
+            matches!(
+                crate::rpc::code_state(self.rpc, self.network, &wasm_hash),
+                Ok(crate::rpc::CodeState::Live)
+            )
+        };
+        let response = match self.simulate(&account, &raw, false) {
+            Ok(response) if response.get("error").is_none_or(|v| v.is_null()) => response,
+            _ if live_again() => return Ok(None),
+            Ok(_) => return Err("Code restoration simulation failed".into()),
+            Err(error) => return Err(error),
+        };
         let data: SorobanTransactionData = read(
             response["transactionData"]
                 .as_str()
