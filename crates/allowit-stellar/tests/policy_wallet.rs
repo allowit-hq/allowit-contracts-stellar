@@ -1804,20 +1804,20 @@ fn owner_params_update_step_matches_the_owner_reconstruction_and_keeps_usage() {
         let revision = u64::from(before.deployment_version);
         let update = change(250_000_000, Some(revision));
         // The owner changed the gas cap on the ledger: an update from this installation would
-        // write the old cap back, so it is refused, and verification names the difference.
-        let other_cap = WalletConfig {
+        // write the old gas cap back, so it is refused, and verification names the difference.
+        let other_gas_cap = WalletConfig {
             max_fee_stroops: MAX_FEE - 1,
             ..c.clone()
         };
         assert!(
-            params_update::installed(&*chain, &other_cap, &update)
+            params_update::installed(&*chain, &other_gas_cap, &update)
                 .unwrap_err()
                 .to_string()
                 .contains("gas cap")
         );
-        let differs = params_update::verify(&*chain, "policy", &other_cap).unwrap();
+        let differs = params_update::verify(&*chain, "policy", &other_gas_cap).unwrap();
         assert!(!differs.matches);
-        let cap = serde_json::to_value(&differs.comparisons)
+        let gas_cap_row = serde_json::to_value(&differs.comparisons)
             .unwrap()
             .as_array()
             .unwrap()
@@ -1826,8 +1826,8 @@ fn owner_params_update_step_matches_the_owner_reconstruction_and_keeps_usage() {
             .cloned()
             .unwrap();
         assert!(
-            cap.to_string().contains(&(MAX_FEE - 1).to_string()),
-            "{cap}"
+            gas_cap_row.to_string().contains(&(MAX_FEE - 1).to_string()),
+            "{gas_cap_row}"
         );
         let owners = allowit_stellar::PLUGIN.owner_runtime();
         let document = owners
@@ -2220,4 +2220,118 @@ fn a_simple_wallet_counts_the_gross_volume_of_a_lossless_deposit() {
     let within = request::transfer(&c, &state, [4; 32], &recipient, headroom).unwrap();
     run(&chain, &c, &within, &terms(headroom, ledger), "transfer").unwrap();
     assert_eq!(chain.accounting().volume_daily, 6_000_000);
+}
+/// A chain whose wallet entry `t` lapsed: each simulation of the wallet's `execute` restores it
+/// in place, or, with `preamble`, asks for a separate restoration first.
+struct Lapsed<'a> {
+    chain: &'a ModelChain,
+    preamble: bool,
+}
+impl rpc::Rpc for Lapsed<'_> {
+    fn call(&self, method: &str, params: Value) -> Result<Value> {
+        let mut reply = self.chain.call(method, params)?;
+        if method == "simulateTransaction"
+            && reply.get("error").is_none()
+            && let Some(data) = reply["transactionData"].as_str()
+        {
+            if self.preamble {
+                reply["restorePreamble"] =
+                    json!({"minResourceFee": "1000", "transactionData": data});
+            } else {
+                let wallet = self
+                    .chain
+                    .0
+                    .lock()
+                    .unwrap()
+                    .wallet
+                    .as_ref()
+                    .unwrap()
+                    .address
+                    .clone();
+                let mut data: x::SorobanTransactionData = de(data);
+                data.resources.footprint.read_write =
+                    vec![x::LedgerKey::ContractData(x::LedgerKeyContractData {
+                        contract: address(&wallet).unwrap(),
+                        key: x::ScVal::Symbol("t".try_into().unwrap()),
+                        durability: x::ContractDataDurability::Persistent,
+                    })]
+                    .try_into()
+                    .unwrap();
+                data.ext = x::SorobanTransactionDataExt::V1(x::SorobanResourcesExtV0 {
+                    archived_soroban_entries: vec![0].try_into().unwrap(),
+                });
+                reply["transactionData"] = json!(b64(&data));
+            }
+        }
+        Ok(reply)
+    }
+}
+#[test]
+fn a_lapsed_entry_restores_in_the_operation_that_needs_it() {
+    let wasm = wasm_for(PolicyTier::Common);
+    let chain = ModelChain::new(BTreeMap::from([(hash(&wasm), PolicyTier::Common)]));
+    let c = create(&chain, PolicyTier::Common, &wasm, [0x33; 32]);
+    let state = sending_state(&chain, &c);
+    let ledger = chain.ledger();
+    let recipient = account_for_seed(&RECIPIENT);
+    let transfer = request::transfer(&c, &state, [1; 32], &recipient, 1_000_000).unwrap();
+    let lapsed = Lapsed {
+        chain: &chain,
+        preamble: false,
+    };
+    let prepared = rpc::prepare_with(
+        &lapsed,
+        &c,
+        &transfer,
+        &terms(1_000_000, ledger),
+        Some(chain.accounting()),
+        NOW,
+        NOW + 300,
+    )
+    .unwrap();
+    let served = authorize_server(&prepared, &SERVER, NOW, None).unwrap();
+    let simulated = rpc::simulate(&lapsed, &served).unwrap();
+    let proof = sign(&simulated, &AGENT, NOW).unwrap();
+    let signed = authorize(&simulated, &[proof], NOW).unwrap();
+    let sealed = rpc::seal(&lapsed, &signed, |hash| {
+        Ok(SigningKey::from_bytes(&SENDER).sign(hash).to_bytes())
+    })
+    .unwrap();
+    // The sealed transaction restores `t` itself, and its fee pays for that.
+    let x::TransactionEnvelope::Tx(envelope) = de(&sealed.transaction_xdr) else {
+        panic!()
+    };
+    let x::TransactionExt::V1(data) = &envelope.tx.ext else {
+        panic!()
+    };
+    assert!(matches!(
+        &data.ext,
+        x::SorobanTransactionDataExt::V1(ext) if ext.archived_soroban_entries.as_slice() == [0]
+    ));
+    chain.step("transfer");
+    assert_eq!(
+        rpc::broadcast(&chain, &sealed, NOW).unwrap(),
+        rpc::Broadcast::Submitted
+    );
+    // An entry that needs a separate restoration first prepares nothing.
+    let preamble = Lapsed {
+        chain: &chain,
+        preamble: true,
+    };
+    let state = sending_state(&chain, &c);
+    let ledger = chain.ledger();
+    let again = request::transfer(&c, &state, [2; 32], &recipient, 1_000_000).unwrap();
+    assert!(
+        rpc::prepare_with(
+            &preamble,
+            &c,
+            &again,
+            &terms(1_000_000, ledger),
+            Some(chain.accounting()),
+            NOW,
+            NOW + 300
+        )
+        .unwrap_err()
+        .contains("separate restoration")
+    );
 }

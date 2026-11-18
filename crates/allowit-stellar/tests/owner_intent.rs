@@ -1191,14 +1191,45 @@ fn simulation_resources_are_bounded_without_becoming_business_intent() {
                         .unwrap()
                 }
                 _ => {
+                    // An archived entry outside the read-write footprint.
+                    let outside = data.resources.footprint.read_write.len() as u32;
                     data.ext = x::SorobanTransactionDataExt::V1(x::SorobanResourcesExtV0 {
-                        archived_soroban_entries: vec![0].try_into().unwrap(),
+                        archived_soroban_entries: vec![outside].try_into().unwrap(),
                     })
                 }
             }
         });
         assert_refused(&p, &expected, "resource scope");
     }
+    // An archived entry of the read-write footprint restores in the same transaction: a wallet
+    // whose entries lapsed returns its funds with one owner signature. Each entry is named once.
+    let mut restoring = valid.clone();
+    modify_tx(&mut restoring, |tx| {
+        let x::TransactionExt::V1(data) = &mut tx.ext else {
+            panic!()
+        };
+        data.resources.footprint.read_write =
+            vec![x::LedgerKey::ContractData(x::LedgerKeyContractData {
+                contract: address(&Contract([34; 32]).to_string()).unwrap(),
+                key: x::ScVal::Symbol(symbol("t")),
+                durability: x::ContractDataDurability::Persistent,
+            })]
+            .try_into()
+            .unwrap();
+        data.ext = x::SorobanTransactionDataExt::V1(x::SorobanResourcesExtV0 {
+            archived_soroban_entries: vec![0].try_into().unwrap(),
+        });
+    });
+    validate_owner_transaction(&restoring, &expected, NOW).unwrap();
+    modify_tx(&mut restoring, |tx| {
+        let x::TransactionExt::V1(data) = &mut tx.ext else {
+            panic!()
+        };
+        data.ext = x::SorobanTransactionDataExt::V1(x::SorobanResourcesExtV0 {
+            archived_soroban_entries: vec![0, 0].try_into().unwrap(),
+        });
+    });
+    assert_refused(&restoring, &expected, "resource scope");
     assert_validation_refused(
         validate_owner_transaction(&packet, &expected, u64::MAX),
         "validity overflow",

@@ -1328,7 +1328,8 @@ impl Deployer<'_> {
         if response.get("error").is_some_and(|v| !v.is_null()) {
             return Err("Deployment simulation rejected the transaction".into());
         }
-        rpc::reject_restoration(&response)?;
+        // Archived code or deployer entries restore in the same transaction.
+        rpc::restoring_in_place(&response)?;
         let results = response["results"]
             .as_array()
             .ok_or("Missing simulation result")?;

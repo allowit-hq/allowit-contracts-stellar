@@ -108,7 +108,7 @@ pub struct Installed {
 }
 /// Read the installed revision and check that the wallet still holds this installation: its
 /// code, source, rules, roles, asset, gas cap and params. An update writes the installation's
-/// gas cap, so a cap that the owner changed on the ledger is not overwritten. The read is the
+/// gas cap, so a gas cap that the owner changed on the ledger is not overwritten. The read is the
 /// wallet instance alone, so an update needs no account of the agent or the server.
 /// A wallet at another revision than the expected one is refused.
 pub fn installed(rpc: &dyn rpc::Rpc, c: &WalletConfig, update: &ParamsUpdate) -> Result<Installed> {

@@ -522,12 +522,14 @@ fn validate_resources(tx: &Transaction) -> Result<()> {
     let TransactionExt::V1(data) = &tx.ext else {
         return Err("Owner host-function transaction needs simulation resources".into());
     };
+    // Archived entries of the read-write footprint restore in the same transaction, at the
+    // owner's fee: a wallet whose entries lapsed returns its funds with one owner signature.
     if data.resource_fee < 0
         || u64::try_from(data.resource_fee)
             .map_err(err)?
             .checked_add(100)
             != Some(u64::from(tx.fee))
-        || matches!(&data.ext, SorobanTransactionDataExt::V1(v) if !v.archived_soroban_entries.is_empty())
+        || crate::rpc::archived_in_footprint(data).is_err()
     {
         return Err("Owner resource fee or restoration scope is invalid".into());
     }

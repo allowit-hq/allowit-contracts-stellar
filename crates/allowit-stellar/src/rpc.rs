@@ -436,6 +436,39 @@ fn priced_terms(
     };
     with_bound(fee_bound(simulated)?)
 }
+/// Refuse a simulation that needs a separate restoration first, and accept one whose archived
+/// entries the transaction restores itself: each named by its index in the read-write
+/// footprint. The transaction's fee pays for that restoration. A policy wallet operation and an
+/// owner transaction restore a lapsed entry, such as `t` or the instance, in this way.
+pub(crate) fn restoring_in_place(value: &Value) -> Result<()> {
+    if value
+        .get("restorePreamble")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Err("The operation needs a separate restoration first".into());
+    }
+    if let Some(data) = value.get("transactionData") {
+        let data: SorobanTransactionData =
+            read(data.as_str().ok_or("Invalid native preflight resources")?)?;
+        archived_in_footprint(&data)?;
+    }
+    Ok(())
+}
+/// Each archived entry that `data` restores is an entry of its read-write footprint, named once.
+pub(crate) fn archived_in_footprint(data: &SorobanTransactionData) -> Result<()> {
+    if let SorobanTransactionDataExt::V1(ext) = &data.ext {
+        let writable = data.resources.footprint.read_write.len();
+        let mut seen = std::collections::BTreeSet::new();
+        if !ext
+            .archived_soroban_entries
+            .iter()
+            .all(|index| (*index as usize) < writable && seen.insert(*index))
+        {
+            return Err("An archived entry is outside the read-write footprint".into());
+        }
+    }
+    Ok(())
+}
 pub(crate) fn reject_restoration(value: &Value) -> Result<()> {
     if value
         .get("restorePreamble")
@@ -484,11 +517,7 @@ pub fn seal(
     if v.get("error").is_some_and(|value| !value.is_null()) {
         return Err("policy wallet simulation rejected the authorized operation".into());
     }
-    if v.get("restorePreamble")
-        .is_some_and(|value| !value.is_null())
-    {
-        return Err("The operation needs a separate restoration first".into());
-    }
+    restoring_in_place(&v)?;
     if readonly_result(&v)? != ScVal::Void {
         return Err("Native simulation returned a value from execute".into());
     }
@@ -577,7 +606,7 @@ fn simulated_resources(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<String> {
     if v.get("error").is_some_and(|value| !value.is_null()) {
         return Err("policy wallet simulation rejected the exact policy operation".into());
     }
-    reject_restoration(&v)?;
+    restoring_in_place(&v)?;
     if readonly_result(&v)? != ScVal::Void {
         return Err("Native simulation returned a value from execute".into());
     }
@@ -679,7 +708,7 @@ pub fn revalidate_prepared(
             .as_deref()
             .ok_or("Existing intent has no bounded Soroban resources")?,
     )?;
-    reject_restoration(&json!({"transactionData":xdr(&original)?}))?;
+    archived_in_footprint(&original)?;
     let mut keys = std::collections::BTreeSet::new();
     if !original
         .resources
