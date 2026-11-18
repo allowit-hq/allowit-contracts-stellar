@@ -649,7 +649,10 @@ pub struct CustomParts {
     pub server_part: bool,
     /// The checked shape of the owner's source.
     pub shape: SourceShape,
-    /// The state keys that the server keeps, sorted. The contract never stores them.
+    /// The state keys that the server keeps, sorted. The contract never stores them, and this
+    /// rail neither reads nor stores them: the snapshot of a wallet holds only the contract's
+    /// entries. The host's evaluator gives their values to the evaluation and keeps the
+    /// values that an admitted operation wrote, with that operation's settlement.
     pub server_keys: Vec<String>,
 }
 /// Check the one source of a Custom wallet and derive its on-chain part.

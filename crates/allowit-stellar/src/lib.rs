@@ -846,12 +846,18 @@ impl TrustedState {
                 server_volume,
             )),
         );
+        // One flag serves both daily figures. When the wallet keeps one of them and the server
+        // the other, an unpriced operation in either one's day marks the day: the wallet counts
+        // its own window, and the server counts the UTC day.
+        let own_unpriced = open && wallet.day_unpriced;
+        let server_unpriced = server_today && self.unpriced_daily;
+        let daily = packed::DAY_SPENT | packed::DAY_TOTAL;
         state.insert(
             "day_unpriced".to_owned(),
-            PolicyValue::Bool(if kept & (packed::DAY_SPENT | packed::DAY_TOTAL) != 0 {
-                open && wallet.day_unpriced
-            } else {
-                server_today && self.unpriced_daily
+            PolicyValue::Bool(match kept & daily {
+                0 => server_unpriced,
+                both if both == daily => own_unpriced,
+                _ => own_unpriced || server_unpriced,
             }),
         );
         state.extend(snapshot.custom.clone());

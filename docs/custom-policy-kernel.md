@@ -109,6 +109,10 @@ that figure to the server's evaluation (`kept_figures`): the wallet's figures fo
 part, the server's for the rest. So an execution of a wallet whose source has a server part needs
 the server's accounting, as an execution of a Simple or Standard wallet does.
 
+The two daily figures share one unpriced flag. When the wallet keeps one daily figure and the
+server the other, an unpriced operation in either one's day marks the day: the wallet counts its
+own window, and the server counts the UTC day.
+
 `t` is created by the constructor and paid for 2,073,600 ledgers (the Mainnet minimum lifetime of a
 persistent entry, about 120 days). Nothing extends it; after it lapses, the next operation restores
 it with its values. The instance lives as long from its creation, and each call keeps it live: once
@@ -135,6 +139,11 @@ Each key has one keeper, which Core's derivation names (`Derived::state`):
 | --- | --- | --- |
 | The contract | Every statement that writes the key is in `policy.rs` | In the wallet, as stated below. The server reads it from the wallet when it evaluates the whole source |
 | The server | A statement that writes the key depends on a server function, or only such statements read it | With the server. No statement of `policy.rs` names the key, and the wallet never stores it |
+
+This rail neither reads nor stores a key of the server: a wallet's snapshot holds only the
+contract's entries. The host's evaluator gives the server's values to the evaluation and keeps the
+values that an admitted operation wrote, with that operation's settlement
+(`policy::CustomParts::server_keys`).
 
 The rest of this section is about the keys that the contract keeps: the keys of `policy.rs`.
 

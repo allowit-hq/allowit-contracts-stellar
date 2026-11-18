@@ -421,20 +421,20 @@ pub fn policy_rules(
     let bytes = std::fs::read(path).map_err(|_| "Cannot read the policy source")?;
     let source = std::str::from_utf8(&bytes).map_err(|_| "Policy source is not UTF-8")?;
     let shape = policy::wallet_shape(tier, source)?;
-    // The contract of a Custom wallet compiles the on-chain part of its source.
+    // The server evaluates the whole source, so the whole source type-checks against the
+    // library. The contract of a Custom wallet compiles the on-chain part of its source, so
+    // that part type-checks by itself too.
+    compile(path)?;
     let parts = (tier == PolicyTier::Custom)
         .then(|| policy::custom_parts(source))
         .transpose()?
         .filter(|parts| parts.server_part);
-    match parts {
-        Some(parts) => {
-            let scratch = Scratch::new()?;
-            let onchain = scratch.0.join("onchain.rs");
-            std::fs::write(&onchain, &parts.onchain)
-                .map_err(|_| "Cannot write the on-chain part of the policy source")?;
-            compile(onchain.to_str().ok_or("Scratch path is not UTF-8")?)?;
-        }
-        None => compile(path)?,
+    if let Some(parts) = parts {
+        let scratch = Scratch::new()?;
+        let onchain = scratch.0.join("onchain.rs");
+        std::fs::write(&onchain, &parts.onchain)
+            .map_err(|_| "Cannot write the on-chain part of the policy source")?;
+        compile(onchain.to_str().ok_or("Scratch path is not UTF-8")?)?;
     }
     let expected = if tier == PolicyTier::Common {
         shape.prefix
