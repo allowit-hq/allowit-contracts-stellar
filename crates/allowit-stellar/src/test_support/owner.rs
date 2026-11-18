@@ -37,7 +37,7 @@ pub(crate) fn hash(tx: &x::Transaction) -> [u8; 32] {
 }
 pub fn wasm() -> Vec<u8> {
     let mut meta = 0u32.to_be_bytes().to_vec();
-    for bytes in [b"allowit_custody_layout".as_slice(), b"4"] {
+    for bytes in [b"allowit_custody_layout".as_slice(), b"5"] {
         meta.extend((bytes.len() as u32).to_be_bytes());
         meta.extend(bytes);
         meta.resize(meta.len().div_ceil(4) * 4, 0);

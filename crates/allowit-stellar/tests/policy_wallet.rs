@@ -868,7 +868,7 @@ fn params() -> PolicyParams {
 /// Synthetic policy wallet code for one tier: a Wasm module that declares custody layout 4.
 fn stand_in_wasm(tier: PolicyTier) -> Vec<u8> {
     let mut meta = 0u32.to_be_bytes().to_vec();
-    for text in [b"allowit_custody_layout".as_slice(), b"4"] {
+    for text in [b"allowit_custody_layout".as_slice(), b"5"] {
         meta.extend((text.len() as u32).to_be_bytes());
         meta.extend(text);
         meta.resize(meta.len().div_ceil(4) * 4, 0);
