@@ -1994,6 +1994,7 @@ mod native_revalidation_tests {
         );
     }
     #[test]
+    #[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
     fn recovery_uses_the_original_service_even_if_the_caller_changes_its_default() {
         struct ProofSigner(String);
         impl AgentSigner for ProofSigner {
@@ -2116,6 +2117,7 @@ mod native_revalidation_tests {
         }
     }
     #[test]
+    #[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
     fn local_rpc_revalidates_exact_gateway_bytes_before_signing_without_credentials() {
         let data = fixture();
         let p: PreparedOperation = serde_json::from_value(data["prepared"].clone()).unwrap();
@@ -2281,6 +2283,7 @@ mod native_revalidation_tests {
         assert!(receipt_settlement(1, "not-xdr").is_err());
     }
     #[test]
+    #[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
     fn a_status_read_ends_at_its_deadline_and_a_call_without_one_does_not() {
         let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
         let body = serde_json::to_vec(&json!({"prepared":p,"operation":{"id":"bounded-001","status":OperationStatus::Prepared,"transactionHash":sdk::hex(&p.transaction_hash)}})).unwrap();
@@ -2435,6 +2438,7 @@ mod native_revalidation_tests {
         assert_eq!(kept.paid_service, None);
     }
     #[test]
+    #[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
     fn a_status_reply_reports_the_charged_fee_and_the_limits_in_the_installed_unit() {
         let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
         let installed = installed_display(&p.config).expect("the fixture asset has a unit");
@@ -2616,6 +2620,7 @@ mod native_revalidation_tests {
         assert_eq!(installed_display(&unlisted), None);
     }
     #[test]
+    #[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
     fn slow_engine_replies_arrive_for_prepare_submit_and_status() {
         // Engine prepare took up to 138 s, submit up to 90 s and status up to 44 s on testnet.
         // Each reply here outlasts the former 30 s submit and status bound.
@@ -2648,6 +2653,7 @@ mod native_revalidation_tests {
         });
     }
     #[test]
+    #[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
     fn engine_refusals_keep_the_denying_rule_and_exit_code() {
         // The engine replies of the testnet rerun: a portable rule denial and a Custom wallet
         // simulation rejection whose contract the RPC did not identify.
@@ -2997,6 +3003,7 @@ mod native_revalidation_tests {
         assert_eq!((reads, saves), (1, 0));
     }
     #[test]
+    #[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
     fn the_limits_route_reports_counted_and_per_payment_limits_without_an_operation() {
         let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
         let installed = installed_display(&p.config).expect("the fixture asset has a unit");
@@ -3236,6 +3243,7 @@ mod native_revalidation_tests {
         }
     }
     #[test]
+    #[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
     fn released_operation_fails_only_with_an_independent_lapse_proof() {
         // Common R4.1 on testnet: the engine released the expired operation as `failed`
         // without a receipt, and the CLI reported `submissionUnknown`.
@@ -3345,6 +3353,7 @@ mod native_revalidation_tests {
         assert_eq!(result, Ok(false));
     }
     #[test]
+    #[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
     fn proven_failure_stays_failed_after_the_nonce_moves_or_rpc_fails() {
         // Codex P2 on PR #45: poll journaled only `failed`, so a later status query that could
         // not repeat the lapse proof overwrote the terminal failure with `submissionUnknown`.
@@ -3428,6 +3437,7 @@ mod native_revalidation_tests {
         assert!(!journaled(&client, "released-001", Some(record), &r).lapsed);
     }
     #[test]
+    #[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
     fn failed_policy_wallet_envelope_remains_unknown_on_the_server_client_wire() {
         use ed25519_dalek::Signer;
         use stellar_xdr::{

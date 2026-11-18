@@ -274,6 +274,7 @@ fn a_settled_setup_signs_nothing_again_and_an_unsigned_one_takes_a_new_key() {
     assert_eq!((signer.calls.load(Ordering::SeqCst), sends()), (0, 1));
 }
 #[test]
+#[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
 fn changed_fund_packets_never_reach_the_signer_and_rebound_records_are_not_signing_authority() {
     for tamper_retained in [false, true] {
         let selected = selection();
@@ -354,6 +355,7 @@ fn changed_fund_packets_never_reach_the_signer_and_rebound_records_are_not_signi
     }
 }
 #[test]
+#[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
 fn funded_wallet_receipt_and_restart_preserve_exact_signed_bytes_and_single_owner_authorization() {
     let selected = selection();
     let now = wire::now();
@@ -463,6 +465,7 @@ fn failed_signed_retention_prevents_native_transmission() {
 }
 
 #[test]
+#[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
 fn owner_funding_renews_only_the_independently_observed_relative_lifetime_target() {
     for target in [999, 1119] {
         let selected = selection();
@@ -533,6 +536,7 @@ fn owner_funding_renews_only_the_independently_observed_relative_lifetime_target
 }
 
 #[test]
+#[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
 fn stale_funding_destination_never_receives_an_owner_signature_or_submission() {
     let p = selection();
     let now = wire::now();
@@ -575,6 +579,7 @@ fn stale_funding_destination_never_receives_an_owner_signature_or_submission() {
 }
 
 #[test]
+#[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
 fn generation_validates_prompt_network_and_profile_before_authenticated_http() {
     use super::{GenerateRequest, Target};
     let server = wire::Server::new(wire::Plan::new(&account(11)));
@@ -624,6 +629,7 @@ fn generation_validates_prompt_network_and_profile_before_authenticated_http() {
 }
 
 #[test]
+#[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
 fn generation_sends_the_chosen_wallet_kind_keeps_the_bound_one_and_reports_a_typed_refusal() {
     use super::{GenerateRequest, Target};
     use allowit_core::vendor::kinds::WalletKind;
@@ -742,6 +748,7 @@ fn prepared_update(
     update_step(&selected.config, &deployment, 2, now)
 }
 #[test]
+#[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
 fn params_update_signs_one_exact_policy_packet_and_resumes_without_another_signature() {
     let selected = selection();
     let update = limit_update(&selected, 20_000_000);
@@ -880,6 +887,7 @@ fn params_update_signs_one_exact_policy_packet_and_resumes_without_another_signa
     assert_eq!(signer.calls.load(Ordering::SeqCst), prior + 1);
 }
 #[test]
+#[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
 fn changed_update_packets_and_invalid_updates_never_reach_the_signer() {
     let selected = selection();
     let update = limit_update(&selected, 20_000_000);

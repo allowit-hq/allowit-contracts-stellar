@@ -43,6 +43,7 @@ fn service(replies: Vec<(String, Value)>) -> (String, thread::JoinHandle<()>) {
 }
 
 #[test]
+#[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
 fn friendbot_accepts_only_an_actual_native_transaction_hash() {
     let account = account_for_seed(&[1; 32]);
     for (value, accepted) in [

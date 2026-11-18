@@ -17,6 +17,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "scripts/contract_admin.py"
+      - "scripts/no-network.sh"
       - "scripts/build-contracts.sh"
       - "scripts/build-browser-owner-verifier.sh"
       - "npm/stellar/**"
@@ -37,6 +38,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "scripts/contract_admin.py"
+      - "scripts/no-network.sh"
       - "scripts/build-contracts.sh"
       - "scripts/build-browser-owner-verifier.sh"
       - "npm/stellar/**"
@@ -50,6 +52,8 @@ concurrency:
   group: stellar-core-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
+  # The hermetic tests: no socket, no network. scripts/no-network.sh runs them in a unit that
+  # may create no IP socket, so a test that needs one fails here.
   stellar-core:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -67,8 +71,25 @@ jobs:
         with:
           node-version: 24
       - run: cargo fmt --manifest-path crates/allowit-stellar/Cargo.toml --check
-      - run: cargo test --locked --manifest-path crates/allowit-stellar/Cargo.toml
+      - run: cargo test --locked --manifest-path crates/allowit-stellar/Cargo.toml --no-run
+      - run: scripts/no-network.sh cargo test --locked --offline --manifest-path crates/allowit-stellar/Cargo.toml
       - run: cargo clippy --locked --manifest-path crates/allowit-stellar/Cargo.toml --all-targets -- -D warnings
+  # The end-to-end tests with the whole suite: fixture RPC and servers on loopback.
+  end-to-end:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/allowit-stellar -> target
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: cargo test --locked --manifest-path crates/allowit-stellar/Cargo.toml --features e2e
   browser-verifier:
     # Match the arm64 macOS toolchain that produced the committed verifier bytes.
     runs-on: macos-15

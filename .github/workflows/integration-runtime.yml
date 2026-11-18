@@ -50,6 +50,7 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/wallet-admin"
           "$RUNNER_TEMP/wallet-admin/bin/pip" install -r scripts/requirements-admin.txt
           "$RUNNER_TEMP/wallet-admin/bin/python" -m unittest discover -s scripts/tests -v
+          "$RUNNER_TEMP/wallet-admin/bin/python" -m unittest discover -s scripts/tests -p 'e2e_*.py' -v
       - name: Full Stellar runtime regressions
         if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.full)
         run: cargo test --workspace --locked

@@ -74,12 +74,22 @@ jobs:
           cargo fmt --all --check
           scripts/build-contracts.sh
           cargo test --workspace --locked
-          cargo test --locked --manifest-path "$native_manifest"
+          # A release source from before the hermetic/end-to-end split has no e2e feature and runs
+          # its end-to-end tests by default; a later one runs them with the feature.
+          e2e_feature=()
+          if cargo metadata --locked --no-deps --format-version 1 --manifest-path "$native_manifest" |
+            python -c 'import json, sys; sys.exit(not any("e2e" in p["features"] for p in json.load(sys.stdin)["packages"]))'; then
+            e2e_feature=(--features e2e)
+          fi
+          cargo test --locked --manifest-path "$native_manifest" "${e2e_feature[@]}"
           cargo clippy --workspace --locked --all-targets -- -D warnings
           cargo clippy --locked --manifest-path "$native_manifest" --all-targets -- -D warnings
           python -m venv "$RUNNER_TEMP/stellar-source-python"
           "$RUNNER_TEMP/stellar-source-python/bin/python" -m pip install -r scripts/requirements-admin.txt
           "$RUNNER_TEMP/stellar-source-python/bin/python" -m unittest discover -s scripts/tests -v
+          if compgen -G 'scripts/tests/e2e_*.py' > /dev/null; then
+            "$RUNNER_TEMP/stellar-source-python/bin/python" -m unittest discover -s scripts/tests -p 'e2e_*.py' -v
+          fi
       - name: Verify release automation
         working-directory: automation
         run: python -m unittest discover -s scripts/tests -p test_testnet_release.py -v
