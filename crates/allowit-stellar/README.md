@@ -22,6 +22,15 @@ cargo test --locked --manifest-path crates/allowit-stellar/Cargo.toml
 cargo clippy --locked --manifest-path crates/allowit-stellar/Cargo.toml --all-targets -- -D warnings
 ```
 
+`cargo test` runs the hermetic tests: no socket, no network. An end-to-end test binds a local
+socket for a fixture RPC or server. It carries `#[cfg_attr(not(feature = "e2e"), ignore = ...)]`,
+so the default run lists it as ignored. The `e2e` feature runs the whole
+suite, end-to-end tests included:
+
+```sh
+cargo test --locked --manifest-path crates/allowit-stellar/Cargo.toml --features e2e
+```
+
 The optional `test-support` feature supplies native protocol fixtures for consumer integration tests.
 Consumer tests provide mock transport, temporary storage and assertions.
 

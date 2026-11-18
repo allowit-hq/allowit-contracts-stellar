@@ -37,6 +37,8 @@ jobs:
           rustc --edition=2024 -Coverflow-checks=on --test --extern allowit="$RUNNER_TEMP/liballowit.rlib" scripts/policy-smoke.rs -o "$RUNNER_TEMP/policy-smoke"
           "$RUNNER_TEMP/policy-smoke" "${{ matrix.flow }}" --nocapture | tee "$RUNNER_TEMP/policy.log"
           grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed' "$RUNNER_TEMP/policy.log"
+  # The hermetic tests: no socket, no network. scripts/no-network.sh runs them in a unit that
+  # may create no IP socket, so a test that needs one fails here.
   contracts:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -66,7 +68,9 @@ jobs:
       - name: Require the committed Common Wasm hash
         run: git diff --exit-code crates/allowit-stellar/allowit_common_policy_engine.wasm.sha256
       - name: Local authorization and custody regressions
-        run: cargo test --workspace --locked
+        run: |
+          cargo test --workspace --locked --no-run
+          scripts/no-network.sh cargo test --workspace --locked --offline
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
@@ -76,4 +80,29 @@ jobs:
         run: |
           python3 -m venv "$RUNNER_TEMP/wallet-admin"
           "$RUNNER_TEMP/wallet-admin/bin/pip" install -r scripts/requirements-admin.txt
-          "$RUNNER_TEMP/wallet-admin/bin/python" -m unittest discover -s scripts/tests -v
+          scripts/no-network.sh "$RUNNER_TEMP/wallet-admin/bin/python" -m unittest discover -s scripts/tests -v
+  # The end-to-end tests: the Stellar CLI against a fixture RPC on loopback.
+  end-to-end:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: stellar-contracts
+      - name: Install pinned Stellar CLI
+        run: |
+          curl -fsSL https://github.com/stellar/stellar-cli/releases/download/v28.1.0/stellar-cli-28.1.0-x86_64-unknown-linux-gnu.tar.gz -o /tmp/stellar.tar.gz
+          echo 'c1680deee94301d33ada7a17f98411e642a4248c727afbd2e43050d345746462  /tmp/stellar.tar.gz' | sha256sum -c -
+          mkdir /tmp/stellar-cli
+          tar -xzf /tmp/stellar.tar.gz -C /tmp/stellar-cli
+          echo /tmp/stellar-cli >> "$GITHUB_PATH"
+          rustup target add wasm32v1-none --toolchain 1.98.0
+      - name: Build all contract Wasm
+        run: scripts/build-contracts.sh
+      - name: Native administration end-to-end regressions
+        run: |
+          python3 -m venv "$RUNNER_TEMP/wallet-admin"
+          "$RUNNER_TEMP/wallet-admin/bin/pip" install -r scripts/requirements-admin.txt
+          "$RUNNER_TEMP/wallet-admin/bin/python" -m unittest discover -s scripts/tests -p 'e2e_*.py' -v

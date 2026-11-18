@@ -243,6 +243,10 @@ python3 -m venv /tmp/allowit-admin
 /tmp/allowit-admin/bin/python -m unittest discover -s scripts/tests -v
 ```
 
+`scripts/tests/test_*.py` are hermetic. `scripts/tests/e2e_*.py` run the Stellar CLI against a fixture
+RPC on loopback and need the built Wasm:
+`/tmp/allowit-admin/bin/python -m unittest discover -s scripts/tests -p 'e2e_*.py' -v`.
+
 ## Operate a wallet
 
 The owner interface is the same on all three wallets:
@@ -329,6 +333,26 @@ cargo fmt --manifest-path crates/allowit-stellar/Cargo.toml --check
 cargo test --locked --manifest-path crates/allowit-stellar/Cargo.toml
 cargo clippy --locked --manifest-path crates/allowit-stellar/Cargo.toml --all-targets -- -D warnings
 ```
+
+`cargo test` runs the hermetic tests: no socket, no network. An end-to-end test binds a local
+socket for a fixture RPC or server. It carries `#[cfg_attr(not(feature = "e2e"), ignore = ...)]`,
+so the default run lists it as ignored. The `e2e` feature of `crates/allowit-stellar` runs the
+whole suite, end-to-end tests included:
+
+```sh
+cargo test --locked --manifest-path crates/allowit-stellar/Cargo.toml --features e2e
+```
+
+`scripts/no-network.sh` runs a command with IP networking denied: on Linux in a systemd unit that
+may create no IP socket (it uses `sudo`), on macOS in the built-in sandbox. CI runs the hermetic
+tests through it, so a hermetic test that opens a socket, even on 127.0.0.1, fails:
+
+```sh
+cargo test --locked --manifest-path crates/allowit-stellar/Cargo.toml --no-run
+scripts/no-network.sh cargo test --locked --offline --manifest-path crates/allowit-stellar/Cargo.toml
+```
+
+Mark a new test that needs a socket or the network with the `e2e` attribute.
 
 The contract workspace and `npm/stellar` consume the `allowit-core` release tag `v0.5.0`. `crates/allowit-stellar` consumes `allowit-core` 0.6.0 at the revision in its `Cargo.toml`. Releases of this repository are annotated git tags `vX.Y.Z`: set `version` in `Cargo.toml`, `crates/allowit-stellar/Cargo.toml` and `npm/stellar/package.json`, merge, then tag the merge commit with `git tag -a vX.Y.Z -m vX.Y.Z <commit> && git push origin vX.Y.Z`.
 
