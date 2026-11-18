@@ -529,11 +529,9 @@ impl OwnerClient {
         }
         Ok(next)
     }
-    /// Change typed params of an unsigned draft. The server checks each value against the
-    /// param's type and range; the reply holds exactly the values that were sent.
-    /// The owner's view of the build of a Custom policy: the source that the server admitted
-    /// and the code hash of the build that the server made from it and uploaded. A client that
-    /// builds the same source compares the hashes before the owner signs the creation.
+    /// The owner's view of the build of a Custom policy: the build ticket, the hash of the source
+    /// that the owner signed and the build that the server holds. The owner's client builds that
+    /// source and hands the code to the server, which uploads it at deployment.
     pub fn custom_build(&self, policy_id: &str, now: u64) -> Result<Value> {
         self.session.owner_request(
             Method::Post,
@@ -548,6 +546,8 @@ impl OwnerClient {
     pub fn into_session(self) -> crate::host::owner_session::Client {
         self.session
     }
+    /// Change typed params of an unsigned draft. The server checks each value against the
+    /// param's type and range; the reply holds exactly the values that were sent.
     pub fn edit_params(
         &self,
         draft: &GeneratedPolicy,
