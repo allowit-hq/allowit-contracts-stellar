@@ -1478,7 +1478,9 @@ impl Deployer<'_> {
         })
     }
     /// Prepare `UploadContractWasm` of policy wallet code that declares custody layout 4.
-    pub fn upload_wasm(&self, source: &str, wasm: &[u8]) -> Result<PreparedDeployment> {
+    /// `None` when the simulation finds the code live on the network: an upload of it would only
+    /// read its entry, so there is nothing to upload.
+    pub fn upload_wasm(&self, source: &str, wasm: &[u8]) -> Result<Option<PreparedDeployment>> {
         let wasm_hash = check_wallet_code(wasm)?;
         let account = self.account(source)?;
         let host = HostFunction::UploadContractWasm(wasm.to_vec().try_into().map_err(err)?);
@@ -1502,7 +1504,25 @@ impl Deployer<'_> {
                     .into(),
             );
         }
+        // An upload writes the code entry alone. Code that is live, for example because another
+        // transaction uploaded it after it was read, is only read: nothing to upload or pay.
+        let TransactionExt::V1(data) = &tx.ext else {
+            return Err("Missing upload resources".into());
+        };
+        let key = [LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: Hash(wasm_hash),
+        })];
+        let footprint = &data.resources.footprint;
+        match (
+            footprint.read_only.as_slice(),
+            footprint.read_write.as_slice(),
+        ) {
+            ([], written) if written == key => {}
+            (read, []) if read == key => return Ok(None),
+            _ => return Err("Upload resources name another entry than its code".into()),
+        }
         self.prepared(&account, "upload_wasm", wasm_hash, None, tx)
+            .map(Some)
     }
     /// Prepare `RestoreFootprint` of the code entry `wasm_hash` from `source` when the network's
     /// archive holds it. It names that entry alone and gives no authority; the simulation sets
@@ -1580,6 +1600,10 @@ impl Deployer<'_> {
                 .as_str()
                 .ok_or("Missing restoration resources")?,
         )?;
+        // Archived entries are named by their index in the read-write footprint: only the code
+        // entry is there. A simulation that names an archived entry outside it is refused, also
+        // when its footprint is empty.
+        crate::rpc::archived_in_footprint(&data)?;
         // The simulation restores only archived entries: it names none for code that is live or
         // absent.
         if data.resources.footprint.read_only.is_empty()
@@ -1592,9 +1616,6 @@ impl Deployer<'_> {
         {
             return Err("Restoration resources name another entry".into());
         }
-        // Archived entries are named by their index in the read-write footprint: only the code
-        // entry is there.
-        crate::rpc::archived_in_footprint(&data)?;
         let fee = response["minResourceFee"]
             .as_str()
             .ok_or("Missing restoration fee")?

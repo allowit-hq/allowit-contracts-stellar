@@ -481,7 +481,11 @@ impl Provider {
             native::admin::CodeRestoration::Prepared(p) => p,
             native::admin::CodeRestoration::Live => return Ok(None),
             native::admin::CodeRestoration::Absent => match wasm {
-                Some(wasm) => checked(deployer.upload_wasm(&account, wasm))?,
+                // Another transaction can upload the code after it was read: nothing is sent.
+                Some(wasm) => match checked(deployer.upload_wasm(&account, wasm))? {
+                    Some(p) => p,
+                    None => return Ok(None),
+                },
                 None => {
                     return Err(Error::usage(
                         "The wallet code is not on the network: a restoration needs code that lapsed",

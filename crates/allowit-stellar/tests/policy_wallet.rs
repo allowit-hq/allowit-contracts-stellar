@@ -337,6 +337,10 @@ struct Model {
     refused_restore: bool,
     /// Reads of code entries fail, as a broken transport does.
     failing_code_reads: bool,
+    /// Another transaction uploads the code of the next upload just before its simulation.
+    uploaded_meanwhile: bool,
+    /// The next upload simulations also write another entry than the code.
+    upload_names_another_entry: bool,
     tiers: BTreeMap<[u8; 32], PolicyTier>,
     wallet: Option<Wallet>,
     settled: BTreeMap<String, String>,
@@ -780,11 +784,39 @@ impl rpc::Rpc for ModelChain {
                     }
                 };
                 let mut wallet_call = false;
+                let mut footprint = x::LedgerFootprint::default();
                 let (result, required): (x::ScVal, Vec<x::SorobanAuthorizationEntry>) = match &op
                     .host_function
                 {
                     x::HostFunction::UploadContractWasm(code) => {
-                        (bytes(&hash(code.as_slice())), vec![])
+                        let code_hash = hash(code.as_slice());
+                        if m.uploaded_meanwhile {
+                            m.uploaded_meanwhile = false;
+                            let tier = m.tiers[&code_hash];
+                            m.code.insert(code_hash, tier);
+                            m.code_bytes.insert(code_hash, code.to_vec());
+                        }
+                        // As the host: an upload reads the entry of code that the network holds
+                        // and writes it otherwise.
+                        let key: x::VecM<x::LedgerKey> =
+                            vec![x::LedgerKey::ContractCode(x::LedgerKeyContractCode {
+                                hash: x::Hash(code_hash),
+                            })]
+                            .try_into()
+                            .unwrap();
+                        if m.code_bytes.contains_key(&code_hash) {
+                            footprint.read_only = key;
+                        } else {
+                            footprint.read_write = key;
+                        }
+                        if m.upload_names_another_entry {
+                            let mut written = footprint.read_write.to_vec();
+                            written.push(x::LedgerKey::ContractCode(x::LedgerKeyContractCode {
+                                hash: x::Hash([0x5b; 32]),
+                            }));
+                            footprint.read_write = written.try_into().unwrap();
+                        }
+                        (bytes(&code_hash), vec![])
                     }
                     x::HostFunction::InvokeContract(call)
                         if call.contract_address == address(&deployer())? =>
@@ -884,7 +916,11 @@ impl rpc::Rpc for ModelChain {
                 Ok(json!({
                     "latestLedger": m.ledger,
                     "minResourceFee": fee.to_string(),
-                    "transactionData": b64(&x::SorobanTransactionData { resource_fee: fee, ..Default::default() }),
+                    "transactionData": b64(&x::SorobanTransactionData {
+                        resource_fee: fee,
+                        resources: x::SorobanResources { footprint, ..Default::default() },
+                        ..Default::default()
+                    }),
                     "results": [{"xdr": b64(&result), "auth": auth.iter().map(b64).collect::<Vec<_>>()}],
                 }))
             }
@@ -1589,7 +1625,7 @@ fn custom_upload_checks_its_source_before_the_next_ledger() {
                 "stale, changed or wrong-network source observation"
             );
         } else {
-            let packet = prepared.unwrap();
+            let packet = prepared.unwrap().expect("the code is not on the network");
             assert_eq!(packet.wasm_hash, module);
             assert_eq!(packet.source, sender());
         }
@@ -1634,9 +1670,10 @@ fn create(chain: &ModelChain, tier: PolicyTier, wasm: &[u8], salt: [u8; 32]) -> 
         now: NOW,
         max_fee_stroops: MAX_FEE,
     };
-    let upload = d.upload_wasm(&sender(), wasm).unwrap();
-    assert_eq!(upload.wasm_hash, module);
-    submit(chain, "upload", &upload.transaction_xdr, &SENDER);
+    if let Some(upload) = d.upload_wasm(&sender(), wasm).unwrap() {
+        assert_eq!(upload.wasm_hash, module);
+        submit(chain, "upload", &upload.transaction_xdr, &SENDER);
+    }
     let c = installation(tier, module, salt);
     let config = PolicyConfig::for_policy(&c).unwrap();
     let created = d
@@ -3265,9 +3302,69 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         .unwrap()
         .tiers
         .insert(hash(&other), PolicyTier::Simple);
+    let signed = signatures();
+    // A restoration simulation that names an archived entry outside its footprint is refused
+    // before anything is signed, also when the footprint is empty, as for absent code.
+    chain.0.lock().unwrap().restore_archived = vec![0];
+    let refused = session
+        .provider
+        .upload_code_within(
+            &installation,
+            &other,
+            u64::from(u32::MAX),
+            Poll::default(),
+            NOW,
+        )
+        .unwrap_err();
+    assert!(
+        refused.message.contains("outside the read-write footprint"),
+        "{}",
+        refused.message
+    );
+    chain.0.lock().unwrap().restore_archived.clear();
+    // An upload whose simulation writes another entry than the code is refused.
+    chain.0.lock().unwrap().upload_names_another_entry = true;
+    let refused = session
+        .provider
+        .upload_code_within(
+            &installation,
+            &other,
+            u64::from(u32::MAX),
+            Poll::default(),
+            NOW,
+        )
+        .unwrap_err();
+    assert!(
+        refused.message.contains("another entry than its code"),
+        "{}",
+        refused.message
+    );
+    chain.0.lock().unwrap().upload_names_another_entry = false;
+    // Another transaction uploads the code after it was read: the upload's simulation only
+    // reads the code entry, so nothing is signed or sent.
+    chain.0.lock().unwrap().uploaded_meanwhile = true;
+    assert!(
+        session
+            .provider
+            .upload_code_within(
+                &installation,
+                &other,
+                u64::from(u32::MAX),
+                Poll::default(),
+                NOW,
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(signatures(), signed);
+    {
+        let mut m = chain.0.lock().unwrap();
+        assert!(!m.uploaded_meanwhile);
+        m.code.remove(&hash(&other));
+        m.code_bytes.remove(&hash(&other));
+    }
     // The server pays the upload, within its fee ceiling: a ceiling below the simulated fee
     // refuses it before anything is signed or sent.
-    let signed = signatures();
     let refused = session
         .provider
         .upload_code_within(&installation, &other, 100, Poll::default(), NOW)
@@ -3301,6 +3398,18 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         .unwrap();
     assert!(receipt.is_some());
     assert!(chain.0.lock().unwrap().code.contains_key(&hash(&other)));
+    // An upload of live code prepares nothing.
+    assert!(
+        Deployer {
+            rpc: &*chain,
+            network: NETWORK,
+            now: NOW,
+            max_fee_stroops: u32::MAX,
+        }
+        .upload_wasm(&sender(), &other)
+        .unwrap()
+        .is_none()
+    );
     // The ledger holds it now: nothing is sent.
     assert!(
         session
