@@ -437,7 +437,8 @@ impl Provider {
     /// Make wallet code live from a sending account: the code of `wasm`, or without it the
     /// installation's code. Absent code is uploaded, which needs its bytes; lapsed code is
     /// restored by its hash. A simulated fee above `max_fee_stroops` is refused before anything
-    /// is signed. The receipt is that of a confirmed transaction: one that the ledger failed is
+    /// is signed. The code is read again just before the signature: code that another
+    /// transaction made live meanwhile needs nothing. The receipt is that of a confirmed transaction: one that the ledger failed is
     /// an error whose details name its `transactionHash` and its fee `nativeUnits`.
     fn upload(
         &self,
@@ -493,6 +494,13 @@ impl Provider {
                 }
             },
         };
+        // Another sending account can make the code live after the simulation, which the
+        // simulation's checks do not see, and a simulation that writes the entry does not prove
+        // that the code is absent. The code is read again just before the signature: live code
+        // needs nothing, and nothing is signed or paid.
+        if checked(rpc::code_state(self.rpc(), &c.network, &code_hash))? == rpc::CodeState::Live {
+            return Ok(None);
+        }
         let signature = sending_signature(sender, &account, &p.transaction_hash)?;
         let signed = checked(native::admin::with_source_signature(
             &c.network,

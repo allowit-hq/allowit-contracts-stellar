@@ -341,6 +341,10 @@ struct Model {
     uploaded_meanwhile: bool,
     /// The next upload simulations also write another entry than the code.
     upload_names_another_entry: bool,
+    /// Another sending account restores the code just after the next restoration's simulation.
+    restored_after_simulation: bool,
+    /// Another sending account uploads the code just after the next upload's simulation.
+    uploaded_after_simulation: bool,
     tiers: BTreeMap<[u8; 32], PolicyTier>,
     wallet: Option<Wallet>,
     settled: BTreeMap<String, String>,
@@ -706,6 +710,14 @@ impl rpc::Rpc for ModelChain {
                         .cloned()
                         .collect();
                     data.resources.footprint.read_write = archived.try_into().unwrap();
+                    if m.restored_after_simulation {
+                        m.restored_after_simulation = false;
+                        for key in data.resources.footprint.read_write.iter() {
+                            if let x::LedgerKey::ContractCode(code) = key {
+                                m.lapsed_code.remove(&code.hash.0);
+                            }
+                        }
+                    }
                     if !m.restore_archived.is_empty() {
                         data.ext = x::SorobanTransactionDataExt::V1(x::SorobanResourcesExtV0 {
                             archived_soroban_entries: m
@@ -808,6 +820,12 @@ impl rpc::Rpc for ModelChain {
                             footprint.read_only = key;
                         } else {
                             footprint.read_write = key;
+                        }
+                        if m.uploaded_after_simulation {
+                            m.uploaded_after_simulation = false;
+                            let tier = m.tiers[&code_hash];
+                            m.code.insert(code_hash, tier);
+                            m.code_bytes.insert(code_hash, code.to_vec());
                         }
                         if m.upload_names_another_entry {
                             let mut written = footprint.read_write.to_vec();
@@ -3363,6 +3381,44 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         m.code.remove(&hash(&other));
         m.code_bytes.remove(&hash(&other));
     }
+    // So with a fee ceiling below the upload's fee: an upload that is not needed costs nothing,
+    // so no ceiling refuses it.
+    chain.0.lock().unwrap().uploaded_meanwhile = true;
+    assert!(
+        session
+            .provider
+            .upload_code_within(&installation, &other, 100, Poll::default(), NOW)
+            .unwrap()
+            .is_none()
+    );
+    // Another sending account uploads the code just after the simulation, which still writes
+    // its entry: the code, read again before the signature, is live, and nothing is signed.
+    {
+        let mut m = chain.0.lock().unwrap();
+        m.code.remove(&hash(&other));
+        m.code_bytes.remove(&hash(&other));
+        m.uploaded_after_simulation = true;
+    }
+    assert!(
+        session
+            .provider
+            .upload_code_within(
+                &installation,
+                &other,
+                u64::from(u32::MAX),
+                Poll::default(),
+                NOW,
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(signatures(), signed);
+    {
+        let mut m = chain.0.lock().unwrap();
+        assert!(!m.uploaded_after_simulation);
+        m.code.remove(&hash(&other));
+        m.code_bytes.remove(&hash(&other));
+    }
     // The server pays the upload, within its fee ceiling: a ceiling below the simulated fee
     // refuses it before anything is signed or sent.
     let refused = session
@@ -3797,6 +3853,26 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         CodeRestoration::Live
     ));
     chain.0.lock().unwrap().refused_restore = false;
+    // Another sending account restores the code just after the simulation, which still names
+    // the entry: the code, read again before the signature, is live, and nothing is signed.
+    {
+        let mut m = chain.0.lock().unwrap();
+        m.lapsed_code.insert(installed);
+        m.restored_after_simulation = true;
+    }
+    let signed = signatures();
+    assert!(
+        provider
+            .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(signatures(), signed);
+    {
+        let m = chain.0.lock().unwrap();
+        assert!(!m.restored_after_simulation);
+        assert!(!m.lapsed_code.contains(&installed));
+    }
     // Code that the network does not have cannot be restored: it needs an upload.
     chain.0.lock().unwrap().code_bytes.remove(&installed);
     let signed = signatures();

@@ -1479,12 +1479,19 @@ impl Deployer<'_> {
     }
     /// Prepare `UploadContractWasm` of policy wallet code that declares custody layout 4.
     /// `None` when the simulation finds the code live on the network: an upload of it would only
-    /// read its entry, so there is nothing to upload.
+    /// read its entry, so there is nothing to upload, and no fee ceiling applies. A simulation
+    /// that writes the entry does not prove that the code is absent: the host also rewrites
+    /// live code whose stored cost inputs differ, so a caller that pays reads the code again.
     pub fn upload_wasm(&self, source: &str, wasm: &[u8]) -> Result<Option<PreparedDeployment>> {
         let wasm_hash = check_wallet_code(wasm)?;
         let account = self.account(source)?;
         let host = HostFunction::UploadContractWasm(wasm.to_vec().try_into().map_err(err)?);
-        let (tx, value) = self.assemble(&account, host, None)?;
+        // The ceiling applies to an upload that is needed: it is checked after the footprint.
+        let unbounded = Deployer {
+            max_fee_stroops: u32::MAX,
+            ..*self
+        };
+        let (tx, value) = unbounded.assemble(&account, host, None)?;
         if value != value_bytes(&wasm_hash)? {
             return Err("Upload simulation returned another Wasm hash".into());
         }
@@ -1520,6 +1527,9 @@ impl Deployer<'_> {
             ([], written) if written == key => {}
             (read, []) if read == key => return Ok(None),
             _ => return Err("Upload resources name another entry than its code".into()),
+        }
+        if tx.fee > self.max_fee_stroops {
+            return Err("Simulated fee exceeds the explicitly selected ceiling".into());
         }
         self.prepared(&account, "upload_wasm", wasm_hash, None, tx)
             .map(Some)
