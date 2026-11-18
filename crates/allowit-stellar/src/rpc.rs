@@ -840,6 +840,37 @@ pub fn status_by_hash(
     let v = rpc.call("getTransaction", json!({"hash":hex(transaction_hash)}))?;
     verify_settlement(&v, network, transaction_hash)
 }
+/// Whether the owner transaction with hash `hash` lapsed: it never applied and can no longer
+/// apply. The server prepared it at ledger `since`, with the time bound `expires_at`. The proof
+/// is one `getTransaction` reply: no record of the hash, a searched history that holds `since`,
+/// and a ledger that closed after the time bound. `false` means not proven.
+pub fn owner_transaction_lapsed(
+    rpc: &dyn Rpc,
+    hash: &[u8; 32],
+    expires_at: u64,
+    since: u64,
+) -> Result<bool> {
+    let reply = rpc.call("getTransaction", json!({ "hash": hex(hash) }))?;
+    Ok(owner_never_applied(&reply, &hex(hash), expires_at, since))
+}
+/// Whether a `getTransaction` reply proves that the transaction with this hash never applied and
+/// can no longer apply: see [`owner_transaction_lapsed`].
+fn owner_never_applied(reply: &Value, hash: &str, expires_at: u64, since: u64) -> bool {
+    let number = |key: &str| {
+        reply[key]
+            .as_u64()
+            .or_else(|| reply[key].as_str()?.parse().ok())
+    };
+    // The searched history is ledgers `oldest..=latest`, and it must contain `since`.
+    let covered = matches!(
+        (number("oldestLedger"), number("latestLedger")),
+        (Some(oldest), Some(latest)) if 0 < oldest && oldest <= since && since <= latest
+    );
+    covered
+        && reply["status"] == "NOT_FOUND"
+        && (reply["txHash"].is_null() || reply["txHash"] == hash)
+        && number("latestLedgerCloseTime").is_some_and(|closed| closed > expires_at)
+}
 /// Whether the policy wallet operation `p` lapsed without executing. Every preparation of the
 /// operation carries the same nonce in the wallet's authorization. When the ledger runs one, the
 /// host keeps that nonce in a temporary entry of the wallet, and the entry lives at least the
@@ -2200,5 +2231,74 @@ mod custom_state_tests {
         // Another tier reads none.
         c.tier = Some(crate::PolicyTier::Common);
         assert!(custom_state(&rpc, &c, 100).unwrap().is_empty());
+    }
+}
+#[cfg(test)]
+mod owner_lapse_tests {
+    use super::*;
+
+    const HASH: &str = "ab";
+    fn reply(status: &str, oldest: u64, latest: u64, closed: u64) -> Value {
+        json!({"status":status,"oldestLedger":oldest,"latestLedger":latest,"latestLedgerCloseTime":closed.to_string()})
+    }
+
+    /// A sent owner step past its time bound with no ledger record lapsed, so the owner signs a
+    /// new step. The proof needs history from the prepared ledger `since` onward.
+    #[test]
+    fn a_lost_owner_send_lapses_only_when_history_covers_its_prepared_ledger() {
+        let (expires_at, since) = (1_000, 500);
+        let lapsed = |reply: &Value| owner_never_applied(reply, HASH, expires_at, since);
+        assert!(lapsed(&reply("NOT_FOUND", 400, 900, 1_001)));
+        assert!(lapsed(&reply("NOT_FOUND", 500, 500, 1_001)));
+        // The history starts after the prepared ledger: an earlier inclusion could be missing.
+        assert!(!lapsed(&reply("NOT_FOUND", 501, 900, 1_001)));
+        // The endpoint has not reached the prepared ledger.
+        assert!(!lapsed(&reply("NOT_FOUND", 400, 499, 1_001)));
+        // No ledger closed after the time bound yet: the step can still apply.
+        assert!(!lapsed(&reply("NOT_FOUND", 400, 900, 1_000)));
+        // A ledger record, a reply without history bounds and a reply for another hash prove
+        // nothing.
+        assert!(!lapsed(&reply("SUCCESS", 400, 900, 1_001)));
+        assert!(!lapsed(&reply("FAILED", 400, 900, 1_001)));
+        assert!(!lapsed(
+            &json!({"status":"NOT_FOUND","latestLedgerCloseTime":"1001"})
+        ));
+        assert!(!lapsed(&reply("NOT_FOUND", 0, 900, 1_001)));
+        let mut other = reply("NOT_FOUND", 400, 900, 1_001);
+        other["txHash"] = json!("cd");
+        assert!(!lapsed(&other));
+        other["txHash"] = json!(HASH);
+        assert!(lapsed(&other));
+    }
+
+    /// The proof reads the reply for the exact hash.
+    #[test]
+    fn the_owner_lapse_reads_the_transaction_of_its_hash() {
+        struct Reply(std::sync::Mutex<Vec<Value>>);
+        impl Rpc for Reply {
+            fn call(&self, method: &str, params: Value) -> Result<Value> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(json!({"method": method, "params": params}));
+                Ok(
+                    json!({"status":"NOT_FOUND","oldestLedger":400,"latestLedger":900,"latestLedgerCloseTime":"1001"}),
+                )
+            }
+        }
+        let rpc = Reply(std::sync::Mutex::new(Vec::new()));
+        assert_eq!(
+            owner_transaction_lapsed(&rpc, &[0xab; 32], 1_000, 500),
+            Ok(true)
+        );
+        assert_eq!(
+            owner_transaction_lapsed(&rpc, &[0xab; 32], 1_001, 500),
+            Ok(false)
+        );
+        let calls = rpc.0.lock().unwrap();
+        assert_eq!(
+            calls[0],
+            json!({"method":"getTransaction","params":{"hash": hex(&[0xab; 32])}})
+        );
     }
 }

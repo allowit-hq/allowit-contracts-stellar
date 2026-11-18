@@ -1263,6 +1263,15 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         }
         checked(rpc::operation_lapsed(self.rpc(), &p))
     }
+    fn owner_lapsed(&self, hash: &[u8; 32], expires_at: u64, since: u64) -> Result<bool> {
+        self.current_height()?;
+        checked(rpc::owner_transaction_lapsed(
+            self.rpc(),
+            hash,
+            expires_at,
+            since,
+        ))
+    }
     fn usage(&self, p: &Prepared) -> Result<Option<Usage>> {
         self.network(p.network())?;
         Ok(
