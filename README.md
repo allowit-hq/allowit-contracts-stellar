@@ -206,7 +206,7 @@ scripts/build-contracts.sh                # build the test fixtures and every Wa
 cargo test --workspace --locked           # authorization, custody and portability regressions
 ```
 
-The build leaves these contracts in `target/wasm32v1-none/release/`, plus the `allowit_sep56_test_vault.wasm` test vault:
+The build leaves these contracts in `target/wasm32v1-none/release/`, plus two SEP-56 test vaults: the hostile `allowit_sep56_test_vault.wasm` and `allowit_sep56_priced_test_vault.wasm`, a well-behaved vault whose admin sets the share price:
 
 ```
 allowit_simple_policy_engine.wasm
@@ -289,7 +289,8 @@ crates/
   protocol/                Shared request, operation, expense and event types
   policy/                  Soroban policy bindings
   policy-wallet/           Custody core, owner operations and policy_wallet! macro
-  test-vault/              SEP-56 vault for tests
+  test-vault/              Hostile SEP-56 vault for tests
+  priced-test-vault/       Well-behaved SEP-56 test vault with an admin-set share price
 npm/stellar/               @allowit/stellar browser package; source, tests and distribution
 scripts/                  Build, policy checks, smoke vectors, administration and release tooling
 docs/                     Architecture, engine parent, administration, mainnet

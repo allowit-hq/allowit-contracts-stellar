@@ -62,6 +62,7 @@ static OTHER_MEMBERS: &[(&str, &[u8])] = tree![
     "contracts/allowit-engine-parent/Cargo.toml",
     "contracts/allowit-simple-policy-engine/Cargo.toml",
     "contracts/allowit-wallet-engine/Cargo.toml",
+    "crates/priced-test-vault/Cargo.toml",
     "crates/test-vault/Cargo.toml",
 ];
 
