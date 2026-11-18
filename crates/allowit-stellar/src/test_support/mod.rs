@@ -106,7 +106,10 @@ pub fn policy_sealed(signed: &SignedOperation) -> SignedOperation {
     let x::MuxedAccount::Ed25519(x::Uint256(key)) = envelope.tx.source_account.clone() else {
         panic!()
     };
-    assert_eq!(crate::account_for_public_key(&key), crate::account_for_seed(&[10; 32]));
+    assert_eq!(
+        crate::account_for_public_key(&key),
+        crate::account_for_seed(&[10; 32])
+    );
     let hash = crate::transaction_hash(&signed.prepared.config.network, &envelope.tx).unwrap();
     envelope.signatures = vec![x::DecoratedSignature {
         hint: x::SignatureHint(key[28..].try_into().unwrap()),
