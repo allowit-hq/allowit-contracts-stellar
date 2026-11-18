@@ -345,7 +345,7 @@ which denies a policy write with `Unsupported`, on the host as onchain. A Custom
 state entries that its build declares, and runs the Custom post-flight: the server evaluates its
 source with the Custom params check and the Custom post-flight, so the server never approves an
 operation whose state the chain would drop. [Custom policy on the wallet kernel](custom-policy-kernel.md#policy-state)
-states the calls, keys, values, lifetimes and caps. The figures and state entries that the wallet
+states the calls, keys, values, lifetimes and bounds. The figures and state entries that the wallet
 keeps are the server's next `ctx.state`. `allowit-stellar-admin` refuses a Simple or Common source
 that calls `allowit::set_state`, also through the raw identifier `allowit::r#set_state`.
 

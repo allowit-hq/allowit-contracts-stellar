@@ -438,9 +438,11 @@ pub fn policy_rules(
     if value["source_hash"] != hex(&hash(&bytes)) {
         return Err("source_hash must be the SHA-256 of the policy source".into());
     }
-    // Simple and Common store only standard state, so their server denies every policy write.
-    // A policy wallet stores no policy state on any tier.
-    if shape.writes_state {
+    // Simple and Common store only standard state, so their server denies every policy write. A
+    // Custom wallet keeps the state entries that its build declares.
+    if tier == PolicyTier::Custom {
+        allowit_stellar::custom_state_entries(source)?;
+    } else if shape.writes_state {
         return Err(policy::WRITES_STATE.into());
     }
     let empty = json!({});

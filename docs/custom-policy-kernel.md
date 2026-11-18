@@ -135,6 +135,11 @@ The build reads every `get_state` and `set_state` call of `policy.rs`:
 | More than 8 distinct keys | The build stops |
 | Two keys whose storage keys are equal | The build stops; rename one |
 
+A call in a comment or in a string literal is no call. The scan is
+`contracts/allowit-custom-policy/state_keys.rs`; the rail's server evaluation runs the same file on
+the installed source, reads each declared entry with the same lifetimes and evaluates the policy
+with the Custom post-flight, so the server decides with the state that the wallet holds.
+
 The wallet never stores the key name. The storage key of an entry is a `u32`: the first four bytes
 of the SHA-256 of the name, big-endian. The same name keeps the same storage key across source
 revisions. The wallet's own entries use `Symbol` keys (`c`, `d`, `t`), so no policy key can reach
@@ -167,13 +172,13 @@ The name of a key states its lifetime:
 No read extends an entry, and no write extends it later. A persistent entry that has lapsed is
 restored with its value by the next operation that uses it.
 
-### Caps
+### Bounds
 
-| Cap | Value | Checked |
+| Bound | Value | Checked |
 | --- | --- | --- |
 | Entries per policy | 8 | At build |
 | Packed bytes per value | 64 | At write: a larger value fails the operation with `InvalidState` |
-| Bytes per wallet | 8 × (64 + 4) = 544 | Follows from the two caps |
+| Bytes per wallet | 8 × (64 + 4) = 544 | Follows from the two bounds above |
 
 ### Who pays
 

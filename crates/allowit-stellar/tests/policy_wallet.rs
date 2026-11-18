@@ -1039,6 +1039,7 @@ fn execute(w: &mut Wallet, request: &x::ScVal, now: u64, ledger: u32, source: &s
     // post-flight computes them.
     let advance = |w: &Wallet, before: &packed::Figures| -> packed::Figures {
         let state = PolicyStateSnapshot {
+            custom: Default::default(),
             params: w.config.params.clone(),
             rules: w.config.rules.clone(),
             source_hash: w.config.source_hash,

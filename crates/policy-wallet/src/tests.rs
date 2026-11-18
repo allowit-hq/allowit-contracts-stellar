@@ -1027,7 +1027,10 @@ fn a_custom_source_keeps_its_own_state_under_a_short_key() {
         raw.copy_into_slice(&mut value[..raw.len() as usize]);
         // The packed value: one type byte and the integer, nothing else.
         let mut r = pack::Reader::new(&value[..raw.len() as usize]);
-        assert_eq!(pack::get_value(&f.env, &mut r).ok(), Some(AllowitValue::Int(count)));
+        assert_eq!(
+            pack::get_value(&f.env, &mut r).ok(),
+            Some(AllowitValue::Int(count))
+        );
         assert!(r.done());
         // A write never extends the entry: it lives from the deployment.
         assert_eq!(ttl, TOTAL_LEDGERS - 1 - 10 * count as u32);
@@ -1085,7 +1088,10 @@ fn a_daily_state_entry_lives_one_window_and_a_read_never_extends_it() {
     f.advance(100);
     assert_eq!(f.run(&f.transfer(10, 0)), Ok(()));
     // A write in an open window keeps its end and its lifetime.
-    assert_eq!(f.daily_state(DAY_PAYMENTS_KEY).unwrap().1, DAY_LEDGERS - 101);
+    assert_eq!(
+        f.daily_state(DAY_PAYMENTS_KEY).unwrap().1,
+        DAY_LEDGERS - 101
+    );
     // Two payments today: the third is denied, and the denial writes nothing.
     f.advance(100);
     assert_eq!(
@@ -1135,24 +1141,29 @@ impl AllowitPolicy for Declared {
 }
 
 #[test]
-fn a_state_value_over_its_cap_or_an_undeclared_key_is_refused() {
+fn a_state_value_over_its_bound_or_an_undeclared_key_is_refused() {
     let f = Fixture::new(SIMPLE);
     let env = &f.env;
     f.env.as_contract(&f.wallet, || {
         let before: [Slot; MAX_POLICY_STATE] = Default::default();
-        let text = |len: usize| {
-            AllowitValue::Str(soroban_sdk::String::from_str(env, &"x".repeat(len)))
-        };
+        let text =
+            |len: usize| AllowitValue::Str(soroban_sdk::String::from_str(env, &"x".repeat(len)));
         let write = |key: &str, value: AllowitValue| {
             let mut state = Map::new(env);
             state.set(Symbol::new(env, key), value);
             write_policy_state::<Declared>(env, &state, &before)
         };
-        // 62 text bytes pack into 64: the cap.
+        // 62 text bytes pack into 64: the most that a value holds.
         assert_eq!(write("note", text(62)), Ok(()));
         assert_eq!(write("day_note", text(62)), Ok(()));
-        assert_eq!(write("note", text(63)), Err(AllowitWalletError::InvalidState));
-        assert_eq!(write("day_note", text(63)), Err(AllowitWalletError::InvalidState));
+        assert_eq!(
+            write("note", text(63)),
+            Err(AllowitWalletError::InvalidState)
+        );
+        assert_eq!(
+            write("day_note", text(63)),
+            Err(AllowitWalletError::InvalidState)
+        );
         // A key that the build did not declare is never stored.
         assert_eq!(
             write("other", AllowitValue::Int(1)),

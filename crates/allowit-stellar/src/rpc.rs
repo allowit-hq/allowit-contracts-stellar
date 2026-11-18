@@ -1663,6 +1663,7 @@ fn current_wallet_state(
                 rules: config.rules.clone(),
                 source_hash: config.source_hash,
                 figures: figures.clone(),
+                custom: custom_state(rpc, c, ledger)?,
             }),
             source: AccountState {
                 address: String::new(),
@@ -1721,6 +1722,36 @@ pub fn figures(rpc: &dyn Rpc, c: &WalletConfig, ledger: u32) -> Result<packed::F
         packed::daily(raw.as_slice(), ledger, &mut figures)?;
     }
     Ok(figures)
+}
+/// A Custom policy's own state entries at `ledger`: each key that its build declares, read from
+/// its short storage key. A daily entry whose window ended and a persistent entry without a
+/// value are absent. Other tiers store none.
+pub fn custom_state(
+    rpc: &dyn Rpc,
+    c: &WalletConfig,
+    ledger: u32,
+) -> Result<std::collections::BTreeMap<String, crate::PolicyValue>> {
+    let mut state = std::collections::BTreeMap::new();
+    if c.tier != Some(crate::PolicyTier::Custom) {
+        return Ok(state);
+    }
+    for entry in crate::custom_state_entries(&c.policy_source)? {
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: address(&c.wallet)?,
+            key: ScVal::U32(entry.key),
+            durability: if entry.daily {
+                ContractDataDurability::Temporary
+            } else {
+                ContractDataDurability::Persistent
+            },
+        });
+        if let Some(ScVal::Bytes(raw)) = persistent_entry(rpc, &key)?
+            && let Some(value) = packed::state_value(raw.as_slice(), entry.daily, ledger)?
+        {
+            state.insert(entry.name, value);
+        }
+    }
+    Ok(state)
 }
 /// Check the wallet's binding against the installation: its rules, asset and the owner's source
 /// hash. The roles may differ.
@@ -1951,5 +1982,114 @@ mod transport_tests {
         server.join().unwrap();
         assert_eq!(error, TRANSPORT_UNKNOWN);
         assert_eq!(crate::provider::failure(error).code, 5);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod custom_state_tests {
+    use super::*;
+    use crate::state_keys::declared;
+
+    const SOURCE: &str = "use allowit::prelude::*;\n/// Count each payment, today and in all.\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    // get_state and set_state in a comment are no calls: set_state(ctx, nothing)\n    let note = \"set_state(ctx, \\\"not_a_key\\\", 1)\";\n    let _ = note;\n    let today: u64 = allowit::get_state(ctx, \"day_payments\")?.unwrap_or(0);\n    let all = allowit::get_state::<u64>(ctx, \"payments\")?.unwrap_or(0);\n    let _spent: i128 = allowit::get_state(ctx, \"spent\")?.unwrap_or(0);\n    allowit::r#set_state(ctx, \"day_payments\", today + 1)?;\n    allowit::set_state(ctx, \"payments\", all + 1)?;\n    Ok(())\n}\n";
+
+    #[test]
+    fn the_scan_finds_each_literal_key_and_skips_comments_and_strings() {
+        let (entries, figures) = declared(SOURCE, |name| crate::hash(name)).unwrap();
+        let names: Vec<(&str, bool)> = entries.iter().map(|e| (e.name.as_str(), e.daily)).collect();
+        assert_eq!(names, [("day_payments", true), ("payments", false)]);
+        assert_eq!(entries[0].key, 0x6df2_15e2);
+        // A read of a standard figure keeps that figure: `spent` is figure 1.
+        assert_eq!(figures, 1);
+        for (source, refused) in [
+            ("allowit::set_state(ctx, key, 1)?;", "string literal"),
+            ("allowit::set_state(ctx, \"spent\", 1)?;", "standard figure"),
+            ("allowit::get_state(ctx, \"a-b\")?;", "not 1 to 32"),
+            ("allowit::get_state(ctx, \"\")?;", "not 1 to 32"),
+            ("let s = \"unterminated;", "unterminated"),
+        ] {
+            let error = declared(source, |name| crate::hash(name)).unwrap_err();
+            assert!(error.contains(refused), "{source}: {error}");
+        }
+        let nine: String = (0..9)
+            .map(|i| format!("allowit::set_state(ctx, \"k{i}\", 1)?;\n"))
+            .collect();
+        assert!(
+            declared(&nine, |name| crate::hash(name))
+                .unwrap_err()
+                .contains("at most 8")
+        );
+    }
+
+    #[test]
+    fn a_state_value_reads_with_its_window_and_its_packing() {
+        // A daily entry: end ledger 100, then the packed `Int(1)`.
+        let daily = [0, 0, 0, 100, 0, 2];
+        assert_eq!(
+            packed::state_value(&daily, true, 100).unwrap(),
+            Some(crate::PolicyValue::Int(1))
+        );
+        assert_eq!(packed::state_value(&daily, true, 101).unwrap(), None);
+        assert_eq!(
+            packed::state_value(&[0, 2], false, 1).unwrap(),
+            Some(crate::PolicyValue::Int(1))
+        );
+        assert_eq!(packed::state_value(&[], false, 1).unwrap(), None);
+        assert!(packed::state_value(&[0, 2, 9], false, 1).is_err());
+        assert!(packed::state_value(&[0, 0], true, 1).is_err());
+    }
+
+    /// An RPC that holds the ledger entries of a test.
+    struct Entries(std::collections::BTreeMap<String, LedgerEntryData>);
+    impl Rpc for Entries {
+        fn call(&self, method: &str, params: Value) -> Result<Value> {
+            assert_eq!(method, "getLedgerEntries");
+            let key = params["keys"][0].as_str().unwrap().to_owned();
+            let entries: Vec<Value> = self
+                .0
+                .get(&key)
+                .map(|data| json!({"key": key, "xdr": xdr(data).unwrap(), "liveUntilLedgerSeq": 1_000}))
+                .into_iter()
+                .collect();
+            Ok(json!({"entries": entries}))
+        }
+    }
+
+    #[test]
+    fn the_snapshot_carries_the_declared_entries_into_the_evaluation() {
+        let mut c = crate::test_support::request_config(crate::WalletRoute::PolicyWallet, false);
+        c.tier = Some(crate::PolicyTier::Custom);
+        c.policy_source = SOURCE.to_owned();
+        let entries = crate::custom_state_entries(SOURCE).unwrap();
+        let mut ledger = std::collections::BTreeMap::new();
+        for (entry, raw) in entries.iter().zip([vec![0, 0, 0, 100, 0, 4], vec![0, 14]]) {
+            let key = LedgerKeyContractData {
+                contract: address(&c.wallet).unwrap(),
+                key: ScVal::U32(entry.key),
+                durability: if entry.daily {
+                    ContractDataDurability::Temporary
+                } else {
+                    ContractDataDurability::Persistent
+                },
+            };
+            let data = LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: key.contract.clone(),
+                key: key.key.clone(),
+                durability: key.durability,
+                val: ScVal::Bytes(raw.try_into().unwrap()),
+            });
+            ledger.insert(xdr(&LedgerKey::ContractData(key)).unwrap(), data);
+        }
+        let rpc = Entries(ledger);
+        // In the window both entries read; after it the daily one is absent.
+        let open = custom_state(&rpc, &c, 100).unwrap();
+        assert_eq!(open.get("day_payments"), Some(&crate::PolicyValue::Int(2)));
+        assert_eq!(open.get("payments"), Some(&crate::PolicyValue::Int(7)));
+        let closed = custom_state(&rpc, &c, 101).unwrap();
+        assert_eq!(closed.get("day_payments"), None);
+        assert_eq!(closed.get("payments"), Some(&crate::PolicyValue::Int(7)));
+        // Another tier reads none.
+        c.tier = Some(crate::PolicyTier::Common);
+        assert!(custom_state(&rpc, &c, 100).unwrap().is_empty());
     }
 }

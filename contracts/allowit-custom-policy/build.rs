@@ -36,146 +36,9 @@ const ALL: [&str; 5] = [
     "evaluate",
 ];
 
-/// The standard figures by key, and the figures that a read of each keeps.
-const STANDARD: [(&str, u8); 7] = [
-    ("spent", 1),
-    ("unpriced", 1),
-    ("calls", 2),
-    ("day_spent", 4),
-    ("day_total", 8),
-    ("day_unpriced", 4 | 8),
-    ("day", 0),
-];
-/// Most state entries of one policy: `allowit_policy_wallet::MAX_POLICY_STATE`.
-const MAX_POLICY_STATE: usize = 8;
-
-/// One state call of the source: whether it writes, and its key.
-struct StateCall {
-    writes: bool,
-    key: String,
-}
-
-/// Every `get_state` and `set_state` call of `code`, with its key. A call whose second argument
-/// is not a string literal stops the build: the wallet must know each key before it runs.
-fn state_calls(code: &str) -> Vec<StateCall> {
-    let bytes = code.as_bytes();
-    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
-    let mut calls = Vec::new();
-    for name in ["get_state", "set_state"] {
-        let mut from = 0;
-        while let Some(at) = code[from..].find(name).map(|i| i + from) {
-            from = at + name.len();
-            if (at > 0 && word(bytes[at - 1])) || bytes.get(from).is_some_and(|c| word(*c)) {
-                continue;
-            }
-            let mut i = from;
-            let skip = |i: &mut usize| {
-                while bytes.get(*i).is_some_and(|c| c.is_ascii_whitespace()) {
-                    *i += 1;
-                }
-            };
-            skip(&mut i);
-            // An explicit type: `get_state::<u64>(...)`.
-            if code[i..].starts_with("::<") {
-                let mut depth = 0;
-                while let Some(c) = bytes.get(i) {
-                    match c {
-                        b'<' => depth += 1,
-                        b'>' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                i += 1;
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                    i += 1;
-                }
-                skip(&mut i);
-            }
-            assert!(
-                bytes.get(i) == Some(&b'('),
-                "`{name}` is called as allowit::{name}(ctx, \"key\", ...)"
-            );
-            // The first argument ends at the first comma outside brackets.
-            let mut depth = 0;
-            i += 1;
-            while let Some(c) = bytes.get(i) {
-                match c {
-                    b'(' | b'[' | b'{' => depth += 1,
-                    b')' | b']' | b'}' => depth -= 1,
-                    b',' if depth == 0 => break,
-                    _ => {}
-                }
-                i += 1;
-            }
-            i += 1;
-            skip(&mut i);
-            assert!(
-                bytes.get(i) == Some(&b'"'),
-                "a state key is a string literal: the wallet must know each key of `{name}` before it runs"
-            );
-            let end = code[i + 1..]
-                .find('"')
-                .map(|n| i + 1 + n)
-                .expect("an unterminated state key");
-            let key = &code[i + 1..end];
-            assert!(
-                !key.is_empty()
-                    && key.len() <= 32
-                    && key.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'),
-                "the state key {key:?} is not 1 to 32 ASCII letters, digits or `_`"
-            );
-            calls.push(StateCall {
-                writes: name == "set_state",
-                key: key.to_owned(),
-            });
-        }
-    }
-    calls
-}
-
-/// The declared state entries, sorted by key, as the `STATE` constant's source; and the figures
-/// that `get_state` reads of standard keys keep.
-fn declared_state(calls: &[StateCall]) -> (String, u8) {
-    let mut figures = 0u8;
-    let mut keys: Vec<&str> = Vec::new();
-    for call in calls {
-        if let Some((_, figure)) = STANDARD.iter().find(|(key, _)| *key == call.key) {
-            assert!(
-                !call.writes,
-                "a policy does not write the standard figure {:?}: the wallet keeps it",
-                call.key
-            );
-            figures |= figure;
-        } else if !keys.contains(&call.key.as_str()) {
-            keys.push(&call.key);
-        }
-    }
-    keys.sort_unstable();
-    assert!(
-        keys.len() <= MAX_POLICY_STATE,
-        "a policy keeps at most {MAX_POLICY_STATE} state entries; this one names {}",
-        keys.len()
-    );
-    let mut stored: Vec<u32> = Vec::new();
-    let mut entries = Vec::new();
-    for key in keys {
-        let digest = Sha256::digest(key.as_bytes());
-        let short = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
-        assert!(
-            !stored.contains(&short),
-            "two state keys share a storage key; rename {key:?}"
-        );
-        stored.push(short);
-        entries.push(format!(
-            "allowit_policy_wallet::AllowitStateKey {{ name: {key:?}, key: {short:#010x}, daily: {} }}",
-            key.starts_with("day_")
-        ));
-    }
-    (format!("&[{}]", entries.join(", ")), figures)
-}
+/// The policy's state keys: the same scan as the rail's server evaluation.
+#[path = "state_keys.rs"]
+mod state_keys;
 
 fn main() {
     let manifest = Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap()).to_path_buf();
@@ -191,6 +54,7 @@ fn main() {
     let owner_source = manifest.join("policy/source.rs");
     println!("cargo:rerun-if-changed={}", policy.display());
     println!("cargo:rerun-if-changed={}", owner_source.display());
+    println!("cargo:rerun-if-changed=state_keys.rs");
     let compiled = fs::read_to_string(&policy).unwrap();
     let code = without_comments(&compiled);
     let words: Vec<&str> = code
@@ -222,8 +86,21 @@ fn main() {
             figures |= figure;
         }
     }
-    let (state, read_figures) = declared_state(&state_calls(&code));
+    let (entries, read_figures) =
+        state_keys::declared(&compiled, |name| Sha256::digest(name).into())
+            .unwrap_or_else(|error| panic!("{error}"));
     figures |= read_figures;
+    let state = format!(
+        "&[{}]",
+        entries
+            .iter()
+            .map(|entry| format!(
+                "allowit_policy_wallet::AllowitStateKey {{ name: {:?}, key: {:#010x}, daily: {} }}",
+                entry.name, entry.key, entry.daily
+            ))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     if words.iter().any(|word| {
         ALL.contains(word) || (word.contains("state") && !["get_state", "set_state"].contains(word))
     }) {
