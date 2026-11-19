@@ -1273,6 +1273,53 @@ fn a_state_value_over_its_bound_or_an_undeclared_key_is_refused() {
     });
 }
 
+/// The wallet keeps a daily entry by Core's rule (`allowit::daily_window_end`): the window's end
+/// is its last ledger, inclusive. A write at that ledger keeps the window; the entry reads as
+/// absent one ledger later, and the next write opens a new window there.
+#[test]
+fn a_daily_entry_keeps_its_window_through_its_last_ledger_by_cores_rule() {
+    let f = Fixture::new(SIMPLE);
+    let env = &f.env;
+    let write = |value: i128| {
+        env.as_contract(&f.wallet, || {
+            let before = read_policy_state::<Declared>(env).unwrap();
+            let mut state = Map::new(env);
+            state.set(Symbol::new(env, "day_note"), AllowitValue::Int(value));
+            write_policy_state::<Declared>(env, &state, &before)
+        })
+    };
+    let read = || {
+        env.as_contract(&f.wallet, || {
+            read_policy_state::<Declared>(env).unwrap()[1].clone()
+        })
+    };
+    let start = env.ledger().sequence();
+    assert_eq!(write(1), Ok(()));
+    let end = start + DAY_LEDGERS - 1;
+    assert_eq!(read().day_ends, Some(end));
+    assert_eq!(
+        u64::from(end),
+        allowit::daily_window_end(
+            None,
+            &AllowitValue::Int(1),
+            u64::from(start),
+            u64::from(DAY_LEDGERS)
+        )
+        .unwrap()
+    );
+    // At the window's last ledger the value still reads, and a write keeps the end.
+    f.advance(end - start);
+    assert_eq!(read().value, Some(AllowitValue::Int(1)));
+    assert_eq!(write(2), Ok(()));
+    assert_eq!(read().day_ends, Some(end));
+    // One ledger later the window has ended: the value reads as absent, and a write opens a new
+    // window from that ledger.
+    f.advance(1);
+    assert_eq!(read().value, None);
+    assert_eq!(write(3), Ok(()));
+    assert_eq!(read().day_ends, Some(end + DAY_LEDGERS));
+}
+
 #[test]
 fn one_event_names_the_operation_and_its_output() {
     let f = Fixture::new(SIMPLE);

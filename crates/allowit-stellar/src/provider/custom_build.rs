@@ -162,8 +162,11 @@ fn write_tree(tree: &Path, inputs: &[(&str, Vec<u8>)]) -> Result<()> {
     Ok(())
 }
 
-/// Build the Custom wallet Wasm of `source` with the Stellar CLI binary `stellar`.
-pub(crate) fn build_with(stellar: &Path, source: &str, work: &Path) -> Result<WalletCode> {
+/// The build inputs of `source` for a Custom wallet, or the refusal of a source that the wallet
+/// cannot hold: one over the build's size limit, or one whose on-chain part does not pass the
+/// portable gate or the wallet's storage of state keys (at most eight, each with its own storage
+/// key). The build and [`CustomWalletBuild::check`] refuse the same sources.
+fn checked_inputs(source: &str) -> Result<Vec<crate::policy::BuildInput>> {
     if source.len() > MAX_SOURCE_BYTES {
         return Err(Error::usage(
             "The policy source exceeds the custom wallet build limit",
@@ -178,6 +181,12 @@ pub(crate) fn build_with(stellar: &Path, source: &str, work: &Path) -> Result<Wa
             "The policy source does not pass the policy source gate: {reason}. Draft the policy again."
         ))
     })?;
+    Ok(inputs)
+}
+
+/// Build the Custom wallet Wasm of `source` with the Stellar CLI binary `stellar`.
+pub(crate) fn build_with(stellar: &Path, source: &str, work: &Path) -> Result<WalletCode> {
+    let inputs = checked_inputs(source)?;
     let unusable = || Error::config("Cannot prepare the custom wallet build folder");
     std::fs::create_dir_all(work).map_err(|_| unusable())?;
     let work = work.canonicalize().map_err(|_| unusable())?;
@@ -251,6 +260,12 @@ impl CustomWalletBuild for CustomBuild {
     fn code_hash(&self, network: &str, code: &[u8]) -> Result<[u8; 32]> {
         crate::host::routing::normalize(network)?;
         crate::admin::check_wallet_code(code).map_err(Error::usage)
+    }
+    /// The build's own check of `source`, without the build: the size limit, the portable gate
+    /// of the on-chain part and the wallet's storage of its state keys.
+    fn check(&self, network: &str, source: &str) -> Result<()> {
+        crate::host::routing::normalize(network)?;
+        checked_inputs(source).map(|_| ())
     }
 }
 
@@ -357,6 +372,23 @@ mod tests {
             crate::hash(&code)
         );
         assert!(CUSTOM_BUILD.code_hash(NETWORK, b"not wasm").is_err());
+    }
+
+    /// The hook's check refuses what the build refuses, without building: here nine state keys
+    /// that the contract would keep, one more than its storage takes. Keys that the server keeps
+    /// do not count. A source that the wallet can hold passes.
+    #[test]
+    fn the_check_refuses_what_the_build_refuses() {
+        assert!(CUSTOM_BUILD.check(NETWORK, SOURCE).is_ok());
+        let writes: String = (1..=9)
+            .map(|i| format!("    allowit::set_state(ctx, \"k{i}\", ctx.request.amount)?;\n"))
+            .collect();
+        let nine = format!(
+            "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {{\n{writes}    allowit::new_decision_context(ctx, None)?;\n    Ok(())\n}}\n"
+        );
+        let error = CUSTOM_BUILD.check(NETWORK, &nine).unwrap_err();
+        assert!(error.to_string().contains("at most 8"), "{error}");
+        assert!(CUSTOM_BUILD.check("bitcoin:mainnet", SOURCE).is_err());
     }
 
     /// A source with a server part: the contract compiles its on-chain part, and the tree holds

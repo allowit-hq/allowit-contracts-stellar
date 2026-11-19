@@ -528,7 +528,7 @@ fn read_figures(env: &Env, kept: u8) -> Result<Stored, AllowitWalletError> {
         let mut end = [0; 4];
         end.copy_from_slice(r.take(4)?);
         let end = u32::from_be_bytes(end);
-        if env.ledger().sequence() <= end {
+        if allowit::daily_window_open(u64::from(end), u64::from(env.ledger().sequence())) {
             day_ends = Some(end);
             let mask = r.byte()?;
             figures.day_unpriced = r.byte()? & 1 != 0;
@@ -653,7 +653,8 @@ fn read_policy_state<P: AllowitPolicy>(
             let mut end = [0; 4];
             end.copy_from_slice(r.take(4)?);
             let end = u32::from_be_bytes(end);
-            if env.ledger().sequence() > end {
+            // Core's rule: the end is the window's last ledger, inclusive.
+            if !allowit::daily_window_open(u64::from(end), u64::from(env.ledger().sequence())) {
                 continue;
             }
             slot.day_ends = Some(end);
@@ -668,8 +669,9 @@ fn read_policy_state<P: AllowitPolicy>(
     Ok(slots)
 }
 /// Write each state entry whose value the policy changed. A daily entry holds its window's end
-/// ledger before the value: a new window ends `DAY_LEDGERS - 1` ledgers from now and the entry
-/// lives that long. A new persistent entry lives `TOTAL_LEDGERS`. The wallet never extends an
+/// ledger before the value, which Core's `daily_window_end` gives: a write keeps an open window,
+/// and otherwise opens one of `DAY_LEDGERS` ledgers from now, and the entry lives that long. An
+/// unchanged value keeps its end by the same rule, so it is not written. A new persistent entry lives `TOTAL_LEDGERS`. The wallet never extends an
 /// entry later. A value of more than `MAX_STATE_VALUE` packed bytes, and a key that the build did
 /// not declare, are `InvalidState`.
 fn write_policy_state<P: AllowitPolicy>(
@@ -690,10 +692,17 @@ fn write_policy_state<P: AllowitPolicy>(
         let mut w = Writer::new(&mut buf);
         let opens = entry.daily && slot.day_ends.is_none();
         if entry.daily {
-            let end = match slot.day_ends {
-                Some(end) => end,
-                None => checked(env.ledger().sequence().checked_add(DAY_LEDGERS - 1))?,
-            };
+            // `before` is the value that the policy read: a value whose window ended reads as
+            // absent (`read_policy_state`).
+            let before = slot.value.as_ref().zip(slot.day_ends.map(u64::from));
+            let end = allowit::daily_window_end(
+                before,
+                &value,
+                u64::from(env.ledger().sequence()),
+                u64::from(DAY_LEDGERS),
+            )
+            .map_err(|_| AllowitWalletError::Overflow)?;
+            let end = checked(u32::try_from(end).ok())?;
             w.put(&end.to_be_bytes())?;
         }
         let start = w.bytes().len();

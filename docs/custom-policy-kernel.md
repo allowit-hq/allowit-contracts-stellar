@@ -219,7 +219,7 @@ The name of a key states its lifetime:
 
 | Key | Storage | Lifetime |
 | --- | --- | --- |
-| `day_…` | Temporary | One daily window: 17,280 ledgers (the Mainnet minimum for a temporary entry, about one day) from the write that opens it. Writes in an open window keep its end. After the end ledger the entry reads as absent, even if someone paid to keep it alive; the next write opens a new window |
+| `day_…` | Temporary | One daily window: 17,280 ledgers (the Mainnet minimum for a temporary entry, about one day) from the write that opens it. Writes in an open window keep its end. After the end ledger the entry reads as absent, even if someone paid to keep it alive; the next write opens a new window. The contract keeps the window by Core's portable rule (`allowit::daily_window_end`, `allowit::daily_window_open`), which the server applies to the keys that it keeps: the end ledger is the window's last ledger, inclusive |
 | Any other | Persistent | 2,073,600 ledgers (the Mainnet minimum for a persistent entry, about 120 days) from its creation |
 
 No read extends an entry, and no write extends it later. A persistent entry that has lapsed is
