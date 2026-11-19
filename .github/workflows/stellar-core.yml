@@ -136,7 +136,7 @@ jobs:
           git diff --exit-code crates/allowit-stellar/tests/fixtures/policy-wallet-vectors.txt
       - name: Build a Custom wallet through the build hook and compare it with the script build
         run: |
-          expected=$(scripts/build-custom-policy.sh contracts/allowit-custom-policy/policy/policy.rs "$RUNNER_TEMP/custom-policy" | grep -o '"wasm_hash":"[0-9a-f]*"' | cut -d '"' -f 4)
+          expected=$(scripts/build-custom-policy.sh contracts/allowit-custom-policy/policy/policy.rs contracts/allowit-custom-policy/policy/policy.figures "$RUNNER_TEMP/custom-policy" | grep -o '"wasm_hash":"[0-9a-f]*"' | cut -d '"' -f 4)
           test -n "$expected"
           ALLOWIT_EXPECTED_CUSTOM_WASM_HASH=$expected cargo test --locked --manifest-path crates/allowit-stellar/Cargo.toml --test custom_build -- --ignored
       - name: Replay the committed vectors on the wallet Wasm

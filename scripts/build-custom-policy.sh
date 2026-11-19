@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Build the Custom tier Wasm for one reviewed policy source.
 #
-#   scripts/build-custom-policy.sh POLICY.rs OUT_DIR [SOURCE.rs]
+#   scripts/build-custom-policy.sh POLICY.rs FIGURES OUT_DIR [SOURCE.rs]
 #
 # The contract compiles `contracts/allowit-custom-policy/policy/policy.rs` verbatim. POLICY.rs is
-# the on-chain policy; SOURCE.rs, when given, is the owner's full source from which POLICY.rs is
-# derived and goes to `policy/source.rs`. The contract embeds the SHA-256 of SOURCE.rs, or of
+# the on-chain policy; FIGURES holds the keys of the figures that Core's derivation names for it,
+# one per line, and goes to `policy/policy.figures`; SOURCE.rs, when given, is the owner's full
+# source from which POLICY.rs is derived and goes to `policy/source.rs`. The contract embeds the SHA-256 of SOURCE.rs, or of
 # POLICY.rs without one. This script builds a copy of the committed tree with the files in place,
 # so the checkout stays unchanged. The copy has a fixed path, so the same revision, sources,
 # toolchain and Stellar CLI give the same Wasm. It prints one JSON line:
@@ -13,14 +14,15 @@
 # `source_digest` is the wallet's `source_hash`. `wasm_hash` is the executable hash that the owner
 # binds.
 set -euo pipefail
-[ $# -eq 2 ] || [ $# -eq 3 ] || { echo "usage: $0 POLICY.rs OUT_DIR [SOURCE.rs]" >&2; exit 2; }
+[ $# -eq 3 ] || [ $# -eq 4 ] || { echo "usage: $0 POLICY.rs FIGURES OUT_DIR [SOURCE.rs]" >&2; exit 2; }
 source_file=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
+figures_file=$(cd "$(dirname "$2")" && pwd)/$(basename "$2")
 owner_file=""
-if [ $# -eq 3 ]; then
-  owner_file=$(cd "$(dirname "$3")" && pwd)/$(basename "$3")
+if [ $# -eq 4 ]; then
+  owner_file=$(cd "$(dirname "$4")" && pwd)/$(basename "$4")
 fi
-mkdir -p "$2"
-out=$(cd "$2" && pwd)
+mkdir -p "$3"
+out=$(cd "$3" && pwd)
 cd "$(dirname "$0")/.."
 stellar_bin="${STELLAR_BIN:-stellar}"
 digest=$(shasum -a 256 "${owner_file:-$source_file}" | cut -d ' ' -f 1)
@@ -35,6 +37,7 @@ rm -rf "$tree"
 mkdir -p "$tree"
 git archive --format=tar HEAD | tar -x -C "$tree"
 cp "$source_file" "$tree/contracts/allowit-custom-policy/policy/policy.rs"
+cp "$figures_file" "$tree/contracts/allowit-custom-policy/policy/policy.figures"
 if [ -n "$owner_file" ]; then
   cp "$owner_file" "$tree/contracts/allowit-custom-policy/policy/source.rs"
 fi

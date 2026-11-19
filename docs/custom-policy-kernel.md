@@ -19,16 +19,19 @@ bytes, so the server and the owner's client build the same code from the same so
 
 `policy::custom_parts` gives both parts in the rail. Every place that reads the source of a Custom
 wallet uses it: the build hook, the installation binding, the read of the wallet's state entries,
-the figures that the wallet keeps and the server's evaluation. A source with a server part is
-server policy source; its on-chain part is portable source that names no server function.
+the figures that the wallet keeps and the server's evaluation. Core's derivation decides which
+statements only the server runs; this rail keeps no list of server functions of its own. A source
+with a server part is server policy source, which the server checks against the registry of the
+host calls that it links; its on-chain part is portable source that names no server function.
 
 ## Build rule
 
-The contract `contracts/allowit-custom-policy` compiles two files:
+The contract `contracts/allowit-custom-policy` builds from three files:
 
 | File | Content | Who writes it |
 | --- | --- | --- |
-| `policy/policy.rs` | The on-chain policy, compiled verbatim as a module | The build hook (`provider/custom_build.rs`), which derives it from the owner's source, or `scripts/build-custom-policy.sh POLICY.rs OUT_DIR [SOURCE.rs]` |
+| `policy/policy.rs` | The on-chain policy, compiled verbatim as a module | The build hook (`provider/custom_build.rs`), which derives it from the owner's source, or `scripts/build-custom-policy.sh POLICY.rs FIGURES OUT_DIR [SOURCE.rs]` |
+| `policy/policy.figures` | The keys of the figures that Core's derivation names for the on-chain policy (`Derived::figures`), one per line | The same builder |
 | `policy/source.rs` | The owner's full source, from which `policy.rs` is derived | The same builder, when the on-chain part differs from the source. Without it the build treats `policy.rs` as the full source |
 
 `build.rs` derives three constants:
@@ -36,7 +39,7 @@ The contract `contracts/allowit-custom-policy` compiles two files:
 - `SOURCE_HASH`: the SHA-256 of `policy/source.rs`, or of `policy/policy.rs` when there is no
   `source.rs`. The owner's policy signature binds this hash. The wallet stores it, and the
   constructor and every `execute` refuse a stored hash that differs from the compiled one.
-- `FIGURES`: the cumulated figures that the compiled policy's checks read (see below).
+- `FIGURES`: the wallet entries of the figures in `policy/policy.figures` (see below).
 - `STATE`: the policy's own state entries, one for each key of its `get_state` and `set_state`
   calls (see [Policy state](#policy-state)).
 
@@ -92,28 +95,21 @@ read them:
 | `day_spent`, `day_unpriced` | `daily_spending_limit` | `d`, temporary |
 | `day_total`, `day_unpriced` | `daily_volume_limit` | `d`, temporary |
 
-`build.rs` finds the figures in the compiled `policy.rs` (`state_keys::figures`, the scan that the
-rail runs too). It reads the names of the source: the text of a comment or of a string literal, such
-as a state key, names nothing.
-
-- each rule name above keeps its figure;
-- a `get_state` read of a standard figure keeps that figure;
-- the name `state`, as in `ctx.state`, and the names `preflight`, `RULES`, `AllowitRule`,
-  `AllowitStandardState` and `evaluate`, which reach the whole state or every rule, keep every figure.
-
-A derived policy calls its rules by name and reads its own state through `get_state`, so it keeps
-exactly the figures of its rules. A local name such as `my_state`, a key such as `"my_state"` and a
-rule named only in a comment keep no figure. A source that the scan cannot read keeps every figure.
+Core's derivation names the figures of the on-chain policy (`Derived::figures`): those of the kept
+canonical rules, and each standard figure that a kept statement reads with `get_state`. The build
+reads their keys from `policy/policy.figures`, and `state_keys::packed` gives each key its entry:
+`spent` and `unpriced` live in `t` with `SPENT`, `calls` in `t` with `CALLS`, `day_spent` and
+`day_total` in `d`, and `day_unpriced` in `d` beside either daily figure. A daily flag without a
+daily figure opens `d` with `day_spent`. The rail reads the same keys from Core
+(`policy::CustomParts::figures`); it finds no figure in the source itself.
 
 A rule that runs only on the server, such as a rule in a branch that depends on a server function,
 is no part of `policy.rs`, so the wallet keeps no figure for it. The server's own accounting gives
-that figure to the server's evaluation (`kept_figures`): the wallet's figures for the on-chain
-part, the server's for the rest. So an execution of a wallet whose source has a server part needs
-the server's accounting, as an execution of a Simple or Standard wallet does.
-
-The two daily figures share one unpriced flag. When the wallet keeps one daily figure and the
-server the other, an unpriced operation in either one's day marks the day: the wallet counts its
-own window, and the server counts the UTC day.
+that figure to the server's evaluation: the wallet gives exactly the figures that Core names for the
+on-chain part, and the server's accounting the rest. So an execution of a wallet whose source has a
+server part needs the server's accounting, as an execution of a Simple or Standard wallet does. The
+two daily figures share one unpriced flag: the wallet gives it when Core names it for the on-chain
+part, and the server's accounting otherwise.
 
 `t` is created by the constructor and paid for 2,073,600 ledgers (the Mainnet minimum lifetime of a
 persistent entry, about 120 days). Nothing extends it; after it lapses, the next operation restores

@@ -427,7 +427,7 @@ Besides a Custom policy's declared state entries, a wallet stores only the cumul
 its checks read:
 spent and calls in the persistent entry `t`, and the day's spent and total in the temporary entry
 `d`. A Standard wallet keeps the figure of each rule that has its param set; a Custom wallet keeps
-the figures that its build finds in its source. With cost bounds a figure counts the conservative
+the figures that Core's derivation names for the on-chain part of its source. With cost bounds a figure counts the conservative
 expense and gas; without them it counts the raw gross and calls and sets the unpriced flag. No
 owner reconciliation or refund method clears a figure. The day is the life of `d`: its first write
 sets its end ledger, one day of ledgers later, and the entry expires with it. The kernel checks the

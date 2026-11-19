@@ -29,6 +29,9 @@ const POLICY_SOURCE: &str = "contracts/allowit-custom-policy/policy/policy.rs";
 /// The owner's full policy source in the build tree, when its on-chain part differs from it.
 /// The contract embeds the hash of this file.
 const OWNER_SOURCE: &str = "contracts/allowit-custom-policy/policy/source.rs";
+/// The keys of the figures that the on-chain part reads, one per line, as Core's derivation names
+/// them: the wallet keeps those.
+const POLICY_FIGURES: &str = "contracts/allowit-custom-policy/policy/policy.figures";
 /// The largest policy source that the build compiles.
 const MAX_SOURCE_BYTES: usize = 262_144;
 
@@ -46,7 +49,9 @@ static TREE: &[(&str, &[u8])] = tree![
     "contracts/allowit-custom-policy/Cargo.toml",
     "contracts/allowit-custom-policy/build.rs",
     "contracts/allowit-custom-policy/src/branch_policy.rs",
+    "contracts/allowit-custom-policy/src/catching_policy.figures",
     "contracts/allowit-custom-policy/src/catching_policy.rs",
+    "contracts/allowit-custom-policy/src/daily_policy.figures",
     "contracts/allowit-custom-policy/src/daily_policy.rs",
     "contracts/allowit-custom-policy/src/lib.rs",
     "contracts/allowit-custom-policy/state_keys.rs",
@@ -142,8 +147,9 @@ fn write(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// Write the build tree of `source` under `tree`, which must not exist. The contract compiles
-/// `onchain`, the on-chain part of `source`, and embeds the hash of `source`.
-fn write_tree(tree: &Path, source: &str, onchain: &str) -> Result<()> {
+/// the on-chain part of `source`, keeps the figures that Core names for it, and embeds the hash
+/// of `source`.
+fn write_tree(tree: &Path, source: &str, parts: &crate::policy::CustomParts) -> Result<()> {
     for (path, bytes) in TREE {
         write(&tree.join(path), bytes)?;
     }
@@ -152,8 +158,10 @@ fn write_tree(tree: &Path, source: &str, onchain: &str) -> Result<()> {
         write(&manifest, bytes)?;
         write(&manifest.with_file_name("src").join("lib.rs"), b"")?;
     }
-    write(&tree.join(POLICY_SOURCE), onchain.as_bytes())?;
-    if onchain != source {
+    write(&tree.join(POLICY_SOURCE), parts.onchain.as_bytes())?;
+    let figures: String = parts.figures.iter().map(|key| format!("{key}\n")).collect();
+    write(&tree.join(POLICY_FIGURES), figures.as_bytes())?;
+    if parts.onchain != source {
         write(&tree.join(OWNER_SOURCE), source.as_bytes())?;
     }
     Ok(())
@@ -184,7 +192,7 @@ pub(crate) fn build_with(stellar: &Path, source: &str, work: &Path) -> Result<Wa
             std::fs::remove_dir_all(stale).map_err(|_| unusable())?;
         }
     }
-    write_tree(&tree, source, &parts.onchain)?;
+    write_tree(&tree, source, &parts)?;
     let cli = version_line(stellar, &tree).ok_or_else(|| {
         toolchain_missing(format!(
             "The Stellar CLI is missing. Install Stellar CLI {STELLAR_CLI_VERSION} (https://developers.stellar.org/docs/tools/cli/install-cli, or `cargo install --locked stellar-cli@{STELLAR_CLI_VERSION}`), or name its binary in {STELLAR_BIN}. Then run the build again."
@@ -366,9 +374,14 @@ mod tests {
         let parts = crate::policy::custom_parts(ONE).unwrap();
         assert!(parts.server_part);
         let tree = work.path().join("one");
-        write_tree(&tree, ONE, &parts.onchain).unwrap();
+        write_tree(&tree, ONE, &parts).unwrap();
         let compiled = std::fs::read_to_string(tree.join(POLICY_SOURCE)).unwrap();
         assert_eq!(compiled, parts.onchain);
+        // Core names no figure for this on-chain part: the payment limit reads none.
+        assert_eq!(
+            std::fs::read_to_string(tree.join(POLICY_FIGURES)).unwrap(),
+            ""
+        );
         assert!(compiled.contains("\"visits\"") && !compiled.contains("decision"));
         assert!(!compiled.contains("last_score"));
         assert_eq!(
@@ -377,12 +390,43 @@ mod tests {
         );
         let plain = work.path().join("plain");
         let parts = crate::policy::custom_parts(SOURCE).unwrap();
-        write_tree(&plain, SOURCE, &parts.onchain).unwrap();
+        write_tree(&plain, SOURCE, &parts).unwrap();
         assert_eq!(
             std::fs::read_to_string(plain.join(POLICY_SOURCE)).unwrap(),
             SOURCE
         );
+        let figures: String = parts.figures.iter().map(|key| format!("{key}\n")).collect();
+        assert_eq!(
+            std::fs::read_to_string(plain.join(POLICY_FIGURES)).unwrap(),
+            figures
+        );
         assert!(!plain.join(OWNER_SOURCE).exists());
+    }
+
+    /// The committed figures of the contract's own policy and of its fixtures are those that
+    /// Core names for each source.
+    #[test]
+    fn the_committed_figures_are_those_that_core_names() {
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contracts/allowit-custom-policy");
+        for (policy, figures) in [
+            ("policy/policy.rs", "policy/policy.figures"),
+            ("src/catching_policy.rs", "src/catching_policy.figures"),
+            ("src/daily_policy.rs", "src/daily_policy.figures"),
+        ] {
+            let source = std::fs::read_to_string(root.join(policy)).unwrap();
+            let derived = allowit_core::policy_source::derive(&source).unwrap();
+            let named: String = derived
+                .figures
+                .iter()
+                .map(|f| format!("{}\n", f.key))
+                .collect();
+            assert_eq!(
+                std::fs::read_to_string(root.join(figures)).unwrap(),
+                named,
+                "{policy}"
+            );
+        }
     }
 
     /// The embedded tree lists every file that the Custom wallet contract compiles from.
@@ -404,6 +448,7 @@ mod tests {
                         walk(root, &path, found);
                     }
                 } else if name == "Cargo.toml"
+                    || name.ends_with(".figures")
                     || name.ends_with(".rs") && !name.ends_with("tests.rs")
                 {
                     found.push(path);
@@ -418,7 +463,7 @@ mod tests {
         ] {
             walk(&root, member, &mut expected);
         }
-        expected.retain(|path| path != POLICY_SOURCE);
+        expected.retain(|path| path != POLICY_SOURCE && path != POLICY_FIGURES);
         expected.sort();
         let mut embedded: Vec<String> = TREE.iter().map(|(path, _)| (*path).to_owned()).collect();
         embedded.sort();

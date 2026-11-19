@@ -123,11 +123,13 @@ compile described there, so it needs `rustc`. For `--tier custom`, also build th
 reviewed custom Wasm from the same file, which is the Soroban compile:
 
 ```sh
-scripts/build-custom-policy.sh POLICY.rs OUT_DIR
+scripts/build-custom-policy.sh POLICY.rs FIGURES OUT_DIR
 ```
 
 The script builds the committed tree with `POLICY.rs` as `contracts/allowit-custom-policy/policy/policy.rs`
-and leaves the checkout unchanged. It prints one JSON line with `source_digest` (the SHA-256 of
+and `FIGURES` as `policy/policy.figures`, and leaves the checkout unchanged. `FIGURES` holds the keys
+of the figures that Core's derivation names for `POLICY.rs`, one per line; the committed policy has
+its own (`contracts/allowit-custom-policy/policy/policy.figures`). It prints one JSON line with `source_digest` (the SHA-256 of
 `POLICY.rs`, the wallet's `source_hash`), `wasm_hash` (the SHA-256 of the Wasm, the `--wasm-hash`)
 and the `wasm` path. The same revision, source, Rust toolchain and Stellar CLI give the same Wasm.
 

@@ -105,7 +105,9 @@ It reads the direct order book only: no path through another asset and no liquid
 
 - `build(network, source, work)` builds the `AllowitCustomPolicy` Wasm from the exact bytes of the policy source.
   The crate embeds the contract workspace of its own revision. The build writes that tree to `work/tree` with the
-  source as `contracts/allowit-custom-policy/policy/policy.rs` and runs
+  on-chain part of the source, which Core derives, as `contracts/allowit-custom-policy/policy/policy.rs`, the keys
+  of the figures that Core names for that part as `policy/policy.figures` and, when the part differs from the
+  source, the source as `policy/source.rs`, and runs
   `stellar contract build --locked --package allowit-custom-policy`. `work/target` keeps the compiler cache.
   The build compiles the same files as `scripts/build-custom-policy.sh` does from a checkout of the same revision, so
   the same source, Rust toolchain and Stellar CLI give the same Wasm. Only source that passes the portable policy

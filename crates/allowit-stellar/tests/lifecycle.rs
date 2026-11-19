@@ -2864,11 +2864,11 @@ fn a_simple_wallet_reads_the_daily_volume_and_unpriced_flags_from_the_servers_ac
 }
 
 /// A Custom wallet whose on-chain part keeps the daily spending figure, while its daily volume
-/// rule runs only on the server. The wallet gives its own figure and the server's accounting the
-/// other. One unpriced flag serves both: an unpriced operation in either one's day marks the day,
-/// so the server's rule cannot pass on the wallet's fresh window.
+/// rule runs only on the server. The wallet gives the figures that Core names for its on-chain
+/// part, the daily spending and the daily unpriced flag, and the server's accounting gives the
+/// daily volume.
 #[test]
-fn a_split_custom_wallet_marks_the_day_unpriced_from_either_keeper() {
+fn a_split_custom_wallet_gives_the_figures_that_core_names_from_the_wallet() {
     let (mut c, r, s) = fixture(WalletRoute::PolicyWallet, true);
     install(
         &mut c,
@@ -2897,11 +2897,12 @@ fn a_split_custom_wallet_marks_the_day_unpriced_from_either_keeper() {
         .0
     };
     let marked = figures(true);
-    // The wallet's daily window is not open: its own figure is zero. The volume is the server's.
+    // The wallet's daily window is not open: its own figures read as zero and false, also when
+    // the server's accounting marks its own day. The volume is the server's.
     assert_eq!(marked["day_spent"], PolicyValue::Int(0));
     assert_eq!(marked["day_total"], PolicyValue::Int(9));
-    assert_eq!(marked["day_unpriced"], PolicyValue::Bool(true));
-    assert_eq!(figures(false)["day_unpriced"], PolicyValue::Bool(false));
+    assert_eq!(marked["day_unpriced"], PolicyValue::Bool(false));
+    assert_eq!(figures(false), marked);
 }
 
 #[test]

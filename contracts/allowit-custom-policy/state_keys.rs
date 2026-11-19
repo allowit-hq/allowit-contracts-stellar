@@ -1,5 +1,6 @@
-//! The state entries and the figures of a compiled Custom policy source, found the same way by
-//! the contract's build and by the rail's server evaluation. A source reads and writes its state with
+//! The state entries of a compiled Custom policy source, found the same way by the contract's
+//! build and by the rail's server evaluation, and the wallet entries that hold the figures that
+//! Core's derivation names for it. A source reads and writes its state with
 //! `allowit::get_state(ctx, "key")` and `allowit::set_state(ctx, "key", value)`; the key is a
 //! string literal of 1 to 32 ASCII letters, digits or `_`. Comments and the contents of string and
 //! character literals are never read as calls.
@@ -9,64 +10,42 @@ pub const MAX_POLICY_STATE: usize = 8;
 /// Most packed bytes of one state value: `allowit_policy_wallet::MAX_STATE_VALUE`.
 pub const MAX_STATE_VALUE: usize = 64;
 
-/// The standard figures by key, and the figures that a `get_state` read of each keeps: `SPENT`
-/// (1), `CALLS` (2), `DAY_SPENT` (4), `DAY_TOTAL` (8). A policy never writes one.
-pub const STANDARD: [(&str, u8); 7] = [
-    ("spent", 1),
-    ("unpriced", 1),
-    ("calls", 2),
-    ("day_spent", 4),
-    ("day_total", 8),
-    ("day_unpriced", 4 | 8),
-    ("day", 0),
+/// The standard state keys: the figures, and `day`. A policy never writes one.
+pub const STANDARD: [&str; 7] = [
+    "spent",
+    "unpriced",
+    "calls",
+    "day_spent",
+    "day_total",
+    "day_unpriced",
+    "day",
 ];
 
-/// Rule names and the figures they read: `SPENT`, `CALLS`, `DAY_SPENT`, `DAY_TOTAL`.
-const RULES: [(&str, u8); 4] = [
-    ("lifetime_spending_limit", 1),
-    ("call_limit", 2),
-    ("daily_spending_limit", 4),
-    ("daily_volume_limit", 8),
-];
-/// Names through which a policy reads the whole state or runs any rule: they keep every figure, as
-/// does the name `state`, as in `ctx.state`.
-const ALL: [&str; 5] = [
-    "preflight",
-    "RULES",
-    "AllowitRule",
-    "AllowitStandardState",
-    "evaluate",
-];
-
-/// The cumulated figures that the checks of the compiled policy source `compiled` read, so the
-/// wallet keeps exactly those. `read` are the figures of its `get_state` reads of standard keys,
-/// from [`declared`].
-///
-/// Core's source gate admits rule calls only as `allowit::<rule>`, so a rule name in the compiled
-/// source marks its figure; any name that can reach the whole state or every rule marks all
-/// figures. The scan reads the names of the source: the text of a string literal, such as a state
-/// key, and of a comment names nothing. A source that the scan cannot read keeps every figure.
-pub fn figures(compiled: &str, read: u8) -> u8 {
-    let Ok(tokens) = tokens(compiled) else {
-        return 15;
-    };
-    let words: Vec<&str> = tokens
-        .iter()
-        .filter_map(|token| match token {
-            Token::Ident(word) => Some(word.as_str()),
-            _ => None,
-        })
-        .collect();
-    if words
-        .iter()
-        .any(|word| ALL.contains(word) || *word == "state")
-    {
-        return 15;
+/// The wallet entries that hold `figures`: the keys of Core's figures of the compiled source
+/// (`allowit_core::policy_source::Derived::figures`). `SPENT` (1) holds `spent` and `unpriced`,
+/// `CALLS` (2) holds `calls`, and the daily entry holds `day_spent` with `DAY_SPENT` (4),
+/// `day_total` with `DAY_TOTAL` (8) and `day_unpriced` beside either. A daily flag without a daily
+/// amount opens the entry with `DAY_SPENT`. Another key is refused.
+pub fn packed<'a>(figures: impl IntoIterator<Item = &'a str>) -> Result<u8, String> {
+    let mut entries = 0u8;
+    let mut daily_flag = false;
+    for key in figures {
+        entries |= match key {
+            "spent" | "unpriced" => 1,
+            "calls" => 2,
+            "day_spent" => 4,
+            "day_total" => 8,
+            "day_unpriced" => {
+                daily_flag = true;
+                0
+            }
+            _ => return Err(format!("{key:?} is no figure of a policy wallet")),
+        };
     }
-    RULES
-        .iter()
-        .filter(|(name, _)| words.contains(name))
-        .fold(read, |figures, (_, figure)| figures | figure)
+    if daily_flag && entries & (4 | 8) == 0 {
+        entries |= 4;
+    }
+    Ok(entries)
 }
 
 /// One declared state entry.
@@ -80,22 +59,16 @@ pub struct StateEntry {
     pub daily: bool,
 }
 
-/// The declared entries of a source, sorted by name, and the figures that its `get_state` reads
-/// of standard keys keep. `sha256` hashes a key name.
-pub fn declared(
-    code: &str,
-    sha256: impl Fn(&[u8]) -> [u8; 32],
-) -> Result<(Vec<StateEntry>, u8), String> {
-    let mut figures = 0u8;
+/// The declared entries of a source, sorted by name. `sha256` hashes a key name.
+pub fn declared(code: &str, sha256: impl Fn(&[u8]) -> [u8; 32]) -> Result<Vec<StateEntry>, String> {
     let mut names: Vec<String> = Vec::new();
     for (writes, key) in calls(code)? {
-        if let Some((_, figure)) = STANDARD.iter().find(|(name, _)| *name == key) {
+        if STANDARD.contains(&key.as_str()) {
             if writes {
                 return Err(format!(
                     "a policy does not write the standard figure {key:?}: the wallet keeps it"
                 ));
             }
-            figures |= figure;
         } else if !names.contains(&key) {
             names.push(key);
         }
@@ -122,7 +95,7 @@ pub fn declared(
             key,
         });
     }
-    Ok((entries, figures))
+    Ok(entries)
 }
 
 /// One token of Rust source: an identifier or keyword, a string literal's contents, or one

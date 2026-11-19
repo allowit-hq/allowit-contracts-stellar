@@ -734,7 +734,7 @@ pub mod state_keys;
 /// The declared state entries of the compiled source of a Custom policy, as its build declares
 /// them. `source` is the on-chain part of the owner's source ([`policy::custom_parts`]).
 pub fn custom_state_entries(source: &str) -> Result<Vec<state_keys::StateEntry>> {
-    state_keys::declared(source, |name| hash(name)).map(|(entries, _)| entries)
+    state_keys::declared(source, |name| hash(name))
 }
 /// The state entries that the contract of a Custom wallet stores for the owner's `source`: those
 /// of its on-chain part.
@@ -798,66 +798,59 @@ impl TrustedState {
             .policy_state
             .as_ref()
             .ok_or("Trusted layout 5 params and figures are required")?;
-        let kept = kept_figures(c);
+        let kept = wallet_figures(c);
         let wallet = &snapshot.figures;
         let open = wallet.day_ends != 0;
         let today = now / allowit_core::DAY;
         let server_today = self.spent_day == today;
-        let pick =
-            |figure: u8, own: i128, server: i128| if kept & figure != 0 { own } else { server };
+        let keeps = |key: &str| kept.contains(&key);
+        let pick = |key: &str, own: i128, server: i128| if keeps(key) { own } else { server };
         let mut state = std::collections::BTreeMap::new();
         state.insert(
             "calls".to_owned(),
             PolicyValue::Int(pick(
-                packed::CALLS,
+                "calls",
                 i128::from(wallet.calls),
                 i128::from(self.calls),
             )),
         );
         state.insert(
             "spent".to_owned(),
-            PolicyValue::Int(pick(packed::SPENT, wallet.spent, self.spent_total)),
+            PolicyValue::Int(pick("spent", wallet.spent, self.spent_total)),
         );
         state.insert(
             "unpriced".to_owned(),
-            PolicyValue::Bool(if kept & packed::SPENT != 0 {
+            PolicyValue::Bool(if keeps("unpriced") {
                 wallet.unpriced
             } else {
                 self.unpriced_total
             }),
         );
+        // The day of the daily figures below: each is of the wallet's current window or of the
+        // server's current UTC day, and an ended one reads as zero. Core's daily rules read it to
+        // roll those figures over. No policy reads it: Core's derivation refuses a use of it.
         state.insert("day".to_owned(), PolicyValue::Int(i128::from(today)));
         let server_daily = if server_today { self.spent_daily } else { 0 };
         let server_volume = if server_today { self.volume_daily } else { 0 };
         let own_daily = |value: i128| if open { value } else { 0 };
         state.insert(
             "day_spent".to_owned(),
-            PolicyValue::Int(pick(
-                packed::DAY_SPENT,
-                own_daily(wallet.day_spent),
-                server_daily,
-            )),
+            PolicyValue::Int(pick("day_spent", own_daily(wallet.day_spent), server_daily)),
         );
         state.insert(
             "day_total".to_owned(),
             PolicyValue::Int(pick(
-                packed::DAY_TOTAL,
+                "day_total",
                 own_daily(wallet.day_total),
                 server_volume,
             )),
         );
-        // One flag serves both daily figures. When the wallet keeps one of them and the server
-        // the other, an unpriced operation in either one's day marks the day: the wallet counts
-        // its own window, and the server counts the UTC day.
-        let own_unpriced = open && wallet.day_unpriced;
-        let server_unpriced = server_today && self.unpriced_daily;
-        let daily = packed::DAY_SPENT | packed::DAY_TOTAL;
         state.insert(
             "day_unpriced".to_owned(),
-            PolicyValue::Bool(match kept & daily {
-                0 => server_unpriced,
-                both if both == daily => own_unpriced,
-                _ => own_unpriced || server_unpriced,
+            PolicyValue::Bool(if keeps("day_unpriced") {
+                open && wallet.day_unpriced
+            } else {
+                server_today && self.unpriced_daily
             }),
         );
         state.extend(snapshot.custom.clone());
@@ -1066,25 +1059,51 @@ pub fn max_fee_ceiling(route: &WalletRoute) -> u32 {
     }
 }
 
-/// The figures that a policy wallet keeps for its checks: a Simple or Common wallet those of its
-/// rules with params. A Custom wallet whose contract compiles its whole source keeps every figure
-/// that the source reads, which are the only ones that the source can read on the server too. A
-/// Custom wallet whose source has a server part keeps the figures that its on-chain part reads,
-/// and the server's accounting gives every other figure to the part that only the server runs.
+/// The wallet entries of the figures that a policy wallet keeps for its checks: a Simple or
+/// Common wallet those of its rules with params. A Custom wallet whose contract compiles its whole
+/// source keeps every figure that the source reads, which are the only ones that the source can
+/// read on the server too. A Custom wallet whose source has a server part keeps the figures that
+/// Core names for its on-chain part, as its build does, and the server's accounting gives every
+/// other figure to the part that only the server runs.
 pub fn kept_figures(c: &WalletConfig) -> u8 {
-    if c.tier == Some(PolicyTier::Custom) {
-        // The build of the on-chain part finds the figures with this same scan. A source that
-        // no longer passes the gate keeps every figure: its operations are refused elsewhere.
-        return policy::custom_parts(&c.policy_source)
-            .ok()
-            .filter(|parts| parts.server_part)
-            .and_then(|parts| {
-                let (_, read) = state_keys::declared(&parts.onchain, |name| hash(name)).ok()?;
-                Some(state_keys::figures(&parts.onchain, read))
-            })
-            .unwrap_or(packed::ALL);
+    match server_part_figures(c) {
+        Some(figures) => state_keys::packed(figures.iter().copied()).unwrap_or(packed::ALL),
+        None if c.tier == Some(PolicyTier::Custom) => packed::ALL,
+        None => packed::standard_kept(&c.rules, &installed_params(c)),
     }
-    packed::standard_kept(&c.rules, &installed_params(c))
+}
+/// The keys of the figures that a Custom wallet whose source has a server part keeps: those that
+/// Core names for its on-chain part. A source that no longer derives keeps every figure: its
+/// operations are refused elsewhere.
+fn server_part_figures(c: &WalletConfig) -> Option<Vec<&'static str>> {
+    (c.tier == Some(PolicyTier::Custom))
+        .then(|| policy::custom_parts(&c.policy_source).ok())
+        .flatten()
+        .filter(|parts| parts.server_part)
+        .map(|parts| parts.figures)
+}
+/// The keys of the figures that a policy wallet gives to an evaluation from its own entries; the
+/// server's accounting gives the others. A Custom wallet whose source has a server part gives
+/// exactly the figures that Core names for its on-chain part. Any other wallet gives the figures
+/// of its kept entries: `spent` and `unpriced` with `SPENT`, `calls` with `CALLS`, `day_spent`
+/// and `day_total` with their own entries, and `day_unpriced` with either daily entry.
+fn wallet_figures(c: &WalletConfig) -> Vec<&'static str> {
+    if let Some(figures) = server_part_figures(c) {
+        return figures;
+    }
+    let kept = kept_figures(c);
+    [
+        ("spent", packed::SPENT),
+        ("unpriced", packed::SPENT),
+        ("calls", packed::CALLS),
+        ("day_spent", packed::DAY_SPENT),
+        ("day_total", packed::DAY_TOTAL),
+        ("day_unpriced", packed::DAY_SPENT | packed::DAY_TOTAL),
+    ]
+    .into_iter()
+    .filter(|(_, entries)| kept & entries != 0)
+    .map(|(key, _)| key)
+    .collect()
 }
 /// The params that a policy wallet stores: a Simple or Common wallet keeps only the params of its
 /// on-chain rules, and the server keeps the rest of the owner's params; a Custom wallet keeps all.

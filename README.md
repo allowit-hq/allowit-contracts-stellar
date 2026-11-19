@@ -140,7 +140,7 @@ Value types, the standard state keys and error mapping are in [docs/architecture
 
 ## Write a policy
 
-Policy source is ordinary synchronous Rust against the same released portable `allowit` package. The offchain server evaluates the file, and `AllowitCustomPolicy` compiles its on-chain part verbatim. A file that the derivation leaves unchanged, as this one, is its own on-chain part: a file with no server function, no state that the server keeps and no read of the stored day.
+Policy source is ordinary synchronous Rust against the same released portable `allowit` package. The offchain server evaluates the file, and `AllowitCustomPolicy` compiles its on-chain part verbatim. A file that the derivation leaves unchanged, as this one, is its own on-chain part.
 
 ```rust
 use allowit::prelude::*;

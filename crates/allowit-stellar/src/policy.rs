@@ -647,34 +647,38 @@ pub struct CustomParts {
     /// Whether the owner's source has a part that only the server runs: the on-chain part
     /// differs from the source.
     pub server_part: bool,
-    /// The checked shape of the owner's source.
+    /// The checked shape of the on-chain part. With a server part, the source is never
+    /// canonical-only: only the server's compiled evaluator runs all of it.
     pub shape: SourceShape,
+    /// The keys of the cumulated figures that the on-chain part reads, as Core names them
+    /// (`Derived::figures`): the wallet keeps those, and the server evaluates the whole source
+    /// on the wallet's values of them.
+    pub figures: Vec<&'static str>,
     /// The state keys that the server keeps, sorted. The contract never stores them, and this
     /// rail neither reads nor stores them: the snapshot of a wallet holds only the contract's
     /// entries. The host's evaluator gives their values to the evaluation and keeps the
     /// values that an admitted operation wrote, with that operation's settlement.
     pub server_keys: Vec<String>,
 }
-/// Check the one source of a Custom wallet and derive its on-chain part.
+/// Derive the on-chain part of the one source of a Custom wallet.
 ///
-/// A source without a server part is portable source, and the contract compiles all of it. A
-/// source with a server part is server policy source: it can read owner text with `as_str()`
-/// for a server function. Its on-chain part is portable source that names no server function.
+/// Core's derivation decides which statements only the server runs, and which figures and keys
+/// the contract keeps: this rail keeps no list of server functions. A source with a server part
+/// is server policy source, which the server checks against the registry of the host calls that
+/// it links before it evaluates the source; the contract compiles only the on-chain part, which
+/// passes the portable gate and names no server function.
 pub fn custom_parts(source: &str) -> Result<CustomParts> {
     let derived = allowit_core::policy_source::derive(source)?;
     let server_part = derived.source != source;
-    let shape = if server_part {
-        classic_shape(source)?
-    } else {
-        source_shape(source)?
-    };
     // The contract compiles the on-chain part, so that part passes the portable gate and its
     // build's own scan of state keys.
-    source_shape(&derived.source)?;
+    let mut shape = source_shape(&derived.source)?;
+    shape.canonical_only &= !server_part;
     crate::custom_state_entries(&derived.source)?;
     Ok(CustomParts {
         server_part,
         shape,
+        figures: derived.figures.iter().map(|figure| figure.key).collect(),
         server_keys: derived
             .state
             .into_iter()
@@ -952,7 +956,7 @@ pub fn evaluate(
     // The wallet stores only the standard figures and the declared keys, each declared value
     // within its packed bound. The server keeps the keys of the server part.
     if let (true, Some(keys)) = (keeps_state, wallet) {
-        let standard = crate::state_keys::STANDARD.map(|(key, _)| key);
+        let standard = crate::state_keys::STANDARD;
         for (key, value) in &next.0 {
             if standard.contains(&key.as_str()) || keys.server.contains(key) {
                 continue;
@@ -1114,25 +1118,28 @@ pub fn execute(ctx: &AllowitContext) -> allowit::Result {
                 .contains("allowit::set_state(ctx, \"day_payments\", payments + 1)?;")
         );
         assert_eq!(parts.server_keys, ["last_score"]);
-        // The contract stores the key of its own part, and keeps the figures that this part
-        // reads: those of the daily limit, not those of the rule that only the server runs.
+        // The contract stores the key of its own part, and keeps the figures that Core names for
+        // this part: those of the daily limit, not those of the rule that only the server runs.
         let stored: Vec<String> = crate::custom_wallet_state_entries(ONE)
             .unwrap()
             .into_iter()
             .map(|entry| entry.name)
             .collect();
         assert_eq!(stored, ["day_payments"]);
-        let (_, read) =
-            crate::state_keys::declared(&parts.onchain, |name| crate::hash(name)).unwrap();
-        assert_eq!(crate::state_keys::figures(&parts.onchain, read), 4);
-        let (_, read) = crate::state_keys::declared(ONE, |name| crate::hash(name)).unwrap();
-        assert_eq!(crate::state_keys::figures(ONE, read), 4 | 2);
-        // A state key, a string and a comment name nothing: a key named `my_state` and a text
-        // that names a rule keep no figure. The name `state` reaches the whole state.
-        let named = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    // allowit::daily_spending_limit\n    let seen: Option<bool> = allowit::get_state(ctx, \"my_state\")?;\n    assert!(seen.is_none() && \"evaluate\" != \"call_limit\");\n    Ok(())\n}\n";
-        assert_eq!(crate::state_keys::figures(named, 0), 0);
-        let whole = named.replace("seen.is_none()", "ctx.state.is_empty()");
-        assert_eq!(crate::state_keys::figures(&whole, 0), 15);
+        assert_eq!(parts.figures, ["day_spent", "day_unpriced"]);
+        assert_eq!(
+            crate::state_keys::packed(parts.figures.iter().copied()),
+            Ok(4)
+        );
+        // A source that calls a function of a policy package that the host registers: Core's
+        // derivation moves the call to the server, and this rail names no list of its own.
+        let package = ONE.replace(
+            "    let question: String",
+            "    sanctions::screen(ctx, &ctx.request.recipient)?;\n    let question: String",
+        );
+        let parts = custom_parts(&package).unwrap();
+        assert!(parts.server_part && !parts.onchain.contains("sanctions"));
+        assert!(!parts.shape.canonical_only);
         // Only a Custom wallet holds server policy source: the contract of another tier
         // compiles no part of it.
         assert_eq!(tier_rules(PolicyTier::Custom, ONE).unwrap(), [""; 0]);

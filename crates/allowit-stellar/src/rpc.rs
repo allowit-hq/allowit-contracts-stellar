@@ -2270,14 +2270,33 @@ mod custom_state_tests {
 
     const SOURCE: &str = "use allowit::prelude::*;\n/// Count each payment, today and in all.\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    // get_state and set_state in a comment are no calls: set_state(ctx, nothing)\n    let note = \"set_state(ctx, \\\"not_a_key\\\", 1)\";\n    let _ = note;\n    let today: u64 = allowit::get_state(ctx, \"day_payments\")?.unwrap_or(0);\n    let all = allowit::get_state::<u64>(ctx, \"payments\")?.unwrap_or(0);\n    let _spent: i128 = allowit::get_state(ctx, \"spent\")?.unwrap_or(0);\n    allowit::r#set_state(ctx, \"day_payments\", today + 1)?;\n    allowit::set_state(ctx, \"payments\", all + 1)?;\n    Ok(())\n}\n";
 
+    /// Each figure that Core names has its wallet entry; a daily flag alone opens the daily entry.
+    #[test]
+    fn each_figure_has_its_wallet_entry() {
+        use crate::state_keys::packed;
+        let all = [
+            "calls",
+            "spent",
+            "unpriced",
+            "day_spent",
+            "day_total",
+            "day_unpriced",
+        ];
+        assert_eq!(packed(all), Ok(packed::ALL));
+        assert_eq!(packed(["unpriced"]), Ok(packed::SPENT));
+        assert_eq!(packed(["day_unpriced"]), Ok(packed::DAY_SPENT));
+        assert_eq!(packed(["day_total", "day_unpriced"]), Ok(packed::DAY_TOTAL));
+        assert_eq!(packed([]), Ok(0));
+        assert!(packed(["day"]).unwrap_err().contains("no figure"));
+    }
+
     #[test]
     fn the_scan_finds_each_literal_key_and_skips_comments_and_strings() {
-        let (entries, figures) = declared(SOURCE, |name| crate::hash(name)).unwrap();
+        let entries = declared(SOURCE, |name| crate::hash(name)).unwrap();
         let names: Vec<(&str, bool)> = entries.iter().map(|e| (e.name.as_str(), e.daily)).collect();
         assert_eq!(names, [("day_payments", true), ("payments", false)]);
         assert_eq!(entries[0].key, 0x6df2_15e2);
-        // A read of a standard figure keeps that figure: `spent` is figure 1.
-        assert_eq!(figures, 1);
+        // A read of a standard figure declares no entry of the policy's own.
         for (source, refused) in [
             ("allowit::set_state(ctx, key, 1)?;", "string literal"),
             ("allowit::set_state(ctx, \"spent\", 1)?;", "standard figure"),
