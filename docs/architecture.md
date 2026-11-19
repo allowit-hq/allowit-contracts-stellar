@@ -166,8 +166,9 @@ compiles:
   `for item in items` binds an owned item on both backends, also when `items` borrows from
   `ctx.params[key]`, and a dereference `*item` fails both compiles. It has no slice `Deref`.
   `scripts/policy_source.py` runs this compile in `check-policy-bindings.py`, and
-  so in `scripts/build-contracts.sh`. `allowit-stellar-admin` and `scripts/contract_admin.py` run the
-  same compile for the owner packets of every tier. These tools need `rustc` (from `RUSTC` or `PATH`). The portability test below and the
+  so in `scripts/build-contracts.sh`. `scripts/contract_admin.py` runs the same compile for the owner
+  packets of every tier. `allowit-stellar-admin` runs it too, except for a Custom source with a
+  server part, which the server compiles whole and the contract's build compiles in part. These tools need `rustc` (from `RUSTC` or `PATH`). The portability test below and the
   `policy` job of `.github/workflows/contracts.yml` also compile `scripts/policy-smoke.rs`, which
   includes the branch sources, the same way.
 - The Soroban compile builds the file into `AllowitCustomPolicy`. A host-only item, such as

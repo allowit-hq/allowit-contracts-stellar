@@ -32,6 +32,9 @@ class ContractSourceManifestTests(unittest.TestCase):
                     (root / member / "src").mkdir(parents=True)
                     (root / member / "src/lib.rs").write_text(member + " source")
                     (root / member / "Cargo.toml").write_text(member + " manifest")
+                (root / contract / "policy").mkdir()
+                (root / contract / "policy/policy.figures").write_text("calls\n")
+                (root / contract / "policy/policy.state").write_text("seen lasting\n")
                 for script in release.BUILD_SCRIPTS:
                     (scripts / script).write_text(script)
                 target = root / "target/wasm32v1-none/release"
@@ -44,13 +47,18 @@ class ContractSourceManifestTests(unittest.TestCase):
                 manifest = json.loads(subprocess.check_output([sys.executable, str(scripts / "artifacts.py")], text=True))
                 entries = {item["path"]: item["sha256"] for item in manifest["sources"]}
                 self.assertEqual(set(entries), {str(path.relative_to(root)) for path in release.contract_build_sources(root)})
-                for relative in (contract + "/Cargo.toml", contract + "/src/lib.rs", "crates/policy/Cargo.toml", "crates/policy/src/lib.rs"):
+                for relative in (contract + "/Cargo.toml", contract + "/src/lib.rs", contract + "/policy/policy.figures", contract + "/policy/policy.state", "crates/policy/Cargo.toml", "crates/policy/src/lib.rs"):
                     self.assertEqual(entries[relative], release.digest((root / relative).read_bytes()))
                 self.assertFalse(any(path.startswith(native + "/") for path in entries))
                 (root / contract / "src/lib.rs").write_text("changed contract")
                 changed = json.loads(subprocess.check_output([sys.executable, str(scripts / "artifacts.py")], text=True))
                 changed_entries = {item["path"]: item["sha256"] for item in changed["sources"]}
                 self.assertNotEqual(entries[contract + "/src/lib.rs"], changed_entries[contract + "/src/lib.rs"])
+                # A build input beside the policy binds the manifest too: the same source with other figures is another build.
+                (root / contract / "policy/policy.figures").write_text("")
+                refigured = json.loads(subprocess.check_output([sys.executable, str(scripts / "artifacts.py")], text=True))
+                refigured_entries = {item["path"]: item["sha256"] for item in refigured["sources"]}
+                self.assertNotEqual(changed_entries[contract + "/policy/policy.figures"], refigured_entries[contract + "/policy/policy.figures"])
 
 
 class ReleaseTests(unittest.TestCase):

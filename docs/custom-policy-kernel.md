@@ -141,8 +141,8 @@ Each key has one keeper, which Core's derivation names (`Derived::state`):
 
 | Keeper | When | Where the value lives |
 | --- | --- | --- |
-| The contract | Every statement that writes the key is in `policy.rs` | In the wallet, as stated below. The server reads it from the wallet when it evaluates the whole source |
-| The server | A statement that writes the key depends on a server function, or only such statements read it | With the server. No statement of `policy.rs` names the key, and the wallet never stores it |
+| The contract | A statement that uses the key stays in `policy.rs`, and no statement that writes it leaves | In the wallet, as stated below. The server reads it from the wallet when it evaluates the whole source |
+| The server | Any other key: a statement that writes it leaves, or every statement that uses it leaves | With the server. No statement of `policy.rs` names the key, and the wallet never stores it |
 
 This rail neither reads nor stores a key of the server: a wallet's snapshot holds only the
 contract's entries. The host's evaluator gives the server's values to the evaluation and keeps the

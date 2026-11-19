@@ -311,16 +311,18 @@ impl OwnerProvider for Owner {
                 _ => None,
             })
             .ok_or_else(|| Error::config("The policy names no wallet kind"))?;
-        let (rules, evidence_functions) = source_calls(&policy.code);
-        Ok(owner::PairedExport::of(
+        // Core reads the calls of the source, as the derivation does.
+        let calls = allowit_core::policy_source::source_calls(&policy.code)
+            .map_err(crate::provider::failure)?;
+        let mut export = owner::PairedExport::of(
             policy.id.clone(),
             policy.network.clone(),
             kind,
             policy.code.clone(),
             policy.source_hash.clone(),
-            rules,
+            calls.rules,
             shape.prefix,
-            evidence_functions,
+            calls.host_calls,
             binding
                 .portable
                 .params
@@ -333,171 +335,63 @@ impl OwnerProvider for Owner {
                         .map_err(crate::provider::failure)
                 })
                 .collect::<Result<_>>()?,
-        ))
+        );
+        on_chain_placement(&mut export, &policy.code)?;
+        Ok(export)
     }
 }
-/// One token of policy source that a call can consist of.
-#[derive(Debug, PartialEq, Eq)]
-enum Token {
-    Ident(String),
-    /// `::`
-    Path,
-    /// `(`
-    Open,
-    Other,
-}
-/// The tokens of Rust source without comments and without the contents of string, byte-string
-/// and character literals. Whitespace separates tokens and is not a token.
-fn tokens(source: &str) -> Vec<Token> {
-    let c: Vec<char> = source.chars().collect();
-    let ident = |ch: char| ch.is_alphanumeric() || ch == '_';
-    let (mut out, mut i) = (Vec::new(), 0);
-    // A raw string: `r`, hashes and a quote. Returns the number of hashes.
-    let raw_start = |i: usize| -> Option<usize> {
-        let mut at = i + usize::from(c.get(i) == Some(&'b'));
-        if c.get(at) != Some(&'r') {
-            return None;
-        }
-        at += 1;
-        let hashes = c[at..].iter().take_while(|ch| **ch == '#').count();
-        (c.get(at + hashes) == Some(&'"')).then_some(hashes)
-    };
-    while i < c.len() {
-        let ch = c[i];
-        if ch.is_whitespace() {
-            i += 1;
-        } else if ch == '/' && c.get(i + 1) == Some(&'/') {
-            while i < c.len() && c[i] != '\n' {
-                i += 1;
-            }
-        } else if ch == '/' && c.get(i + 1) == Some(&'*') {
-            // Block comments nest.
-            let mut depth = 1;
-            i += 2;
-            while i < c.len() && depth > 0 {
-                if c[i] == '/' && c.get(i + 1) == Some(&'*') {
-                    depth += 1;
-                    i += 2;
-                } else if c[i] == '*' && c.get(i + 1) == Some(&'/') {
-                    depth -= 1;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-        } else if let Some(hashes) = raw_start(i) {
-            i += usize::from(c[i] == 'b') + 1 + hashes + 1;
-            while i < c.len()
-                && !(c[i] == '"'
-                    && c[i + 1..]
-                        .iter()
-                        .take(hashes)
-                        .filter(|h| **h == '#')
-                        .count()
-                        == hashes)
-            {
-                i += 1;
-            }
-            i += 1 + hashes;
-            out.push(Token::Other);
-        } else if ch == '"' || (ch == 'b' && c.get(i + 1) == Some(&'"')) {
-            i += 1 + usize::from(ch == 'b');
-            while i < c.len() && c[i] != '"' {
-                i += 1 + usize::from(c[i] == '\\');
-            }
-            i += 1;
-            out.push(Token::Other);
-        } else if ch == '\'' {
-            // A character literal closes within a few characters; a lifetime does not close.
-            let close = if c.get(i + 1) == Some(&'\\') {
-                c[i + 2..]
-                    .iter()
-                    .take(12)
-                    .position(|x| *x == '\'')
-                    .map(|n| i + 2 + n)
-            } else {
-                (c.get(i + 2) == Some(&'\'')).then_some(i + 2)
-            };
-            i = close.map_or(i + 1, |close| close + 1);
-            out.push(Token::Other);
-        } else if ident(ch) {
-            let start = i;
-            while i < c.len() && ident(c[i]) {
-                i += 1;
-            }
-            out.push(Token::Ident(c[start..i].iter().collect()));
-        } else if ch == ':' && c.get(i + 1) == Some(&':') {
-            i += 2;
-            out.push(Token::Path);
-        } else {
-            i += 1;
-            out.push(if ch == '(' { Token::Open } else { Token::Other });
-        }
+/// The native placement of a Custom wallet whose source has a server part: the contract compiles
+/// the on-chain part that Core derives, so the placement holds that part and the rules that Core
+/// reads in it. The host placement keeps the whole source and every rule that it calls.
+fn on_chain_placement(export: &mut owner::PairedExport, source: &str) -> Result<()> {
+    if export.native.wallet_kind != allowit_core::vendor::kinds::WalletKind::Custom {
+        return Ok(());
     }
-    out
-}
-/// The calls of checked source, in source order and without repeats: the canonical rules
-/// (`allowit::<rule>`) and the host evidence functions (`<namespace>::<function>` of another
-/// lowercase namespace). The source gate admits no other lowercase path call. Comments and
-/// literals hold no call, and a path may have whitespace around `::`.
-fn source_calls(source: &str) -> (Vec<String>, Vec<String>) {
-    let tokens = tokens(source);
-    let (mut rules, mut evidence) = (Vec::<String>::new(), Vec::<String>::new());
-    for (at, window) in tokens.windows(4).enumerate() {
-        let [
-            Token::Ident(namespace),
-            Token::Path,
-            Token::Ident(function),
-            Token::Open,
-        ] = window
-        else {
-            continue;
-        };
-        // A longer path, such as `a::b::c(`, is not a direct call of `b::c`.
-        if at > 0 && tokens[at - 1] == Token::Path {
-            continue;
-        }
-        if namespace == "allowit" {
-            if allowit_core::vendor::kinds::STANDARD_PARAMS.contains(&function.as_str())
-                && !rules.contains(function)
-            {
-                rules.push(function.clone());
-            }
-        } else if namespace.starts_with(|c: char| c.is_ascii_lowercase()) {
-            let name = format!("{namespace}::{function}");
-            if !evidence.contains(&name) {
-                evidence.push(name);
-            }
-        }
+    let parts = crate::policy::custom_parts(source).map_err(crate::provider::failure)?;
+    if parts.server_part {
+        export.native.rules = allowit_core::policy_source::source_calls(&parts.onchain)
+            .map_err(crate::provider::failure)?
+            .rules;
+        export.native.source = Some(parts.onchain);
     }
-    (rules, evidence)
+    Ok(())
 }
 #[cfg(test)]
 mod paired_export_tests {
     use super::*;
+    /// The placements of a split Custom source come from Core: the host placement holds the
+    /// whole source and every rule that it calls, a raw identifier included, in source order; the
+    /// native placement holds the on-chain part and the rules that stay in it. A call limit in a
+    /// branch of a server decision runs only on the server.
     #[test]
-    fn source_calls_lists_rules_and_evidence_functions_in_source_order() {
-        let source = "use allowit::prelude::*;\n// allowit::call_limit(ctx) in a comment\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    let operation = allowit::operations(ctx, &ctx.params[allowit::OPERATIONS].ok())?;\n    allowit::tokens(ctx, &ctx.params[allowit::TOKENS].ok())?;\n    let report = catalog::report (ctx, 1)?;\n    allowit::tokens(ctx, &ctx.params[allowit::TOKENS].ok())?;\n    let output: Address = ctx.params[SWAP_TOKEN].ok();\n    let x = Some(output);\n    allowit::payment_limit(ctx, &ctx.params[REPORT_LIMIT].ok())?;\n    Ok(())\n}\n";
-        let (rules, evidence) = source_calls(source);
-        assert_eq!(rules, ["operations", "tokens", "payment_limit"]);
-        assert_eq!(evidence, ["catalog::report"]);
-    }
-    #[test]
-    fn source_calls_ignores_comments_and_literals_and_reads_spaced_paths() {
-        // A call inside a block comment, a nested block comment, a string, a raw string or a
-        // character literal is no call.
-        let quiet = "pub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    /* allowit::call_limit(ctx) /* allowit::tokens(ctx) */ catalog::report(ctx) */\n    let a = \"allowit::destinations(ctx) \\\" catalog::quote(ctx)\";\n    let b = r#\"allowit::payment_limit(ctx) \" still\"#;\n    let c = '(';\n    let d: &'static str = \"\";\n    Ok(())\n}\n";
-        assert_eq!(source_calls(quiet), (vec![], vec![]));
-        // Whitespace and line breaks around `::` and before `(` are part of the same call. A
-        // longer path is not a call of its tail, and a path that is not called is no call.
-        let spaced = "pub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit :: call_limit (ctx, &ctx.params[allowit::CALL_LIMIT])?;\n    catalog\n        ::report(ctx)?;\n    outer::catalog::quote(ctx)?;\n    let f = allowit::tokens;\n    Ok(())\n}\n";
-        assert_eq!(
-            source_calls(spaced),
-            (
-                vec!["call_limit".to_owned()],
-                vec!["catalog::report".to_owned()]
-            )
-        );
+    fn a_split_custom_export_takes_both_placements_from_core() {
+        const TWICE: &str = "use allowit::prelude::*;\nuse allowit::AllowitDecision;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    let score = allowit::decision(ctx, &AllowitDecision { id: \"research\", query: \"Is this research?\", deny_below: 3000, allow_above: 8000 })?;\n    if score < 9000 {\n        allowit::call_limit(ctx, &ctx.params[allowit::CALL_LIMIT])?;\n    }\n    allowit::r#payment_limit(ctx, &ctx.params[allowit::PAYMENT_LIMIT])?;\n    Ok(())\n}\n";
+        let calls = allowit_core::policy_source::source_calls(TWICE).unwrap();
+        let export = |kind| {
+            let mut export = owner::PairedExport::of(
+                "p".into(),
+                "stellar:testnet".into(),
+                kind,
+                TWICE.into(),
+                "h".into(),
+                calls.rules.clone(),
+                vec![],
+                calls.host_calls.clone(),
+                Default::default(),
+            );
+            on_chain_placement(&mut export, TWICE).unwrap();
+            export
+        };
+        let custom = export(allowit_core::vendor::kinds::WalletKind::Custom);
+        let onchain = crate::policy::custom_parts(TWICE).unwrap().onchain;
+        assert!(!onchain.contains("call_limit"));
+        assert_eq!(custom.host.source, TWICE);
+        assert_eq!(custom.host.rules, ["call_limit", "payment_limit"]);
+        assert_eq!(custom.native.source.as_deref(), Some(onchain.as_str()));
+        assert_eq!(custom.native.rules, ["payment_limit"]);
+        // Another kind keeps Core's placement as it is.
+        let simple = export(allowit_core::vendor::kinds::WalletKind::Simple);
+        assert!(simple.native.source.is_none() && simple.native.rules.is_empty());
     }
 }
 

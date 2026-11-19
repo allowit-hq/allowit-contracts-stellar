@@ -20,6 +20,8 @@ out=$(cd "$2" && pwd)
 cd "$(dirname "$0")/.."
 stellar_bin="${STELLAR_BIN:-stellar}"
 digest=$(shasum -a 256 "$source_file" | cut -d ' ' -f 1)
+# One revision for the archive and for the generator's build folder.
+revision=$(git rev-parse HEAD)
 tree="${TMPDIR:-/tmp}/allowit-custom-policy-build"
 lock="$tree.lock"
 if ! mkdir "$lock" 2>/dev/null; then
@@ -29,13 +31,13 @@ fi
 trap 'rm -rf "$tree"; rmdir "$lock"' EXIT
 rm -rf "$tree"
 mkdir -p "$tree"
-git archive --format=tar HEAD | tar -x -C "$tree"
+git archive --format=tar "$revision" | tar -x -C "$tree"
 # The committed tree's own build inputs give way to those of SOURCE.rs. The generator is the
 # committed revision's, built from the copy, in a folder of the caller's Cargo build folder or of
 # the checkout's ignored `target` that names the revision: every copy has the same path, so a
 # folder of another revision could run that revision's generator.
 policy="$tree/contracts/allowit-custom-policy/policy"
-inputs_target="${CARGO_TARGET_DIR:-$PWD/target}/custom-build-inputs-$(git rev-parse HEAD)"
+inputs_target="${CARGO_TARGET_DIR:-$PWD/target}/custom-build-inputs-$revision"
 (cd "$tree" && CARGO_TARGET_DIR="$inputs_target" cargo run --quiet --locked \
   --manifest-path crates/allowit-stellar/Cargo.toml \
   --bin allowit-stellar-admin -- custom-build-inputs "$source_file" "$policy" >&2)

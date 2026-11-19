@@ -119,7 +119,9 @@ as macros other than the assertion and `matches!` macros, writes to `ctx.env`, t
 and args, list methods, indexing other than `ctx.params[key]` and pointer-width methods. A Simple or
 Common wallet stores no policy state, so the tool rejects such a source that calls
 `allowit::set_state`; a Custom source keeps the state keys that Core's derivation gives the chain. It also runs the std-only
-compile described there, so it needs `rustc`. For `--tier custom`, also build the
+compile described there on a source that the contract compiles whole, so it needs `rustc`. A Custom source with a server
+part is no such source: the tool does not compile it, the server compiles it whole with the host calls that it links,
+and the contract's build compiles its on-chain part. Passing the owner packet check is then no successful host compile. For `--tier custom`, also build the
 reviewed custom Wasm from the same file, which is the Soroban compile:
 
 ```sh
