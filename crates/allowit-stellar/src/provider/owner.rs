@@ -209,7 +209,7 @@ impl OwnerProvider for Owner {
             asset,
             funding,
         };
-        request(None).validate()?;
+        request(None).validate_caller_values()?;
         let runtime = runtime(cx.rpc_url)?;
         // The server's template of the network names the asset that the wallet holds. It is
         // read before anything is signed for the ledger, so a server that offers no wallet on
@@ -571,6 +571,20 @@ mod storage_boundary_tests {
                     id,
                     None,
                     "Owner, agent and server must be distinct G accounts",
+                ),
+                // The most that a wallet of an issued asset takes passes the early check, which
+                // does not know the asset yet: the next check, of the RPC endpoint, stops it.
+                (
+                    agent.as_str(),
+                    id,
+                    Some("100000000"),
+                    "Invalid owner RPC endpoint",
+                ),
+                (
+                    agent.as_str(),
+                    id,
+                    Some("100000000.0000001"),
+                    "The setup funding amount is out of range",
                 ),
             ] {
                 assert_eq!(

@@ -99,6 +99,10 @@ pub fn passphrase(network: &str) -> Result<&'static str> {
         _ => Err("Unsupported Stellar network".into()),
     }
 }
+/// Whether `network` is the id of a network of the rail, and not an alias of one.
+pub fn is_network_id(network: &str) -> bool {
+    matches!(network, "stellar:pubnet" | "stellar:testnet")
+}
 pub fn network_id(network: &str) -> Result<[u8; 32]> {
     Ok(hash(passphrase(network)?))
 }

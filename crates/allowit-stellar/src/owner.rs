@@ -445,6 +445,11 @@ pub fn prepare_native_setup(
     now: u64,
 ) -> Result<NativeSetup> {
     check_owner_source(state)?;
+    // A new setup names its network by the network id. An alias selects the same ledger and
+    // the same transaction, and would give that transaction a second intent digest.
+    if !is_network_id(terms.network) {
+        return Err("A native setup names its network by its network id".into());
+    }
     if terms
         .trustline
         .is_some_and(Trustline::names_the_native_code)
@@ -1167,6 +1172,9 @@ mod tests {
         assert_eq!(testnet.transaction_xdr, pubnet.transaction_xdr);
         assert_ne!(testnet.transaction_hash, pubnet.transaction_hash);
         assert!(prepared("stellar:futurenet").is_err());
+        // An alias of a network is no second name of a setup.
+        assert!(passphrase("stellar:mainnet").is_ok());
+        assert!(prepared("stellar:mainnet").is_err());
         // The bytes of one network are no setup of the other.
         let mut moved = testnet.clone();
         moved.network = "stellar:pubnet".into();
