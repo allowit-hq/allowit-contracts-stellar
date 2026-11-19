@@ -29,7 +29,7 @@ const RULES: [(&str, u8); 4] = [
     ("daily_volume_limit", 8),
 ];
 /// Names through which a policy reads the whole state or runs any rule: they keep every figure, as
-/// does any other word that contains `state`, such as `ctx.state`.
+/// does the name `state`, as in `ctx.state`.
 const ALL: [&str; 5] = [
     "preflight",
     "RULES",
@@ -44,34 +44,29 @@ const ALL: [&str; 5] = [
 ///
 /// Core's source gate admits rule calls only as `allowit::<rule>`, so a rule name in the compiled
 /// source marks its figure; any name that can reach the whole state or every rule marks all
-/// figures. The scan reads whole words, leaving out lines that start with `//`; words in a
-/// literal or a trailing comment can only add figures.
+/// figures. The scan reads the names of the source: the text of a string literal, such as a state
+/// key, and of a comment names nothing. A source that the scan cannot read keeps every figure.
 pub fn figures(compiled: &str, read: u8) -> u8 {
-    let code = without_comments(compiled);
-    let words: Vec<&str> = code
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .filter(|word| !word.is_empty())
+    let Ok(tokens) = tokens(compiled) else {
+        return 15;
+    };
+    let words: Vec<&str> = tokens
+        .iter()
+        .filter_map(|token| match token {
+            Token::Ident(word) => Some(word.as_str()),
+            _ => None,
+        })
         .collect();
-    if words.iter().any(|word| {
-        ALL.contains(word) || (word.contains("state") && !["get_state", "set_state"].contains(word))
-    }) {
+    if words
+        .iter()
+        .any(|word| ALL.contains(word) || *word == "state")
+    {
         return 15;
     }
     RULES
         .iter()
         .filter(|(name, _)| words.contains(name))
         .fold(read, |figures, (_, figure)| figures | figure)
-}
-
-/// The source without the lines that start with `//`: doc and line comments. Such a line is a
-/// comment or the inside of a literal, never code. Trailing and block comments stay in the scan,
-/// which can only add figures.
-fn without_comments(source: &str) -> String {
-    source
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// One declared state entry.

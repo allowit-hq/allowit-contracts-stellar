@@ -1127,6 +1127,12 @@ pub fn execute(ctx: &AllowitContext) -> allowit::Result {
         assert_eq!(crate::state_keys::figures(&parts.onchain, read), 4);
         let (_, read) = crate::state_keys::declared(ONE, |name| crate::hash(name)).unwrap();
         assert_eq!(crate::state_keys::figures(ONE, read), 4 | 2);
+        // A state key, a string and a comment name nothing: a key named `my_state` and a text
+        // that names a rule keep no figure. The name `state` reaches the whole state.
+        let named = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    // allowit::daily_spending_limit\n    let seen: Option<bool> = allowit::get_state(ctx, \"my_state\")?;\n    assert!(seen.is_none() && \"evaluate\" != \"call_limit\");\n    Ok(())\n}\n";
+        assert_eq!(crate::state_keys::figures(named, 0), 0);
+        let whole = named.replace("seen.is_none()", "ctx.state.is_empty()");
+        assert_eq!(crate::state_keys::figures(&whole, 0), 15);
         // Only a Custom wallet holds server policy source: the contract of another tier
         // compiles no part of it.
         assert_eq!(tier_rules(PolicyTier::Custom, ONE).unwrap(), [""; 0]);
