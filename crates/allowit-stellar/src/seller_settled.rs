@@ -1277,6 +1277,91 @@ mod tests {
         );
     }
 
+    /// A seller's facilitator can pay a fee bump of its own transaction: the wallet pays none. A
+    /// fee bump of that transaction that the wallet's own account paid is refused, whether the
+    /// receipt holds the transaction, and the ledger names the payer, or holds the fee bump
+    /// itself, as a restored receipt can.
+    #[test]
+    fn a_settlement_whose_fee_bump_the_wallet_paid_is_refused() {
+        use crate::host::runtime::{Accounting, Kind, Prepared, Receipt, Signed};
+        use crate::host::vendors::RuntimeProvider;
+        use crate::provider::server::{FEE_BUMP_UNSUPPORTED, Provider, restore};
+        struct Answers(serde_json::Value);
+        impl rpc::Rpc for Answers {
+            fn call(&self, _: &str, _: serde_json::Value) -> Result<serde_json::Value> {
+                Ok(self.0.clone())
+            }
+        }
+        let p = keypair_wallet();
+        let signed = assemble(&p, &[signed_by(AGENT, &p), signed_by(SERVER, &p)], NOW).unwrap();
+        let TransactionEnvelope::Tx(mut envelope) = read(&signed.transaction_xdr).unwrap() else {
+            panic!("a transaction")
+        };
+        let facilitator = account_for_seed(&[6; 32]);
+        envelope.tx.source_account =
+            MuxedAccount::Ed25519(Uint256(account_key(&facilitator).unwrap()));
+        envelope.tx.seq_num = SequenceNumber(77);
+        let network = &p.config.network;
+        // The transaction as a fee bump leaves it: its own result holds no fee.
+        let inner = rpc::VerifiedReceipt {
+            transaction_hash: transaction_hash(network, &envelope.tx).unwrap(),
+            status: OperationStatus::Confirmed,
+            ledger: 130,
+            envelope_xdr: xdr(&TransactionEnvelope::Tx(envelope)).unwrap(),
+            result_xdr: xdr(&TransactionResult {
+                fee_charged: 0,
+                result: TransactionResultResult::TxSuccess(VecM::default()),
+                ext: TransactionResultExt::V0,
+            })
+            .unwrap(),
+            settles: Some(p.transaction_hash),
+            closed_at: None,
+        };
+        let restored = |kind, value: String| {
+            restore(
+                kind,
+                serde_json::value::RawValue::from_string(value).unwrap(),
+            )
+            .unwrap()
+        };
+        let settle = |receipt: &rpc::VerifiedReceipt, answer: serde_json::Value| {
+            Provider::from_rpc(network, std::sync::Arc::new(Answers(answer))).settle_receipt(
+                &Prepared(restored(Kind::Prepared, serde_json::to_string(&p).unwrap())),
+                &Signed(restored(
+                    Kind::Signed,
+                    serde_json::to_string(&signed).unwrap(),
+                )),
+                &Receipt(restored(
+                    Kind::Receipt,
+                    serde_json::to_string(receipt).unwrap(),
+                )),
+                Some(&Accounting::default()),
+                0,
+            )
+        };
+        for (payer, refused) in [(&p.config.wallet, true), (&facilitator, false)] {
+            let reply = test_support::fee_bump_reply(&inner, network, payer, 5_000);
+            // The receipt that holds the fee bump itself needs no answer of the ledger.
+            let mut wrapped = inner.clone();
+            wrapped.envelope_xdr = reply["envelopeXdr"].as_str().unwrap().into();
+            wrapped.result_xdr = reply["resultXdr"].as_str().unwrap().into();
+            validate_settled(&signed, &wrapped).unwrap();
+            for settled in [
+                settle(&inner, reply),
+                settle(&wrapped, serde_json::json!({})),
+            ] {
+                if refused {
+                    assert_eq!(
+                        settled.unwrap_err().api_code.as_deref(),
+                        Some(FEE_BUMP_UNSUPPORTED)
+                    );
+                } else {
+                    assert_eq!(settled.unwrap().fee_units, 0);
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_ledger_of_a_preparation_is_one_that_the_signers_endpoint_has() {
         struct Latest(u64);

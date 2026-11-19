@@ -1457,10 +1457,34 @@ pub fn receipt_by_reported_hash(
     let FeeBumpTransactionInnerTx::Tx(inner) = &outer.tx.inner_tx;
     receipt_from_response(&v, network, &transaction_hash_for(network, &inner.tx)?)
 }
+/// The source account of the transaction of `receipt`, and the account that paid its fee bump
+/// when the receipt holds the wrapper itself, as a restored seller-settled receipt can.
+pub fn receipt_fee_parties(receipt: &VerifiedReceipt) -> Result<(String, Option<String>)> {
+    fee_parties(&receipt.envelope_xdr)
+}
+fn fee_parties(envelope: &str) -> Result<(String, Option<String>)> {
+    let account = |a: &MuxedAccount| match a {
+        MuxedAccount::Ed25519(Uint256(key)) => account_for_public_key(key),
+        MuxedAccount::MuxedEd25519(m) => account_for_public_key(&m.ed25519.0),
+    };
+    match read(envelope)? {
+        TransactionEnvelope::Tx(envelope) => Ok((account(&envelope.tx.source_account), None)),
+        TransactionEnvelope::TxFeeBump(outer) => {
+            let FeeBumpTransactionInnerTx::Tx(inner) = &outer.tx.inner_tx;
+            Ok((
+                account(&inner.tx.source_account),
+                Some(account(&outer.tx.fee_source)),
+            ))
+        }
+        TransactionEnvelope::TxV0(_) => Err("Unexpected settlement envelope".into()),
+    }
+}
 /// The account that paid the fee bump that carried the transaction of `receipt`, as the ledger
-/// answers it now, the wrapper verified: `None` for a transaction that no fee bump carried or
-/// that the ledger does not hold. A ledger answer whose inner transaction or result differs from
-/// the receipt is refused. Nothing of it is retained.
+/// answers it now, the wrapper verified: `None` for a transaction that no fee bump carried, and
+/// for one that the ledger answers it does not hold (a valid `NOT_FOUND`). A reply with any other
+/// or no status establishes neither: it is a read with an unknown result, to ask again. A
+/// terminal answer whose status, ledger, inner transaction or result differs from the receipt is
+/// refused. Nothing of it is retained.
 pub fn fee_bump_payer(
     rpc: &dyn Rpc,
     network: &str,
@@ -1468,25 +1492,29 @@ pub fn fee_bump_payer(
 ) -> Result<Option<String>> {
     let hash = &receipt.transaction_hash;
     let v = rpc.call("getTransaction", json!({"hash": hex(hash)}))?;
-    let inner = settlement_reply(&v, network, hash)?;
-    if !matches!(v["status"].as_str(), Some("SUCCESS" | "FAILED")) {
-        return Ok(None);
+    if !matches!(
+        v["status"].as_str(),
+        Some("SUCCESS" | "FAILED" | "NOT_FOUND")
+    ) {
+        return Err(format!(
+            "{TRANSPORT_UNKNOWN}: getTransaction answered no known status"
+        ));
     }
-    if inner["envelopeXdr"].as_str() != Some(receipt.envelope_xdr.as_str())
-        || inner["resultXdr"].as_str() != Some(receipt.result_xdr.as_str())
+    // The reply passes the checks of every receipt read, its status against its result included.
+    let Some(answer) = receipt_from_response(&v, network, hash)? else {
+        return Ok(None);
+    };
+    if answer.status != receipt.status
+        || answer.ledger != receipt.ledger
+        || answer.envelope_xdr != receipt.envelope_xdr
+        || answer.result_xdr != receipt.result_xdr
     {
         return Err("The ledger's answer differs from the receipt".into());
     }
-    let Some(envelope) = v["envelopeXdr"].as_str() else {
-        return Ok(None);
-    };
-    let TransactionEnvelope::TxFeeBump(outer) = read(envelope)? else {
-        return Ok(None);
-    };
-    Ok(Some(match &outer.tx.fee_source {
-        MuxedAccount::Ed25519(Uint256(key)) => account_for_public_key(key),
-        MuxedAccount::MuxedEd25519(m) => account_for_public_key(&m.ed25519.0),
-    }))
+    let reported = v["envelopeXdr"]
+        .as_str()
+        .ok_or("Settlement envelope is required")?;
+    Ok(fee_parties(reported)?.1)
 }
 fn receipt_from_response(
     v: &Value,
