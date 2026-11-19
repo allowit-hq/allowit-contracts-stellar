@@ -850,7 +850,7 @@ fn native_setup_rebuilds_exact_roles_thresholds_and_request_identity() {
     assert_refused(&packet, &changed, "native fee overflow");
 }
 /// A retained setup packet of an earlier release configured the owner's own account with three
-/// operations. It stays readable as history, and no intent signs it.
+/// operations. It stays readable as history, and the Rust owner-intent signer refuses it.
 #[test]
 fn a_retained_setup_of_an_earlier_release_stays_readable_and_is_never_signed() {
     let (current, expected) = native();
