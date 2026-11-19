@@ -503,11 +503,6 @@ pub fn receipt_info(p: &Packet) -> Result<ReceiptInfo> {
     // counters: the engine prices its fee through ServerHooks::charged_fee.
     let charged_units = checked(rpc::counted_gas_units(&r))?;
     let repaid_native_units = checked(rpc::repaid_gas_stroops(&r))?;
-    let source = r
-        .fee_bump
-        .as_ref()
-        .map(|_| receipt_source(&r))
-        .transpose()?;
     Ok(ReceiptInfo {
         // The settlement of a payment authorization keeps the identity of the retained
         // operation, and names the transaction that settled it apart.
@@ -519,16 +514,6 @@ pub fn receipt_info(p: &Packet) -> Result<ReceiptInfo> {
             // transaction. The wallet paid and counted none.
             native_units: if r.settles.is_some() {
                 0
-            } else if let Some(bump) = &r.fee_bump {
-                // The inner result of a fee bump reports no fee: the bump's payer paid it. The
-                // transaction's own source paid it as its fee; another party's payment is none
-                // of the source's.
-                if source.as_deref() == Some(bump.payer.as_str()) {
-                    u128::try_from(bump.fee_charged)
-                        .map_err(|_| Error::config("Invalid Stellar receipt fee"))?
-                } else {
-                    0
-                }
             } else {
                 u128::try_from(result.fee_charged)
                     .map_err(|_| Error::config("Invalid Stellar receipt fee"))?
@@ -539,21 +524,6 @@ pub fn receipt_info(p: &Packet) -> Result<ReceiptInfo> {
         // The prepared operation carries its debits; the receipt adds only the fee.
         debits: Vec::new(),
         settlement_hash: r.settles.map(|_| r.transaction_hash),
-    })
-}
-/// The source account of the transaction of the receipt `r`.
-fn receipt_source(r: &rpc::VerifiedReceipt) -> Result<String> {
-    let stellar_xdr::TransactionEnvelope::Tx(envelope) = checked(native::read(&r.envelope_xdr))?
-    else {
-        return Err(Error::config(
-            "A receipt's transaction is a plain transaction",
-        ));
-    };
-    Ok(match envelope.tx.source_account {
-        stellar_xdr::MuxedAccount::Ed25519(stellar_xdr::Uint256(key)) => {
-            native::account_for_public_key(&key)
-        }
-        stellar_xdr::MuxedAccount::MuxedEd25519(m) => native::account_for_public_key(&m.ed25519.0),
     })
 }
 pub struct Provider {
@@ -992,19 +962,27 @@ impl Provider {
         self.runtime.rpc()
     }
     /// The vault's value of `shares` in asset units. The read simulates from an account that
-    /// exists: the sending account of a policy wallet, or the keypair wallet itself. A sending
-    /// account that the server cannot give is the outer error, which the caller keeps, as the
-    /// server's valuation keeps it; a read that fails and the vault's own refusal to value the
-    /// shares are the inner one, on which `expense` counts a deposit whole and refuses a redeem.
+    /// exists: the sending account of a policy wallet, or the keypair wallet itself. The server's
+    /// refusal to give a sending account (an answer with its status) is the outer error, which
+    /// the caller keeps, as the server's valuation keeps it; another failure to give one, a read
+    /// that fails and the vault's own refusal to value the shares are the inner one, on which
+    /// `expense` counts a deposit whole and refuses a redeem.
     fn vault_value(&self, i: &Installation, vault: &str, shares: i128) -> Result<Result<i128>> {
         let sender = match self.config(i)?.route {
-            WalletRoute::PolicyWallet => Some(self.sending_account()?),
+            WalletRoute::PolicyWallet => match self.sending_account() {
+                Ok(sender) => Some(Ok(sender)),
+                // A server's refusal, an answer with its status such as a held pool that the
+                // caller asks again, stays the caller's; any other failure is a failed read.
+                Err(refused) if refused.status.is_some() => return Err(refused),
+                Err(failed) => Some(Err(failed)),
+            },
             _ => None,
         };
         let read = || {
             let c = self.fresh(i)?;
             let source = match &sender {
-                Some(sender) => checked(rpc::get_account(self.rpc(), sender))?,
+                Some(Ok(sender)) => checked(rpc::get_account(self.rpc(), sender))?,
+                Some(Err(failed)) => return Err(failed.clone()),
                 None => {
                     checked(rpc::trusted_state_for_discovery(self.rpc(), &c, None))?
                         .state
@@ -2622,7 +2600,6 @@ mod receipt_fee_tests {
             envelope_xdr: native::xdr(&TransactionEnvelope::Tx(envelope)).unwrap(),
             result_xdr: native::xdr(&result).unwrap(),
             settles: None,
-            fee_bump: None,
         };
         receipt_info(&packet(network, &receipt).unwrap()).unwrap()
     }
@@ -4644,7 +4621,8 @@ mod settlement_api {
         struct Held;
         impl SendingAccounts for Held {
             fn account(&self) -> Result<String> {
-                Err(Error::coded(
+                Err(Error::refused(
+                    503,
                     "sending_unavailable",
                     "Every sending account is busy",
                 ))
@@ -4676,6 +4654,46 @@ mod settlement_api {
                 "{action:?}"
             );
         }
+    }
+
+    /// A sending account that the server fails to give for another reason, as a claim store
+    /// that fails, is a failed read: a deposit counts its whole assets and a redeem is the
+    /// valuation's refusal, as the server counts them.
+    #[test]
+    fn a_failing_sending_account_is_a_failed_read() {
+        struct Failing;
+        impl SendingAccounts for Failing {
+            fn account(&self) -> Result<String> {
+                Err(Error::config("The claim store is unreadable"))
+            }
+            fn sign(&self, _: &str, _: &[u8; 32]) -> Result<Vec<u8>> {
+                Err(Error::unsupported("This sending account signs nothing"))
+            }
+        }
+        let failing =
+            Provider::from_rpc(NETWORK, Arc::new(Unreachable)).with_sender(Arc::new(Failing));
+        let vault = crate::test_support::vault(0);
+        let deposit = Action::Deposit {
+            vault: vault.clone(),
+            assets: 100,
+            min_shares: 1,
+        };
+        assert_eq!(
+            failing
+                .expense(&installation(), &deposit, &CEILING)
+                .unwrap()
+                .conversion_units,
+            100
+        );
+        let redeem = Action::Redeem {
+            vault,
+            shares: 100,
+            min_assets: 1,
+        };
+        let error = failing
+            .expense(&installation(), &redeem, &CEILING)
+            .unwrap_err();
+        assert!(error.message.contains("cannot value"), "{error:?}");
     }
 
     /// A redeem's ceiling is checked before the vault is read, and a redeem that cannot be
@@ -4764,7 +4782,6 @@ mod settlement_api {
             })
             .unwrap(),
             settles: None,
-            fee_bump: None,
         };
         rpc::validate_settled_policy_packet(&later, &receipt).unwrap();
         let settled = provider()
@@ -4778,49 +4795,37 @@ mod settlement_api {
             .unwrap();
         assert_eq!(settled.outcome, OperationOutcome::Executed);
         assert_eq!(settled.transaction, later.transaction_hash.to_vec());
-    }
-
-    /// A fee bump that the transaction's own source paid is that source's fee: a keypair
-    /// wallet's fee, a contract wallet's sending account's fee that the carry takes. A fee bump
-    /// that another party paid is no fee of the wallet's.
-    #[test]
-    fn a_fee_bump_paid_by_the_transactions_source_is_its_fee() {
-        let (signed, _, _) = keypair();
-        let mut receipt = crate::test_support::confirmed_payment_receipt(&signed, 9, 0);
-        for (payer, fee) in [
-            (signed.prepared.config.wallet.clone(), 5_000),
-            (native::account_for_seed(&[99; 32]), 0),
-        ] {
-            receipt.fee_bump = Some(rpc::FeeBump {
-                payer,
-                fee_charged: 5_000,
-            });
-            let info = receipt_info(&super::packet(NETWORK, &receipt).unwrap()).unwrap();
-            assert_eq!(info.fee.native_units, fee);
-        }
-        let (p, signed, receipt) = standard();
-        let mut verified: rpc::VerifiedReceipt = decode_packet(&receipt.0).unwrap();
-        let sender = {
-            let stellar_xdr::TransactionEnvelope::Tx(e) =
-                native::read(&verified.envelope_xdr).unwrap()
-            else {
-                panic!()
-            };
-            let stellar_xdr::MuxedAccount::Ed25519(key) = e.tx.source_account else {
-                panic!()
-            };
-            native::account_for_public_key(&key.0)
+        // An earlier sequence, another sender and another operation are none of its envelopes.
+        assert!(
+            native::validate_retained_signed(&crate::test_support::policy_sealed_at(&signed, -1))
+                .is_err()
+        );
+        let mut other_sender = later.clone();
+        let stellar_xdr::TransactionEnvelope::Tx(mut envelope) =
+            native::read(&other_sender.transaction_xdr).unwrap()
+        else {
+            panic!()
         };
-        let repaid = receipt.info().unwrap().fee.repaid_native_units;
-        verified.fee_bump = Some(rpc::FeeBump {
-            payer: sender,
-            fee_charged: 100_000,
-        });
-        let bumped = Receipt(super::packet(NETWORK, &verified).unwrap());
-        let settled = provider()
-            .settle_receipt(&p, &signed, &bumped, None, 0)
-            .unwrap();
-        assert_eq!(settled.gas_carry, repaid - 100_000);
+        envelope.tx.source_account = stellar_xdr::MuxedAccount::Ed25519(stellar_xdr::Uint256(
+            native::account_key(&native::account_for_seed(&[11; 32])).unwrap(),
+        ));
+        other_sender.transaction_xdr =
+            native::xdr(&stellar_xdr::TransactionEnvelope::Tx(envelope.clone())).unwrap();
+        other_sender.transaction_hash =
+            native::transaction_hash(&signed.prepared.config.network, &envelope.tx).unwrap();
+        assert!(native::validate_retained_signed(&other_sender).is_err());
+        let mut other_operation = later.clone();
+        let stellar_xdr::TransactionEnvelope::Tx(mut envelope) =
+            native::read(&other_operation.transaction_xdr).unwrap()
+        else {
+            panic!()
+        };
+        envelope.tx.memo = stellar_xdr::Memo::Id(7);
+        other_operation.transaction_xdr =
+            native::xdr(&stellar_xdr::TransactionEnvelope::Tx(envelope.clone())).unwrap();
+        other_operation.transaction_hash =
+            native::transaction_hash(&signed.prepared.config.network, &envelope.tx).unwrap();
+        assert!(native::validate_retained_signed(&other_operation).is_err());
     }
 
     /// A deposit whose shares cannot be valued, because the sending account cannot be read,

@@ -346,18 +346,34 @@ pub fn fee_bound(resource_fee: i64) -> Result<u32> {
         .and_then(|fee| fee.checked_add(resource.div_ceil(FEE_BOUND_MARGIN_DIVISOR)))
         .ok_or_else(|| "Resource fee overflow".into())
 }
+/// The refusal of [`mul_div_ceil`]: a negative operand, a zero divisor, or a result that an
+/// `i128` cannot hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutOfRange;
+impl std::fmt::Display for OutOfRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The amount is out of range")
+    }
+}
 /// `ceil(x * y / d)` for `x, y >= 0` and `d > 0`, with no intermediate value wider than the
 /// result: with `y = yq * d + yr` and `x = xq * d + xr`, it is `x * yq + xq * yr` plus
-/// `ceil(xr * yr / d)`, and `xr * yr` is below `d * d`. `None` when the result does not fit.
-pub fn mul_div_ceil(x: i128, y: i128, d: i128) -> Option<i128> {
-    if x < 0 || y < 0 || d <= 0 || d > i128::from(u64::MAX) {
-        return None;
+/// `ceil(xr * yr / d)`. A 32-bit divisor keeps `xr * yr` below `2^64`; every step is checked.
+pub fn mul_div_ceil(x: i128, y: i128, d: u32) -> std::result::Result<i128, OutOfRange> {
+    if x < 0 || y < 0 || d == 0 {
+        return Err(OutOfRange);
     }
+    let d = i128::from(d);
     let (yq, yr) = (y / d, y % d);
     let (xq, xr) = (x / d, x % d);
-    x.checked_mul(yq)?
-        .checked_add(xq.checked_mul(yr)?)?
-        .checked_add((xr * yr + d - 1) / d)
+    let tail = xr
+        .checked_mul(yr)
+        .and_then(|p| p.checked_add(d - 1))
+        .map(|p| p / d)
+        .ok_or(OutOfRange)?;
+    x.checked_mul(yq)
+        .and_then(|v| v.checked_add(xq.checked_mul(yr)?))
+        .and_then(|v| v.checked_add(tail))
+        .ok_or(OutOfRange)
 }
 /// Request-bound conservative economic ceilings in the wallet asset, attested by the server
 /// signer with its authorization: `AllowitExpenseBounds`. Amounts use the wallet asset's seven
@@ -428,9 +444,9 @@ impl ExpenseBounds {
         if self.gas_units < 0 {
             return Err("A gas carry lowers nonnegative gas".into());
         }
-        let bound = i128::from(self.max_fee_stroops);
         let repaid = self.repaid_after_carry(carry);
-        let gas_units = mul_div_ceil(self.gas_units, repaid, bound).ok_or("Expense overflow")?;
+        let gas_units = mul_div_ceil(self.gas_units, repaid, self.max_fee_stroops)
+            .map_err(|_| "Expense overflow")?;
         Ok(Self {
             gas_units,
             spent_units: self
@@ -457,8 +473,8 @@ impl ExpenseBounds {
             return Err("The repayment exceeds the wallet's gas cap".into());
         }
         let repaid = base;
-        let ceiling = i128::from(self.max_fee_stroops);
-        let gas_units = mul_div_ceil(self.gas_units, repaid, ceiling).ok_or("Expense overflow")?;
+        let gas_units = mul_div_ceil(self.gas_units, repaid, self.max_fee_stroops)
+            .map_err(|_| "Expense overflow")?;
         Ok(Self {
             gas_units,
             spent_units: self
@@ -477,9 +493,12 @@ impl ExpenseBounds {
         if fee_stroops == 0 || fee_stroops > self.max_fee_stroops || self.gas_units < 0 {
             return Err("A fee bound lowers a positive fee ceiling".into());
         }
-        let ceiling = i128::from(self.max_fee_stroops);
-        let gas_units = mul_div_ceil(self.gas_units, i128::from(fee_stroops), ceiling)
-            .ok_or("Expense overflow")?;
+        let gas_units = mul_div_ceil(
+            self.gas_units,
+            i128::from(fee_stroops),
+            self.max_fee_stroops,
+        )
+        .map_err(|_| "Expense overflow")?;
         Ok(Self {
             gas_units,
             spent_units: self
@@ -2838,6 +2857,22 @@ mod repayment_width {
     use super::*;
     /// The gas of a wide ceiling scales down to the repayment without an intermediate overflow,
     /// as the price of the same rate does: 10^37 units for 10,000,000 stroops are 10^32 for 100.
+    /// The helper is exact where the result fits, and refuses with its typed error where it
+    /// does not, or where an operand is outside its domain.
+    #[test]
+    fn mul_div_ceil_is_exact_or_out_of_range() {
+        assert_eq!(mul_div_ceil(1, 15, 10), Ok(2));
+        assert_eq!(
+            mul_div_ceil(10_i128.pow(30), 100, 10_000_000),
+            Ok(10_i128.pow(25))
+        );
+        let d = u32::MAX;
+        let wide = i128::from(d) - 1;
+        assert_eq!(mul_div_ceil(wide, wide, d), Ok(wide - 1 + 1));
+        assert_eq!(mul_div_ceil(i128::MAX, 2, 1), Err(OutOfRange));
+        assert_eq!(mul_div_ceil(-1, 2, 3), Err(OutOfRange));
+        assert_eq!(mul_div_ceil(1, 2, 0), Err(OutOfRange));
+    }
     #[test]
     fn a_wide_ceiling_scales_to_its_repayment() {
         let bounds = ExpenseBounds {

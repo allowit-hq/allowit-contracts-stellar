@@ -1246,14 +1246,6 @@ fn fee_bumped_owner_receipt_binds_outer_inner_result_and_status() {
                 OperationStatus::Failed
             }
         );
-        // The receipt keeps the bump's payer and the fee that the ledger charged it.
-        assert_eq!(
-            receipt.fee_bump,
-            Some(rpc::FeeBump {
-                payer: account(99),
-                fee_charged: 5000,
-            })
-        );
         rpc::validate_receipt(&receipt, NETWORK, &packet.transaction_hash).unwrap();
         let valid = chain.receipt.clone();
         // Current stellar-rpc getTransaction echoes the requested inner hash.

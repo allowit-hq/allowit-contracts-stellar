@@ -467,14 +467,25 @@ impl ServerHooks for Hooks {
         let ticker = listed
             .and_then(|t| config.get("gasRates")?.get(t.code))
             .cloned();
-        match ticker {
+        let config = match ticker {
             Some(rate) if config.get("gasRates").and_then(|r| r.get(asset)).is_none() => {
                 let mut config = config.clone();
                 config["gasRates"][asset] = rate;
-                self.price_fee(network, &config, asset, receipt.fee.native_units)
+                config
             }
-            _ => self.price_fee(network, config, asset, receipt.fee.native_units),
-        }
+            _ => config.clone(),
+        };
+        let fee = i128::try_from(receipt.fee.native_units)
+            .map_err(|_| Error::config("The receipt fee is out of range"))?;
+        let Some(rate) = asset_rate(network, &config, asset)? else {
+            return Ok(fee);
+        };
+        // The arithmetic of this hook stays the one that the server's admission reads today:
+        // units = ceil(fee * rate / 10^7), refused when fee * rate does not fit.
+        fee.checked_mul(rate)
+            .and_then(|v| v.checked_add(9_999_999))
+            .map(|v| v / 10_000_000)
+            .ok_or_else(|| Error::config("The fee is out of range"))
     }
     /// The XLM fee of `native_units` in the wallet's asset `asset` (its contract id), rounded
     /// up. XLM, the network's own asset, is one to one; any other asset takes the `gasRates`
@@ -486,29 +497,39 @@ impl ServerHooks for Hooks {
         asset: &str,
         native_units: u128,
     ) -> Result<i128> {
-        let network = self::network(network)?.id;
         let fee = i128::try_from(native_units)
-            .map_err(|_| Error::config("The receipt fee is out of range"))?;
-        let xlm =
-            crate::sac_address(network, &stellar_xdr::Asset::Native).map_err(Error::config)?;
-        if asset == xlm {
+            .map_err(|_| Error::coded(AMOUNT_OUT_OF_RANGE, "The native fee is out of range"))?;
+        let Some(rate) = asset_rate(network, config, asset)? else {
             return Ok(fee);
-        }
-        let rate = config
-            .get("gasRates")
-            .and_then(|rates| rates.get(asset))
-            .and_then(Value::as_str)
-            .and_then(rate)
-            .ok_or_else(|| {
-                Error::config(format!(
-                    "Configure gasRates to price the XLM fee in {asset}"
-                ))
-            })?;
+        };
         // `rate` has 7 decimals, as XLM does, so units = ceil(fee * rate / 10^7), with no
         // intermediate value wider than the price, as the repayment of a preparation computes it.
         crate::mul_div_ceil(fee, rate, 10_000_000)
-            .ok_or_else(|| Error::config("The fee is out of range"))
+            .map_err(|_| Error::coded(AMOUNT_OUT_OF_RANGE, "The price of the fee is out of range"))
     }
+}
+
+/// The code of a fee or a price that its type cannot hold.
+pub const AMOUNT_OUT_OF_RANGE: &str = "amount_out_of_range";
+/// The rate of the wallet's asset `asset` (its contract id) in `config`, scaled by 10^7; `None`
+/// for XLM, the network's own asset, which is one to one. No list of known assets decides.
+fn asset_rate(network: &str, config: &Value, asset: &str) -> Result<Option<i128>> {
+    let network = self::network(network)?.id;
+    let xlm = crate::sac_address(network, &stellar_xdr::Asset::Native).map_err(Error::config)?;
+    if asset == xlm {
+        return Ok(None);
+    }
+    config
+        .get("gasRates")
+        .and_then(|rates| rates.get(asset))
+        .and_then(Value::as_str)
+        .and_then(rate)
+        .map(Some)
+        .ok_or_else(|| {
+            Error::config(format!(
+                "Configure gasRates to price the XLM fee in {asset}"
+            ))
+        })
 }
 
 /// A positive decimal string with at most 7 fraction digits, scaled by 10^7.
@@ -1005,6 +1026,24 @@ mod tests {
             settlement_hash: None,
         };
         assert_eq!(hooks.charged_fee(network, &ticker, &receipt).unwrap(), 150);
+        // At an extreme rate the receipt hook keeps the server's refusal of today, and the
+        // wallet's price is the exact one: 5,000,000 stroops at 10^30 are 5 * 10^36 units.
+        let extreme = serde_json::json!({"asset": usdc.as_str(),
+            "gasRates": {usdc.as_str(): "1000000000000000000000000000000"}});
+        let wide = ReceiptInfo {
+            fee: allowit_core::vendor::runtime::Fee {
+                native_units: 5_000_000,
+                ..receipt.fee
+            },
+            ..receipt.clone()
+        };
+        assert!(hooks.charged_fee(network, &extreme, &wide).is_err());
+        assert_eq!(
+            hooks
+                .price_fee(network, &extreme, &usdc, 5_000_000)
+                .unwrap(),
+            5 * 10_i128.pow(36)
+        );
         // A rate under a ticker prices no asset, a listed one neither.
         assert!(
             hooks
