@@ -581,19 +581,32 @@ fn write_total(env: &Env, kept: u8, f: &Figures, exists: bool) -> Result<(), All
     }
     Ok(())
 }
-/// Write `d` with the kept daily figures. A new window ends `DAY_LEDGERS - 1` ledgers from now,
-/// and the entry lives at least that long; the wallet never extends it later.
+/// The end ledger of a daily window after a write of a changed value, by Core's rule
+/// (`allowit::daily_window_end`): a window still open at this ledger (`day_ends`) keeps its end,
+/// and otherwise the write opens a window of `DAY_LEDGERS` ledgers from this one. The wallet
+/// writes `d` only when a kept daily figure changed (`admit`), so the figures before and after
+/// are two different values in Core's terms; Core compares nothing else.
+fn written_window_end(env: &Env, day_ends: Option<u32>) -> Result<u32, AllowitWalletError> {
+    let (before, after) = (AllowitValue::Bool(false), AllowitValue::Bool(true));
+    let end = allowit::daily_window_end(
+        day_ends.map(|end| (&before, u64::from(end))),
+        &after,
+        u64::from(env.ledger().sequence()),
+        u64::from(DAY_LEDGERS),
+    )
+    .map_err(|_| AllowitWalletError::Overflow)?;
+    checked(u32::try_from(end).ok())
+}
+/// Write `d` with the kept daily figures. Its window's end comes from Core's rule
+/// ([`written_window_end`]): a new window ends `DAY_LEDGERS - 1` ledgers from now, and the entry
+/// lives at least that long; the wallet never extends it later.
 fn write_daily(
     env: &Env,
     kept: u8,
     f: &Figures,
     day_ends: Option<u32>,
 ) -> Result<(), AllowitWalletError> {
-    let seq = env.ledger().sequence();
-    let end = match day_ends {
-        Some(end) => end,
-        None => checked(seq.checked_add(DAY_LEDGERS - 1))?,
-    };
+    let end = written_window_end(env, day_ends)?;
     let mut buf = [0u8; 64];
     let mut w = Writer::new(&mut buf);
     w.put(&end.to_be_bytes())?;

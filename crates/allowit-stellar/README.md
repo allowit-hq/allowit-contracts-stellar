@@ -117,10 +117,13 @@ It reads the direct order book only: no path through another asset and no liquid
   installs the pinned compiler and the `wasm32v1-none` target from `rust-toolchain.toml`. A missing tool or another
   CLI release is a `custom_toolchain_missing` refusal that says what to install. A failed compile is
   `custom_build_failed`.
-- `check(network, source)` refuses, without building, every source that the build refuses: one over the build's
-  size limit, or one whose on-chain part does not pass the portable gate or the wallet's storage of state keys (at
-  most eight keys that the contract keeps, each with its own storage key; keys that the server keeps do not count).
-  A client calls it before it reports a source as fit for a Custom wallet.
+- `check(network, source)` runs, without building, the checks that the build makes before it compiles: the build's
+  size limit, the portable gate of the on-chain part, the build's text check of the compiled part
+  (`state_keys::one_safe_file`: no `unsafe`, `include!`, `include_str!`, `include_bytes!` or `#[path`, comments
+  included) and the wallet's storage of state keys (at most eight keys that the contract keeps, each with its own
+  storage key; keys that the server keeps do not count). It does not compile the part: a source that passes it can
+  still fail the compile, for example on a type error. A client calls it before it reports a source as fit for a
+  Custom wallet.
 - `code_hash` is the SHA-256 of a wallet Wasm of the current custody layout: the hash of the code on the ledger.
 - The owner's client builds the code of a Custom policy from the source that the owner's policy signature binds
   and hands it to the server, which uploads it from its sending account when the owner deploys, with the

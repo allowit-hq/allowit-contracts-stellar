@@ -164,8 +164,9 @@ fn write_tree(tree: &Path, inputs: &[(&str, Vec<u8>)]) -> Result<()> {
 
 /// The build inputs of `source` for a Custom wallet, or the refusal of a source that the wallet
 /// cannot hold: one over the build's size limit, or one whose on-chain part does not pass the
-/// portable gate or the wallet's storage of state keys (at most eight, each with its own storage
-/// key). The build and [`CustomWalletBuild::check`] refuse the same sources.
+/// portable gate, the build's text check or the wallet's storage of state keys (at most eight,
+/// each with its own storage key). The build and [`CustomWalletBuild::check`] make these checks
+/// alike; only the build compiles the part.
 fn checked_inputs(source: &str) -> Result<Vec<crate::policy::BuildInput>> {
     if source.len() > MAX_SOURCE_BYTES {
         return Err(Error::usage(
@@ -261,8 +262,9 @@ impl CustomWalletBuild for CustomBuild {
         crate::host::routing::normalize(network)?;
         crate::admin::check_wallet_code(code).map_err(Error::usage)
     }
-    /// The build's own check of `source`, without the build: the size limit, the portable gate
-    /// of the on-chain part and the wallet's storage of its state keys.
+    /// The build's own checks of `source`, without the build: the size limit, the portable gate
+    /// of the on-chain part, the build's text check of the compiled part and the wallet's storage
+    /// of its state keys. It does not compile the part.
     fn check(&self, network: &str, source: &str) -> Result<()> {
         crate::host::routing::normalize(network)?;
         checked_inputs(source).map(|_| ())
@@ -388,6 +390,16 @@ mod tests {
         );
         let error = CUSTOM_BUILD.check(NETWORK, &nine).unwrap_err();
         assert!(error.to_string().contains("at most 8"), "{error}");
+        // The build's text check of the compiled part: a comment that names `unsafe` in it is
+        // refused before the build, as the build refuses it.
+        let unsafe_comment = SOURCE.replacen(
+            "pub fn execute",
+            "// Reject unsafe payments.\npub fn execute",
+            1,
+        );
+        assert_ne!(unsafe_comment, SOURCE);
+        let error = CUSTOM_BUILD.check(NETWORK, &unsafe_comment).unwrap_err();
+        assert!(error.to_string().contains("`unsafe`"), "{error}");
         assert!(CUSTOM_BUILD.check("bitcoin:mainnet", SOURCE).is_err());
     }
 

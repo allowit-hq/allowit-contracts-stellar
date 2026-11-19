@@ -770,6 +770,44 @@ fn daily_figures_live_in_a_window_that_ends_with_its_own_ledger() {
     assert_eq!(f.run(&f.transfer(100, 0)), Ok(()));
 }
 
+/// The window of `d` follows Core's rule at its edges (`allowit::daily_window_end`, the end being
+/// the window's last ledger): a write at the last ledger keeps the end; one ledger later the
+/// figures read as zero, and the next write opens a window from that ledger.
+#[test]
+fn daily_figures_keep_cores_window_at_its_edges() {
+    let f = Fixture::with(COMMON, false, |env, c| {
+        c.rules = Vec::from_array(env, [AllowitRule::daily_spending_limit]);
+    });
+    assert_eq!(f.run(&f.transfer(10, 0)), Ok(()));
+    let start = f.env.ledger().sequence();
+    let end = start + DAY_LEDGERS - 1;
+    assert_eq!(f.figures().day_ends, end);
+    f.advance(DAY_LEDGERS - 1);
+    assert_eq!(f.env.ledger().sequence(), end);
+    assert_eq!(f.run(&f.transfer(10, 0)), Ok(()));
+    assert_eq!((f.figures().day_spent, f.figures().day_ends), (20, end));
+    f.advance(1);
+    assert_eq!(f.figures().day_ends, 0, "the window has ended");
+    assert_eq!(f.run(&f.transfer(10, 0)), Ok(()));
+    assert_eq!(
+        (f.figures().day_spent, f.figures().day_ends),
+        (10, end + DAY_LEDGERS)
+    );
+    // The same ends from Core's rule for a changed value.
+    let (before, after) = (AllowitValue::Bool(false), AllowitValue::Bool(true));
+    for (open, at, want) in [(Some(end), end, end), (None, end + 1, end + DAY_LEDGERS)] {
+        assert_eq!(
+            allowit::daily_window_end(
+                open.map(|end| (&before, u64::from(end))),
+                &after,
+                u64::from(at),
+                u64::from(DAY_LEDGERS)
+            ),
+            Ok(u64::from(want))
+        );
+    }
+}
+
 /// Each call keeps the wallet live. Once the instance has at most `TOTAL_LEDGERS - RENEWAL_LEDGERS`
 /// ledgers left, a call renews it to `TOTAL_LEDGERS - 1`; a call above that threshold renews
 /// nothing. A Custom wallet's code is its own, and a call renews it the same way;

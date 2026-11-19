@@ -49,7 +49,8 @@ derivation; the build reads no policy decision from the source itself.
   [Policy state](#policy-state)).
 
 The build refuses a `policy.rs` that contains `unsafe`, `include!`, `include_str!`,
-`include_bytes!` or `#[path`: the policy is one safe file. Core's source gate
+`include_bytes!` or `#[path`, comments included: the policy is one safe file
+(`state_keys::one_safe_file`, which the rail's `check` runs too). Core's source gate
 (`scripts/check-policy-bindings.py`) applies its own checks as well.
 
 The owner's deployment signature names the code hash. The owner's client compares it with the
@@ -128,7 +129,9 @@ wallet of its kind, and Allowit keeps it live. The rent is part of the call's ne
 wallet repays as gas within its gas cap. Nothing restores a wallet whose instance or code lapsed. `d` opens at the first operation after the last window ended and holds its own
 end ledger, 17,279 ledgers later (the Mainnet minimum lifetime of a temporary entry, about one
 day). The daily figures of the policy are the figures of that window, not of a UTC day. A window
-whose end ledger has passed reads as zero, even if someone paid to keep the entry alive.
+whose end ledger has passed reads as zero, even if someone paid to keep the entry alive. The
+contract and the rail's host take the window from Core's portable rule (`allowit::daily_window_end`,
+`allowit::daily_window_open`; the end ledger is the window's last ledger), as for a daily policy key.
 
 ## Policy state
 

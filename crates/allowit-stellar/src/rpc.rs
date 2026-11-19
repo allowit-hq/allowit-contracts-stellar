@@ -2366,6 +2366,13 @@ mod custom_state_tests {
             Some(crate::PolicyValue::Int(1))
         );
         assert_eq!(packed::state_value(&daily, true, 101).unwrap(), None);
+        // The window is Core's: open through its last ledger, closed one ledger later.
+        for ledger in [99, 100, 101] {
+            assert_eq!(
+                packed::state_value(&daily, true, ledger).unwrap().is_some(),
+                allowit_core::daily_window_open(100, u64::from(ledger))
+            );
+        }
         assert_eq!(
             packed::state_value(&[0, 2], false, 1).unwrap(),
             Some(crate::PolicyValue::Int(1))
