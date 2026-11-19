@@ -68,6 +68,22 @@ export declare function nativeSetupOf(payload: string, network: string): {
     server: string;
     startingBalance: bigint;
 } | null;
+/**
+ * A setup that the owner's account cannot pay for, found before any signature. `code` is the typed code of the
+ * refusal, whose title is in Allowit's error catalogue; the message says what happened and what the owner does next.
+ */
+export declare class SetupRefusal extends Error {
+    readonly code: 'owner_account_unfunded' | 'owner_balance_low';
+    constructor(code: 'owner_account_unfunded' | 'owner_balance_low', message: string);
+}
+/** The whole fee of the setup transaction, in stroops: the owner's account pays it. The owner's approval that follows is a message signature and costs nothing. */
+export declare const NATIVE_SETUP_FEE: bigint;
+/**
+ * What an account can spend now, in stroops: its XLM above its own reserve and its selling liabilities. Null when the
+ * account record lacks one of the fields that the reserve and the liabilities need: a partial record could refuse an
+ * owner who can pay, or pass one who cannot, so the caller stops as for a failed read.
+ */
+export declare function spendableXlm(account: Record<string, unknown>): bigint | null;
 /** The roles and funding of a Native wallet account's setup. */
 export interface NativeSetupInput {
     network: string;
@@ -98,10 +114,6 @@ export interface PreparedNativeSetup {
      */
     complete(ownerSigned: string): string;
 }
-/**
- * Prepares the setup of the wallet account of an agent: one transaction from the owner's own sequence. The account's
- * own key is random; it signs the creation once, beside the owner, in `complete`.
- */
 export declare function prepareNativeSetup({ network, owner, agent, server, amount, fetch: send }: NativeSetupInput): Promise<PreparedNativeSetup>;
 /**
  * What signed setup bytes are: their hash, their roles and their own time bound. Null for bytes that are no setup of

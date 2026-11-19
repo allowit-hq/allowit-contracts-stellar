@@ -4,7 +4,7 @@ import test from 'node:test';
 import {Asset, Keypair, Networks, Operation, TransactionBuilder, Account} from '@stellar/stellar-sdk/base';
 import {
   APPROVE_POLICY, SET_UP_WALLET, WALLET_FEE_FLOAT, WALLET_RESERVE, approvalMessage, approvalStep, messageDigest,
-  nativeSetupOf, nativeSetupTransaction, nativeWalletConfiguration, policyApproval, prepareNativeSetup, sendNativeSetup, signedNativeSetupOf,
+  NATIVE_SETUP_FEE, nativeSetupOf, nativeSetupTransaction, nativeWalletConfiguration, policyApproval, prepareNativeSetup, sendNativeSetup, SetupRefusal, signedNativeSetupOf, spendableXlm,
   walletStartingBalance,
 } from '../dist/native-wallet.js';
 import {ownerChain} from '../dist/owner-chain.js';
@@ -39,6 +39,8 @@ async function createWallet(fetch, amount = '0') {
  * The public network: the owner's account, the transactions that it was sent, and each created wallet account
  * with its signers. `send` decides what a submission answers.
  */
+/** Horizon's answer for an account that the network does not hold. */
+const NOT_FOUND = {type: 'https://stellar.org/horizon-errors/not_found', title: 'Resource Missing', status: 404};
 function ledger({send = 'ok'} = {}) {
   const state = {posted: [], held: new Map(), send, ledger: 7};
   const json = (body, status = 200) => new Response(JSON.stringify(body), {status});
@@ -53,13 +55,15 @@ function ledger({send = 'ok'} = {}) {
       return state.send === 'failed' ? json({}, 400) : json({hash, successful: true, ledger: state.ledger});
     }
     if (pathname === '/') return json({history_latest_ledger_closed_at: new Date().toISOString()});
-    if (pathname === `/accounts/${roles.owner}`) return json({account_id: roles.owner, sequence: '41'});
+    // The owner's account as Horizon gives it: enough XLM for any setup of these tests, and every field of its reserve.
+    if (pathname === `/accounts/${roles.owner}`) return json({account_id: roles.owner, sequence: '41', subentry_count: 0, num_sponsoring: 0, num_sponsored: 0,
+      balances: [{asset_type: 'native', balance: '10000.0000000', buying_liabilities: '0.0000000', selling_liabilities: '0.0000000'}]});
     if (pathname.startsWith('/accounts/')) {
       const account = pathname.split('/').pop();
       const created = [...state.held.values()].find(record => record.successful && nativeSetupOf(record.signed, network)?.wallet === account);
       return created ? json({account_id: account, signers: [
         {key: roles.owner, weight: 3, type: 'ed25519_public_key'}, {key: roles.agent, weight: 1, type: 'ed25519_public_key'},
-        {key: roles.server, weight: 1, type: 'ed25519_public_key'}, {key: account, weight: 0, type: 'ed25519_public_key'}]}) : json({}, 404);
+        {key: roles.server, weight: 1, type: 'ed25519_public_key'}, {key: account, weight: 0, type: 'ed25519_public_key'}]}) : json(NOT_FOUND, 404);
     }
     if (pathname.startsWith('/transactions/')) {
       const record = state.held.get(pathname.split('/').pop());
@@ -182,8 +186,53 @@ test('a send without a certain answer is null: lost, refused or a record of anot
   const signedPayload = prepared.complete(await ownerSigns([])(prepared.step));
   assert.equal(await sendNativeSetup(network, signedPayload, hex(Buffer.alloc(32)), fetch), null);
   assert.equal(await sendNativeSetup('other:testnet', signedPayload, prepared.step.hash, fetch), null);
+  // An owner address without an account on the network prepares nothing, with a typed refusal before any signature.
+  await assert.rejects(prepareNativeSetup({network, ...roles, owner: Keypair.random().publicKey(), amount: '5', fetch}),
+    error => error instanceof SetupRefusal && error.code === 'owner_account_unfunded' && /holds no account/.test(error.message));
   // The owner account that the network cannot read prepares nothing.
-  await assert.rejects(prepareNativeSetup({network, ...roles, owner: Keypair.random().publicKey(), amount: '5', fetch}), /owner account could not be read/);
+  const unreadable = async () => new Response('{}', {status: 503});
+  await assert.rejects(prepareNativeSetup({network, ...roles, amount: '5', fetch: unreadable}), /owner account could not be read/);
+  // A 404 that is not Horizon's answer for a missing account, such as a proxy's page, is a failed read, not an unfunded owner.
+  for (const body of ['Not Found', JSON.stringify({status: 404}), JSON.stringify({type: 'https://proxy.example/route_missing', status: 404}), JSON.stringify({type: 'https://proxy.example/not_found', status: 404})]) {
+    const proxy = async () => new Response(body, {status: 404});
+    await assert.rejects(prepareNativeSetup({network, ...roles, amount: '5', fetch: proxy}),
+      error => !(error instanceof SetupRefusal) && /owner account could not be read/.test(error.message), body);
+  }
+  // An owner that is no account address is refused before the network is asked.
+  let asked = 0;
+  await assert.rejects(prepareNativeSetup({network, ...roles, owner: 'not-an-address', amount: '5', fetch: async () => { asked += 1; return new Response('{}'); }}));
+  assert.equal(asked, 0);
+});
+
+test('a setup that the owner account cannot pay for is refused before any signature', async () => {
+  // The account record as Horizon reports it: its XLM, its entries and its liabilities.
+  const holding = (balance, extra = {}) => async () => new Response(JSON.stringify({account_id: roles.owner, sequence: '41', subentry_count: 0, num_sponsoring: 0, num_sponsored: 0,
+    balances: [{asset_type: 'native', balance, buying_liabilities: '0.0000000', selling_liabilities: '0.0000000'}], ...extra}));
+  // 5 XLM of funding needs the wallet's reserve (2.5), its fee float (0.5) and the setup's fee (4 operations of
+  // 100 stroops) above the owner's own reserve (1).
+  const low = prepareNativeSetup({network, ...roles, amount: '5', fetch: holding('9.0000399')});
+  await assert.rejects(low, error => error instanceof SetupRefusal && error.code === 'owner_balance_low' && /can spend 8\.0000399 XLM/.test(error.message) && /needs 8\.0000400 XLM: 5\.0000000 XLM of funding, 2\.5000000 XLM that the network locks in the wallet, 0\.5000000 XLM for the fees of the owner's own steps and 0\.0000400 XLM of setup fee/.test(error.message));
+  // An owner who can pay exactly the setup and its fee is not refused (the review: 8.001 XLM spendable is enough).
+  assert.equal((await prepareNativeSetup({network, ...roles, amount: '5', fetch: holding('9.0000400')})).step.action, SET_UP_WALLET);
+  assert.equal((await prepareNativeSetup({network, ...roles, amount: '5', fetch: holding('9.0010000')})).step.action, SET_UP_WALLET);
+  // The check uses the fee of the transaction that the setup builds.
+  const built = nativeSetupTransaction({network, owner: roles.owner, sequence: '41', wallet: Keypair.random().publicKey(), agent: roles.agent, server: roles.server,
+    funding: 50_000_000n, requestId: 'wallet-0123456789', expiresAt: 2_000_000_000});
+  assert.equal(BigInt(built.fee), NATIVE_SETUP_FEE);
+  // Each entry of the account locks half an XLM more, and so does an amount on offer.
+  await assert.rejects(prepareNativeSetup({network, ...roles, amount: '5', fetch: holding('9.0000400', {subentry_count: 1})}), {code: 'owner_balance_low'});
+  assert.equal(spendableXlm({subentry_count: 2, num_sponsoring: 1, num_sponsored: 1, balances: [{asset_type: 'native', balance: '10', selling_liabilities: '1.5'}]}), 65_000_000n);
+  assert.equal(spendableXlm({subentry_count: 0, num_sponsoring: 0, num_sponsored: 0, balances: [{asset_type: 'native', balance: '0.5', selling_liabilities: '0'}]}), 0n);
+  // A partial record claims nothing: without num_sponsored, a sponsored reserve would read as the owner's own.
+  assert.equal(spendableXlm({subentry_count: 0, num_sponsoring: 0, balances: [{asset_type: 'native', balance: '8.0000400', selling_liabilities: '0'}]}), null);
+  assert.equal(spendableXlm({subentry_count: 0, num_sponsoring: 0, num_sponsored: 0, balances: [{asset_type: 'native', balance: '9'}]}), null);
+  assert.equal(spendableXlm({balances: [{asset_type: 'credit_alphanum4', balance: '5'}]}), null);
+  assert.equal(spendableXlm({}), null);
+  // A partial record establishes nothing: the setup stops as a failed read, also when the balance alone would be low.
+  for (const extra of [{num_sponsored: undefined}, {balances: [{asset_type: 'native', balance: '0'}]}, {balances: []}]) {
+    await assert.rejects(prepareNativeSetup({network, ...roles, amount: '5', fetch: holding('9.0010000', extra)}),
+      error => !(error instanceof SetupRefusal) && /could not be read/.test(error.message), JSON.stringify(extra));
+  }
 });
 
 const canonicalJson = value => Array.isArray(value) ? `[${value.map(canonicalJson).join(',')}]`

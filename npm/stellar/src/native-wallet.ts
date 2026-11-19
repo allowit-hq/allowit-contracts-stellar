@@ -109,7 +109,7 @@ export function nativeSetupTransaction({network, owner, sequence, wallet, agent,
   if (!Number.isSafeInteger(expiresAt) || expiresAt <= 0) throw new Error('The setup time bound is invalid.');
   const signer = (ed25519PublicKey: string, weight: number) => ({ed25519PublicKey, weight});
   return new TransactionBuilder(new Account(owner, sequence), {
-    fee: '100', networkPassphrase: networkPassphrase(network), timebounds: {minTime: 0, maxTime: expiresAt}, memo: Memo.hash(hex(digest(requestId))),
+    fee: String(SETUP_OPERATION_FEE), networkPassphrase: networkPassphrase(network), timebounds: {minTime: 0, maxTime: expiresAt}, memo: Memo.hash(hex(digest(requestId))),
   })
     .addOperation(Operation.createAccount({destination: wallet, startingBalance: decimal(walletStartingBalance(funding))}))
     .addOperation(Operation.setOptions({source: wallet, signer: signer(owner, OWNER_WEIGHT)}))
@@ -160,6 +160,39 @@ export function nativeSetupOf(payload: string, network: string): {owner: string;
   return {owner, wallet, agent, server, startingBalance: starting};
 }
 
+/**
+ * A setup that the owner's account cannot pay for, found before any signature. `code` is the typed code of the
+ * refusal, whose title is in Allowit's error catalogue; the message says what happened and what the owner does next.
+ */
+export class SetupRefusal extends Error {
+  constructor(public readonly code: 'owner_account_unfunded' | 'owner_balance_low', message: string) {
+    super(message);
+    this.name = 'SetupRefusal';
+  }
+}
+/** The fee of each operation of the setup transaction, in stroops. */
+const SETUP_OPERATION_FEE = 100;
+/** The operations of the setup transaction: the creation and three signer changes. */
+const SETUP_OPERATIONS = 4;
+/** The whole fee of the setup transaction, in stroops: the owner's account pays it. The owner's approval that follows is a message signature and costs nothing. */
+export const NATIVE_SETUP_FEE = BigInt(SETUP_OPERATION_FEE * SETUP_OPERATIONS);
+/**
+ * What an account can spend now, in stroops: its XLM above its own reserve and its selling liabilities. Null when the
+ * account record lacks one of the fields that the reserve and the liabilities need: a partial record could refuse an
+ * owner who can pay, or pass one who cannot, so the caller stops as for a failed read.
+ */
+export function spendableXlm(account: Record<string, unknown>): bigint | null {
+  const native = Array.isArray(account.balances) ? account.balances.find(b => object(b) && b.asset_type === 'native') as Record<string, unknown> | undefined : undefined;
+  const amount = (value: unknown) => typeof value === 'string' ? stroops(value) : null;
+  const count = (value: unknown) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? BigInt(value) : null;
+  const balance = amount(native?.balance), selling = amount(native?.selling_liabilities);
+  const subentries = count(account.subentry_count), sponsoring = count(account.num_sponsoring), sponsored = count(account.num_sponsored);
+  if (balance === null || selling === null || subentries === null || sponsoring === null || sponsored === null) return null;
+  const entries = 2n + subentries + sponsoring - sponsored;
+  const spendable = balance - selling - (entries > 0n ? entries : 0n) * BASE_RESERVE;
+  return spendable > 0n ? spendable : 0n;
+}
+
 /** The roles and funding of a Native wallet account's setup. */
 export interface NativeSetupInput {
   network: string;
@@ -190,16 +223,35 @@ export interface PreparedNativeSetup {
  * Prepares the setup of the wallet account of an agent: one transaction from the owner's own sequence. The account's
  * own key is random; it signs the creation once, beside the owner, in `complete`.
  */
+/** The problem type of Horizon's answer for a resource that it does not hold. */
+const HORIZON_NOT_FOUND = 'https://stellar.org/horizon-errors/not_found';
 export async function prepareNativeSetup({network, owner, agent, server, amount, fetch: send = fetch}: NativeSetupInput): Promise<PreparedNativeSetup> {
   const id = canonicalNetwork(network), base = horizonOrigin(network);
   if (!id || !base) throw new Error('Select a supported Stellar network.');
   const funding = stroops(amount);
   if (funding === null) throw new Error('Enter an amount of XLM with at most seven decimals.');
   const passphrase = networkPassphrase(id);
+  // The roles are checked before the network is asked about the owner's address.
+  roles(owner, Keypair.random().publicKey(), agent, server);
   const read = await send(`${base}/accounts/${owner}`, {headers: {Accept: 'application/json'}, signal: AbortSignal.timeout(15_000)}).catch(() => null);
+  // The network holds no account for an address that never received funds: Horizon answers 404 with its own
+  // not_found problem type. Any other 404, such as a proxy's, is a failed read. Nothing is prepared or signed.
+  if (read?.status === 404) {
+    const problem: unknown = await read.clone().json().catch(() => null);
+    if (object(problem) && problem.status === 404 && problem.type === HORIZON_NOT_FOUND)
+      throw new SetupRefusal('owner_account_unfunded', 'The network holds no account for the owner address. Send XLM to it, then set up the wallet again.');
+    throw new Error('The owner account could not be read from the network.');
+  }
   const account: unknown = read?.ok ? await read.json().catch(() => null) : null;
   if (!object(account) || account.account_id !== owner || typeof account.sequence !== 'string' || !/^[0-9]{1,19}$/.test(account.sequence))
     throw new Error('The owner account could not be read from the network.');
+  // The owner's account pays the starting balance of the wallet and the fee, and keeps its own reserve.
+  // A record without every field that the reserve and the liabilities need establishes nothing: the setup stops as a
+  // failed read, before anything is prepared or signed.
+  const spendable = spendableXlm(account), needed = walletStartingBalance(funding) + NATIVE_SETUP_FEE;
+  if (spendable === null) throw new Error('The balance of the owner account could not be read from the network. Nothing was prepared.');
+  if (spendable < needed)
+    throw new SetupRefusal('owner_balance_low', `The owner account can spend ${decimal(spendable)} XLM, and this setup needs ${decimal(needed)} XLM: ${decimal(funding)} XLM of funding, ${decimal(WALLET_RESERVE)} XLM that the network locks in the wallet, ${decimal(WALLET_FEE_FLOAT)} XLM for the fees of the owner's own steps and ${decimal(NATIVE_SETUP_FEE)} XLM of setup fee.`);
   // The setup key is random and lives in this object only. Nothing stores, derives or recovers it.
   const setupKey = Keypair.random(), wallet = setupKey.publicKey();
   const requestId = `wallet-${hex(setupKey.rawPublicKey()).slice(0, 32)}`;
