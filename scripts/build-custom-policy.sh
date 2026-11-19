@@ -32,9 +32,10 @@ mkdir -p "$tree"
 git archive --format=tar HEAD | tar -x -C "$tree"
 # The committed tree's own build inputs give way to those of SOURCE.rs. The generator is the
 # committed revision's, built from the copy, in a folder of the caller's Cargo build folder or of
-# the checkout's ignored `target`, so a later run reuses it.
+# the checkout's ignored `target` that names the revision: every copy has the same path, so a
+# folder of another revision could run that revision's generator.
 policy="$tree/contracts/allowit-custom-policy/policy"
-inputs_target="${CARGO_TARGET_DIR:-$PWD/target}/custom-build-inputs"
+inputs_target="${CARGO_TARGET_DIR:-$PWD/target}/custom-build-inputs-$(git rev-parse HEAD)"
 (cd "$tree" && CARGO_TARGET_DIR="$inputs_target" cargo run --quiet --locked \
   --manifest-path crates/allowit-stellar/Cargo.toml \
   --bin allowit-stellar-admin -- custom-build-inputs "$source_file" "$policy" >&2)

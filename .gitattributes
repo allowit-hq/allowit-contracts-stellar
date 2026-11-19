@@ -1,3 +1,8 @@
 # Custom policy identity hashes the literal source bytes. Preserve the release bytes
 # when cloning on Windows with core.autocrlf enabled.
 /contracts/allowit-custom-policy/policy/*.rs text eol=lf
+# The build inputs beside a compiled policy, which a test compares byte for byte with Core's output.
+/contracts/allowit-custom-policy/policy/*.figures text eol=lf
+/contracts/allowit-custom-policy/policy/*.state text eol=lf
+/contracts/allowit-custom-policy/src/*.figures text eol=lf
+/contracts/allowit-custom-policy/src/*.state text eol=lf

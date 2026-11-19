@@ -654,8 +654,6 @@ pub struct CustomParts {
     /// (`Derived::figures`): the wallet keeps those, and the server evaluates the whole source
     /// on the wallet's values of them.
     pub figures: Vec<&'static str>,
-    /// The deterministic checks that the on-chain part keeps, in source order (`Derived::kept`).
-    pub kept: Vec<String>,
     /// The state entries that the contract stores: Core's keys whose keeper is the chain
     /// (`Derived::state`), with the storage key of each (`state_keys::entries`).
     pub stored: Vec<crate::state_keys::StateEntry>,
@@ -692,7 +690,6 @@ pub fn custom_parts(source: &str) -> Result<CustomParts> {
         server_part,
         shape,
         figures: derived.figures.iter().map(|figure| figure.key).collect(),
-        kept: derived.kept.clone(),
         stored,
         server_keys: derived
             .state
