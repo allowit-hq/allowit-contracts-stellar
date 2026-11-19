@@ -122,17 +122,19 @@ pub fn find_account(rpc: &dyn Rpc, address: &str) -> Result<Option<AccountState>
     }
     account_from_response(&value, address).map(Some)
 }
-/// The one entry of a `getLedgerEntries` reply for one account key. A reply with its ledger and
-/// an empty or omitted entry list holds no account; more than one entry for one key, or a reply
-/// without its ledger or its list, is an invalid reply.
+/// The one entry of a `getLedgerEntries` reply for one account key. A reply with a valid ledger
+/// and an empty or omitted entry list holds no account; more than one entry for one key, or a
+/// reply without a valid ledger or without its list, is an invalid reply.
 fn account_entry(value: &Value) -> Result<Option<&Value>> {
+    let ledger = owner_observation::ledger(&value["latestLedger"]).is_ok();
     match value.get("entries") {
         Some(Value::Array(list)) => match list.as_slice() {
-            [] => Ok(None),
             [one] => Ok(Some(one)),
+            [] if ledger => Ok(None),
+            [] => Err("Missing or invalid current ledger".into()),
             _ => Err("Invalid account response: more than one entry for one key".into()),
         },
-        None | Some(Value::Null) if value.get("latestLedger").is_some() => Ok(None),
+        None | Some(Value::Null) if ledger => Ok(None),
         _ => Err("Missing account entries".into()),
     }
 }
@@ -193,8 +195,7 @@ pub fn get_sending_account(rpc: &dyn Rpc, address: &str) -> Result<AccountState>
 pub fn get_owner_account(rpc: &dyn Rpc, address: &str) -> Result<AccountState> {
     get_role_account(rpc, address, OWNER_ACCOUNT_NOT_FOUND)
 }
-/// An account of a policy wallet: the Native wallet account, or the agent account of a contract
-/// wallet. A missing one is [`WALLET_ACCOUNT_NOT_FOUND`].
+/// The Native wallet account of a policy. A missing one is [`WALLET_ACCOUNT_NOT_FOUND`].
 pub fn get_wallet_account(rpc: &dyn Rpc, address: &str) -> Result<AccountState> {
     get_role_account(rpc, address, WALLET_ACCOUNT_NOT_FOUND)
 }
@@ -2063,7 +2064,9 @@ fn historical_wallet_state(
         return Err("policy wallet automation is paused".into());
     }
     let current_agent = addr(map_field(state, "agent")?)?;
-    let source = get_wallet_account(rpc, &current_agent)?;
+    // The agent's own account: a missing one is a missing account, not a closed wallet, because the
+    // contract wallet whose state was just read exists.
+    let source = get_account(rpc, &current_agent)?;
     source.validate_structure()?;
     if require_customer_quorum && source.signer_weight(&c.agent)? == 0 {
         return Err("Customer is not a current policy wallet agent account signer".into());
@@ -2451,9 +2454,22 @@ mod custom_state_tests {
             assert_ne!(error, ACCOUNT_NOT_FOUND);
             assert!(error.contains("more than one entry"), "{error}");
         }
-        // A reply that is no ledger reply at all is not read as a missing account.
-        let broken = Fixed(json!({"error": "x"}));
-        assert_ne!(get_account(&broken, &owner).unwrap_err(), ACCOUNT_NOT_FOUND);
+        // A reply that is no ledger reply at all, or one without a valid ledger, is not read as a
+        // missing account.
+        for broken in [
+            json!({"error": "x"}),
+            json!({"latestLedger": null}),
+            json!({"latestLedger": "10", "entries": []}),
+            json!({"latestLedger": 0}),
+        ] {
+            let rpc = Fixed(broken.clone());
+            assert_ne!(
+                get_account(&rpc, &owner).unwrap_err(),
+                ACCOUNT_NOT_FOUND,
+                "{broken}"
+            );
+            assert!(find_account(&rpc, &owner).is_err(), "{broken}");
+        }
     }
 
     #[test]

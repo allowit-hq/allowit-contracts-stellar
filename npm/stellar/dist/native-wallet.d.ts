@@ -80,8 +80,8 @@ export declare class SetupRefusal extends Error {
 export declare const NATIVE_SETUP_FEE: bigint;
 /**
  * What an account can spend now, in stroops: its XLM above its own reserve and its selling liabilities. Null when the
- * account record lacks one of the fields that the reserve and the liabilities need, so the caller claims nothing: a
- * partial record could refuse an owner who can pay, or pass one who cannot.
+ * account record lacks one of the fields that the reserve and the liabilities need: a partial record could refuse an
+ * owner who can pay, or pass one who cannot, so the caller stops as for a failed read.
  */
 export declare function spendableXlm(account: Record<string, unknown>): bigint | null;
 /** The roles and funding of a Native wallet account's setup. */
@@ -114,10 +114,6 @@ export interface PreparedNativeSetup {
      */
     complete(ownerSigned: string): string;
 }
-/**
- * Prepares the setup of the wallet account of an agent: one transaction from the owner's own sequence. The account's
- * own key is random; it signs the creation once, beside the owner, in `complete`.
- */
 export declare function prepareNativeSetup({ network, owner, agent, server, amount, fetch: send }: NativeSetupInput): Promise<PreparedNativeSetup>;
 /**
  * What signed setup bytes are: their hash, their roles and their own time bound. Null for bytes that are no setup of

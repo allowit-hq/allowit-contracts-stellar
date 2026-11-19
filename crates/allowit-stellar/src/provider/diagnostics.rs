@@ -145,7 +145,7 @@ pub fn denial(message: &str, contract: Option<&ContractFault>, wallet: &str) -> 
         return coded(
             409,
             "account_not_found",
-            "The network holds no account for an address of this step: the owner account holds no funds yet, or the wallet account was closed.",
+            "The network holds no account for an address of this step.",
         );
     }
     if contract.is_none() && message == crate::rpc::SENDING_ACCOUNT_NOT_FOUND {

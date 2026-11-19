@@ -511,8 +511,9 @@ fn shown_details(details: &RefusalDetails) -> serde_json::Value {
 /// The client error for a non-2xx engine reply. A 409 `policy_denied` names the denying rule
 /// and error and uses the policy-denial exit code. A 409 `wallet_rejected` is a contract
 /// rejection: the wallet, its asset or a vault refused the operation, and it names the contract
-/// error. Both keep their typed code and the checked details, so a host shows the error
-/// catalogue's text and the rule. A 409 `operation_refused` is the engine's refusal with the engine's message. Every
+/// error. A 409 `param_invalid`, `call_unpriced` or `policy_evaluation_failed` is the policy's
+/// definite refusal. Each keeps its typed code and the checked details, so a host shows the
+/// catalogue's title with the rail's message and the rule. A 409 `operation_refused` is the engine's refusal with the engine's message. Every
 /// other reply leaves the operation unresolved: its message keeps the engine's message, and the
 /// error keeps the engine's stable code when the reply has one.
 fn refusal(status: u16, body: &[u8]) -> Error {
@@ -555,17 +556,40 @@ fn refusal(status: u16, body: &[u8]) -> Error {
         "wallet_rejected" if status == 409 => Error::refused(
             status,
             code.as_str(),
-            match (name(&d.error), d.contract_error) {
-                (Some(error), Some(code)) => format!(
-                    "The operation was rejected in simulation: {error} (contract error {code})"
-                ),
-                (None, Some(code)) => {
-                    format!("The operation was rejected in simulation: contract error {code}")
-                }
-                (_, None) => "The operation was rejected in simulation".into(),
+            // The rail's own text names the contract that refused and is the whole message;
+            // without one, the checked details stand in for it.
+            match (plain(&reason), name(&d.error), d.contract_error) {
+                (Some(text), _, _) => text,
+                (None, error, contract) => match (error, contract) {
+                    (Some(error), Some(code)) => format!(
+                        "The operation was rejected in simulation: {error} (contract error {code})"
+                    ),
+                    (None, Some(code)) => {
+                        format!("The operation was rejected in simulation: contract error {code}")
+                    }
+                    (_, None) => "The operation was rejected in simulation".into(),
+                },
             },
         )
         .with_details(shown_details(&d)),
+        // A definite refusal of the policy other than a rule's denial: a value in the wrong form,
+        // a call without a price, or a failure of the policy itself. It keeps its typed code and
+        // the checked details; nothing is left unresolved.
+        "param_invalid" | "call_unpriced" | "policy_evaluation_failed" if status == 409 => {
+            // The rail's own text says what to correct; without one, the checked details.
+            let text = plain(&reason).unwrap_or_else(|| match (name(&d.error), d.contract_error) {
+                (Some(error), Some(code)) => format!("{error} (contract error {code})"),
+                (Some(error), None) => error,
+                (None, Some(code)) => format!("contract error {code}"),
+                (None, None) => "no error named".into(),
+            });
+            Error::refused(
+                status,
+                code.as_str(),
+                format!("The policy refused this operation: {text}"),
+            )
+            .with_details(shown_details(&d))
+        }
         OPERATION_REFUSED if status == 409 => Error::refused(
             status,
             code,
@@ -2695,7 +2719,7 @@ mod native_revalidation_tests {
                 "409 Conflict",
                 json!({"code":"wallet_rejected","details":{"contract":null,"contractError":18},"error":"The operation failed in simulation: an unidentified contract raised contract error 18."}),
                 4,
-                "Allowit returned HTTP 409: The operation was rejected in simulation: contract error 18",
+                "Allowit returned HTTP 409: The operation failed in simulation: an unidentified contract raised contract error 18",
             ),
             (
                 "409 Conflict",
@@ -2957,6 +2981,52 @@ mod native_revalidation_tests {
         )));
         assert!(!unresolved(&refusal(409, br#"{"code":"policy_denied"}"#)));
         assert!(!unresolved(&refusal(409, br#"{"code":"wallet_rejected"}"#)));
+    }
+    #[test]
+    fn a_policy_refusal_other_than_a_denial_is_definite_and_keeps_its_details() {
+        for code in ["param_invalid", "call_unpriced", "policy_evaluation_failed"] {
+            let body = json!({"code": code, "details": {"error": "MissingParam", "contractError": 3, "secret": "x"}});
+            let error = refusal(409, &serde_json::to_vec(&body).unwrap());
+            assert_eq!(error.api_code.as_deref(), Some(code));
+            assert!(!error.message.contains(UNRESOLVED), "{}", error.message);
+            assert!(
+                error.message.ends_with(
+                    "The policy refused this operation: MissingParam (contract error 3)"
+                ),
+                "{}",
+                error.message
+            );
+            assert_eq!(
+                error.details,
+                Some(json!({"error": "MissingParam", "contractError": 3}))
+            );
+        }
+    }
+    #[test]
+    fn a_refusal_keeps_the_rails_own_text() {
+        let corrective = refusal(
+            409,
+            br#"{"code":"param_invalid","error":"The value payment_limit is missing.","details":{"error":"MissingParam"}}"#,
+        );
+        assert!(
+            corrective
+                .message
+                .ends_with("The policy refused this operation: The value payment_limit is missing"),
+            "{}",
+            corrective.message
+        );
+        let asset = refusal(
+            409,
+            br#"{"code":"wallet_rejected","error":"The asset contract refused the operation in simulation.","details":{"contractError":10}}"#,
+        );
+        assert!(
+            asset
+                .message
+                .ends_with("HTTP 409: The asset contract refused the operation in simulation"),
+            "{}",
+            asset.message
+        );
+        assert_eq!(asset.details, Some(json!({"contractError": 10})));
     }
     #[test]
     fn a_denial_keeps_its_typed_code_and_only_checked_details() {

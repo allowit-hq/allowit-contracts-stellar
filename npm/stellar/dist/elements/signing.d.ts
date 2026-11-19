@@ -1,11 +1,17 @@
 import { type Data } from './base.js';
+/** A refusal that an element makes itself: `code` is a code of Allowit's error catalogue. */
+export declare class StepRefusal extends Error {
+    readonly code: string;
+    constructor(code: string, message: string);
+}
 type Failure = {
     code: string;
     message: string;
 };
 /**
- * The failure that the element reports: the error's own code when the catalogue has an entry for it, such as a code of
- * this element, or else `fallback`, a catalogue code of the step. A wallet library's own code never reaches a host.
+ * The failure that the element reports: the code of a refusal that the element made itself, or else `fallback`, a
+ * catalogue code of the step. An error from elsewhere, such as a wallet library's, never names the code, also when its
+ * own code has the spelling of a catalogue code.
  */
 export declare const failure: (error: unknown, fallback: "wallet_unavailable" | "wallet_signing_failed") => Failure;
 /** The owner step that the server prepared. `payload` is a base64 transaction envelope; `hash` is its transaction hash. */
@@ -25,11 +31,13 @@ export declare function payloadHash(payload: string, network: string): Promise<s
  */
 export declare function signedPayloadValid(signed: string, network: string, hash: string, owner: string): Promise<boolean>;
 /**
- * Why the wallet's signed envelope is not the reviewed step signed by `owner`, or null when it is: `other_transaction`
- * when it is another transaction, or none that can be read; `no_owner_signature` when the owner's signature over the
- * reviewed hash is missing.
+ * Why the wallet's signed envelope is not the reviewed step signed by `owner`, or null when it is. Each answer names only
+ * what the envelope shows: `unreadable` when it is no transaction that can be read; `other_transaction` when it is
+ * another transaction than the reviewed one; `unsigned` when it carries no signature; `other_signer` when no signature
+ * has the owner's key hint; `invalid_owner_signature` when a signature with the owner's hint does not verify.
  */
-export declare function signedPayloadProblem(signed: string, network: string, hash: string, owner: string): Promise<'other_transaction' | 'no_owner_signature' | null>;
+export type SignedPayloadProblem = 'unreadable' | 'other_transaction' | 'unsigned' | 'other_signer' | 'invalid_owner_signature';
+export declare function signedPayloadProblem(signed: string, network: string, hash: string, owner: string): Promise<SignedPayloadProblem | null>;
 /** CAIP-122 sign-in text: the first line names this site, the second line is the signing account. */
 export declare function signInMessageFor(message: string, address: string, host: string): boolean;
 export declare function walletSignInElement(): {

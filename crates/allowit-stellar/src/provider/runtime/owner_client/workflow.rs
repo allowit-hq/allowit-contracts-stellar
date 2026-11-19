@@ -174,7 +174,21 @@ struct Record {
 }
 
 fn checked<T>(value: native::Result<T>) -> Result<T> {
-    value.map_err(|_| Error::config("Native owner intent or chain observation failed validation"))
+    value.map_err(|error| {
+        // A missing account keeps its message, so that its refusal keeps the code of its role;
+        // any other failure stays one generic validation failure.
+        let missing = [
+            rpc::ACCOUNT_NOT_FOUND,
+            rpc::OWNER_ACCOUNT_NOT_FOUND,
+            rpc::WALLET_ACCOUNT_NOT_FOUND,
+            rpc::SENDING_ACCOUNT_NOT_FOUND,
+        ];
+        if missing.contains(&error.to_string().as_str()) {
+            crate::provider::failure(error.to_string())
+        } else {
+            Error::config("Native owner intent or chain observation failed validation")
+        }
+    })
 }
 /// The identity of a workflow: its selection, its work and its fee ceiling.
 fn workflow_identity(selection: &OwnerPolicy, work: &Work, max_fee: u32) -> Result<String> {
@@ -2025,6 +2039,30 @@ fn submit_refusal(error: Error) -> Error {
 #[cfg(test)]
 mod submit_refusal_tests {
     use super::*;
+    #[test]
+    fn a_missing_account_keeps_its_refusal_and_another_failure_stays_generic() {
+        // The owner's missing account reaches the diagnostics with its own message, so its
+        // refusal keeps the code of its role.
+        for missing in [
+            rpc::ACCOUNT_NOT_FOUND,
+            rpc::OWNER_ACCOUNT_NOT_FOUND,
+            rpc::WALLET_ACCOUNT_NOT_FOUND,
+            rpc::SENDING_ACCOUNT_NOT_FOUND,
+        ] {
+            let kept = checked::<()>(Err(missing.into())).unwrap_err();
+            assert_eq!(kept.message, missing);
+        }
+        let owner = checked::<()>(Err(rpc::OWNER_ACCOUNT_NOT_FOUND.into())).unwrap_err();
+        assert_eq!(
+            crate::provider::diagnostics::denial(&owner.message, None, "").code,
+            "owner_account_unfunded"
+        );
+        let other = checked::<()>(Err("Invalid account response".into())).unwrap_err();
+        assert_eq!(
+            other.message,
+            "Native owner intent or chain observation failed validation"
+        );
+    }
     #[test]
     fn a_refused_submission_keeps_the_server_code_and_is_uncertain_only_when_unknown() {
         // No answer or an untyped server error leaves the outcome unknown.

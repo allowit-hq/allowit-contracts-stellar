@@ -16,18 +16,24 @@ async function sources(dir) {
   }
   return out;
 }
-/** The words where only a code can stand: `{code: 'word'}` and `new SetupRefusal('word', …)`. */
-const codesIn = text => [...text.matchAll(/\bcode:\s*'([^']+)'/g), ...text.matchAll(/new SetupRefusal\('([^']+)'/g)].map(match => match[1]);
-/** The `failure` fallbacks of the elements, which a host maps to the step that failed: `wallet` and `sign`. */
-const STEPS = ['wallet', 'sign'];
+/**
+ * The words where only a code can stand: `{code: 'word'}`, `new SetupRefusal('word', …)`, `new StepRefusal('word', …)`,
+ * a `failure` fallback (`failure(error, 'word')`) and each word of the fallback's type (`fallback: 'one' | 'two'`).
+ */
+const codesIn = text => [
+  ...[...text.matchAll(/\bcode:\s*'([^']+)'/g), ...text.matchAll(/new (?:SetupRefusal|StepRefusal)\('([^']+)'/g),
+    ...text.matchAll(/\bfailure\([^,()]+,\s*'([^']+)'\)/g)].map(match => match[1]),
+  ...[...text.matchAll(/\bfallback:\s*((?:'[^']+'\s*\|?\s*)+)/g)].flatMap(match => [...match[1].matchAll(/'([^']+)'/g)].map(word => word[1])),
+];
 
 test('the scan reads every form of a code', () => {
-  assert.deepEqual(codesIn("throw Object.assign(new Error('x'), {code: 'one'}); new SetupRefusal('two', 'x'); failure(error, 'wallet')"), ['one', 'two']);
+  assert.deepEqual(codesIn("throw Object.assign(new Error('x'), {code: 'one'}); new SetupRefusal('two', 'x'); new StepRefusal('three', 'x'); failure(error, 'four'); (error: unknown, fallback: 'five' | 'six')"),
+    ['one', 'two', 'three', 'four', 'five', 'six']);
 });
 
 test('every code that the package gives an error has a catalogue entry', async () => {
   const found = (await sources(new URL('../src/', import.meta.url))).flatMap(([file, text]) => codesIn(text).map(code => [code, file]));
   assert.ok(found.length >= 8, 'the codes were not found');
-  const missing = found.filter(([code]) => !STEPS.includes(code) && !errorEntry(code));
+  const missing = found.filter(([code]) => !errorEntry(code));
   assert.deepEqual(missing, [], 'these codes have no entry in the error catalogue of @allowit/core');
 });

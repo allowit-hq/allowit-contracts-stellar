@@ -75,6 +75,7 @@ fn every_typed_code_of_the_rail_has_a_catalogue_entry() {
         code::CODE_HASH_MISMATCH,
         code::TOOLCHAIN_MISSING,
         code::BUILD_FAILED,
+        code::SOURCE_REJECTED,
     ] {
         assert!(errors::entry(defined).is_some(), "{defined}");
     }
