@@ -126,7 +126,7 @@ hour), the call renews it to `TOTAL_LEDGERS - 1`, so most calls renew nothing. A
 is built from its policy and is its own: its creation renews the code to the same lifetime, and each
 call keeps it live with the instance. The code of a Simple or Standard wallet is shared by every
 wallet of its kind, and Allowit keeps it live. The rent is part of the call's network fee, which the
-wallet repays as gas within its gas cap. Nothing restores a wallet whose instance or code lapsed. `d` opens at the first operation after the last window ended and holds its own
+wallet repays as gas within its gas cap. Nothing restores a wallet whose instance or code lapsed. `d` opens at the first operation after the last window ended that changes a daily figure that the wallet keeps (an operation that changes only another figure, such as a deposit in a wallet that keeps only the daily spending figures, opens nothing) and holds its own
 end ledger, 17,279 ledgers later (the Mainnet minimum lifetime of a temporary entry, about one
 day). The daily figures of the policy are the figures of that window, not of a UTC day. A window
 whose end ledger has passed reads as zero, even if someone paid to keep the entry alive. The
