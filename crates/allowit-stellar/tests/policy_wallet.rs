@@ -4133,8 +4133,10 @@ fn a_lapsed_wallet_takes_no_owner_step() {
         "{}",
         refused.message
     );
-    assert!(
-        refused.message.contains("other code"),
+    // The deployment's own code for a wallet whose ledger code is not its configuration's.
+    assert_eq!(
+        provider.problem(&refused).code,
+        allowit_core::vendor::custom_build::code::CODE_HASH_MISMATCH,
         "{}",
         refused.message
     );
@@ -4156,8 +4158,10 @@ fn a_lapsed_wallet_takes_no_owner_step() {
     // Live, that other code is still not the installation's.
     chain.0.lock().unwrap().lapsed_code.remove(&hash(&other));
     let refused = provider.resources(&installation).unwrap_err();
-    assert!(
-        refused.message.contains("other code"),
+    // The deployment's own code for a wallet whose ledger code is not its configuration's.
+    assert_eq!(
+        provider.problem(&refused).code,
+        allowit_core::vendor::custom_build::code::CODE_HASH_MISMATCH,
         "{}",
         refused.message
     );

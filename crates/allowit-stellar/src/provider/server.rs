@@ -859,12 +859,12 @@ impl Provider {
     /// `CONTRACT_EXPIRED`, and one whose owner installed other code, or that is gone, is refused.
     /// The operation's last simulation may precede either.
     /// The refusal of a wallet whose instance runs `running`, other code than its installation
-    /// names: `CONTRACT_EXPIRED` when that code lapsed, a configuration mismatch otherwise. A
-    /// read that fails is its error.
+    /// names: `CONTRACT_EXPIRED` when that code lapsed, `EXECUTABLE_DIFFERS` otherwise. A read
+    /// that fails is its error.
     fn other_code(&self, c: &WalletConfig, running: &[u8; 32]) -> Error {
         match checked(rpc::code_state(self.rpc(), &c.network, running)) {
             Ok(rpc::CodeState::Lapsed) => Error::config(rpc::CONTRACT_EXPIRED),
-            Ok(_) => Error::config("The wallet runs other code than its installation names"),
+            Ok(_) => Error::config(rpc::EXECUTABLE_DIFFERS),
             Err(error) => error,
         }
     }
@@ -2730,11 +2730,7 @@ mod capability_tests {
         let refused = provider
             .authorize_preparation(&installation, &simulated, &signer, None, 86_402)
             .unwrap_err();
-        assert!(
-            refused.message.contains("other code"),
-            "{}",
-            refused.message
-        );
+        assert_eq!(refused.message, rpc::EXECUTABLE_DIFFERS);
         let refused = provider
             .finalize(
                 &installation,
@@ -2745,11 +2741,7 @@ mod capability_tests {
                 Box::new(|_| Ok(())),
             )
             .unwrap_err();
-        assert!(
-            refused.message.contains("other code"),
-            "{}",
-            refused.message
-        );
+        assert_eq!(refused.message, rpc::EXECUTABLE_DIFFERS);
         assert_eq!(signer.0.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
     #[test]
