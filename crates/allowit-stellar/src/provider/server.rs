@@ -287,6 +287,9 @@ fn expense_of(action: &Action, conversion: i128, ceiling: &FeeCeiling) -> Result
     };
     // A Stellar transaction declares its fee in 32 bits and pays at least the inclusion fee, and
     // its expense names a ledger sequence: another ceiling cannot be signed.
+    if ceiling.day > u64::MAX / allowit_core::DAY {
+        return Err(Error::config("The day of the fee ceiling is no UTC day"));
+    }
     if ceiling.observed_height == 0 || u32::try_from(ceiling.observed_height).is_err() {
         return Err(Error::config(
             "The observed ledger of the fee ceiling is no Stellar ledger",
@@ -947,8 +950,8 @@ impl Provider {
     }
     /// The vault's value of `shares` in asset units. The read simulates from an account that
     /// exists: the sending account of a policy wallet, or the keypair wallet itself. A failure to
-    /// reach that account is the outer error, which no caller turns into a value; the vault's own
-    /// refusal to value the shares is the inner one.
+    /// reach that account is the outer error, and the vault's own refusal to value the shares the
+    /// inner one; `expense` counts a deposit whole on either, as the server does.
     fn vault_value(&self, i: &Installation, vault: &str, shares: i128) -> Result<Result<i128>> {
         let c = self.fresh(i)?;
         let source = if c.route == WalletRoute::PolicyWallet {
@@ -4199,10 +4202,15 @@ mod settlement_api {
                 surplus
             )
         );
-        let usage = settled
-            .usage
-            .expect("an executed transfer reports its usage");
-        assert_eq!(usage.gas_units, fee.charged_units);
+        // The transfer of 2,000,000 units, with the gas that the wallet counted.
+        let usage = Usage {
+            amount_units: 2_000_000,
+            gas_units: 154_039,
+            spent_units: 2_154_039,
+            unpriced: false,
+        };
+        assert_eq!(fee.charged_units, usage.gas_units);
+        assert_eq!(settled.usage, Some(usage));
         assert_eq!(settled.usage_for(0), Some(usage));
         let settled = provider()
             .settle_receipt(&p, &signed, &receipt, None, u128::MAX - surplus)
@@ -4273,8 +4281,8 @@ mod settlement_api {
         assert!(provider().expense(&i, &transfer, &negative_gas).is_err());
     }
 
-    /// An endpoint that holds the server's sending account and values any count of a vault's
-    /// shares at `self.0` asset units.
+    /// An endpoint that holds the server's sending account and values `n` of a vault's shares at
+    /// `n` less `self.0` asset units.
     struct Vault(i128);
     impl rpc::Rpc for Vault {
         fn call(
@@ -4302,9 +4310,24 @@ mod settlement_api {
                     }]})
                 }
                 "simulateTransaction" => {
+                    let x::TransactionEnvelope::Tx(envelope) =
+                        native::read(params["transaction"].as_str().unwrap())?
+                    else {
+                        unreachable!()
+                    };
+                    let x::OperationBody::InvokeHostFunction(op) = &envelope.tx.operations[0].body
+                    else {
+                        unreachable!()
+                    };
+                    let x::HostFunction::InvokeContract(call) = &op.host_function else {
+                        unreachable!()
+                    };
+                    let x::ScVal::I128(shares) = &call.args[0] else {
+                        unreachable!()
+                    };
                     let value = x::ScVal::I128(x::Int128Parts {
                         hi: 0,
-                        lo: u64::try_from(self.0).unwrap(),
+                        lo: shares.lo - u64::try_from(self.0).unwrap(),
                     });
                     serde_json::json!({"latestLedger": 120,
                         "results": [{"xdr": native::xdr(&value)?, "auth": []}]})
@@ -4315,37 +4338,44 @@ mod settlement_api {
     }
 
     /// A vault operation's principal is its worst-case conversion, as the vault values it: a
-    /// deposit of 100 whose shares redeem for 95, and a redeem of shares worth 95 that accepts 90,
-    /// each lose 5, and spend 5 and the gas of the ceiling.
+    /// deposit of 100 whose least shares redeem for 55 loses 45, and a redeem of shares worth 95
+    /// that accepts 90 loses 5; each spends its loss and the gas of the ceiling.
     #[test]
     fn a_vault_operation_spends_the_conversion_that_the_vault_values() {
         let i = installation();
-        let reading = Provider::from_rpc(NETWORK, Arc::new(Vault(95)))
+        let reading = Provider::from_rpc(NETWORK, Arc::new(Vault(5)))
             .with_sender(Arc::new(Account(native::account_for_seed(&[10; 32]))));
         let vault = crate::test_support::vault(0);
-        for action in [
-            Action::Deposit {
-                vault: vault.clone(),
-                assets: 100,
-                min_shares: 1,
-            },
-            Action::Redeem {
-                vault: vault.clone(),
-                shares: 100,
-                min_assets: 90,
-            },
+        for (action, loss) in [
+            (
+                Action::Deposit {
+                    vault: vault.clone(),
+                    assets: 100,
+                    min_shares: 60,
+                },
+                45,
+            ),
+            (
+                Action::Redeem {
+                    vault: vault.clone(),
+                    shares: 100,
+                    min_assets: 90,
+                },
+                5,
+            ),
         ] {
             let bound = reading.expense(&i, &action, &CEILING).unwrap();
             assert_eq!(
                 (bound.conversion_units, bound.spent_units),
-                (5, 7),
+                (loss, loss + 2),
                 "{action:?}"
             );
         }
     }
 
     /// A ceiling that a Stellar transaction cannot carry is refused: a fee below the inclusion
-    /// fee, and an observed ledger that is none or wider than a ledger sequence.
+    /// fee or wider than 32 bits, an observed ledger that is none or wider than a ledger
+    /// sequence, and a day after the last UTC day of a Unix time.
     #[test]
     fn an_expense_ceiling_that_stellar_cannot_sign_is_refused() {
         let i = installation();
@@ -4365,6 +4395,14 @@ mod settlement_api {
             },
             FeeCeiling {
                 observed_height: u64::from(u32::MAX) + 1,
+                ..CEILING
+            },
+            FeeCeiling {
+                max_fee_units: u128::from(u32::MAX) + 1,
+                ..CEILING
+            },
+            FeeCeiling {
+                day: u64::MAX / allowit_core::DAY + 1,
                 ..CEILING
             },
         ] {
