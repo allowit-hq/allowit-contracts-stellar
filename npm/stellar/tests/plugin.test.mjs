@@ -3,7 +3,7 @@ import test from 'node:test';
 import {Account, Keypair, Networks, Operation, TransactionBuilder} from '@stellar/stellar-sdk/base';
 import plugin, {canonicalNetwork, strkey} from '../dist/plugin.js';
 import {formatUnits} from '../dist/elements/display.js';
-import {ownerStep, payloadHash, signInMessageFor, signedPayloadValid} from '../dist/elements/signing.js';
+import {StepRefusal, failure, ownerStep, payloadHash, signInMessageFor, signedPayloadProblem, signedPayloadValid} from '../dist/elements/signing.js';
 import {expiry} from '../dist/elements/base.js';
 
 test('plugin identity, networks and element tags follow the SDK contract', () => {
@@ -66,6 +66,7 @@ test('owner steps admit only the rail-neutral shape and sign only the reviewed h
   assert.equal(ownerStep({...step, hash: 'zz'}), null);
   const key = Keypair.fromRawEd25519Seed(Buffer.alloc(32, 1));
   assert.equal(await signedPayloadValid(tx.toXDR(), 'stellar:testnet', step.hash, owner), false, 'unsigned');
+  const unsigned = tx.toXDR();
   tx.sign(key);
   assert.equal(await signedPayloadValid(tx.toXDR(), 'stellar:testnet', step.hash, owner), true);
   const other = new TransactionBuilder(new Account(owner, '41'), {fee: '200', networkPassphrase: Networks.TESTNET})
@@ -76,7 +77,29 @@ test('owner steps admit only the rail-neutral shape and sign only the reviewed h
   const foreign = TransactionBuilder.fromXDR(step.payload, Networks.TESTNET);
   foreign.sign(stranger);
   assert.equal(await signedPayloadValid(foreign.toXDR(), 'stellar:testnet', step.hash, owner), false, 'another signer');
+  // Each problem names only what the envelope shows: another transaction, bytes that are no transaction, no
+  // signature, a signer without the owner's key hint, or the owner's hint on a signature that does not verify.
+  assert.equal(await signedPayloadProblem(other.toXDR(), 'stellar:testnet', step.hash, owner), 'other_transaction');
+  assert.equal(await signedPayloadProblem('not a transaction', 'stellar:testnet', step.hash, owner), 'unreadable');
+  assert.equal(await signedPayloadProblem(Buffer.from('not xdr at all').toString('base64'), 'stellar:testnet', step.hash, owner), 'unreadable');
+  assert.equal(await signedPayloadProblem(unsigned, 'stellar:testnet', step.hash, owner), 'unsigned');
+  assert.equal(await signedPayloadProblem(foreign.toXDR(), 'stellar:testnet', step.hash, owner), 'other_signer');
+  const forged = TransactionBuilder.fromXDR(step.payload, Networks.TESTNET);
+  forged.signatures.push(other.signatures[0]);
+  assert.equal(await signedPayloadProblem(forged.toXDR(), 'stellar:testnet', step.hash, owner), 'invalid_owner_signature');
+  assert.equal(await signedPayloadProblem(tx.toXDR(), 'stellar:testnet', step.hash, owner), null);
   assert.equal(ownerStep({...step, payload: '<xml/>'}), null);
+});
+
+test('a failure of a signing element names a catalogue code, never a code of the wallet library', () => {
+  // Only a refusal that the element made names its code; any other error, also one whose own code has the spelling
+  // of a catalogue code, falls back to the step's catalogue code.
+  assert.equal(failure(new StepRefusal('wallet_wrong_account', 'x'), 'wallet_signing_failed').code, 'wallet_wrong_account');
+  assert.equal(failure(Object.assign(new Error('x'), {code: 'wallet_closed'}), 'wallet_signing_failed').code, 'wallet_signing_failed');
+  assert.equal(failure(Object.assign(new Error('x'), {code: -4}), 'wallet_signing_failed').code, 'wallet_signing_failed');
+  assert.equal(failure(Object.assign(new Error('x'), {code: 'USER_DECLINED'}), 'wallet_unavailable').code, 'wallet_unavailable');
+  assert.equal(failure('plain text', 'wallet_signing_failed').code, 'wallet_signing_failed');
+  assert.equal(failure(null, 'wallet_unavailable').message, 'null');
 });
 
 test('sign-in signs only a CAIP-122 message for this site and account', () => {

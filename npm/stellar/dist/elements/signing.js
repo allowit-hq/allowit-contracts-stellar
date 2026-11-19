@@ -4,7 +4,20 @@ import { link } from './display.js';
 import { APPROVE_POLICY, SET_UP_WALLET, WALLET_FEE_FLOAT, WALLET_RESERVE, approvalMessage, nativeSetupOf, policyApproval } from '../native-wallet.js';
 /** XLM text of stroops, without trailing zeros. */
 const xlm = (units) => `${units / 10000000n}${units % 10000000n ? `.${(units % 10000000n).toString().padStart(7, '0').replace(/0+$/, '')}` : ''} XLM`;
-const failure = (error, code) => ({ code: String(error?.code ?? code), message: error instanceof Error ? error.message : String(error) });
+/** A refusal that an element makes itself: `code` is a code of Allowit's error catalogue. */
+export class StepRefusal extends Error {
+    code;
+    constructor(code, message) {
+        super(message);
+        this.code = code;
+    }
+}
+/**
+ * The failure that the element reports: the code of a refusal that the element made itself, or else `fallback`, a
+ * catalogue code of the step. An error from elsewhere, such as a wallet library's, never names the code, also when its
+ * own code has the spelling of a catalogue code.
+ */
+export const failure = (error, fallback) => ({ code: error instanceof StepRefusal ? error.code : fallback, message: error instanceof Error ? error.message : String(error) });
 const hex = (bytes) => Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
 export function ownerStep(value) {
     if (!value || typeof value !== 'object')
@@ -26,20 +39,28 @@ export async function payloadHash(payload, network) {
  * signature by `owner` over that hash.
  */
 export async function signedPayloadValid(signed, network, hash, owner) {
+    return await signedPayloadProblem(signed, network, hash, owner) === null;
+}
+export async function signedPayloadProblem(signed, network, hash, owner) {
     try {
         const { Keypair, TransactionBuilder } = await import('@stellar/stellar-sdk/base');
         const tx = TransactionBuilder.fromXDR(signed, networkPassphrase(network));
         const digest = tx.hash();
         if (hex(digest) !== hash)
-            return false;
+            return 'other_transaction';
+        if (!tx.signatures.length)
+            return 'unsigned';
         const key = Keypair.fromPublicKey(owner);
         // XDR opaque values wrap their bytes in `value`.
         const bytes = (v) => Uint8Array.from((v instanceof Uint8Array ? v : v.value));
         const hint = hex(bytes(key.signatureHint()));
-        return tx.signatures.some(s => hex(bytes(s.hint)) === hint && key.verify(digest, bytes(s.signature)));
+        const own = tx.signatures.filter(s => hex(bytes(s.hint)) === hint);
+        if (!own.length)
+            return 'other_signer';
+        return own.some(s => key.verify(digest, bytes(s.signature))) ? null : 'invalid_owner_signature';
     }
     catch {
-        return false;
+        return 'unreadable';
     }
 }
 /** CAIP-122 sign-in text: the first line names this site, the second line is the signing account. */
@@ -65,25 +86,28 @@ export function walletSignInElement() {
                 const message = this.data?.message;
                 go.disabled = true;
                 status.textContent = 'Waiting for the wallet…';
+                // A failure before the wallet connects is its availability; after it, the signature of the message.
+                let phase = 'wallet_unavailable';
                 try {
                     if (!id || (message != null && typeof message !== 'string'))
-                        throw Object.assign(new Error('The sign-in request is invalid.'), { code: 'invalid' });
+                        throw new StepRefusal('sign_in_expired', 'The sign-in request is invalid.');
                     const { connectWallet, signWalletMessage } = await import('./wallet.js');
                     const address = await connectWallet(id);
+                    phase = 'wallet_signing_failed';
                     if (message == null) {
                         status.textContent = '';
                         emit(this, 'allowit-signed-in', { address });
                         return;
                     }
                     if (!signInMessageFor(message, address, location.host))
-                        throw Object.assign(new Error('The sign-in message does not match this site and account. Nothing was signed.'), { code: 'invalid' });
+                        throw new StepRefusal('sign_in_expired', 'The sign-in message does not match this site and account. Nothing was signed.');
                     const signature = await signWalletMessage(message, address, id);
                     status.textContent = '';
                     emit(this, 'allowit-signed-in', { address, signature });
                 }
                 catch (error) {
                     status.textContent = error instanceof Error ? error.message : String(error);
-                    emit(this, 'allowit-error', failure(error, 'wallet'));
+                    emit(this, 'allowit-error', failure(error, phase));
                 }
                 finally {
                     go.disabled = false;
@@ -127,7 +151,7 @@ export function ownerSignElement() {
                     status.textContent = 'Waiting for the wallet…';
                     try {
                         if (step.expiresAt <= Date.now() / 1000)
-                            throw Object.assign(new Error('This owner step expired. Prepare it again.'), { code: 'expired' });
+                            throw new StepRefusal('wallet_signing_failed', 'This approval expired before it was signed. Prepare it again.');
                         const { connectWallet, signWalletMessage } = await import('./wallet.js');
                         const owner = typeof data.owner === 'string' && strkey(data.owner) ? data.owner : await connectWallet(id);
                         const signedPayload = await signWalletMessage(message, owner, id);
@@ -136,7 +160,7 @@ export function ownerSignElement() {
                     }
                     catch (error) {
                         status.textContent = error instanceof Error ? error.message : String(error);
-                        emit(this, 'allowit-error', failure(error, 'sign'));
+                        emit(this, 'allowit-error', failure(error, 'wallet_signing_failed'));
                     }
                     finally {
                         sign.disabled = false;
@@ -168,9 +192,9 @@ export function ownerSignElement() {
                 status.textContent = 'Checking the transaction…';
                 try {
                     if (step.expiresAt <= Date.now() / 1000)
-                        throw Object.assign(new Error('This owner step expired. Prepare it again.'), { code: 'expired' });
+                        throw new StepRefusal('owner_transaction_expired', 'This owner step expired. Prepare it again.');
                     if (await payloadHash(step.payload, id) !== step.hash)
-                        throw Object.assign(new Error('The transaction differs from the reviewed step. Nothing was signed.'), { code: 'mismatch' });
+                        throw new StepRefusal('review_differs', 'The transaction differs from the reviewed step. Nothing was signed.');
                     const expected = data.expected;
                     if (expected && typeof expected === 'object') {
                         const { verifyAdkOwnerStep } = await import('../owner-verifier.js');
@@ -180,14 +204,23 @@ export function ownerSignElement() {
                     const owner = typeof data.owner === 'string' && strkey(data.owner) ? data.owner : await connectWallet(id);
                     status.textContent = 'Waiting for the wallet…';
                     const signedPayload = await signWalletTransaction(step.payload, owner, id);
-                    if (!await signedPayloadValid(signedPayload, id, step.hash, owner))
-                        throw Object.assign(new Error('The wallet returned another transaction or no owner signature. Nothing was sent.'), { code: 'mismatch' });
+                    const problem = await signedPayloadProblem(signedPayload, id, step.hash, owner);
+                    if (problem === 'other_transaction')
+                        throw new StepRefusal('wallet_signed_other_transaction', 'The wallet returned another transaction than the reviewed step. Nothing was sent.');
+                    if (problem === 'other_signer')
+                        throw new StepRefusal('wallet_wrong_account', 'Another account than the owner signed this step. Nothing was sent.');
+                    if (problem === 'unreadable')
+                        throw new StepRefusal('wallet_signing_failed', 'The wallet returned an envelope that cannot be read. Nothing was sent.');
+                    if (problem === 'unsigned')
+                        throw new StepRefusal('wallet_signing_failed', 'The wallet returned the step without a signature. Nothing was sent.');
+                    if (problem)
+                        throw new StepRefusal('wallet_signing_failed', "The owner account's signature of this step does not verify. Nothing was sent.");
                     status.textContent = 'Signed.';
                     emit(this, 'allowit-signed', { signedPayload, hash: step.hash });
                 }
                 catch (error) {
                     status.textContent = error instanceof Error ? error.message : String(error);
-                    emit(this, 'allowit-error', failure(error, 'sign'));
+                    emit(this, 'allowit-error', failure(error, 'wallet_signing_failed'));
                 }
                 finally {
                     sign.disabled = false;
@@ -271,14 +304,14 @@ export function ownerAnswerElement() {
                     const { connectWallet, signWalletMessage } = await import('./wallet.js');
                     const address = await connectWallet(id);
                     if (address !== owner)
-                        throw Object.assign(new Error('The wallet account is not the owner of this policy. Nothing was signed.'), { code: 'mismatch' });
+                        throw Object.assign(new Error('The wallet account is not the owner of this policy. Nothing was signed.'), { code: 'wallet_wrong_account' });
                     const signature = await signWalletMessage(message, address, id);
                     status.textContent = 'Signed.';
                     emit(this, 'allowit-signed', { signature, answer: fields.answer, snapshot: fields.snapshot });
                 }
                 catch (error) {
                     status.textContent = error instanceof Error ? error.message : String(error);
-                    emit(this, 'allowit-error', failure(error, 'sign'));
+                    emit(this, 'allowit-error', failure(error, 'wallet_signing_failed'));
                 }
                 finally {
                     sign.disabled = false;
