@@ -250,13 +250,14 @@ fn settlement_of(
         ),
         (false, Some(a)) => Some(a.nonce),
     };
-    let gas_carry = if contract && executed {
-        carry
-            .checked_add(info.fee.repaid_native_units)
-            .ok_or_else(|| Error::config("The gas carry is out of range"))?
-            .saturating_sub(info.fee.native_units)
-    } else {
-        carry
+    // The carry moves by what the wallet repaid less the ledger fee, down to zero; only a carry
+    // that its result cannot hold is out of range.
+    let gas_carry = match (contract && executed, info.fee) {
+        (true, fee) if fee.repaid_native_units >= fee.native_units => carry
+            .checked_add(fee.repaid_native_units - fee.native_units)
+            .ok_or_else(|| Error::config("The gas carry is out of range"))?,
+        (true, fee) => carry.saturating_sub(fee.native_units - fee.repaid_native_units),
+        (false, _) => carry,
     };
     let fee_units = if contract {
         if executed {
@@ -510,6 +511,9 @@ pub struct Provider {
 /// policy wallet operation or code upload, pays its fee and receives its gas, and the
 /// signature of a transaction hash with an account's key.
 pub type Sender = std::sync::Arc<dyn SendingAccounts>;
+/// The code of the refusal of a retained packet of a historical route (`Odc`): such a packet only
+/// reads its status, and settles nothing.
+pub const RETIRED_ROUTE: &str = "retired_route";
 pub use crate::host::runtime::SendingAccounts;
 /// The fee that the signed transaction envelope `xdr` declares, in stroops: the most that the
 /// ledger charges its source.
@@ -1712,10 +1716,21 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         for network in [p.network(), signed.network(), r.network()] {
             self.network(network)?;
         }
+        let operation = prepared(p)?;
+        // A retained packet of the historical route only reads its status.
+        if operation.config.route == WalletRoute::Odc {
+            return Err(Error::coded(
+                RETIRED_ROUTE,
+                "A retained packet of a historical route settles nothing; it only reads its status.",
+            ));
+        }
         // The receipt is of `signed`'s transaction, or of the transaction that settled it.
         verify_receipt(&r.0, &signed.0)?;
-        let operation = prepared(p)?;
-        if signed_preparation(&signed.0)?.info()?.operation_id != operation.request.operation.nonce
+        // `signed` carries the operation of `p`: the same wallet and the same operation ID. The
+        // envelope can differ, as another envelope of a contract wallet's authorization.
+        let carried = signed_preparation(&signed.0)?.info()?;
+        if carried.operation_id != operation.request.operation.nonce
+            || carried.wallet != operation.config.wallet
         {
             return Err(Error::config(
                 "The signed transaction carries another operation than the prepared one",
@@ -1741,14 +1756,28 @@ impl crate::host::vendors::RuntimeProvider for Provider {
     }
     /// An operation's expense bound: the principal of a transfer is its amount; a vault
     /// operation's is its worst-case conversion, which the vault values from the account that the
-    /// operation is read from. A deposit whose shares the vault cannot value counts its whole
-    /// assets; a redeem whose shares it cannot value is refused.
+    /// operation is read from. A deposit whose shares the vault cannot value, or whose valuation
+    /// cannot be read, counts its whole assets, as the server counts it; a redeem whose shares it
+    /// cannot value is refused. An action or a ceiling with a negative amount is refused.
     fn expense(
         &self,
         i: &Installation,
         action: &Action,
         ceiling: &FeeCeiling,
     ) -> Result<ExpenseBound> {
+        self.config(i)?;
+        let amounts = match action {
+            Action::Transfer { units, .. } => [*units, 0],
+            Action::Deposit {
+                assets, min_shares, ..
+            } => [*assets, *min_shares],
+            Action::Redeem {
+                shares, min_assets, ..
+            } => [*shares, *min_assets],
+        };
+        if amounts.iter().chain([&ceiling.gas_units]).any(|a| *a < 0) {
+            return Err(Error::usage("An expense amount is negative"));
+        }
         let conversion = match action {
             Action::Transfer { .. } => 0,
             Action::Deposit {
@@ -1757,7 +1786,9 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 min_shares,
             } => {
                 let floor = self
-                    .vault_value(i, vault, *min_shares)?
+                    .vault_value(i, vault, *min_shares)
+                    .ok()
+                    .and_then(|value| value.ok())
                     .unwrap_or(0)
                     .clamp(0, *assets);
                 assets - floor
@@ -3971,5 +4002,255 @@ mod settlement {
             ..ceiling
         };
         assert!(expense_of(&transfer, 0, &wider).is_err());
+    }
+}
+
+/// The settlement, expense and fee hooks as a server calls them: through the public methods,
+/// with retained packets and an RPC endpoint that answers no read.
+#[cfg(test)]
+mod settlement_api {
+    use super::*;
+    use crate::host::vendors::RuntimeProvider;
+    use std::sync::Arc;
+    const NETWORK: &str = "stellar:testnet";
+    /// An endpoint that answers no read.
+    struct Unreachable;
+    impl rpc::Rpc for Unreachable {
+        fn call(&self, method: &str, _: serde_json::Value) -> native::Result<serde_json::Value> {
+            Err(format!("{method}: the endpoint is unreachable"))
+        }
+    }
+    /// The server's sending account, which signs nothing here.
+    struct Account(String);
+    impl SendingAccounts for Account {
+        fn account(&self) -> Result<String> {
+            Ok(self.0.clone())
+        }
+        fn sign(&self, _: &str, _: &[u8; 32]) -> Result<Vec<u8>> {
+            Err(Error::unsupported("This sending account signs nothing"))
+        }
+    }
+    fn provider() -> Provider {
+        Provider::from_rpc(NETWORK, Arc::new(Unreachable))
+            .with_sender(Arc::new(Account(native::account_for_seed(&[10; 32]))))
+    }
+    fn restored(kind: Kind, value: &serde_json::Value) -> Packet {
+        restore(kind, RawValue::from_string(value.to_string()).unwrap()).unwrap()
+    }
+    fn of(value: &impl Serialize) -> serde_json::Value {
+        serde_json::to_value(value).unwrap()
+    }
+    fn accounting(nonce: u64) -> Accounting {
+        Accounting {
+            nonce,
+            ..Accounting::default()
+        }
+    }
+    /// One transfer of a Standard policy wallet on Stellar Testnet, as a server retained it:
+    /// the preparation, the signed envelope and the receipt of its confirmed transaction.
+    fn standard() -> (Prepared, Signed, Receipt) {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/provider/stellar-testnet-standard-transfer-settled.json"
+        ))
+        .unwrap();
+        (
+            Prepared(restored(Kind::Prepared, &fixture["prepared"])),
+            Signed(restored(Kind::Signed, &fixture["signed"])),
+            Receipt(restored(Kind::Receipt, &fixture["receipt"])),
+        )
+    }
+    /// A keypair wallet's signed transfer and the receipt of its confirmed transaction.
+    fn keypair() -> (SignedOperation, Signed, Receipt) {
+        let signed = crate::test_support::native_signed();
+        let receipt = crate::test_support::confirmed_payment_receipt(&signed, 9, 100);
+        let packet = Signed(restored(Kind::Signed, &of(&signed)));
+        let receipt = Receipt(super::packet(NETWORK, &receipt).unwrap());
+        (signed, packet, receipt)
+    }
+    /// A transfer of another keypair wallet under the operation ID of `p`.
+    fn other_wallet(p: &PreparedOperation) -> PreparedOperation {
+        let wallet = native::account_for_seed(&[30; 32]);
+        let mut c = p.config.clone();
+        c.wallet = wallet.clone();
+        c.owner = wallet.clone();
+        let mut state = p.state.clone();
+        state.source.address = wallet;
+        let request = crate::request::transfer(
+            &c,
+            &state,
+            p.request.operation.nonce,
+            &native::account_for_seed(&[31; 32]),
+            20_000_000,
+        )
+        .unwrap();
+        crate::prepare(&c, &request, &state, p.created_at, p.expires_at).unwrap()
+    }
+
+    /// A receipt settles the operation of the wallet whose envelope it verified, and no
+    /// operation of another wallet under the same operation ID.
+    #[test]
+    fn a_receipt_settles_only_the_operation_of_its_own_wallet() {
+        let (signed, packet, receipt) = keypair();
+        let own = Prepared(restored(Kind::Prepared, &of(&signed.prepared)));
+        let settled = provider()
+            .settle_receipt(&own, &packet, &receipt, Some(&accounting(9)), 0)
+            .unwrap();
+        assert_eq!(settled.outcome, OperationOutcome::Executed);
+        assert_eq!(settled.next_nonce, Some(10));
+        let other = other_wallet(&signed.prepared);
+        assert_eq!(
+            other.request.operation.nonce,
+            signed.prepared.request.operation.nonce
+        );
+        assert_ne!(other.config.wallet, signed.prepared.config.wallet);
+        let other = Prepared(restored(Kind::Prepared, &of(&other)));
+        assert!(
+            provider()
+                .settle_receipt(&other, &packet, &receipt, Some(&accounting(9)), 0)
+                .is_err()
+        );
+    }
+
+    /// A retained packet of the historical route `Odc` settles nothing: the refusal is typed.
+    #[test]
+    fn a_receipt_of_the_historical_route_is_refused_with_its_code() {
+        let signed: SignedOperation = serde_json::from_str(include_str!(
+            "../../tests/fixtures/canonical-main-9682-odc-signed.json"
+        ))
+        .unwrap();
+        assert_eq!(signed.prepared.config.route, WalletRoute::Odc);
+        let receipt = crate::test_support::confirmed_payment_receipt(&signed, 9, 100);
+        let error = provider()
+            .settle_receipt(
+                &Prepared(restored(Kind::Prepared, &of(&signed.prepared))),
+                &Signed(restored(Kind::Signed, &of(&signed))),
+                &Receipt(super::packet(NETWORK, &receipt).unwrap()),
+                Some(&accounting(9)),
+                0,
+            )
+            .unwrap_err();
+        assert_eq!(error.api_code.as_deref(), Some(RETIRED_ROUTE));
+    }
+
+    /// A contract wallet's confirmed transfer: the receipt's charged units are the gas it
+    /// counted, what it repaid is its fee, and the carry takes the repayment less the ledger fee,
+    /// also when the server keeps an account of the wallet. A carry whose sum would pass the
+    /// widest value before the ledger fee comes off still settles.
+    #[test]
+    fn a_contract_wallets_receipt_moves_the_carry_without_overflow() {
+        let (p, signed, receipt) = standard();
+        let fee = receipt.info().unwrap().fee;
+        assert!(fee.repaid_native_units > fee.native_units);
+        let surplus = fee.repaid_native_units - fee.native_units;
+        let settled = provider()
+            .settle_receipt(&p, &signed, &receipt, Some(&accounting(4)), 0)
+            .unwrap();
+        assert_eq!(
+            (
+                settled.outcome,
+                settled.next_nonce,
+                settled.fee_units,
+                settled.counted_gas,
+                settled.gas_carry
+            ),
+            (
+                OperationOutcome::Executed,
+                None,
+                fee.repaid_native_units,
+                Some(fee.charged_units),
+                surplus
+            )
+        );
+        let settled = provider()
+            .settle_receipt(&p, &signed, &receipt, None, u128::MAX - surplus)
+            .unwrap();
+        assert_eq!(settled.gas_carry, u128::MAX);
+    }
+
+    fn installation() -> Installation {
+        let (p, _, _) = standard();
+        let config = prepared(&p).unwrap().config;
+        super::installation(
+            &super::super::server_owner::configuration(
+                NETWORK,
+                &serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap(),
+        )
+    }
+    const CEILING: FeeCeiling = FeeCeiling {
+        max_fee_units: 1_000,
+        gas_units: 2,
+        observed_height: 9,
+        day: 1,
+    };
+
+    /// An expense of a negative amount is refused before any read.
+    #[test]
+    fn an_expense_of_a_negative_amount_is_refused() {
+        let i = installation();
+        let vault = crate::test_support::vault(0);
+        for action in [
+            Action::Transfer {
+                recipient: native::account_for_seed(&[31; 32]),
+                units: -1,
+            },
+            Action::Deposit {
+                vault: vault.clone(),
+                assets: -1,
+                min_shares: 1,
+            },
+            Action::Deposit {
+                vault: vault.clone(),
+                assets: 100,
+                min_shares: -1,
+            },
+            Action::Redeem {
+                vault: vault.clone(),
+                shares: -1,
+                min_assets: 1,
+            },
+            Action::Redeem {
+                vault: vault.clone(),
+                shares: 100,
+                min_assets: -1,
+            },
+        ] {
+            let error = provider().expense(&i, &action, &CEILING).unwrap_err();
+            assert!(error.message.contains("negative"), "{action:?}: {error:?}");
+        }
+        let negative_gas = FeeCeiling {
+            gas_units: -1,
+            ..CEILING
+        };
+        let transfer = Action::Transfer {
+            recipient: native::account_for_seed(&[31; 32]),
+            units: 100,
+        };
+        assert!(provider().expense(&i, &transfer, &negative_gas).is_err());
+    }
+
+    /// A deposit whose shares cannot be valued, because the sending account cannot be read,
+    /// counts its whole assets, as the server counts them. A redeem is refused.
+    #[test]
+    fn a_deposit_counts_its_whole_assets_when_the_sending_account_cannot_be_read() {
+        let i = installation();
+        let vault = crate::test_support::vault(0);
+        let deposit = Action::Deposit {
+            vault: vault.clone(),
+            assets: 100,
+            min_shares: 1,
+        };
+        let bound = provider().expense(&i, &deposit, &CEILING).unwrap();
+        assert_eq!(
+            (bound.conversion_units, bound.spent_units, bound.gas_units),
+            (100, 102, 2)
+        );
+        let redeem = Action::Redeem {
+            vault,
+            shares: 100,
+            min_assets: 1,
+        };
+        assert!(provider().expense(&i, &redeem, &CEILING).is_err());
     }
 }
