@@ -1717,16 +1717,22 @@ fn verify_setup_signatures(record: &NativeSetupRecord, signature: &[u8; 64]) -> 
     {
         return Err(changed());
     }
-    checked(native::signing::verify_digest(
-        &record.setup.owner,
-        &hash,
-        by_owner.signature.as_slice(),
-    ))?;
-    checked(native::signing::verify_digest(
-        &record.setup.wallet,
-        &hash,
-        by_wallet.signature.as_slice(),
-    ))
+    // The network matches a signature to its key by the hint: each signature stands under
+    // the hint of its own key.
+    for (account, decorated) in [
+        (&record.setup.owner, by_owner),
+        (&record.setup.wallet, by_wallet),
+    ] {
+        if decorated.hint.0 != checked(native::account_key(account))?[28..] {
+            return Err(changed());
+        }
+        checked(native::signing::verify_digest(
+            account,
+            &hash,
+            decorated.signature.as_slice(),
+        ))?;
+    }
+    Ok(())
 }
 /// Create one agent's wallet account with one owner-signed transaction, through SDK Runtime.
 /// The new account's one-time key is random and lives in this call: it co-signs the creation
@@ -1752,15 +1758,34 @@ pub fn configure_native(
     }
     network(runtime.rpc(), &request.network)?;
     let identity = intent_hash(&setup_identity(request))?;
+    // A request that stopped before its signature takes the wallet asset of the server's
+    // template again. When the template names another asset by then, the unsigned record
+    // differs from this request in that asset only: nothing of it was signed, so the request
+    // is prepared again, as a new request is. Any other difference, and any difference of a
+    // signed record, is another intent.
+    let asset_alone_differs = |record: &NativeSetupRecord| -> Result<bool> {
+        let earlier = crate::provider::runtime::owner::SetupRequest {
+            network: request.network.clone(),
+            owner: request.owner.clone(),
+            agent: request.agent.clone(),
+            server: request.server.clone(),
+            request_id: request.request_id.clone(),
+            fee_per_operation: request.fee_per_operation,
+            asset: record.setup.trustline.clone(),
+            funding: request.funding,
+        };
+        Ok(record.signed_xdr.is_none()
+            && record.identity == intent_hash(&setup_identity(&earlier))?)
+    };
     let mut made = None;
     let mut record = match store.load::<NativeSetupRecord>(&request.request_id)? {
         Some(record) if record.identity == identity => record,
-        Some(_) => {
+        Some(record) if !asset_alone_differs(&record)? => {
             return Err(Error::config(
                 "Native setup request ID already binds another intent",
             ));
         }
-        None => {
+        _ => {
             let key = checked(native::owner::WalletKey::random())?;
             let wallet = key.account();
             made = Some(key);

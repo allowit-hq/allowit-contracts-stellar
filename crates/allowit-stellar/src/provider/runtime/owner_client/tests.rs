@@ -377,6 +377,113 @@ fn the_wallet_asset_is_the_asset_of_the_servers_template_of_the_network() {
     renamed["assetIssuer"] = json!(PUBNET_ISSUER);
     assert!(read(json!([renamed]), "stellar:pubnet").is_err());
 }
+/// A request that stopped before its signature holds nothing signed. When the server's template
+/// names another asset at its next run, the request is prepared again for that asset; another
+/// amount under the same request ID stays another intent. A retained signed setup is checked
+/// under the hint of each key: a signature under another hint is no signature of that key.
+#[test]
+fn an_unsigned_setup_follows_the_template_asset_and_a_signed_one_keeps_its_hints() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().canonicalize().unwrap().join("proof")).unwrap();
+    let c = selection().config;
+    let chain = Arc::new(Chain::new(c.clone()));
+    let runtime = Runtime::from_rpc(chain.clone());
+    let usdc = crate::owner::Trustline {
+        code: "USDC".into(),
+        issuer: USDC_ISSUER.into(),
+    };
+    let request = |asset: Option<crate::owner::Trustline>, funding: i64| SetupRequest {
+        network: c.network.clone(),
+        owner: c.owner.clone(),
+        agent: c.agent.clone(),
+        server: c.server.clone(),
+        request_id: "setup-template-001".into(),
+        fee_per_operation: 100,
+        asset,
+        funding: Some(funding),
+    };
+    let now = wire::now();
+    // The owner's signer fails: the USDC request is retained unsigned.
+    let failing = Key {
+        calls: AtomicUsize::new(0),
+        bad: true,
+        before: None,
+    };
+    workflow::configure_native(
+        &runtime,
+        &store,
+        &request(Some(usdc.clone()), 100_000),
+        &failing,
+        &|| Ok(now),
+    )
+    .unwrap_err();
+    let unsigned: Value = store.load("setup-template-001").unwrap().unwrap();
+    assert!(unsigned["signedXdr"].is_null());
+    assert_eq!(unsigned["setup"]["trustline"]["code"], "USDC");
+    // Another amount under the same request ID is another intent, signed or not.
+    let signer = key();
+    let refused = workflow::configure_native(
+        &runtime,
+        &store,
+        &request(Some(usdc.clone()), 100_001),
+        &signer,
+        &|| Ok(now),
+    )
+    .unwrap_err();
+    assert!(
+        refused.message.contains("another intent"),
+        "{}",
+        refused.message
+    );
+    assert_eq!(signer.calls.load(Ordering::SeqCst), 0);
+    // The template names XLM by now: the same request is prepared again for XLM and signed once.
+    let out =
+        workflow::configure_native(&runtime, &store, &request(None, 100_000), &signer, &|| {
+            Ok(now)
+        })
+        .unwrap();
+    assert_eq!(out["configuration"]["assetSymbol"], "XLM");
+    assert_eq!(signer.calls.load(Ordering::SeqCst), 1);
+    // The signed XLM setup keeps its asset: the USDC request under its ID is another intent.
+    let refused = workflow::configure_native(
+        &runtime,
+        &store,
+        &request(Some(usdc), 100_000),
+        &signer,
+        &|| Ok(now),
+    )
+    .unwrap_err();
+    assert!(
+        refused.message.contains("another intent"),
+        "{}",
+        refused.message
+    );
+    // The new account's signature under another hint: the retained bytes are refused.
+    let mut record: Value = store.load("setup-template-001").unwrap().unwrap();
+    let stellar_xdr::TransactionEnvelope::Tx(mut envelope) =
+        crate::read(record["signedXdr"].as_str().unwrap()).unwrap()
+    else {
+        panic!()
+    };
+    let mut signatures = envelope.signatures.to_vec();
+    signatures[1].hint = stellar_xdr::SignatureHint([0; 4]);
+    envelope.signatures = signatures.try_into().unwrap();
+    record["signedXdr"] =
+        json!(crate::xdr(&stellar_xdr::TransactionEnvelope::Tx(envelope)).unwrap());
+    store.save("setup-template-001", &record).unwrap();
+    let again = signer.calls.load(Ordering::SeqCst);
+    let changed =
+        workflow::configure_native(&runtime, &store, &request(None, 100_000), &signer, &|| {
+            Ok(now)
+        })
+        .unwrap_err();
+    assert!(
+        changed.message.contains("bytes changed"),
+        "{}",
+        changed.message
+    );
+    assert_eq!(signer.calls.load(Ordering::SeqCst), again);
+}
 /// The setup key of a wallet account is random and lives in one run. A request that settled
 /// reports its wallet again and signs nothing. A request that stopped before its signature
 /// holds no key and nothing signed: its next run prepares another account with a new key.
