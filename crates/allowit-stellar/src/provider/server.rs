@@ -232,14 +232,20 @@ fn settlement_of(
         _ => return Err(Error::config("A receipt holds a final status")),
     };
     let executed = outcome == OperationOutcome::Executed;
-    let next_nonce = match (contract, executed, accounting) {
-        (false, true, Some(a)) => Some(
+    // A keypair wallet's server keeps its nonce: its receipt needs the server's account.
+    let next_nonce = match (contract, accounting) {
+        (true, _) => None,
+        (false, None) => {
+            return Err(Error::config(
+                "The receipt of a keypair wallet needs the server's account of the wallet",
+            ));
+        }
+        (false, Some(a)) if executed => Some(
             a.nonce
                 .checked_add(1)
                 .ok_or_else(|| Error::config("The wallet's nonce is out of range"))?,
         ),
-        (false, _, Some(a)) => Some(a.nonce),
-        _ => None,
+        (false, Some(a)) => Some(a.nonce),
     };
     let gas_carry = if contract && executed {
         carry
@@ -260,19 +266,24 @@ fn settlement_of(
 }
 /// The expense of `action` with the worst-case `conversion` that the vault valued: see
 /// `RuntimeProvider::expense`.
-fn expense_of(action: &Action, conversion: i128, ceiling: &FeeCeiling) -> Result<Expense> {
+fn expense_of(action: &Action, conversion: i128, ceiling: &FeeCeiling) -> Result<ExpenseBound> {
     let principal = match action {
         Action::Transfer { units, .. } => *units,
         Action::Deposit { .. } | Action::Redeem { .. } => conversion,
     };
-    Ok(Expense {
+    // A Stellar transaction declares its fee in 32 bits: a wider ceiling cannot be signed.
+    if ceiling.max_fee_units > u128::from(u32::MAX) {
+        return Err(Error::config(
+            "The fee ceiling is above what a Stellar transaction can declare",
+        ));
+    }
+    Ok(ExpenseBound {
         gas_units: ceiling.gas_units,
         conversion_units: conversion,
         spent_units: principal
             .checked_add(ceiling.gas_units)
             .ok_or_else(|| Error::config("The operation amount overflows."))?,
-        max_fee_units: u64::try_from(ceiling.max_fee_units)
-            .map_err(|_| Error::config("The fee ceiling is out of range"))?,
+        max_fee_units: ceiling.max_fee_units,
         observed_height: ceiling.observed_height,
         day: ceiling.day,
     })
@@ -1719,7 +1730,12 @@ impl crate::host::vendors::RuntimeProvider for Provider {
     /// operation's is its worst-case conversion, which the vault values from the account that the
     /// operation is read from. A deposit whose shares the vault cannot value counts its whole
     /// assets; a redeem whose shares it cannot value is refused.
-    fn expense(&self, i: &Installation, action: &Action, ceiling: &FeeCeiling) -> Result<Expense> {
+    fn expense(
+        &self,
+        i: &Installation,
+        action: &Action,
+        ceiling: &FeeCeiling,
+    ) -> Result<ExpenseBound> {
         let conversion = match action {
             Action::Transfer { .. } => 0,
             Action::Deposit {
@@ -3866,6 +3882,18 @@ mod settlement {
         .unwrap();
         assert_eq!(failed.outcome, OperationOutcome::Failed);
         assert_eq!(failed.next_nonce, Some(4));
+        // A keypair wallet's receipt without the server's account is refused.
+        assert!(
+            settlement_of(
+                false,
+                [9; 32],
+                &receipt(Status::Confirmed, 100, 0, 0),
+                None,
+                None,
+                0
+            )
+            .is_err()
+        );
         // A receipt without a final status settles nothing.
         assert!(
             settlement_of(
@@ -3911,10 +3939,19 @@ mod settlement {
         };
         // A deposit of 100 whose shares redeem for at least 95 spends 5 and the ceiling.
         assert_eq!(expense_of(&deposit, 5, &ceiling).unwrap().spent_units, 7);
+        // The ceiling keeps its width; one above what a transaction can declare is refused.
         let wide = FeeCeiling {
-            max_fee_units: u128::from(u64::MAX) + 1,
+            max_fee_units: u128::from(u32::MAX),
             ..ceiling
         };
-        assert!(expense_of(&transfer, 0, &wide).is_err());
+        assert_eq!(
+            expense_of(&transfer, 0, &wide).unwrap().max_fee_units,
+            u128::from(u32::MAX)
+        );
+        let wider = FeeCeiling {
+            max_fee_units: u128::from(u32::MAX) + 1,
+            ..ceiling
+        };
+        assert!(expense_of(&transfer, 0, &wider).is_err());
     }
 }

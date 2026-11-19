@@ -455,17 +455,23 @@ impl ServerHooks for Hooks {
     /// The XLM fee in installed-asset units, rounded up. Native XLM is one to one; another
     /// asset needs its `gasRates` entry, keyed by contract id or symbol.
     fn charged_fee(&self, network: &str, config: &Value, receipt: &ReceiptInfo) -> Result<i128> {
-        self.price_fee(network, config, receipt.fee.native_units)
-    }
-    /// The XLM fee of `native_units` priced as [`Self::charged_fee`] prices a receipt's fee.
-    fn price_fee(&self, network: &str, config: &Value, native_units: u128) -> Result<i128> {
-        let network = self::network(network)?.id;
-        let fee = i128::try_from(native_units)
-            .map_err(|_| Error::config("The receipt fee is out of range"))?;
         let asset = config
             .get("asset")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::config("The fee needs the installed asset"))?;
+        self.price_fee(network, config, asset, receipt.fee.native_units)
+    }
+    /// The XLM fee of `native_units` in the wallet's asset `asset` (its contract), rounded up.
+    fn price_fee(
+        &self,
+        network: &str,
+        config: &Value,
+        asset: &str,
+        native_units: u128,
+    ) -> Result<i128> {
+        let network = self::network(network)?.id;
+        let fee = i128::try_from(native_units)
+            .map_err(|_| Error::config("The receipt fee is out of range"))?;
         let tokens = provider::tokens_for(network);
         let token = tokens
             .iter()
