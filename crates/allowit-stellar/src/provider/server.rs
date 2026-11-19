@@ -726,7 +726,7 @@ impl Provider {
             } => {
                 let spendable = if asset == stellar_xdr::Asset::Native {
                     let paused = checked(
-                        checked(rpc::get_account(self.rpc(), &c.wallet))?
+                        checked(rpc::get_wallet_account(self.rpc(), &c.wallet))?
                             .wallet_status(&c.owner, &c.agent, &c.server),
                     )? == native::owner::WalletStatus::Paused;
                     checked(rpc::native_balance(self.rpc(), &c.wallet))?
@@ -748,8 +748,8 @@ impl Provider {
                 ));
             }
         };
-        let owner_state = checked(rpc::get_account(self.rpc(), &c.owner))?;
-        let wallet_state = checked(rpc::get_account(self.rpc(), &c.wallet))?;
+        let owner_state = checked(rpc::get_owner_account(self.rpc(), &c.owner))?;
+        let wallet_state = checked(rpc::get_wallet_account(self.rpc(), &c.wallet))?;
         // Each operation bids the same share of the caller's fee limit, within the bounds of
         // one classic operation.
         let fee_per_operation = u32::try_from((fee_limit / 6).clamp(100, 10_000))
@@ -919,7 +919,7 @@ impl Provider {
             return Ok(p);
         }
         if c.route == WalletRoute::Native {
-            let current = checked(rpc::get_account(self.rpc(), &c.wallet))?;
+            let current = checked(rpc::get_wallet_account(self.rpc(), &c.wallet))?;
             checked(current.validate_roles(&c.owner, &c.agent, &c.server))?;
             if current != p.state.source {
                 return Err(Error::uncertain(
@@ -1213,7 +1213,10 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         // The read simulates from an account that exists: the sending account of a policy
         // wallet, or the keypair wallet itself.
         let source = if c.route == WalletRoute::PolicyWallet {
-            checked(rpc::get_account(self.rpc(), &self.sending_account()?))?
+            checked(rpc::get_sending_account(
+                self.rpc(),
+                &self.sending_account()?,
+            ))?
         } else {
             checked(rpc::trusted_state_for_discovery(self.rpc(), &c, None))?
                 .state

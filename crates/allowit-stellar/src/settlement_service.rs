@@ -532,7 +532,7 @@ impl SettlementProvider for Service {
         };
         // The service's own transaction: its account is the source, it pays the fee, and the
         // invocation and the payer's entry are the payload's, unchanged.
-        let account = rpc::get_account(&rpc, &source).map_err(rail)?;
+        let account = rpc::get_sending_account(&rpc, &source).map_err(rail)?;
         let tx = Transaction {
             source_account: MuxedAccount::Ed25519(Uint256(account_key(&source).map_err(rail)?)),
             fee: admitted.fee,

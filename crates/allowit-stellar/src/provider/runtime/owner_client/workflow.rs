@@ -174,7 +174,21 @@ struct Record {
 }
 
 fn checked<T>(value: native::Result<T>) -> Result<T> {
-    value.map_err(|_| Error::config("Native owner intent or chain observation failed validation"))
+    value.map_err(|error| {
+        // A missing account keeps its message, so that its refusal keeps the code of its role;
+        // any other failure stays one generic validation failure.
+        let missing = [
+            rpc::ACCOUNT_NOT_FOUND,
+            rpc::OWNER_ACCOUNT_NOT_FOUND,
+            rpc::WALLET_ACCOUNT_NOT_FOUND,
+            rpc::SENDING_ACCOUNT_NOT_FOUND,
+        ];
+        if missing.contains(&error.to_string().as_str()) {
+            crate::provider::failure(error.to_string())
+        } else {
+            Error::config("Native owner intent or chain observation failed validation")
+        }
+    })
 }
 /// The identity of a workflow: its selection, its work and its fee ceiling.
 fn workflow_identity(selection: &OwnerPolicy, work: &Work, max_fee: u32) -> Result<String> {
@@ -674,7 +688,7 @@ impl OwnerClient {
         }
         network(rpc, &selection.config.network)?;
         // The owner is the account's administrator: only then does its signature approve.
-        let account = checked(rpc::get_account(rpc, &selection.config.wallet))?;
+        let account = checked(rpc::get_wallet_account(rpc, &selection.config.wallet))?;
         checked(account.wallet_status(
             &selection.config.owner,
             &selection.config.agent,
@@ -955,7 +969,7 @@ impl OwnerClient {
                         "Deployment preparation repeated an already retained action",
                     ));
                 }
-                let source = checked(rpc::get_account(rpc, self.session.owner()))?;
+                let source = checked(rpc::get_owner_account(rpc, self.session.owner()))?;
                 if selection.config.route == WalletRoute::Native {
                     // The owner's account is not the wallet: its own key must pay alone, as
                     // the wallet setup requires. A policy wallet owner is its master key only.
@@ -980,7 +994,10 @@ impl OwnerClient {
                     None
                 };
                 let wallet = if selection.config.route == WalletRoute::Native {
-                    Some(checked(rpc::get_account(rpc, &selection.config.wallet))?)
+                    Some(checked(rpc::get_wallet_account(
+                        rpc,
+                        &selection.config.wallet,
+                    ))?)
                 } else {
                     None
                 };
@@ -1006,7 +1023,7 @@ impl OwnerClient {
             let index = record.steps.len() - 1;
             if record.steps[index].signed_xdr.is_none() {
                 let step = &record.steps[index];
-                let current = checked(rpc::get_account(rpc, self.session.owner()))?;
+                let current = checked(rpc::get_owner_account(rpc, self.session.owner()))?;
                 if current != step.source {
                     return Err(Error::config(
                         "Owner account changed before signing; retain the original intent",
@@ -1073,7 +1090,7 @@ impl OwnerClient {
                     ));
                 }
             } else if record.steps[index].submitted {
-                let current = checked(rpc::get_account(rpc, self.session.owner()))?;
+                let current = checked(rpc::get_owner_account(rpc, self.session.owner()))?;
                 if clock()? >= record.steps[index].packet.expires_at
                     || current.sequence != record.steps[index].source.sequence
                 {
@@ -1224,7 +1241,7 @@ impl OwnerClient {
         if c.route == WalletRoute::Native {
             // The owner acts on its wallet also while it is paused: the account holds the exact
             // roles, with or without the agent signer. An agent's own admission stays strict.
-            let account = checked(rpc::get_account(rpc, &c.wallet))?;
+            let account = checked(rpc::get_wallet_account(rpc, &c.wallet))?;
             if account.address != c.wallet {
                 return Err(Error::config(
                     "Native account differs from the selected wallet",
@@ -1364,7 +1381,7 @@ impl OwnerClient {
             ));
         }
         if selection.config.route == WalletRoute::Native && record.signature.is_none() {
-            let account = checked(rpc::get_account(rpc, &selection.config.wallet))?;
+            let account = checked(rpc::get_wallet_account(rpc, &selection.config.wallet))?;
             // The owner approves a source as the account's administrator, also while paused.
             checked(account.wallet_status(
                 &selection.config.owner,
@@ -1486,7 +1503,7 @@ impl OwnerClient {
                 &native::signing::signed_message_digest(&message),
                 &signature.signature,
             ))?;
-            let current = checked(rpc::get_account(rpc, &selection.config.wallet))?;
+            let current = checked(rpc::get_wallet_account(rpc, &selection.config.wallet))?;
             checked(current.validate_authority_signatures(
                 &native::signing::signed_message_digest(&message),
                 std::slice::from_ref(signature),
@@ -1623,7 +1640,7 @@ fn prepare_setup(
     wallet: &str,
     now: u64,
 ) -> Result<NativeSetupRecord> {
-    let source = checked(rpc::get_account(runtime.rpc(), &request.owner))?;
+    let source = checked(rpc::get_owner_account(runtime.rpc(), &request.owner))?;
     let setup = checked(native::owner::prepare_native_setup(
         &source,
         &native::owner::SetupTerms {
@@ -1739,7 +1756,7 @@ pub fn configure_native(
             }
         };
         let expected = expected_setup(request, &record)?;
-        let current = checked(rpc::get_account(runtime.rpc(), &request.owner))?;
+        let current = checked(rpc::get_owner_account(runtime.rpc(), &request.owner))?;
         if current != record.source || clock()? < record.created_at {
             return Err(Error::config(
                 "Native source or clock changed before setup signing",
@@ -1798,7 +1815,7 @@ pub fn configure_native(
             ));
         }
         if record.submitted
-            && checked(rpc::get_account(runtime.rpc(), &request.owner))?.sequence
+            && checked(rpc::get_owner_account(runtime.rpc(), &request.owner))?.sequence
                 != record.source.sequence
         {
             return Err(Error::uncertain(
@@ -1835,7 +1852,7 @@ pub fn configure_native(
             "The original Native setup failed or its receipt envelope differs",
         ));
     }
-    let account = checked(rpc::get_account(runtime.rpc(), &wallet))?;
+    let account = checked(rpc::get_wallet_account(runtime.rpc(), &wallet))?;
     // The owner can pause the wallet after setup: a paused wallet is still this wallet.
     checked(account.wallet_status(&request.owner, &request.agent, &request.server))?;
     configured(
@@ -2022,6 +2039,30 @@ fn submit_refusal(error: Error) -> Error {
 #[cfg(test)]
 mod submit_refusal_tests {
     use super::*;
+    #[test]
+    fn a_missing_account_keeps_its_refusal_and_another_failure_stays_generic() {
+        // The owner's missing account reaches the diagnostics with its own message, so its
+        // refusal keeps the code of its role.
+        for missing in [
+            rpc::ACCOUNT_NOT_FOUND,
+            rpc::OWNER_ACCOUNT_NOT_FOUND,
+            rpc::WALLET_ACCOUNT_NOT_FOUND,
+            rpc::SENDING_ACCOUNT_NOT_FOUND,
+        ] {
+            let kept = checked::<()>(Err(missing.into())).unwrap_err();
+            assert_eq!(kept.message, missing);
+        }
+        let owner = checked::<()>(Err(rpc::OWNER_ACCOUNT_NOT_FOUND.into())).unwrap_err();
+        assert_eq!(
+            crate::provider::diagnostics::denial(&owner.message, None, "").code,
+            "owner_account_unfunded"
+        );
+        let other = checked::<()>(Err("Invalid account response".into())).unwrap_err();
+        assert_eq!(
+            other.message,
+            "Native owner intent or chain observation failed validation"
+        );
+    }
     #[test]
     fn a_refused_submission_keeps_the_server_code_and_is_uncertain_only_when_unknown() {
         // No answer or an untyped server error leaves the outcome unknown.

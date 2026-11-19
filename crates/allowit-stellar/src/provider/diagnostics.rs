@@ -71,18 +71,36 @@ fn wallet_error_code(name: &str) -> &'static str {
         _ => "wallet_rejected",
     }
 }
-fn policy_denied(name: &str, rule: Option<&str>, contract: Option<u32>) -> Problem {
-    let text = match (rule, contract) {
-        (Some(rule), _) => format!("The policy denied this operation: `{rule}` ({name})."),
-        (None, Some(code)) => format!(
-            "The policy wallet denied this operation in simulation: {name} (contract error {code})."
-        ),
-        (None, None) => format!("The policy denied this operation: {name}."),
-    };
-    coded(409, "policy_denied", text)
-        .with_details(json!({"rule":rule,"error":name,"contractError":contract}))
+/// The code of an `AllowitError` that the policy raised: one recovery for each code. A denial by
+/// a rule, or a Custom wallet's own `PolicyDenied`, is `policy_denied`; a value of the policy in
+/// the wrong form is `param_invalid`; a call without a price is `call_unpriced`; any other error
+/// means that the policy itself failed on this request.
+fn policy_code(name: &str, rule: Option<&str>) -> &'static str {
+    match (rule, name) {
+        (Some(_), _) | (None, "PolicyDenied") => "policy_denied",
+        (None, "MissingParam" | "InvalidParam") => "param_invalid",
+        (None, "Unpriced") => "call_unpriced",
+        _ => "policy_evaluation_failed",
+    }
 }
-/// A host evaluator's `AllowitError`, by its code, as `policy_denied`.
+fn policy_denied(name: &str, rule: Option<&str>, contract: Option<u32>) -> Problem {
+    let code = policy_code(name, rule);
+    // Words, not a code: the catalogue test reads each code-shaped literal of this file as a code.
+    let what = if code == "policy_denied" {
+        "denied this operation"
+    } else {
+        "could not evaluate this operation"
+    };
+    let text = match (rule, contract) {
+        (Some(rule), _) => format!("The policy {what}: `{rule}` ({name})."),
+        (None, Some(contract)) => {
+            format!("The policy wallet {what} in simulation: {name} (contract error {contract}).")
+        }
+        (None, None) => format!("The policy {what}: {name}."),
+    };
+    coded(409, code, text).with_details(json!({"rule":rule,"error":name,"contractError":contract}))
+}
+/// A host evaluator's `AllowitError`, by its code: `policy_denied` for a rule's denial.
 pub fn rule_denial(code: u32) -> Problem {
     match rule_error(code) {
         Some((name, rule)) => policy_denied(&name, rule, None),
@@ -98,7 +116,10 @@ pub fn rule_denial(code: u32) -> Problem {
 /// keep their own codes. An error that another contract raised, such as the asset contract or a
 /// vault, or whose origin is unknown, is a plain wallet rejection with the raw code. A stale owner
 /// observation is `stale_owner_observation`, which a caller can retry once. Anything else stays
-/// a plain conflict.
+/// a plain conflict. An owner address without an account on the ledger is
+/// `owner_account_unfunded`, a wallet account without one `wallet_closed`, the server's own
+/// sending account without one `service_not_configured`, and another address without one
+/// `account_not_found`.
 pub fn denial(message: &str, contract: Option<&ContractFault>, wallet: &str) -> Problem {
     if contract.is_none() && message == crate::rpc::owner_observation::STALE_OBSERVATION {
         return coded(409, "stale_owner_observation", message);
@@ -119,6 +140,22 @@ pub fn denial(message: &str, contract: Option<&ContractFault>, wallet: &str) -> 
             "params_differ_from_wallet",
             "The wallet's params on the ledger are not the ones that its installation stores.",
         );
+    }
+    if contract.is_none() && message == crate::rpc::ACCOUNT_NOT_FOUND {
+        return coded(
+            409,
+            "account_not_found",
+            "The network holds no account for an address of this step.",
+        );
+    }
+    if contract.is_none() && message == crate::rpc::SENDING_ACCOUNT_NOT_FOUND {
+        return coded(409, "service_not_configured", message);
+    }
+    if contract.is_none() && message == crate::rpc::OWNER_ACCOUNT_NOT_FOUND {
+        return coded(409, "owner_account_unfunded", message);
+    }
+    if contract.is_none() && message == crate::rpc::WALLET_ACCOUNT_NOT_FOUND {
+        return coded(409, "wallet_closed", message);
     }
     if contract.is_none() && message == crate::rpc::EXECUTABLE_DIFFERS {
         return coded(
@@ -201,10 +238,53 @@ mod tests {
         assert_eq!(problem.status, 409);
     }
     #[test]
+    fn an_error_of_the_policy_has_the_code_of_its_recovery() {
+        // A rule's denial is changed by the owner; a value in the wrong form is entered again; a
+        // call without a price needs the operator; any other error is a failure of the policy.
+        for (error, code) in [
+            (E::PaymentLimitExceeded, "policy_denied"),
+            (E::DestinationNotAllowed, "policy_denied"),
+            (E::MissingParam, "param_invalid"),
+            (E::InvalidParam, "param_invalid"),
+            (E::Unpriced, "call_unpriced"),
+            (E::Panicked, "policy_evaluation_failed"),
+            (E::Overflow, "policy_evaluation_failed"),
+            (E::InvalidState, "policy_evaluation_failed"),
+        ] {
+            assert_eq!(rule_denial(error as u32).code, code, "{error:?}");
+        }
+        assert_eq!(policy_code("PolicyDenied", None), "policy_denied");
+    }
+    #[test]
     fn a_wallet_with_other_code_than_its_configuration_has_its_own_code() {
         let problem = denial(crate::rpc::EXECUTABLE_DIFFERS, None, "wallet");
         assert_eq!(problem.code, "custom_code_hash_mismatch");
         assert_eq!(problem.status, 409);
+    }
+    #[test]
+    fn an_address_without_an_account_has_its_own_code() {
+        let problem = denial(crate::rpc::ACCOUNT_NOT_FOUND, None, "");
+        assert_eq!((problem.status, problem.code), (409, "account_not_found"));
+        // The server's own sending account is the operator's matter, not the owner's.
+        let sending = denial(crate::rpc::SENDING_ACCOUNT_NOT_FOUND, None, "");
+        assert_eq!(
+            (sending.status, sending.code),
+            (409, "service_not_configured")
+        );
+        // The owner funds a new owner account; a closed wallet needs a new policy.
+        let owner = denial(crate::rpc::OWNER_ACCOUNT_NOT_FOUND, None, "");
+        assert_eq!((owner.status, owner.code), (409, "owner_account_unfunded"));
+        let wallet = denial(crate::rpc::WALLET_ACCOUNT_NOT_FOUND, None, "");
+        assert_eq!((wallet.status, wallet.code), (409, "wallet_closed"));
+        // A contract's own error with the same text is not the ledger's answer.
+        let fault = ContractFault {
+            code: 1,
+            contract: None,
+        };
+        assert_ne!(
+            denial(crate::rpc::ACCOUNT_NOT_FOUND, Some(&fault), "").code,
+            "account_not_found"
+        );
     }
     #[test]
     fn a_stale_owner_observation_has_its_own_code() {
