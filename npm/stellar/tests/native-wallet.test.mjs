@@ -146,6 +146,30 @@ test('the rail checks that signed setup bytes set up the reviewed asset, and ref
   refused(xlm, null, 'stellar:pubnet');
 });
 
+test('the rail checks that a funding step pays the wallet in the reviewed asset, and refuses others with asset_mismatch', () => {
+  const wallet = Keypair.random().publicKey();
+  // The funding step of a Native wallet: one payment from the owner's account to the wallet, as the server builds it.
+  const funding = (ops, source = roles.owner) => {
+    const tx = new TransactionBuilder(new Account(source, '41'), {fee: '100', networkPassphrase: Networks.TESTNET}).setTimeout(300);
+    for (const op of ops) tx.addOperation(op);
+    return tx.build().toXDR();
+  };
+  const pay = (asset, extra = {}) => Operation.payment({destination: wallet, asset, amount: '1', ...extra});
+  const xlm = funding([pay(Asset.native())]), issued = funding([pay(new Asset(usdc.symbol, usdc.issuer))]);
+  const check = ownerChain.keypairSetup.checkAsset;
+  for (const asset of [undefined, null, {symbol: 'XLM', issuer: null}]) assert.equal(check(xlm, network, asset), undefined);
+  assert.equal(check(issued, network, {...usdc}), undefined);
+  const refused = (payload, asset) => assert.throws(() => check(payload, network, asset), error => error.code === 'asset_mismatch' && error.message.length > 0);
+  refused(xlm, usdc);
+  for (const asset of [null, mainnetUsdc, {symbol: 'EURC', issuer: usdc.issuer}]) refused(issued, asset);
+  // The refusal names both issuers when only the issuer differs.
+  assert.throws(() => check(issued, network, mainnetUsdc), error => error.message.includes(usdc.issuer) && error.message.includes(mainnetUsdc.issuer));
+  // Only one payment from the step's own account is a funding step.
+  refused(funding([pay(Asset.native()), pay(Asset.native())]), null);
+  refused(funding([pay(Asset.native(), {source: Keypair.random().publicKey()})]), null);
+  refused(funding([Operation.bumpSequence({bumpTo: '50'})]), null);
+});
+
 test('a setup that moves another asset, another amount or another XLM balance than its wallet takes is not read as one', () => {
   const wallet = Keypair.random().publicKey();
   const build = ops => {
