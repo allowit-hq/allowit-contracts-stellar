@@ -216,7 +216,10 @@ pub struct PreparationCapability(PreparedOperation);
 /// its nonce, one more after each executed operation. A contract wallet counts its own gas and
 /// repays it to the sending account: the gas it counted is the receipt's charged units (none for
 /// a failed transaction), and the server's carry takes what it repaid less the fee that the
-/// ledger charged, at least zero.
+/// ledger charged, at least zero. The fee that the operation's wallet is charged: a keypair
+/// wallet's account pays its transaction's fee, which the receipt reports as zero when a
+/// settlement service paid it; a contract wallet pays what it repaid to the sending account,
+/// nothing when its envelope failed. A Stellar transaction carries one operation.
 fn settlement_of(
     contract: bool,
     transaction: [u8; 32],
@@ -255,9 +258,19 @@ fn settlement_of(
     } else {
         carry
     };
+    let fee_units = if contract {
+        if executed {
+            info.fee.repaid_native_units
+        } else {
+            0
+        }
+    } else {
+        info.fee.native_units
+    };
     Ok(Settlement {
         transaction: transaction.to_vec(),
         outcome,
+        fee_units,
         usage: if contract && executed { usage } else { None },
         counted_gas: contract.then_some(if executed { info.fee.charged_units } else { 0 }),
         next_nonce,
@@ -3823,6 +3836,8 @@ mod settlement {
         assert_eq!(s.usage, Some(USAGE));
         assert_eq!(s.counted_gas, Some(136));
         assert_eq!(s.next_nonce, None);
+        // The wallet is charged what it repaid.
+        assert_eq!(s.fee_units, 150);
         // 20 + 150 − 100.
         assert_eq!(s.gas_carry, 70);
         // A fee above the carry and the repayment leaves no carry, never a debt.
@@ -3851,6 +3866,7 @@ mod settlement {
         )
         .unwrap();
         assert_eq!(s.outcome, OperationOutcome::Open);
+        assert_eq!(s.fee_units, 0);
         assert_eq!((s.usage, s.counted_gas, s.gas_carry), (None, Some(0), 20));
     }
     /// A keypair wallet's server keeps its nonce and prices its fee: an executed operation takes
@@ -3871,6 +3887,8 @@ mod settlement {
             (done.next_nonce, done.counted_gas, done.usage),
             (Some(5), None, None)
         );
+        // The keypair wallet's account paid its transaction's fee.
+        assert_eq!(done.fee_units, 100);
         let failed = settlement_of(
             false,
             [9; 32],
