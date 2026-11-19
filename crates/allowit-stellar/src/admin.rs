@@ -381,6 +381,11 @@ impl OwnerAdmin<'_> {
         version: DeploymentVersion,
         authorizers: Vec<String>,
     ) -> Result<PreparedOwnerOperation> {
+        // No owner step reaches a wallet whose instance, or the code that it runs, lapsed: the
+        // answer is `CONTRACT_EXPIRED` whatever a simulation of the step would say.
+        if self.lapsed()? {
+            return Err(rpc::CONTRACT_EXPIRED.into());
+        }
         let expires = self.now.checked_add(300).ok_or("Expiry overflow")?;
         let mut tx = self.transaction(
             &snapshot.owner,
@@ -881,21 +886,21 @@ impl OwnerAdmin<'_> {
     /// whose instance, or the code that it runs, lapsed, since no owner step reaches it; the
     /// balance reads touch neither. A read that fails is its error.
     fn nothing_to_recover(&self) -> String {
-        let lapsed =
-            || -> Result<bool> {
-                let Some(running) =
-                    rpc::instance_code(self.rpc, &self.config.network, &self.config.wallet)?
-                else {
-                    return Ok(false);
-                };
-                Ok(rpc::code_state(self.rpc, &self.config.network, &running)?
-                    == rpc::CodeState::Lapsed)
-            };
-        match lapsed() {
+        match self.lapsed() {
             Ok(true) => rpc::CONTRACT_EXPIRED.into(),
             Ok(false) => NO_RECOVERABLE_BALANCE.into(),
             Err(error) => error.to_string(),
         }
+    }
+    /// Whether the wallet's instance, or the code that it runs, lapsed on the network. A wallet
+    /// with no instance has not lapsed.
+    fn lapsed(&self) -> Result<bool> {
+        let Some(running) =
+            rpc::instance_code(self.rpc, &self.config.network, &self.config.wallet)?
+        else {
+            return Ok(false);
+        };
+        Ok(rpc::code_state(self.rpc, &self.config.network, &running)? == rpc::CodeState::Lapsed)
     }
     /// The balance of `token` that the wallet holds, read through the owner's simulation.
     fn balance_of(&self, s: &Snapshot, token: &str) -> Result<i128> {

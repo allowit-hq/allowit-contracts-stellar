@@ -978,7 +978,7 @@ fn owner_never_applied(reply: &Value, hash: &str, expires_at: u64, since: u64) -
 /// then, from the preparation's ledger on, hold every execution of the operation, in any envelope,
 /// also one whose envelope no receipt of the operation adopts: an event found means that it
 /// executed. The time bound alone proves no lapse: once the history no longer holds the
-/// preparation's ledger, the operation stays open, and its owner can release it. `false` before
+/// preparation's ledger, the operation stays open. `false` before
 /// that ledger, when its prepared transaction succeeded, when the RPC does not show the closing
 /// time or a history that holds the preparation, or when an execution is found; a read that fails
 /// is an error, never a lapse.

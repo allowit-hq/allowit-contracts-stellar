@@ -469,7 +469,7 @@ fn code_of(p: &Signed) -> Result<SignedCode> {
 impl Provider {
     /// The upload of the wallet code `wasm`, from a sending account and signed by it. A simulated
     /// fee above `max_fee_stroops` is refused before anything is signed. `None` when the code is
-    /// live. Code that lapsed is refused: nothing restores it.
+    /// live. Code that lapsed is refused as `CONTRACT_EXPIRED`: nothing restores it.
     ///
     /// The step trusts the reads and simulations of the one RPC that the server configured (see
     /// the crate README). Another transaction, from another sending account or from the same
@@ -498,11 +498,7 @@ impl Provider {
         };
         match checked(rpc::code_state(self.rpc(), &c.network, &code_hash))? {
             rpc::CodeState::Live => return Ok(None),
-            rpc::CodeState::Lapsed => {
-                return Err(Error::usage(
-                    "The wallet code lapsed on the network: nothing restores it",
-                ));
-            }
+            rpc::CodeState::Lapsed => return Err(Error::config(rpc::CONTRACT_EXPIRED)),
             rpc::CodeState::Absent => {}
         }
         // A refusal can come from the transaction that made the code live: a simulated fee above

@@ -934,21 +934,18 @@ impl Client {
         }
         Ok(())
     }
-    /// Whether the engine released the retained policy wallet operation and this client's own
-    /// RPC proves that it lapsed without executing. Without independent RPC, a retained
-    /// preparation or the proof, the operation stays `submissionUnknown`.
+    /// Whether the engine released the retained payment authorization and this client's own RPC
+    /// proves that it lapsed unsettled. A policy wallet operation that the engine released
+    /// without a receipt stays `submissionUnknown` here: this client decides no outcome from a
+    /// lapse of it. Without independent RPC, a retained preparation or the proof, the operation
+    /// stays `submissionUnknown`.
     fn proven_release(&self, r: &Response, record: Option<&Record>) -> bool {
         r.released
+            && r.prepared.payment_authorization.is_some()
             && record.and_then(|v| v.prepared.as_ref()) == Some(&r.prepared)
             && !self.rpc_url.is_empty()
             && sdk::rpc::HttpRpc::new(&self.rpc_url)
-                .and_then(|rpc| {
-                    if r.prepared.payment_authorization.is_some() {
-                        sdk::seller_settled::lapsed(&rpc, &r.prepared)
-                    } else {
-                        sdk::rpc::operation_lapsed(&rpc, &r.prepared)
-                    }
-                })
+                .and_then(|rpc| sdk::seller_settled::lapsed(&rpc, &r.prepared))
                 .unwrap_or(false)
     }
 }
@@ -3258,7 +3255,7 @@ mod native_revalidation_tests {
     }
     #[test]
     #[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
-    fn released_operation_fails_only_with_an_independent_lapse_proof() {
+    fn a_released_policy_wallet_operation_stays_unknown_in_the_client() {
         // Common R4.1 on testnet: the engine released the expired operation as `failed`
         // without a receipt, and the CLI reported `submissionUnknown`.
         let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
@@ -3298,7 +3295,8 @@ mod native_revalidation_tests {
             paid_service: None,
             rpc_url: None,
         };
-        assert!(client.proven_release(&r, Some(&record)));
+        // The client decides no outcome of a released policy wallet operation from a lapse.
+        assert!(!client.proven_release(&r, Some(&record)));
         record.prepared = None;
         assert!(!client.proven_release(&r, Some(&record)));
         assert!(!client.proven_release(&r, None));
@@ -3311,8 +3309,8 @@ mod native_revalidation_tests {
         unreleased.rpc_url.clear();
         assert!(!unreleased.proven_release(&submitted, Some(&record)));
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        let methods = server.join().unwrap();
-        assert_eq!(methods[0], "getTransaction");
+        // The client read no lapse.
+        assert!(server.join().unwrap().is_empty());
 
         for (transaction, entries_ledger, packet, lapsed) in [
             (not_found.clone(), 185, &p, true),
@@ -3366,7 +3364,7 @@ mod native_revalidation_tests {
     }
     #[test]
     #[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
-    fn proven_failure_stays_failed_after_the_nonce_moves_or_rpc_fails() {
+    fn a_retained_proof_stays_failed_after_the_nonce_moves_or_rpc_fails() {
         // Codex P2 on PR #45: poll journaled only `failed`, so a later status query that could
         // not repeat the lapse proof overwrote the terminal failure with `submissionUnknown`.
         let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
@@ -3398,13 +3396,12 @@ mod native_revalidation_tests {
         client.settle(&mut r, Some(&record)).unwrap();
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         server.join().unwrap();
-        assert_eq!(r.operation.status, OperationStatus::Failed);
-        journal
-            .save(
-                "released",
-                &journaled(&client, "released-001", Some(record), &r),
-            )
-            .unwrap();
+        // The client proves no lapse of a policy wallet operation itself.
+        assert_eq!(r.operation.status, OperationStatus::SubmissionUnknown);
+        // A journal that an earlier client wrote with its own proof keeps it final.
+        let mut proven = journaled(&client, "released-001", Some(record), &r);
+        proven.lapsed = true;
+        journal.save("released", &proven).unwrap();
 
         // A node whose last ledger closed before the expiry proves no lapse.
         let early =

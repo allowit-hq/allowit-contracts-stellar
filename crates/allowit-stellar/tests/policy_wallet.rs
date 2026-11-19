@@ -3542,8 +3542,9 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     let refused = provider
         .send_code(&installation, &wasm, u64::from(u32::MAX))
         .unwrap_err();
-    assert!(
-        refused.message.contains("nothing restores it"),
+    assert_eq!(
+        provider.problem(&refused).code,
+        allowit_core::vendor::runtime::CONTRACT_EXPIRED,
         "{}",
         refused.message
     );
@@ -4158,6 +4159,25 @@ fn a_lapsed_wallet_takes_no_owner_step() {
     assert_eq!(recover(), allowit_stellar::admin::NO_RECOVERABLE_BALANCE);
     chain.0.lock().unwrap().lapsed_instances = true;
     assert_eq!(recover(), rpc::CONTRACT_EXPIRED);
+    // A withdrawal whose simulation fails, as one above the balance does: a lapsed wallet is
+    // `contract_expired` all the same, before anything is simulated.
+    struct Rejecting<'a>(&'a ModelChain);
+    impl rpc::Rpc for Rejecting<'_> {
+        fn call(&self, method: &str, params: Value) -> Result<Value> {
+            if method == "simulateTransaction" {
+                return Ok(json!({"error": "HostError: the transfer exceeds the balance"}));
+            }
+            self.0.call(method, params)
+        }
+    }
+    let withdrawn = OwnerAdmin {
+        rpc: &Rejecting(&chain),
+        config: &c,
+        now: NOW,
+    }
+    .recover_to(&c.owner, 1_000_000)
+    .unwrap_err();
+    assert_eq!(withdrawn.to_string(), rpc::CONTRACT_EXPIRED);
     chain.0.lock().unwrap().lapsed_instances = false;
     chain.0.lock().unwrap().lapsed_code.insert(c.module_digest);
     assert_eq!(recover(), rpc::CONTRACT_EXPIRED);
