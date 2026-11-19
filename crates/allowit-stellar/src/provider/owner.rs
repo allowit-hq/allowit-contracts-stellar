@@ -339,8 +339,9 @@ impl OwnerProvider for Owner {
     }
 }
 /// The native placement of a Custom wallet whose source has a server part: the contract compiles
-/// the on-chain part that Core derives, so the placement holds that part and only the rules that
-/// it keeps (`Derived::kept`). The host placement keeps the whole source and all its rules.
+/// the on-chain part that Core derives, so the placement holds that part and the canonical rules
+/// that Core keeps in it, in Core's order (`Derived::kept`). The host placement keeps the whole
+/// source and all its rules.
 fn on_chain_placement(export: &mut owner::PairedExport, source: &str) {
     if export.native.wallet_kind != allowit_core::vendor::kinds::WalletKind::Custom {
         return;
@@ -349,7 +350,11 @@ fn on_chain_placement(export: &mut owner::PairedExport, source: &str) {
         .ok()
         .filter(|parts| parts.server_part)
     {
-        export.native.rules.retain(|rule| parts.kept.contains(rule));
+        export.native.rules = parts
+            .kept
+            .into_iter()
+            .filter(|check| allowit_core::vendor::kinds::STANDARD_PARAMS.contains(&check.as_str()))
+            .collect();
         export.native.source = Some(parts.onchain);
     }
 }
@@ -520,6 +525,22 @@ mod paired_export_tests {
         assert!(!onchain.contains("call_limit"));
         assert_eq!(custom.native.source.as_deref(), Some(onchain.as_str()));
         assert_eq!(custom.native.rules, ["payment_limit"]);
+        // Core's rules in Core's order: a rule that a server branch also calls first stays in the
+        // place that the on-chain part gives it, and a raw identifier names the same rule.
+        const TWICE: &str = "use allowit::prelude::*;\nuse allowit::AllowitDecision;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    let score = allowit::decision(ctx, &AllowitDecision { id: \"research\", query: \"Is this research?\", deny_below: 3000, allow_above: 8000 })?;\n    if score < 9000 {\n        allowit::call_limit(ctx, &ctx.params[allowit::CALL_LIMIT])?;\n    }\n    allowit::r#payment_limit(ctx, &ctx.params[allowit::PAYMENT_LIMIT])?;\n    allowit::call_limit(ctx, &ctx.params[allowit::CALL_LIMIT])?;\n    Ok(())\n}\n";
+        let mut twice = owner::PairedExport::of(
+            "p".into(),
+            "stellar:testnet".into(),
+            allowit_core::vendor::kinds::WalletKind::Custom,
+            TWICE.into(),
+            "h".into(),
+            source_calls(TWICE).0,
+            vec![],
+            vec![],
+            Default::default(),
+        );
+        on_chain_placement(&mut twice, TWICE);
+        assert_eq!(twice.native.rules, ["payment_limit", "call_limit"]);
         assert_eq!(custom.host.source, ONE);
         assert_eq!(custom.host.rules, ["payment_limit", "call_limit"]);
         // Another kind keeps Core's placement as it is.

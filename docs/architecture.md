@@ -12,7 +12,9 @@ a shared checker contract or that contract's parent administrator. Shared checke
 
 `AllowitSimplePolicyEngine` relies on the agent's and the server's signatures and runs no rule onchain. `AllowitCommonPolicyEngine` is
 the standard implementation for an owner-approved initial preflight prefix. `AllowitCustomPolicy`
-compiles a complete authored policy into its contract. All three are built from the same custody
+compiles into its contract the on-chain part that Core derives from the owner's one source: the
+whole source when it calls no server function, and otherwise the statements that the chain can
+check by itself, while the server evaluates the whole source before it co-signs. All three are built from the same custody
 core in `crates/policy-wallet`. The `policy_wallet!` macro attaches the complete owner and
 delegated-execution interface to an `AllowitPolicy` implementation, so Simple, Common and Custom
 expose identical entrypoints and differ only in their `AllowitPolicy` logic.
@@ -33,8 +35,9 @@ so rebuilt Wasm has new module hashes.
 
 ## One portable policy source
 
-Policy source is ordinary synchronous Rust against the portable `allowit` package from Allowit core. The offchain server and
-`AllowitCustomPolicy` compile the file verbatim:
+Policy source is ordinary synchronous Rust against the portable `allowit` package from Allowit core. The offchain server
+compiles the file verbatim, and `AllowitCustomPolicy` compiles its on-chain part verbatim, which is the whole file when
+it calls no server function:
 
 ```rust
 use allowit::prelude::*;

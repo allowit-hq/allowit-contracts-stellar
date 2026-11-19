@@ -5,9 +5,9 @@
 #
 # SOURCE.rs is the owner's one policy source. The contract compiles the on-chain part that Core
 # derives from it, keeps the figures and state keys that Core names for that part, and embeds the
-# SHA-256 of SOURCE.rs. `allowit-stellar-admin custom-build-inputs` writes those build inputs, as
-# the build hook does, into a copy of the committed tree, so the checkout stays unchanged and no
-# input comes from anywhere else. The copy has a fixed path, so the same revision, source,
+# SHA-256 of SOURCE.rs. `allowit-stellar-admin custom-build-inputs`, built from the same copy of
+# the committed tree with its locked dependencies, writes those build inputs into the copy, as the
+# build hook does, so the checkout stays unchanged and no input comes from anywhere else. The copy has a fixed path, so the same revision, source,
 # toolchain and Stellar CLI give the same Wasm. It prints one JSON line:
 #   {"source_digest": SHA-256 of SOURCE.rs, "wasm_hash": SHA-256 of the Wasm, "wasm": path}
 # `source_digest` is the wallet's `source_hash`. `wasm_hash` is the executable hash that the owner
@@ -30,11 +30,14 @@ trap 'rm -rf "$tree"; rmdir "$lock"' EXIT
 rm -rf "$tree"
 mkdir -p "$tree"
 git archive --format=tar HEAD | tar -x -C "$tree"
-# The committed tree's own build inputs give way to those of SOURCE.rs.
+# The committed tree's own build inputs give way to those of SOURCE.rs. The generator is the
+# committed revision's, built from the copy, in a folder of the caller's Cargo build folder or of
+# the checkout's ignored `target`, so a later run reuses it.
 policy="$tree/contracts/allowit-custom-policy/policy"
-rm -f "$policy/policy.rs" "$policy/policy.figures" "$policy/policy.state" "$policy/source.rs"
-cargo run --quiet --locked --manifest-path crates/allowit-stellar/Cargo.toml \
-  --bin allowit-stellar-admin -- custom-build-inputs "$source_file" "$policy" >&2
+inputs_target="${CARGO_TARGET_DIR:-$PWD/target}/custom-build-inputs"
+(cd "$tree" && CARGO_TARGET_DIR="$inputs_target" cargo run --quiet --locked \
+  --manifest-path crates/allowit-stellar/Cargo.toml \
+  --bin allowit-stellar-admin -- custom-build-inputs "$source_file" "$policy" >&2)
 (cd "$tree" && CARGO_TARGET_DIR="$tree/target" "$stellar_bin" contract build --locked \
   --package allowit-custom-policy --out-dir "$out" >&2)
 wasm="$out/allowit_custom_policy.wasm"

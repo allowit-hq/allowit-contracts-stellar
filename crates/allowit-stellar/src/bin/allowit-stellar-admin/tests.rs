@@ -685,5 +685,15 @@ fn custom_build_inputs_writes_what_core_derives() {
         std::fs::read_to_string(out.join("policy.figures")).unwrap(),
         "day_spent\nday_unpriced\n"
     );
+    // The same folder for a source without a server part: the earlier owner source goes, so the
+    // contract hashes the new source.
+    let plain = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::payment_limit(ctx, &ctx.params[allowit::PAYMENT_LIMIT])?;\n    Ok(())\n}\n";
+    std::fs::write(&source, plain).unwrap();
+    custom_build_inputs(source.to_str().unwrap(), out.to_str().unwrap()).unwrap();
+    assert!(!out.join("source.rs").exists());
+    assert_eq!(
+        std::fs::read_to_string(out.join("policy.rs")).unwrap(),
+        plain
+    );
     assert!(custom_build_inputs("/nonexistent/owner.rs", out.to_str().unwrap()).is_err());
 }

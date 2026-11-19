@@ -670,13 +670,24 @@ fn help_requested(args: &[String]) -> bool {
 /// on-chain part, the keys of its figures, the state keys that the contract keeps and, for a
 /// source with a server part, the source itself. Core's derivation gives all of them
 /// ([`allowit_stellar::policy::custom_build_inputs`]), as it does for the build hook;
-/// `scripts/build-custom-policy.sh` writes its build tree with this action.
+/// `scripts/build-custom-policy.sh` writes its build tree with this action. A build input that
+/// the source has none of is removed, so an earlier owner source in a reused folder cannot
+/// lend the contract its hash.
 fn custom_build_inputs(source: &str, dir: &str) -> Result<()> {
     let text = std::fs::read_to_string(source).map_err(|_| "Cannot read the policy source")?;
     let (_, inputs) = allowit_stellar::policy::custom_build_inputs(&text)?;
+    let dir = std::path::Path::new(dir);
+    for name in ["policy.rs", "policy.figures", "policy.state", "source.rs"] {
+        match std::fs::remove_file(dir.join(name)) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(format!("Cannot replace {name} in {}", dir.display()));
+            }
+            _ => {}
+        }
+    }
     for (name, bytes) in inputs {
-        std::fs::write(std::path::Path::new(dir).join(name), bytes)
-            .map_err(|_| format!("Cannot write {name} in {dir}"))?;
+        std::fs::write(dir.join(name), bytes)
+            .map_err(|_| format!("Cannot write {name} in {}", dir.display()))?;
     }
     Ok(())
 }
