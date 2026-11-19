@@ -161,16 +161,59 @@ pub fn with_params(
 pub fn code_hash(wasm: &[u8]) -> Result<[u8; 32]> {
     native::admin::check_wallet_code(wasm).map_err(crate::provider::failure)
 }
-pub fn connect(endpoint: &str) -> Result<std::sync::Arc<dyn crate::host::runtime::Transport>> {
+/// The transport of one RPC `endpoint` of `network`. See [`verified_identity`].
+pub fn connect(
+    network: &str,
+    endpoint: &str,
+) -> Result<std::sync::Arc<dyn crate::host::runtime::Transport>> {
     struct Transport(native::rpc::HttpRpc);
     impl crate::host::runtime::Transport for Transport {
         fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
             native::rpc::Rpc::call(&self.0, method, params).map_err(crate::provider::failure)
         }
     }
-    Ok(std::sync::Arc::new(Transport(
-        native::rpc::HttpRpc::new(endpoint).map_err(crate::provider::failure)?,
-    )))
+    verified_identity(
+        network,
+        std::sync::Arc::new(Transport(
+            native::rpc::HttpRpc::new(endpoint).map_err(crate::provider::failure)?,
+        )),
+    )
+}
+/// `inner` with the network identity that it verified. Every read and send of the rail first asks
+/// the endpoint which network it serves (`getNetwork`), and one call of a host makes several of
+/// them, so the transport keeps the first reply that names the passphrase of `network` and
+/// answers each later `getNetwork` with it. A reply that names another network or no passphrase,
+/// and an error, are returned as they came and kept nowhere: the rail's own check refuses them,
+/// and the next call asks the endpoint again. Every other method goes to the endpoint.
+fn verified_identity(
+    network: &str,
+    inner: std::sync::Arc<dyn crate::host::runtime::Transport>,
+) -> Result<std::sync::Arc<dyn crate::host::runtime::Transport>> {
+    struct Verified {
+        inner: std::sync::Arc<dyn crate::host::runtime::Transport>,
+        passphrase: &'static str,
+        identity: std::sync::OnceLock<serde_json::Value>,
+    }
+    impl crate::host::runtime::Transport for Verified {
+        fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+            if method != "getNetwork" {
+                return self.inner.call(method, params);
+            }
+            if let Some(reply) = self.identity.get() {
+                return Ok(reply.clone());
+            }
+            let reply = self.inner.call(method, params)?;
+            if reply["passphrase"].as_str() == Some(self.passphrase) {
+                let _ = self.identity.set(reply.clone());
+            }
+            Ok(reply)
+        }
+    }
+    Ok(std::sync::Arc::new(Verified {
+        inner,
+        passphrase: native::passphrase(network).map_err(crate::provider::failure)?,
+        identity: std::sync::OnceLock::new(),
+    }))
 }
 pub fn fee_bounds() -> crate::host::runtime::owner::FeeBounds {
     crate::host::runtime::owner::FeeBounds {
@@ -250,7 +293,109 @@ pub fn source_consent<P: serde::Serialize>(
 
 #[cfg(test)]
 mod tests {
-    use super::explorer_link;
+    use super::{explorer_link, verified_identity};
+    use crate::host::{error::Result, runtime::Transport};
+    use serde_json::{Value, json};
+    use std::sync::{Arc, Mutex};
+
+    /// An endpoint that answers `getNetwork` with each reply of `replies` in turn, then with the
+    /// last one, and records every method that it is asked.
+    struct Endpoint {
+        replies: Mutex<Vec<Result<Value>>>,
+        asked: Mutex<Vec<String>>,
+    }
+    impl Endpoint {
+        fn new(replies: Vec<Result<Value>>) -> Arc<Self> {
+            Arc::new(Self {
+                replies: Mutex::new(replies),
+                asked: Mutex::new(Vec::new()),
+            })
+        }
+        fn asked(&self, method: &str) -> usize {
+            self.asked
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| *m == method)
+                .count()
+        }
+    }
+    impl Transport for Endpoint {
+        fn call(&self, method: &str, _: Value) -> Result<Value> {
+            self.asked.lock().unwrap().push(method.into());
+            if method != "getNetwork" {
+                return Ok(json!({ "method": method }));
+            }
+            let mut replies = self.replies.lock().unwrap();
+            if replies.len() > 1 {
+                replies.remove(0)
+            } else {
+                replies[0].clone()
+            }
+        }
+    }
+    const TESTNET: &str = "Test SDF Network ; September 2015";
+    const PUBNET: &str = "Public Global Stellar Network ; September 2015";
+
+    /// The endpoint is asked once for its network: its verified reply answers every later
+    /// `getNetwork`, and every other method still reaches the endpoint.
+    #[test]
+    fn a_verified_network_reply_is_asked_once() {
+        let endpoint = Endpoint::new(vec![Ok(json!({ "passphrase": TESTNET }))]);
+        let transport = verified_identity("stellar:testnet", endpoint.clone()).unwrap();
+        for _ in 0..3 {
+            let reply = transport.call("getNetwork", json!({})).unwrap();
+            assert_eq!(reply["passphrase"], TESTNET);
+            transport.call("getLatestLedger", json!({})).unwrap();
+        }
+        assert_eq!(endpoint.asked("getNetwork"), 1);
+        assert_eq!(endpoint.asked("getLatestLedger"), 3);
+    }
+
+    /// A reply that names another network, no passphrase, or an error is returned as it came
+    /// and kept nowhere: the next call asks the endpoint again, and the first reply that names
+    /// the network is the one that is kept.
+    #[test]
+    fn a_reply_of_another_network_is_not_kept() {
+        let endpoint = Endpoint::new(vec![
+            Ok(json!({ "passphrase": PUBNET })),
+            Ok(json!({})),
+            Err(crate::host::error::Error::uncertain("no answer")),
+            Ok(json!({ "passphrase": TESTNET })),
+            Ok(json!({ "passphrase": PUBNET })),
+        ]);
+        let transport = verified_identity("stellar:testnet", endpoint.clone()).unwrap();
+        let ask = || transport.call("getNetwork", json!({}));
+        assert_eq!(ask().unwrap()["passphrase"], PUBNET);
+        assert_eq!(ask().unwrap(), json!({}));
+        assert!(ask().is_err());
+        assert_eq!(ask().unwrap()["passphrase"], TESTNET);
+        // The verified reply is kept: the endpoint's later answer of another network is never read.
+        assert_eq!(ask().unwrap()["passphrase"], TESTNET);
+        assert_eq!(endpoint.asked("getNetwork"), 4);
+    }
+
+    /// Each network keeps its own passphrase, an alias included; a network of another rail has
+    /// no transport.
+    #[test]
+    fn the_kept_identity_is_the_passphrase_of_the_transports_network() {
+        for (network, passphrase) in [
+            ("stellar:pubnet", PUBNET),
+            ("stellar:mainnet", PUBNET),
+            ("stellar:testnet", TESTNET),
+        ] {
+            let endpoint = Endpoint::new(vec![
+                Ok(json!({ "passphrase": if passphrase == PUBNET { TESTNET } else { PUBNET } })),
+                Ok(json!({ "passphrase": passphrase })),
+            ]);
+            let transport = verified_identity(network, endpoint.clone()).unwrap();
+            transport.call("getNetwork", json!({})).unwrap();
+            transport.call("getNetwork", json!({})).unwrap();
+            transport.call("getNetwork", json!({})).unwrap();
+            assert_eq!(endpoint.asked("getNetwork"), 2, "{network}");
+        }
+        assert!(verified_identity("solana:devnet", Endpoint::new(vec![Ok(json!({}))])).is_err());
+    }
 
     #[test]
     fn public_explorer_links_accept_canonical_and_historical_networks() {

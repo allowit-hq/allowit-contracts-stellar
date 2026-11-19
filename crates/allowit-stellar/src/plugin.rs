@@ -215,8 +215,7 @@ impl RailPlugin for Plugin {
         &OWNER
     }
     fn connect(&self, network: &str, endpoint: &str) -> Result<Arc<dyn Transport>> {
-        self::network(network)?;
-        server_owner::connect(endpoint)
+        server_owner::connect(self::network(network)?.id, endpoint)
     }
     fn runtime(
         &self,
