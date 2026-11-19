@@ -12,7 +12,7 @@ use allowit_core::errors;
 use std::collections::BTreeSet;
 
 /// The codes that files other than the diagnostics name, with the file's text.
-const NAMED: [(&str, &str, &[&str]); 3] = [
+const NAMED: [(&str, &str, &[&str]); 2] = [
     (
         "src/provider/runtime/client.rs",
         include_str!("../src/provider/runtime/client.rs"),
@@ -29,11 +29,6 @@ const NAMED: [(&str, &str, &[&str]); 3] = [
         "src/provider/runtime/owner_client/workflow.rs",
         include_str!("../src/provider/runtime/owner_client/workflow.rs"),
         &["owner_transaction_expired", "owner_transaction_pending"],
-    ),
-    (
-        "npm/stellar/src/adk-owner-workflow.ts",
-        include_str!("../../../npm/stellar/src/adk-owner-workflow.ts"),
-        &["owner_transaction_expired", "owner_transaction_failed"],
     ),
 ];
 

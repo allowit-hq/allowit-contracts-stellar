@@ -117,6 +117,13 @@ It reads the direct order book only: no path through another asset and no liquid
   installs the pinned compiler and the `wasm32v1-none` target from `rust-toolchain.toml`. A missing tool or another
   CLI release is a `custom_toolchain_missing` refusal that says what to install. A failed compile is
   `custom_build_failed`.
+- `check(network, source)` runs, without building, the checks that the build makes before it compiles: the build's
+  size limit, the portable gate of the on-chain part, the build's text check of the compiled part
+  (`state_keys::one_safe_file`: no `unsafe`, `include!`, `include_str!`, `include_bytes!` or `#[path`, comments
+  included) and the wallet's storage of state keys (at most eight keys that the contract keeps, each with its own
+  storage key; keys that the server keeps do not count). It does not compile the part: a source that passes it can
+  still fail the compile, for example on a type error. A client calls it before it reports a source as fit for a
+  Custom wallet.
 - `code_hash` is the SHA-256 of a wallet Wasm of the current custody layout: the hash of the code on the ledger.
 - The owner's client builds the code of a Custom policy from the source that the owner's policy signature binds
   and hands it to the server, which uploads it from its sending account when the owner deploys, with the
@@ -391,7 +398,7 @@ The service evaluates the installed policy on the host before it signs. A Custom
 
 `rpc::revalidate_prepared` revalidates an existing unsigned packet through a trusted RPC without changing its transaction or hash. Fresh resource requirements must fit the existing resources.
 
-The wallet stores no receipt. A settled operation is its transaction and the one `allowit` event that names the operation id and its output; `rpc::receipt_by_hash` verifies the transaction, and `rpc::validate_settled_policy_packet` checks that the settled envelope is the sealed packet.
+The wallet stores no receipt. A settled operation is its transaction and the one `allowit` event that names the operation id and its output; `rpc::receipt_by_hash` verifies the transaction, and `rpc::validate_settled_policy_packet` checks that the settled envelope is the sealed packet. A verified receipt keeps the close time of its ledger, which the RPC states as `createdAt` (`VerifiedReceipt::closed_at`, Unix seconds); the provider states it as Core's `PacketProvider::receipt_settled_at`. A receipt that this rail retained before it kept that time states none.
 
 Use `rpc::trusted_state_for_discovery` for public network, account and policy wallet discovery without requiring a formerly configured key. Its `DiscoveredState` reports the installed roles and whether a policy wallet is paused; it still requires the wallet's binding: its rules, asset and source hash. A policy wallet has no account: its observation carries no account signers, and `signer_weight` weighs the roles that its configuration holds on chain as a keypair wallet's account weighs its signers (the owner, an account or a contract, 3; agent and server 1 each; any other address 0), paused or not. Discovery does not authorize an operation. `rpc::trusted_state` checks the configured agent and server keys against the wallet, and that the wallet holds exactly the params that its deployment stores (`installed_params`: the params of a Simple or Common wallet's on-chain rules, every param of a Custom wallet); a wallet whose params differ, such as one whose owner's update outside Allowit dropped a limit, is refused with `rpc::PARAMS_DIFFER`, which the provider reports as `params_differ_from_wallet`. Installation, activation and execution use this read. Classic custody accounting must come from the durable policy coordinator. A policy wallet reads the figures it keeps from `t` and `d`; `rpc::trusted_state` refuses a Simple or Common wallet without the server's accounting of the others. Discovery reports the wallet's own figures without it.
 

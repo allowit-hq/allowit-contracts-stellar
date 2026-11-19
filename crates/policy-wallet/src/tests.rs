@@ -770,6 +770,44 @@ fn daily_figures_live_in_a_window_that_ends_with_its_own_ledger() {
     assert_eq!(f.run(&f.transfer(100, 0)), Ok(()));
 }
 
+/// The window of `d` follows Core's rule at its edges (`allowit::daily_window_end`, the end being
+/// the window's last ledger): a write at the last ledger keeps the end; one ledger later the
+/// figures read as zero, and the next write opens a window from that ledger.
+#[test]
+fn daily_figures_keep_cores_window_at_its_edges() {
+    let f = Fixture::with(COMMON, false, |env, c| {
+        c.rules = Vec::from_array(env, [AllowitRule::daily_spending_limit]);
+    });
+    assert_eq!(f.run(&f.transfer(10, 0)), Ok(()));
+    let start = f.env.ledger().sequence();
+    let end = start + DAY_LEDGERS - 1;
+    assert_eq!(f.figures().day_ends, end);
+    f.advance(DAY_LEDGERS - 1);
+    assert_eq!(f.env.ledger().sequence(), end);
+    assert_eq!(f.run(&f.transfer(10, 0)), Ok(()));
+    assert_eq!((f.figures().day_spent, f.figures().day_ends), (20, end));
+    f.advance(1);
+    assert_eq!(f.figures().day_ends, 0, "the window has ended");
+    assert_eq!(f.run(&f.transfer(10, 0)), Ok(()));
+    assert_eq!(
+        (f.figures().day_spent, f.figures().day_ends),
+        (10, end + DAY_LEDGERS)
+    );
+    // The same ends from Core's rule for a changed value.
+    let (before, after) = (AllowitValue::Bool(false), AllowitValue::Bool(true));
+    for (open, at, want) in [(Some(end), end, end), (None, end + 1, end + DAY_LEDGERS)] {
+        assert_eq!(
+            allowit::daily_window_end(
+                open.map(|end| (&before, u64::from(end))),
+                &after,
+                u64::from(at),
+                u64::from(DAY_LEDGERS)
+            ),
+            Ok(u64::from(want))
+        );
+    }
+}
+
 /// Each call keeps the wallet live. Once the instance has at most `TOTAL_LEDGERS - RENEWAL_LEDGERS`
 /// ledgers left, a call renews it to `TOTAL_LEDGERS - 1`; a call above that threshold renews
 /// nothing. A Custom wallet's code is its own, and a call renews it the same way;
@@ -1273,6 +1311,53 @@ fn a_state_value_over_its_bound_or_an_undeclared_key_is_refused() {
     });
 }
 
+/// The wallet keeps a daily entry by Core's rule (`allowit::daily_window_end`): the window's end
+/// is its last ledger, inclusive. A write at that ledger keeps the window; the entry reads as
+/// absent one ledger later, and the next write opens a new window there.
+#[test]
+fn a_daily_entry_keeps_its_window_through_its_last_ledger_by_cores_rule() {
+    let f = Fixture::new(SIMPLE);
+    let env = &f.env;
+    let write = |value: i128| {
+        env.as_contract(&f.wallet, || {
+            let before = read_policy_state::<Declared>(env).unwrap();
+            let mut state = Map::new(env);
+            state.set(Symbol::new(env, "day_note"), AllowitValue::Int(value));
+            write_policy_state::<Declared>(env, &state, &before)
+        })
+    };
+    let read = || {
+        env.as_contract(&f.wallet, || {
+            read_policy_state::<Declared>(env).unwrap()[1].clone()
+        })
+    };
+    let start = env.ledger().sequence();
+    assert_eq!(write(1), Ok(()));
+    let end = start + DAY_LEDGERS - 1;
+    assert_eq!(read().day_ends, Some(end));
+    assert_eq!(
+        u64::from(end),
+        allowit::daily_window_end(
+            None,
+            &AllowitValue::Int(1),
+            u64::from(start),
+            u64::from(DAY_LEDGERS)
+        )
+        .unwrap()
+    );
+    // At the window's last ledger the value still reads, and a write keeps the end.
+    f.advance(end - start);
+    assert_eq!(read().value, Some(AllowitValue::Int(1)));
+    assert_eq!(write(2), Ok(()));
+    assert_eq!(read().day_ends, Some(end));
+    // One ledger later the window has ended: the value reads as absent, and a write opens a new
+    // window from that ledger.
+    f.advance(1);
+    assert_eq!(read().value, None);
+    assert_eq!(write(3), Ok(()));
+    assert_eq!(read().day_ends, Some(end + DAY_LEDGERS));
+}
+
 #[test]
 fn one_event_names_the_operation_and_its_output() {
     let f = Fixture::new(SIMPLE);
@@ -1408,6 +1493,41 @@ fn swap_deposit_and_redeem_run_through_execute_with_effect_checks() {
         priced(&f, &mut e, 0);
         assert_eq!(f.run(&e), Err(Ok(AllowitWalletError::UnsupportedAsset)));
     }
+}
+
+/// A wallet that keeps only the daily spending figures writes `d` only when one of them changes.
+/// A deposit spends nothing: it leaves the window closed, so the next spend opens it at its own
+/// ledger, and that spend's day ends a whole window later.
+#[test]
+fn a_deposit_leaves_the_daily_spending_window_closed() {
+    let f = Fixture::with(COMMON, false, |env, c| {
+        c.rules = Vec::from_array(env, [AllowitRule::daily_spending_limit]);
+    });
+    assert_eq!(f.client().state().kept, u32::from(DAY_SPENT));
+    f.env.mock_all_auths();
+    let vault = f.env.register(VAULT, (f.asset.clone(), 0u32));
+    f.env.set_auths(&[]);
+    let mut e = f.transfer(1, 0);
+    e.3 = AllowitStellarOperation::Deposit(vault, 40, 40);
+    priced(&f, &mut e, 0);
+    assert_eq!(f.run(&e), Ok(()));
+    assert_eq!(
+        f.figures().day_ends,
+        0,
+        "a deposit opens no spending window"
+    );
+    assert!(
+        !f.env
+            .as_contract(&f.wallet, || f.env.storage().temporary().has(&DAILY)),
+        "nor writes d"
+    );
+    f.advance(10);
+    assert_eq!(f.run(&f.transfer(10, 0)), Ok(()));
+    let now = f.env.ledger().sequence();
+    assert_eq!(
+        (f.figures().day_spent, f.figures().day_ends),
+        (10, now + DAY_LEDGERS - 1)
+    );
 }
 
 #[test]

@@ -1,7 +1,8 @@
 //! The wallet's storage of what Core's derivation names for the compiled part of a Custom policy
 //! source (`allowit_core::policy_source::Derived`): the entries of its figures and the storage
 //! keys of the state keys that the contract keeps. The contract's build and the rail read the
-//! same Core output through these functions; neither reads the source itself.
+//! same Core output through these functions; neither reads the source itself, except for the
+//! build's text check of the compiled part ([`one_safe_file`]), which the rail runs too.
 
 /// Most state entries of one policy: `allowit_policy_wallet::MAX_POLICY_STATE`.
 pub const MAX_POLICY_STATE: usize = 8;
@@ -18,6 +19,27 @@ pub const STANDARD: [&str; 7] = [
     "day_unpriced",
     "day",
 ];
+
+/// The text that the compiled part of a Custom policy must not hold: a policy source is one safe
+/// file, which neither runs unsafe code nor reads another file.
+pub const FORBIDDEN_TEXT: [&str; 5] = [
+    "unsafe",
+    "include!",
+    "include_str!",
+    "include_bytes!",
+    "#[path",
+];
+
+/// Refuse a compiled part that holds a [`FORBIDDEN_TEXT`], anywhere in its text, comments
+/// included. The contract's build refuses it, and the rail refuses it before a build.
+pub fn one_safe_file(compiled: &str) -> Result<(), String> {
+    match FORBIDDEN_TEXT.iter().find(|text| compiled.contains(*text)) {
+        Some(text) => Err(format!(
+            "a policy source is one safe file: it must not use `{text}`"
+        )),
+        None => Ok(()),
+    }
+}
 
 /// The wallet entries that hold `figures`: the keys of Core's figures of the compiled source
 /// (`allowit_core::policy_source::Derived::figures`). `SPENT` (1) holds `spent` and `unpriced`,
