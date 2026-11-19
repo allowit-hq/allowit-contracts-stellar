@@ -67,14 +67,16 @@ fn checked_shape(
             false,
         ));
     }
-    match crate::host::authoring::check(source) {
-        Ok(shape) => Ok((shape, false)),
-        Err(portable) => crate::policy::custom_parts(source)
-            .ok()
-            .filter(|parts| custom && parts.server_part)
-            .map(|parts| (parts.shape, true))
-            .ok_or(portable),
+    // A Custom source is the source that Core derives a part from: its derivation decides the
+    // shape and whether a server part exists, also for a source that the portable gate admits.
+    if custom {
+        let checked = crate::host::authoring::check(source);
+        return match crate::policy::custom_parts(source) {
+            Ok(parts) => Ok((parts.shape, parts.server_part)),
+            Err(derive) => Err(checked.err().unwrap_or_else(|| Error::usage(derive))),
+        };
     }
+    Ok((crate::host::authoring::check(source)?, false))
 }
 /// Convert a native failure to a client error. A Stellar RPC call that got no answer keeps the
 /// network-unavailable code, and an answer with an unknown outcome stays uncertain, so callers
@@ -445,6 +447,14 @@ mod source_shape_tests {
         assert!(!report_matches(false, true, PLAIN, &rules, true).unwrap());
         assert!(!report_matches(false, false, PLAIN, &[], false).unwrap());
         assert!(report_matches(false, false, SPLIT, &[], true).is_err());
+        // A Custom source that the portable gate admits still goes through Core's derivation: a
+        // read of the stored day passes the gate, and Core refuses it.
+        let day = PLAIN.replace(
+            "    Ok(())",
+            "    let day: Option<u64> = allowit::get_state(ctx, \"day\")?;\n    assert!(day.is_some());\n    Ok(())",
+        );
+        assert!(source_shape(false, false, &day).is_ok());
+        assert!(source_shape(false, true, &day).is_err());
     }
 
     /// Server policy source, with owner text read by `as_str()`, belongs to a classic account

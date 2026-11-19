@@ -728,18 +728,14 @@ impl AccountState {
         Ok(())
     }
 }
-/// The state entries of a Custom policy source: the same scan as the contract's build.
+/// The wallet's storage of the figures and state keys that Core names for a Custom policy: the
+/// same functions as the contract's build.
 #[path = "../../../contracts/allowit-custom-policy/state_keys.rs"]
 pub mod state_keys;
-/// The declared state entries of the compiled source of a Custom policy, as its build declares
-/// them. `source` is the on-chain part of the owner's source ([`policy::custom_parts`]).
-pub fn custom_state_entries(source: &str) -> Result<Vec<state_keys::StateEntry>> {
-    state_keys::declared(source, |name| hash(name))
-}
-/// The state entries that the contract of a Custom wallet stores for the owner's `source`: those
-/// of its on-chain part.
+/// The state entries that the contract of a Custom wallet stores for the owner's `source`: the
+/// keys that Core's derivation gives the chain ([`policy::CustomParts::stored`]).
 pub fn custom_wallet_state_entries(source: &str) -> Result<Vec<state_keys::StateEntry>> {
-    custom_state_entries(&policy::custom_parts(source)?.onchain)
+    Ok(policy::custom_parts(source)?.stored)
 }
 /// Chain-observed policy inputs of a layout 4 policy wallet.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1745,10 +1741,7 @@ fn verify_wallet_portable(
     // server keeps for the part of a Custom wallet's source that only it runs.
     let (shape, stored, server) = if tier == PolicyTier::Custom {
         let parts = policy::custom_parts(&c.policy_source)?;
-        let stored: Vec<String> = custom_state_entries(&parts.onchain)?
-            .into_iter()
-            .map(|entry| entry.name)
-            .collect();
+        let stored: Vec<String> = parts.stored.into_iter().map(|entry| entry.name).collect();
         (parts.shape, stored, parts.server_keys)
     } else {
         (policy::source_shape(&c.policy_source)?, vec![], vec![])

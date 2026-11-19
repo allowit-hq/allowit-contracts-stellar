@@ -58,9 +58,11 @@ const USAGE: &str = "usage: allowit-stellar-admin {inspect,verify-admin,setup-ad
 [--network {testnet,mainnet}] [--allow-mainnet] --source ACCOUNT [--wasm PATH] [--wasm-hash HEX] \
 [--engine-wasm HEX] [--owner ACCOUNT] [--config JSON] [--contract CONTRACT] [--method METHOD] \
 [--family {wallet,parent}] [--tier {simple,common,custom}] [--policy-source PATH] [--member MEMBER] \
-[--candidate-member MEMBER] [--max-fee STROOPS] [--arguments JSON]";
+[--candidate-member MEMBER] [--max-fee STROOPS] [--arguments JSON]
+       allowit-stellar-admin custom-build-inputs SOURCE.rs DIR";
 const HELP: &str = "Every action reads public state or prints unsigned XDR. No action signs or submits. \
-Pass only public addresses and hashes, never a secret seed. See docs/admin.md.";
+Pass only public addresses and hashes, never a secret seed. custom-build-inputs reads nothing from a network: \
+it writes the build inputs of a Custom policy source into DIR, as the build hook does. See docs/admin.md.";
 const BAD_ADDRESS: &str = "Expected a public Stellar G address";
 const MAX_RESPONSE_BYTES: usize = 1 << 20;
 
@@ -664,10 +666,38 @@ fn help_requested(args: &[String]) -> bool {
     false
 }
 
+/// Write the build inputs of the Custom policy source at `source` into the folder `dir`: the
+/// on-chain part, the keys of its figures, the state keys that the contract keeps and, for a
+/// source with a server part, the source itself. Core's derivation gives all of them
+/// ([`allowit_stellar::policy::custom_build_inputs`]), as it does for the build hook;
+/// `scripts/build-custom-policy.sh` writes its build tree with this action.
+fn custom_build_inputs(source: &str, dir: &str) -> Result<()> {
+    let text = std::fs::read_to_string(source).map_err(|_| "Cannot read the policy source")?;
+    let (_, inputs) = allowit_stellar::policy::custom_build_inputs(&text)?;
+    for (name, bytes) in inputs {
+        std::fs::write(std::path::Path::new(dir).join(name), bytes)
+            .map_err(|_| format!("Cannot write {name} in {dir}"))?;
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if help_requested(&args) {
         println!("{USAGE}\n\n{HELP}");
+        return;
+    }
+    if args.first().map(String::as_str) == Some("custom-build-inputs") {
+        let [_, source, dir] = &args[..] else {
+            eprintln!(
+                "{USAGE}\nallowit-stellar-admin: error: custom-build-inputs takes SOURCE.rs and DIR"
+            );
+            std::process::exit(2)
+        };
+        if let Err(error) = custom_build_inputs(source, dir) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
         return;
     }
     let now = SystemTime::now()

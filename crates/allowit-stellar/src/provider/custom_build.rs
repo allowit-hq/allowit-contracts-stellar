@@ -23,15 +23,12 @@ pub static CUSTOM_BUILD: CustomBuild = CustomBuild;
 pub const STELLAR_CLI_VERSION: &str = "28.1.0";
 /// The environment variable that names the Stellar CLI binary. The default is `stellar` on `PATH`.
 pub const STELLAR_BIN: &str = "STELLAR_BIN";
-/// The file of the Custom wallet contract in the build tree that the contract compiles: the
-/// on-chain part of the owner's policy source.
-const POLICY_SOURCE: &str = "contracts/allowit-custom-policy/policy/policy.rs";
-/// The owner's full policy source in the build tree, when its on-chain part differs from it.
-/// The contract embeds the hash of this file.
-const OWNER_SOURCE: &str = "contracts/allowit-custom-policy/policy/source.rs";
-/// The keys of the figures that the on-chain part reads, one per line, as Core's derivation names
-/// them: the wallet keeps those.
-const POLICY_FIGURES: &str = "contracts/allowit-custom-policy/policy/policy.figures";
+/// The folder of the build tree that holds the build inputs of the owner's policy source
+/// ([`crate::policy::custom_build_inputs`]): the on-chain part that the contract compiles
+/// (`policy.rs`), the keys of its figures (`policy.figures`), the state keys that the contract
+/// keeps (`policy.state`) and, when the part differs from the source, the source (`source.rs`),
+/// whose hash the contract embeds.
+const POLICY_DIR: &str = "contracts/allowit-custom-policy/policy";
 /// The largest policy source that the build compiles.
 const MAX_SOURCE_BYTES: usize = 262_144;
 
@@ -51,8 +48,10 @@ static TREE: &[(&str, &[u8])] = tree![
     "contracts/allowit-custom-policy/src/branch_policy.rs",
     "contracts/allowit-custom-policy/src/catching_policy.figures",
     "contracts/allowit-custom-policy/src/catching_policy.rs",
+    "contracts/allowit-custom-policy/src/catching_policy.state",
     "contracts/allowit-custom-policy/src/daily_policy.figures",
     "contracts/allowit-custom-policy/src/daily_policy.rs",
+    "contracts/allowit-custom-policy/src/daily_policy.state",
     "contracts/allowit-custom-policy/src/lib.rs",
     "contracts/allowit-custom-policy/state_keys.rs",
     "crates/policy/Cargo.toml",
@@ -146,10 +145,9 @@ fn write(path: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::write(path, bytes).map_err(|_| failed())
 }
 
-/// Write the build tree of `source` under `tree`, which must not exist. The contract compiles
-/// the on-chain part of `source`, keeps the figures that Core names for it, and embeds the hash
-/// of `source`.
-fn write_tree(tree: &Path, source: &str, parts: &crate::policy::CustomParts) -> Result<()> {
+/// Write the build tree under `tree`, which must not exist, with the build inputs of the owner's
+/// source (`inputs`, from [`crate::policy::custom_build_inputs`]).
+fn write_tree(tree: &Path, inputs: &[(&str, Vec<u8>)]) -> Result<()> {
     for (path, bytes) in TREE {
         write(&tree.join(path), bytes)?;
     }
@@ -158,11 +156,8 @@ fn write_tree(tree: &Path, source: &str, parts: &crate::policy::CustomParts) -> 
         write(&manifest, bytes)?;
         write(&manifest.with_file_name("src").join("lib.rs"), b"")?;
     }
-    write(&tree.join(POLICY_SOURCE), parts.onchain.as_bytes())?;
-    let figures: String = parts.figures.iter().map(|key| format!("{key}\n")).collect();
-    write(&tree.join(POLICY_FIGURES), figures.as_bytes())?;
-    if parts.onchain != source {
-        write(&tree.join(OWNER_SOURCE), source.as_bytes())?;
+    for (name, bytes) in inputs {
+        write(&tree.join(POLICY_DIR).join(name), bytes)?;
     }
     Ok(())
 }
@@ -178,7 +173,7 @@ pub(crate) fn build_with(stellar: &Path, source: &str, work: &Path) -> Result<Wa
     // so every client builds the same code from the same source. Only source that passes the
     // portable policy gate is compiled: it cannot include a local file or run code at compile
     // time.
-    let parts = crate::policy::custom_parts(source).map_err(|reason| {
+    let (_, inputs) = crate::policy::custom_build_inputs(source).map_err(|reason| {
         build_failed(format!(
             "The policy source does not pass the policy source gate: {reason}. Draft the policy again."
         ))
@@ -192,7 +187,7 @@ pub(crate) fn build_with(stellar: &Path, source: &str, work: &Path) -> Result<Wa
             std::fs::remove_dir_all(stale).map_err(|_| unusable())?;
         }
     }
-    write_tree(&tree, source, &parts)?;
+    write_tree(&tree, &inputs)?;
     let cli = version_line(stellar, &tree).ok_or_else(|| {
         toolchain_missing(format!(
             "The Stellar CLI is missing. Install Stellar CLI {STELLAR_CLI_VERSION} (https://developers.stellar.org/docs/tools/cli/install-cli, or `cargo install --locked stellar-cli@{STELLAR_CLI_VERSION}`), or name its binary in {STELLAR_BIN}. Then run the build again."
@@ -365,67 +360,50 @@ mod tests {
     }
 
     /// A source with a server part: the contract compiles its on-chain part, and the tree holds
-    /// the owner's source beside it, whose hash the contract embeds. A source without a server
-    /// part is the one file.
+    /// the owner's source beside it, whose hash the contract embeds, with the figures and the
+    /// state keys that Core names for the part. A source without a server part is the one file.
     #[test]
     fn the_build_tree_holds_the_on_chain_part_and_the_owners_source() {
         const ONE: &str = "use allowit::prelude::*;\nuse allowit::AllowitDecision;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::payment_limit(ctx, &ctx.params[allowit::PAYMENT_LIMIT])?;\n    let visits: u64 = allowit::get_state(ctx, \"visits\")?.unwrap_or(0);\n    allowit::set_state(ctx, \"visits\", visits + 1)?;\n    let score = allowit::decision(ctx, &AllowitDecision { id: \"research\", query: \"Is this payment for research?\", deny_below: 3000, allow_above: 8000 })?;\n    allowit::set_state(ctx, \"last_score\", score)?;\n    Ok(())\n}\n";
         let work = tempfile::tempdir().unwrap();
-        let parts = crate::policy::custom_parts(ONE).unwrap();
+        let read =
+            |tree: &Path, name: &str| std::fs::read_to_string(tree.join(POLICY_DIR).join(name));
+        let (parts, inputs) = crate::policy::custom_build_inputs(ONE).unwrap();
         assert!(parts.server_part);
         let tree = work.path().join("one");
-        write_tree(&tree, ONE, &parts).unwrap();
-        let compiled = std::fs::read_to_string(tree.join(POLICY_SOURCE)).unwrap();
+        write_tree(&tree, &inputs).unwrap();
+        let compiled = read(&tree, "policy.rs").unwrap();
         assert_eq!(compiled, parts.onchain);
-        // Core names no figure for this on-chain part: the payment limit reads none.
-        assert_eq!(
-            std::fs::read_to_string(tree.join(POLICY_FIGURES)).unwrap(),
-            ""
-        );
         assert!(compiled.contains("\"visits\"") && !compiled.contains("decision"));
         assert!(!compiled.contains("last_score"));
-        assert_eq!(
-            std::fs::read_to_string(tree.join(OWNER_SOURCE)).unwrap(),
-            ONE
-        );
+        // Core names no figure for this on-chain part, and gives the chain the key "visits".
+        assert_eq!(read(&tree, "policy.figures").unwrap(), "");
+        assert_eq!(read(&tree, "policy.state").unwrap(), "visits lasting\n");
+        assert_eq!(read(&tree, "source.rs").unwrap(), ONE);
         let plain = work.path().join("plain");
-        let parts = crate::policy::custom_parts(SOURCE).unwrap();
-        write_tree(&plain, SOURCE, &parts).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(plain.join(POLICY_SOURCE)).unwrap(),
-            SOURCE
-        );
+        let (parts, inputs) = crate::policy::custom_build_inputs(SOURCE).unwrap();
+        write_tree(&plain, &inputs).unwrap();
+        assert_eq!(read(&plain, "policy.rs").unwrap(), SOURCE);
         let figures: String = parts.figures.iter().map(|key| format!("{key}\n")).collect();
-        assert_eq!(
-            std::fs::read_to_string(plain.join(POLICY_FIGURES)).unwrap(),
-            figures
-        );
-        assert!(!plain.join(OWNER_SOURCE).exists());
+        assert_eq!(read(&plain, "policy.figures").unwrap(), figures);
+        assert!(read(&plain, "source.rs").is_err());
     }
 
-    /// The committed figures of the contract's own policy and of its fixtures are those that
-    /// Core names for each source.
+    /// The committed build inputs of the contract's own policy and of its fixtures are those that
+    /// Core's derivation gives each source.
     #[test]
-    fn the_committed_figures_are_those_that_core_names() {
+    fn the_committed_build_inputs_are_those_that_core_names() {
         let root =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contracts/allowit-custom-policy");
-        for (policy, figures) in [
-            ("policy/policy.rs", "policy/policy.figures"),
-            ("src/catching_policy.rs", "src/catching_policy.figures"),
-            ("src/daily_policy.rs", "src/daily_policy.figures"),
-        ] {
-            let source = std::fs::read_to_string(root.join(policy)).unwrap();
-            let derived = allowit_core::policy_source::derive(&source).unwrap();
-            let named: String = derived
-                .figures
-                .iter()
-                .map(|f| format!("{}\n", f.key))
-                .collect();
-            assert_eq!(
-                std::fs::read_to_string(root.join(figures)).unwrap(),
-                named,
-                "{policy}"
-            );
+        for stem in ["policy/policy", "src/catching_policy", "src/daily_policy"] {
+            let source = std::fs::read_to_string(root.join(format!("{stem}.rs"))).unwrap();
+            let (parts, inputs) = crate::policy::custom_build_inputs(&source).unwrap();
+            assert!(!parts.server_part, "{stem}");
+            for (name, bytes) in inputs {
+                let ext = name.rsplit('.').next().unwrap();
+                let committed = std::fs::read(root.join(format!("{stem}.{ext}"))).unwrap();
+                assert_eq!(committed, bytes, "{stem}.{ext}");
+            }
         }
     }
 
@@ -449,6 +427,7 @@ mod tests {
                     }
                 } else if name == "Cargo.toml"
                     || name.ends_with(".figures")
+                    || name.ends_with(".state")
                     || name.ends_with(".rs") && !name.ends_with("tests.rs")
                 {
                     found.push(path);
@@ -463,7 +442,14 @@ mod tests {
         ] {
             walk(&root, member, &mut expected);
         }
-        expected.retain(|path| path != POLICY_SOURCE && path != POLICY_FIGURES);
+        // The committed tree's own build inputs: the build writes each of them again from the
+        // owner's source.
+        const POLICY_INPUTS: [&str; 3] = ["policy.rs", "policy.figures", "policy.state"];
+        expected.retain(|path| {
+            !POLICY_INPUTS
+                .iter()
+                .any(|name| *path == format!("{POLICY_DIR}/{name}"))
+        });
         expected.sort();
         let mut embedded: Vec<String> = TREE.iter().map(|(path, _)| (*path).to_owned()).collect();
         embedded.sort();

@@ -118,27 +118,26 @@ construct listed in [One portable policy source](architecture.md#one-portable-po
 as macros other than the assertion and `matches!` macros, writes to `ctx.env`, the map inside params
 and args, list methods, indexing other than `ctx.params[key]` and pointer-width methods. A Simple or
 Common wallet stores no policy state, so the tool rejects such a source that calls
-`allowit::set_state`; a Custom source keeps the state entries that its build declares. It also runs the std-only
+`allowit::set_state`; a Custom source keeps the state keys that Core's derivation gives the chain. It also runs the std-only
 compile described there, so it needs `rustc`. For `--tier custom`, also build the
 reviewed custom Wasm from the same file, which is the Soroban compile:
 
 ```sh
-scripts/build-custom-policy.sh POLICY.rs FIGURES OUT_DIR
+scripts/build-custom-policy.sh SOURCE.rs OUT_DIR
 ```
 
-The script builds the committed tree with `POLICY.rs` as `contracts/allowit-custom-policy/policy/policy.rs`
-and `FIGURES` as `policy/policy.figures`, and leaves the checkout unchanged. `FIGURES` holds the keys
-of the figures that Core's derivation names for `POLICY.rs`, one per line; the committed policy has
-its own (`contracts/allowit-custom-policy/policy/policy.figures`). This form builds a source that is
-its own on-chain part. For a source with a server part, `POLICY.rs` is the on-chain part that Core
-derives from it, and the owner's source follows as the fourth argument, whose hash the contract
-embeds:
+`SOURCE.rs` is the owner's one source. The script builds a copy of the committed tree and leaves the
+checkout unchanged. `allowit-stellar-admin custom-build-inputs SOURCE.rs DIR` writes the build inputs
+into the copy, as the build hook does: the on-chain part that Core derives (`policy.rs`), the keys of
+its figures (`policy.figures`), the state keys that the contract keeps (`policy.state`) and, for a
+source with a server part, the source itself (`source.rs`). No input comes from anywhere else. The
+script prints one JSON line with `source_digest` (the SHA-256 of `SOURCE.rs`, the wallet's
+`source_hash`), `wasm_hash` (the SHA-256 of the Wasm, the `--wasm-hash`) and the `wasm` path. The same
+revision, source, Rust toolchain and Stellar CLI give the same Wasm.
 
-```sh
-scripts/build-custom-policy.sh ONCHAIN.rs FIGURES OUT_DIR SOURCE.rs
-``` It prints one JSON line with `source_digest` (the SHA-256 of
-`POLICY.rs`, the wallet's `source_hash`), `wasm_hash` (the SHA-256 of the Wasm, the `--wasm-hash`)
-and the `wasm` path. The same revision, source, Rust toolchain and Stellar CLI give the same Wasm.
+For a Custom source with a server part, the owner packet check compiles nothing: the server compiles
+the whole source with the host calls that it links, and the contract's build compiles the on-chain
+part.
 
 An owner builds the Wasm of a Custom policy with `allowit policy build`, which runs the same build through the
 rail's build hook ([Custom wallet build](../crates/allowit-stellar/README.md#custom-wallet-build)). The script

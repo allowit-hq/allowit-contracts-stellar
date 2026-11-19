@@ -654,6 +654,11 @@ pub struct CustomParts {
     /// (`Derived::figures`): the wallet keeps those, and the server evaluates the whole source
     /// on the wallet's values of them.
     pub figures: Vec<&'static str>,
+    /// The deterministic checks that the on-chain part keeps, in source order (`Derived::kept`).
+    pub kept: Vec<String>,
+    /// The state entries that the contract stores: Core's keys whose keeper is the chain
+    /// (`Derived::state`), with the storage key of each (`state_keys::entries`).
+    pub stored: Vec<crate::state_keys::StateEntry>,
     /// The state keys that the server keeps, sorted. The contract never stores them, and this
     /// rail neither reads nor stores them: the snapshot of a wallet holds only the contract's
     /// entries. The host's evaluator gives their values to the evaluation and keeps the
@@ -670,23 +675,62 @@ pub struct CustomParts {
 pub fn custom_parts(source: &str) -> Result<CustomParts> {
     let derived = allowit_core::policy_source::derive(source)?;
     let server_part = derived.source != source;
-    // The contract compiles the on-chain part, so that part passes the portable gate and its
-    // build's own scan of state keys.
+    // The contract compiles the on-chain part, so that part passes the portable gate, and it
+    // stores the keys that Core gives the chain.
     let mut shape = source_shape(&derived.source)?;
     shape.canonical_only &= !server_part;
-    crate::custom_state_entries(&derived.source)?;
+    use allowit_core::policy_source::Keeper;
+    let stored = crate::state_keys::entries(
+        derived
+            .state
+            .iter()
+            .filter(|entry| entry.keeper == Keeper::Chain)
+            .map(|entry| (entry.key.as_str(), entry.daily)),
+        |name| crate::hash(name),
+    )?;
     Ok(CustomParts {
         server_part,
         shape,
         figures: derived.figures.iter().map(|figure| figure.key).collect(),
+        kept: derived.kept.clone(),
+        stored,
         server_keys: derived
             .state
             .into_iter()
-            .filter(|entry| entry.keeper == allowit_core::policy_source::Keeper::Server)
+            .filter(|entry| entry.keeper == Keeper::Server)
             .map(|entry| entry.key)
             .collect(),
         onchain: derived.source,
     })
+}
+/// One build input of the Custom wallet contract: its file name in the policy folder and its bytes.
+pub type BuildInput = (&'static str, Vec<u8>);
+/// The files that the Custom wallet contract builds from, beside `policy/policy.rs` in
+/// `contracts/allowit-custom-policy/policy/`, for the owner's `source`: the on-chain part
+/// (`policy.rs`), the keys of its figures (`policy.figures`), the state keys that the contract
+/// keeps (`policy.state`) and, when the part differs from the source, the source itself
+/// (`source.rs`), whose hash the contract embeds. Everything in them comes from Core's derivation;
+/// the build hook and `scripts/build-custom-policy.sh` both write these files.
+pub fn custom_build_inputs(source: &str) -> Result<(CustomParts, Vec<BuildInput>)> {
+    let parts = custom_parts(source)?;
+    let figures: String = parts.figures.iter().map(|key| format!("{key}\n")).collect();
+    let state: String = parts
+        .stored
+        .iter()
+        .map(|entry| {
+            let life = if entry.daily { "daily" } else { "lasting" };
+            format!("{} {life}\n", entry.name)
+        })
+        .collect();
+    let mut files = vec![
+        ("policy.rs", parts.onchain.clone().into_bytes()),
+        ("policy.figures", figures.into_bytes()),
+        ("policy.state", state.into_bytes()),
+    ];
+    if parts.server_part {
+        files.push(("source.rs", source.as_bytes().to_vec()));
+    }
+    Ok((parts, files))
 }
 /// The checked shape of the source of a policy wallet of `tier`. The contract of a Simple or
 /// Common wallet runs canonical rules of portable source. The contract of a Custom wallet

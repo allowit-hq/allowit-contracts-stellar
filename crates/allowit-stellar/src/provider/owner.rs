@@ -312,7 +312,7 @@ impl OwnerProvider for Owner {
             })
             .ok_or_else(|| Error::config("The policy names no wallet kind"))?;
         let (rules, evidence_functions) = source_calls(&policy.code);
-        Ok(owner::PairedExport::of(
+        let mut export = owner::PairedExport::of(
             policy.id.clone(),
             policy.network.clone(),
             kind,
@@ -333,7 +333,24 @@ impl OwnerProvider for Owner {
                         .map_err(crate::provider::failure)
                 })
                 .collect::<Result<_>>()?,
-        ))
+        );
+        on_chain_placement(&mut export, &policy.code);
+        Ok(export)
+    }
+}
+/// The native placement of a Custom wallet whose source has a server part: the contract compiles
+/// the on-chain part that Core derives, so the placement holds that part and only the rules that
+/// it keeps (`Derived::kept`). The host placement keeps the whole source and all its rules.
+fn on_chain_placement(export: &mut owner::PairedExport, source: &str) {
+    if export.native.wallet_kind != allowit_core::vendor::kinds::WalletKind::Custom {
+        return;
+    }
+    if let Some(parts) = crate::policy::custom_parts(source)
+        .ok()
+        .filter(|parts| parts.server_part)
+    {
+        export.native.rules.retain(|rule| parts.kept.contains(rule));
+        export.native.source = Some(parts.onchain);
     }
 }
 /// One token of policy source that a call can consist of.
@@ -475,6 +492,40 @@ fn source_calls(source: &str) -> (Vec<String>, Vec<String>) {
 #[cfg(test)]
 mod paired_export_tests {
     use super::*;
+    /// The native placement of a split Custom source is Core's on-chain part with the rules that
+    /// it keeps: a call limit in a branch of a server decision runs only on the server. The host
+    /// placement keeps the whole source and every rule.
+    #[test]
+    fn a_split_custom_export_places_the_on_chain_part_natively() {
+        const ONE: &str = "use allowit::prelude::*;\nuse allowit::AllowitDecision;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::payment_limit(ctx, &ctx.params[allowit::PAYMENT_LIMIT])?;\n    let score = allowit::decision(ctx, &AllowitDecision { id: \"research\", query: \"Is this research?\", deny_below: 3000, allow_above: 8000 })?;\n    if score < 9000 {\n        allowit::call_limit(ctx, &ctx.params[allowit::CALL_LIMIT])?;\n    }\n    Ok(())\n}\n";
+        let (rules, evidence) = source_calls(ONE);
+        assert_eq!(rules, ["payment_limit", "call_limit"]);
+        let export = |kind| {
+            let mut export = owner::PairedExport::of(
+                "p".into(),
+                "stellar:testnet".into(),
+                kind,
+                ONE.into(),
+                "h".into(),
+                rules.clone(),
+                vec![],
+                evidence.clone(),
+                Default::default(),
+            );
+            on_chain_placement(&mut export, ONE);
+            export
+        };
+        let custom = export(allowit_core::vendor::kinds::WalletKind::Custom);
+        let onchain = crate::policy::custom_parts(ONE).unwrap().onchain;
+        assert!(!onchain.contains("call_limit"));
+        assert_eq!(custom.native.source.as_deref(), Some(onchain.as_str()));
+        assert_eq!(custom.native.rules, ["payment_limit"]);
+        assert_eq!(custom.host.source, ONE);
+        assert_eq!(custom.host.rules, ["payment_limit", "call_limit"]);
+        // Another kind keeps Core's placement as it is.
+        let simple = export(allowit_core::vendor::kinds::WalletKind::Simple);
+        assert!(simple.native.source.is_none() && simple.native.rules.is_empty());
+    }
     #[test]
     fn source_calls_lists_rules_and_evidence_functions_in_source_order() {
         let source = "use allowit::prelude::*;\n// allowit::call_limit(ctx) in a comment\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    let operation = allowit::operations(ctx, &ctx.params[allowit::OPERATIONS].ok())?;\n    allowit::tokens(ctx, &ctx.params[allowit::TOKENS].ok())?;\n    let report = catalog::report (ctx, 1)?;\n    allowit::tokens(ctx, &ctx.params[allowit::TOKENS].ok())?;\n    let output: Address = ctx.params[SWAP_TOKEN].ok();\n    let x = Some(output);\n    allowit::payment_limit(ctx, &ctx.params[REPORT_LIMIT].ok())?;\n    Ok(())\n}\n";
