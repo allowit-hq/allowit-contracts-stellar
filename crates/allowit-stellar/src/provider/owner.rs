@@ -182,6 +182,20 @@ impl OwnerProvider for Owner {
         // its canonical id, whichever alias the caller selected: the server's templates and the
         // identity of a resumed request then name the same network.
         let network = crate::host::routing::normalize(cx.network)?;
+        // The caller's own values are checked first: a setup that must fail asks the owner for
+        // no sign-in, opens no journal and asks the server nothing. The wallet asset is checked
+        // after the server's template names it.
+        let request = |asset| SetupRequest {
+            network: network.into(),
+            owner: cx.signer.address().into(),
+            agent: r.agent.into(),
+            server: r.server.into(),
+            request_id: r.request_id.into(),
+            fee_per_operation,
+            asset,
+            funding,
+        };
+        request(None).validate()?;
         // The server's template of the network names the asset that the wallet holds. It is
         // read before anything is signed for the ledger, so a server that offers no wallet on
         // this network stops the setup before an account exists. A request that the store
@@ -197,16 +211,7 @@ impl OwnerProvider for Owner {
                 (asset, Some(client))
             }
         };
-        let request = SetupRequest {
-            network: network.into(),
-            owner: cx.signer.address().into(),
-            agent: r.agent.into(),
-            server: r.server.into(),
-            request_id: r.request_id.into(),
-            fee_per_operation,
-            asset,
-            funding,
-        };
+        let request = request(asset);
         request.validate()?;
         let mut configured = workflow::configure_native(
             &runtime(cx.rpc_url)?,
@@ -466,5 +471,74 @@ mod storage_boundary_tests {
             error.message,
             "The request file must contain a JSON object."
         );
+    }
+    /// A setup with an invalid value of the caller fails before the journal opens, before the
+    /// owner signs a sign-in and before the server is asked: the store and the signer of this
+    /// test panic when they are used, and the server origin answers nothing.
+    #[test]
+    fn an_invalid_setup_fails_before_the_journal_the_sign_in_and_the_server() {
+        struct Owner(String);
+        impl crate::host::Signer for Owner {
+            fn network(&self) -> &str {
+                "stellar:testnet"
+            }
+            fn address(&self) -> &str {
+                &self.0
+            }
+            fn sign_hash(&self, _: &[u8]) -> Result<Vec<u8>> {
+                panic!("an invalid setup requested a signature")
+            }
+        }
+        let server = crate::account_for_seed(&[13; 32]);
+        let authority = crate::host::config::ServerAuthority::validated(
+            "stellar:testnet",
+            "http://localhost:3000",
+            &server,
+        )
+        .unwrap();
+        let signer = Owner(crate::account_for_seed(&[11; 32]));
+        let agent = crate::account_for_seed(&[12; 32]);
+        let setup = |network: &'static str, agent: &str, request_id: &str, amount: Option<&str>| {
+            let context = Context {
+                network,
+                backend: authority.origin(),
+                authority: &authority,
+                origin: "http://localhost:5173",
+                rpc_url: "invalid",
+                store: &|| panic!("an invalid setup requested a journal"),
+                signer: &signer,
+                clock: &|| Ok(1),
+            };
+            OWNER
+                .setup(
+                    &context,
+                    owner::Setup {
+                        agent,
+                        server: &server,
+                        request_id,
+                        fee_per_operation: "100",
+                        amount,
+                    },
+                )
+                .unwrap_err()
+                .message
+        };
+        for network in ["stellar:testnet", "stellar:pubnet", "stellar:mainnet"] {
+            assert_eq!(
+                setup(network, "GAGENT", "setup-invalid-001", None),
+                "Expected canonical Stellar G account",
+                "{network}"
+            );
+            assert_eq!(
+                setup(network, &agent, "bad id", None),
+                "Invalid Stellar setup request ID",
+                "{network}"
+            );
+            assert_eq!(
+                setup(network, &agent, "setup-invalid-001", Some("0")),
+                "Asset amount exceeds the supported positive range",
+                "{network}"
+            );
+        }
     }
 }
