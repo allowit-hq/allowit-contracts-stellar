@@ -2469,6 +2469,65 @@ fn native_preflight_binds_new_signing_and_json_cannot_restore_it() {
         assert!(sign(&changed, &[2; 32], 86401).is_err(), "{change}");
     }
 }
+/// A Custom wallet whose source has a server part. Its contract compiles only the on-chain part,
+/// so the server signs after it evaluated the whole source: without its evaluator it does not
+/// sign, a denial of the evaluator is its denial, and a pass signs. The wallet keeps the figures
+/// that its on-chain part reads, so an execution needs the server's accounting of the others.
+#[test]
+fn a_custom_wallet_with_a_server_part_signs_only_after_the_servers_evaluation() {
+    let mut rpc = preflight_fixture();
+    let one = PORTABLE.replace(
+        "    Ok(())\n}",
+        "    let score = allowit::decision(ctx, &allowit::AllowitDecision { id: \"research\", query: \"Is this payment for research?\", deny_below: 3000, allow_above: 8000 })?;\n    allowit::set_state(ctx, \"last_score\", score)?;\n    Ok(())\n}",
+    );
+    assert_ne!(one, PORTABLE);
+    let parts = policy::custom_parts(&one).unwrap();
+    assert!(parts.server_part && parts.onchain == PORTABLE);
+    assert_eq!(parts.server_keys, ["last_score"]);
+    rpc.base.config.source_hash = hash(&one);
+    rpc.base.config.source_digest = rpc.base.config.source_hash;
+    rpc.base.config.policy_source = one;
+    let c = rpc.base.config.clone();
+    assert_eq!(kept_figures(&c), 0);
+    assert!(
+        rpc::prepare(&rpc, &c, &rpc.request, None, 86401, 86700)
+            .unwrap_err()
+            .contains("needs the server's accounting")
+    );
+    let accounting = rpc::NativeAccounting {
+        nonce: 0,
+        deployment_version: 0,
+        spent_daily: 0,
+        spent_total: 0,
+        spent_day: 1,
+        volume_daily: 0,
+        unpriced_total: false,
+        unpriced_daily: false,
+        calls: 0,
+    };
+    let p = rpc::prepare(&rpc, &c, &rpc.request, Some(accounting), 86401, 86700).unwrap();
+    assert_eq!(
+        authorize_server(&p, &[3; 32], 86401, None).unwrap_err(),
+        policy::NEEDS_SERVER_EVALUATION
+    );
+    let deny: policy::PortableEvaluator = &|_| Err(allowit_core::AllowitError::Unsupported);
+    assert!(
+        authorize_server_with(&p, &[3; 32], 86401, deny)
+            .unwrap_err()
+            .contains("denied")
+    );
+    // The server part writes its own key: the server keeps it, and the wallet's build does
+    // not declare it.
+    let pass: policy::PortableEvaluator =
+        &|ctx| allowit_core::set_state(ctx, "last_score", 9_000u32);
+    authorize_server_with(&p, &[3; 32], 86401, pass).unwrap();
+    let stray: policy::PortableEvaluator = &|ctx| allowit_core::set_state(ctx, "other", 1u32);
+    assert!(
+        authorize_server_with(&p, &[3; 32], 86401, stray)
+            .unwrap_err()
+            .contains("does not declare")
+    );
+}
 #[test]
 fn local_revalidation_preserves_existing_unsigned_identity_and_checks_current_authority() {
     let rpc = preflight_fixture();
@@ -2802,6 +2861,78 @@ fn a_simple_wallet_reads_the_daily_volume_and_unpriced_flags_from_the_servers_ac
     ] {
         assert_eq!(yesterday[key], value, "{key}");
     }
+}
+
+/// A Custom wallet whose on-chain part keeps the daily spending figure, while its daily volume
+/// rule runs only on the server. The wallet gives the figures that Core names for its on-chain
+/// part, the daily spending and the daily unpriced flag, and the server's accounting gives the
+/// daily volume.
+#[test]
+fn a_split_custom_wallet_gives_the_figures_that_core_names_from_the_wallet() {
+    let (mut c, r, s) = fixture(WalletRoute::PolicyWallet, true);
+    install(
+        &mut c,
+        PolicyTier::Custom,
+        "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::daily_spending_limit(ctx, &ctx.params[allowit::DAILY_SPENDING_LIMIT])?;\n    let score = allowit::decision(ctx, &allowit::AllowitDecision { id: \"a\", query: \"Is this research?\", deny_below: 1, allow_above: 2 })?;\n    if score < 9000 {\n        allowit::daily_volume_limit(ctx, &ctx.params[allowit::DAILY_VOLUME_LIMIT])?;\n    }\n    Ok(())\n}\n",
+        json!({"daily_spending_limit": 100, "daily_volume_limit": 100}),
+    );
+    assert_eq!(kept_figures(&c), 4);
+    let rpc = preflight_rpc(&c, &r, &s);
+    let now = 86_401;
+    let figures = |unpriced_daily: bool| {
+        rpc::trusted_state(
+            &rpc,
+            &c,
+            Some(rpc::NativeAccounting {
+                spent_daily: 3,
+                spent_day: now / 86_400,
+                volume_daily: 9,
+                unpriced_daily,
+                ..server_accounting()
+            }),
+        )
+        .unwrap()
+        .policy_wallet_state(&c, now)
+        .unwrap()
+        .0
+    };
+    let marked = figures(true);
+    // The wallet's daily window is not open: its own figures read as zero and false, also when
+    // the server's accounting marks its own day. The volume is the server's.
+    assert_eq!(marked["day_spent"], PolicyValue::Int(0));
+    assert_eq!(marked["day_total"], PolicyValue::Int(9));
+    assert_eq!(marked["day_unpriced"], PolicyValue::Bool(false));
+    assert_eq!(figures(false), marked);
+}
+
+/// A Custom wallet whose on-chain part reads four figures directly, while only the server reads
+/// the lifetime unpriced flag. Every wallet entry is kept, yet Core leaves the flag to the
+/// server: the server's accounting gives it, so an execution needs that accounting.
+#[test]
+fn a_split_custom_wallet_takes_from_the_server_a_figure_that_core_leaves_to_it() {
+    let (mut c, r, s) = fixture(WalletRoute::PolicyWallet, true);
+    install(
+        &mut c,
+        PolicyTier::Custom,
+        "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    let calls: u64 = allowit::get_state(ctx, \"calls\")?.unwrap_or(0);\n    let spent: i128 = allowit::get_state(ctx, \"spent\")?.unwrap_or(0);\n    let day_spent: i128 = allowit::get_state(ctx, \"day_spent\")?.unwrap_or(0);\n    let day_total: i128 = allowit::get_state(ctx, \"day_total\")?.unwrap_or(0);\n    assert!(calls < 1_000 && spent < 1_000_000 && day_spent < 1_000 && day_total < 1_000);\n    let score = allowit::decision(ctx, &allowit::AllowitDecision { id: \"a\", query: \"Is this research?\", deny_below: 1, allow_above: 2 })?;\n    if score < 9000 {\n        let unpriced: bool = allowit::get_state(ctx, \"unpriced\")?.unwrap_or(false);\n        assert!(!unpriced);\n    }\n    Ok(())\n}\n",
+        json!({}),
+    );
+    assert_eq!(kept_figures(&c), allowit_stellar::packed::ALL);
+    assert!(!allowit_stellar::wallet_gives_every_figure(&c));
+    let rpc = preflight_rpc(&c, &r, &s);
+    let state = rpc::trusted_state(
+        &rpc,
+        &c,
+        Some(rpc::NativeAccounting {
+            unpriced_total: true,
+            ..server_accounting()
+        }),
+    )
+    .unwrap()
+    .policy_wallet_state(&c, 86_401)
+    .unwrap()
+    .0;
+    assert_eq!(state["unpriced"], PolicyValue::Bool(true));
 }
 
 #[test]

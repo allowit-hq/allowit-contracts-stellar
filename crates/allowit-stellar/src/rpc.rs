@@ -773,7 +773,7 @@ pub fn revalidate_prepared(
     authorization::server_signature(p, true)?;
     // The server's accounting of the figures that the wallet does not keep is the one that the
     // preparation retained; the ledger gives the rest.
-    let accounting = (crate::kept_figures(&p.config) != packed::ALL).then_some(NativeAccounting {
+    let accounting = (!crate::wallet_gives_every_figure(&p.config)).then_some(NativeAccounting {
         nonce: p.state.nonce,
         deployment_version: p.state.deployment_version,
         spent_daily: p.state.spent_daily,
@@ -1867,15 +1867,17 @@ fn current_wallet_state(
         }
     }
     let figures = figures(rpc, c, ledger)?;
-    // A wallet that keeps every figure needs no account of the server's.
-    let accounting = accounting.filter(|_| crate::kept_figures(c) != packed::ALL);
-    // The server's account of the figures that the wallet does not keep: a Simple wallet keeps
-    // none, a Common wallet those of its rules with params. An execution needs it; discovery
-    // reports the wallet's own figures without it.
-    if require_customer_quorum && accounting.is_none() && crate::kept_figures(c) != packed::ALL {
+    // A wallet that gives every figure needs no account of the server's.
+    let accounting = accounting.filter(|_| !crate::wallet_gives_every_figure(c));
+    // The server's account of the figures that the wallet does not give: a Simple wallet gives
+    // none, a Common wallet those of its rules with params, and a Custom wallet whose source has
+    // a server part the figures that Core names for its on-chain part. The decision is by figure,
+    // not by wallet entry: an entry can hold one figure that the wallet gives and one that it
+    // does not. An execution needs it; discovery reports the
+    // wallet's own figures without it.
+    if require_customer_quorum && accounting.is_none() && !crate::wallet_gives_every_figure(c) {
         return Err(
-            "A Simple or Common wallet needs the server's accounting of the figures that it does not keep"
-                .into(),
+            "This wallet needs the server's accounting of the figures that it does not keep".into(),
         );
     }
     Ok(DiscoveredState {
@@ -1946,8 +1948,8 @@ pub fn figures(rpc: &dyn Rpc, c: &WalletConfig, ledger: u32) -> Result<packed::F
     }
     Ok(figures)
 }
-/// A Custom policy's own state entries at `ledger`: each key that its build declares, read from
-/// its short storage key. A daily entry whose window ended and a persistent entry without a
+/// A Custom policy's own state entries at `ledger`: each key that the build of its on-chain part
+/// declares, read from its short storage key. A daily entry whose window ended and a persistent entry without a
 /// value are absent. Other tiers store none.
 pub fn custom_state(
     rpc: &dyn Rpc,
@@ -1958,7 +1960,7 @@ pub fn custom_state(
     if c.tier != Some(crate::PolicyTier::Custom) {
         return Ok(state);
     }
-    for entry in crate::custom_state_entries(&c.policy_source)? {
+    for entry in crate::custom_wallet_state_entries(&c.policy_source)? {
         let key = LedgerKey::ContractData(LedgerKeyContractData {
             contract: address(&c.wallet)?,
             key: ScVal::U32(entry.key),
@@ -2274,45 +2276,60 @@ mod footprint_tests {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod custom_state_tests {
     use super::*;
-    use crate::state_keys::declared;
 
     const SOURCE: &str = "use allowit::prelude::*;\n/// Count each payment, today and in all.\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    // get_state and set_state in a comment are no calls: set_state(ctx, nothing)\n    let note = \"set_state(ctx, \\\"not_a_key\\\", 1)\";\n    let _ = note;\n    let today: u64 = allowit::get_state(ctx, \"day_payments\")?.unwrap_or(0);\n    let all = allowit::get_state::<u64>(ctx, \"payments\")?.unwrap_or(0);\n    let _spent: i128 = allowit::get_state(ctx, \"spent\")?.unwrap_or(0);\n    allowit::r#set_state(ctx, \"day_payments\", today + 1)?;\n    allowit::set_state(ctx, \"payments\", all + 1)?;\n    Ok(())\n}\n";
 
+    /// Each figure that Core names has its wallet entry; a daily flag alone opens the daily entry.
     #[test]
-    fn the_scan_finds_each_literal_key_and_skips_comments_and_strings() {
-        let (entries, figures) = declared(SOURCE, |name| crate::hash(name)).unwrap();
+    fn each_figure_has_its_wallet_entry() {
+        use crate::state_keys::packed;
+        let all = [
+            "calls",
+            "spent",
+            "unpriced",
+            "day_spent",
+            "day_total",
+            "day_unpriced",
+        ];
+        assert_eq!(packed(all), Ok(packed::ALL));
+        assert_eq!(packed(["unpriced"]), Ok(packed::SPENT));
+        assert_eq!(packed(["day_unpriced"]), Ok(packed::DAY_SPENT));
+        assert_eq!(packed(["day_total", "day_unpriced"]), Ok(packed::DAY_TOTAL));
+        assert_eq!(packed([]), Ok(0));
+        assert!(packed(["day"]).unwrap_err().contains("no figure"));
+    }
+
+    /// The wallet stores the keys that Core gives the chain, each with Stellar's storage key; a
+    /// read of a standard figure stores no entry of the policy's own. Stellar's storage refuses
+    /// a key that is no `Symbol`, a standard figure, more than eight keys and a malformed line of
+    /// a state file.
+    #[test]
+    fn the_wallet_stores_the_keys_that_core_gives_the_chain() {
+        let entries = crate::custom_wallet_state_entries(SOURCE).unwrap();
         let names: Vec<(&str, bool)> = entries.iter().map(|e| (e.name.as_str(), e.daily)).collect();
         assert_eq!(names, [("day_payments", true), ("payments", false)]);
         assert_eq!(entries[0].key, 0x6df2_15e2);
-        // A read of a standard figure keeps that figure: `spent` is figure 1.
-        assert_eq!(figures, 1);
-        for (source, refused) in [
-            ("allowit::set_state(ctx, key, 1)?;", "string literal"),
-            ("allowit::set_state(ctx, \"spent\", 1)?;", "standard figure"),
-            ("allowit::get_state(ctx, \"a-b\")?;", "not 1 to 32"),
-            ("allowit::get_state(ctx, \"\")?;", "not 1 to 32"),
-            ("let s = \"unterminated;", "unterminated"),
-            // A key is the literal alone: an expression that starts with one is no key.
-            (
-                "allowit::get_state(ctx, \"day_spent\".max(\"spent\"))?;",
-                "string literal",
-            ),
-            (
-                "allowit::set_state(ctx, \"note\".to_owned() + \"x\", 1)?;",
-                "string literal",
-            ),
+        let hash = |name: &[u8]| crate::hash(name);
+        for (key, refused) in [
+            ("spent", "no state key"),
+            ("a-b", "no state key"),
+            ("", "no state key"),
+            ("x".repeat(33).leak() as &str, "no state key"),
         ] {
-            let error = declared(source, |name| crate::hash(name)).unwrap_err();
-            assert!(error.contains(refused), "{source}: {error}");
+            let error = crate::state_keys::entries([(key, false)], hash).unwrap_err();
+            assert!(error.contains(refused), "{key}: {error}");
         }
-        let nine: String = (0..9)
-            .map(|i| format!("allowit::set_state(ctx, \"k{i}\", 1)?;\n"))
-            .collect();
+        let nine: Vec<String> = (0..9).map(|i| format!("k{i}")).collect();
         assert!(
-            declared(&nine, |name| crate::hash(name))
+            crate::state_keys::entries(nine.iter().map(|k| (k.as_str(), false)), hash)
                 .unwrap_err()
                 .contains("at most 8")
         );
+        assert_eq!(
+            crate::state_keys::state_file("day_paid daily\nseen lasting\n"),
+            Ok(vec![("day_paid", true), ("seen", false)])
+        );
+        assert!(crate::state_keys::state_file("seen\n").is_err());
     }
 
     #[test]
@@ -2354,7 +2371,7 @@ mod custom_state_tests {
         let mut c = crate::test_support::request_config(crate::WalletRoute::PolicyWallet, false);
         c.tier = Some(crate::PolicyTier::Custom);
         c.policy_source = SOURCE.to_owned();
-        let entries = crate::custom_state_entries(SOURCE).unwrap();
+        let entries = crate::custom_wallet_state_entries(SOURCE).unwrap();
         let mut ledger = std::collections::BTreeMap::new();
         for (entry, raw) in entries.iter().zip([vec![0, 0, 0, 100, 0, 4], vec![0, 14]]) {
             let key = LedgerKeyContractData {

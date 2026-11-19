@@ -113,10 +113,6 @@ fn validate_portable_profile(bundle: &Bundle) -> Result<()> {
             "The portable Stellar profile is missing its source binding",
         ));
     };
-    let shape = crate::provider::source_shape(
-        bundle.config.route == WalletRoute::Native,
-        &bundle.config.policy_source,
-    )?;
     let params_hash = crate::host::authoring::canonical_digest(&portable.params)?;
     if bundle.language.as_deref() != Some("allowit-portable-v1")
         || portable.language != "allowit-portable-v1"
@@ -127,8 +123,13 @@ fn validate_portable_profile(bundle: &Bundle) -> Result<()> {
         || portable.asset.symbol != bundle.config.asset_symbol
         || portable.asset.decimals != 7
         || !portable.unresolved.is_empty()
-        || portable.build.prefix != shape.prefix
-        || portable.build.writes_state != shape.writes_state
+        || !crate::provider::report_matches(
+            bundle.config.route == WalletRoute::Native,
+            bundle.config.tier == Some(crate::PolicyTier::Custom),
+            &bundle.config.policy_source,
+            &portable.build.prefix,
+            portable.build.writes_state,
+        )?
     {
         return Err(Error::config(
             "The portable Stellar descriptor differs from its installed configuration",

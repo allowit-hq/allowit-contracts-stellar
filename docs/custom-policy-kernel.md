@@ -3,25 +3,50 @@
 A Custom wallet is the shared wallet kernel (`crates/policy-wallet`) with one compiled policy. The
 owner writes and signs one policy source. The on-chain policy is derived from it, compiled into the
 contract and run by the kernel on every agent operation. This page states what that compiled
-policy may call, which figures the wallet keeps for it, and how the contract is built.
+policy may call, which figures and state the wallet keeps for it, and how the contract is built.
+
+## One source, two parts
+
+The server evaluates the whole source before it signs. A contract cannot call a server function,
+so the contract compiles the on-chain part: the statements that the chain can check by itself.
+Core derives that part (`allowit_core::policy_source::derive`). It is a pure function of the source
+bytes, so the server and the owner's client build the same code from the same source.
+
+| Source | `policy/policy.rs` | `policy/source.rs` | Server signs |
+| --- | --- | --- | --- |
+| No server part: the on-chain part equals the source | The source | Absent | After the contract's recording simulation |
+| A server part: a server function, owner text read with `as_str()`, or state that the server keeps | The on-chain part | The source | Only after its evaluator passed the whole source |
+
+`policy::custom_parts` gives both parts in the rail. Every place that reads the source of a Custom
+wallet uses it: the build hook, the installation binding, the read of the wallet's state entries,
+the figures that the wallet keeps and the server's evaluation. Core's derivation decides which
+statements only the server runs; this rail keeps no list of server functions of its own. A source
+with a server part is server policy source, which the server checks against the registry of the
+host calls that it links; its on-chain part is portable source that names no server function.
 
 ## Build rule
 
-The contract `contracts/allowit-custom-policy` compiles two files:
+The contract `contracts/allowit-custom-policy` builds from four files, its build inputs. One function
+writes all of them from the owner's source, `policy::custom_build_inputs`, which the build hook
+(`provider/custom_build.rs`) and `scripts/build-custom-policy.sh SOURCE.rs OUT_DIR` (through
+`allowit-stellar-admin custom-build-inputs`) both use. Everything in them comes from Core's
+derivation; the build reads no policy decision from the source itself.
 
-| File | Content | Who writes it |
-| --- | --- | --- |
-| `policy/policy.rs` | The on-chain policy, compiled verbatim as a module | The host builder, or `scripts/build-custom-policy.sh POLICY.rs OUT_DIR [SOURCE.rs]` |
-| `policy/source.rs` | The owner's full source, from which `policy.rs` is derived | The same builder, when the policy is derived. Without it the build treats `policy.rs` as the full source |
+| File | Content |
+| --- | --- |
+| `policy/policy.rs` | The on-chain policy, compiled verbatim as a module |
+| `policy/policy.figures` | The keys of the figures that Core names for the on-chain policy (`Derived::figures`), one per line |
+| `policy/policy.state` | The state keys that Core gives the chain (`Derived::state`), one per line with `daily` or `lasting` |
+| `policy/source.rs` | The owner's full source, when the on-chain part differs from it. Without it the build treats `policy.rs` as the full source |
 
 `build.rs` derives three constants:
 
 - `SOURCE_HASH`: the SHA-256 of `policy/source.rs`, or of `policy/policy.rs` when there is no
   `source.rs`. The owner's policy signature binds this hash. The wallet stores it, and the
   constructor and every `execute` refuse a stored hash that differs from the compiled one.
-- `FIGURES`: the cumulated figures that the compiled policy's checks read (see below).
-- `STATE`: the policy's own state entries, one for each key of its `get_state` and `set_state`
-  calls (see [Policy state](#policy-state)).
+- `FIGURES`: the wallet entries of the figures in `policy/policy.figures` (see below).
+- `STATE`: the policy's own state entries, one for each key in `policy/policy.state` (see
+  [Policy state](#policy-state)).
 
 The build refuses a `policy.rs` that contains `unsafe`, `include!`, `include_str!`,
 `include_bytes!` or `#[path`: the policy is one safe file. Core's source gate
@@ -75,16 +100,22 @@ read them:
 | `day_spent`, `day_unpriced` | `daily_spending_limit` | `d`, temporary |
 | `day_total`, `day_unpriced` | `daily_volume_limit` | `d`, temporary |
 
-`build.rs` finds the figures in the compiled `policy.rs`. It reads whole words and leaves out the
-lines that start with `//`:
+Core's derivation names the figures of the on-chain policy (`Derived::figures`): those of the kept
+canonical rules, and each standard figure that a kept statement reads with `get_state`. The build
+reads their keys from `policy/policy.figures`, and `state_keys::packed` gives each key its entry:
+`spent` and `unpriced` live in `t` with `SPENT`, `calls` in `t` with `CALLS`, `day_spent` and
+`day_total` in `d`, and `day_unpriced` in `d` beside either daily figure. A daily flag without a
+daily figure opens `d` with `day_spent`. The rail reads the same keys from Core
+(`policy::CustomParts::figures`); it finds no figure in the source itself.
 
-- each rule name above keeps its figure;
-- a `get_state` read of a standard figure keeps that figure;
-- any other word that contains `state`, such as `ctx.state`, and the words `preflight`, `RULES`,
-  `AllowitRule`, `AllowitStandardState` and `evaluate`, keep every figure.
-
-A derived policy calls its rules by name and reads its own state through `get_state`, so it keeps
-exactly the figures of its rules. A word in a trailing comment or a string literal can only add a figure.
+A rule that runs only on the server, such as a rule in a branch that depends on a server function,
+is no part of `policy.rs`, so the wallet keeps no figure for it. The server's own accounting gives
+that figure to the server's evaluation: the wallet gives exactly the figures that Core names for the
+on-chain part, and the server's accounting the rest. An execution needs the server's
+accounting whenever the wallet gives fewer than all six standard figures
+(`wallet_gives_every_figure`), as an execution of a Simple or Standard wallet does. The
+two daily figures share one unpriced flag: the wallet gives it when Core names it for the on-chain
+part, and the server's accounting otherwise.
 
 `t` is created by the constructor and paid for 2,073,600 ledgers (the Mainnet minimum lifetime of a
 persistent entry, about 120 days). Nothing extends it; after it lapses, the next operation restores
@@ -105,6 +136,20 @@ A Custom policy can keep its own state when its checks need it. Generation prefe
 state; a figure that a canonical rule already keeps or that the request derives; then the
 smallest packed state. The wallet itself still writes only the figures that the installed checks
 read (`d`, `t`): no receipts and no lifetime paid ahead.
+
+Each key has one keeper, which Core's derivation names (`Derived::state`):
+
+| Keeper | When | Where the value lives |
+| --- | --- | --- |
+| The contract | A statement that uses the key stays in `policy.rs`, and no statement that writes it leaves | In the wallet, as stated below. The server reads it from the wallet when it evaluates the whole source |
+| The server | Any other key: a statement that writes it leaves, or every statement that uses it leaves | With the server. No statement of `policy.rs` names the key, and the wallet never stores it |
+
+This rail neither reads nor stores a key of the server: a wallet's snapshot holds only the
+contract's entries. The host's evaluator gives the server's values to the evaluation and keeps the
+values that an admitted operation wrote, with that operation's settlement
+(`policy::CustomParts::server_keys`).
+
+The rest of this section is about the keys that the contract keeps: the keys of `policy.rs`.
 
 ### Calls
 
@@ -131,20 +176,22 @@ pub fn execute(ctx: &AllowitContext) -> allowit::Result {
 
 ### Keys
 
-The build reads every `get_state` and `set_state` call of `policy.rs`:
+Core's derivation names each key of the policy's own state and its keeper, and it refuses a key
+that is not a string literal of 1 to 32 ASCII letters, digits or `_`, and a write of a standard
+figure. The build reads the keys that Core gives the chain from `policy/policy.state`, and
+`state_keys::entries` applies Stellar's storage to them:
 
 | Rule | Build result |
 | --- | --- |
-| The key is a string literal of 1 to 32 ASCII letters, digits or `_` | The key is declared |
-| The key is anything else: a variable, a format, a call | The build stops: the wallet must know each key before it runs |
-| The key names a standard figure in `set_state` | The build stops |
+| The key is a `Symbol`: 1 to 32 ASCII letters, digits or `_` | The key gets its storage key |
+| The key names a standard figure | The build stops |
 | More than 8 distinct keys | The build stops |
 | Two keys whose storage keys are equal | The build stops; rename one |
 
-A call in a comment or in a string literal is no call. The scan is
-`contracts/allowit-custom-policy/state_keys.rs`; the rail's server evaluation runs the same file on
-the installed source, reads each declared entry with the same lifetimes and evaluates the policy
-with the Custom post-flight, so the server decides with the state that the wallet holds.
+The rail's server evaluation reads the same Core output through the same file
+(`contracts/allowit-custom-policy/state_keys.rs`), reads each entry with the same lifetimes and
+evaluates the policy with the Custom post-flight, so the server decides with the state that the
+wallet holds. A write of a key that neither the contract nor the server keeps is refused.
 
 The wallet never stores the key name. The storage key of an entry is a `u32`: the first four bytes
 of the SHA-256 of the name, big-endian. The same name keeps the same storage key across source

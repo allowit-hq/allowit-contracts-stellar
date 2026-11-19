@@ -402,8 +402,11 @@ pub fn host_compile(path: &str) -> Result<()> {
 }
 
 /// Bind an owner packet to its authored source. Every tier requires one self-contained file that
-/// binds `allowit` only to the canonical crate and passes `compile`, the std-only compile of the
-/// offchain server. Common binds the source's standard prefix; Simple and Custom bind none.
+/// binds `allowit` only to the canonical crate. A source that the contract compiles whole passes
+/// `compile`, the std-only compile of the offchain server. For a Custom source with a server part
+/// this tool selects the on-chain part that Core derives and binds the owner's source: the server
+/// compiles and checks the whole source with the registry of the host calls that it links, and
+/// the contract's own build compiles the on-chain part. Common binds the source's standard prefix; Simple and Custom bind none.
 /// Custom also binds the source bytes. Returns the warning for prefix rules without a param.
 pub fn policy_rules(
     value: &Value,
@@ -420,8 +423,14 @@ pub fn policy_rules(
     };
     let bytes = std::fs::read(path).map_err(|_| "Cannot read the policy source")?;
     let source = std::str::from_utf8(&bytes).map_err(|_| "Policy source is not UTF-8")?;
-    let shape = policy::source_shape(source)?;
-    compile(path)?;
+    let shape = policy::wallet_shape(tier, source)?;
+    // A source that the contract compiles whole passes the server's std-only compile here. A
+    // Custom source with a server part is compiled whole by the server, which links its host
+    // calls, and in part by the contract's build.
+    let split = tier == PolicyTier::Custom && policy::custom_parts(source)?.server_part;
+    if !split {
+        compile(path)?;
+    }
     let expected = if tier == PolicyTier::Common {
         shape.prefix
     } else {
@@ -441,7 +450,7 @@ pub fn policy_rules(
     // Simple and Common store only standard state, so their server denies every policy write. A
     // Custom wallet keeps the state entries that its build declares.
     if tier == PolicyTier::Custom {
-        allowit_stellar::custom_state_entries(source)?;
+        allowit_stellar::custom_wallet_state_entries(source)?;
     } else if shape.writes_state {
         return Err(policy::WRITES_STATE.into());
     }

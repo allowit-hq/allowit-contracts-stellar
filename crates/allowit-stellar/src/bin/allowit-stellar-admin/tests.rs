@@ -663,3 +663,37 @@ fn agent_wallet_actions_verify_the_exact_profile_and_prepare_one_owner_transacti
         .is_err()
     );
 }
+
+/// The build inputs that the admin tool writes for `scripts/build-custom-policy.sh` are the build
+/// hook's: the on-chain part, its figures and state keys, and the owner's source of a split policy.
+#[test]
+fn custom_build_inputs_writes_what_core_derives() {
+    const ONE: &str = "use allowit::prelude::*;\nuse allowit::AllowitDecision;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::daily_spending_limit(ctx, &ctx.params[allowit::DAILY_SPENDING_LIMIT])?;\n    let question: String = allowit::param(ctx, \"question\");\n    allowit::decision(ctx, &AllowitDecision { id: \"research\", query: question.as_str(), deny_below: 3000, allow_above: 8000 })?;\n    Ok(())\n}\n";
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("owner.rs");
+    std::fs::write(&source, ONE).unwrap();
+    let out = directory.path().join("policy");
+    std::fs::create_dir(&out).unwrap();
+    custom_build_inputs(source.to_str().unwrap(), out.to_str().unwrap()).unwrap();
+    let (parts, inputs) = allowit_stellar::policy::custom_build_inputs(ONE).unwrap();
+    assert!(parts.server_part);
+    assert_eq!(inputs.len(), 4);
+    for (name, bytes) in inputs {
+        assert_eq!(std::fs::read(out.join(name)).unwrap(), bytes, "{name}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(out.join("policy.figures")).unwrap(),
+        "day_spent\nday_unpriced\n"
+    );
+    // The same folder for a source without a server part: the earlier owner source goes, so the
+    // contract hashes the new source.
+    let plain = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::payment_limit(ctx, &ctx.params[allowit::PAYMENT_LIMIT])?;\n    Ok(())\n}\n";
+    std::fs::write(&source, plain).unwrap();
+    custom_build_inputs(source.to_str().unwrap(), out.to_str().unwrap()).unwrap();
+    assert!(!out.join("source.rs").exists());
+    assert_eq!(
+        std::fs::read_to_string(out.join("policy.rs")).unwrap(),
+        plain
+    );
+    assert!(custom_build_inputs("/nonexistent/owner.rs", out.to_str().unwrap()).is_err());
+}

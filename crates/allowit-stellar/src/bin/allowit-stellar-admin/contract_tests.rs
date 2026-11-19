@@ -319,6 +319,56 @@ fn owner_packets_pass_the_std_only_compile_of_the_offchain_server() {
     }
 }
 
+/// A Custom wallet's source with a server part: the owner packet path type-checks the whole
+/// source, which the server evaluates, and then the on-chain part, which the contract compiles.
+/// A source that is its own on-chain part is checked once.
+#[test]
+fn a_custom_owner_packet_with_a_server_part_leaves_the_compile_to_the_server_and_the_build() {
+    const ONE: &str = "use allowit::prelude::*;\nuse allowit::AllowitDecision;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::payment_limit(ctx, &ctx.params[allowit::PAYMENT_LIMIT])?;\n    let question: String = allowit::param(ctx, \"question\");\n    allowit::decision(ctx, &AllowitDecision { id: \"research\", query: question.as_str(), deny_below: 3000, allow_above: 8000 })?;\n    Ok(())\n}\n";
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("policy.rs");
+    std::fs::write(&path, ONE).unwrap();
+    let packet =
+        json!({"rules": [], "source_hash": allowit_stellar::hex(&allowit_stellar::hash(ONE))});
+    let seen = std::cell::RefCell::new(Vec::new());
+    let record = |file: &str| -> Result<()> {
+        seen.borrow_mut()
+            .push(std::fs::read_to_string(file).unwrap());
+        Ok(())
+    };
+    policy_rules(&packet, Some("custom"), path.to_str(), &record).unwrap();
+    let onchain = allowit_stellar::policy::custom_parts(ONE).unwrap().onchain;
+    assert!(!onchain.contains("decision") && onchain.contains("payment_limit"));
+    // Nothing is compiled here: the server compiles the whole source, which can call a function
+    // that only it links, such as a function of a policy package that its host registers, and
+    // the contract's build compiles the on-chain part.
+    assert!(seen.borrow().is_empty());
+    let package = ONE.replace(
+        "    let question: String",
+        "    sanctions::screen(ctx, &ctx.request.recipient)?;\n    let question: String",
+    );
+    std::fs::write(&path, &package).unwrap();
+    let packet =
+        json!({"rules": [], "source_hash": allowit_stellar::hex(&allowit_stellar::hash(&package))});
+    policy_rules(&packet, Some("custom"), path.to_str(), &|file: &str| {
+        host_compile(file)
+    })
+    .unwrap();
+    // A source that the contract compiles whole passes the std-only compile.
+    let plain = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::payment_limit(ctx, &ctx.params[allowit::PAYMENT_LIMIT])?;\n    Ok(())\n}\n";
+    std::fs::write(&path, plain).unwrap();
+    let packet =
+        json!({"rules": [], "source_hash": allowit_stellar::hex(&allowit_stellar::hash(plain))});
+    policy_rules(&packet, Some("custom"), path.to_str(), &record).unwrap();
+    assert_eq!(*seen.borrow(), [plain.to_owned()]);
+    let failing = |_: &str| -> Result<()> { Err("std-only compile".into()) };
+    assert!(policy_rules(&packet, Some("custom"), path.to_str(), &failing).is_err());
+    // Another tier holds no server policy source.
+    std::fs::write(&path, &package).unwrap();
+    assert!(policy_rules(&packet, Some("simple"), path.to_str(), &record).is_err());
+    assert_eq!(seen.borrow().len(), 1);
+}
+
 /// `tests/fixtures/policy-source-cases.json` records the std-only compile verdict of the Core
 /// Python helper for sources that the gate tests compiled. Some pass the lexical gate and fail
 /// the compile, such as an address order; the compile is the second guard of an owner packet.

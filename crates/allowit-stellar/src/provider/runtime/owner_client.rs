@@ -619,10 +619,12 @@ fn validate_generated(
 ) -> Result<()> {
     let b = &policy.runtime.instance_binding;
     let d = &b.portable;
-    let shape =
-        crate::provider::source_shape(kind == "owner-wallet", &policy.code).map_err(|_| {
-            Error::uncertain("Returned policy source is outside the portable vocabulary")
-        })?;
+    let shape = crate::provider::source_shape(
+        kind == "owner-wallet",
+        request.profile == "allowit-custom-wallet-v1",
+        &policy.code,
+    )
+    .map_err(|_| Error::uncertain("Returned policy source is outside the portable vocabulary"))?;
     if !crate::host::request::request_id_valid(&policy.id)
         || policy.revision == 0
         || policy.network != network
@@ -645,8 +647,13 @@ fn validate_generated(
         || d.asset.address != policy.mint
         || d.asset.symbol != policy.token
         || d.asset.decimals != 7
-        || d.build.prefix != shape.prefix
-        || d.build.writes_state != shape.writes_state
+        || !crate::provider::report_matches(
+            kind == "owner-wallet",
+            request.profile == "allowit-custom-wallet-v1",
+            &policy.code,
+            &d.build.prefix,
+            d.build.writes_state,
+        )?
         || d.build.attempts == 0
         || d.build.attempts > 3
     {

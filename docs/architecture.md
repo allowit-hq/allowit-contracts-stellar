@@ -12,7 +12,9 @@ a shared checker contract or that contract's parent administrator. Shared checke
 
 `AllowitSimplePolicyEngine` relies on the agent's and the server's signatures and runs no rule onchain. `AllowitCommonPolicyEngine` is
 the standard implementation for an owner-approved initial preflight prefix. `AllowitCustomPolicy`
-compiles a complete authored policy into its contract. All three are built from the same custody
+compiles into its contract the on-chain part that Core derives from the owner's one source: the
+whole source when the derivation leaves it unchanged, and otherwise the statements that the chain
+can check by itself, while the server evaluates the whole source before it co-signs. All three are built from the same custody
 core in `crates/policy-wallet`. The `policy_wallet!` macro attaches the complete owner and
 delegated-execution interface to an `AllowitPolicy` implementation, so Simple, Common and Custom
 expose identical entrypoints and differ only in their `AllowitPolicy` logic.
@@ -33,8 +35,9 @@ so rebuilt Wasm has new module hashes.
 
 ## One portable policy source
 
-Policy source is ordinary synchronous Rust against the portable `allowit` package from Allowit core. The offchain server and
-`AllowitCustomPolicy` compile the file verbatim:
+Policy source is ordinary synchronous Rust against the portable `allowit` package from Allowit core. The offchain server
+compiles the file verbatim, and `AllowitCustomPolicy` compiles its on-chain part verbatim, which is the whole file when
+the derivation leaves it unchanged:
 
 ```rust
 use allowit::prelude::*;
@@ -163,8 +166,9 @@ compiles:
   `for item in items` binds an owned item on both backends, also when `items` borrows from
   `ctx.params[key]`, and a dereference `*item` fails both compiles. It has no slice `Deref`.
   `scripts/policy_source.py` runs this compile in `check-policy-bindings.py`, and
-  so in `scripts/build-contracts.sh`. `allowit-stellar-admin` and `scripts/contract_admin.py` run the
-  same compile for the owner packets of every tier. These tools need `rustc` (from `RUSTC` or `PATH`). The portability test below and the
+  so in `scripts/build-contracts.sh`. `scripts/contract_admin.py` runs the same compile for the owner
+  packets of every tier. `allowit-stellar-admin` runs it too, except for a Custom source with a
+  server part, which the server compiles whole and the contract's build compiles in part. These tools need `rustc` (from `RUSTC` or `PATH`). The portability test below and the
   `policy` job of `.github/workflows/contracts.yml` also compile `scripts/policy-smoke.rs`, which
   includes the branch sources, the same way.
 - The Soroban compile builds the file into `AllowitCustomPolicy`. A host-only item, such as
@@ -359,8 +363,9 @@ owner-written request and returns its passing constraint:
 `decision(ctx, &AllowitDecision { id, query, deny_below, allow_above })` the passing confidence,
 and `new_decision_context(ctx, contents)` nothing: it starts a new decision context, empty or with the optional
 `contents` as its first contents. `id` names the decision call within the policy. Scores and confidences are basis points. There they are
-stubs that return `Unsupported` until the server fills them. A Custom policy that calls one does not
-compile, because the Soroban backend has none of them.
+stubs that return `Unsupported` until the server fills them. The Soroban backend has none of them:
+the contract of a Custom wallet compiles the on-chain part of its source, which names no server
+function ([one source, two parts](custom-policy-kernel.md#one-source-two-parts)).
 
 | Rule and canonical param key | Param value | Pass value |
 | --- | --- | --- |
@@ -426,7 +431,7 @@ Besides a Custom policy's declared state entries, a wallet stores only the cumul
 its checks read:
 spent and calls in the persistent entry `t`, and the day's spent and total in the temporary entry
 `d`. A Standard wallet keeps the figure of each rule that has its param set; a Custom wallet keeps
-the figures that its build finds in its source. With cost bounds a figure counts the conservative
+the figures that Core's derivation names for the on-chain part of its source. With cost bounds a figure counts the conservative
 expense and gas; without them it counts the raw gross and calls and sets the unpriced flag. No
 owner reconciliation or refund method clears a figure. The day is the life of `d`: its first write
 sets its end ledger, one day of ledgers later, and the entry expires with it. The kernel checks the

@@ -96,7 +96,7 @@ fn validate_portable(v: &ApprovalIntent) -> Result<()> {
             "Invalid portable approval language or params hash",
         ));
     }
-    let shape = crate::provider::source_shape(b.route == "native", &v.source)?;
+    let shape = crate::provider::source_shape(b.route == "native", tier == "custom", &v.source)?;
     let policy_tier = match tier.as_str() {
         "standard" if *rules == shape.prefix => PolicyTier::Common,
         "custom" if rules.is_empty() => PolicyTier::Custom,
