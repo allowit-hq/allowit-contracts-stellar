@@ -1,22 +1,29 @@
 name: Project review
+# Reports the maintainers' project review of a pull request head: the commit status
+# allowit-project/review, which the knowledge repository's project-review command posts on that head.
+# The check reads the status when it runs. The merge gate reads the status itself.
 on:
   pull_request:
-permissions:
-  statuses: read
+permissions: {}
 jobs:
   project-review:
     name: Project review
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      statuses: read
     steps:
       - name: Report the maintainers' project review
+        # bash with pipefail: a failed lookup fails the check instead of reading as "no status".
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          status=$(gh api "repos/$REPO/commits/$SHA/statuses" \
-            --jq '[.[] | select(.context == "allowit-project/review")][0] // empty | "\(.state)\t\(.description)"')
+          # The combined status holds the latest status of each context. Every page is read.
+          status=$(gh api --paginate "repos/$REPO/commits/$SHA/status?per_page=100" \
+            --jq '.statuses[] | select(.context == "allowit-project/review") | "\(.state)\t\(.description)"' | sed -n 1p)
           state=${status%%$'\t'*}
           description=${status#*$'\t'}
           case "$state" in
