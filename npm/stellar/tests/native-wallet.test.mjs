@@ -3,7 +3,7 @@ import {createHash} from 'node:crypto';
 import test from 'node:test';
 import {Asset, Keypair, Networks, Operation, TransactionBuilder, Account} from '@stellar/stellar-sdk/base';
 import {
-  APPROVE_POLICY, SET_UP_WALLET, WALLET_FEE_FLOAT, WALLET_RESERVE, approvalMessage, approvalStep, messageDigest,
+  APPROVE_POLICY, SET_UP_WALLET, TRUSTLINE_RESERVE, WALLET_FEE_FLOAT, WALLET_RESERVE, approvalMessage, approvalStep, messageDigest,
   nativeSetupOf, nativeSetupTransaction, nativeWalletConfiguration, policyApproval, prepareNativeSetup, sendNativeSetup, signedNativeSetupOf,
   walletStartingBalance,
 } from '../dist/native-wallet.js';
@@ -85,7 +85,7 @@ test('the setup is one atomic transaction: the account, its three signers, the t
   assert.deepEqual([second.source, second.signer], [wallet, {ed25519PublicKey: roles.agent, weight: 1}]);
   assert.deepEqual([last.source, last.signer, last.masterWeight, last.lowThreshold, last.medThreshold, last.highThreshold],
     [wallet, {ed25519PublicKey: roles.server, weight: 1}, 0, 2, 2, 3]);
-  assert.deepEqual(nativeSetupOf(tx.toXDR(), network), {...roles, wallet, startingBalance: 80_000_000n});
+  assert.deepEqual(nativeSetupOf(tx.toXDR(), network), {...roles, wallet, startingBalance: 80_000_000n, asset: {symbol: 'XLM', issuer: null}, funding: 50_000_000n});
   assert.equal(walletStartingBalance(0n), WALLET_RESERVE + WALLET_FEE_FLOAT);
   assert.throws(() => walletStartingBalance(-1n));
   // The four roles are four accounts, and the request identity and the sequence are bounded.
@@ -93,6 +93,88 @@ test('the setup is one atomic transaction: the account, its three signers, the t
   assert.throws(() => nativeSetupTransaction(terms(wallet, {agent: 'GAGENT'})), /agent account is invalid/);
   assert.throws(() => nativeSetupTransaction(terms(wallet, {requestId: 'short'})));
   assert.throws(() => nativeSetupTransaction(terms(wallet, {sequence: '-1'})));
+});
+
+/** Testnet USDC and Mainnet USDC of the rail's token list. */
+const usdc = {symbol: 'USDC', issuer: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5'};
+const mainnetUsdc = {symbol: 'USDC', issuer: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN'};
+
+test('a wallet of an issued asset adds its trustline and takes its funding in that asset, in the same transaction', () => {
+  const wallet = Keypair.random().publicKey();
+  const tx = nativeSetupTransaction(terms(wallet, {asset: usdc, funding: 100_000n}));
+  assert.equal(tx.source, roles.owner);
+  assert.equal(tx.fee, '600');
+  assert.deepEqual(tx.operations.map(op => op.type), ['createAccount', 'changeTrust', 'payment', 'setOptions', 'setOptions', 'setOptions']);
+  const [create, trust, pay] = tx.operations;
+  // The XLM is the reserve of the account and its trustline and the fee float. The funding is the asset.
+  assert.equal(walletStartingBalance(100_000n, true), WALLET_RESERVE + TRUSTLINE_RESERVE + WALLET_FEE_FLOAT);
+  assert.deepEqual([create.destination, create.startingBalance, create.source], [wallet, '3.5000000', undefined]);
+  assert.deepEqual([trust.source, trust.line.getCode(), trust.line.getIssuer(), trust.limit], [wallet, 'USDC', usdc.issuer, '922337203685.4775807']);
+  // The owner's account, the transaction source, pays the asset to the new account.
+  assert.deepEqual([pay.source, pay.destination, pay.asset.getCode(), pay.asset.getIssuer(), pay.amount], [undefined, wallet, 'USDC', usdc.issuer, '0.0100000']);
+  assert.deepEqual(nativeSetupOf(tx.toXDR(), network), {...roles, wallet, startingBalance: 35_000_000n, asset: usdc, funding: 100_000n});
+  // Without a funding the setup adds the trustline alone.
+  const unfunded = nativeSetupTransaction(terms(wallet, {asset: usdc, funding: 0n}));
+  assert.deepEqual(unfunded.operations.map(op => op.type), ['createAccount', 'changeTrust', 'setOptions', 'setOptions', 'setOptions']);
+  assert.deepEqual(nativeSetupOf(unfunded.toXDR(), network), {...roles, wallet, startingBalance: 35_000_000n, asset: usdc, funding: 0n});
+  // XLM by its name is the wallet of today, with the same bytes.
+  assert.equal(nativeSetupTransaction(terms(wallet, {asset: {symbol: 'XLM', issuer: null}})).toXDR(), nativeSetupTransaction(terms(wallet)).toXDR());
+  for (const asset of [{symbol: 'USDC', issuer: null}, {symbol: 'USDC', issuer: 'GISSUER'}, {symbol: '', issuer: usdc.issuer}, {symbol: 'US DC', issuer: usdc.issuer}, 'USDC', {issuer: usdc.issuer}])
+    assert.throws(() => nativeSetupTransaction(terms(wallet, {asset})), /wallet asset is invalid/, JSON.stringify(asset));
+});
+
+test('a setup that moves another asset, another amount or another XLM balance than its wallet takes is not read as one', () => {
+  const wallet = Keypair.random().publicKey();
+  const build = ops => {
+    const builder = new TransactionBuilder(new Account(roles.owner, '41'), {fee: '100', networkPassphrase: Networks.TESTNET, timebounds: {minTime: 0, maxTime: 2_000_000_000}});
+    for (const op of ops) builder.addOperation(op);
+    return builder.build().toXDR();
+  };
+  const signer = (key, weight) => ({ed25519PublicKey: key, weight});
+  const asset = new Asset(usdc.symbol, usdc.issuer), other = new Asset('EURC', usdc.issuer);
+  const create = (startingBalance = '3.5') => Operation.createAccount({destination: wallet, startingBalance});
+  const trust = (extra = {}) => Operation.changeTrust({source: wallet, asset, ...extra});
+  const pay = (extra = {}) => Operation.payment({destination: wallet, asset, amount: '0.01', ...extra});
+  const signers = [Operation.setOptions({source: wallet, signer: signer(roles.owner, 3)}), Operation.setOptions({source: wallet, signer: signer(roles.agent, 1)}),
+    Operation.setOptions({source: wallet, masterWeight: 0, lowThreshold: 2, medThreshold: 2, highThreshold: 3, signer: signer(roles.server, 1)})];
+  assert.ok(nativeSetupOf(build([create(), trust(), pay(), ...signers]), network));
+  assert.ok(nativeSetupOf(build([create(), trust(), ...signers]), network));
+  for (const [name, ops] of Object.entries({
+    'a payment of another asset': [create(), trust(), pay({asset: other}), ...signers],
+    'a payment of XLM': [create(), trust(), pay({asset: Asset.native()}), ...signers],
+    'a payment to another account': [create(), trust(), pay({destination: roles.agent}), ...signers],
+    'a payment from the new account': [create(), trust(), pay({source: wallet, destination: roles.owner}), ...signers],
+    'two payments': [create(), trust(), pay(), pay(), ...signers],
+    'a payment without a trustline': [create('3'), pay(), ...signers],
+    'a payment before the trustline': [create(), pay(), trust(), ...signers],
+    'a trustline of the owner account': [create(), Operation.changeTrust({asset}), pay(), ...signers],
+    'a trustline with a lower limit': [create(), trust({limit: '100'}), pay(), ...signers],
+    'two trustlines': [create(), trust(), trust({asset: other}), ...signers],
+    'a trustline after the signers': [create(), ...signers, trust()],
+    'more XLM than the reserve and the float': [create('8'), trust(), pay(), ...signers],
+    'less XLM than the reserve of the trustline': [create('3'), trust(), pay(), ...signers],
+    'less XLM than the reserve of the account': [create('2.9'), ...signers],
+  })) assert.equal(nativeSetupOf(build(ops), network), null, name);
+});
+
+test('a setup is built and read for each network of the rail, and its bytes belong to one network', () => {
+  const wallet = Keypair.random().publicKey(), mainnet = 'stellar:pubnet';
+  const tx = nativeSetupTransaction(terms(wallet, {network: mainnet, asset: mainnetUsdc, funding: 100_000n}));
+  assert.equal(tx.networkPassphrase, Networks.PUBLIC);
+  assert.deepEqual(nativeSetupOf(tx.toXDR(), mainnet), {...roles, wallet, startingBalance: 35_000_000n, asset: mainnetUsdc, funding: 100_000n});
+  // The alias names the same network.
+  assert.equal(nativeSetupTransaction(terms(wallet, {network: 'stellar:mainnet', asset: mainnetUsdc, funding: 100_000n})).toXDR(), tx.toXDR());
+  // The same operations on the other network have another hash.
+  const testnet = nativeSetupTransaction(terms(wallet, {asset: mainnetUsdc, funding: 100_000n}));
+  assert.notEqual(hex(testnet.hash()), hex(tx.hash()));
+  assert.throws(() => nativeSetupTransaction(terms(wallet, {network: 'stellar:futurenet'})), /supported Stellar network/);
+  // The document of a Mainnet wallet names the asset by the contract of that network.
+  const configuration = nativeWalletConfiguration(mainnet, wallet, roles.owner, roles.agent, roles.server, mainnetUsdc);
+  assert.deepEqual([configuration.network, configuration.asset, configuration.assetSymbol, configuration.assetIssuer],
+    [mainnet, 'CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75', 'USDC', mainnetUsdc.issuer]);
+  assert.deepEqual(configuration.params.tokens, {List: [{Addr: configuration.asset}]});
+  assert.notEqual(nativeWalletConfiguration(network, wallet, roles.owner, roles.agent, roles.server, mainnetUsdc).asset, configuration.asset);
+  assert.throws(() => nativeWalletConfiguration(mainnet, wallet, roles.owner, roles.agent, roles.server, {symbol: 'USDC', issuer: null}), /wallet asset is invalid/);
 });
 
 test('a transaction that is not exactly the setup is not read as one', () => {
@@ -147,7 +229,7 @@ test('the owner signs once: the new account countersigns and the network takes t
   const result = await sendNativeSetup(network, signedPayload, prepared.step.hash, fetch);
   assert.equal(state.posted.length, 1);
   const tx = TransactionBuilder.fromXDR(state.posted[0], Networks.TESTNET), setup = nativeSetupOf(state.posted[0], network);
-  assert.deepEqual({...setup, startingBalance: undefined}, {...roles, wallet: prepared.wallet, startingBalance: undefined});
+  assert.deepEqual({...setup, startingBalance: undefined}, {...roles, wallet: prepared.wallet, startingBalance: undefined, asset: {symbol: 'XLM', issuer: null}, funding: 50_000_000n});
   assert.equal(setup.startingBalance, WALLET_RESERVE + WALLET_FEE_FLOAT + 50_000_000n);
   // Two signatures over the same hash: the owner's and the new account's own.
   assert.equal(tx.signatures.length, 2);
@@ -155,7 +237,7 @@ test('the owner signs once: the new account countersigns and the network takes t
     assert.ok(tx.signatures.some(s => key.verify(tx.hash(), Buffer.from(s.signature instanceof Uint8Array ? s.signature : s.signature.value))), key.publicKey());
   assert.deepEqual([prepared.step.hash, result], [hex(tx.hash()), 8]);
   // The signed bytes name their hash, roles and own time bound.
-  assert.deepEqual(signedNativeSetupOf(signedPayload, network), {hash: prepared.step.hash, ...roles, wallet: prepared.wallet, validUntil: Number(tx.timeBounds.maxTime)});
+  assert.deepEqual(signedNativeSetupOf(signedPayload, network), {hash: prepared.step.hash, ...roles, wallet: prepared.wallet, validUntil: Number(tx.timeBounds.maxTime), asset: {symbol: 'XLM', issuer: null}});
   for (const other of ['not-xdr', nativeSetupTransaction(terms(Keypair.random().publicKey())).toXDR()])
     assert.equal(signedNativeSetupOf(other, network)?.hash === prepared.step.hash, false);
   assert.equal(signedNativeSetupOf(signedPayload, 'stellar:other'), null);
@@ -290,6 +372,39 @@ test('an approval holds only for the reviewed policy, the wallet\'s own configur
   assert.equal(holds(approval({wallet: setup.wallet}).message, {...reviewedOf(), rules: []}), false);
   const {source, params} = reviewedOf();
   assert.equal(holds(approval({wallet: setup.wallet}).message, {source, params}), true);
+});
+
+test('an approval names the asset of the reviewed policy: XLM without one, and never another asset than the reviewed one', async () => {
+  const {fetch} = ledger();
+  const wallet = Keypair.random().publicKey();
+  const holds = (message, policy) => {
+    const fields = ownerChain.approval.read(message, network);
+    return fields !== null && ownerChain.approval.holds(fields, wallet, policy);
+  };
+  const usdcContract = new Asset(usdc.symbol, usdc.issuer).contractId(Networks.TESTNET);
+  const inUsdc = approval({wallet, asset: usdcContract, assetSymbol: 'USDC', assetIssuer: usdc.issuer}).message, inXlm = approval({wallet}).message;
+  assert.equal(holds(inUsdc, {...reviewedOf(), asset: usdc}), true);
+  assert.equal(holds(inXlm, {...reviewedOf(), asset: {symbol: 'XLM', issuer: null}}), true);
+  assert.equal(holds(inXlm, {...reviewedOf(), asset: null}), true);
+  // The reviewed policy pays in one asset and the approval names another one.
+  assert.equal(holds(inUsdc, reviewedOf()), false);
+  assert.equal(holds(inXlm, {...reviewedOf(), asset: usdc}), false);
+  assert.equal(holds(inUsdc, {...reviewedOf(), asset: mainnetUsdc}), false);
+  // The code and the issuer of the reviewed asset with the contract of another asset.
+  assert.equal(holds(approval({wallet, asset: nativeXlm, assetSymbol: 'USDC', assetIssuer: usdc.issuer}).message, {...reviewedOf(), asset: usdc}), false);
+  // A reviewed asset that is no asset holds for nothing.
+  for (const asset of [{symbol: 'USDC', issuer: null}, {symbol: 'USDC', issuer: 'GISSUER'}, 'USDC'])
+    assert.equal(holds(inUsdc, {...reviewedOf(), asset}), false, JSON.stringify(asset));
+  // The hooks of the SDK's workflow carry the asset: the setup, the read of its signed bytes and the document.
+  globalThis.fetch = fetch;
+  const prepared = await ownerChain.keypairSetup.prepare({network, ...roles, amount: '0.01', asset: usdc});
+  const signedPayload = prepared.complete(await ownerSigns([])(prepared.step));
+  assert.deepEqual(ownerChain.keypairSetup.read(signedPayload, network).asset, usdc);
+  assert.deepEqual(nativeSetupOf(signedPayload, network), {...roles, wallet: prepared.wallet, startingBalance: 35_000_000n, asset: usdc, funding: 100_000n});
+  const configuration = ownerChain.keypairSetup.configuration(network, prepared.wallet, roles.owner, roles.agent, roles.server, usdc);
+  assert.deepEqual([configuration.asset, configuration.assetSymbol, configuration.assetIssuer], [usdcContract, 'USDC', usdc.issuer]);
+  await assert.rejects(ownerChain.keypairSetup.prepare({network, ...roles, amount: '0.00000001', asset: usdc}), /Enter an amount of USDC with at most seven decimals/);
+  await assert.rejects(prepareNativeSetup({network, ...roles, amount: '1.123456789', fetch}), /Enter an amount of XLM with at most seven decimals/);
 });
 
 test('the owner pays every part of a setup: the server\'s account is no source, pays nothing and only becomes a signer', () => {

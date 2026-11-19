@@ -36,8 +36,9 @@ signed step whose result is unknown and their typed errors. `ownerChain` supplie
   read past that bound and holds the failed transaction, or holds none while the source sequence is still below the
   transaction's. Anything else rejects, and the SDK keeps the step.
 - `keypairSetup`: `prepare` builds a Native wallet account's setup (below) and returns its step with `complete`, which
-  checks the owner's signed bytes and adds the new account's own signature; `read` reads the hash, roles and time bound
-  of signed setup bytes; `send` sends them to Horizon; `configuration` is the installation document of the account.
+  checks the owner's signed bytes and adds the new account's own signature; `read` reads the hash, roles, wallet asset
+  and time bound of signed setup bytes; `send` sends them to Horizon; `configuration` is the installation document of
+  the account. `prepare` and `configuration` take the asset of the wallet, `{symbol, issuer}`; without one it is XLM.
 - `approval`: `read` reads the exact approval message of a network, `holds` checks it against the reviewed policy and
   the wallet's own configuration, `step` makes the `approve_policy` step, `walletOwner` reads the account's one signer
   of the owner's weight, and `signedBy` checks an Ed25519 signature over the step's digest.
@@ -55,10 +56,15 @@ A Native policy needs the wallet account of its agent: a new classic account, on
 1. Builds the setup from the owner's own sequence (`prepareNativeSetup` in `native-wallet.ts`): one transaction that creates the account with
    its starting balance, adds the owner signer (weight 3), the agent signer (1) and the server signer (1), sets the
    thresholds 2, 2 and 3 and gives the account's own key weight 0. The starting balance is the reserve of the account
-   (2.5 XLM), 0.5 XLM for the fees of the owner's own steps and the owner's funding amount.
+   (2.5 XLM), 0.5 XLM for the fees of the owner's own steps and the owner's funding amount. A wallet holds one asset.
+   The policy that the owner reviewed names it, and the server's template of the network decides it at the draft. For
+   an issued asset, such as USDC, the same transaction adds the account's trustline after the creation, and the
+   owner's account then pays the funding amount in that asset; the starting balance is 3.0 XLM of reserve, for the
+   account and its trustline, and the 0.5 XLM. The setup works on every network of the rail.
 2. Has the host's `sign` sign it as the step `set_up_wallet`. The account's own key is random, lives in `complete` only
    and signs the creation once beside the owner. The `owner-sign` element reads the step from its bytes: it shows the
-   wallet account, the agent and the funding, and it refuses any transaction that is not exactly this setup.
+   wallet account, the agent, the asset with its issuer and the funding, and it refuses any transaction that is not
+   exactly this setup.
 3. Saves the signed bytes in the host's journal under `<key>:wallet-setup` and sends them with `send`. They stay saved
    until the service has registered the wallet, so a run that stops in between names the same account again and signs
    no second setup. A result that is unknown is settled first: done when Horizon holds it as successful, sent again
@@ -69,9 +75,10 @@ A Native policy needs the wallet account of its agent: a new classic account, on
    a message, never a transaction. The payload is the base64 UTF-8 text of the message, and the hash its SEP-53 digest.
    The element signs only the exact approval message of its network, shows the wallet account and the hashes of the
    source and the values, and compares them with `data.expected` when the host passes `{policyId, wallet, sourceHash,
-   paramsHash}`. The host passes `reviewed: {source, params}`, and `rules` and `tier` when it shows them: the policy that the owner reviewed. The
+   paramsHash}`. The host passes `reviewed: {source, params}`, and `rules` and `tier` when it shows them: the policy that the owner reviewed. It also
+   passes `asset: {symbol, issuer}` when the policy pays in another asset than XLM. The
    workflow signs only an approval that states exactly that policy and the wallet account's own configuration (its
-   network, route, asset and fee ceiling). The server's digests `irHash` and `moduleDigest` and the name of its
+   network, route, the reviewed asset and fee ceiling). The server's digests `irHash` and `moduleDigest` and the name of its
    installation, `policyInstance`, are left to the server; a Native wallet enforces none of them. It keeps the signature only when the owner's account
    made it, and confirms the approval with `micro/allocation/confirm`.
 
