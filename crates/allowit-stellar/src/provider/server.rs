@@ -248,6 +248,15 @@ pub fn info(p: &Packet, k: Kind) -> Result<PacketInfo> {
             Ok(info_of(&value, value.transaction_hash))
         }
         Kind::Signed => {
+            // A code transaction's identity is its transaction hash.
+            if let Some(code) = signed_code(p)? {
+                return Ok(PacketInfo {
+                    operation_id: code.code.transaction_hash,
+                    transaction_hash: code.code.transaction_hash,
+                    wallet: code.code.source,
+                    expires_at: code.code.expires_at,
+                });
+            }
             let s: SignedOperation = decode_packet(p)?;
             Ok(info_of(&s.prepared, s.transaction_hash))
         }
@@ -267,12 +276,15 @@ fn owner_payload(p: &OwnerSignedData) -> Result<&str> {
 pub fn restore(k: Kind, document: Box<RawValue>) -> Result<Packet> {
     let network = match k {
         Kind::Prepared => decode::<PreparedOperation>(&document)?.config.network,
-        Kind::Signed => {
-            decode::<SignedOperation>(&document)?
-                .prepared
-                .config
-                .network
-        }
+        Kind::Signed => match decode::<SignedCode>(&document) {
+            Ok(code) => code.code.network,
+            Err(_) => {
+                decode::<SignedOperation>(&document)?
+                    .prepared
+                    .config
+                    .network
+            }
+        },
         Kind::Owner => decode::<native::owner_intent::OwnerTransaction>(&document)?.network,
         Kind::OwnerSigned => decode::<OwnerSignedData>(&document)?.original.network,
         Kind::Receipt => {
@@ -300,7 +312,9 @@ pub fn restore(k: Kind, document: Box<RawValue>) -> Result<Packet> {
             decode_packet::<PreparedOperation>(&packet)?;
         }
         Kind::Signed => {
-            decode_packet::<SignedOperation>(&packet)?;
+            if signed_code(&packet)?.is_none() {
+                decode_packet::<SignedOperation>(&packet)?;
+            }
         }
         Kind::Owner => {
             decode_packet::<native::owner_intent::OwnerTransaction>(&packet)?;
@@ -433,21 +447,54 @@ fn sending_signature(sender: &Sender, account: &str, hash: &[u8; 32]) -> Result<
         .try_into()
         .map_err(|_| Error::config("A sending account returned a signature of another size"))
 }
+/// A wallet code transaction that a sending account signed: the upload of wallet code, or the
+/// restoration of lapsed code by its hash (`RuntimeProvider::prepare_code_within`). The rail
+/// sends nothing: the caller submits it with `broadcast` and follows it with `status` and
+/// `observe`, as any signed operation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SignedCode {
+    /// The transaction, `upload_wasm` or `restore_code`, from the sending account, unsigned.
+    pub code: native::admin::PreparedDeployment,
+    /// The same transaction with the sending account's signature.
+    pub signed_xdr: String,
+}
+/// The code transaction that the signed packet `p` carries, `None` for any other signed packet.
+/// Its bytes are checked: the signed envelope is the prepared transaction with one signature
+/// of its source, and the transaction uploads or restores its code alone.
+fn signed_code(p: &Packet) -> Result<Option<SignedCode>> {
+    let Ok(s) = serde_json::from_str::<SignedCode>(p.document().get()) else {
+        return Ok(None);
+    };
+    if crate::host::routing::normalize(&s.code.network)? != p.network() {
+        return Err(Error::config(
+            "The code transaction's network differs from its packet",
+        ));
+    }
+    checked(native::admin::check_signed_code(&s.code, &s.signed_xdr))?;
+    Ok(Some(s))
+}
+fn code_of(p: &Signed) -> Result<SignedCode> {
+    signed_code(&p.0)?.ok_or_else(|| Error::usage("This packet is not a wallet code transaction"))
+}
 impl Provider {
-    /// Make wallet code live from a sending account: the code of `wasm`, or without it the
-    /// installation's code. Absent code is uploaded, which needs its bytes; lapsed code is
-    /// restored by its hash. A simulated fee above `max_fee_stroops` is refused before anything
-    /// is signed. The code is read again just before the signature: code that another
-    /// transaction made live meanwhile needs nothing. The receipt is that of a confirmed transaction: one that the ledger failed is
-    /// an error whose details name its `transactionHash` and its fee `nativeUnits`.
-    fn upload(
+    /// The transaction that makes wallet code live, from a sending account and signed by it:
+    /// the code of `wasm`, or without it the installation's code. Absent code is uploaded,
+    /// which needs its bytes; lapsed code is restored by its hash. A simulated fee above
+    /// `max_fee_stroops` is refused before anything is signed. `None` when the code is live.
+    ///
+    /// The step trusts the reads and simulations of the one RPC that the server configured (see
+    /// the crate README). Another transaction, from another sending account or from the same
+    /// one, can make the code live while the step runs: the code is read first, again after
+    /// every refusal on the way to the signature, and again just before the signature, and
+    /// live code needs nothing.
+    fn prepare_code(
         &self,
         i: &Installation,
         wasm: Option<&[u8]>,
         max_fee_stroops: u32,
-        poll: Poll,
         now: u64,
-    ) -> Result<Option<Receipt>> {
+    ) -> Result<Option<SignedCode>> {
         let c = self.config(i)?;
         if c.route != WalletRoute::PolicyWallet {
             return Err(Error::unsupported(
@@ -458,28 +505,15 @@ impl Provider {
             Some(wasm) => checked(native::admin::check_wallet_code(wasm))?,
             None => c.module_digest,
         };
-        // Every call of this decision, its sends included, goes through one mark of the highest
-        // ledger that its replies name.
-        let mark = rpc::LedgerMark::new(self.rpc());
-        // Nothing is done only when a read shows the code live at the highest ledger seen; a
-        // replica can serve it as live at its own, older head. Something is paid only when a read
-        // dated at that ledger shows the state that the prepared transaction needs. The code is
-        // observed first, again by every refusal on the way to a signature, the signature
-        // included, and again just before the signature and before every send: another
-        // transaction, from another sending account or from this one, can make it live at any of
-        // these steps, and live code needs nothing. Such a transaction can still land after the
-        // last observation, until the code transaction applies: the ledger has no precondition
-        // on an entry's state, so the code transaction then applies to live code and its source
-        // pays its fee, within the ceiling.
-        if checked(rpc::code_live_at(&mark, &c.network, &code_hash, &mark.seen))? {
-            return Ok(None);
-        }
         let live = || {
             matches!(
-                rpc::code_live_at(&mark, &c.network, &code_hash, &mark.seen),
-                Ok(true)
+                rpc::code_state(self.rpc(), &c.network, &code_hash),
+                Ok(rpc::CodeState::Live)
             )
         };
+        if checked(rpc::code_state(self.rpc(), &c.network, &code_hash))? == rpc::CodeState::Live {
+            return Ok(None);
+        }
         // A refusal can come from the transaction that made the code live: a simulated fee above
         // the ceiling for a write that is no longer needed, the sending account's sequence that
         // its own upload advanced, or sending accounts that are all busy with it. Live code
@@ -494,14 +528,14 @@ impl Provider {
             // the simulation sets it, within the ceiling. Lapsed code is restored, never
             // uploaded again: the network refuses an upload of code that its archive holds.
             let deployer = native::admin::Deployer {
-                rpc: &mark,
+                rpc: self.rpc(),
                 network: &c.network,
                 now,
                 max_fee_stroops,
             };
             // A simulated restoration of the code entry decides between a restoration and an
-            // upload: it names the entry only when the network's archive holds it, which a read
-            // can miss, since an RPC can serve no archived entry. Absent code needs its bytes.
+            // upload: it names the entry only when the network's archive holds it. Absent code
+            // needs its bytes.
             let p = match checked(deployer.restore_code(&account, code_hash))? {
                 native::admin::CodeRestoration::Prepared(p) => p,
                 native::admin::CodeRestoration::Live => return Ok(None),
@@ -521,82 +555,13 @@ impl Provider {
         };
         let (sender, account, p) = match prepare() {
             Ok(Some(prepared)) => prepared,
-            // The preparation found the code live: that holds only at the highest ledger seen.
-            Ok(None) => {
-                return unless_live(crate::provider::failure(
-                    "The preparation found the wallet code live, but it is not live at the highest ledger seen",
-                ));
-            }
+            Ok(None) => return Ok(None),
             Err(refused) => return unless_live(refused),
         };
-        // An upload needs code that the network's archive does not hold. A replica that trails can
-        // predate the code's upload and simulate as if the network never had it, and an RPC that
-        // serves no archived entry reads lapsed code as absent. So the archive-aware restoration
-        // simulation is taken again just before the signature. Its answer counts only when the
-        // simulation is dated at the highest ledger seen; one that is not is taken once more,
-        // and a second one is refused. An archive that holds the code refuses the upload.
-        if p.function == "upload_wasm" {
-            let deployer = native::admin::Deployer {
-                rpc: &mark,
-                network: &c.network,
-                now,
-                max_fee_stroops,
-            };
-            let dated = || {
-                mark.simulated.load(std::sync::atomic::Ordering::SeqCst)
-                    >= mark.seen.load(std::sync::atomic::Ordering::SeqCst)
-            };
-            let mut answer = None;
-            for _ in 0..2 {
-                let restoration = checked(deployer.restore_code(&account, code_hash));
-                if dated() {
-                    answer = Some(restoration);
-                    break;
-                }
-            }
-            match answer {
-                Some(Ok(native::admin::CodeRestoration::Absent)) => {}
-                Some(Ok(native::admin::CodeRestoration::Prepared(_))) => {
-                    return Err(crate::provider::failure(
-                        "The network's archive holds the wallet code: lapsed code is restored, not uploaded",
-                    ));
-                }
-                Some(Ok(native::admin::CodeRestoration::Live)) => {
-                    return unless_live(crate::provider::failure(
-                        "The wallet code is live, but not at the highest ledger seen",
-                    ));
-                }
-                Some(Err(refused)) => return unless_live(refused),
-                None => {
-                    return unless_live(crate::provider::failure(
-                        "The simulated restoration of the wallet code trails the network's head",
-                    ));
-                }
-            }
+        if checked(rpc::code_state(self.rpc(), &c.network, &code_hash))? == rpc::CodeState::Live {
+            return Ok(None);
         }
-        // The state that the prepared transaction needs, from a read dated at the highest ledger
-        // that the decision has seen, here and before every send. Live code needs nothing. A
-        // restoration needs code that is not live: an RPC that serves no archived entry reads
-        // lapsed code as absent. An upload needs absent code: lapsed code contradicts it, since
-        // the ledger would fail its upload and still charge its fee.
-        let needed = |state: rpc::CodeState| -> native::Result<bool> {
-            match (state, p.function.as_str()) {
-                (rpc::CodeState::Live, _) => Ok(false),
-                (rpc::CodeState::Lapsed, "upload_wasm") => Err(
-                    "The wallet code lapsed after its upload was prepared: lapsed code is restored, not uploaded"
-                        .into(),
-                ),
-                _ => Ok(true),
-            }
-        };
-        match checked(
-            rpc::current_code_state(&mark, &c.network, &code_hash, &mark.seen).and_then(&needed),
-        ) {
-            Ok(true) => {}
-            Ok(false) => return Ok(None),
-            Err(refused) => return unless_live(refused),
-        }
-        let signed =
+        let signed_xdr =
             match sending_signature(sender, &account, &p.transaction_hash).and_then(|signature| {
                 checked(native::admin::with_source_signature(
                     &c.network,
@@ -607,51 +572,72 @@ impl Provider {
                 Ok(signed) => signed,
                 Err(refused) => return unless_live(refused),
             };
-        // Each send until the network accepts one, the first included, goes out only while a read
-        // dated at the highest ledger seen shows the state that the transaction needs: another
-        // transaction can restore or upload the code while this one is signed or waits.
-        let Some(receipt) = checked(crate::provider::runtime::Runtime::send_and_poll_while(
-            &mark,
-            &c.network,
-            &signed,
-            crate::provider::runtime::Poll {
-                attempts: poll.attempts,
-                interval: poll.interval,
+        Ok(Some(SignedCode {
+            code: p,
+            signed_xdr,
+        }))
+    }
+    /// Send the code transaction `s` once. `Prepared` when the network did not accept it:
+    /// nothing is pending, and the caller can send the same bytes again while it is needed.
+    fn broadcast_code(&self, s: &SignedCode, now: u64) -> Result<Status> {
+        if now > s.code.expires_at {
+            return Err(Error::usage("The code transaction expired"));
+        }
+        let network = &s.code.network;
+        Ok(
+            match checked(rpc::send_transaction(self.rpc(), network, &s.signed_xdr))? {
+                rpc::Broadcast::Submitted => Status::Submitted,
+                rpc::Broadcast::RetryLater => Status::Prepared,
+                rpc::Broadcast::Unknown => Status::SubmissionUnknown,
+                // A transaction that the network rejected did not apply and cost nothing, unless
+                // an earlier send of the same bytes did.
+                rpc::Broadcast::Rejected { error_result_xdr } => {
+                    match checked(rpc::receipt_by_hash(
+                        self.rpc(),
+                        network,
+                        &s.code.transaction_hash,
+                    ))? {
+                        Some(receipt) => status(receipt.status),
+                        None => {
+                            return Err(crate::provider::failure(format!(
+                                "Stellar rejected the wallet code transaction {}: {}",
+                                native::hex(&s.code.transaction_hash),
+                                error_result_xdr.as_deref().unwrap_or("no result")
+                            )));
+                        }
+                    }
+                }
             },
-            &|| {
-                rpc::current_code_state(&mark, &c.network, &code_hash, &mark.seen).and_then(&needed)
-            },
+        )
+    }
+    /// The receipt of the code transaction `s`, once the ledger included it. A transaction that
+    /// the ledger failed has a receipt too, whose fee its source paid. The ledger charges a
+    /// transaction at most the fee that it declares: a receipt that reports more is refused.
+    fn observe_code(&self, s: &SignedCode) -> Result<Option<Receipt>> {
+        let network = &s.code.network;
+        let Some(receipt) = checked(rpc::receipt_by_hash(
+            self.rpc(),
+            network,
+            &s.code.transaction_hash,
         ))?
         else {
             return Ok(None);
         };
         checked(rpc::validate_receipt(
             &receipt,
-            &c.network,
-            &p.transaction_hash,
+            network,
+            &s.code.transaction_hash,
         ))?;
-        let packet = packet(&c.network, &receipt)?;
-        // The ledger charges a transaction at most the fee that it declares: a receipt that
-        // reports more is refused, and names no fee to charge.
-        let fee = receipt_info(&packet)?.fee.native_units;
-        if fee > u128::from(declared_fee(&signed)?) {
+        if receipt.envelope_xdr != s.signed_xdr {
+            return Err(Error::config(
+                "The receipt's envelope differs from the code transaction",
+            ));
+        }
+        let packet = packet(network, &receipt)?;
+        if receipt_info(&packet)?.fee.native_units > u128::from(declared_fee(&s.signed_xdr)?) {
             return Err(crate::provider::failure(
                 "The receipt reports a fee above the fee of its transaction",
             ));
-        }
-        // A transaction that the ledger included and failed leaves the code as it was, so it is
-        // an error, never a receipt of live code. Its source still paid the fee: the error names
-        // the transaction and that fee, in stroops, for the server's accounts.
-        if receipt.status != native::OperationStatus::Confirmed {
-            return Err(crate::provider::failure(if p.function == "restore_code" {
-                "The restoration of the wallet code failed on the ledger"
-            } else {
-                "The upload of the wallet code failed on the ledger"
-            })
-            .with_details(serde_json::json!({
-                "transactionHash": native::hex(&receipt.transaction_hash),
-                "nativeUnits": fee.to_string(),
-            })));
         }
         Ok(Some(Receipt(packet)))
     }
@@ -1402,10 +1388,19 @@ impl crate::host::vendors::RuntimeProvider for Provider {
     }
     fn validate_signed(&self, p: &Signed, now: u64) -> Result<()> {
         self.network(p.network())?;
+        if let Some(code) = signed_code(&p.0)? {
+            if now > code.code.expires_at {
+                return Err(Error::usage("The code transaction expired"));
+            }
+            return Ok(());
+        }
         checked(native::validate_signed(&signed(p)?, now))
     }
     fn broadcast(&self, p: &Signed, now: u64) -> Result<Status> {
         self.network(p.network())?;
+        if let Some(code) = signed_code(&p.0)? {
+            return self.broadcast_code(&code, now);
+        }
         let s = signed(p)?;
         if s.prepared.payment_authorization.is_some() {
             // The seller's facilitator submits a payment authorization. The service releases
@@ -1430,6 +1425,13 @@ impl crate::host::vendors::RuntimeProvider for Provider {
     }
     fn status(&self, p: &Signed) -> Result<Status> {
         self.network(p.network())?;
+        if let Some(code) = signed_code(&p.0)? {
+            return Ok(status(checked(rpc::status_by_hash(
+                self.rpc(),
+                &code.code.network,
+                &code.code.transaction_hash,
+            ))?));
+        }
         let s = signed(p)?;
         if s.prepared.payment_authorization.is_some() {
             // The ledger names the transaction that settled the entry, or shows that no
@@ -1455,6 +1457,9 @@ impl crate::host::vendors::RuntimeProvider for Provider {
     }
     fn observe(&self, p: &Signed) -> Result<Option<Receipt>> {
         self.network(p.network())?;
+        if let Some(code) = signed_code(&p.0)? {
+            return self.observe_code(&code);
+        }
         let s = signed(p)?;
         if s.prepared.payment_authorization.is_some() {
             return checked(native::seller_settled::settlement(self.rpc(), &s.prepared))?
@@ -1693,33 +1698,26 @@ impl crate::host::vendors::RuntimeProvider for Provider {
             },
         )?))
     }
-    fn upload_code(
+    fn prepare_code_within(
         &self,
         i: &Installation,
-        wasm: &[u8],
-        poll: Poll,
-        now: u64,
-    ) -> Result<Option<Receipt>> {
-        self.upload(i, Some(wasm), u32::MAX, poll, now)
-    }
-    fn upload_code_within(
-        &self,
-        i: &Installation,
-        wasm: &[u8],
+        wasm: Option<&[u8]>,
         max_fee: u64,
-        poll: Poll,
         now: u64,
-    ) -> Result<Option<Receipt>> {
-        self.upload(i, Some(wasm), fee(max_fee)?, poll, now)
+    ) -> Result<Option<Signed>> {
+        let Some(code) = self.prepare_code(i, wasm, fee(max_fee)?, now)? else {
+            return Ok(None);
+        };
+        Ok(Some(Signed(packet(&code.code.network, &code)?)))
     }
-    fn restore_code_within(
-        &self,
-        i: &Installation,
-        max_fee: u64,
-        poll: Poll,
-        now: u64,
-    ) -> Result<Option<Receipt>> {
-        self.upload(i, None, fee(max_fee)?, poll, now)
+    fn code_needed(&self, p: &Signed) -> Result<bool> {
+        self.network(p.network())?;
+        let code = code_of(p)?;
+        Ok(checked(rpc::code_state(
+            self.rpc(),
+            &code.code.network,
+            &code.code.wasm_hash,
+        ))? != rpc::CodeState::Live)
     }
     fn submit_owner<'a>(
         &self,
@@ -1826,6 +1824,11 @@ pub fn prepared_metadata(p: &Packet) -> Result<PreparedMetadata> {
     })
 }
 pub fn signed_preparation(p: &Packet) -> Result<Prepared> {
+    if signed_code(p)?.is_some() {
+        return Err(Error::usage(
+            "A wallet code transaction has no wallet operation to prepare",
+        ));
+    }
     let value: SignedOperation = decode_packet(p)?;
     Ok(Prepared(packet(
         &value.prepared.config.network,
@@ -1916,15 +1919,31 @@ fn retained_signed_shape(s: &SignedOperation) -> Result<()> {
     checked(native::validate_retained_signed(s))
 }
 pub fn validate_signed(p: &Packet) -> Result<()> {
+    if signed_code(p)?.is_some() {
+        return Ok(());
+    }
     let signed: SignedOperation = decode_packet(p)?;
     checked(native::validate_retained_signed(&signed))
 }
 pub fn verify_receipt(r: &Packet, p: &Packet) -> Result<()> {
-    let signed: SignedOperation = decode_packet(p)?;
     let receipt: rpc::VerifiedReceipt = decode_packet(r)?;
     if r.network() != p.network() {
         return Err(Error::config("Receipt network differs from operation"));
     }
+    if let Some(code) = signed_code(p)? {
+        checked(rpc::validate_receipt(
+            &receipt,
+            &code.code.network,
+            &code.code.transaction_hash,
+        ))?;
+        if receipt.envelope_xdr != code.signed_xdr {
+            return Err(Error::config(
+                "The receipt's envelope differs from the code transaction",
+            ));
+        }
+        return Ok(());
+    }
+    let signed: SignedOperation = decode_packet(p)?;
     verify_native_receipt(&signed, &receipt)
 }
 fn verify_native_receipt(signed: &SignedOperation, receipt: &rpc::VerifiedReceipt) -> Result<()> {

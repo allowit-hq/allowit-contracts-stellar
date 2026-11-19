@@ -1749,6 +1749,54 @@ pub fn with_source_signature(
     .map_err(err)?;
     xdr(&TransactionEnvelope::Tx(envelope))
 }
+/// Check a wallet code transaction that its source signed: `signed_xdr` is the prepared
+/// transaction `p` with one signature of its source over its hash, and the transaction uploads
+/// the code `p.wasm_hash` (`upload_wasm`) or restores that code's entry alone (`restore_code`).
+pub fn check_signed_code(p: &PreparedDeployment, signed_xdr: &str) -> Result<()> {
+    let TransactionEnvelope::Tx(unsigned) = read(&p.transaction_xdr)? else {
+        return Err("Expected a v1 code transaction".into());
+    };
+    let TransactionEnvelope::Tx(signed) = read(signed_xdr)? else {
+        return Err("Expected a signed v1 code transaction".into());
+    };
+    if signed.tx != unsigned.tx {
+        return Err("The signed code transaction differs from its preparation".into());
+    }
+    if transaction_hash(&p.network, &signed.tx)? != p.transaction_hash {
+        return Err("The code transaction's hash differs from its preparation".into());
+    }
+    if signed.tx.source_account != muxed(&p.source)? {
+        return Err("The code transaction has another source".into());
+    }
+    let [signature] = signed.signatures.as_slice() else {
+        return Err("A code transaction carries one signature, its source's".into());
+    };
+    let signature: [u8; 64] = signature.signature.0.as_slice().try_into().map_err(err)?;
+    signing::verify_digest(&p.source, &p.transaction_hash, &signature)?;
+    let [operation] = signed.tx.operations.as_slice() else {
+        return Err("A code transaction has one operation".into());
+    };
+    let key = LedgerKey::ContractCode(LedgerKeyContractCode {
+        hash: Hash(p.wasm_hash),
+    });
+    let alone = match (p.function.as_str(), &operation.body) {
+        ("upload_wasm", OperationBody::InvokeHostFunction(op)) => {
+            op.auth.is_empty()
+                && matches!(&op.host_function,
+                    HostFunction::UploadContractWasm(code) if hash(code.as_slice()) == p.wasm_hash)
+        }
+        ("restore_code", OperationBody::RestoreFootprint(_)) => {
+            matches!(&signed.tx.ext, TransactionExt::V1(data)
+                if data.resources.footprint.read_only.is_empty()
+                    && data.resources.footprint.read_write.as_slice() == [key])
+        }
+        _ => false,
+    };
+    if !alone || operation.source_account.is_some() || p.wallet.is_some() {
+        return Err("The code transaction neither uploads nor restores its code alone".into());
+    }
+    Ok(())
+}
 /// Low-level source-account signing. This checks unsigned v1 envelope ownership only; it does
 /// not validate the business intent, fees or expiry. Use [`crate::owner_intent`] to validate an
 /// untrusted prepared packet against independently approved intent before requesting a signature.

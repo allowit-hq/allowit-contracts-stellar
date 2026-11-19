@@ -1,6 +1,5 @@
 //! Native observations and original-owner-packet settlement. No polling, retries or storage.
 use super::*;
-use std::sync::atomic::Ordering;
 
 /// Whether an exact code entry is currently live. False does not prove it never existed.
 pub fn code_uploaded(rpc: &dyn Rpc, network: &str, code: &[u8; 32]) -> Result<bool> {
@@ -26,102 +25,15 @@ pub enum CodeState {
 }
 /// Whether an exact code entry is live, lapsed or absent.
 pub fn code_state(rpc: &dyn Rpc, network: &str, code: &[u8; 32]) -> Result<CodeState> {
-    let (live_until, closing) = observed_entry(rpc, network, &code_key(code)?)?;
-    Ok(match live_until {
-        None => CodeState::Absent,
-        Some(until) if until >= closing => CodeState::Live,
-        Some(_) => CodeState::Lapsed,
-    })
-}
-/// As `code_state`, for a decision to pay for a transaction that only code that is not live
-/// needs. RPC nodes, also behind one load balancer, can answer some ledgers behind the network,
-/// which can miss a transaction that made the code live. `seen` is the highest ledger that the
-/// decision has seen: every head and every entry reply of its reads raises it, and it only rises.
-/// A negative answer counts only from a read dated at that ledger. A read that is not is taken
-/// once more, and a second one is refused.
-pub fn current_code_state(
-    rpc: &dyn Rpc,
-    network: &str,
-    code: &[u8; 32],
-    seen: &std::sync::atomic::AtomicU32,
-) -> Result<CodeState> {
-    let key = code_key(code)?;
-    for _ in 0..2 {
-        owner_observation::network(rpc, network)?;
-        let before = owner_observation::head(rpc)?;
-        let (live_until, observed) = entry_reply(rpc, &key)?;
-        let closing = owner_observation::head(rpc)?;
-        let highest = seen
-            .fetch_max(before.max(observed).max(closing), Ordering::SeqCst)
-            .max(before)
-            .max(observed)
-            .max(closing);
-        match live_until {
-            Some(until) if until >= highest => return Ok(CodeState::Live),
-            Some(_) if observed == highest => return Ok(CodeState::Lapsed),
-            None if observed == highest => return Ok(CodeState::Absent),
-            _ => {}
-        }
-    }
-    Err("The observation of the wallet code trails the network's head".into())
-}
-/// Whether the code is live at the highest ledger that `seen` holds, after one more read through
-/// `rpc`. A replica can serve code as live at its own head, below a ledger that the decision saw,
-/// where the code has lapsed: only a live-until ledger at or above the highest ledger counts.
-pub fn code_live_at(
-    rpc: &dyn Rpc,
-    network: &str,
-    code: &[u8; 32],
-    seen: &std::sync::atomic::AtomicU32,
-) -> Result<bool> {
-    let (live_until, closing) = observed_entry(rpc, network, &code_key(code)?)?;
-    let highest = seen.fetch_max(closing, Ordering::SeqCst).max(closing);
-    Ok(live_until.is_some_and(|until| until >= highest))
-}
-/// An RPC transport that keeps the highest ledger that its replies name: the sequence of
-/// `getLatestLedger` and the `latestLedger` of every other reply. A decision that makes all its
-/// calls through it, its preparation and its sends included, passes `seen` to
-/// `current_code_state`, so no ledger that any of its replies named is forgotten. `simulated` is
-/// the ledger of the last `simulateTransaction` reply, which dates that simulation.
-pub struct LedgerMark<'a> {
-    rpc: &'a dyn Rpc,
-    pub seen: std::sync::atomic::AtomicU32,
-    pub simulated: std::sync::atomic::AtomicU32,
-}
-impl<'a> LedgerMark<'a> {
-    pub fn new(rpc: &'a dyn Rpc) -> Self {
-        Self {
-            rpc,
-            seen: std::sync::atomic::AtomicU32::new(0),
-            simulated: std::sync::atomic::AtomicU32::new(0),
-        }
-    }
-}
-impl Rpc for LedgerMark<'_> {
-    fn call(&self, method: &str, params: Value) -> Result<Value> {
-        let value = self.rpc.call(method, params)?;
-        let named = if method == "getLatestLedger" {
-            &value["sequence"]
-        } else {
-            &value["latestLedger"]
-        };
-        let ledger = named.as_u64().and_then(|v| u32::try_from(v).ok());
-        if let Some(ledger) = ledger {
-            self.seen.fetch_max(ledger, Ordering::SeqCst);
-        }
-        if method == "simulateTransaction" {
-            self.simulated.store(ledger.unwrap_or(0), Ordering::SeqCst);
-        }
-        Ok(value)
-    }
-}
-fn code_key(code: &[u8; 32]) -> Result<LedgerKey> {
     if *code == [0; 32] {
         return Err("Missing executable identity".into());
     }
-    Ok(LedgerKey::ContractCode(LedgerKeyContractCode {
-        hash: Hash(*code),
-    }))
+    let key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: Hash(*code) });
+    Ok(match observed_entry(rpc, network, &key)? {
+        (None, _) => CodeState::Absent,
+        (Some(until), closing) if until >= closing => CodeState::Live,
+        (Some(_), _) => CodeState::Lapsed,
+    })
 }
 /// Whether a native C-address currently has a live Wasm instance. This grants no trust in its config.
 pub fn contract_exists(rpc: &dyn Rpc, network: &str, contract: &str) -> Result<bool> {
@@ -147,23 +59,8 @@ fn live_entry(rpc: &dyn Rpc, network: &str, key: LedgerKey) -> Result<bool> {
 /// entry, and the closing head of the observation. An archived entry that the RPC serves without
 /// a live-until ledger reads as 0.
 fn observed_entry(rpc: &dyn Rpc, network: &str, key: &LedgerKey) -> Result<(Option<u32>, u32)> {
-    dated_entry(rpc, network, key).map(|(live_until, _, closing)| (live_until, closing))
-}
-/// As `observed_entry`, with the ledger that dates the entry between the live-until ledger and
-/// the closing head.
-fn dated_entry(rpc: &dyn Rpc, network: &str, key: &LedgerKey) -> Result<(Option<u32>, u32, u32)> {
     owner_observation::network(rpc, network)?;
     let before = owner_observation::head(rpc)?;
-    let (live_until, observed) = entry_reply(rpc, key)?;
-    Ok((
-        live_until,
-        observed,
-        owner_observation::current(rpc, before, observed)?,
-    ))
-}
-/// The live-until ledger of the verified entry of `key` in one `getLedgerEntries` reply, `None`
-/// when the reply has no such entry, and the ledger that dates the reply.
-fn entry_reply(rpc: &dyn Rpc, key: &LedgerKey) -> Result<(Option<u32>, u32)> {
     let value = rpc.call("getLedgerEntries", json!({"keys":[xdr(key)?]}))?;
     let observed = owner_observation::ledger(&value["latestLedger"])?;
     // A reply that finds no entry can omit the list.
@@ -212,7 +109,10 @@ fn entry_reply(rpc: &dyn Rpc, key: &LedgerKey) -> Result<(Option<u32>, u32)> {
         }
         _ => return Err("Unexpected native entry count".into()),
     };
-    Ok((live_until, observed))
+    Ok((
+        live_until,
+        owner_observation::current(rpc, before, observed)?,
+    ))
 }
 /// Only a verified native receipt is terminal. A missing lookup or expiry cannot prove absence.
 #[derive(Clone, Debug, PartialEq, Eq)]

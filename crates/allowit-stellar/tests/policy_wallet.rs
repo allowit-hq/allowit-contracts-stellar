@@ -348,56 +348,15 @@ struct Model {
     /// The upload of `uploaded_meanwhile` came from the upload's own source, whose sequence it
     /// advanced.
     uploaded_by_source: bool,
-    /// The next submission is not accepted (`TRY_AGAIN_LATER`) while another account restores
-    /// this code.
-    retry_later_restores: Option<[u8; 32]>,
-    /// The next reads of code entries come from a node that trails: it serves the code as
-    /// lapsed at the head before another account's restoration, and the head then closes one
-    /// more ledger.
-    stale_code_reads: u32,
-    /// The `stale_code_reads` that the answer `TRY_AGAIN_LATER` starts.
-    stale_reads_on_retry_later: u32,
-    /// The next reads of code entries answer at a ledger before the head that was read just
-    /// before them, from a node that trails; the entry itself is current.
-    behind_head_code_reads: u32,
-    /// The `behind_head_code_reads` that a restoration's simulation starts.
-    behind_reads_on_restore_simulation: u32,
-    /// The heads that the next `getLatestLedger` calls answer, as nodes behind a load balancer
-    /// that do not agree.
-    heads: std::collections::VecDeque<u32>,
-    /// The ledgers at which replicas that trail answer the next reads of code entries: they serve
-    /// the code as lapsed.
-    replica_code_reads: std::collections::VecDeque<u32>,
-    /// The `heads` and `replica_code_reads` that the answer `TRY_AGAIN_LATER` starts.
-    heads_on_retry_later: Vec<u32>,
-    replica_reads_on_retry_later: Vec<u32>,
-    /// A replica at this ledger answers every head and every read of a code entry; it serves
-    /// the code as lapsed.
-    replica_ledger: Option<u32>,
-    /// The next restoration's simulation answers one ledger later, at which another account
-    /// restored the code, and a replica at the earlier ledger answers from the second network
-    /// check after it on (the first one closes the simulation's own observation).
-    replica_after_restore_simulation: bool,
-    replica_from_network_check: Option<(u32, u32)>,
-    /// The answer `TRY_AGAIN_LATER` names one ledger later, at which another account restored
-    /// the code, and a replica at the earlier ledger answers from then on.
-    replica_on_retry_later: bool,
-    /// The replica serves the code as live until its own ledger, its last live ledger.
-    replica_serves_live: bool,
-    /// A replica that predates the upload of this code answers the next reads of it, and the
-    /// next `predating_simulations` simulations of its restoration or its upload, as if the
-    /// network never had it.
-    predating_replica: Option<([u8; 32], u32)>,
-    predating_simulations: u32,
-    /// The `heads` and `restore_simulation_ledgers` that the next upload's simulation starts.
-    heads_on_upload_simulation: Vec<u32>,
-    restore_ledgers_on_upload_simulation: Vec<u32>,
-    /// The ledgers at which the next restoration simulations answer, from a replica that trails.
-    restore_simulation_ledgers: std::collections::VecDeque<u32>,
     tiers: BTreeMap<[u8; 32], PolicyTier>,
     wallet: Option<Wallet>,
     settled: BTreeMap<String, String>,
     steps: Vec<Step>,
+    /// The next submission is not accepted (`TRY_AGAIN_LATER`) while another account restores
+    /// this code.
+    retry_later_restores: Option<[u8; 32]>,
+    /// The network rejects the next submission.
+    reject_next_send: bool,
     pending_name: String,
     /// The resource fee of the next enforcing simulations.
     enforce_fee: i64,
@@ -623,66 +582,13 @@ impl rpc::Rpc for ModelChain {
     fn call(&self, method: &str, params: Value) -> Result<Value> {
         let mut m = self.0.lock().unwrap();
         match method {
-            "getNetwork" => {
-                if let Some((ledger, checks)) = m.replica_from_network_check {
-                    m.replica_from_network_check = if checks <= 1 {
-                        m.replica_ledger = Some(ledger);
-                        None
-                    } else {
-                        Some((ledger, checks - 1))
-                    };
-                }
-                Ok(json!({"passphrase": passphrase(NETWORK)?}))
-            }
-            "getLatestLedger" => {
-                let head = m.heads.pop_front().or(m.replica_ledger).unwrap_or(m.ledger);
-                Ok(json!({"sequence": head}))
-            }
+            "getNetwork" => Ok(json!({"passphrase": passphrase(NETWORK)?})),
+            "getLatestLedger" => Ok(json!({"sequence": m.ledger})),
             "getLedgerEntries" => {
                 let encoded = params["keys"][0].as_str().unwrap();
                 let key: x::LedgerKey = de(encoded);
                 if m.failing_code_reads && matches!(key, x::LedgerKey::ContractCode(_)) {
                     return Err("The RPC is unreachable".into());
-                }
-                if let x::LedgerKey::ContractCode(code) = &key
-                    && let Some((predated, reads)) = m.predating_replica
-                    && predated == code.hash.0
-                    && reads > 0
-                {
-                    m.predating_replica = Some((predated, reads - 1));
-                    return Ok(json!({"latestLedger": m.ledger, "entries": []}));
-                }
-                if let x::LedgerKey::ContractCode(code) = &key
-                    && let Some(bytes) = m.code_bytes.get(&code.hash.0).cloned()
-                    && let Some(ledger) = m.replica_code_reads.pop_front().or(m.replica_ledger)
-                {
-                    let entry = x::LedgerEntryData::ContractCode(x::ContractCodeEntry {
-                        ext: x::ContractCodeEntryExt::V0,
-                        hash: code.hash.clone(),
-                        code: bytes.try_into().unwrap(),
-                    });
-                    let live_until = if m.replica_serves_live { ledger } else { 0 };
-                    return Ok(json!({
-                        "latestLedger": ledger,
-                        "entries": [{"key": encoded, "xdr": b64(&entry), "liveUntilLedgerSeq": live_until}],
-                    }));
-                }
-                if m.stale_code_reads > 0
-                    && let x::LedgerKey::ContractCode(code) = &key
-                    && let Some(bytes) = m.code_bytes.get(&code.hash.0).cloned()
-                {
-                    m.stale_code_reads -= 1;
-                    let observed = m.ledger;
-                    m.ledger += 1;
-                    let entry = x::LedgerEntryData::ContractCode(x::ContractCodeEntry {
-                        ext: x::ContractCodeEntryExt::V0,
-                        hash: code.hash.clone(),
-                        code: bytes.try_into().unwrap(),
-                    });
-                    return Ok(json!({
-                        "latestLedger": observed,
-                        "entries": [{"key": encoded, "xdr": b64(&entry), "liveUntilLedgerSeq": 0}],
-                    }));
                 }
                 let entry = match &key {
                     x::LedgerKey::Account(a) => {
@@ -766,15 +672,10 @@ impl rpc::Rpc for ModelChain {
                     .into_iter()
                     .map(|e| json!({"key": encoded, "xdr": b64(&e), "liveUntilLedgerSeq": live_until}))
                     .collect();
-                let mut latest = m.ledger;
-                if m.behind_head_code_reads > 0 && matches!(key, x::LedgerKey::ContractCode(_)) {
-                    m.behind_head_code_reads -= 1;
-                    latest -= 1;
-                }
                 if entries.is_empty() && m.omit_empty_entries {
-                    return Ok(json!({"latestLedger": latest}));
+                    return Ok(json!({"latestLedger": m.ledger}));
                 }
-                Ok(json!({"latestLedger": latest, "entries": entries}))
+                Ok(json!({"latestLedger": m.ledger, "entries": entries}))
             }
             "simulateTransaction" => {
                 let x::TransactionEnvelope::Tx(env) = de(params["transaction"].as_str().unwrap())
@@ -801,19 +702,6 @@ impl rpc::Rpc for ModelChain {
                             m.accounts.get_mut(&source_of(&env.tx)).unwrap().sequence += 1;
                         }
                     }
-                    let hidden = match m.predating_replica {
-                        Some((predated, _))
-                            if m.predating_simulations > 0
-                                && data.resources.footprint.read_write.iter().any(|key| {
-                                    matches!(key, x::LedgerKey::ContractCode(code) if code.hash.0 == predated)
-                                }) =>
-                        {
-                            m.predating_simulations -= 1;
-                            Some(predated)
-                        }
-                        _ => None,
-                    };
-                    let answered = m.restore_simulation_ledgers.pop_front().unwrap_or(m.ledger);
                     let mut data = x::SorobanTransactionData {
                         resource_fee: RESTORE_FEE,
                         ..data.clone()
@@ -825,18 +713,11 @@ impl rpc::Rpc for ModelChain {
                         .read_write
                         .iter()
                         .filter(|key| {
-                            matches!(key, x::LedgerKey::ContractCode(code) if m.lapsed_code.contains(&code.hash.0)
-                                && hidden != Some(code.hash.0))
+                            matches!(key, x::LedgerKey::ContractCode(code) if m.lapsed_code.contains(&code.hash.0))
                         })
                         .cloned()
                         .collect();
                     data.resources.footprint.read_write = archived.try_into().unwrap();
-                    m.behind_head_code_reads =
-                        std::mem::take(&mut m.behind_reads_on_restore_simulation);
-                    if std::mem::take(&mut m.replica_after_restore_simulation) {
-                        m.replica_from_network_check = Some((m.ledger, 2));
-                        m.ledger += 1;
-                    }
                     if m.restored_after_simulation {
                         m.restored_after_simulation = false;
                         for key in data.resources.footprint.read_write.iter() {
@@ -855,26 +736,14 @@ impl rpc::Rpc for ModelChain {
                         });
                     }
                     return Ok(json!({
-                        "latestLedger": answered,
+                        "latestLedger": m.ledger,
                         "minResourceFee": RESTORE_FEE.to_string(),
                         "transactionData": b64(&data),
                     }));
                 }
                 let op = host_op(&env.tx);
-                let upload_predated = if let x::HostFunction::UploadContractWasm(code) =
-                    &op.host_function
-                    && let Some((predated, _)) = m.predating_replica
-                    && predated == hash(code.as_slice())
-                    && m.predating_simulations > 0
-                {
-                    m.predating_simulations -= 1;
-                    true
-                } else {
-                    false
-                };
                 if let x::HostFunction::UploadContractWasm(code) = &op.host_function
                     && m.lapsed_code.contains(&hash(code.as_slice()))
-                    && !upload_predated
                 {
                     if !m.upload_restores_in_place {
                         return Ok(
@@ -958,12 +827,7 @@ impl rpc::Rpc for ModelChain {
                             })]
                             .try_into()
                             .unwrap();
-                        if !m.heads_on_upload_simulation.is_empty() {
-                            m.heads = std::mem::take(&mut m.heads_on_upload_simulation).into();
-                            m.restore_simulation_ledgers =
-                                std::mem::take(&mut m.restore_ledgers_on_upload_simulation).into();
-                        }
-                        if m.code_bytes.contains_key(&code_hash) && !upload_predated {
+                        if m.code_bytes.contains_key(&code_hash) {
                             footprint.read_only = key;
                         } else {
                             footprint.read_write = key;
@@ -1101,19 +965,12 @@ impl rpc::Rpc for ModelChain {
                 }
                 if let Some(code) = m.retry_later_restores.take() {
                     m.lapsed_code.remove(&code);
-                    m.stale_code_reads = std::mem::take(&mut m.stale_reads_on_retry_later);
-                    m.heads = std::mem::take(&mut m.heads_on_retry_later).into();
-                    m.replica_code_reads =
-                        std::mem::take(&mut m.replica_reads_on_retry_later).into();
-                    if std::mem::take(&mut m.replica_on_retry_later) {
-                        m.replica_ledger = Some(m.ledger);
-                        m.ledger += 1;
-                    }
-                    return Ok(json!({
-                        "hash": tx_hash,
-                        "status": "TRY_AGAIN_LATER",
-                        "latestLedger": m.ledger,
-                    }));
+                    return Ok(json!({"hash": tx_hash, "status": "TRY_AGAIN_LATER"}));
+                }
+                if std::mem::take(&mut m.reject_next_send) {
+                    return Ok(
+                        json!({"hash": tx_hash, "status": "ERROR", "errorResultXdr": "AAAAAAAAAGT////7AAAAAA=="}),
+                    );
                 }
                 // The source signs alone.
                 let source = source_of(&env.tx);
@@ -3392,6 +3249,62 @@ fn a_creation_funds_the_asset_and_the_gas_and_recovery_returns_both() {
     assert_eq!(admin::next_recovery(&c.asset, &xlm, 0, 0), None);
     assert_eq!(admin::next_recovery(&xlm, &xlm, 0, 0), None);
 }
+/// What the SDK engine does with a wallet code transaction, for this crate's tests: prepare it,
+/// send it while it is needed until the network accepts it, and read its receipt. A
+/// transaction that the ledger included and failed is an error that names it and the fee that
+/// its source paid.
+trait SendCode {
+    fn send_code(
+        &self,
+        i: &allowit_core::vendor::runtime::Installation,
+        wasm: Option<&[u8]>,
+        max_fee: u64,
+    ) -> allowit_core::client::error::Result<Option<allowit_core::vendor::runtime::Receipt>>;
+}
+impl<T: allowit_core::vendor::RuntimeProvider + ?Sized> SendCode for T {
+    fn send_code(
+        &self,
+        i: &allowit_core::vendor::runtime::Installation,
+        wasm: Option<&[u8]>,
+        max_fee: u64,
+    ) -> allowit_core::client::error::Result<Option<allowit_core::vendor::runtime::Receipt>> {
+        use allowit_core::client::error::Error;
+        use allowit_core::vendor::runtime::Status;
+        let Some(signed) = self.prepare_code_within(i, wasm, max_fee, NOW)? else {
+            return Ok(None);
+        };
+        let mut status = Status::Prepared;
+        for _ in 0..3 {
+            if !self.code_needed(&signed)? {
+                return Ok(None);
+            }
+            status = self.broadcast(&signed, NOW)?;
+            if status != Status::Prepared {
+                break;
+            }
+        }
+        if status == Status::Prepared {
+            return Err(Error::config(
+                "The network did not accept the code transaction",
+            ));
+        }
+        let receipt = self
+            .observe(&signed)?
+            .ok_or_else(|| Error::config("The code transaction has no receipt"))?;
+        let info = receipt.info()?;
+        if info.status != Status::Confirmed {
+            return Err(
+                Error::config("The wallet code transaction failed on the ledger").with_details(
+                    json!({
+                        "transactionHash": hexs(&info.transaction_hash),
+                        "nativeUnits": info.fee.native_units.to_string(),
+                    }),
+                ),
+            );
+        }
+        Ok(Some(receipt))
+    }
+}
 /// The server's runtime from the plugin sends with the server's own accounts, and so does its
 /// diagnostic session: a code upload through either reaches them. Code that lapsed is restored
 /// from those accounts, never uploaded again.
@@ -3400,7 +3313,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     use allowit_core::vendor::plugin::RailPlugin;
     use allowit_core::vendor::profiles::Description;
     use allowit_core::vendor::runtime::SendingAccounts;
-    use allowit_core::vendor::runtime::{Installation, Poll, Transport};
+    use allowit_core::vendor::runtime::{Installation, Transport};
     use std::sync::Arc;
     struct Wire(Arc<ModelChain>);
     impl Transport for Wire {
@@ -3446,6 +3359,8 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
             panic!("a leased account signs nothing")
         }
     }
+    // A sending account whose signer refuses while another account restores the code.
+    struct Refusing(Arc<ModelChain>, [u8; 32]);
     // A sending account whose signer gives a signature that does not verify while another
     // account restores the code.
     struct Garbled(Arc<ModelChain>, [u8; 32]);
@@ -3458,39 +3373,6 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
             Ok(vec![0; 64])
         }
     }
-    // Sending accounts that are all leased, after which a replica at the code's last live ledger
-    // answers: it serves the code as live at its own head.
-    struct LeasedBehindReplica(Arc<ModelChain>);
-    impl SendingAccounts for LeasedBehindReplica {
-        fn account(&self) -> allowit_core::client::error::Result<String> {
-            let mut m = self.0.0.lock().unwrap();
-            m.replica_ledger = Some(m.ledger - 1);
-            m.replica_serves_live = true;
-            Err(allowit_core::client::error::Error::config(
-                "All sending accounts are leased",
-            ))
-        }
-        fn sign(&self, _: &str, _: &[u8; 32]) -> allowit_core::client::error::Result<Vec<u8>> {
-            panic!("a leased account signs nothing")
-        }
-    }
-    // A sending account whose signer is overtaken: another account restores the code while it
-    // signs, and the signature is valid.
-    struct Overtaken(Arc<ModelChain>, [u8; 32]);
-    impl SendingAccounts for Overtaken {
-        fn account(&self) -> allowit_core::client::error::Result<String> {
-            Ok(sender())
-        }
-        fn sign(&self, _: &str, hash: &[u8; 32]) -> allowit_core::client::error::Result<Vec<u8>> {
-            self.0.0.lock().unwrap().lapsed_code.remove(&self.1);
-            Ok(SigningKey::from_bytes(&SENDER)
-                .sign(hash)
-                .to_bytes()
-                .to_vec())
-        }
-    }
-    // A sending account whose signer refuses while another account restores the code.
-    struct Refusing(Arc<ModelChain>, [u8; 32]);
     impl SendingAccounts for Refusing {
         fn account(&self) -> allowit_core::client::error::Result<String> {
             Ok(sender())
@@ -3541,7 +3423,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     let unsent = wasm_for(PolicyTier::Custom);
     assert!(
         plain
-            .upload_code(&installation, &unsent, Poll::default(), NOW)
+            .send_code(&installation, Some(&unsent), u64::from(u32::MAX))
             .unwrap_err()
             .message
             .contains("no sending account")
@@ -3561,13 +3443,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     chain.0.lock().unwrap().restore_archived = vec![0];
     let refused = session
         .provider
-        .upload_code_within(
-            &installation,
-            &other,
-            u64::from(u32::MAX),
-            Poll::default(),
-            NOW,
-        )
+        .send_code(&installation, Some(&other), u64::from(u32::MAX))
         .unwrap_err();
     assert!(
         refused.message.contains("outside the read-write footprint"),
@@ -3579,13 +3455,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     chain.0.lock().unwrap().upload_names_another_entry = true;
     let refused = session
         .provider
-        .upload_code_within(
-            &installation,
-            &other,
-            u64::from(u32::MAX),
-            Poll::default(),
-            NOW,
-        )
+        .send_code(&installation, Some(&other), u64::from(u32::MAX))
         .unwrap_err();
     assert!(
         refused.message.contains("another entry than its code"),
@@ -3599,13 +3469,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     assert!(
         session
             .provider
-            .upload_code_within(
-                &installation,
-                &other,
-                u64::from(u32::MAX),
-                Poll::default(),
-                NOW,
-            )
+            .send_code(&installation, Some(&other), u64::from(u32::MAX))
             .unwrap()
             .is_none()
     );
@@ -3622,7 +3486,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     assert!(
         session
             .provider
-            .upload_code_within(&installation, &other, 100, Poll::default(), NOW)
+            .send_code(&installation, Some(&other), 100)
             .unwrap()
             .is_none()
     );
@@ -3637,13 +3501,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     assert!(
         session
             .provider
-            .upload_code_within(
-                &installation,
-                &other,
-                u64::from(u32::MAX),
-                Poll::default(),
-                NOW,
-            )
+            .send_code(&installation, Some(&other), u64::from(u32::MAX))
             .unwrap()
             .is_none()
     );
@@ -3659,7 +3517,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     assert!(
         session
             .provider
-            .upload_code_within(&installation, &other, 100, Poll::default(), NOW)
+            .send_code(&installation, Some(&other), 100)
             .unwrap()
             .is_none()
     );
@@ -3678,13 +3536,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     assert!(
         session
             .provider
-            .upload_code_within(
-                &installation,
-                &other,
-                u64::from(u32::MAX),
-                Poll::default(),
-                NOW,
-            )
+            .send_code(&installation, Some(&other), u64::from(u32::MAX))
             .unwrap()
             .is_none()
     );
@@ -3695,69 +3547,11 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         m.code.remove(&hash(&other));
         m.code_bytes.remove(&hash(&other));
     }
-    // Just before an upload is signed, the archive-aware restoration simulation is taken again,
-    // and it counts only when it is dated at the highest ledger seen. A replica that trails by
-    // one ledger answers it once: it is taken once more, and the upload goes on.
-    let lagged_restoration = |times: usize| {
-        let mut m = chain.0.lock().unwrap();
-        let head = m.ledger;
-        // The upload's own closing head, then for each restoration: its account observation (two
-        // heads), its simulation's opening head from the replica and closing head, and the read
-        // after a simulation that names no entry (two heads).
-        let mut heads = vec![head];
-        for _ in 0..times {
-            heads.extend([head, head, head - 1, head, head, head]);
-        }
-        m.heads_on_upload_simulation = heads;
-        m.restore_ledgers_on_upload_simulation = vec![head - 1; times];
-    };
-    lagged_restoration(1);
-    chain.step("upload after a restoration simulation that trails once");
-    assert!(
-        session
-            .provider
-            .upload_code_within(
-                &installation,
-                &other,
-                u64::from(u32::MAX),
-                Poll::default(),
-                NOW,
-            )
-            .unwrap()
-            .is_some()
-    );
-    {
-        let mut m = chain.0.lock().unwrap();
-        assert!(m.heads.is_empty() && m.restore_simulation_ledgers.is_empty());
-        m.code.remove(&hash(&other));
-        m.code_bytes.remove(&hash(&other));
-    }
-    // The replica answers it twice: the upload is refused, and nothing is signed.
-    lagged_restoration(2);
-    let before = signatures();
-    let refused = session
-        .provider
-        .upload_code_within(
-            &installation,
-            &other,
-            u64::from(u32::MAX),
-            Poll::default(),
-            NOW,
-        )
-        .unwrap_err();
-    assert!(refused.message.contains("trails"), "{}", refused.message);
-    assert_eq!(signatures(), before);
-    {
-        let m = chain.0.lock().unwrap();
-        assert!(m.heads.is_empty() && m.restore_simulation_ledgers.is_empty());
-        assert!(!m.code.contains_key(&hash(&other)));
-    }
-    let signed = signatures();
     // The server pays the upload, within its fee ceiling: a ceiling below the simulated fee
     // refuses it before anything is signed or sent.
     let refused = session
         .provider
-        .upload_code_within(&installation, &other, 100, Poll::default(), NOW)
+        .send_code(&installation, Some(&other), 100)
         .unwrap_err();
     assert!(
         refused
@@ -3771,20 +3565,14 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     assert!(
         session
             .provider
-            .upload_code_within(&installation, &other, u64::MAX, Poll::default(), NOW)
+            .send_code(&installation, Some(&other), u64::MAX)
             .is_err()
     );
     assert_eq!(signatures(), signed);
     chain.step("upload");
     let receipt = session
         .provider
-        .upload_code_within(
-            &installation,
-            &other,
-            u64::from(u32::MAX),
-            Poll::default(),
-            NOW,
-        )
+        .send_code(&installation, Some(&other), u64::from(u32::MAX))
         .unwrap();
     assert!(receipt.is_some());
     assert!(chain.0.lock().unwrap().code.contains_key(&hash(&other)));
@@ -3804,7 +3592,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     assert!(
         session
             .provider
-            .upload_code(&installation, &other, Poll::default(), NOW)
+            .send_code(&installation, Some(&other), u64::from(u32::MAX))
             .unwrap()
             .is_none()
     );
@@ -3818,7 +3606,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     chain.step("upload");
     assert!(
         provider
-            .upload_code(&installation, &unsent, Poll::default(), NOW)
+            .send_code(&installation, Some(&unsent), u64::from(u32::MAX))
             .unwrap()
             .is_some()
     );
@@ -3829,7 +3617,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     assert!(!provider.resources(&installation).unwrap().code_present);
     let signed = signatures();
     let refused = provider
-        .upload_code_within(&installation, &wasm, 100, Poll::default(), NOW)
+        .send_code(&installation, Some(&wasm), 100)
         .unwrap_err();
     assert!(
         refused
@@ -3842,12 +3630,10 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     assert_eq!(signatures(), signed);
     chain.step("restore");
     let restored = provider
-        .upload_code_within(
+        .send_code(
             &installation,
-            &wasm,
+            Some(&wasm),
             u64::try_from(RESTORE_FEE).unwrap() + 100,
-            Poll::default(),
-            NOW,
         )
         .unwrap();
     assert!(restored.is_some());
@@ -3884,7 +3670,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     );
     assert!(
         provider
-            .upload_code(&installation, &wasm, Poll::default(), NOW)
+            .send_code(&installation, Some(&wasm), u64::from(u32::MAX))
             .unwrap()
             .is_none()
     );
@@ -3893,7 +3679,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     let ceiling = u64::try_from(RESTORE_FEE).unwrap() + 100;
     assert!(
         provider
-            .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+            .send_code(&installation, None, ceiling)
             .unwrap()
             .is_none()
     );
@@ -3901,14 +3687,14 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     let signed = signatures();
     assert!(
         plain
-            .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+            .send_code(&installation, None, ceiling)
             .unwrap_err()
             .message
             .contains("no sending account")
     );
     assert!(
         provider
-            .restore_code_within(&installation, 100, Poll::default(), NOW)
+            .send_code(&installation, None, 100)
             .unwrap_err()
             .message
             .contains("exceeds the explicitly selected ceiling")
@@ -3917,7 +3703,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     chain.step("restore before an operation");
     assert!(
         provider
-            .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+            .send_code(&installation, None, ceiling)
             .unwrap()
             .is_some()
     );
@@ -3936,7 +3722,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     let sent = chain.0.lock().unwrap().steps.len();
     let signed = signatures();
     let refused = provider
-        .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+        .send_code(&installation, None, ceiling)
         .unwrap_err();
     assert_eq!(signatures(), signed);
     assert!(
@@ -3957,7 +3743,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     // account paid for it, which the server accounts for.
     chain.step("failed restoration");
     let failed = provider
-        .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+        .send_code(&installation, None, ceiling)
         .unwrap_err();
     assert!(
         failed.message.contains("failed on the ledger"),
@@ -3985,7 +3771,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     chain.step("failed restoration of the upload step");
     assert!(
         provider
-            .upload_code_within(&installation, &wasm, ceiling, Poll::default(), NOW)
+            .send_code(&installation, Some(&wasm), ceiling)
             .unwrap_err()
             .message
             .contains("failed on the ledger")
@@ -3996,7 +3782,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     chain.0.lock().unwrap().charged_fee = Some(i64::from(u32::MAX));
     chain.step("failed restoration with an inflated fee");
     let inflated = provider
-        .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+        .send_code(&installation, None, ceiling)
         .unwrap_err();
     assert!(
         inflated
@@ -4012,7 +3798,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     chain.step("restore after a failure");
     assert!(
         provider
-            .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+            .send_code(&installation, None, ceiling)
             .unwrap()
             .is_some()
     );
@@ -4032,7 +3818,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         let signed = signatures();
         assert!(
             provider
-                .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+                .send_code(&installation, None, ceiling)
                 .unwrap()
                 .is_none(),
             "{by_source}"
@@ -4063,9 +3849,9 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         chain.0.lock().unwrap().lapsed_code.insert(installed);
         chain.step(name);
         let restored = if upload {
-            provider.upload_code_within(&installation, &wasm, ceiling, Poll::default(), NOW)
+            provider.send_code(&installation, Some(&wasm), ceiling)
         } else {
-            provider.restore_code_within(&installation, ceiling, Poll::default(), NOW)
+            provider.send_code(&installation, None, ceiling)
         };
         assert!(restored.unwrap().is_some(), "{name}");
         let m = chain.0.lock().unwrap();
@@ -4083,8 +3869,8 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
             }]
         ));
     }
-    // A restoration of such code that the ledger fails is reported as a restoration, the
-    // operation that the sending account sent, not as an upload.
+    // A restoration of such code that the ledger fails: the sending account sent a restoration,
+    // and its failure names that transaction and the fee that its source paid.
     {
         let mut m = chain.0.lock().unwrap();
         m.lapsed_code.insert(installed);
@@ -4092,20 +3878,35 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     }
     chain.step("failed restoration of unread code");
     let failed = provider
-        .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+        .send_code(&installation, None, ceiling)
         .unwrap_err();
     assert!(
-        failed
-            .message
-            .contains("restoration of the wallet code failed"),
+        failed.message.contains("failed on the ledger"),
         "{}",
         failed.message
     );
+    {
+        let m = chain.0.lock().unwrap();
+        let sent = &m.steps.last().unwrap().1;
+        let x::TransactionEnvelope::Tx(env) = de(sent) else {
+            panic!()
+        };
+        assert!(matches!(
+            env.tx.operations.as_slice(),
+            [x::Operation {
+                body: x::OperationBody::RestoreFootprint(_),
+                ..
+            }]
+        ));
+        let details = failed.details.as_ref().unwrap();
+        assert_eq!(details["transactionHash"], json!(hexs(&tx_hash(&env.tx))));
+        assert!(details["nativeUnits"].as_str().is_some());
+    }
     chain.0.lock().unwrap().failing_restore = false;
     chain.step("restore of unread code after a failure");
     assert!(
         provider
-            .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+            .send_code(&installation, None, ceiling)
             .unwrap()
             .is_some()
     );
@@ -4129,7 +3930,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     chain.step("upload step of code that an upload would restore");
     assert!(
         provider
-            .upload_code_within(&installation, &wasm, ceiling, Poll::default(), NOW)
+            .send_code(&installation, Some(&wasm), ceiling)
             .unwrap()
             .is_some()
     );
@@ -4176,7 +3977,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     assert!(refused.contains("lapsed"), "{refused}");
     let signed = signatures();
     let refused = provider
-        .upload_code_within(&installation, &wasm, ceiling, Poll::default(), NOW)
+        .send_code(&installation, Some(&wasm), ceiling)
         .unwrap_err();
     assert!(refused.message.contains("lapsed"), "{}", refused.message);
     assert_eq!(signatures(), signed);
@@ -4197,7 +3998,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     let signed = signatures();
     assert!(
         provider
-            .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+            .send_code(&installation, None, ceiling)
             .unwrap()
             .is_none()
     );
@@ -4216,7 +4017,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     }
     assert!(
         provider
-            .restore_code_within(&installation, 100, Poll::default(), NOW)
+            .send_code(&installation, None, 100)
             .unwrap()
             .is_none()
     );
@@ -4236,14 +4037,14 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     };
     assert!(
         leased(Some(installed))
-            .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+            .send_code(&installation, None, ceiling)
             .unwrap()
             .is_none()
     );
     // While the code stays lapsed, the refusal stands.
     chain.0.lock().unwrap().lapsed_code.insert(installed);
     let refused = leased(None)
-        .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+        .send_code(&installation, None, ceiling)
         .unwrap_err();
     assert!(refused.message.contains("leased"), "{}", refused.message);
     // The signer refuses while another account restores the code: nothing is needed.
@@ -4255,11 +4056,90 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
                 Arc::new(Refusing(chain.clone(), installed)),
             )
             .unwrap()
-            .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+            .send_code(&installation, None, ceiling)
             .unwrap()
             .is_none()
     );
     assert!(!chain.0.lock().unwrap().lapsed_code.contains(&installed));
+    // A code transaction is a signed packet that the caller sends: the rail prepares it, signed
+    // by the sending account, and sends nothing. Its identity is its transaction hash.
+    {
+        use allowit_core::vendor::runtime::{Kind, Status};
+        chain.0.lock().unwrap().lapsed_code.insert(installed);
+        let signed = signatures();
+        let code = provider
+            .prepare_code_within(&installation, None, ceiling, NOW)
+            .unwrap()
+            .unwrap();
+        assert_eq!(signatures(), signed + 1);
+        assert!(chain.0.lock().unwrap().lapsed_code.contains(&installed));
+        let info = code.info().unwrap();
+        assert_eq!(info.operation_id, info.transaction_hash);
+        assert_eq!(info.wallet, sender());
+        provider.validate_signed(&code, NOW).unwrap();
+        assert!(
+            provider
+                .validate_signed(&code, info.expires_at + 1)
+                .is_err()
+        );
+        assert!(code.preparation().is_err());
+        assert!(provider.code_needed(&code).unwrap());
+        // Its exact bytes restore, and bytes that differ do not: an envelope without the
+        // source's signature, or a restoration named an upload.
+        let raw =
+            |value: &Value| serde_json::value::RawValue::from_string(value.to_string()).unwrap();
+        let document: Value = serde_json::from_slice(code.bytes()).unwrap();
+        assert!(
+            allowit_stellar::PLUGIN
+                .restore(Kind::Signed, raw(&document))
+                .is_ok()
+        );
+        let mut unsigned = document.clone();
+        unsigned["signedXdr"] = unsigned["code"]["transactionXdr"].clone();
+        assert!(
+            allowit_stellar::PLUGIN
+                .restore(Kind::Signed, raw(&unsigned))
+                .is_err()
+        );
+        let mut renamed = document.clone();
+        renamed["code"]["function"] = json!("upload_wasm");
+        assert!(
+            allowit_stellar::PLUGIN
+                .restore(Kind::Signed, raw(&renamed))
+                .is_err()
+        );
+        // The network does not accept it yet while another account restores the code: nothing is
+        // pending, the transaction is no longer needed, and it is not sent again.
+        chain.0.lock().unwrap().retry_later_restores = Some(installed);
+        assert_eq!(provider.broadcast(&code, NOW).unwrap(), Status::Prepared);
+        assert!(!provider.code_needed(&code).unwrap());
+        assert!(provider.observe(&code).unwrap().is_none());
+        // A transaction that the network rejects did not apply: an error that names it.
+        chain.0.lock().unwrap().lapsed_code.insert(installed);
+        let code = provider
+            .prepare_code_within(&installation, None, ceiling, NOW)
+            .unwrap()
+            .unwrap();
+        chain.0.lock().unwrap().reject_next_send = true;
+        let rejected = provider.broadcast(&code, NOW).unwrap_err();
+        assert!(
+            rejected
+                .message
+                .contains("rejected the wallet code transaction"),
+            "{}",
+            rejected.message
+        );
+        assert!(chain.0.lock().unwrap().lapsed_code.contains(&installed));
+        // Sent, it restores the code, and its receipt is the caller's.
+        chain.step("restore by a code transaction");
+        assert_eq!(provider.broadcast(&code, NOW).unwrap(), Status::Submitted);
+        assert_eq!(provider.status(&code).unwrap(), Status::Confirmed);
+        let receipt = provider.observe(&code).unwrap().unwrap();
+        receipt.verify_operation(&code).unwrap();
+        assert_eq!(receipt.info().unwrap().status, Status::Confirmed);
+        assert!(!chain.0.lock().unwrap().lapsed_code.contains(&installed));
+        assert!(!provider.code_needed(&code).unwrap());
+    }
     // The signature does not verify while another account restores the code: nothing is needed.
     chain.0.lock().unwrap().lapsed_code.insert(installed);
     assert!(
@@ -4270,264 +4150,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
                 Arc::new(Garbled(chain.clone(), installed)),
             )
             .unwrap()
-            .restore_code_within(&installation, ceiling, Poll::default(), NOW)
-            .unwrap()
-            .is_none()
-    );
-    // A node that trails serves the code as lapsed after another account restored it: a
-    // negative read that trails the closing head does not decide a paid transaction, and the
-    // code is read again.
-    let signed = signatures();
-    {
-        let mut m = chain.0.lock().unwrap();
-        m.lapsed_code.insert(installed);
-        m.restored_after_simulation = true;
-        m.stale_code_reads = 2;
-    }
-    assert!(
-        provider
-            .restore_code_within(&installation, ceiling, Poll::default(), NOW)
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(signatures(), signed);
-    assert_eq!(chain.0.lock().unwrap().stale_code_reads, 0);
-    // The network does not accept the restoration yet, and another account restores the code
-    // meanwhile: the restoration is not sent again.
-    {
-        let mut m = chain.0.lock().unwrap();
-        m.lapsed_code.insert(installed);
-        m.retry_later_restores = Some(installed);
-    }
-    let quick = Poll {
-        attempts: 3,
-        interval: std::time::Duration::ZERO,
-    };
-    assert!(
-        provider
-            .restore_code_within(&installation, ceiling, quick, NOW)
-            .unwrap()
-            .is_none()
-    );
-    {
-        let m = chain.0.lock().unwrap();
-        assert!(m.retry_later_restores.is_none());
-        assert!(!m.lapsed_code.contains(&installed));
-    }
-    // So when the read before the repeated send trails the closing head: that read does not
-    // decide, and the code is read again.
-    {
-        let mut m = chain.0.lock().unwrap();
-        m.lapsed_code.insert(installed);
-        m.retry_later_restores = Some(installed);
-        m.stale_reads_on_retry_later = 1;
-    }
-    assert!(
-        provider
-            .restore_code_within(&installation, ceiling, quick, NOW)
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(chain.0.lock().unwrap().stale_code_reads, 0);
-    // The read before the signature answers at a ledger before the head read just before it:
-    // it is taken once more, and the restoration of code that is still lapsed goes on.
-    {
-        let mut m = chain.0.lock().unwrap();
-        m.lapsed_code.insert(installed);
-        m.behind_reads_on_restore_simulation = 1;
-    }
-    chain.step("restore after a read that trails the head");
-    assert!(
-        provider
-            .restore_code_within(&installation, ceiling, Poll::default(), NOW)
-            .unwrap()
-            .is_some()
-    );
-    {
-        let m = chain.0.lock().unwrap();
-        assert_eq!(m.behind_head_code_reads, 0);
-        assert!(!m.lapsed_code.contains(&installed));
-    }
-    // A read taken again may come from a node behind a head that the first read saw: its
-    // negative answer does not decide.
-    {
-        let mut m = chain.0.lock().unwrap();
-        m.lapsed_code.insert(installed);
-        let head = m.ledger;
-        m.heads = [head, head + 1, head, head].into();
-    }
-    let refused =
-        rpc::current_code_state(&*chain, NETWORK, &installed, &Default::default()).unwrap_err();
-    assert!(refused.contains("trails"), "{refused}");
-    assert!(chain.0.lock().unwrap().heads.is_empty());
-    // The first reply trails its own heads (H+1) and the read taken again comes wholly from a
-    // replica at H: the heads of the first reply count, so its negative answer does not decide.
-    {
-        let mut m = chain.0.lock().unwrap();
-        let head = m.ledger;
-        m.heads = [head + 1, head + 1, head, head].into();
-        m.replica_code_reads = [head, head].into();
-    }
-    let refused =
-        rpc::current_code_state(&*chain, NETWORK, &installed, &Default::default()).unwrap_err();
-    assert!(refused.contains("trails"), "{refused}");
-    // The highest ledger seen holds across the reads of one decision: a later read from a
-    // replica behind it does not decide.
-    let seen = std::sync::atomic::AtomicU32::new(0);
-    assert_eq!(
-        rpc::current_code_state(&*chain, NETWORK, &installed, &seen).unwrap(),
-        rpc::CodeState::Lapsed
-    );
-    {
-        let mut m = chain.0.lock().unwrap();
-        let behind = m.ledger - 1;
-        m.heads = [behind; 4].into();
-        m.replica_code_reads = [behind, behind].into();
-    }
-    let refused = rpc::current_code_state(&*chain, NETWORK, &installed, &seen).unwrap_err();
-    assert!(refused.contains("trails"), "{refused}");
-    {
-        let mut m = chain.0.lock().unwrap();
-        assert!(m.heads.is_empty() && m.replica_code_reads.is_empty());
-        m.lapsed_code.remove(&installed);
-    }
-    // So across the sends of one code transaction: after TRY_AGAIN_LATER another account
-    // restores the code, and the check before the repeated send reads from a replica behind
-    // the checks before it. Nothing is sent again.
-    {
-        let mut m = chain.0.lock().unwrap();
-        m.lapsed_code.insert(installed);
-        m.retry_later_restores = Some(installed);
-        let behind = m.ledger - 1;
-        m.heads_on_retry_later = vec![behind; 4];
-        m.replica_reads_on_retry_later = vec![behind, behind];
-    }
-    let refused = provider
-        .restore_code_within(&installation, ceiling, quick, NOW)
-        .unwrap_err();
-    assert!(refused.message.contains("trails"), "{}", refused.message);
-    {
-        let m = chain.0.lock().unwrap();
-        assert!(m.heads.is_empty() && m.replica_code_reads.is_empty());
-        assert!(!m.lapsed_code.contains(&installed));
-    }
-    // The restoration's simulation answers at H+1, where another account restored the code, and
-    // the checks before the signature and before the send read wholly from a replica at H: the
-    // ledgers that the preparation saw count, so nothing is signed.
-    {
-        let mut m = chain.0.lock().unwrap();
-        m.lapsed_code.insert(installed);
-        m.restored_after_simulation = true;
-        m.replica_after_restore_simulation = true;
-    }
-    let signed = signatures();
-    let refused = provider
-        .restore_code_within(&installation, ceiling, Poll::default(), NOW)
-        .unwrap_err();
-    assert!(refused.message.contains("trails"), "{}", refused.message);
-    assert_eq!(signatures(), signed);
-    {
-        let mut m = chain.0.lock().unwrap();
-        assert!(m.replica_ledger.is_some() && m.replica_from_network_check.is_none());
-        m.replica_ledger = None;
-        assert!(!m.lapsed_code.contains(&installed));
-    }
-    // A replica that predates the upload answers the simulations and the first reads, so an
-    // upload is prepared, but the read before the signature finds the code lapsed: an upload of
-    // archived code would fail and still cost its fee, so nothing is signed.
-    {
-        let mut m = chain.0.lock().unwrap();
-        m.lapsed_code.insert(installed);
-        m.predating_replica = Some((installed, 2));
-        m.predating_simulations = 2;
-    }
-    let signed = signatures();
-    let refused = session
-        .provider
-        .upload_code_within(&installation, &wasm, ceiling, Poll::default(), NOW)
-        .unwrap_err();
-    assert!(refused.message.contains("lapsed"), "{}", refused.message);
-    assert_eq!(signatures(), signed);
-    {
-        let mut m = chain.0.lock().unwrap();
-        assert_eq!(m.predating_replica, Some((installed, 0)));
-        m.predating_replica = None;
-        assert!(m.lapsed_code.remove(&installed));
-    }
-    // So when a newer RPC that serves no archived entry reads the code as absent at the highest
-    // ledger seen: the archive-aware restoration simulation, taken again just before the
-    // signature, finds the code in the archive, so nothing is signed.
-    {
-        let mut m = chain.0.lock().unwrap();
-        m.lapsed_code.insert(installed);
-        m.hide_archived = true;
-        m.predating_replica = Some((installed, 2));
-        m.predating_simulations = 2;
-    }
-    let refused = session
-        .provider
-        .upload_code_within(&installation, &wasm, ceiling, Poll::default(), NOW)
-        .unwrap_err();
-    assert!(refused.message.contains("lapsed"), "{}", refused.message);
-    assert_eq!(signatures(), signed);
-    {
-        let mut m = chain.0.lock().unwrap();
-        assert_eq!(m.predating_simulations, 0);
-        m.predating_replica = None;
-        m.hide_archived = false;
-        assert!(m.lapsed_code.remove(&installed));
-    }
-    // The sending accounts are all leased, and a replica at the code's last live ledger then
-    // serves it as live at its own head: the code is not live at the highest ledger seen, so
-    // the refusal stands.
-    chain.0.lock().unwrap().lapsed_code.insert(installed);
-    let refused = allowit_stellar::PLUGIN
-        .sending_runtime(
-            NETWORK,
-            Arc::new(Wire(chain.clone())),
-            Arc::new(LeasedBehindReplica(chain.clone())),
-        )
-        .unwrap()
-        .restore_code_within(&installation, ceiling, Poll::default(), NOW)
-        .unwrap_err();
-    assert!(refused.message.contains("leased"), "{}", refused.message);
-    {
-        let mut m = chain.0.lock().unwrap();
-        m.replica_ledger = None;
-        m.replica_serves_live = false;
-        assert!(m.lapsed_code.remove(&installed));
-    }
-    // The answer TRY_AGAIN_LATER names H+1, where another account restored the code, and the
-    // check before the repeated send reads wholly from a replica at H: the ledger of the send's
-    // answer counts, so nothing is sent again.
-    {
-        let mut m = chain.0.lock().unwrap();
-        m.lapsed_code.insert(installed);
-        m.retry_later_restores = Some(installed);
-        m.replica_on_retry_later = true;
-    }
-    let refused = provider
-        .restore_code_within(&installation, ceiling, quick, NOW)
-        .unwrap_err();
-    assert!(refused.message.contains("trails"), "{}", refused.message);
-    {
-        let mut m = chain.0.lock().unwrap();
-        assert!(m.replica_ledger.is_some());
-        m.replica_ledger = None;
-        assert!(!m.lapsed_code.contains(&installed));
-    }
-    // Another account restores the code while the sending account signs: the restoration is
-    // not sent.
-    chain.0.lock().unwrap().lapsed_code.insert(installed);
-    assert!(
-        allowit_stellar::PLUGIN
-            .sending_runtime(
-                NETWORK,
-                Arc::new(Wire(chain.clone())),
-                Arc::new(Overtaken(chain.clone(), installed)),
-            )
-            .unwrap()
-            .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+            .prepare_code_within(&installation, None, ceiling, NOW)
             .unwrap()
             .is_none()
     );
@@ -4537,7 +4160,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     let signed = signatures();
     assert!(
         provider
-            .restore_code_within(&installation, ceiling, Poll::default(), NOW)
+            .send_code(&installation, None, ceiling)
             .unwrap_err()
             .message
             .contains("not on the network")
