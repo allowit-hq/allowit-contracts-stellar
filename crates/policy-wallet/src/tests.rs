@@ -1495,6 +1495,41 @@ fn swap_deposit_and_redeem_run_through_execute_with_effect_checks() {
     }
 }
 
+/// A wallet that keeps only the daily spending figures writes `d` only when one of them changes.
+/// A deposit spends nothing: it leaves the window closed, so the next spend opens it at its own
+/// ledger, and that spend's day ends a whole window later.
+#[test]
+fn a_deposit_leaves_the_daily_spending_window_closed() {
+    let f = Fixture::with(COMMON, false, |env, c| {
+        c.rules = Vec::from_array(env, [AllowitRule::daily_spending_limit]);
+    });
+    assert_eq!(f.client().state().kept, u32::from(DAY_SPENT));
+    f.env.mock_all_auths();
+    let vault = f.env.register(VAULT, (f.asset.clone(), 0u32));
+    f.env.set_auths(&[]);
+    let mut e = f.transfer(1, 0);
+    e.3 = AllowitStellarOperation::Deposit(vault, 40, 40);
+    priced(&f, &mut e, 0);
+    assert_eq!(f.run(&e), Ok(()));
+    assert_eq!(
+        f.figures().day_ends,
+        0,
+        "a deposit opens no spending window"
+    );
+    assert!(
+        !f.env
+            .as_contract(&f.wallet, || f.env.storage().temporary().has(&DAILY)),
+        "nor writes d"
+    );
+    f.advance(10);
+    assert_eq!(f.run(&f.transfer(10, 0)), Ok(()));
+    let now = f.env.ledger().sequence();
+    assert_eq!(
+        (f.figures().day_spent, f.figures().day_ends),
+        (10, now + DAY_LEDGERS - 1)
+    );
+}
+
 #[test]
 fn a_custom_wallet_deposits_within_its_policy() {
     let f = Fixture::with(CUSTOM, false, |env, c| {

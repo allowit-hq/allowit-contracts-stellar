@@ -559,6 +559,23 @@ fn totals(kept: u8, f: &Figures) -> (i128, u64, bool) {
         spent && f.unpriced,
     )
 }
+/// The daily figures that `kept` names; the others are zero. The unpriced flag lives beside either
+/// daily figure.
+fn dailies(kept: u8, f: &Figures) -> (i128, i128, bool) {
+    (
+        if kept & DAY_SPENT != 0 {
+            f.day_spent
+        } else {
+            0
+        },
+        if kept & DAY_TOTAL != 0 {
+            f.day_total
+        } else {
+            0
+        },
+        kept & DAILIES != 0 && f.day_unpriced,
+    )
+}
 /// Write `t`: spent as 8 bytes, then calls in 31 bits with the unpriced flag in the top bit. The
 /// value has one fixed size, so a payment never grows it: a larger value would pay rent for the
 /// whole prepaid lifetime of `t`. A figure that no check reads is written as zero. A figure beyond
@@ -1105,10 +1122,9 @@ fn admit<P: AllowitPolicy>(
     {
         write_total(env, kept, &after, stored.total_exists)?;
     }
-    if kept & DAILIES != 0
-        && (after.day_spent, after.day_total, after.day_unpriced)
-            != (before.day_spent, before.day_total, before.day_unpriced)
-    {
+    // `d` changes only when a daily figure that it keeps changes: then its window opens or keeps
+    // its end by Core's rule. A figure that the wallet does not keep opens no window.
+    if kept & DAILIES != 0 && dailies(kept, &after) != dailies(kept, before) {
         write_daily(env, kept, &after, stored.day_ends)?;
     }
     Ok(())
