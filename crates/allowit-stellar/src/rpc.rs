@@ -1482,9 +1482,10 @@ fn fee_parties(envelope: &str) -> Result<(String, Option<String>)> {
 /// The account that paid the fee bump that carried the transaction of `receipt`, as the ledger
 /// answers it now, the wrapper verified: `None` for a transaction that no fee bump carried, and
 /// for one that the ledger answers it does not hold (a valid `NOT_FOUND`). A reply with any other
-/// or no status establishes neither: it is a read with an unknown result, to ask again. A
-/// terminal answer whose status, ledger, inner transaction or result differs from the receipt is
-/// refused. Nothing of it is retained.
+/// or no status, and a `NOT_FOUND` that states a settlement ledger, an envelope or a result all
+/// the same, establish neither: each is a read with an unknown result, to ask again. A terminal
+/// answer whose status, ledger, inner transaction or result differs from the receipt is refused.
+/// Nothing of it is retained.
 pub fn fee_bump_payer(
     rpc: &dyn Rpc,
     network: &str,
@@ -1492,13 +1493,23 @@ pub fn fee_bump_payer(
 ) -> Result<Option<String>> {
     let hash = &receipt.transaction_hash;
     let v = rpc.call("getTransaction", json!({"hash": hex(hash)}))?;
-    if !matches!(
-        v["status"].as_str(),
-        Some("SUCCESS" | "FAILED" | "NOT_FOUND")
-    ) {
-        return Err(format!(
-            "{TRANSPORT_UNKNOWN}: getTransaction answered no known status"
-        ));
+    let unknown = |what: &str| format!("{TRANSPORT_UNKNOWN}: getTransaction answered {what}");
+    match v["status"].as_str() {
+        Some("SUCCESS" | "FAILED") => {}
+        // An absent transaction has no settlement. A reply that states one all the same
+        // contradicts itself and establishes nothing.
+        Some("NOT_FOUND") => {
+            let unset = |name: &str, empty: Value| {
+                matches!(v.get(name), None | Some(Value::Null)) || v[name] == empty
+            };
+            if !(unset("ledger", json!(0))
+                && unset("envelopeXdr", json!(""))
+                && unset("resultXdr", json!("")))
+            {
+                return Err(unknown("NOT_FOUND with a settlement"));
+            }
+        }
+        _ => return Err(unknown("no known status")),
     }
     // The reply passes the checks of every receipt read, its status against its result included.
     let Some(answer) = receipt_from_response(&v, network, hash)? else {

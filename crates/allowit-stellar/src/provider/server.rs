@@ -4346,17 +4346,18 @@ mod settlement_api {
             .settle_receipt(&own, &packet, &receipt, Some(&accounting(9)), 0)
             .unwrap_err();
         assert_eq!(error.api_code, None);
-        // So is one whose inner transaction differs, alone.
+        // So is one whose inner envelope differs, alone: the same transaction, under the same
+        // hash, without its signature.
         let mut other = bumped.clone();
         let stellar_xdr::TransactionEnvelope::Tx(mut envelope) =
             native::read(&other.envelope_xdr).unwrap()
         else {
             panic!("a transaction")
         };
-        envelope.tx.seq_num.0 += 1;
+        assert!(!envelope.signatures.is_empty());
+        envelope.signatures = Default::default();
         other.envelope_xdr = native::xdr(&stellar_xdr::TransactionEnvelope::Tx(envelope)).unwrap();
-        let mut reply = crate::test_support::fee_bump_reply(&other, NETWORK, &sponsor, 5_000);
-        reply["txHash"] = serde_json::json!(native::hex(&bumped.transaction_hash));
+        let reply = crate::test_support::fee_bump_reply(&other, NETWORK, &sponsor, 5_000);
         assert!(
             Provider::from_rpc(NETWORK, Arc::new(Answers(reply)))
                 .settle_receipt(&own, &packet, &receipt, Some(&accounting(9)), 0)
@@ -4402,6 +4403,25 @@ mod settlement_api {
             )
             .is_err()
         );
+        // A `NOT_FOUND` that states the settlement all the same, here with the fee bump that the
+        // wallet paid, contradicts itself: it is no absence. The unset ledger of an absent
+        // transaction is zero.
+        let mut contradictory = crate::test_support::fee_bump_reply(
+            &unpaid,
+            NETWORK,
+            &signed.prepared.config.wallet,
+            5_000,
+        );
+        contradictory["status"] = serde_json::json!("NOT_FOUND");
+        for name in ["ledger", "envelopeXdr", "resultXdr"] {
+            let mut reply = serde_json::json!({"status": "NOT_FOUND"});
+            reply[name] = contradictory[name].clone();
+            for reply in [reply, contradictory.clone()] {
+                assert_eq!(settle(reply).unwrap_err().code, Error::uncertain("").code);
+            }
+        }
+        let absent = serde_json::json!({"status": "NOT_FOUND", "ledger": 0, "envelopeXdr": null});
+        assert_eq!(settle(absent).unwrap().fee_units, 0);
         // The ledger holds the transaction itself, with no fee bump: the receipt's own.
         let plain = |status: &str, ledger: u32| {
             serde_json::json!({"status": status, "txHash": native::hex(&unpaid.transaction_hash),
@@ -4414,22 +4434,40 @@ mod settlement_api {
     }
 
     /// A contract wallet's own transaction has the server's sending account as its source, which
-    /// is not the wallet: a fee bump that the sending account paid is refused.
+    /// is not the wallet: a fee bump that the sending account paid is refused, for a confirmed and
+    /// for a failed transaction. One that another party paid settles as the receipt reads.
     #[test]
     fn a_fee_bump_that_the_sending_account_paid_is_refused() {
         let (p, signed, receipt) = standard();
-        let mut unpaid: rpc::VerifiedReceipt = decode_packet(&receipt.0).unwrap();
-        let mut result: stellar_xdr::TransactionResult = native::read(&unpaid.result_xdr).unwrap();
-        result.fee_charged = 0;
-        unpaid.result_xdr = native::xdr(&result).unwrap();
-        let receipt = Receipt(super::packet(NETWORK, &unpaid).unwrap());
-        let (sender, _) = rpc::receipt_fee_parties(&unpaid).unwrap();
+        let retained: rpc::VerifiedReceipt = decode_packet(&receipt.0).unwrap();
+        let (sender, _) = rpc::receipt_fee_parties(&retained).unwrap();
         assert_ne!(sender, prepared(&p).unwrap().config.wallet);
-        let reply = crate::test_support::fee_bump_reply(&unpaid, NETWORK, &sender, 5_000);
-        let error = Provider::from_rpc(NETWORK, Arc::new(Answers(reply)))
-            .settle_receipt(&p, &signed, &receipt, None, 0)
-            .unwrap_err();
-        assert_eq!(error.api_code.as_deref(), Some(FEE_BUMP_UNSUPPORTED));
+        let sponsor = native::account_for_seed(&[99; 32]);
+        for outcome in [OperationOutcome::Executed, OperationOutcome::Open] {
+            let mut unpaid = retained.clone();
+            let mut result: stellar_xdr::TransactionResult =
+                native::read(&unpaid.result_xdr).unwrap();
+            result.fee_charged = 0;
+            if outcome == OperationOutcome::Open {
+                unpaid.status = native::OperationStatus::Failed;
+                result.result = stellar_xdr::TransactionResultResult::TxFailed(Default::default());
+            }
+            unpaid.result_xdr = native::xdr(&result).unwrap();
+            let receipt = Receipt(super::packet(NETWORK, &unpaid).unwrap());
+            for (payer, refused) in [(&sender, true), (&sponsor, false)] {
+                let reply = crate::test_support::fee_bump_reply(&unpaid, NETWORK, payer, 5_000);
+                let settled = Provider::from_rpc(NETWORK, Arc::new(Answers(reply)))
+                    .settle_receipt(&p, &signed, &receipt, None, 0);
+                if refused {
+                    assert_eq!(
+                        settled.unwrap_err().api_code.as_deref(),
+                        Some(FEE_BUMP_UNSUPPORTED)
+                    );
+                } else {
+                    assert_eq!(settled.unwrap().outcome, outcome);
+                }
+            }
+        }
     }
 
     /// A retained packet of the historical route `Odc` settles nothing: the refusal is typed.
