@@ -357,6 +357,9 @@ struct Model {
     retry_later_restores: Option<[u8; 32]>,
     /// The network rejects the next submission.
     reject_next_send: bool,
+    /// The history that a lookup of an unknown transaction searched: its oldest ledger, and
+    /// the close time of the latest ledger.
+    history: Option<(u32, u64)>,
     pending_name: String,
     /// The resource fee of the next enforcing simulations.
     enforce_fee: i64,
@@ -1048,7 +1051,15 @@ impl rpc::Rpc for ModelChain {
             "getTransaction" => {
                 let tx_hash = params["hash"].as_str().unwrap();
                 let Some(envelope) = m.settled.get(tx_hash) else {
-                    return Ok(json!({"status": "NOT_FOUND"}));
+                    return Ok(match m.history {
+                        Some((oldest, closed)) => json!({
+                            "status": "NOT_FOUND",
+                            "oldestLedger": oldest,
+                            "latestLedger": m.ledger,
+                            "latestLedgerCloseTime": closed.to_string(),
+                        }),
+                        None => json!({"status": "NOT_FOUND"}),
+                    });
                 };
                 let failed = m.failed.contains(tx_hash);
                 let result = x::TransactionResult {
@@ -3249,6 +3260,10 @@ fn a_creation_funds_the_asset_and_the_gas_and_recovery_returns_both() {
     assert_eq!(admin::next_recovery(&c.asset, &xlm, 0, 0), None);
     assert_eq!(admin::next_recovery(&xlm, &xlm, 0, 0), None);
 }
+/// The JSON document of a signed packet.
+fn code_doc(p: &allowit_core::vendor::runtime::Signed) -> Value {
+    serde_json::from_slice(p.bytes()).unwrap()
+}
 /// What the SDK engine does with a wallet code transaction, for this crate's tests: prepare it,
 /// send it while it is needed until the network accepts it, and read its receipt. A
 /// transaction that the ledger included and failed is an error that names it and the fee that
@@ -4139,6 +4154,125 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         assert_eq!(receipt.info().unwrap().status, Status::Confirmed);
         assert!(!chain.0.lock().unwrap().lapsed_code.contains(&installed));
         assert!(!provider.code_needed(&code).unwrap());
+        // A retained receipt that reports a fee above the declared fee does not verify.
+        let x::TransactionEnvelope::Tx(signed) = de(code_doc(&code)["signedXdr"].as_str().unwrap())
+        else {
+            panic!()
+        };
+        let mut retained: Value = serde_json::from_slice(receipt.bytes()).unwrap();
+        let mut result: x::TransactionResult = de(retained["resultXdr"].as_str().unwrap());
+        result.fee_charged = i64::from(signed.tx.fee) + 1;
+        retained["resultXdr"] = json!(b64(&result));
+        let inflated = allowit_core::vendor::runtime::Receipt(
+            allowit_stellar::PLUGIN
+                .restore(Kind::Receipt, raw(&retained))
+                .unwrap(),
+        );
+        assert!(inflated.verify_operation(&code).is_err());
+        // A sent transaction never lapses.
+        chain.0.lock().unwrap().history = Some((1, u64::MAX / 2));
+        assert!(!provider.code_lapsed(&code).unwrap());
+        chain.0.lock().unwrap().history = None;
+    }
+    // A code transaction that was never sent lapses once the network's ledgers closed past its
+    // time bound, in a history that reaches back to the ledger at which it was signed.
+    {
+        chain.0.lock().unwrap().lapsed_code.insert(installed);
+        let code = provider
+            .prepare_code_within(&installation, None, ceiling, NOW)
+            .unwrap()
+            .unwrap();
+        let expires = code.info().unwrap().expires_at;
+        assert!(!provider.code_lapsed(&code).unwrap());
+        chain.0.lock().unwrap().history = Some((1, expires));
+        assert!(!provider.code_lapsed(&code).unwrap());
+        chain.0.lock().unwrap().history = Some((1, expires + 1));
+        assert!(provider.code_lapsed(&code).unwrap());
+        let ledger = chain.0.lock().unwrap().ledger;
+        chain.0.lock().unwrap().history = Some((ledger + 1, expires + 1));
+        assert!(!provider.code_lapsed(&code).unwrap());
+        chain.0.lock().unwrap().history = None;
+        chain.0.lock().unwrap().lapsed_code.remove(&installed);
+    }
+    // The packet binds its time bound, its source's signature hint and a footprint of the code
+    // entry alone.
+    {
+        use allowit_core::vendor::runtime::Kind;
+        let raw =
+            |value: &Value| serde_json::value::RawValue::from_string(value.to_string()).unwrap();
+        let refused = |document: &Value| {
+            allowit_stellar::PLUGIN
+                .restore(Kind::Signed, raw(document))
+                .is_err()
+        };
+        chain.0.lock().unwrap().lapsed_code.insert(installed);
+        let code = provider
+            .prepare_code_within(&installation, None, ceiling, NOW)
+            .unwrap()
+            .unwrap();
+        chain.0.lock().unwrap().lapsed_code.remove(&installed);
+        let document = code_doc(&code);
+        assert!(!refused(&document));
+        let mut later = document.clone();
+        later["code"]["expiresAt"] = json!(code.info().unwrap().expires_at + 100);
+        assert!(refused(&later));
+        let mut hinted = document.clone();
+        let x::TransactionEnvelope::Tx(mut envelope) = de(document["signedXdr"].as_str().unwrap())
+        else {
+            panic!()
+        };
+        let mut signatures = envelope.signatures.to_vec();
+        signatures[0].hint = x::SignatureHint([0; 4]);
+        envelope.signatures = signatures.try_into().unwrap();
+        hinted["signedXdr"] = json!(b64(&x::TransactionEnvelope::Tx(envelope)));
+        assert!(refused(&hinted));
+        // An upload re-signed by its source with another entry in its footprint.
+        {
+            let mut m = chain.0.lock().unwrap();
+            m.code.remove(&hash(&unsent));
+            m.code_bytes.remove(&hash(&unsent));
+        }
+        let upload = provider
+            .prepare_code_within(&installation, Some(&unsent), ceiling, NOW)
+            .unwrap()
+            .unwrap();
+        let mut widened = code_doc(&upload);
+        assert!(!refused(&widened));
+        let x::TransactionEnvelope::Tx(mut envelope) =
+            de(widened["code"]["transactionXdr"].as_str().unwrap())
+        else {
+            panic!()
+        };
+        let x::TransactionExt::V1(data) = &mut envelope.tx.ext else {
+            panic!()
+        };
+        let mut written = data.resources.footprint.read_write.to_vec();
+        written.push(x::LedgerKey::ContractCode(x::LedgerKeyContractCode {
+            hash: x::Hash([0x5b; 32]),
+        }));
+        data.resources.footprint.read_write = written.try_into().unwrap();
+        let digest = tx_hash(&envelope.tx);
+        widened["code"]["transactionXdr"] =
+            json!(b64(&x::TransactionEnvelope::Tx(envelope.clone())));
+        widened["code"]["transactionHash"] = json!(digest.to_vec());
+        envelope.signatures = vec![x::DecoratedSignature {
+            hint: x::SignatureHint(account_key(&sender()).unwrap()[28..].try_into().unwrap()),
+            signature: x::Signature(
+                SigningKey::from_bytes(&SENDER)
+                    .sign(&digest)
+                    .to_bytes()
+                    .to_vec()
+                    .try_into()
+                    .unwrap(),
+            ),
+        }]
+        .try_into()
+        .unwrap();
+        widened["signedXdr"] = json!(b64(&x::TransactionEnvelope::Tx(envelope)));
+        assert!(refused(&widened));
+        let mut m = chain.0.lock().unwrap();
+        m.code.insert(hash(&unsent), PolicyTier::Custom);
+        m.code_bytes.insert(hash(&unsent), unsent.clone());
     }
     // The signature does not verify while another account restores the code: nothing is needed.
     chain.0.lock().unwrap().lapsed_code.insert(installed);

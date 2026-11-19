@@ -1750,8 +1750,10 @@ pub fn with_source_signature(
     xdr(&TransactionEnvelope::Tx(envelope))
 }
 /// Check a wallet code transaction that its source signed: `signed_xdr` is the prepared
-/// transaction `p` with one signature of its source over its hash, and the transaction uploads
-/// the code `p.wasm_hash` (`upload_wasm`) or restores that code's entry alone (`restore_code`).
+/// transaction `p` with one signature of its source over its hash, under the source key's
+/// hint; the transaction's time bound is `p.expires_at`; and it uploads the code `p.wasm_hash`
+/// (`upload_wasm`) or restores that code's entry (`restore_code`), with the code entry alone
+/// in its read-write footprint, no read-only entry and no archived entry restored in place.
 pub fn check_signed_code(p: &PreparedDeployment, signed_xdr: &str) -> Result<()> {
     let TransactionEnvelope::Tx(unsigned) = read(&p.transaction_xdr)? else {
         return Err("Expected a v1 code transaction".into());
@@ -1768,30 +1770,55 @@ pub fn check_signed_code(p: &PreparedDeployment, signed_xdr: &str) -> Result<()>
     if signed.tx.source_account != muxed(&p.source)? {
         return Err("The code transaction has another source".into());
     }
+    if !matches!(&signed.tx.cond, Preconditions::Time(bounds) if bounds.max_time.0 == p.expires_at)
+    {
+        return Err("The code transaction's time bound differs from its expiry".into());
+    }
     let [signature] = signed.signatures.as_slice() else {
         return Err("A code transaction carries one signature, its source's".into());
     };
-    let signature: [u8; 64] = signature.signature.0.as_slice().try_into().map_err(err)?;
-    signing::verify_digest(&p.source, &p.transaction_hash, &signature)?;
+    let MuxedAccount::Ed25519(Uint256(key)) = &signed.tx.source_account else {
+        return Err("The code transaction's source is a plain account".into());
+    };
+    if signature.hint.0.as_slice() != &key[28..] {
+        return Err("The code transaction's signature hint is not its source's".into());
+    }
+    let bytes: [u8; 64] = signature.signature.0.as_slice().try_into().map_err(err)?;
+    signing::verify_digest(&p.source, &p.transaction_hash, &bytes)?;
     let [operation] = signed.tx.operations.as_slice() else {
         return Err("A code transaction has one operation".into());
     };
     let key = LedgerKey::ContractCode(LedgerKeyContractCode {
         hash: Hash(p.wasm_hash),
     });
-    let alone = match (p.function.as_str(), &operation.body) {
-        ("upload_wasm", OperationBody::InvokeHostFunction(op)) => {
-            op.auth.is_empty()
-                && matches!(&op.host_function,
-                    HostFunction::UploadContractWasm(code) if hash(code.as_slice()) == p.wasm_hash)
+    // Both name the code entry alone. An upload restores no archived entry in place: lapsed
+    // code is restored, not uploaded. A restoration names that entry as archived at most.
+    let footprint = match &signed.tx.ext {
+        TransactionExt::V1(data) => {
+            data.resources.footprint.read_only.is_empty()
+                && data.resources.footprint.read_write.as_slice() == [key]
+                && match (&data.ext, p.function.as_str()) {
+                    (SorobanTransactionDataExt::V0, _) => true,
+                    (SorobanTransactionDataExt::V1(ext), "restore_code") => {
+                        matches!(ext.archived_soroban_entries.as_slice(), [] | [0])
+                    }
+                    (SorobanTransactionDataExt::V1(ext), _) => {
+                        ext.archived_soroban_entries.is_empty()
+                    }
+                }
         }
-        ("restore_code", OperationBody::RestoreFootprint(_)) => {
-            matches!(&signed.tx.ext, TransactionExt::V1(data)
-                if data.resources.footprint.read_only.is_empty()
-                    && data.resources.footprint.read_write.as_slice() == [key])
-        }
-        _ => false,
+        TransactionExt::V0 => false,
     };
+    let alone = footprint
+        && match (p.function.as_str(), &operation.body) {
+            ("upload_wasm", OperationBody::InvokeHostFunction(op)) => {
+                op.auth.is_empty()
+                    && matches!(&op.host_function,
+                    HostFunction::UploadContractWasm(code) if hash(code.as_slice()) == p.wasm_hash)
+            }
+            ("restore_code", OperationBody::RestoreFootprint(_)) => true,
+            _ => false,
+        };
     if !alone || operation.source_account.is_some() || p.wallet.is_some() {
         return Err("The code transaction neither uploads nor restores its code alone".into());
     }

@@ -458,6 +458,9 @@ pub struct SignedCode {
     pub code: native::admin::PreparedDeployment,
     /// The same transaction with the sending account's signature.
     pub signed_xdr: String,
+    /// The network's head when the sending account signed it: the network can include it only
+    /// in a later ledger. A proof that it lapsed searches the network's history from there.
+    pub ledger: u32,
 }
 /// The code transaction that the signed packet `p` carries, `None` for any other signed packet.
 /// Its bytes are checked: the signed envelope is the prepared transaction with one signature
@@ -572,9 +575,11 @@ impl Provider {
                 Ok(signed) => signed,
                 Err(refused) => return unless_live(refused),
             };
+        let ledger = checked(rpc::owner_observation::head(self.rpc()))?;
         Ok(Some(SignedCode {
             code: p,
             signed_xdr,
+            ledger,
         }))
     }
     /// Send the code transaction `s` once. `Prepared` when the network did not accept it:
@@ -1710,6 +1715,16 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         };
         Ok(Some(Signed(packet(&code.code.network, &code)?)))
     }
+    fn code_lapsed(&self, p: &Signed) -> Result<bool> {
+        self.network(p.network())?;
+        let code = code_of(p)?;
+        checked(rpc::owner_transaction_lapsed(
+            self.rpc(),
+            &code.code.transaction_hash,
+            code.code.expires_at,
+            u64::from(code.ledger),
+        ))
+    }
     fn code_needed(&self, p: &Signed) -> Result<bool> {
         self.network(p.network())?;
         let code = code_of(p)?;
@@ -1939,6 +1954,12 @@ pub fn verify_receipt(r: &Packet, p: &Packet) -> Result<()> {
         if receipt.envelope_xdr != code.signed_xdr {
             return Err(Error::config(
                 "The receipt's envelope differs from the code transaction",
+            ));
+        }
+        // The ledger charges a transaction at most the fee that it declares.
+        if receipt_info(r)?.fee.native_units > u128::from(declared_fee(&code.signed_xdr)?) {
+            return Err(Error::config(
+                "The receipt reports a fee above the fee of its transaction",
             ));
         }
         return Ok(());
