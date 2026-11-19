@@ -528,7 +528,7 @@ fn read_figures(env: &Env, kept: u8) -> Result<Stored, AllowitWalletError> {
         let mut end = [0; 4];
         end.copy_from_slice(r.take(4)?);
         let end = u32::from_be_bytes(end);
-        if env.ledger().sequence() <= end {
+        if allowit::daily_window_open(u64::from(end), u64::from(env.ledger().sequence())) {
             day_ends = Some(end);
             let mask = r.byte()?;
             figures.day_unpriced = r.byte()? & 1 != 0;
@@ -559,6 +559,23 @@ fn totals(kept: u8, f: &Figures) -> (i128, u64, bool) {
         spent && f.unpriced,
     )
 }
+/// The daily figures that `kept` names; the others are zero. The unpriced flag lives beside either
+/// daily figure.
+fn dailies(kept: u8, f: &Figures) -> (i128, i128, bool) {
+    (
+        if kept & DAY_SPENT != 0 {
+            f.day_spent
+        } else {
+            0
+        },
+        if kept & DAY_TOTAL != 0 {
+            f.day_total
+        } else {
+            0
+        },
+        kept & DAILIES != 0 && f.day_unpriced,
+    )
+}
 /// Write `t`: spent as 8 bytes, then calls in 31 bits with the unpriced flag in the top bit. The
 /// value has one fixed size, so a payment never grows it: a larger value would pay rent for the
 /// whole prepaid lifetime of `t`. A figure that no check reads is written as zero. A figure beyond
@@ -581,19 +598,32 @@ fn write_total(env: &Env, kept: u8, f: &Figures, exists: bool) -> Result<(), All
     }
     Ok(())
 }
-/// Write `d` with the kept daily figures. A new window ends `DAY_LEDGERS - 1` ledgers from now,
-/// and the entry lives at least that long; the wallet never extends it later.
+/// The end ledger of a daily window after a write of a changed value, by Core's rule
+/// (`allowit::daily_window_end`): a window still open at this ledger (`day_ends`) keeps its end,
+/// and otherwise the write opens a window of `DAY_LEDGERS` ledgers from this one. The wallet
+/// writes `d` only when a kept daily figure changed (`admit`), so the figures before and after
+/// are two different values in Core's terms; Core compares nothing else.
+fn written_window_end(env: &Env, day_ends: Option<u32>) -> Result<u32, AllowitWalletError> {
+    let (before, after) = (AllowitValue::Bool(false), AllowitValue::Bool(true));
+    let end = allowit::daily_window_end(
+        day_ends.map(|end| (&before, u64::from(end))),
+        &after,
+        u64::from(env.ledger().sequence()),
+        u64::from(DAY_LEDGERS),
+    )
+    .map_err(|_| AllowitWalletError::Overflow)?;
+    checked(u32::try_from(end).ok())
+}
+/// Write `d` with the kept daily figures. Its window's end comes from Core's rule
+/// ([`written_window_end`]): a new window ends `DAY_LEDGERS - 1` ledgers from now, and the entry
+/// lives at least that long; the wallet never extends it later.
 fn write_daily(
     env: &Env,
     kept: u8,
     f: &Figures,
     day_ends: Option<u32>,
 ) -> Result<(), AllowitWalletError> {
-    let seq = env.ledger().sequence();
-    let end = match day_ends {
-        Some(end) => end,
-        None => checked(seq.checked_add(DAY_LEDGERS - 1))?,
-    };
+    let end = written_window_end(env, day_ends)?;
     let mut buf = [0u8; 64];
     let mut w = Writer::new(&mut buf);
     w.put(&end.to_be_bytes())?;
@@ -653,7 +683,8 @@ fn read_policy_state<P: AllowitPolicy>(
             let mut end = [0; 4];
             end.copy_from_slice(r.take(4)?);
             let end = u32::from_be_bytes(end);
-            if env.ledger().sequence() > end {
+            // Core's rule: the end is the window's last ledger, inclusive.
+            if !allowit::daily_window_open(u64::from(end), u64::from(env.ledger().sequence())) {
                 continue;
             }
             slot.day_ends = Some(end);
@@ -668,8 +699,9 @@ fn read_policy_state<P: AllowitPolicy>(
     Ok(slots)
 }
 /// Write each state entry whose value the policy changed. A daily entry holds its window's end
-/// ledger before the value: a new window ends `DAY_LEDGERS - 1` ledgers from now and the entry
-/// lives that long. A new persistent entry lives `TOTAL_LEDGERS`. The wallet never extends an
+/// ledger before the value, which Core's `daily_window_end` gives: a write keeps an open window,
+/// and otherwise opens one of `DAY_LEDGERS` ledgers from now, and the entry lives that long. An
+/// unchanged value keeps its end by the same rule, so it is not written. A new persistent entry lives `TOTAL_LEDGERS`. The wallet never extends an
 /// entry later. A value of more than `MAX_STATE_VALUE` packed bytes, and a key that the build did
 /// not declare, are `InvalidState`.
 fn write_policy_state<P: AllowitPolicy>(
@@ -690,10 +722,17 @@ fn write_policy_state<P: AllowitPolicy>(
         let mut w = Writer::new(&mut buf);
         let opens = entry.daily && slot.day_ends.is_none();
         if entry.daily {
-            let end = match slot.day_ends {
-                Some(end) => end,
-                None => checked(env.ledger().sequence().checked_add(DAY_LEDGERS - 1))?,
-            };
+            // `before` is the value that the policy read: a value whose window ended reads as
+            // absent (`read_policy_state`).
+            let before = slot.value.as_ref().zip(slot.day_ends.map(u64::from));
+            let end = allowit::daily_window_end(
+                before,
+                &value,
+                u64::from(env.ledger().sequence()),
+                u64::from(DAY_LEDGERS),
+            )
+            .map_err(|_| AllowitWalletError::Overflow)?;
+            let end = checked(u32::try_from(end).ok())?;
             w.put(&end.to_be_bytes())?;
         }
         let start = w.bytes().len();
@@ -1083,10 +1122,9 @@ fn admit<P: AllowitPolicy>(
     {
         write_total(env, kept, &after, stored.total_exists)?;
     }
-    if kept & DAILIES != 0
-        && (after.day_spent, after.day_total, after.day_unpriced)
-            != (before.day_spent, before.day_total, before.day_unpriced)
-    {
+    // `d` changes only when a daily figure that it keeps changes: then its window opens or keeps
+    // its end by Core's rule. A figure that the wallet does not keep opens no window.
+    if kept & DAILIES != 0 && dailies(kept, &after) != dailies(kept, before) {
         write_daily(env, kept, &after, stored.day_ends)?;
     }
     Ok(())

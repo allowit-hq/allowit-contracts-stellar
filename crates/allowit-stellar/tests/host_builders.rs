@@ -1221,6 +1221,35 @@ fn a_reported_fee_bump_hash_reads_the_receipt_of_its_inner_transaction() {
     assert!(rpc::receipt_by_reported_hash(&chain, NETWORK, &[13; 32]).is_err());
 }
 
+/// A receipt keeps the close time of its ledger, which the RPC states as `createdAt`: the time
+/// at which the operation settled. A reply without it gives a receipt without it, and a time that
+/// is no count of seconds is refused.
+#[test]
+fn a_receipt_keeps_the_close_time_of_its_ledger() {
+    let c = config();
+    let mut chain = Chain::new(&c);
+    let packet = deployer(&chain).fund(&c, 500).unwrap();
+    let signed = sign_owner_transaction(NETWORK, &packet.transaction_xdr, &[11; 32]).unwrap();
+    let x::TransactionEnvelope::Tx(inner) = read(&signed).unwrap() else {
+        panic!()
+    };
+    chain.receipt = fee_bump_reply(&inner, true);
+    let outer = unhex(chain.receipt["txHash"].as_str().unwrap()).unwrap();
+    let read = |chain: &Chain| rpc::receipt_by_reported_hash(chain, NETWORK, &outer);
+    assert_eq!(read(&chain).unwrap().unwrap().closed_at, None);
+    for (created, closed) in [
+        (json!("1795028239"), 1_795_028_239),
+        (json!(1_795_028_240u64), 1_795_028_240),
+    ] {
+        chain.receipt["createdAt"] = created;
+        assert_eq!(read(&chain).unwrap().unwrap().closed_at, Some(closed));
+    }
+    for invalid in [json!(""), json!("-1"), json!("1.5"), json!(-1), json!(true)] {
+        chain.receipt["createdAt"] = invalid.clone();
+        assert!(read(&chain).is_err(), "{invalid}");
+    }
+}
+
 #[test]
 fn fee_bumped_owner_receipt_binds_outer_inner_result_and_status() {
     let c = config();

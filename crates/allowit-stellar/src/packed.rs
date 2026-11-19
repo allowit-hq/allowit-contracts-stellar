@@ -148,8 +148,9 @@ pub fn state_value_bytes(value: &PolicyValue) -> Result<usize> {
     Ok(out.len())
 }
 /// The value of a Custom policy's state entry at `ledger`, or `None`. A daily entry holds its
-/// window's end ledger first and reads as absent after it; a persistent entry without bytes holds
-/// no value. The value is packed as the configuration's params are.
+/// window's end ledger first and reads as absent once its window has closed by Core's rule
+/// (`allowit_core::daily_window_open`: the end is the window's last ledger); a persistent entry
+/// without bytes holds no value. The value is packed as the configuration's params are.
 pub fn state_value(raw: &[u8], daily: bool, ledger: u32) -> Result<Option<PolicyValue>> {
     let mut r = Reader { buf: raw, pos: 0 };
     if daily {
@@ -158,7 +159,7 @@ pub fn state_value(raw: &[u8], daily: bool, ledger: u32) -> Result<Option<Policy
                 .try_into()
                 .map_err(|_| "A stored policy state entry is short")?,
         );
-        if ledger > end {
+        if !allowit_core::daily_window_open(u64::from(end), u64::from(ledger)) {
             return Ok(None);
         }
     } else if r.done() {
@@ -359,12 +360,12 @@ pub fn totals(raw: &[u8], kept: u8, figures: &mut Figures) -> Result<()> {
     Ok(())
 }
 
-/// The daily figures of a stored `d` at `ledger`: none once its window has ended, even if the
-/// entry is still alive.
+/// The daily figures of a stored `d` at `ledger`: none once its window has closed by Core's rule
+/// (`allowit_core::daily_window_open`), even if the entry is still alive.
 pub fn daily(raw: &[u8], ledger: u32, figures: &mut Figures) -> Result<()> {
     let mut r = Reader { buf: raw, pos: 0 };
     let end = u32::from_be_bytes(r.take(4)?.try_into().expect("4 bytes"));
-    if ledger > end {
+    if !allowit_core::daily_window_open(u64::from(end), u64::from(ledger)) {
         return Ok(());
     }
     figures.day_ends = end;
@@ -446,5 +447,14 @@ mod tests {
         let mut ended = Figures::default();
         daily(&d, 501, &mut ended).unwrap();
         assert_eq!(ended, Figures::default());
+        // The window is Core's: open through its last ledger, closed one ledger later.
+        for ledger in [499, 500, 501] {
+            let mut read = Figures::default();
+            daily(&d, ledger, &mut read).unwrap();
+            assert_eq!(
+                read.day_ends != 0,
+                allowit_core::daily_window_open(500, u64::from(ledger))
+            );
+        }
     }
 }

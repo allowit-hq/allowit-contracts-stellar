@@ -1255,6 +1255,30 @@ pub struct VerifiedReceipt {
     /// [`crate::seller_settled`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settles: Option<[u8; 32]>,
+    /// When the ledger that holds the transaction closed, in Unix seconds: the RPC's `createdAt`.
+    /// `None` for a receipt that this rail retained before it kept the time, and for an RPC that
+    /// does not state it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_at: Option<u64>,
+}
+/// The close time of the settlement ledger in a `getTransaction` reply (`createdAt`, Unix seconds
+/// as decimal text or a number), or `None` when the reply does not state it.
+fn closed_at(v: &Value) -> Result<Option<u64>> {
+    match v.get("createdAt") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text))
+            if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            text.parse()
+                .map(Some)
+                .map_err(|_| "Invalid settlement time".into())
+        }
+        Some(Value::Number(number)) => number
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| "Invalid settlement time".into()),
+        Some(_) => Err("Invalid settlement time".into()),
+    }
 }
 /// Recheck a retained receipt before projecting it through another interface.
 pub fn validate_receipt(
@@ -1493,6 +1517,7 @@ fn receipt_from_response(
             .ok_or("Settlement result is required")?
             .into(),
         settles: None,
+        closed_at: closed_at(v)?,
     }))
 }
 /// The server's account of a wallet's standard figures: Core's `vendor::runtime::Accounting`.
@@ -2372,6 +2397,13 @@ mod custom_state_tests {
             Some(crate::PolicyValue::Int(1))
         );
         assert_eq!(packed::state_value(&daily, true, 101).unwrap(), None);
+        // The window is Core's: open through its last ledger, closed one ledger later.
+        for ledger in [99, 100, 101] {
+            assert_eq!(
+                packed::state_value(&daily, true, ledger).unwrap().is_some(),
+                allowit_core::daily_window_open(100, u64::from(ledger))
+            );
+        }
         assert_eq!(
             packed::state_value(&[0, 2], false, 1).unwrap(),
             Some(crate::PolicyValue::Int(1))

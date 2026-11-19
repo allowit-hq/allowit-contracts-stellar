@@ -2474,6 +2474,12 @@ impl PacketProvider for Packets {
     fn receipt_info(&self, p: &Packet) -> Result<ReceiptInfo> {
         receipt_info(p)
     }
+    /// The close time of the ledger that holds the receipt's transaction, which the RPC states
+    /// with the receipt (`createdAt`).
+    fn receipt_settled_at(&self, p: &Packet) -> Result<Option<u64>> {
+        let r: rpc::VerifiedReceipt = decode_packet(p)?;
+        Ok(r.closed_at)
+    }
 }
 
 #[cfg(test)]
@@ -2645,8 +2651,29 @@ mod receipt_fee_tests {
             envelope_xdr: native::xdr(&TransactionEnvelope::Tx(envelope)).unwrap(),
             result_xdr: native::xdr(&result).unwrap(),
             settles: None,
+            closed_at: None,
         };
         receipt_info(&packet(network, &receipt).unwrap()).unwrap()
+    }
+
+    /// A receipt states when its operation settled: the close time of its ledger, which the RPC
+    /// gave with it. A receipt retained before the rail kept that time states none.
+    #[test]
+    fn a_receipt_states_the_close_time_of_its_ledger() {
+        let signed = crate::test_support::policy_signed();
+        let mut receipt = crate::test_support::confirmed_payment_receipt(&signed, 9, 100);
+        let network = &signed.prepared.config.network;
+        let settled_at = |receipt: &rpc::VerifiedReceipt| {
+            crate::host::runtime::Receipt(packet(network, receipt).unwrap()).settled_at()
+        };
+        assert_eq!(settled_at(&receipt).unwrap(), None);
+        receipt.closed_at = Some(1_795_028_239);
+        assert_eq!(settled_at(&receipt).unwrap(), Some(1_795_028_239));
+        // A receipt retained without the field decodes as before.
+        let mut document = serde_json::to_value(&receipt).unwrap();
+        document.as_object_mut().unwrap().remove("closedAt");
+        let earlier: rpc::VerifiedReceipt = serde_json::from_value(document).unwrap();
+        assert_eq!(earlier.closed_at, None);
     }
 
     /// Only an operation that repays its gas takes a gas carry.

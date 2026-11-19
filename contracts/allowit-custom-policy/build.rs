@@ -46,18 +46,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", owner_source.display());
     println!("cargo:rerun-if-changed=state_keys.rs");
     let compiled = fs::read_to_string(&policy).unwrap();
-    for forbidden in [
-        "unsafe",
-        "include!",
-        "include_str!",
-        "include_bytes!",
-        "#[path",
-    ] {
-        assert!(
-            !compiled.contains(forbidden),
-            "a policy source is one safe file: it must not use `{forbidden}`"
-        );
-    }
+    state_keys::one_safe_file(&compiled).unwrap_or_else(|error| panic!("{error}"));
     let source = if owner_source.exists() && fixture.is_none() {
         fs::read(&owner_source).unwrap()
     } else {
