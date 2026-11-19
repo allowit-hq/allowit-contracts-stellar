@@ -357,9 +357,9 @@ struct Model {
     retry_later_restores: Option<[u8; 32]>,
     /// The network rejects the next submission.
     reject_next_send: bool,
-    /// The history that a lookup of an unknown transaction searched: its oldest ledger, and
-    /// the close time of the latest ledger.
-    history: Option<(u32, u64)>,
+    /// The oldest ledger of the history that a lookup of an unknown transaction searched, up to
+    /// the head.
+    history: Option<u32>,
     pending_name: String,
     /// The resource fee of the next enforcing simulations.
     enforce_fee: i64,
@@ -1052,11 +1052,10 @@ impl rpc::Rpc for ModelChain {
                 let tx_hash = params["hash"].as_str().unwrap();
                 let Some(envelope) = m.settled.get(tx_hash) else {
                     return Ok(match m.history {
-                        Some((oldest, closed)) => json!({
+                        Some(oldest) => json!({
                             "status": "NOT_FOUND",
                             "oldestLedger": oldest,
                             "latestLedger": m.ledger,
-                            "latestLedgerCloseTime": closed.to_string(),
                         }),
                         None => json!({"status": "NOT_FOUND"}),
                     });
@@ -4129,21 +4128,16 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         assert_eq!(provider.broadcast(&code, NOW).unwrap(), Status::Prepared);
         assert!(!provider.code_needed(&code).unwrap());
         assert!(provider.observe(&code).unwrap().is_none());
-        // A transaction that the network rejects did not apply: an error that names it.
+        // A transaction that the network rejects is not pending and cost nothing: it was not
+        // accepted.
         chain.0.lock().unwrap().lapsed_code.insert(installed);
         let code = provider
             .prepare_code_within(&installation, None, ceiling, NOW)
             .unwrap()
             .unwrap();
         chain.0.lock().unwrap().reject_next_send = true;
-        let rejected = provider.broadcast(&code, NOW).unwrap_err();
-        assert!(
-            rejected
-                .message
-                .contains("rejected the wallet code transaction"),
-            "{}",
-            rejected.message
-        );
+        assert_eq!(provider.broadcast(&code, NOW).unwrap(), Status::Prepared);
+        assert!(provider.observe(&code).unwrap().is_none());
         assert!(chain.0.lock().unwrap().lapsed_code.contains(&installed));
         // Sent, it restores the code, and its receipt is the caller's.
         chain.step("restore by a code transaction");
@@ -4169,30 +4163,54 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
                 .unwrap(),
         );
         assert!(inflated.verify_operation(&code).is_err());
+        // A code transaction pays its own fee: a retained receipt that says it settled a payment
+        // authorization does not verify.
+        let mut settling: Value = serde_json::from_slice(receipt.bytes()).unwrap();
+        settling["settles"] = json!(vec![5u8; 32]);
+        let settling = allowit_core::vendor::runtime::Receipt(
+            allowit_stellar::PLUGIN
+                .restore(Kind::Receipt, raw(&settling))
+                .unwrap(),
+        );
+        assert!(settling.verify_operation(&code).is_err());
         // A sent transaction never lapses.
-        chain.0.lock().unwrap().history = Some((1, u64::MAX / 2));
+        chain.0.lock().unwrap().history = Some(1);
         assert!(!provider.code_lapsed(&code).unwrap());
         chain.0.lock().unwrap().history = None;
     }
-    // A code transaction that was never sent lapses once the network's ledgers closed past its
-    // time bound, in a history that reaches back to the ledger at which it was signed.
+    // A code transaction that was never sent lapses once a ledger after its signed ledger bound
+    // closed, in a history that reaches back to its first ledger. The proof reads nothing else.
     {
         chain.0.lock().unwrap().lapsed_code.insert(installed);
         let code = provider
             .prepare_code_within(&installation, None, ceiling, NOW)
             .unwrap()
             .unwrap();
-        let expires = code.info().unwrap().expires_at;
+        let x::TransactionEnvelope::Tx(signed) = de(code_doc(&code)["signedXdr"].as_str().unwrap())
+        else {
+            panic!()
+        };
+        let x::Preconditions::V2(x::PreconditionsV2 {
+            ledger_bounds: Some(bounds),
+            ..
+        }) = &signed.tx.cond
+        else {
+            panic!("a code transaction is bounded by ledgers")
+        };
+        let (first, last) = (bounds.min_ledger, bounds.max_ledger);
+        assert!(first > 0 && last > first);
+        let head = chain.0.lock().unwrap().ledger;
         assert!(!provider.code_lapsed(&code).unwrap());
-        chain.0.lock().unwrap().history = Some((1, expires));
+        chain.0.lock().unwrap().history = Some(1);
         assert!(!provider.code_lapsed(&code).unwrap());
-        chain.0.lock().unwrap().history = Some((1, expires + 1));
+        chain.0.lock().unwrap().ledger = last + 1;
         assert!(provider.code_lapsed(&code).unwrap());
-        let ledger = chain.0.lock().unwrap().ledger;
-        chain.0.lock().unwrap().history = Some((ledger + 1, expires + 1));
+        chain.0.lock().unwrap().history = Some(first + 1);
         assert!(!provider.code_lapsed(&code).unwrap());
-        chain.0.lock().unwrap().history = None;
-        chain.0.lock().unwrap().lapsed_code.remove(&installed);
+        let mut m = chain.0.lock().unwrap();
+        m.history = None;
+        m.ledger = head;
+        m.lapsed_code.remove(&installed);
     }
     // The packet binds its time bound, its source's signature hint and a footprint of the code
     // entry alone.
@@ -4226,6 +4244,72 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         envelope.signatures = signatures.try_into().unwrap();
         hinted["signedXdr"] = json!(b64(&x::TransactionEnvelope::Tx(envelope)));
         assert!(refused(&hinted));
+        // The packet holds nothing outside the signature that a proof could read.
+        let mut anchored = document.clone();
+        anchored["ledger"] = json!(1);
+        assert!(refused(&anchored));
+        // Re-signed by its source with other bounds: a time bound alone, a time bound of zero,
+        // which Stellar reads as none, or a ledger window without an upper bound.
+        let resigned = |change: &dyn Fn(&mut x::Transaction, &mut Value)| {
+            let mut document = document.clone();
+            let x::TransactionEnvelope::Tx(mut envelope) =
+                de(document["code"]["transactionXdr"].as_str().unwrap())
+            else {
+                panic!()
+            };
+            change(&mut envelope.tx, &mut document);
+            let digest = tx_hash(&envelope.tx);
+            document["code"]["transactionXdr"] =
+                json!(b64(&x::TransactionEnvelope::Tx(envelope.clone())));
+            document["code"]["transactionHash"] = json!(digest.to_vec());
+            envelope.signatures = vec![x::DecoratedSignature {
+                hint: x::SignatureHint(account_key(&sender()).unwrap()[28..].try_into().unwrap()),
+                signature: x::Signature(
+                    SigningKey::from_bytes(&SENDER)
+                        .sign(&digest)
+                        .to_bytes()
+                        .to_vec()
+                        .try_into()
+                        .unwrap(),
+                ),
+            }]
+            .try_into()
+            .unwrap();
+            document["signedXdr"] = json!(b64(&x::TransactionEnvelope::Tx(envelope)));
+            document
+        };
+        let expires = code.info().unwrap().expires_at;
+        assert!(!refused(&resigned(&|_, _| {})));
+        assert!(refused(&resigned(&|tx, _| {
+            tx.cond = x::Preconditions::Time(x::TimeBounds {
+                min_time: x::TimePoint(0),
+                max_time: x::TimePoint(expires),
+            });
+        })));
+        assert!(refused(&resigned(&|tx, document| {
+            tx.cond = x::Preconditions::Time(x::TimeBounds {
+                min_time: x::TimePoint(0),
+                max_time: x::TimePoint(0),
+            });
+            document["code"]["expiresAt"] = json!(0);
+        })));
+        assert!(refused(&resigned(&|tx, document| {
+            if let x::Preconditions::V2(v2) = &mut tx.cond {
+                v2.time_bounds = Some(x::TimeBounds {
+                    min_time: x::TimePoint(0),
+                    max_time: x::TimePoint(0),
+                });
+            }
+            document["code"]["expiresAt"] = json!(0);
+        })));
+        assert!(refused(&resigned(&|tx, _| {
+            if let x::Preconditions::V2(v2) = &mut tx.cond {
+                v2.ledger_bounds = Some(x::LedgerBounds {
+                    min_ledger: 1,
+                    max_ledger: 0,
+                });
+            }
+        })));
         // An upload re-signed by its source with another entry in its footprint.
         {
             let mut m = chain.0.lock().unwrap();

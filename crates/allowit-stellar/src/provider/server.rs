@@ -458,9 +458,6 @@ pub struct SignedCode {
     pub code: native::admin::PreparedDeployment,
     /// The same transaction with the sending account's signature.
     pub signed_xdr: String,
-    /// The network's head when the sending account signed it: the network can include it only
-    /// in a later ledger. A proof that it lapsed searches the network's history from there.
-    pub ledger: u32,
 }
 /// The code transaction that the signed packet `p` carries, `None` for any other signed packet.
 /// Its bytes are checked: the signed envelope is the prepared transaction with one signature
@@ -575,11 +572,9 @@ impl Provider {
                 Ok(signed) => signed,
                 Err(refused) => return unless_live(refused),
             };
-        let ledger = checked(rpc::owner_observation::head(self.rpc()))?;
         Ok(Some(SignedCode {
             code: p,
             signed_xdr,
-            ledger,
         }))
     }
     /// Send the code transaction `s` once. `Prepared` when the network did not accept it:
@@ -594,22 +589,16 @@ impl Provider {
                 rpc::Broadcast::Submitted => Status::Submitted,
                 rpc::Broadcast::RetryLater => Status::Prepared,
                 rpc::Broadcast::Unknown => Status::SubmissionUnknown,
-                // A transaction that the network rejected did not apply and cost nothing, unless
-                // an earlier send of the same bytes did.
-                rpc::Broadcast::Rejected { error_result_xdr } => {
+                // A transaction that the network rejected is not pending and cost nothing, unless
+                // an earlier send of the same bytes applied: then its receipt decides.
+                rpc::Broadcast::Rejected { .. } => {
                     match checked(rpc::receipt_by_hash(
                         self.rpc(),
                         network,
                         &s.code.transaction_hash,
                     ))? {
                         Some(receipt) => status(receipt.status),
-                        None => {
-                            return Err(crate::provider::failure(format!(
-                                "Stellar rejected the wallet code transaction {}: {}",
-                                native::hex(&s.code.transaction_hash),
-                                error_result_xdr.as_deref().unwrap_or("no result")
-                            )));
-                        }
+                        None => Status::Prepared,
                     }
                 }
             },
@@ -628,7 +617,7 @@ impl Provider {
         else {
             return Ok(None);
         };
-        checked(rpc::validate_receipt(
+        checked(rpc::validate_own_receipt(
             &receipt,
             network,
             &s.code.transaction_hash,
@@ -1718,11 +1707,13 @@ impl crate::host::vendors::RuntimeProvider for Provider {
     fn code_lapsed(&self, p: &Signed) -> Result<bool> {
         self.network(p.network())?;
         let code = code_of(p)?;
-        checked(rpc::owner_transaction_lapsed(
+        // The proof reads only the transaction's signed ledger bounds.
+        let (min_ledger, max_ledger) = checked(native::admin::code_ledger_bounds(&code.code))?;
+        checked(rpc::code_transaction_lapsed(
             self.rpc(),
             &code.code.transaction_hash,
-            code.code.expires_at,
-            u64::from(code.ledger),
+            min_ledger,
+            max_ledger,
         ))
     }
     fn code_needed(&self, p: &Signed) -> Result<bool> {
@@ -1946,7 +1937,7 @@ pub fn verify_receipt(r: &Packet, p: &Packet) -> Result<()> {
         return Err(Error::config("Receipt network differs from operation"));
     }
     if let Some(code) = signed_code(p)? {
-        checked(rpc::validate_receipt(
+        checked(rpc::validate_own_receipt(
             &receipt,
             &code.code.network,
             &code.code.transaction_hash,

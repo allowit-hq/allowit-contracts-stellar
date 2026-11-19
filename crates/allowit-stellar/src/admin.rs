@@ -1461,6 +1461,10 @@ impl Deployer<'_> {
     ) -> Result<PreparedDeployment> {
         let expires_at = match &tx.cond {
             Preconditions::Time(bounds) => bounds.max_time.0,
+            Preconditions::V2(PreconditionsV2 {
+                time_bounds: Some(bounds),
+                ..
+            }) => bounds.max_time.0,
             _ => unreachable!(),
         };
         Ok(PreparedDeployment {
@@ -1531,6 +1535,8 @@ impl Deployer<'_> {
         if tx.fee > self.max_fee_stroops {
             return Err("Simulated fee exceeds the explicitly selected ceiling".into());
         }
+        let mut tx = tx;
+        self.bind_code_bounds(&mut tx)?;
         self.prepared(&account, "upload_wasm", wasm_hash, None, tx)
             .map(Some)
     }
@@ -1643,8 +1649,34 @@ impl Deployer<'_> {
         }
         tx.fee = fee;
         tx.ext = TransactionExt::V1(data);
+        self.bind_code_bounds(&mut tx)?;
         self.prepared(&account, "restore_code", wasm_hash, None, tx)
             .map(CodeRestoration::Prepared)
+    }
+    /// Bound the code transaction `tx` by ledgers as well as by time, in its signed
+    /// preconditions: the network can include it only from the head that this preparation reads
+    /// to [`CODE_LEDGER_WINDOW`] ledgers later, and by its time bound. Once a later ledger
+    /// closed, a lookup that does not find it proves that it never applied and can no longer
+    /// apply, from signed data alone (`rpc::code_transaction_lapsed`).
+    fn bind_code_bounds(&self, tx: &mut Transaction) -> Result<()> {
+        let Preconditions::Time(time) = &tx.cond else {
+            return Err("A code transaction is prepared with a time bound".into());
+        };
+        let head = rpc::owner_observation::head(self.rpc)?;
+        tx.cond = Preconditions::V2(PreconditionsV2 {
+            time_bounds: Some(time.clone()),
+            ledger_bounds: Some(LedgerBounds {
+                min_ledger: head,
+                max_ledger: head
+                    .checked_add(CODE_LEDGER_WINDOW)
+                    .ok_or("Ledger bound overflow")?,
+            }),
+            min_seq_num: None,
+            min_seq_age: stellar_xdr::Duration(0),
+            min_seq_ledger_gap: 0,
+            extra_signers: VecM::default(),
+        });
+        Ok(())
     }
     /// Prepare the owner's one transaction that creates the policy wallet of `wasm` (uploaded by
     /// the server) through `deployer` and funds it with each `(asset, amount)` of `funding`. The
@@ -1749,9 +1781,46 @@ pub fn with_source_signature(
     .map_err(err)?;
     xdr(&TransactionEnvelope::Tx(envelope))
 }
+/// The ledgers in which the network can include a code transaction after the head that its
+/// preparation read: about five minutes, as its time bound.
+pub const CODE_LEDGER_WINDOW: u32 = 60;
+/// The ledger bounds `(min, max)` of the code transaction `tx`, which also has a time bound
+/// that ends at `expires_at`. Both are required and nonzero: Stellar reads a zero upper bound
+/// as no bound at all, so such a transaction would never lapse.
+fn code_bounds(tx: &Transaction, expires_at: u64) -> Result<(u32, u32)> {
+    let Preconditions::V2(PreconditionsV2 {
+        time_bounds: Some(time),
+        ledger_bounds: Some(ledgers),
+        min_seq_num: None,
+        min_seq_age: stellar_xdr::Duration(0),
+        min_seq_ledger_gap: 0,
+        extra_signers,
+    }) = &tx.cond
+    else {
+        return Err("A code transaction is bounded by time and by ledgers".into());
+    };
+    if time.max_time.0 == 0 || time.max_time.0 != expires_at {
+        return Err("The code transaction's time bound differs from its expiry".into());
+    }
+    if !extra_signers.is_empty()
+        || ledgers.min_ledger == 0
+        || ledgers.max_ledger < ledgers.min_ledger
+    {
+        return Err("The code transaction's ledger bounds are not a bounded window".into());
+    }
+    Ok((ledgers.min_ledger, ledgers.max_ledger))
+}
+/// The signed ledger bounds `(min, max)` of the prepared code transaction `p`.
+pub fn code_ledger_bounds(p: &PreparedDeployment) -> Result<(u32, u32)> {
+    let TransactionEnvelope::Tx(envelope) = read(&p.transaction_xdr)? else {
+        return Err("Expected a v1 code transaction".into());
+    };
+    code_bounds(&envelope.tx, p.expires_at)
+}
 /// Check a wallet code transaction that its source signed: `signed_xdr` is the prepared
 /// transaction `p` with one signature of its source over its hash, under the source key's
-/// hint; the transaction's time bound is `p.expires_at`; and it uploads the code `p.wasm_hash`
+/// hint; the transaction is bounded by ledgers and by a time bound that is `p.expires_at`
+/// (`code_bounds`); and it uploads the code `p.wasm_hash`
 /// (`upload_wasm`) or restores that code's entry (`restore_code`), with the code entry alone
 /// in its read-write footprint, no read-only entry and no archived entry restored in place.
 pub fn check_signed_code(p: &PreparedDeployment, signed_xdr: &str) -> Result<()> {
@@ -1770,10 +1839,7 @@ pub fn check_signed_code(p: &PreparedDeployment, signed_xdr: &str) -> Result<()>
     if signed.tx.source_account != muxed(&p.source)? {
         return Err("The code transaction has another source".into());
     }
-    if !matches!(&signed.tx.cond, Preconditions::Time(bounds) if bounds.max_time.0 == p.expires_at)
-    {
-        return Err("The code transaction's time bound differs from its expiry".into());
-    }
+    code_bounds(&signed.tx, p.expires_at)?;
     let [signature] = signed.signatures.as_slice() else {
         return Err("A code transaction carries one signature, its source's".into());
     };

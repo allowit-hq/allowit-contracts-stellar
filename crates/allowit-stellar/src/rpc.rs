@@ -881,6 +881,28 @@ pub fn owner_transaction_lapsed(
     let reply = rpc.call("getTransaction", json!({ "hash": hex(hash) }))?;
     Ok(owner_never_applied(&reply, &hex(hash), expires_at, since))
 }
+/// Whether the code transaction with hash `hash`, which the network can include only in the
+/// ledgers `min_ledger..=max_ledger` of its signed bounds, lapsed: a lookup finds no such
+/// transaction in a history that reaches back to `min_ledger`, and a ledger after `max_ledger`
+/// closed, so it never applied and can no longer apply.
+pub fn code_transaction_lapsed(
+    rpc: &dyn Rpc,
+    hash: &[u8; 32],
+    min_ledger: u32,
+    max_ledger: u32,
+) -> Result<bool> {
+    let reply = rpc.call("getTransaction", json!({ "hash": hex(hash) }))?;
+    let number = |key: &str| {
+        reply[key]
+            .as_u64()
+            .or_else(|| reply[key].as_str()?.parse().ok())
+    };
+    Ok(reply["status"] == "NOT_FOUND"
+        && (reply["txHash"].is_null() || reply["txHash"] == hex(hash))
+        && number("oldestLedger")
+            .is_some_and(|oldest| 0 < oldest && oldest <= u64::from(min_ledger))
+        && number("latestLedger").is_some_and(|latest| latest > u64::from(max_ledger)))
+}
 /// Whether a `getTransaction` reply proves that the transaction with this hash never applied and
 /// can no longer apply: see [`owner_transaction_lapsed`].
 fn owner_never_applied(reply: &Value, hash: &str, expires_at: u64, since: u64) -> bool {
