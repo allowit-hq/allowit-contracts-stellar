@@ -489,10 +489,15 @@ impl ServerHooks for Hooks {
                     "Configure gasRates to price the XLM fee in {asset}"
                 ))
             })?;
-        // `rate` has 7 decimals, as XLM does, so units = ceil(fee * rate / 10^7).
-        fee.checked_mul(rate)
-            .and_then(|v| v.checked_add(9_999_999))
-            .map(|v| v / 10_000_000)
+        // `rate` has 7 decimals, as XLM does, so units = ceil(fee * rate / 10^7). With
+        // rate = q * 10^7 + r and fee = a * 10^7 + b, that is fee * q + a * r + ceil(b * r / 10^7):
+        // no intermediate value is wider than the price, and b * r is below 10^14.
+        const SCALE: i128 = 10_000_000;
+        let (q, r) = (rate / SCALE, rate % SCALE);
+        let (a, b) = (fee / SCALE, fee % SCALE);
+        fee.checked_mul(q)
+            .and_then(|v| v.checked_add(a.checked_mul(r)?))
+            .and_then(|v| v.checked_add((b * r + SCALE - 1) / SCALE))
             .ok_or_else(|| Error::config("The fee is out of range"))
     }
 }
@@ -967,6 +972,14 @@ mod tests {
                 .price_fee(network, &serde_json::json!({}), &xlm, 1_000)
                 .unwrap(),
             1_000
+        );
+        // A price that fits is given, whatever the width of fee times rate: 100 stroops at
+        // 10^30 units per XLM are 10^32 units.
+        let wide =
+            serde_json::json!({"gasRates": {foo.as_str(): "1000000000000000000000000000000"}});
+        assert_eq!(
+            hooks.price_fee(network, &wide, &foo, 100).unwrap(),
+            10_i128.pow(32)
         );
         // A rate under a ticker prices no asset, a listed one neither.
         assert!(

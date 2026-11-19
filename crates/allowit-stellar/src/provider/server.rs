@@ -285,7 +285,18 @@ fn expense_of(action: &Action, conversion: i128, ceiling: &FeeCeiling) -> Result
         Action::Transfer { units, .. } => *units,
         Action::Deposit { .. } | Action::Redeem { .. } => conversion,
     };
-    // A Stellar transaction declares its fee in 32 bits: a wider ceiling cannot be signed.
+    // A Stellar transaction declares its fee in 32 bits and pays at least the inclusion fee, and
+    // its expense names a ledger sequence: another ceiling cannot be signed.
+    if ceiling.observed_height == 0 || u32::try_from(ceiling.observed_height).is_err() {
+        return Err(Error::config(
+            "The observed ledger of the fee ceiling is no Stellar ledger",
+        ));
+    }
+    if ceiling.max_fee_units < u128::from(native::INCLUSION_FEE_STROOPS) {
+        return Err(Error::config(
+            "The fee ceiling is below the inclusion fee of a Stellar transaction",
+        ));
+    }
     if ceiling.max_fee_units > u128::from(u32::MAX) {
         return Err(Error::config(
             "The fee ceiling is above what a Stellar transaction can declare",
@@ -1726,12 +1737,10 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         }
         // The receipt is of `signed`'s transaction, or of the transaction that settled it.
         verify_receipt(&r.0, &signed.0)?;
-        // `signed` carries the operation of `p`: the same wallet and the same operation ID. The
-        // envelope can differ, as another envelope of a contract wallet's authorization.
-        let carried = signed_preparation(&signed.0)?.info()?;
-        if carried.operation_id != operation.request.operation.nonce
-            || carried.wallet != operation.config.wallet
-        {
+        // `signed` carries the operation of `p`: its whole preparation, the wallet, the operation
+        // ID, the request and the signed terms included. The envelope can differ, as another
+        // envelope of a contract wallet's authorization.
+        if self::signed(signed)?.prepared != operation {
             return Err(Error::config(
                 "The signed transaction carries another operation than the prepared one",
             ));
@@ -4111,6 +4120,35 @@ mod settlement_api {
         );
     }
 
+    /// A receipt settles no other operation of its own wallet under the same operation ID: the
+    /// signed envelope carries the preparation of the operation, whole.
+    #[test]
+    fn a_receipt_settles_no_other_operation_of_its_wallet_under_the_same_id() {
+        let (signed, packet, receipt) = keypair();
+        let p = &signed.prepared;
+        let request = crate::request::transfer(
+            &p.config,
+            &p.state,
+            p.request.operation.nonce,
+            &native::account_for_seed(&[31; 32]),
+            10_000_000,
+        )
+        .unwrap();
+        let other =
+            crate::prepare(&p.config, &request, &p.state, p.created_at, p.expires_at).unwrap();
+        assert_eq!(
+            (other.config.wallet.as_str(), other.request.operation.nonce),
+            (p.config.wallet.as_str(), p.request.operation.nonce)
+        );
+        assert_ne!(other.request, p.request);
+        let other = Prepared(restored(Kind::Prepared, &of(&other)));
+        assert!(
+            provider()
+                .settle_receipt(&other, &packet, &receipt, Some(&accounting(9)), 0)
+                .is_err()
+        );
+    }
+
     /// A retained packet of the historical route `Odc` settles nothing: the refusal is typed.
     #[test]
     fn a_receipt_of_the_historical_route_is_refused_with_its_code() {
@@ -4161,6 +4199,11 @@ mod settlement_api {
                 surplus
             )
         );
+        let usage = settled
+            .usage
+            .expect("an executed transfer reports its usage");
+        assert_eq!(usage.gas_units, fee.charged_units);
+        assert_eq!(settled.usage_for(0), Some(usage));
         let settled = provider()
             .settle_receipt(&p, &signed, &receipt, None, u128::MAX - surplus)
             .unwrap();
@@ -4228,6 +4271,108 @@ mod settlement_api {
             units: 100,
         };
         assert!(provider().expense(&i, &transfer, &negative_gas).is_err());
+    }
+
+    /// An endpoint that holds the server's sending account and values any count of a vault's
+    /// shares at `self.0` asset units.
+    struct Vault(i128);
+    impl rpc::Rpc for Vault {
+        fn call(
+            &self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> native::Result<serde_json::Value> {
+            use stellar_xdr as x;
+            Ok(match method {
+                "getNetwork" => serde_json::json!({"passphrase": native::passphrase(NETWORK)?}),
+                "getLatestLedger" => serde_json::json!({"sequence": 120}),
+                "getLedgerEntries" => {
+                    let key = native::account_key(&native::account_for_seed(&[10; 32]))?;
+                    let entry = x::LedgerEntryData::Account(x::AccountEntry {
+                        account_id: x::AccountId(x::PublicKey::PublicKeyTypeEd25519(x::Uint256(
+                            key,
+                        ))),
+                        seq_num: x::SequenceNumber(41),
+                        balance: 1_000_000_000,
+                        thresholds: x::Thresholds([1, 0, 0, 0]),
+                        ..Default::default()
+                    });
+                    serde_json::json!({"latestLedger": 120, "entries": [{
+                        "key": params["keys"][0], "xdr": native::xdr(&entry)?, "liveUntilLedgerSeq": 520
+                    }]})
+                }
+                "simulateTransaction" => {
+                    let value = x::ScVal::I128(x::Int128Parts {
+                        hi: 0,
+                        lo: u64::try_from(self.0).unwrap(),
+                    });
+                    serde_json::json!({"latestLedger": 120,
+                        "results": [{"xdr": native::xdr(&value)?, "auth": []}]})
+                }
+                _ => return Err(format!("Unexpected call {method}")),
+            })
+        }
+    }
+
+    /// A vault operation's principal is its worst-case conversion, as the vault values it: a
+    /// deposit of 100 whose shares redeem for 95, and a redeem of shares worth 95 that accepts 90,
+    /// each lose 5, and spend 5 and the gas of the ceiling.
+    #[test]
+    fn a_vault_operation_spends_the_conversion_that_the_vault_values() {
+        let i = installation();
+        let reading = Provider::from_rpc(NETWORK, Arc::new(Vault(95)))
+            .with_sender(Arc::new(Account(native::account_for_seed(&[10; 32]))));
+        let vault = crate::test_support::vault(0);
+        for action in [
+            Action::Deposit {
+                vault: vault.clone(),
+                assets: 100,
+                min_shares: 1,
+            },
+            Action::Redeem {
+                vault: vault.clone(),
+                shares: 100,
+                min_assets: 90,
+            },
+        ] {
+            let bound = reading.expense(&i, &action, &CEILING).unwrap();
+            assert_eq!(
+                (bound.conversion_units, bound.spent_units),
+                (5, 7),
+                "{action:?}"
+            );
+        }
+    }
+
+    /// A ceiling that a Stellar transaction cannot carry is refused: a fee below the inclusion
+    /// fee, and an observed ledger that is none or wider than a ledger sequence.
+    #[test]
+    fn an_expense_ceiling_that_stellar_cannot_sign_is_refused() {
+        let i = installation();
+        let transfer = Action::Transfer {
+            recipient: native::account_for_seed(&[31; 32]),
+            units: 100,
+        };
+        assert!(provider().expense(&i, &transfer, &CEILING).is_ok());
+        for ceiling in [
+            FeeCeiling {
+                max_fee_units: u128::from(native::INCLUSION_FEE_STROOPS) - 1,
+                ..CEILING
+            },
+            FeeCeiling {
+                observed_height: 0,
+                ..CEILING
+            },
+            FeeCeiling {
+                observed_height: u64::from(u32::MAX) + 1,
+                ..CEILING
+            },
+        ] {
+            assert!(
+                provider().expense(&i, &transfer, &ceiling).is_err(),
+                "{ceiling:?}"
+            );
+        }
     }
 
     /// A deposit whose shares cannot be valued, because the sending account cannot be read,
