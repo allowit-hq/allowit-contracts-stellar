@@ -162,6 +162,20 @@ fn a_funded_setup_is_one_owner_transaction_and_binds_its_amount() {
     use crate::provider::runtime::owner::MAX_SETUP_FUNDING;
     assert!(request(MAX_SETUP_FUNDING).validate().is_ok());
     assert!(request(MAX_SETUP_FUNDING + 1).validate().is_err());
+    // The funding of an issued asset is a payment of its own: its ceiling is the builder's,
+    // which the browser package shares, and no reserve comes off it.
+    let issued = |funding: i64| SetupRequest {
+        asset: Some(crate::owner::Trustline {
+            code: "USDC".into(),
+            issuer: USDC_ISSUER.into(),
+        }),
+        ..request(funding)
+    };
+    use crate::owner::MAX_ASSET_FUNDING;
+    const { assert!(MAX_ASSET_FUNDING > MAX_SETUP_FUNDING) };
+    assert!(issued(MAX_ASSET_FUNDING).validate().is_ok());
+    assert!(issued(MAX_ASSET_FUNDING + 1).validate().is_err());
+    assert!(issued(0).validate().is_err());
     let at_ceiling = crate::owner::prepare_native_setup(
         &crate::AccountState {
             address: c.owner.clone(),

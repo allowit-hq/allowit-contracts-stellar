@@ -18,8 +18,9 @@ pub struct SetupRequest {
     /// `None` funds the reserve and the float only.
     pub funding: Option<i64>,
 }
-/// The most that one setup funds, in base units: the transaction's ceiling on the starting
-/// balance, less the reserve and the fee float that the starting balance also holds.
+/// The most that one setup funds a wallet that holds XLM, in stroops: the transaction's
+/// ceiling on the starting balance, less the reserve and the fee float that the starting
+/// balance also holds. A wallet of an issued asset takes `owner::MAX_ASSET_FUNDING`.
 pub const MAX_SETUP_FUNDING: i64 =
     native::owner::MAX_STARTING_BALANCE - native::owner::default_starting_balance(false);
 impl SetupRequest {
@@ -58,10 +59,14 @@ impl SetupRequest {
                 "Setup fee must be 100..100000 stroops per operation",
             ));
         }
-        if self
-            .funding
-            .is_some_and(|f| !(1..=MAX_SETUP_FUNDING).contains(&f))
-        {
+        // The funding of a wallet that holds XLM is part of the starting balance. The funding
+        // of an issued asset is a payment of its own, with the ceiling of the setup builder.
+        let ceiling = if self.asset.is_some() {
+            native::owner::MAX_ASSET_FUNDING
+        } else {
+            MAX_SETUP_FUNDING
+        };
+        if self.funding.is_some_and(|f| !(1..=ceiling).contains(&f)) {
             return Err(Error::usage("The setup funding amount is out of range"));
         }
         Ok(())

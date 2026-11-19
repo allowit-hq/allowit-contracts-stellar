@@ -165,7 +165,7 @@ export function ownerSignElement() {
                     // A wallet of an issued asset: the asset by its code and its issuer, the funding in that asset, and the
                     // XLM that the account, its trustline and the owner's own steps need.
                     rows.push(h('dt', {}, 'Asset'), h('dd', {}, `${asset.symbol}, issued by `, link(id, 'address', asset.issuer, asset.issuer)));
-                    rows.push(h('dt', {}, 'You fund it with'), h('dd', {}, `${funding > 0n ? `${units(funding, asset.symbol)} for your agent's payments, and ` : ''}${xlm(setup.startingBalance)}: ${xlm(WALLET_RESERVE + TRUSTLINE_RESERVE)} that the network locks in the account and its ${asset.symbol} trustline, and ${xlm(WALLET_FEE_FLOAT)} for the fees of your own steps. Only you can take the XLM back. The ${asset.symbol} follows the rules of its issuer.`));
+                    rows.push(h('dt', {}, 'You fund it with'), h('dd', {}, `${funding > 0n ? `${units(funding, asset.symbol)} for your agent's payments, and ` : ''}${xlm(setup.startingBalance)}: ${xlm(WALLET_RESERVE + TRUSTLINE_RESERVE)} that the network locks in the account and its ${asset.symbol} trustline, and ${xlm(WALLET_FEE_FLOAT)} for network fees. Only you can close the wallet, which returns its XLM to you. The ${asset.symbol} follows the rules of its issuer.`));
                 }
                 rows.push(h('dt', {}, 'Who can pay'), h('dd', {}, 'Your agent and the server, only together. You can do everything alone.'));
             }

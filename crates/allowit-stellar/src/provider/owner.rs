@@ -196,9 +196,9 @@ impl OwnerProvider for Owner {
                 )));
             }
         }
-        // The caller's own values are checked first: a setup that must fail asks the owner for
-        // no sign-in, opens no journal and asks the server nothing. The wallet asset is checked
-        // after the server's template names it.
+        // The caller's own values, the RPC endpoint among them, are checked first: a setup that
+        // must fail asks the owner for no sign-in, opens no journal and asks the server
+        // nothing. The wallet asset is checked after the server's template names it.
         let request = |asset| SetupRequest {
             network: network.into(),
             owner: cx.signer.address().into(),
@@ -210,6 +210,7 @@ impl OwnerProvider for Owner {
             funding,
         };
         request(None).validate()?;
+        let runtime = runtime(cx.rpc_url)?;
         // The server's template of the network names the asset that the wallet holds. It is
         // read before anything is signed for the ledger, so a server that offers no wallet on
         // this network stops the setup before an account exists. A request that the store
@@ -228,7 +229,7 @@ impl OwnerProvider for Owner {
         let request = request(asset);
         request.validate()?;
         let mut configured = workflow::configure_native(
-            &runtime(cx.rpc_url)?,
+            &runtime,
             &store,
             &request,
             &super::OwnerSignerRef(cx.signer),
@@ -593,6 +594,12 @@ mod storage_boundary_tests {
             assert_eq!(
                 setup([selected, selected, other], &agent, id, None),
                 "The server authority belongs to another network than the wallet setup",
+                "{selected}"
+            );
+            // A valid request whose RPC endpoint is no URL.
+            assert_eq!(
+                setup(same, &agent, id, None),
+                "Invalid owner RPC endpoint",
                 "{selected}"
             );
         }

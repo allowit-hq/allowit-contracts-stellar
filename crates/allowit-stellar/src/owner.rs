@@ -30,6 +30,9 @@ pub const FEE_FLOAT_STROOPS: i64 = 5_000_000;
 const SIGNERS: i64 = 3;
 /// The most that one setup sends to a new account, in stroops.
 pub const MAX_STARTING_BALANCE: i64 = 1_000_000_000_000_000;
+/// The most that one setup pays into a new account in its issued asset, in base units. The
+/// browser package builds and reads the same ceiling.
+pub const MAX_ASSET_FUNDING: i64 = 1_000_000_000_000_000;
 
 /// The balance that the network locks in a wallet account: the account, its three signers and
 /// its trustline.
@@ -80,13 +83,15 @@ pub struct Trustline {
     pub issuer: String,
 }
 impl Trustline {
-    /// The issued asset. An issued asset with the code of the network's own asset reads as
-    /// that asset in every amount, so no wallet holds one.
     fn asset(&self) -> Result<Asset> {
-        if self.code == "XLM" {
-            return Err("A wallet holds no issued asset with the code XLM".into());
-        }
         asset_from_identity(&self.code, Some(&self.issuer))
+    }
+    /// An issued asset with the code of the network's own asset reads as that asset in every
+    /// amount, so no new setup names one and no setup funds one. The builder of earlier
+    /// releases could add such a trustline without funding: that setup stays readable as
+    /// retained history.
+    fn names_the_native_code(&self) -> bool {
+        self.code == "XLM"
     }
 }
 
@@ -173,7 +178,12 @@ fn asset_funding(v: &NativeSetup) -> Result<Option<i64>> {
         return Ok(None);
     };
     let units: i64 = text.parse().map_err(err)?;
-    if v.trustline.is_none() || units <= 0 || units.to_string() != *text {
+    if v.trustline
+        .as_ref()
+        .is_none_or(Trustline::names_the_native_code)
+        || !(1..=MAX_ASSET_FUNDING).contains(&units)
+        || units.to_string() != *text
+    {
         return Err("The setup funds a positive amount of its trustline's asset".into());
     }
     Ok(Some(units))
@@ -435,6 +445,12 @@ pub fn prepare_native_setup(
     now: u64,
 ) -> Result<NativeSetup> {
     check_owner_source(state)?;
+    if terms
+        .trustline
+        .is_some_and(Trustline::names_the_native_code)
+    {
+        return Err("A wallet holds no issued asset with the code XLM".into());
+    }
     let trustline = terms.trustline.is_some();
     let mut v = NativeSetup {
         version: 2,
@@ -1097,8 +1113,41 @@ mod tests {
         let mut other = v.clone();
         other.funding = Some("100001".into());
         assert!(validate_native_setup(&other).is_err());
+        // The ceiling of the funding is the builder's own.
+        terms.funding = Some(MAX_ASSET_FUNDING);
+        assert!(prepare_native_setup(&owner_state(), &terms, 1).is_ok());
+        terms.funding = Some(MAX_ASSET_FUNDING + 1);
+        assert!(prepare_native_setup(&owner_state(), &terms, 1).is_err());
+        terms.funding = Some(100_000);
         terms.trustline = None;
         assert!(prepare_native_setup(&owner_state(), &terms, 1).is_err());
+        // No new setup names an issued asset with the code XLM, funded or not.
+        let native_code = Trustline {
+            code: "XLM".into(),
+            issuer: trustline.issuer.clone(),
+        };
+        terms.trustline = Some(&native_code);
+        for funding in [None, Some(100_000)] {
+            terms.funding = funding;
+            assert!(prepare_native_setup(&owner_state(), &terms, 1).is_err());
+        }
+        // The builder of earlier releases made that setup without funding. Its bytes stay
+        // readable as a retained setup. The funded form, which no builder made, does not.
+        let memo = hash(unfunded.request_id.as_bytes());
+        let mut earlier = unfunded.clone();
+        earlier.trustline = Some(native_code);
+        let bytes = setup_transaction(&earlier, memo).unwrap();
+        assert!(is_setup_transaction(&bytes, &earlier.network));
+        earlier.funding = Some("100000".into());
+        earlier.fee_stroops = 600;
+        assert!(setup_transaction(&earlier, memo).is_err());
+        // The current setups are read too.
+        for current in [&unfunded, &v] {
+            let TransactionEnvelope::Tx(envelope) = read(&current.transaction_xdr).unwrap() else {
+                panic!()
+            };
+            assert!(is_setup_transaction(&envelope.tx, &current.network));
+        }
     }
     /// A setup is prepared for each network of the rail, with that network's transaction hash,
     /// and for no other network.

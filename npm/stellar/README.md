@@ -62,7 +62,9 @@ A Native policy needs the wallet account of its agent: a new classic account, on
    owner's account then pays the funding amount in that asset; the starting balance is 3.0 XLM of reserve, for the
    account and its trustline, and the 0.5 XLM. The setup works on every network of the rail. The issuer's flags hold
    for the wallet's asset: an issuer that authorizes each trustline itself makes a funded setup fail as a whole, and
-   an issuer with clawback can take the asset back. So the element says that only the owner can take the XLM back.
+   an issuer with clawback can take the asset back. On the ledger the agent and the server together reach the payment
+   threshold, so the 0.5 XLM above the reserve pays the network fees of the wallet's operations; only the owner can
+   close the account, which returns its XLM. The element says exactly that.
 2. Has the host's `sign` sign it as the step `set_up_wallet`. The account's own key is random, lives in `complete` only
    and signs the creation once beside the owner. The `owner-sign` element reads the step from its bytes: it shows the
    wallet account, the agent, the asset with its issuer and the funding, and it refuses any transaction that is not
@@ -90,7 +92,8 @@ A Native policy needs the wallet account of its agent: a new classic account, on
 So a Native deployment takes two owner signatures: the setup, which also funds the wallet, and the approval. No
 funding step follows. The SDK's `updateParams` on a Native wallet is one `approve_policy` signature and no transaction: the
 account holds no values, so the service answers the change with the approval message of the new values. The host
-passes `installed: {wallet, source, rules, params, tier}`, the policy that the owner reviewed. The workflow signs
+passes `installed: {wallet, source, rules, params, tier, asset}`, the policy that the owner reviewed; `asset` is
+`{symbol, issuer}` for a wallet of an issued asset and may be left out for a wallet that holds XLM. The workflow signs
 only an approval of that policy with the changed params replaced, checked as for the deployment's approval; any
 other field or value is refused before a signature.
 
