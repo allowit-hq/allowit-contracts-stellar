@@ -151,8 +151,9 @@ export declare function signedNativeSetupOf(signedPayload: string, network: stri
 /**
  * Checks the asset of a Native wallet's bytes against `asset`, the asset of the reviewed policy, or XLM without one:
  * Core's `keypairSetup.checkAsset`. `payload` is signed setup bytes, which must set up a wallet of that asset, or the
- * funding step that the server prepared, which must pay the wallet in it. Throws an error whose `code` is
- * `asset_mismatch` otherwise, for a payload that is neither, and when `asset` is no Stellar asset.
+ * funding step that the server prepared, which must pay the wallet in it, in the encoding that the rail builds. Throws
+ * an error whose `code` is `asset_mismatch` otherwise, for a payload that is neither, and when `asset` is no Stellar
+ * asset. The check is of the asset only.
  */
 export declare function checkNativeAsset(payload: string, network: string, asset?: NativeWalletAsset | null | undefined): void;
 /** Sends signed setup bytes to Horizon. The ledger of the successful transaction, or null without a certain answer. */

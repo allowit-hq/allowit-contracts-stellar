@@ -314,21 +314,19 @@ export function signedNativeSetupOf(signedPayload, network) {
     }
 }
 /**
- * The asset of the funding step of a Native wallet: one payment from the transaction's own account, as the server
- * builds it. Null for any other payload.
+ * The asset of the funding step of a Native wallet, as the server builds it: an unsigned envelope of the current form,
+ * no memo, and one payment from the transaction's own account. Null for any other payload.
  */
 function nativeFundingAssetOf(payload, network) {
     const id = canonicalNetwork(network);
-    if (!id)
+    if (!id || !currentEnvelope(payload))
         return null;
     try {
         const tx = TransactionBuilder.fromXDR(payload, networkPassphrase(id));
-        if ('innerTransaction' in tx || tx.operations.length !== 1)
+        if ('innerTransaction' in tx || tx.signatures.length !== 0 || tx.memo.type !== 'none' || tx.operations.length !== 1)
             return null;
         const [op] = tx.operations;
-        if (op.type !== 'payment' || op.source !== undefined)
-            return null;
-        return op.asset.isNative() ? { symbol: 'XLM', issuer: null } : { symbol: op.asset.getCode(), issuer: op.asset.getIssuer() ?? null };
+        return op.type === 'payment' && op.source === undefined ? op.asset : null;
     }
     catch {
         return null;
@@ -339,23 +337,32 @@ const assetLabel = (asset) => asset.issuer === null ? asset.symbol : `${asset.sy
 /**
  * Checks the asset of a Native wallet's bytes against `asset`, the asset of the reviewed policy, or XLM without one:
  * Core's `keypairSetup.checkAsset`. `payload` is signed setup bytes, which must set up a wallet of that asset, or the
- * funding step that the server prepared, which must pay the wallet in it. Throws an error whose `code` is
- * `asset_mismatch` otherwise, for a payload that is neither, and when `asset` is no Stellar asset.
+ * funding step that the server prepared, which must pay the wallet in it, in the encoding that the rail builds. Throws
+ * an error whose `code` is `asset_mismatch` otherwise, for a payload that is neither, and when `asset` is no Stellar
+ * asset. The check is of the asset only.
  */
 export function checkNativeAsset(payload, network, asset) {
     const refused = (message) => Object.assign(new Error(message), { code: 'asset_mismatch' });
-    let expected;
+    let issued;
     try {
-        expected = assetOf(issuedAsset(asset));
+        issued = issuedAsset(asset);
     }
     catch {
-        throw refused('The asset of the reviewed policy is not a Stellar asset. Nothing was signed.');
+        throw refused('The asset of the reviewed policy is not a Stellar asset. Nothing was signed; a saved setup stays saved.');
     }
-    const held = signedNativeSetupOf(payload, network)?.asset ?? nativeFundingAssetOf(payload, network);
-    if (!held)
-        throw refused('These bytes are neither a signed wallet setup nor a wallet funding of this network, so their asset cannot be read. Nothing was signed.');
-    if (held.symbol !== expected.symbol || held.issuer !== expected.issuer)
-        throw refused(`The wallet's transaction moves ${assetLabel(held)}, and the reviewed policy pays in ${assetLabel(expected)}. Nothing was signed; resume the policy of that wallet.`);
+    const expected = assetOf(issued);
+    const setup = signedNativeSetupOf(payload, network);
+    if (setup) {
+        if (setup.asset.symbol !== expected.symbol || setup.asset.issuer !== expected.issuer)
+            throw refused(`The signed wallet setup is for ${assetLabel(setup.asset)}, and the reviewed policy pays in ${assetLabel(expected)}. It stays saved; resume the policy of that setup.`);
+        return;
+    }
+    const funding = nativeFundingAssetOf(payload, network);
+    if (!funding)
+        throw refused('These bytes are neither a signed wallet setup nor a wallet funding step of this network, so their asset cannot be read. Nothing was signed; a saved setup stays saved.');
+    const builds = issued ?? Asset.native();
+    if (!funding.equals(builds) || funding.getAssetType() !== builds.getAssetType())
+        throw refused(`The funding step pays in ${assetLabel(assetOf(funding.isNative() ? null : funding))}, and the reviewed policy pays in ${assetLabel(expected)}. Nothing was signed.`);
 }
 /** Sends signed setup bytes to Horizon. The ledger of the successful transaction, or null without a certain answer. */
 export async function sendNativeSetup(network, signedPayload, hash, send = fetch) {
