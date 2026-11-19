@@ -541,9 +541,6 @@ pub type Sender = std::sync::Arc<dyn SendingAccounts>;
 pub const RETIRED_ROUTE: &str = "retired_route";
 /// The code of the refusal of a fee ceiling that no Stellar transaction of the wallet can carry.
 pub const UNSIGNABLE_CEILING: &str = "fee_ceiling_unsignable";
-/// The code of the refusal of a receipt whose fee bump the wallet's own account or the server's
-/// sending account paid. Allowit sends no such fee bump, and its receipt does not keep the fee.
-pub const FEE_BUMP_UNSUPPORTED: &str = "fee_bump_unsupported";
 pub use crate::host::runtime::SendingAccounts;
 /// The fee that the signed transaction envelope `xdr` declares, in stroops: the most that the
 /// ledger charges its source.
@@ -966,16 +963,18 @@ impl Provider {
     }
     /// The vault's value of `shares` in asset units. The read simulates from an account that
     /// exists: the sending account of a policy wallet, or the keypair wallet itself. The server's
-    /// refusal to give a sending account (an answer with its status) is the outer error, which
-    /// the caller keeps, as the server's valuation keeps it; another failure to give one, a read
-    /// that fails and the vault's own refusal to value the shares are the inner one, on which
-    /// `expense` counts a deposit whole and refuses a redeem.
+    /// refusal to give a sending account (an answer with its status: a pool whose accounts are
+    /// all held, or a claim store that did not answer) is the outer error, which the caller
+    /// keeps and asks again; another failure to give one, a read that fails and the vault's own
+    /// refusal to value the shares are the inner one, on which `expense` counts a deposit whole
+    /// and refuses a redeem.
     fn vault_value(&self, i: &Installation, vault: &str, shares: i128) -> Result<Result<i128>> {
         let sender = match self.config(i)?.route {
             WalletRoute::PolicyWallet => match self.sending_account() {
                 Ok(sender) => Some(Ok(sender)),
-                // A server's refusal, an answer with its status such as a held pool that the
-                // caller asks again, stays the caller's; any other failure is a failed read.
+                // A server's refusal, an answer with its status such as a held pool or a claim
+                // store's 503 that the caller asks again, stays the caller's; any other failure
+                // is a failed read.
                 Err(refused) if refused.status.is_some() => return Err(refused),
                 Err(failed) => Some(Err(failed)),
             },
@@ -1783,7 +1782,6 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         }
         let receipt: rpc::VerifiedReceipt = decode_packet(&r.0)?;
         let info = receipt_info(&r.0)?;
-        self.refuse_own_fee_bump(&operation, &receipt)?;
         let usage = if operation.config.route == WalletRoute::PolicyWallet
             && info.status == Status::Confirmed
         {
@@ -2149,47 +2147,6 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         ))?
         .map(|r| Ok(Receipt(packet(p.network(), &r)?)))
         .transpose()
-    }
-}
-
-impl Provider {
-    /// Refuse the receipt of a transaction whose fee bump the wallet's own account or the
-    /// server's sending account paid ([`FEE_BUMP_UNSUPPORTED`]): Allowit sends no such fee bump,
-    /// and its receipt keeps no fee of it. The receipt names the payer when it holds the fee bump
-    /// itself; otherwise a fee bump leaves the inner result without a fee, and the ledger names
-    /// its payer. The wallet's own account is a keypair wallet's account; the server's sending
-    /// account is the source of a contract wallet's own transaction. A fee bump that another
-    /// party paid, as a seller's facilitator for its own transaction, and a transaction that the
-    /// ledger answers it no longer holds, read as before. A lookup without a known status is
-    /// uncertain: the caller asks again.
-    fn refuse_own_fee_bump(
-        &self,
-        operation: &PreparedOperation,
-        receipt: &rpc::VerifiedReceipt,
-    ) -> Result<()> {
-        let (source, carried) = checked(rpc::receipt_fee_parties(receipt))?;
-        let payer = match carried {
-            Some(payer) => Some(payer),
-            None => {
-                let result: stellar_xdr::TransactionResult =
-                    checked(native::read(&receipt.result_xdr))?;
-                if result.fee_charged != 0 {
-                    return Ok(());
-                }
-                checked(rpc::fee_bump_payer(self.rpc(), &self.network, receipt))?
-            }
-        };
-        let mut own = vec![operation.config.wallet.clone()];
-        if receipt.settles.is_none() {
-            own.push(source);
-        }
-        match payer {
-            Some(payer) if own.contains(&payer) => Err(Error::coded(
-                FEE_BUMP_UNSUPPORTED,
-                "The wallet's own account or the server's sending account paid this transaction's fee bump, which Allowit does not send.",
-            )),
-            _ => Ok(()),
-        }
     }
 }
 
@@ -4180,16 +4137,6 @@ mod settlement_api {
             Err(Error::unsupported("This sending account signs nothing"))
         }
     }
-    /// An endpoint that gives one answer to every transaction lookup.
-    struct Answers(serde_json::Value);
-    impl rpc::Rpc for Answers {
-        fn call(&self, method: &str, _: serde_json::Value) -> native::Result<serde_json::Value> {
-            match method {
-                "getTransaction" => Ok(self.0.clone()),
-                _ => Err(format!("Unexpected call {method}")),
-            }
-        }
-    }
     fn provider() -> Provider {
         Provider::from_rpc(NETWORK, Arc::new(Unreachable))
             .with_sender(Arc::new(Account(native::account_for_seed(&[10; 32]))))
@@ -4298,176 +4245,6 @@ mod settlement_api {
                 .settle_receipt(&other, &packet, &receipt, Some(&accounting(9)), 0)
                 .is_err()
         );
-    }
-
-    /// A receipt whose fee bump the wallet's own account paid is refused with its code: its inner
-    /// result keeps no fee. One that another party paid, and one whose transaction the ledger no
-    /// longer holds, read as before: no fee of the wallet's.
-    #[test]
-    fn a_fee_bump_that_the_transactions_own_source_paid_is_refused() {
-        let (signed, packet, _) = keypair();
-        let own = Prepared(restored(Kind::Prepared, &of(&signed.prepared)));
-        let bumped = crate::test_support::confirmed_payment_receipt(&signed, 9, 0);
-        let receipt = Receipt(super::packet(NETWORK, &bumped).unwrap());
-        let wallet = signed.prepared.config.wallet.clone();
-        let sponsor = native::account_for_seed(&[99; 32]);
-        // A transaction that the ledger no longer holds reads as before.
-        let pruned =
-            serde_json::json!({"status": "NOT_FOUND", "oldestLedger": 100, "latestLedger": 120});
-        let settled = Provider::from_rpc(NETWORK, Arc::new(Answers(pruned)))
-            .settle_receipt(&own, &packet, &receipt, Some(&accounting(9)), 0)
-            .unwrap();
-        assert_eq!(settled.fee_units, 0);
-        for (payer, refused) in [(wallet, true), (sponsor.clone(), false)] {
-            let reply = crate::test_support::fee_bump_reply(&bumped, NETWORK, &payer, 5_000);
-            let settled = Provider::from_rpc(NETWORK, Arc::new(Answers(reply))).settle_receipt(
-                &own,
-                &packet,
-                &receipt,
-                Some(&accounting(9)),
-                0,
-            );
-            if refused {
-                assert_eq!(
-                    settled.unwrap_err().api_code.as_deref(),
-                    Some(FEE_BUMP_UNSUPPORTED)
-                );
-            } else {
-                assert_eq!(settled.unwrap().fee_units, 0);
-            }
-        }
-        // A ledger answer whose inner result differs from the receipt is refused.
-        let mut other = bumped.clone();
-        let mut result: stellar_xdr::TransactionResult = native::read(&other.result_xdr).unwrap();
-        result.result = stellar_xdr::TransactionResultResult::TxSuccess(Default::default());
-        other.result_xdr = native::xdr(&result).unwrap();
-        let reply = crate::test_support::fee_bump_reply(&other, NETWORK, &sponsor, 5_000);
-        let error = Provider::from_rpc(NETWORK, Arc::new(Answers(reply)))
-            .settle_receipt(&own, &packet, &receipt, Some(&accounting(9)), 0)
-            .unwrap_err();
-        assert_eq!(error.api_code, None);
-        // So is one whose inner envelope differs, alone: the same transaction, under the same
-        // hash, without its signature.
-        let mut other = bumped.clone();
-        let stellar_xdr::TransactionEnvelope::Tx(mut envelope) =
-            native::read(&other.envelope_xdr).unwrap()
-        else {
-            panic!("a transaction")
-        };
-        assert!(!envelope.signatures.is_empty());
-        envelope.signatures = Default::default();
-        other.envelope_xdr = native::xdr(&stellar_xdr::TransactionEnvelope::Tx(envelope)).unwrap();
-        let reply = crate::test_support::fee_bump_reply(&other, NETWORK, &sponsor, 5_000);
-        assert!(
-            Provider::from_rpc(NETWORK, Arc::new(Answers(reply)))
-                .settle_receipt(&own, &packet, &receipt, Some(&accounting(9)), 0)
-                .is_err()
-        );
-    }
-
-    /// The ledger's answer for the payer of a fee bump establishes something only with a known
-    /// status. A reply without one, or with one that Stellar does not have, is no "the ledger
-    /// does not hold it": the settlement is uncertain and the caller asks again. A terminal
-    /// answer that no fee bump carried agrees with the receipt in its status and ledger too.
-    #[test]
-    fn a_payer_lookup_without_a_known_status_settles_nothing() {
-        let (signed, packet, _) = keypair();
-        let own = Prepared(restored(Kind::Prepared, &of(&signed.prepared)));
-        let unpaid = crate::test_support::confirmed_payment_receipt(&signed, 9, 0);
-        let receipt = Receipt(super::packet(NETWORK, &unpaid).unwrap());
-        let settle = |reply: serde_json::Value| {
-            Provider::from_rpc(NETWORK, Arc::new(Answers(reply))).settle_receipt(
-                &own,
-                &packet,
-                &receipt,
-                Some(&accounting(9)),
-                0,
-            )
-        };
-        for reply in [
-            serde_json::json!({}),
-            serde_json::json!({"status": null}),
-            serde_json::json!({"status": "PENDING"}),
-            serde_json::json!({"oldestLedger": 100, "latestLedger": 120}),
-        ] {
-            let error = settle(reply).unwrap_err();
-            assert_eq!(
-                (error.code, error.api_code),
-                (Error::uncertain("").code, None)
-            );
-        }
-        // A `NOT_FOUND` whose history interval is not one is refused, and settles nothing.
-        assert!(
-            settle(
-                serde_json::json!({"status": "NOT_FOUND", "oldestLedger": 120, "latestLedger": 100})
-            )
-            .is_err()
-        );
-        // A `NOT_FOUND` that states the settlement all the same, here with the fee bump that the
-        // wallet paid, contradicts itself: it is no absence. The unset ledger of an absent
-        // transaction is zero.
-        let mut contradictory = crate::test_support::fee_bump_reply(
-            &unpaid,
-            NETWORK,
-            &signed.prepared.config.wallet,
-            5_000,
-        );
-        contradictory["status"] = serde_json::json!("NOT_FOUND");
-        for name in ["ledger", "envelopeXdr", "resultXdr"] {
-            let mut reply = serde_json::json!({"status": "NOT_FOUND"});
-            reply[name] = contradictory[name].clone();
-            for reply in [reply, contradictory.clone()] {
-                assert_eq!(settle(reply).unwrap_err().code, Error::uncertain("").code);
-            }
-        }
-        let absent = serde_json::json!({"status": "NOT_FOUND", "ledger": 0, "envelopeXdr": null});
-        assert_eq!(settle(absent).unwrap().fee_units, 0);
-        // The ledger holds the transaction itself, with no fee bump: the receipt's own.
-        let plain = |status: &str, ledger: u32| {
-            serde_json::json!({"status": status, "txHash": native::hex(&unpaid.transaction_hash),
-                "ledger": ledger, "envelopeXdr": unpaid.envelope_xdr, "resultXdr": unpaid.result_xdr})
-        };
-        assert_eq!(settle(plain("SUCCESS", 9)).unwrap().fee_units, 0);
-        // The same envelope and result under another status or in another ledger are refused.
-        assert!(settle(plain("FAILED", 9)).is_err());
-        assert!(settle(plain("SUCCESS", 10)).is_err());
-    }
-
-    /// A contract wallet's own transaction has the server's sending account as its source, which
-    /// is not the wallet: a fee bump that the sending account paid is refused, for a confirmed and
-    /// for a failed transaction. One that another party paid settles as the receipt reads.
-    #[test]
-    fn a_fee_bump_that_the_sending_account_paid_is_refused() {
-        let (p, signed, receipt) = standard();
-        let retained: rpc::VerifiedReceipt = decode_packet(&receipt.0).unwrap();
-        let (sender, _) = rpc::receipt_fee_parties(&retained).unwrap();
-        assert_ne!(sender, prepared(&p).unwrap().config.wallet);
-        let sponsor = native::account_for_seed(&[99; 32]);
-        for outcome in [OperationOutcome::Executed, OperationOutcome::Open] {
-            let mut unpaid = retained.clone();
-            let mut result: stellar_xdr::TransactionResult =
-                native::read(&unpaid.result_xdr).unwrap();
-            result.fee_charged = 0;
-            if outcome == OperationOutcome::Open {
-                unpaid.status = native::OperationStatus::Failed;
-                result.result = stellar_xdr::TransactionResultResult::TxFailed(Default::default());
-            }
-            unpaid.result_xdr = native::xdr(&result).unwrap();
-            let receipt = Receipt(super::packet(NETWORK, &unpaid).unwrap());
-            for (payer, refused) in [(&sender, true), (&sponsor, false)] {
-                let reply = crate::test_support::fee_bump_reply(&unpaid, NETWORK, payer, 5_000);
-                let settled = Provider::from_rpc(NETWORK, Arc::new(Answers(reply)))
-                    .settle_receipt(&p, &signed, &receipt, None, 0);
-                if refused {
-                    assert_eq!(
-                        settled.unwrap_err().api_code.as_deref(),
-                        Some(FEE_BUMP_UNSUPPORTED)
-                    );
-                } else {
-                    assert_eq!(settled.unwrap().outcome, outcome);
-                }
-            }
-        }
     }
 
     /// A retained packet of the historical route `Odc` settles nothing: the refusal is typed.
@@ -4866,57 +4643,62 @@ mod settlement_api {
         assert_eq!(error.api_code.as_deref(), Some(RETIRED_ROUTE));
     }
 
-    /// A sending account that the server cannot give keeps its refusal for a vault operation, as
-    /// the server's valuation keeps it: the caller asks again, and no bound is given.
+    /// A sending account that the server cannot give keeps the server's refusal for a vault
+    /// operation, with its code and status: a pool whose accounts are all held, and a claim
+    /// store that did not answer, each a retryable 503. The caller asks again, and no bound is
+    /// given.
     #[test]
-    fn a_held_sending_account_refuses_a_vault_operation() {
-        struct Held;
-        impl SendingAccounts for Held {
+    fn a_refused_sending_account_refuses_a_vault_operation() {
+        struct Refused(&'static str);
+        impl SendingAccounts for Refused {
             fn account(&self) -> Result<String> {
                 Err(Error::refused(
                     503,
-                    "sending_unavailable",
-                    "Every sending account is busy",
+                    self.0,
+                    "No sending account can be given now",
                 ))
             }
             fn sign(&self, _: &str, _: &[u8; 32]) -> Result<Vec<u8>> {
                 Err(Error::unsupported("This sending account signs nothing"))
             }
         }
-        let held = Provider::from_rpc(NETWORK, Arc::new(Unreachable)).with_sender(Arc::new(Held));
         let vault = crate::test_support::vault(0);
-        for action in [
-            Action::Deposit {
-                vault: vault.clone(),
-                assets: 100,
-                min_shares: 1,
-            },
-            Action::Redeem {
-                vault: vault.clone(),
-                shares: 100,
-                min_assets: 1,
-            },
-        ] {
-            let error = held
-                .expense(&installation(), &action, &CEILING)
-                .unwrap_err();
-            assert_eq!(
-                (error.api_code.as_deref(), error.status),
-                (Some("sending_unavailable"), Some(503)),
-                "{action:?}"
-            );
+        for code in ["sending_unavailable", "sending_store_unavailable"] {
+            let refused = Provider::from_rpc(NETWORK, Arc::new(Unreachable))
+                .with_sender(Arc::new(Refused(code)));
+            for action in [
+                Action::Deposit {
+                    vault: vault.clone(),
+                    assets: 100,
+                    min_shares: 1,
+                },
+                Action::Redeem {
+                    vault: vault.clone(),
+                    shares: 100,
+                    min_assets: 1,
+                },
+            ] {
+                let error = refused
+                    .expense(&installation(), &action, &CEILING)
+                    .unwrap_err();
+                assert_eq!(
+                    (error.api_code.as_deref(), error.status),
+                    (Some(code), Some(503)),
+                    "{action:?}"
+                );
+            }
         }
     }
 
-    /// A sending account that the server fails to give for another reason, as a claim store
-    /// that fails, is a failed read: a deposit counts its whole assets and a redeem is the
+    /// A sending account that fails with no refusal of the server, as an error without a
+    /// status, is a failed read: a deposit counts its whole assets and a redeem is the
     /// valuation's refusal, as the server counts them.
     #[test]
     fn a_failing_sending_account_is_a_failed_read() {
         struct Failing;
         impl SendingAccounts for Failing {
             fn account(&self) -> Result<String> {
-                Err(Error::config("The claim store is unreadable"))
+                Err(Error::config("The sending account is unreadable"))
             }
             fn sign(&self, _: &str, _: &[u8; 32]) -> Result<Vec<u8>> {
                 Err(Error::unsupported("This sending account signs nothing"))
@@ -5048,7 +4830,8 @@ mod settlement_api {
             .unwrap();
         assert_eq!(settled.outcome, OperationOutcome::Executed);
         assert_eq!(settled.transaction, later.transaction_hash.to_vec());
-        // An earlier sequence, another sender and another operation are none of its envelopes.
+        // An earlier sequence, another sender, another memo and another operation are none of
+        // its envelopes.
         assert!(
             native::validate_retained_signed(&crate::test_support::policy_sealed_at(&signed, -1))
                 .is_err()
@@ -5098,7 +4881,19 @@ mod settlement_api {
             [11; 32],
         );
         assert!(native::validate_retained_signed(&other_sender).is_err());
-        let other_operation = resealed(&|tx| tx.memo = stellar_xdr::Memo::Id(7), [10; 32]);
+        let other_memo = resealed(&|tx| tx.memo = stellar_xdr::Memo::Id(7), [10; 32]);
+        assert!(native::validate_retained_signed(&other_memo).is_err());
+        // Another operation: the same invocation with a source account of its own.
+        let other_operation = resealed(
+            &|tx| {
+                let mut operations = tx.operations.to_vec();
+                assert_eq!(operations[0].source_account, None);
+                operations[0].source_account = Some(tx.source_account.clone());
+                tx.operations = operations.try_into().unwrap();
+            },
+            [10; 32],
+        );
+        assert_ne!(other_operation.transaction_hash, later.transaction_hash);
         assert!(native::validate_retained_signed(&other_operation).is_err());
     }
 

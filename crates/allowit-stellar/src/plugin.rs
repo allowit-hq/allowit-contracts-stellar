@@ -452,9 +452,12 @@ impl ServerHooks for Hooks {
         )
         .map_err(|_| Error::usage("The wallet sign-in signature is invalid"))
     }
-    /// The XLM fee in installed-asset units, rounded up: [`ServerHooks::price_fee`] of the
-    /// installed asset `config["asset"]`. As before `price_fee`, a listed token without a rate
-    /// under its contract id takes the rate of its ticker.
+    /// The XLM fee in units of the installed asset `config["asset"]`, rounded up, at the rate
+    /// that [`ServerHooks::price_fee`] finds for that asset: one lookup ([`asset_rate`]) serves
+    /// both hooks, so a listed token without a rate under its contract id takes the rate of its
+    /// ticker. The two hooks differ in their range: this one keeps the arithmetic that the
+    /// server's admission reads and refuses a fee whose product with the rate does not fit its
+    /// signed 128 bits, which `price_fee` can still price.
     fn charged_fee(&self, network: &str, config: &Value, receipt: &ReceiptInfo) -> Result<i128> {
         let asset = config
             .get("asset")
@@ -473,7 +476,8 @@ impl ServerHooks for Hooks {
             .ok_or_else(|| Error::config("The fee is out of range"))
     }
     /// The XLM fee of `native_units` in the wallet's asset `asset` (its contract id), rounded
-    /// up, at the rate of [`asset_rate`], as `charged_fee` finds it.
+    /// up, at the rate of [`asset_rate`], as `charged_fee` finds it. It refuses only a price
+    /// that its result cannot hold.
     fn price_fee(
         &self,
         network: &str,
