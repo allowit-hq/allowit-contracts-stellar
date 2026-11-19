@@ -2077,6 +2077,155 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         .map(|r| Ok(Receipt(packet(p.network(), &r)?)))
         .transpose()
     }
+    /// A step past its time bound can never be sent (`OWNER_TRANSACTION_EXPIRED`). A funding of
+    /// a contract wallet moves the owner's assets without calling the wallet, so the network
+    /// would accept it after the wallet lapsed: it is sent only while the wallet's instance and
+    /// the code that it runs are live (`CONTRACT_EXPIRED`). A read that fails is uncertain.
+    fn validate_owner_signed(&self, p: &OwnerSigned, now: u64) -> Result<()> {
+        self.network(p.network())?;
+        let data: OwnerSignedData = decode_packet(&p.0)?;
+        if now >= data.original.expires_at {
+            return Err(Error::coded(
+                OWNER_TRANSACTION_EXPIRED,
+                "The owner step passed its time bound: the network can no longer apply it.",
+            ));
+        }
+        if let Some(wallet) = funded_contract(&data.original)? {
+            self.contract_live(&data.original.network, &wallet)?;
+        }
+        Ok(())
+    }
+    /// Send the signed owner step once, after [`Self::validate_owner_signed`]. A step that the
+    /// network refused, but whose transaction it holds, was sent before.
+    fn broadcast_owner(&self, p: &OwnerSigned, now: u64) -> Result<Status> {
+        self.validate_owner_signed(p, now)?;
+        let data: OwnerSignedData = decode_packet(&p.0)?;
+        let network = &data.original.network;
+        let hash = &data.original.transaction_hash;
+        match checked(rpc::send_transaction(
+            self.rpc(),
+            network,
+            owner_payload(&data)?,
+        ))? {
+            rpc::Broadcast::Submitted => Ok(Status::Submitted),
+            rpc::Broadcast::RetryLater => Ok(Status::Prepared),
+            rpc::Broadcast::Unknown => Ok(Status::SubmissionUnknown),
+            rpc::Broadcast::Rejected { error_result_xdr } => {
+                match rpc::receipt_by_hash(self.rpc(), network, hash) {
+                    Ok(Some(_)) => Ok(Status::Submitted),
+                    Ok(None) => Err(Error::config(format!(
+                        "Stellar rejected transaction {}: {}",
+                        native::hex(hash),
+                        error_result_xdr.as_deref().unwrap_or("no result")
+                    ))),
+                    Err(_) => Ok(Status::SubmissionUnknown),
+                }
+            }
+        }
+    }
+    /// `Submitted` when the network holds the step's transaction; otherwise `SubmissionUnknown`:
+    /// a Stellar lookup does not tell a pending transaction from one that the network never
+    /// accepted.
+    fn owner_status(&self, p: &OwnerSigned) -> Result<Status> {
+        self.network(p.network())?;
+        let data: OwnerSignedData = decode_packet(&p.0)?;
+        Ok(
+            match checked(rpc::receipt_by_hash(
+                self.rpc(),
+                &data.original.network,
+                &data.original.transaction_hash,
+            ))? {
+                Some(_) => Status::Submitted,
+                None => Status::SubmissionUnknown,
+            },
+        )
+    }
+    /// The proof of [`Self::owner_lapsed`] for the signed step's own hash and time bound.
+    fn owner_step_lapsed(&self, p: &OwnerSigned, since: u64) -> Result<bool> {
+        self.network(p.network())?;
+        let data: OwnerSignedData = decode_packet(&p.0)?;
+        self.owner_lapsed(
+            &data.original.transaction_hash,
+            data.original.expires_at,
+            since,
+        )
+    }
+    /// A keypair wallet closes by merging its account away: it is closed when its account is
+    /// gone. A policy wallet never closes.
+    fn wallet_closed(&self, i: &Installation) -> Result<bool> {
+        let c = self.config(i)?;
+        if c.route != WalletRoute::Native {
+            return Ok(false);
+        }
+        Ok(checked(rpc::find_account(self.rpc(), &c.wallet))?.is_none())
+    }
+    /// A keypair wallet's close: every amount returns to the owner, every signer is removed and
+    /// the account merges into the owner's account. A policy wallet does not close.
+    fn prepare_close(&self, i: &Installation, fee: u64, now: u64) -> Result<OwnerPacket> {
+        if self.config(i)?.route != WalletRoute::Native {
+            return Err(Error::unsupported("A policy wallet does not close"));
+        }
+        self.prepare_owner(
+            i,
+            OwnerAction::Recover {
+                units: None,
+                recipient: None,
+            },
+            fee,
+            now,
+        )
+    }
+}
+/// The contract wallet that the owner step `t` funds: the one `transfer` of a funding, to a
+/// contract. `None` for another step, and for a funding of an account.
+fn funded_contract(t: &native::owner_intent::OwnerTransaction) -> Result<Option<String>> {
+    use stellar_xdr::{HostFunction, OperationBody, ScAddress, ScVal, TransactionEnvelope};
+    if t.action != "fund" {
+        return Ok(None);
+    }
+    let TransactionEnvelope::Tx(envelope) = checked(native::read(&t.transaction_xdr))? else {
+        return Ok(None);
+    };
+    let [operation] = envelope.tx.operations.as_slice() else {
+        return Ok(None);
+    };
+    let OperationBody::InvokeHostFunction(op) = &operation.body else {
+        return Ok(None);
+    };
+    let HostFunction::InvokeContract(call) = &op.host_function else {
+        return Ok(None);
+    };
+    if call.function_name.0.as_slice() != b"transfer" {
+        return Ok(None);
+    }
+    Ok(match call.args.get(1) {
+        Some(ScVal::Address(ScAddress::Contract(id))) => {
+            Some(stellar_strkey::Contract(id.0.0).to_string())
+        }
+        _ => None,
+    })
+}
+impl Provider {
+    /// Refuse a step on the contract wallet `wallet` whose instance, or the code that it runs,
+    /// lapsed (`CONTRACT_EXPIRED`). A read that fails is uncertain.
+    fn contract_live(&self, network: &str, wallet: &str) -> Result<()> {
+        let lapsed = |message: String| {
+            if message == rpc::CONTRACT_EXPIRED {
+                Error::coded(CONTRACT_EXPIRED, message)
+            } else {
+                Error::uncertain(message)
+            }
+        };
+        let running = rpc::instance_code(self.rpc(), network, wallet)
+            .map_err(lapsed)?
+            .ok_or_else(|| lapsed(rpc::CONTRACT_EXPIRED.into()))?;
+        match rpc::code_state(self.rpc(), network, &running).map_err(lapsed)? {
+            rpc::CodeState::Live => Ok(()),
+            rpc::CodeState::Lapsed | rpc::CodeState::Absent => {
+                Err(lapsed(rpc::CONTRACT_EXPIRED.into()))
+            }
+        }
+    }
 }
 
 pub fn prepared_metadata(p: &Packet) -> Result<PreparedMetadata> {
@@ -2359,6 +2508,15 @@ impl PacketProvider for Packets {
     }
     fn receipt_info(&self, p: &Packet) -> Result<ReceiptInfo> {
         receipt_info(p)
+    }
+    /// A signed owner step's identity: its 32-byte transaction hash.
+    fn owner_signed_info(&self, p: &Packet) -> Result<OwnerSignedInfo> {
+        let data: OwnerSignedData = decode_packet(p)?;
+        Ok(OwnerSignedInfo {
+            action: data.original.action,
+            identity: data.original.transaction_hash.to_vec(),
+            expires_at: data.original.expires_at,
+        })
     }
 }
 
@@ -3677,6 +3835,34 @@ mod keypair_wallet_owner_tests {
         }
     }
 
+    /// A keypair wallet closes by its close step, which merges its account away, and it is
+    /// closed when its account is gone.
+    #[test]
+    fn a_keypair_wallet_closes_and_reads_closed_once_its_account_is_gone() {
+        let (c, _, provider, installation) = fixture();
+        let close = provider
+            .prepare_close(&installation, 100_000, 86_401)
+            .unwrap();
+        assert_eq!(close.info().unwrap().action, "close");
+        assert!(!provider.wallet_closed(&installation).unwrap());
+        struct Gone;
+        impl rpc::Rpc for Gone {
+            fn call(
+                &self,
+                method: &str,
+                _: serde_json::Value,
+            ) -> native::Result<serde_json::Value> {
+                match method {
+                    "getLedgerEntries" => {
+                        Ok(serde_json::json!({"latestLedger": 120, "entries": []}))
+                    }
+                    _ => Err(format!("Unexpected call {method}")),
+                }
+            }
+        }
+        let gone = Provider::from_rpc(&c.network, Arc::new(Gone));
+        assert!(gone.wallet_closed(&installation).unwrap());
+    }
     #[test]
     fn the_server_prepares_each_owner_action_of_a_keypair_wallet_for_one_owner_signature() {
         let (c, ledger, provider, installation) = fixture();
@@ -4397,5 +4583,334 @@ mod settlement_api {
             min_assets: 1,
         };
         assert!(provider().expense(&i, &redeem, &CEILING).is_err());
+    }
+}
+
+/// Owner steps that the caller sends itself: the checks before a send, one send, a lookup with no
+/// final status, the step's identity and its lapse, and a keypair wallet's close.
+#[cfg(test)]
+mod owner_steps {
+    use super::*;
+    use crate::host::vendors::RuntimeProvider;
+    use std::sync::{Arc, Mutex};
+    use stellar_xdr as x;
+    const NETWORK: &str = "stellar:testnet";
+    const NOW: u64 = 1_800_000_000;
+    const CODE: &[u8] = b"policy wallet code";
+
+    /// What the endpoint answers: the lifetimes of the wallet's instance and code (`None`: no
+    /// entry), the reply status of a send (`None`: the call fails), whether it holds the step's
+    /// transaction, and whether its reads fail.
+    struct Steps {
+        instance_until: Option<u32>,
+        code_until: Option<u32>,
+        send: Option<&'static str>,
+        holds: bool,
+        reads_fail: bool,
+        calls: Mutex<Vec<String>>,
+        wallet: String,
+        receipt: serde_json::Value,
+    }
+    impl Steps {
+        fn new(wallet: &str) -> Self {
+            Self {
+                instance_until: Some(500),
+                code_until: Some(500),
+                send: Some("PENDING"),
+                holds: false,
+                reads_fail: false,
+                calls: Mutex::new(Vec::new()),
+                wallet: wallet.into(),
+                receipt: serde_json::Value::Null,
+            }
+        }
+        fn sent(&self) -> bool {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| m == "sendTransaction")
+        }
+    }
+    impl rpc::Rpc for Steps {
+        fn call(
+            &self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> native::Result<serde_json::Value> {
+            self.calls.lock().unwrap().push(method.into());
+            if self.reads_fail && method != "sendTransaction" {
+                return Err(format!("{method}: the endpoint is unreachable"));
+            }
+            Ok(match method {
+                "getNetwork" => serde_json::json!({"passphrase": native::passphrase(NETWORK)?}),
+                "getLatestLedger" => serde_json::json!({"sequence": 120}),
+                "getLedgerEntries" => {
+                    let key: x::LedgerKey = native::read(params["keys"][0].as_str().unwrap())?;
+                    let (data, until) = match &key {
+                        x::LedgerKey::ContractData(_) => (
+                            x::LedgerEntryData::ContractData(x::ContractDataEntry {
+                                ext: x::ExtensionPoint::V0,
+                                contract: native::address(&self.wallet)?,
+                                key: x::ScVal::LedgerKeyContractInstance,
+                                durability: x::ContractDataDurability::Persistent,
+                                val: x::ScVal::ContractInstance(x::ScContractInstance {
+                                    executable: x::ContractExecutable::Wasm(x::Hash(native::hash(
+                                        CODE,
+                                    ))),
+                                    storage: None,
+                                }),
+                            }),
+                            self.instance_until,
+                        ),
+                        x::LedgerKey::ContractCode(_) => (
+                            x::LedgerEntryData::ContractCode(x::ContractCodeEntry {
+                                ext: x::ContractCodeEntryExt::V0,
+                                hash: x::Hash(native::hash(CODE)),
+                                code: CODE.to_vec().try_into().unwrap(),
+                            }),
+                            self.code_until,
+                        ),
+                        _ => return Err("Unexpected ledger key".into()),
+                    };
+                    let entries = until.map(|until| {
+                        serde_json::json!({"key": params["keys"][0], "xdr": native::xdr(&data).unwrap(), "liveUntilLedgerSeq": until})
+                    });
+                    serde_json::json!({"latestLedger": 120, "entries": entries.into_iter().collect::<Vec<_>>()})
+                }
+                "sendTransaction" => {
+                    let hash = native::hex(&rpc::signed_transaction_hash(
+                        NETWORK,
+                        params["transaction"].as_str().unwrap(),
+                    )?);
+                    match self.send {
+                        Some(status) => serde_json::json!({"hash": hash, "status": status}),
+                        None => return Err("sendTransaction: the endpoint is unreachable".into()),
+                    }
+                }
+                "getTransaction" if self.holds => self.receipt.clone(),
+                "getTransaction" => serde_json::json!({"status": "NOT_FOUND",
+                    "oldestLedger": 10, "latestLedger": 120,
+                    "latestLedgerCloseTime": (NOW + 1_000).to_string()}),
+                _ => return Err(format!("Unexpected call {method}")),
+            })
+        }
+    }
+    /// `original` as the account of `seed` signed it.
+    fn signed(original: native::owner_intent::OwnerTransaction, seed: [u8; 32]) -> OwnerSigned {
+        let x::TransactionEnvelope::Tx(mut envelope) =
+            native::read(&original.transaction_xdr).unwrap()
+        else {
+            unreachable!()
+        };
+        let signature = native::signing::LocalSigner::from_entropy(&seed)
+            .unwrap()
+            .sign_digest(&original.transaction_hash)
+            .unwrap();
+        let key = native::account_key(&native::account_for_seed(&seed)).unwrap();
+        envelope.signatures = vec![x::DecoratedSignature {
+            hint: x::SignatureHint(key[28..].try_into().unwrap()),
+            signature: x::Signature(signature.try_into().unwrap()),
+        }]
+        .try_into()
+        .unwrap();
+        let payload = native::xdr(&x::TransactionEnvelope::Tx(envelope)).unwrap();
+        let network = original.network.clone();
+        OwnerSigned(
+            Packet::new(
+                &network,
+                &OwnerSignedData {
+                    original,
+                    signed_payload: payload.into_bytes(),
+                },
+                &PACKETS,
+            )
+            .unwrap(),
+        )
+    }
+    /// A funding of the policy wallet of `c`, signed by its owner, valid until `NOW + 300`.
+    fn funding(c: &WalletConfig) -> OwnerSigned {
+        let step = crate::test_support::owner::fund_step(c, 10, NOW);
+        signed(
+            native::owner_intent::OwnerTransaction {
+                network: NETWORK.into(),
+                action: "fund".into(),
+                transaction_xdr: step["payload"].as_str().unwrap().into(),
+                transaction_hash: native::unhex(step["transactionHash"].as_str().unwrap()).unwrap(),
+                expires_at: step["expiresAt"].as_u64().unwrap(),
+            },
+            [1; 32],
+        )
+    }
+    fn policy_wallet() -> WalletConfig {
+        crate::test_support::request_config(WalletRoute::PolicyWallet, false)
+    }
+    fn provider(steps: &Arc<Steps>) -> Provider {
+        Provider::from_rpc(NETWORK, steps.clone())
+    }
+    /// The receipt of the step `p`, as the endpoint holds it.
+    fn confirmed(p: &OwnerSigned) -> serde_json::Value {
+        let data: OwnerSignedData = decode_packet(&p.0).unwrap();
+        let result = x::TransactionResult {
+            fee_charged: 100,
+            result: x::TransactionResultResult::TxSuccess(Default::default()),
+            ext: x::TransactionResultExt::V0,
+        };
+        serde_json::json!({"status": "SUCCESS", "txHash": native::hex(&data.original.transaction_hash),
+            "ledger": 110, "envelopeXdr": String::from_utf8(data.signed_payload).unwrap(),
+            "resultXdr": native::xdr(&result).unwrap()})
+    }
+
+    /// A step past its time bound can never be sent: the refusal is typed, and nothing is sent.
+    #[test]
+    fn a_step_past_its_time_bound_is_refused_and_not_sent() {
+        let c = policy_wallet();
+        let step = funding(&c);
+        let steps = Arc::new(Steps::new(&c.wallet));
+        let late = step.info().unwrap().expires_at;
+        for result in [
+            provider(&steps).validate_owner_signed(&step, late),
+            provider(&steps).broadcast_owner(&step, late).map(drop),
+        ] {
+            assert_eq!(
+                result.unwrap_err().api_code.as_deref(),
+                Some(OWNER_TRANSACTION_EXPIRED)
+            );
+        }
+        assert!(!steps.sent());
+        provider(&steps)
+            .validate_owner_signed(&step, late - 1)
+            .unwrap();
+    }
+
+    /// A funding of a contract wallet whose instance or code lapsed is refused with
+    /// `CONTRACT_EXPIRED`, and nothing is sent; a read that fails is uncertain.
+    #[test]
+    fn a_funding_of_a_lapsed_contract_wallet_is_refused_and_not_sent() {
+        let c = policy_wallet();
+        let step = funding(&c);
+        for (instance, code) in [
+            (Some(100), Some(500)),
+            (Some(500), Some(100)),
+            (None, Some(500)),
+        ] {
+            let steps = Arc::new(Steps {
+                instance_until: instance,
+                code_until: code,
+                ..Steps::new(&c.wallet)
+            });
+            let error = provider(&steps).broadcast_owner(&step, NOW).unwrap_err();
+            assert_eq!(
+                error.api_code.as_deref(),
+                Some(CONTRACT_EXPIRED),
+                "{instance:?} {code:?}"
+            );
+            assert!(!steps.sent());
+        }
+        let unreadable = Arc::new(Steps {
+            reads_fail: true,
+            ..Steps::new(&c.wallet)
+        });
+        let error = provider(&unreadable)
+            .validate_owner_signed(&step, NOW)
+            .unwrap_err();
+        assert_eq!(
+            (error.code, error.api_code),
+            (Error::uncertain("").code, None)
+        );
+        assert!(!unreadable.sent());
+    }
+
+    /// A step is sent once and answers no final status: accepted, not accepted yet, unknown; a
+    /// refused send is an error unless the network holds the step's transaction.
+    #[test]
+    fn a_step_is_sent_once_with_no_final_status() {
+        let c = policy_wallet();
+        let step = funding(&c);
+        for (send, holds, expected) in [
+            (Some("PENDING"), false, Some(Status::Submitted)),
+            (Some("DUPLICATE"), false, Some(Status::Submitted)),
+            (Some("TRY_AGAIN_LATER"), false, Some(Status::Prepared)),
+            (None, false, Some(Status::SubmissionUnknown)),
+            (Some("ERROR"), false, None),
+            (Some("ERROR"), true, Some(Status::Submitted)),
+        ] {
+            let steps = Arc::new(Steps {
+                send,
+                holds,
+                receipt: confirmed(&step),
+                ..Steps::new(&c.wallet)
+            });
+            let sent = provider(&steps).broadcast_owner(&step, NOW);
+            assert_eq!(sent.as_ref().ok(), expected.as_ref(), "{send:?} {holds}");
+            let sends = steps
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| *m == "sendTransaction")
+                .count();
+            assert_eq!(sends, 1);
+        }
+    }
+
+    /// A lookup answers `Submitted` when the network holds the step's transaction, and
+    /// `SubmissionUnknown` otherwise; the receipt itself is `observe_owner`'s.
+    #[test]
+    fn a_step_is_looked_up_with_no_final_status() {
+        let c = policy_wallet();
+        let step = funding(&c);
+        let held = Arc::new(Steps {
+            holds: true,
+            receipt: confirmed(&step),
+            ..Steps::new(&c.wallet)
+        });
+        assert_eq!(
+            provider(&held).owner_status(&step).unwrap(),
+            Status::Submitted
+        );
+        assert!(provider(&held).observe_owner(&step).unwrap().is_some());
+        let unknown = Arc::new(Steps::new(&c.wallet));
+        assert_eq!(
+            provider(&unknown).owner_status(&step).unwrap(),
+            Status::SubmissionUnknown
+        );
+    }
+
+    /// A signed step's identity is its transaction hash, and its lapse is proven by that hash
+    /// and its time bound.
+    #[test]
+    fn a_signed_step_names_its_hash_and_its_lapse() {
+        let c = policy_wallet();
+        let step = funding(&c);
+        let data: OwnerSignedData = decode_packet(&step.0).unwrap();
+        let info = step.info().unwrap();
+        assert_eq!(
+            (info.action.as_str(), info.identity, info.expires_at),
+            (
+                "fund",
+                data.original.transaction_hash.to_vec(),
+                data.original.expires_at
+            )
+        );
+        // The searched history holds ledger 20, and a ledger closed after the time bound.
+        let steps = Arc::new(Steps::new(&c.wallet));
+        assert!(provider(&steps).owner_step_lapsed(&step, 20).unwrap());
+        // A step prepared before the history that the endpoint keeps is not proven lapsed.
+        assert!(!provider(&steps).owner_step_lapsed(&step, 5).unwrap());
+    }
+
+    /// A policy wallet never closes: it is not closed, and its close is refused before any read.
+    #[test]
+    fn a_policy_wallet_never_closes() {
+        let c = policy_wallet();
+        let steps = Arc::new(Steps::new(&c.wallet));
+        let configuration =
+            super::super::server_owner::configuration(NETWORK, &serde_json::to_vec(&c).unwrap())
+                .unwrap();
+        let i = super::installation(&configuration);
+        assert!(!provider(&steps).wallet_closed(&i).unwrap());
+        assert!(provider(&steps).prepare_close(&i, 100_000, NOW).is_err());
+        assert!(steps.calls.lock().unwrap().is_empty());
     }
 }
