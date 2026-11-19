@@ -400,7 +400,7 @@ pub fn current_ledger(rpc: &dyn rpc::Rpc, p: &PreparedOperation) -> Result<()> {
 pub fn revalidate(rpc: &dyn rpc::Rpc, p: &PreparedOperation, now: u64) -> Result<()> {
     admit(p, now)?;
     current_ledger(rpc, p)?;
-    let current = rpc::get_account(rpc, &p.config.wallet)?;
+    let current = rpc::get_wallet_account(rpc, &p.config.wallet)?;
     current.validate_roles(&p.config.owner, &p.config.agent, &p.config.server)?;
     if current != p.state.source {
         return Err("The wallet changed since this payment authorization was prepared".into());

@@ -242,7 +242,7 @@ pub fn verify(rpc: &dyn rpc::Rpc, policy_id: &str, c: &WalletConfig) -> Result<V
     if c.route == WalletRoute::Native {
         // A keypair account holds no policy: the ledger shows the signers, and the server
         // records the usage.
-        let account = checked(rpc::get_account(rpc, &c.wallet))?;
+        let account = checked(rpc::get_wallet_account(rpc, &c.wallet))?;
         let roles = account.validate_roles(&c.owner, &c.agent, &c.server);
         let comparisons = vec![
             Comparison::new("wallet", json!(c.wallet), json!(account.address)),

@@ -292,7 +292,7 @@ fn revalidate_with_rpc_url(
         if p.payment_authorization.is_some() {
             checked(sdk::seller_settled::current_ledger(&rpc, p))?;
         }
-        let current = checked(sdk::rpc::get_account(&rpc, &p.config.wallet))?;
+        let current = checked(sdk::rpc::get_wallet_account(&rpc, &p.config.wallet))?;
         verify_native_members(&current, &p.config)?;
         if current != p.state.source {
             return Err(Error::uncertain(
@@ -493,10 +493,26 @@ struct RefusalDetails {
     error: Option<String>,
     contract_error: Option<u32>,
 }
+/// The details of a denial that a host may show: the rule and the error as plain identifiers, and
+/// the contract error number. Anything else in the engine's details stays out.
+fn shown_details(details: &RefusalDetails) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    if let Some(rule) = details.rule.as_deref().filter(|v| identifier(v).is_some()) {
+        out.insert("rule".into(), rule.into());
+    }
+    if let Some(error) = details.error.as_deref().filter(|v| identifier(v).is_some()) {
+        out.insert("error".into(), error.into());
+    }
+    if let Some(code) = details.contract_error {
+        out.insert("contractError".into(), code.into());
+    }
+    out.into()
+}
 /// The client error for a non-2xx engine reply. A 409 `policy_denied` names the denying rule
 /// and error and uses the policy-denial exit code. A 409 `wallet_rejected` is a contract
 /// rejection: the wallet, its asset or a vault refused the operation, and it names the contract
-/// error. A 409 `operation_refused` is the engine's refusal with the engine's message. Every
+/// error. Both keep their typed code and the checked details, so a host shows the error
+/// catalogue's text and the rule. A 409 `operation_refused` is the engine's refusal with the engine's message. Every
 /// other reply leaves the operation unresolved: its message keeps the engine's message, and the
 /// error keeps the engine's stable code when the reply has one.
 fn refusal(status: u16, body: &[u8]) -> Error {
@@ -527,15 +543,18 @@ fn refusal(status: u16, body: &[u8]) -> Error {
                 (None, None, Some(code)) => format!("contract error {code}"),
                 (None, None, None) => "no rule named".into(),
             };
-            let mut error = Error::api(
+            let mut error = Error::refused(
                 status,
+                code.as_str(),
                 format!("The policy denied this operation: {reason}"),
-            );
+            )
+            .with_details(shown_details(&d));
             error.code = POLICY_DENIED;
             error
         }
-        "wallet_rejected" if status == 409 => Error::api(
+        "wallet_rejected" if status == 409 => Error::refused(
             status,
+            code.as_str(),
             match (name(&d.error), d.contract_error) {
                 (Some(error), Some(code)) => format!(
                     "The operation was rejected in simulation: {error} (contract error {code})"
@@ -545,7 +564,8 @@ fn refusal(status: u16, body: &[u8]) -> Error {
                 }
                 (_, None) => "The operation was rejected in simulation".into(),
             },
-        ),
+        )
+        .with_details(shown_details(&d)),
         OPERATION_REFUSED if status == 409 => Error::refused(
             status,
             code,
@@ -1956,7 +1976,7 @@ impl Bundle {
             .ok_or_else(||Error::config("Native import requires the exact administrator source approval. Export this active policy from the owner workspace."))?;
         let message = self.source_approval_message(proof.revision)?;
         let digest = sdk::signing::signed_message_digest(&message);
-        let live = checked(sdk::rpc::get_account(rpc, &c.wallet))?;
+        let live = checked(sdk::rpc::get_wallet_account(rpc, &c.wallet))?;
         verify_native_members(&live, c)?;
         checked(live.validate_authority_signatures(&digest, &proof.signatures))
     }
@@ -2882,7 +2902,7 @@ mod native_revalidation_tests {
                     json!({"code":"policy_denied","details":{"rule":"payment_limit"}}),
                 ),
                 20,
-                None,
+                Some("policy_denied"),
             ),
             // A stable code that this client does not interpret stays a refusal with that code.
             (
@@ -2937,6 +2957,37 @@ mod native_revalidation_tests {
         )));
         assert!(!unresolved(&refusal(409, br#"{"code":"policy_denied"}"#)));
         assert!(!unresolved(&refusal(409, br#"{"code":"wallet_rejected"}"#)));
+    }
+    #[test]
+    fn a_denial_keeps_its_typed_code_and_only_checked_details() {
+        let denied = refusal(
+            409,
+            br#"{"code":"policy_denied","error":"denied","details":{"rule":"payment_limit","error":"PaymentLimitExceeded","contractError":null,"secret":"x"}}"#,
+        );
+        assert_eq!(
+            (denied.code, denied.status, denied.api_code.as_deref()),
+            (POLICY_DENIED, Some(409), Some("policy_denied"))
+        );
+        assert_eq!(denied.detail("rule"), Some("payment_limit"));
+        assert_eq!(
+            denied.details,
+            Some(json!({"rule":"payment_limit","error":"PaymentLimitExceeded"}))
+        );
+        // A hostile rule name is not an identifier, so it stays out of the details.
+        let hostile = refusal(
+            409,
+            br#"{"code":"policy_denied","details":{"rule":"payment_limit\u001b[2J","contractError":18}}"#,
+        );
+        assert_eq!(hostile.details, Some(json!({"contractError":18})));
+        let rejected = refusal(
+            409,
+            br#"{"code":"wallet_rejected","details":{"error":"BalanceTooLow","contractError":10}}"#,
+        );
+        assert_eq!(rejected.api_code.as_deref(), Some("wallet_rejected"));
+        assert_eq!(
+            rejected.details,
+            Some(json!({"error":"BalanceTooLow","contractError":10}))
+        );
     }
     #[test]
     fn typed_conflicts_are_read_again_and_a_typed_refusal_keeps_the_engine_message() {

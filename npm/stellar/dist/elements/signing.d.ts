@@ -1,4 +1,13 @@
 import { type Data } from './base.js';
+type Failure = {
+    code: string;
+    message: string;
+};
+/**
+ * The failure that the element reports: the error's own code when the catalogue has an entry for it, such as a code of
+ * this element, or else `fallback`, a catalogue code of the step. A wallet library's own code never reaches a host.
+ */
+export declare const failure: (error: unknown, fallback: "wallet_unavailable" | "wallet_signing_failed") => Failure;
 /** The owner step that the server prepared. `payload` is a base64 transaction envelope; `hash` is its transaction hash. */
 export interface OwnerStep {
     action: string;
@@ -15,6 +24,12 @@ export declare function payloadHash(payload: string, network: string): Promise<s
  * signature by `owner` over that hash.
  */
 export declare function signedPayloadValid(signed: string, network: string, hash: string, owner: string): Promise<boolean>;
+/**
+ * Why the wallet's signed envelope is not the reviewed step signed by `owner`, or null when it is: `other_transaction`
+ * when it is another transaction, or none that can be read; `no_owner_signature` when the owner's signature over the
+ * reviewed hash is missing.
+ */
+export declare function signedPayloadProblem(signed: string, network: string, hash: string, owner: string): Promise<'other_transaction' | 'no_owner_signature' | null>;
 /** CAIP-122 sign-in text: the first line names this site, the second line is the signing account. */
 export declare function signInMessageFor(message: string, address: string, host: string): boolean;
 export declare function walletSignInElement(): {
@@ -1470,3 +1485,4 @@ export declare function bindingReviewElement(): {
         data: Data | undefined;
     };
 };
+export {};

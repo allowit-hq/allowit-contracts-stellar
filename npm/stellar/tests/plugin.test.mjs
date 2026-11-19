@@ -3,7 +3,7 @@ import test from 'node:test';
 import {Account, Keypair, Networks, Operation, TransactionBuilder} from '@stellar/stellar-sdk/base';
 import plugin, {canonicalNetwork, strkey} from '../dist/plugin.js';
 import {formatUnits} from '../dist/elements/display.js';
-import {ownerStep, payloadHash, signInMessageFor, signedPayloadValid} from '../dist/elements/signing.js';
+import {failure, ownerStep, payloadHash, signInMessageFor, signedPayloadProblem, signedPayloadValid} from '../dist/elements/signing.js';
 import {expiry} from '../dist/elements/base.js';
 
 test('plugin identity, networks and element tags follow the SDK contract', () => {
@@ -76,7 +76,22 @@ test('owner steps admit only the rail-neutral shape and sign only the reviewed h
   const foreign = TransactionBuilder.fromXDR(step.payload, Networks.TESTNET);
   foreign.sign(stranger);
   assert.equal(await signedPayloadValid(foreign.toXDR(), 'stellar:testnet', step.hash, owner), false, 'another signer');
+  // One recovery for each problem: another transaction is signed again as shown; a missing owner signature needs the
+  // owner account.
+  assert.equal(await signedPayloadProblem(other.toXDR(), 'stellar:testnet', step.hash, owner), 'other_transaction');
+  assert.equal(await signedPayloadProblem('not a transaction', 'stellar:testnet', step.hash, owner), 'other_transaction');
+  assert.equal(await signedPayloadProblem(foreign.toXDR(), 'stellar:testnet', step.hash, owner), 'no_owner_signature');
+  assert.equal(await signedPayloadProblem(tx.toXDR(), 'stellar:testnet', step.hash, owner), null);
   assert.equal(ownerStep({...step, payload: '<xml/>'}), null);
+});
+
+test('a failure of a signing element names a catalogue code, never a code of the wallet library', () => {
+  // The element's own codes pass; a wallet library's code, or none, falls back to the step's catalogue code.
+  assert.equal(failure(Object.assign(new Error('x'), {code: 'wallet_wrong_account'}), 'wallet_signing_failed').code, 'wallet_wrong_account');
+  assert.equal(failure(Object.assign(new Error('x'), {code: -4}), 'wallet_signing_failed').code, 'wallet_signing_failed');
+  assert.equal(failure(Object.assign(new Error('x'), {code: 'USER_DECLINED'}), 'wallet_unavailable').code, 'wallet_unavailable');
+  assert.equal(failure('plain text', 'wallet_signing_failed').code, 'wallet_signing_failed');
+  assert.equal(failure(null, 'wallet_unavailable').message, 'null');
 });
 
 test('sign-in signs only a CAIP-122 message for this site and account', () => {

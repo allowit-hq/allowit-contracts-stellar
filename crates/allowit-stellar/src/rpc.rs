@@ -117,10 +117,24 @@ pub fn find_account(rpc: &dyn Rpc, address: &str) -> Result<Option<AccountState>
         )?))),
     });
     let value = rpc.call("getLedgerEntries", json!({"keys":[xdr(&key)?]}))?;
-    if value["entries"].as_array().is_some_and(Vec::is_empty) {
+    if account_entry(&value)?.is_none() {
         return Ok(None);
     }
     account_from_response(&value, address).map(Some)
+}
+/// The one entry of a `getLedgerEntries` reply for one account key. A reply with its ledger and
+/// an empty or omitted entry list holds no account; more than one entry for one key, or a reply
+/// without its ledger or its list, is an invalid reply.
+fn account_entry(value: &Value) -> Result<Option<&Value>> {
+    match value.get("entries") {
+        Some(Value::Array(list)) => match list.as_slice() {
+            [] => Ok(None),
+            [one] => Ok(Some(one)),
+            _ => Err("Invalid account response: more than one entry for one key".into()),
+        },
+        None | Some(Value::Null) if value.get("latestLedger").is_some() => Ok(None),
+        _ => Err("Missing account entries".into()),
+    }
 }
 /// The XLM of an account as the ledger holds it, in stroops, with what the network locks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,6 +160,44 @@ impl NativeBalance {
             .max(0)
     }
 }
+/// The ledger holds no account for an address: it never received funds, or it was merged away.
+/// The client-visible code is `account_not_found`.
+pub const ACCOUNT_NOT_FOUND: &str = "Native account not found";
+/// The ledger holds no account for the server's own sending account, which pays the fee of a
+/// policy wallet's operation. It is a fault of the server's configuration, not of the owner's
+/// accounts: the client-visible code is `service_not_configured`.
+pub const SENDING_ACCOUNT_NOT_FOUND: &str =
+    "The server's sending account does not exist on the network";
+/// The ledger holds no account for the owner address: it never received funds. The
+/// client-visible code is `owner_account_unfunded`.
+pub const OWNER_ACCOUNT_NOT_FOUND: &str = "The owner account does not exist on the network";
+/// The ledger holds no account for the wallet of a policy: it was merged away. The
+/// client-visible code is `wallet_closed`.
+pub const WALLET_ACCOUNT_NOT_FOUND: &str = "The wallet account does not exist on the network";
+/// `get_account` of an account whose role is known: a missing account gets the message of that
+/// role, so that each role keeps its own recovery.
+fn get_role_account(rpc: &dyn Rpc, address: &str, missing: &str) -> Result<AccountState> {
+    get_account(rpc, address).map_err(|error| {
+        if error == ACCOUNT_NOT_FOUND {
+            missing.into()
+        } else {
+            error
+        }
+    })
+}
+/// The server's own sending account. A missing one is [`SENDING_ACCOUNT_NOT_FOUND`].
+pub fn get_sending_account(rpc: &dyn Rpc, address: &str) -> Result<AccountState> {
+    get_role_account(rpc, address, SENDING_ACCOUNT_NOT_FOUND)
+}
+/// The owner's account. A missing one is [`OWNER_ACCOUNT_NOT_FOUND`].
+pub fn get_owner_account(rpc: &dyn Rpc, address: &str) -> Result<AccountState> {
+    get_role_account(rpc, address, OWNER_ACCOUNT_NOT_FOUND)
+}
+/// An account of a policy wallet: the Native wallet account, or the agent account of a contract
+/// wallet. A missing one is [`WALLET_ACCOUNT_NOT_FOUND`].
+pub fn get_wallet_account(rpc: &dyn Rpc, address: &str) -> Result<AccountState> {
+    get_role_account(rpc, address, WALLET_ACCOUNT_NOT_FOUND)
+}
 /// Read the XLM of an account and the entries that lock its reserve.
 pub fn native_balance(rpc: &dyn Rpc, address: &str) -> Result<NativeBalance> {
     let key = LedgerKey::Account(LedgerKeyAccount {
@@ -154,14 +206,9 @@ pub fn native_balance(rpc: &dyn Rpc, address: &str) -> Result<NativeBalance> {
         )?))),
     });
     let value = rpc.call("getLedgerEntries", json!({"keys":[xdr(&key)?]}))?;
-    let entries = value["entries"]
-        .as_array()
-        .ok_or("Missing account entries")?;
-    if entries.len() != 1 {
-        return Err("Native account not found".into());
-    }
+    let entry = account_entry(&value)?.ok_or(ACCOUNT_NOT_FOUND)?;
     let LedgerEntryData::Account(account) =
-        read(entries[0]["xdr"].as_str().ok_or("Missing account XDR")?)?
+        read(entry["xdr"].as_str().ok_or("Missing account XDR")?)?
     else {
         return Err("Wrong ledger entry type".into());
     };
@@ -276,13 +323,8 @@ pub(crate) fn read_account_observation(rpc: &dyn Rpc, address: &str) -> Result<A
     Ok(AccountObservation { account, ledger })
 }
 fn account_from_response(value: &Value, address: &str) -> Result<AccountState> {
-    let entries = value["entries"]
-        .as_array()
-        .ok_or("Missing account entries")?;
-    if entries.len() != 1 {
-        return Err("Native account not found".into());
-    }
-    let raw = entries[0]["xdr"].as_str().ok_or("Missing account XDR")?;
+    let entry = account_entry(value)?.ok_or(ACCOUNT_NOT_FOUND)?;
+    let raw = entry["xdr"].as_str().ok_or("Missing account XDR")?;
     let LedgerEntryData::Account(account) = read(raw)? else {
         return Err("Wrong ledger entry type".into());
     };
@@ -356,7 +398,7 @@ pub fn prepare_with(
     }
     // The server's sending account is the source and pays the fee; the wallet repays its gas
     // to that same account.
-    state.source = get_account(rpc, &super::gas_payee(request, terms)?)?;
+    state.source = get_sending_account(rpc, &super::gas_payee(request, terms)?)?;
     let ceiling = terms.expense.as_ref();
     let mut terms = priced_terms(rpc, c, request, terms, &state, now, expires_at)?;
     // The invocation that carries the priced expense is simulated on its own. A policy that
@@ -785,7 +827,7 @@ pub fn revalidate_prepared(
         calls: p.state.calls,
     });
     let mut current = trusted_state(rpc, &p.config, accounting)?;
-    current.source = get_account(rpc, &crate::gas_payee(&p.request, &p.terms)?)?;
+    current.source = get_sending_account(rpc, &crate::gas_payee(&p.request, &p.terms)?)?;
     // Observation ledgers can advance without changing the transaction's authority or state.
     current.ledger = p.state.ledger;
     if current != p.state {
@@ -1733,7 +1775,7 @@ fn trusted_state_inner(
     )
     .map_err(err)?;
     if c.route == WalletRoute::Native {
-        let source = get_account(rpc, &c.wallet)?;
+        let source = get_wallet_account(rpc, &c.wallet)?;
         // The wallet account holds exactly the roles of its installation. A signer or a
         // threshold that the installation does not name ends every use of the wallet.
         let paused =
@@ -2021,7 +2063,7 @@ fn historical_wallet_state(
         return Err("policy wallet automation is paused".into());
     }
     let current_agent = addr(map_field(state, "agent")?)?;
-    let source = get_account(rpc, &current_agent)?;
+    let source = get_wallet_account(rpc, &current_agent)?;
     source.validate_structure()?;
     if require_customer_quorum && source.signer_weight(&c.agent)? == 0 {
         return Err("Customer is not a current policy wallet agent account signer".into());
@@ -2364,6 +2406,54 @@ mod custom_state_tests {
                 .collect();
             Ok(json!({"entries": entries}))
         }
+    }
+
+    /// An RPC that answers every call with one reply.
+    struct Fixed(Value);
+    impl Rpc for Fixed {
+        fn call(&self, _: &str, _: Value) -> Result<Value> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn an_account_reply_without_an_entry_is_a_missing_account_and_two_entries_are_invalid() {
+        let owner = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
+        for absent in [
+            json!({"latestLedger": 10, "entries": []}),
+            json!({"latestLedger": 10}),
+            json!({"latestLedger": 10, "entries": null}),
+        ] {
+            let rpc = Fixed(absent.clone());
+            assert_eq!(
+                get_account(&rpc, &owner).unwrap_err(),
+                ACCOUNT_NOT_FOUND,
+                "{absent}"
+            );
+            assert_eq!(
+                native_balance(&rpc, &owner).unwrap_err(),
+                ACCOUNT_NOT_FOUND,
+                "{absent}"
+            );
+            assert!(find_account(&rpc, &owner).unwrap().is_none(), "{absent}");
+            // The server's own sending account names its own fault.
+            assert_eq!(
+                get_sending_account(&rpc, &owner).unwrap_err(),
+                SENDING_ACCOUNT_NOT_FOUND
+            );
+        }
+        let two = Fixed(json!({"latestLedger": 10, "entries": [{"xdr": "AA"}, {"xdr": "AA"}]}));
+        for error in [
+            get_account(&two, &owner).unwrap_err(),
+            native_balance(&two, &owner).unwrap_err(),
+            find_account(&two, &owner).unwrap_err(),
+        ] {
+            assert_ne!(error, ACCOUNT_NOT_FOUND);
+            assert!(error.contains("more than one entry"), "{error}");
+        }
+        // A reply that is no ledger reply at all is not read as a missing account.
+        let broken = Fixed(json!({"error": "x"}));
+        assert_ne!(get_account(&broken, &owner).unwrap_err(), ACCOUNT_NOT_FOUND);
     }
 
     #[test]

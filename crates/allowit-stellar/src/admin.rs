@@ -320,7 +320,7 @@ impl OwnerAdmin<'_> {
         }
         account_key(&header.owner)
             .map_err(|_| "Contract owners require a separate native authorization adapter")?;
-        let owner = rpc::get_account(self.rpc, &header.owner)?;
+        let owner = rpc::get_owner_account(self.rpc, &header.owner)?;
         owner.validate_owner_only()?;
         let state = if reach == Reach::Kept {
             None
@@ -730,7 +730,7 @@ impl OwnerAdmin<'_> {
         let mut authorizers = vec![s.owner.address.clone()];
         if artifact.owner != s.owner.address {
             account_key(&artifact.owner).map_err(|_| "A new owner must be a native G-account")?;
-            rpc::get_account(self.rpc, &artifact.owner)?.validate_owner_only()?;
+            rpc::get_owner_account(self.rpc, &artifact.owner)?.validate_owner_only()?;
             authorizers.push(artifact.owner.clone());
         }
         let arguments = artifact.scval(version)?;

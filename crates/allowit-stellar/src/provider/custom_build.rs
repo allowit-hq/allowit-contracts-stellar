@@ -102,6 +102,10 @@ fn toolchain_missing(message: impl Into<String>) -> Error {
 fn build_failed(message: impl Into<String>) -> Error {
     refusal(code::BUILD_FAILED, message)
 }
+/// A policy source that the source gate refuses: it needs a revised policy, not another build.
+fn source_rejected(message: impl Into<String>) -> Error {
+    refusal(code::SOURCE_REJECTED, message)
+}
 
 /// The first line of a tool's `--version` output.
 fn version_line(tool: &Path, dir: &Path) -> Option<String> {
@@ -174,7 +178,7 @@ pub(crate) fn build_with(stellar: &Path, source: &str, work: &Path) -> Result<Wa
     // portable policy gate is compiled: it cannot include a local file or run code at compile
     // time.
     let (_, inputs) = crate::policy::custom_build_inputs(source).map_err(|reason| {
-        build_failed(format!(
+        source_rejected(format!(
             "The policy source does not pass the policy source gate: {reason}. Draft the policy again."
         ))
     })?;
@@ -344,7 +348,8 @@ mod tests {
         let work = tempfile::tempdir().unwrap();
         let source = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    let _ = include_str!(\"/etc/hosts\");\n    Ok(())\n}\n";
         let error = build_with(Path::new("/nonexistent/stellar"), source, work.path()).unwrap_err();
-        assert_eq!(refused(error), code::BUILD_FAILED);
+        // A source that the gate refuses needs a revised policy, not another build.
+        assert_eq!(refused(error), code::SOURCE_REJECTED);
         assert!(!work.path().join("tree").exists());
     }
 

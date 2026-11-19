@@ -56,6 +56,10 @@ A Native policy needs the wallet account of its agent: a new classic account, on
    its starting balance, adds the owner signer (weight 3), the agent signer (1) and the server signer (1), sets the
    thresholds 2, 2 and 3 and gives the account's own key weight 0. The starting balance is the reserve of the account
    (2.5 XLM), 0.5 XLM for the fees of the owner's own steps and the owner's funding amount.
+   It first reads the owner's account. An address without an account on the network is the refusal
+   `owner_account_unfunded`, and an account that cannot spend the starting balance and the setup's fee (`NATIVE_SETUP_FEE`,
+   4 operations of 100 stroops) above its own reserve is
+   `owner_balance_low` (`SetupRefusal`, with `code`). Both come before any signature.
 2. Has the host's `sign` sign it as the step `set_up_wallet`. The account's own key is random, lives in `complete` only
    and signs the creation once beside the owner. The `owner-sign` element reads the step from its bytes: it shows the
    wallet account, the agent and the funding, and it refuses any transaction that is not exactly this setup.
