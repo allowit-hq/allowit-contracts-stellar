@@ -377,8 +377,10 @@ pub fn capabilities(network: &str) -> crate::host::execution::Capabilities {
         address_is_key: true,
         operations: &["transfer", "deposit", "redeem"],
         build_only: true,
-        verbs: if crate::host::routing::info(network).is_ok_and(|v| v.testnet) {
-            &[
+        verbs: match crate::host::routing::info(network) {
+            // A network that the rail does not serve has no verb.
+            Err(_) => &[],
+            Ok(rail) if rail.testnet => &[
                 "keys fund",
                 "wallet setup",
                 "wallet import",
@@ -392,10 +394,9 @@ pub fn capabilities(network: &str) -> crate::host::execution::Capabilities {
                 "policy generate",
                 "exec",
                 "status",
-            ]
-        } else {
+            ],
             // Every verb of a test network but its faucet.
-            &[
+            Ok(_) => &[
                 "wallet setup",
                 "wallet import",
                 "policy deploy",
@@ -408,7 +409,7 @@ pub fn capabilities(network: &str) -> crate::host::execution::Capabilities {
                 "policy generate",
                 "exec",
                 "status",
-            ]
+            ],
         },
     }
 }
@@ -496,6 +497,14 @@ mod capability_tests {
                 "{}",
                 network.id
             );
+        }
+    }
+    /// A network that the rail does not serve advertises no verb: the setup refuses it.
+    #[test]
+    fn a_network_outside_the_rail_advertises_no_verb() {
+        for network in ["stellar:futurenet", "example:testnet", ""] {
+            assert!(crate::host::routing::info(network).is_err(), "{network}");
+            assert!(super::capabilities(network).verbs.is_empty(), "{network}");
         }
     }
 }

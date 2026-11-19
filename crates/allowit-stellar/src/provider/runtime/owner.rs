@@ -45,6 +45,11 @@ impl SetupRequest {
         for account in [&self.owner, &self.agent, &self.server] {
             native::account_key(account).map_err(Error::usage)?;
         }
+        if self.owner == self.agent || self.owner == self.server || self.agent == self.server {
+            return Err(Error::usage(
+                "Owner, agent and server must be distinct G accounts",
+            ));
+        }
         if !crate::host::request::request_id_valid(&self.request_id) {
             return Err(Error::usage("Invalid Stellar setup request ID"));
         }

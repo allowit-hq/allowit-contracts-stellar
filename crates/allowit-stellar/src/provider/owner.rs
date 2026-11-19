@@ -182,6 +182,20 @@ impl OwnerProvider for Owner {
         // its canonical id, whichever alias the caller selected: the server's templates and the
         // identity of a resumed request then name the same network.
         let network = crate::host::routing::normalize(cx.network)?;
+        // The owner's key and the server's key are those of this network. A key store or a
+        // server authority of another network of the rail holds a valid account of this one
+        // too, so the setup compares the ids: it never installs the server key of one network
+        // in a wallet of another.
+        for (role, other) in [
+            ("owner key", cx.signer.network()),
+            ("server authority", cx.authority.network()),
+        ] {
+            if crate::host::routing::normalize(other).ok() != Some(network) {
+                return Err(Error::config(format!(
+                    "The {role} belongs to another network than the wallet setup"
+                )));
+            }
+        }
         // The caller's own values are checked first: a setup that must fail asks the owner for
         // no sign-in, opens no journal and asks the server nothing. The wallet asset is checked
         // after the server's template names it.
@@ -474,33 +488,40 @@ mod storage_boundary_tests {
     }
     /// A setup with an invalid value of the caller fails before the journal opens, before the
     /// owner signs a sign-in and before the server is asked: the store and the signer of this
-    /// test panic when they are used, and the server origin answers nothing.
+    /// test panic when they are used, and the server origin answers nothing. So does a setup
+    /// whose owner key or server authority belongs to another network of the rail.
     #[test]
     fn an_invalid_setup_fails_before_the_journal_the_sign_in_and_the_server() {
-        struct Owner(String);
+        struct Owner(&'static str, String);
         impl crate::host::Signer for Owner {
             fn network(&self) -> &str {
-                "stellar:testnet"
+                self.0
             }
             fn address(&self) -> &str {
-                &self.0
+                &self.1
             }
             fn sign_hash(&self, _: &[u8]) -> Result<Vec<u8>> {
                 panic!("an invalid setup requested a signature")
             }
         }
-        let server = crate::account_for_seed(&[13; 32]);
-        let authority = crate::host::config::ServerAuthority::validated(
-            "stellar:testnet",
-            "http://localhost:3000",
-            &server,
-        )
-        .unwrap();
-        let signer = Owner(crate::account_for_seed(&[11; 32]));
+        let owner = crate::account_for_seed(&[11; 32]);
         let agent = crate::account_for_seed(&[12; 32]);
-        let setup = |network: &'static str, agent: &str, request_id: &str, amount: Option<&str>| {
+        let server = crate::account_for_seed(&[13; 32]);
+        // `selected` is the network of the call, `keys` the network of the owner's key store
+        // and `service` the network of the configured server authority.
+        let setup = |[selected, keys, service]: [&'static str; 3],
+                     agent: &str,
+                     request_id: &str,
+                     amount: Option<&str>| {
+            let authority = crate::host::config::ServerAuthority::validated(
+                service,
+                "http://localhost:3000",
+                &server,
+            )
+            .unwrap();
+            let signer = Owner(keys, owner.clone());
             let context = Context {
-                network,
+                network: selected,
                 backend: authority.origin(),
                 authority: &authority,
                 origin: "http://localhost:5173",
@@ -523,21 +544,56 @@ mod storage_boundary_tests {
                 .unwrap_err()
                 .message
         };
-        for network in ["stellar:testnet", "stellar:pubnet", "stellar:mainnet"] {
+        let id = "setup-invalid-001";
+        for (selected, canonical) in [
+            ("stellar:testnet", "stellar:testnet"),
+            ("stellar:pubnet", "stellar:pubnet"),
+            ("stellar:mainnet", "stellar:pubnet"),
+        ] {
+            let same = [selected, selected, canonical];
+            for (agent, request_id, amount, message) in [
+                ("GAGENT", id, None, "Expected canonical Stellar G account"),
+                (
+                    agent.as_str(),
+                    "bad id",
+                    None,
+                    "Invalid Stellar setup request ID",
+                ),
+                (
+                    agent.as_str(),
+                    id,
+                    Some("0"),
+                    "Asset amount exceeds the supported positive range",
+                ),
+                (
+                    owner.as_str(),
+                    id,
+                    None,
+                    "Owner, agent and server must be distinct G accounts",
+                ),
+            ] {
+                assert_eq!(
+                    setup(same, agent, request_id, amount),
+                    message,
+                    "{selected}"
+                );
+            }
+            // A valid request of this network with a key store or a server authority of the
+            // other network of the rail: the account of each key is valid on both.
+            let other = if canonical == "stellar:testnet" {
+                "stellar:pubnet"
+            } else {
+                "stellar:testnet"
+            };
             assert_eq!(
-                setup(network, "GAGENT", "setup-invalid-001", None),
-                "Expected canonical Stellar G account",
-                "{network}"
+                setup([selected, other, canonical], &agent, id, None),
+                "The owner key belongs to another network than the wallet setup",
+                "{selected}"
             );
             assert_eq!(
-                setup(network, &agent, "bad id", None),
-                "Invalid Stellar setup request ID",
-                "{network}"
-            );
-            assert_eq!(
-                setup(network, &agent, "setup-invalid-001", Some("0")),
-                "Asset amount exceeds the supported positive range",
-                "{network}"
+                setup([selected, selected, other], &agent, id, None),
+                "The server authority belongs to another network than the wallet setup",
+                "{selected}"
             );
         }
     }
