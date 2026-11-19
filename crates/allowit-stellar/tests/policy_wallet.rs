@@ -4047,6 +4047,38 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
 /// owner step refuses a simulation that would restore any code of the wallet, also code that the
 /// owner installed outside Allowit, which the installation does not name. Each answers
 /// `contract_expired`.
+/// The admission read (`rpc::trusted_state`, the provider's `snapshot`), which installation,
+/// activation and execution use, refuses a wallet whose params are not the ones that its
+/// deployment stores (`installed_params`): a Standard wallet whose owner's update outside
+/// Allowit dropped `daily_spending_limit` and kept its rules and source. Discovery still reads
+/// it, so its owner can pause or stop it.
+#[test]
+fn an_admission_read_refuses_a_wallet_that_dropped_an_approved_param() {
+    let tier = PolicyTier::Common;
+    let wasm = wasm_for(tier);
+    let chain = ModelChain::new(BTreeMap::from([(hash(&wasm), tier)]));
+    let c = create(&chain, tier, &wasm, [0x5d; 32]);
+    assert!(c.rules.iter().any(|rule| rule == "daily_spending_limit"));
+    assert!(c.params.0.contains_key("daily_spending_limit"));
+    rpc::trusted_state(&chain, &c, Some(chain.accounting())).unwrap();
+    let mut owner_admin = Admin::new(OwnerAdmin {
+        rpc: &chain,
+        config: &c,
+        now: NOW,
+    });
+    let mut dropped = c.params.clone();
+    dropped.0.remove("daily_spending_limit");
+    let (deployment, _) = PolicyDeployment::for_source(&c, SOURCE, dropped).unwrap();
+    let updated = owner_admin
+        .deploy_policy(DeploymentVersion(1), deployment)
+        .unwrap();
+    owner_submit(&chain, "params", &updated.transaction_xdr);
+    assert!(!chain.config().params.0.contains_key("daily_spending_limit"));
+    let refused = rpc::trusted_state(&chain, &c, Some(chain.accounting())).unwrap_err();
+    assert_eq!(refused.to_string(), rpc::PARAMS_DIFFER);
+    assert!(rpc::trusted_state_for_discovery(&chain, &c, None).is_ok());
+}
+
 #[test]
 fn a_lapsed_wallet_takes_no_owner_step() {
     use allowit_core::vendor::plugin::RailPlugin;

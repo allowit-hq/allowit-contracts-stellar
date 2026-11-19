@@ -113,6 +113,13 @@ pub fn denial(message: &str, contract: Option<&ContractFault>, wallet: &str) -> 
             "The wallet lapsed on the network: nothing restores it, and nothing was signed or sent. Its owner restores it outside Allowit.",
         );
     }
+    if contract.is_none() && message == crate::rpc::PARAMS_DIFFER {
+        return coded(
+            409,
+            "params_differ_from_wallet",
+            "The wallet's params on the ledger are not the ones that its installation stores.",
+        );
+    }
     if contract.is_none() && message == crate::rpc::EXECUTABLE_DIFFERS {
         return coded(
             409,
@@ -186,6 +193,12 @@ mod tests {
         let local = denial("Policy prefix denied: PaymentLimitExceeded", None, "");
         assert_eq!(local.code, "policy_denied");
         assert!(local.details.unwrap()["contractError"].is_null());
+    }
+    #[test]
+    fn a_wallet_whose_params_differ_from_its_installation_has_its_own_code() {
+        let problem = denial(crate::rpc::PARAMS_DIFFER, None, "wallet");
+        assert_eq!(problem.code, "params_differ_from_wallet");
+        assert_eq!(problem.status, 409);
     }
     #[test]
     fn a_wallet_with_other_code_than_its_configuration_has_its_own_code() {
