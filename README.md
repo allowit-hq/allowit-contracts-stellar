@@ -116,7 +116,7 @@ Three wallet implementations share one custody core (`crates/policy-wallet`) and
 | --- | --- | --- |
 | `AllowitSimplePolicyEngine` | Agent and server | Offchain. The server checks the authored policy before it signs. The contract enforces custody invariants only. |
 | `AllowitCommonPolicyEngine` | Agent and server | Onchain, from the standard prefix: the leading canonical rule calls of the authored policy, which the owner approves as `rules`. |
-| `AllowitCustomPolicy` | Agent and server | Onchain, compiled. The on-chain part of the authored policy file compiles verbatim into its own contract, on the same custody mixins. A file with no server function is its own on-chain part. |
+| `AllowitCustomPolicy` | Agent and server | Onchain, compiled. The on-chain part of the authored policy file compiles verbatim into its own contract, on the same custody mixins. A file that the derivation leaves unchanged is its own on-chain part. |
 
 Pick **Simple** when your server already runs the whole policy and you want the lightest contract. Pick **Common** when you want standard limits enforced by the ledger itself. Pick **Custom** when the policy needs logic the canonical rules do not cover.
 
@@ -140,7 +140,7 @@ Value types, the standard state keys and error mapping are in [docs/architecture
 
 ## Write a policy
 
-Policy source is ordinary synchronous Rust against the same released portable `allowit` package. The offchain server evaluates the file, and `AllowitCustomPolicy` compiles its on-chain part verbatim. A file with no server function, as this one, is its own on-chain part:
+Policy source is ordinary synchronous Rust against the same released portable `allowit` package. The offchain server evaluates the file, and `AllowitCustomPolicy` compiles its on-chain part verbatim. A file that the derivation leaves unchanged, as this one, is its own on-chain part: a file with no server function, no state that the server keeps and no read of the stored day.
 
 ```rust
 use allowit::prelude::*;

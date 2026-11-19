@@ -93,15 +93,17 @@ read them:
 | `day_total`, `day_unpriced` | `daily_volume_limit` | `d`, temporary |
 
 `build.rs` finds the figures in the compiled `policy.rs` (`state_keys::figures`, the scan that the
-rail runs too). It reads whole words and leaves out the lines that start with `//`:
+rail runs too). It reads the names of the source: the text of a comment or of a string literal, such
+as a state key, names nothing.
 
 - each rule name above keeps its figure;
 - a `get_state` read of a standard figure keeps that figure;
-- any other word that contains `state`, such as `ctx.state`, and the words `preflight`, `RULES`,
-  `AllowitRule`, `AllowitStandardState` and `evaluate`, keep every figure.
+- the name `state`, as in `ctx.state`, and the names `preflight`, `RULES`, `AllowitRule`,
+  `AllowitStandardState` and `evaluate`, which reach the whole state or every rule, keep every figure.
 
 A derived policy calls its rules by name and reads its own state through `get_state`, so it keeps
-exactly the figures of its rules. A word in a trailing comment or a string literal can only add a figure.
+exactly the figures of its rules. A local name such as `my_state`, a key such as `"my_state"` and a
+rule named only in a comment keep no figure. A source that the scan cannot read keeps every figure.
 
 A rule that runs only on the server, such as a rule in a branch that depends on a server function,
 is no part of `policy.rs`, so the wallet keeps no figure for it. The server's own accounting gives
