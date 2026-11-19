@@ -453,13 +453,28 @@ impl ServerHooks for Hooks {
         .map_err(|_| Error::usage("The wallet sign-in signature is invalid"))
     }
     /// The XLM fee in installed-asset units, rounded up: [`ServerHooks::price_fee`] of the
-    /// installed asset `config["asset"]`.
+    /// installed asset `config["asset"]`. As before `price_fee`, a listed token without a rate
+    /// under its contract id takes the rate of its ticker.
     fn charged_fee(&self, network: &str, config: &Value, receipt: &ReceiptInfo) -> Result<i128> {
         let asset = config
             .get("asset")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::config("The fee needs the installed asset"))?;
-        self.price_fee(network, config, asset, receipt.fee.native_units)
+        let id = self::network(network)?.id;
+        let listed = provider::tokens_for(id)
+            .iter()
+            .find(|t| provider::token_contract(id, t).as_deref() == Some(asset));
+        let ticker = listed
+            .and_then(|t| config.get("gasRates")?.get(t.code))
+            .cloned();
+        match ticker {
+            Some(rate) if config.get("gasRates").and_then(|r| r.get(asset)).is_none() => {
+                let mut config = config.clone();
+                config["gasRates"][asset] = rate;
+                self.price_fee(network, &config, asset, receipt.fee.native_units)
+            }
+            _ => self.price_fee(network, config, asset, receipt.fee.native_units),
+        }
     }
     /// The XLM fee of `native_units` in the wallet's asset `asset` (its contract id), rounded
     /// up. XLM, the network's own asset, is one to one; any other asset takes the `gasRates`
@@ -489,10 +504,9 @@ impl ServerHooks for Hooks {
                     "Configure gasRates to price the XLM fee in {asset}"
                 ))
             })?;
-        // `rate` has 7 decimals, as XLM does, so units = ceil(fee * rate / 10^7).
-        fee.checked_mul(rate)
-            .and_then(|v| v.checked_add(9_999_999))
-            .map(|v| v / 10_000_000)
+        // `rate` has 7 decimals, as XLM does, so units = ceil(fee * rate / 10^7), with no
+        // intermediate value wider than the price, as the repayment of a preparation computes it.
+        crate::mul_div_ceil(fee, rate, 10_000_000)
             .ok_or_else(|| Error::config("The fee is out of range"))
     }
 }
@@ -968,6 +982,29 @@ mod tests {
                 .unwrap(),
             1_000
         );
+        // A price that fits is given, whatever the width of fee times rate: 100 stroops at
+        // 10^30 units per XLM are 10^32 units.
+        let wide =
+            serde_json::json!({"gasRates": {foo.as_str(): "1000000000000000000000000000000"}});
+        assert_eq!(
+            hooks.price_fee(network, &wide, &foo, 100).unwrap(),
+            10_i128.pow(32)
+        );
+        // The existing receipt hook keeps the rate of a listed token's ticker.
+        let ticker = serde_json::json!({"asset": usdc.as_str(), "gasRates": {"USDC": "0.15"}});
+        let receipt = crate::host::runtime::ReceiptInfo {
+            transaction_hash: [0; 32],
+            status: crate::host::runtime::Status::Confirmed,
+            observed_height: 1,
+            fee: allowit_core::vendor::runtime::Fee {
+                native_units: 1_000,
+                charged_units: 0,
+                repaid_native_units: 0,
+            },
+            debits: Vec::new(),
+            settlement_hash: None,
+        };
+        assert_eq!(hooks.charged_fee(network, &ticker, &receipt).unwrap(), 150);
         // A rate under a ticker prices no asset, a listed one neither.
         assert!(
             hooks

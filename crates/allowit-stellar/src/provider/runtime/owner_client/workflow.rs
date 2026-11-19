@@ -2157,6 +2157,7 @@ mod submit_refusal_tests {
             envelope_xdr: String::new(),
             result_xdr: String::new(),
             settles: None,
+            fee_bump: None,
         });
         let receipt = OwnerReceipt::of(&step).unwrap();
         // The link is this client's own, never the one that the server sent with the step.

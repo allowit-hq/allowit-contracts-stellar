@@ -1255,6 +1255,18 @@ pub struct VerifiedReceipt {
     /// [`crate::seller_settled`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settles: Option<[u8; 32]>,
+    /// The fee bump that carried this transaction: the account that paid its fee and the fee
+    /// that the ledger charged it. The inner result reports no fee.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_bump: Option<FeeBump>,
+}
+/// The payer and the charge of a fee bump ([`VerifiedReceipt::fee_bump`]).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FeeBump {
+    /// The account that paid the fee bump.
+    pub payer: String,
+    pub fee_charged: i64,
 }
 /// Recheck a retained receipt before projecting it through another interface.
 pub fn validate_receipt(
@@ -1433,11 +1445,41 @@ pub fn receipt_by_reported_hash(
     let FeeBumpTransactionInnerTx::Tx(inner) = &outer.tx.inner_tx;
     receipt_from_response(&v, network, &transaction_hash_for(network, &inner.tx)?)
 }
+/// The payer and the charge of the fee bump of a terminal reply that [`settlement_reply`]
+/// verified; `None` for a reply of a plain transaction.
+fn fee_bump_of(v: &Value) -> Result<Option<FeeBump>> {
+    if !matches!(v["status"].as_str(), Some("SUCCESS" | "FAILED")) {
+        return Ok(None);
+    }
+    let Some(envelope) = v["envelopeXdr"].as_str() else {
+        return Ok(None);
+    };
+    let TransactionEnvelope::TxFeeBump(outer) = read(envelope)? else {
+        return Ok(None);
+    };
+    let result: TransactionResult = read(
+        v["resultXdr"]
+            .as_str()
+            .ok_or("Settlement result is required")?,
+    )?;
+    let payer = match &outer.tx.fee_source {
+        MuxedAccount::Ed25519(Uint256(key)) => account_for_public_key(key),
+        MuxedAccount::MuxedEd25519(m) => account_for_public_key(&m.ed25519.0),
+    };
+    Ok(Some(FeeBump {
+        payer,
+        fee_charged: result.fee_charged,
+    }))
+}
 fn receipt_from_response(
     v: &Value,
     network: &str,
     transaction_hash: &[u8; 32],
 ) -> Result<Option<VerifiedReceipt>> {
+    let fee_bump = {
+        settlement_reply(v, network, transaction_hash)?;
+        fee_bump_of(v)?
+    };
     let normalized = settlement_reply(v, network, transaction_hash)?;
     let v = normalized.as_ref();
     let status = verify_settlement(v, network, transaction_hash)?;
@@ -1462,6 +1504,7 @@ fn receipt_from_response(
             .ok_or("Settlement result is required")?
             .into(),
         settles: None,
+        fee_bump,
     }))
 }
 /// The server's account of a wallet's standard figures: Core's `vendor::runtime::Accounting`.

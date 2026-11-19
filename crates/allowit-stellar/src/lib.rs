@@ -346,6 +346,19 @@ pub fn fee_bound(resource_fee: i64) -> Result<u32> {
         .and_then(|fee| fee.checked_add(resource.div_ceil(FEE_BOUND_MARGIN_DIVISOR)))
         .ok_or_else(|| "Resource fee overflow".into())
 }
+/// `ceil(x * y / d)` for `x, y >= 0` and `d > 0`, with no intermediate value wider than the
+/// result: with `y = yq * d + yr` and `x = xq * d + xr`, it is `x * yq + xq * yr` plus
+/// `ceil(xr * yr / d)`, and `xr * yr` is below `d * d`. `None` when the result does not fit.
+pub fn mul_div_ceil(x: i128, y: i128, d: i128) -> Option<i128> {
+    if x < 0 || y < 0 || d <= 0 || d > i128::from(u64::MAX) {
+        return None;
+    }
+    let (yq, yr) = (y / d, y % d);
+    let (xq, xr) = (x / d, x % d);
+    x.checked_mul(yq)?
+        .checked_add(xq.checked_mul(yr)?)?
+        .checked_add((xr * yr + d - 1) / d)
+}
 /// Request-bound conservative economic ceilings in the wallet asset, attested by the server
 /// signer with its authorization: `AllowitExpenseBounds`. Amounts use the wallet asset's seven
 /// decimals. For XLM, gas equals the fee bound in stroops.
@@ -417,12 +430,7 @@ impl ExpenseBounds {
         }
         let bound = i128::from(self.max_fee_stroops);
         let repaid = self.repaid_after_carry(carry);
-        let gas_units = self
-            .gas_units
-            .checked_mul(repaid)
-            .and_then(|units| units.checked_add(bound - 1))
-            .map(|units| units / bound)
-            .ok_or("Expense overflow")?;
+        let gas_units = mul_div_ceil(self.gas_units, repaid, bound).ok_or("Expense overflow")?;
         Ok(Self {
             gas_units,
             spent_units: self
@@ -450,12 +458,7 @@ impl ExpenseBounds {
         }
         let repaid = base;
         let ceiling = i128::from(self.max_fee_stroops);
-        let gas_units = self
-            .gas_units
-            .checked_mul(repaid)
-            .and_then(|units| units.checked_add(ceiling - 1))
-            .map(|units| units / ceiling)
-            .ok_or("Expense overflow")?;
+        let gas_units = mul_div_ceil(self.gas_units, repaid, ceiling).ok_or("Expense overflow")?;
         Ok(Self {
             gas_units,
             spent_units: self
@@ -475,11 +478,7 @@ impl ExpenseBounds {
             return Err("A fee bound lowers a positive fee ceiling".into());
         }
         let ceiling = i128::from(self.max_fee_stroops);
-        let gas_units = self
-            .gas_units
-            .checked_mul(i128::from(fee_stroops))
-            .and_then(|units| units.checked_add(ceiling - 1))
-            .map(|units| units / ceiling)
+        let gas_units = mul_div_ceil(self.gas_units, i128::from(fee_stroops), ceiling)
             .ok_or("Expense overflow")?;
         Ok(Self {
             gas_units,
@@ -1279,7 +1278,8 @@ pub fn operation_usage(p: &PreparedOperation) -> Result<Option<OperationUsage>> 
     if p.config.route != WalletRoute::PolicyWallet || p.payment_authorization.is_some() {
         return Ok(None);
     }
-    let operation = operation_from_request(&p.config, &p.request)?;
+    // The figures of the operation that executed, under the rules that admitted it.
+    let operation = retained_operation_from_request(&p.config, &p.request)?;
     let facts = policy::RuleRequest::new(
         &operation,
         &p.config.asset,
@@ -2592,6 +2592,13 @@ fn validate_wallet_signed(s: &SignedOperation) -> Result<()> {
     let mut normalized = env.tx.clone();
     normalized.fee = unsigned.tx.fee;
     normalized.ext = unsigned.tx.ext.clone();
+    // The sender can send the same authorization again in a later transaction of its own: the
+    // wallet's authorization, not the sender's sequence, is the operation.
+    if env.tx.source_account == unsigned.tx.source_account
+        && env.tx.seq_num.0 >= unsigned.tx.seq_num.0
+    {
+        normalized.seq_num = unsigned.tx.seq_num.clone();
+    }
     let mut operations = normalized.operations.to_vec();
     let mut original = unsigned.tx.operations.to_vec();
     if let (
@@ -2824,4 +2831,34 @@ fn attach_resources(
         transaction_signers(&out, &automated_roles(&out.config))?;
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod repayment_width {
+    use super::*;
+    /// The gas of a wide ceiling scales down to the repayment without an intermediate overflow,
+    /// as the price of the same rate does: 10^37 units for 10,000,000 stroops are 10^32 for 100.
+    #[test]
+    fn a_wide_ceiling_scales_to_its_repayment() {
+        let bounds = ExpenseBounds {
+            gas_units: 10_i128.pow(37),
+            conversion_units: 0,
+            spent_units: 10_i128.pow(37) + 1,
+            max_fee_stroops: 10_000_000,
+            observed_ledger: 9,
+            day: 1,
+        };
+        assert_eq!(
+            bounds.with_repayment(100, 0, i128::MAX).unwrap().gas_units,
+            10_i128.pow(32)
+        );
+        assert_eq!(
+            bounds.with_fee_bound(100).unwrap().gas_units,
+            10_i128.pow(32)
+        );
+        assert_eq!(
+            bounds.with_gas_carry(10_000_000 - 100).unwrap().gas_units,
+            10_i128.pow(32)
+        );
+    }
 }
