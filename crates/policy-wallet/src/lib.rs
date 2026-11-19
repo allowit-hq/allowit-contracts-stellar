@@ -1396,8 +1396,10 @@ macro_rules! policy_wallet {
                 env: soroban_sdk::Env,
                 update: $crate::AllowitPolicyUpdate,
             ) -> Result<(), $crate::AllowitWalletError> {
+                $crate::deploy_policy::<$policy>(&env, update)?;
+                // After an upgrade the wallet runs its new code: the renewal keeps that code live.
                 $crate::keep_live::<$policy>(&env);
-                $crate::deploy_policy::<$policy>(&env, update)
+                Ok(())
             }
             /// Pause or resume the agent path at the next deployment version.
             pub fn set_pause(

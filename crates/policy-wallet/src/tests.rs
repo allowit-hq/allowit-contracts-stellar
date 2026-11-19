@@ -820,6 +820,21 @@ fn a_call_below_the_threshold_renews_the_instance_and_a_custom_wallets_own_code(
     );
 }
 
+/// An upgrade keeps the code that it installs live: a Custom wallet's upgrade renews its new code,
+/// whose own upload gave it the network's minimum lifetime only.
+#[test]
+fn a_custom_upgrade_renews_the_code_that_it_installs() {
+    let f = Fixture::new(CUSTOM);
+    let next = f.env.deployer().upload_contract_wasm(CATCHING);
+    let mut u = f.update();
+    u.wasm_hash = Some(next.clone());
+    assert_eq!(f.owner_call("deploy_policy", (u,).into_val(&f.env)), Ok(()));
+    assert_eq!(
+        f.env.deployer().get_contract_code_ttl(&f.wallet),
+        TOTAL_LEDGERS - 1
+    );
+}
+
 #[test]
 fn total_figures_are_created_at_deployment_and_kept_for_their_checks() {
     let f = Fixture::with(COMMON, false, |env, c| {

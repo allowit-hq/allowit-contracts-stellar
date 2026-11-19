@@ -1145,7 +1145,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 lifetime: None,
             });
         }
-        // Lapsed code is not present: the server's upload step restores it.
+        // Lapsed code is not present, and nothing restores it.
         let code_present = checked(rpc::code_state(self.rpc(), &c.network, &c.module_digest))?
             == rpc::CodeState::Live;
         let wallet_present = checked(rpc::contract_exists(self.rpc(), &c.network, &c.wallet))?;
@@ -1662,6 +1662,14 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                     }
                     .custody(),
                 )?;
+                // A transfer does not call the wallet: its lifetimes are read first, and a wallet
+                // whose instance or code lapsed takes no funds (`CONTRACT_EXPIRED`).
+                checked(rpc::wallet_lifetime(
+                    self.rpc(),
+                    &c.network,
+                    &c.wallet,
+                    &c.module_digest,
+                ))?;
                 checked(d.fund(&c, units))?
             }
             OwnerAction::Extend => {

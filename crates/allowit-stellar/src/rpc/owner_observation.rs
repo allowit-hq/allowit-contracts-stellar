@@ -158,7 +158,18 @@ pub(crate) fn lifetime_keys(wallet: &str, code: &[u8; 32]) -> Result<[LedgerKey;
     ])
 }
 /// Read and bind both selected lifetime entries and the exact current network archival limit.
-/// Missing/expired entries require a separate restoration flow; they never become a zero lifetime.
+/// A wallet whose instance or code lapsed is refused with `CONTRACT_EXPIRED`: nothing restores it.
+/// An archived entry that the RPC serves without a live-until ledger has lapsed; a missing entry
+/// or a malformed reply is an error of its own.
+/// A live-until ledger as an entry's lifetime reply gives it: 0 for an archived entry served
+/// without one.
+fn live_until(value: &Value) -> Result<u32> {
+    match value {
+        Value::Null => Ok(0),
+        value if value.as_u64() == Some(0) => Ok(0),
+        value => ledger(value),
+    }
+}
 pub fn wallet_lifetime(
     rpc: &dyn Rpc,
     selected_network: &str,
@@ -205,16 +216,12 @@ pub fn wallet_lifetime(
                 if state.executable != ContractExecutable::Wasm(Hash(*code)) {
                     return Err("Wallet lifetime instance names another executable".into());
                 }
-                (
-                    &instance_key,
-                    1,
-                    Some(ledger(&entry["liveUntilLedgerSeq"])?),
-                )
+                (&instance_key, 1, Some(live_until(&entry["liveUntilLedgerSeq"])?))
             }
             LedgerEntryData::ContractCode(data)
                 if data.hash == Hash(*code) && hash(data.code.as_slice()) == *code =>
             {
-                (&code_key, 2, Some(ledger(&entry["liveUntilLedgerSeq"])?))
+                (&code_key, 2, Some(live_until(&entry["liveUntilLedgerSeq"])?))
             }
             _ => return Err("Wallet lifetime entry differs from the exact selected keys".into()),
         };
@@ -237,17 +244,18 @@ pub fn wallet_lifetime(
     let max = max.ok_or("Missing archival lifetime setting")?;
     let instance = instance.ok_or("Missing wallet instance lifetime")?;
     let code = executable.ok_or("Missing wallet code lifetime")?;
+    if instance < observed || code < observed {
+        return Err(super::CONTRACT_EXPIRED.into());
+    }
     if observed.checked_add(max - 1).is_none()
-        || instance < observed
-        || code < observed
         || instance - observed >= max
         || code - observed >= max
     {
-        return Err("Wallet lifetime is expired or exceeds the network limit".into());
+        return Err("Wallet lifetime exceeds the network limit".into());
     }
     let closing = current(rpc, before, observed)?;
     if instance < closing || code < closing {
-        return Err("Wallet lifetime expired before the closing observation".into());
+        return Err(super::CONTRACT_EXPIRED.into());
     }
     Ok(WalletLifetime {
         ledger: observed,

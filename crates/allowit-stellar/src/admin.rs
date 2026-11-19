@@ -470,11 +470,7 @@ impl OwnerAdmin<'_> {
     /// Take the simulated resources and fee of an owner step. Nothing restores a wallet whose
     /// instance or code lapsed: such a simulation is refused (`rpc::refuse_expired`).
     fn apply_resources(&self, tx: &mut Transaction, response: &serde_json::Value) -> Result<()> {
-        rpc::refuse_expired(
-            response,
-            Some(&self.config.wallet),
-            &self.config.module_digest,
-        )?;
+        rpc::refuse_expired(response, Some(&self.config.wallet), None)?;
         let fee = response["minResourceFee"]
             .as_str()
             .ok_or("Missing resource fee")?
@@ -1379,7 +1375,7 @@ impl Deployer<'_> {
         // Archived deployer entries restore in the same transaction; archived wallet code does not:
         // nothing restores it.
         if let Some(code) = expected_wasm {
-            rpc::refuse_expired(&response, None, &code)?;
+            rpc::refuse_expired(&response, None, Some(&code))?;
         }
         rpc::restoring_in_place(&response)?;
         let results = response["results"]

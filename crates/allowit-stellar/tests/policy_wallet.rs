@@ -359,6 +359,9 @@ struct Model {
     reject_next_send: bool,
     /// The endpoint serves another network.
     foreign_network: bool,
+    /// Every contract instance is past its lifetime: the RPC serves it with a live-until ledger
+    /// of 0.
+    lapsed_instances: bool,
     /// The ledger holds each settled transaction inside a fee bump of another source.
     fee_bumped: bool,
     pending_name: String,
@@ -600,7 +603,9 @@ impl rpc::Rpc for ModelChain {
             })?})),
             "getLatestLedger" => Ok(json!({"sequence": m.ledger})),
             "getLedgerEntries" => {
-                let encoded = params["keys"][0].as_str().unwrap();
+                let mut entries: Vec<Value> = Vec::new();
+                for encoded in params["keys"].as_array().unwrap() {
+                let encoded = encoded.as_str().unwrap();
                 let key: x::LedgerKey = de(encoded);
                 if m.failing_code_reads && matches!(key, x::LedgerKey::ContractCode(_)) {
                     return Err("The RPC is unreachable".into());
@@ -690,12 +695,16 @@ impl rpc::Rpc for ModelChain {
                         .get(&code.hash.0)
                         .copied()
                         .unwrap_or(m.ledger + 10_000),
+                    x::LedgerKey::ContractData(x::LedgerKeyContractData {
+                        key: x::ScVal::LedgerKeyContractInstance,
+                        ..
+                    }) if m.lapsed_instances => 0,
                     _ => m.ledger + 10_000,
                 };
-                let entries: Vec<Value> = entry
-                    .into_iter()
-                    .map(|e| json!({"key": encoded, "xdr": b64(&e), "liveUntilLedgerSeq": live_until}))
-                    .collect();
+                entries.extend(entry.into_iter().map(
+                    |e| json!({"key": encoded, "xdr": b64(&e), "liveUntilLedgerSeq": live_until}),
+                ));
+                }
                 if entries.is_empty() && m.omit_empty_entries {
                     return Ok(json!({"latestLedger": m.ledger}));
                 }
@@ -2623,6 +2632,8 @@ struct Lapsed<'a> {
     chain: &'a ModelChain,
     preamble: bool,
     instance: bool,
+    /// A code entry that the simulation restores in place too.
+    code: Option<[u8; 32]>,
 }
 impl rpc::Rpc for Lapsed<'_> {
     fn call(&self, method: &str, params: Value) -> Result<Value> {
@@ -2664,6 +2675,11 @@ impl rpc::Rpc for Lapsed<'_> {
                 let mut lapsed = vec![entry(x::ScVal::Symbol("t".try_into().unwrap()))];
                 if self.instance {
                     lapsed.push(entry(x::ScVal::LedgerKeyContractInstance));
+                }
+                if let Some(code) = self.code {
+                    lapsed.push(x::LedgerKey::ContractCode(x::LedgerKeyContractCode {
+                        hash: x::Hash(code),
+                    }));
                 }
                 let archived: Vec<u32> = (0..lapsed.len() as u32).collect();
                 data.resources.footprint.read_write = lapsed.try_into().unwrap();
@@ -2738,6 +2754,7 @@ fn a_lapsed_entry_restores_in_the_operation_that_needs_it() {
         chain: &chain,
         preamble: false,
         instance: false,
+        code: None,
     };
     let prepared = rpc::prepare_with(
         &lapsed,
@@ -2778,6 +2795,7 @@ fn a_lapsed_entry_restores_in_the_operation_that_needs_it() {
         chain: &chain,
         preamble: true,
         instance: false,
+        code: None,
     };
     let state = sending_state(&chain, &c);
     let ledger = chain.ledger();
@@ -3986,6 +4004,95 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         m.code_bytes.insert(hash(&unsent), unsent.clone());
     }
 }
+/// A wallet whose instance or code lapsed takes no owner step either. Funding transfers to the
+/// wallet without calling it, so its lifetimes are read first; an extension reads them too; and an
+/// owner step refuses a simulation that would restore any code of the wallet, also code that the
+/// owner installed outside Allowit, which the installation does not name. Each answers
+/// `contract_expired`.
+#[test]
+fn a_lapsed_wallet_takes_no_owner_step() {
+    use allowit_core::vendor::plugin::RailPlugin;
+    use allowit_core::vendor::profiles::Description;
+    use allowit_core::vendor::runtime::{Installation, OwnerAction, Transport};
+    use std::sync::Arc;
+    struct Wire(Arc<ModelChain>);
+    impl Transport for Wire {
+        fn call(&self, method: &str, params: Value) -> allowit_core::client::error::Result<Value> {
+            rpc::Rpc::call(&*self.0, method, params)
+                .map_err(allowit_core::client::error::Error::config)
+        }
+    }
+    let wasm = wasm_for(PolicyTier::Common);
+    let chain = Arc::new(ModelChain::new(BTreeMap::from([(
+        hash(&wasm),
+        PolicyTier::Common,
+    )])));
+    let c = create(&chain, PolicyTier::Common, &wasm, [0x38; 32]);
+    let document = allowit_stellar::PLUGIN
+        .owner_runtime()
+        .configuration(NETWORK, &serde_json::to_vec(&c).unwrap())
+        .unwrap();
+    let installation = Installation {
+        description: Description {
+            network: NETWORK.into(),
+            wallet: c.wallet.clone(),
+            agent: c.agent.clone(),
+            policy_id: "policy".into(),
+            owner: c.owner.clone(),
+            server: c.server.clone(),
+            asset: c.asset.clone(),
+            asset_symbol: c.asset_symbol.clone(),
+            source: c.policy_source.clone(),
+            source_hash: hex(&c.source_hash),
+            module_digest: hex(&c.module_digest),
+            params: document.params.clone(),
+        },
+        config: document.document().to_owned(),
+        export: None,
+        authority: None,
+    };
+    let provider = allowit_stellar::PLUGIN
+        .runtime(NETWORK, Arc::new(Wire(chain.clone())))
+        .unwrap();
+    let expired = |action: OwnerAction| {
+        let refused = provider
+            .prepare_owner(&installation, action, u64::from(c.max_fee_stroops), NOW)
+            .unwrap_err();
+        let problem = provider.problem(&refused);
+        assert_eq!(
+            problem.code,
+            allowit_core::vendor::runtime::CONTRACT_EXPIRED,
+            "{}",
+            refused.message
+        );
+    };
+    // Its instance lapsed: nothing is simulated or signed.
+    chain.0.lock().unwrap().lapsed_instances = true;
+    expired(OwnerAction::Fund { units: 5 });
+    expired(OwnerAction::Extend);
+    chain.0.lock().unwrap().lapsed_instances = false;
+    // Its code lapsed.
+    chain.0.lock().unwrap().lapsed_code.insert(c.module_digest);
+    expired(OwnerAction::Fund { units: 5 });
+    expired(OwnerAction::Extend);
+    chain.0.lock().unwrap().lapsed_code.remove(&c.module_digest);
+    // The owner installed other code outside Allowit, and that code lapsed: the stop's simulation
+    // would restore it, and is refused.
+    let lapsed = Lapsed {
+        chain: &chain,
+        preamble: false,
+        instance: false,
+        code: Some([0x42; 32]),
+    };
+    let mut owner = OwnerAdmin {
+        rpc: &lapsed,
+        config: &c,
+        now: NOW,
+    };
+    let version = owner.deployment_version().unwrap().0 + 1;
+    let refused = owner.stop(DeploymentVersion(version)).unwrap_err();
+    assert_eq!(refused.to_string(), rpc::CONTRACT_EXPIRED);
+}
 /// A transport that answers nothing: for the rail's naming of a problem, which reads no ledger.
 struct NoTransport;
 impl allowit_core::vendor::runtime::Transport for NoTransport {
@@ -4006,6 +4113,7 @@ fn a_lapsed_wallet_is_expired_before_anything_is_signed_or_sent() {
         chain: &chain,
         preamble: false,
         instance: true,
+        code: None,
     };
     let mut state = rpc::trusted_state(&lapsed, &c, Some(chain.accounting())).unwrap();
     state.source = rpc::get_account(&lapsed, &sender()).unwrap();

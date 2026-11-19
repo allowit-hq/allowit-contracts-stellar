@@ -474,8 +474,14 @@ pub const CONTRACT_EXPIRED: &str =
 /// Refuse the simulation `value` of a step on the wallet `wallet`, whose code is `code`, when it
 /// would restore that wallet's instance or code, in place or in a separate restoration first
 /// (`CONTRACT_EXPIRED`). A creation names the code of the wallet that it creates and no wallet.
-/// Other entries, such as `t` or another contract's, are left to `restoring_in_place`.
-pub(crate) fn refuse_expired(value: &Value, wallet: Option<&str>, code: &[u8; 32]) -> Result<()> {
+/// An owner step names no code: it calls the wallet alone, whatever code the wallet runs or an
+/// upgrade installs, so it refuses any code entry. Other entries, such as `t` or another
+/// contract's instance, are left to `restoring_in_place`.
+pub(crate) fn refuse_expired(
+    value: &Value,
+    wallet: Option<&str>,
+    code: Option<&[u8; 32]>,
+) -> Result<()> {
     let instance = wallet
         .map(|wallet| {
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(LedgerKey::ContractData(
@@ -488,8 +494,10 @@ pub(crate) fn refuse_expired(value: &Value, wallet: Option<&str>, code: &[u8; 32
         })
         .transpose()
         .map_err(|e| e.to_string())?;
-    let code = LedgerKey::ContractCode(LedgerKeyContractCode { hash: Hash(*code) });
-    let expired = |key: &LedgerKey| *key == code || Some(key) == instance.as_ref();
+    let expired = |key: &LedgerKey| match key {
+        LedgerKey::ContractCode(entry) => code.is_none_or(|code| entry.hash == Hash(*code)),
+        key => Some(key) == instance.as_ref(),
+    };
     let data = |value: &Value| -> Result<Option<SorobanTransactionData>> {
         value
             .as_str()
@@ -598,7 +606,7 @@ pub fn seal(
     if v.get("error").is_some_and(|value| !value.is_null()) {
         return Err("policy wallet simulation rejected the authorized operation".into());
     }
-    refuse_expired(&v, Some(&p.config.wallet), &p.config.module_digest)?;
+    refuse_expired(&v, Some(&p.config.wallet), Some(&p.config.module_digest))?;
     restoring_in_place(&v)?;
     if readonly_result(&v)? != ScVal::Void {
         return Err("Native simulation returned a value from execute".into());
@@ -688,7 +696,7 @@ fn simulated_resources(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<String> {
     if v.get("error").is_some_and(|value| !value.is_null()) {
         return Err("policy wallet simulation rejected the exact policy operation".into());
     }
-    refuse_expired(&v, Some(&p.config.wallet), &p.config.module_digest)?;
+    refuse_expired(&v, Some(&p.config.wallet), Some(&p.config.module_digest))?;
     restoring_in_place(&v)?;
     if readonly_result(&v)? != ScVal::Void {
         return Err("Native simulation returned a value from execute".into());
