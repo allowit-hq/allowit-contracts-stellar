@@ -1709,6 +1709,8 @@ pub fn installed_agent_address(rpc: &dyn Rpc, c: &WalletConfig) -> Result<Option
 }
 /// The fault of a wallet whose code on the ledger differs from the code of its configuration.
 pub const EXECUTABLE_DIFFERS: &str = "policy wallet executable differs from installed code";
+/// The fault of a wallet whose params on the ledger are not the ones that its deployment stores.
+pub const PARAMS_DIFFER: &str = "policy wallet params differ from the installation";
 fn trusted_state_inner(
     rpc: &dyn Rpc,
     c: &WalletConfig,
@@ -1848,6 +1850,12 @@ fn current_wallet_state(
     verify_binding(c, &config)?;
     if require_customer_quorum {
         verify_configuration(c, &config)?;
+        // The wallet holds exactly the params that its deployment stores: an update outside
+        // Allowit that dropped or added one leaves a wallet that admits nothing. Discovery still
+        // reports it, so its owner can pause or stop it.
+        if config.params != crate::installed_params(c) {
+            return Err(PARAMS_DIFFER.into());
+        }
         // An operation repays gas under the wallet's current gas cap, which the owner can change
         // on the ledger. An installation with another gas cap would price repayments that the
         // wallet refuses, so it is verified again first. Owner actions do not depend on it.
