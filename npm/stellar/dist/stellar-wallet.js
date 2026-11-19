@@ -18,7 +18,7 @@ function base64Bytes(value) {
         return bytes;
     }
     catch {
-        throw new Error('Freighter returned invalid signed bytes.');
+        throw new Error('Varial returned invalid signed bytes.');
     }
 }
 function base64(bytes) { return btoa(String.fromCharCode(...bytes)); }
@@ -26,7 +26,7 @@ function failed(error) {
     if (!error)
         return;
     const detail = error;
-    throw Object.assign(new Error(detail.message || 'Freighter could not complete the request.'), { code: detail.code });
+    throw Object.assign(new Error(detail.message || 'Varial could not complete the request.'), { code: detail.code });
 }
 export async function freighterAvailable() {
     const result = await freighter.isConnected();
@@ -37,14 +37,14 @@ async function currentAddress(expected) {
     failed(value.error);
     stellarAccountKey(value.address);
     if (expected !== undefined && value.address !== expected)
-        throw new Error('The Freighter account changed. Sign in again.');
+        throw new Error('The Varial account changed. Sign in again.');
     return value.address;
 }
 async function checkNetwork(network) {
     const value = await freighter.getNetworkDetails();
     failed(value.error);
     if (value.networkPassphrase !== STELLAR_NETWORKS[network].passphrase)
-        throw new Error(`Select ${STELLAR_NETWORKS[network].label} in Freighter, then try again.`);
+        throw new Error(`Select ${STELLAR_NETWORKS[network].label} in Varial, then try again.`);
 }
 /** Bind the exact sign-in purpose, account, Origin and nonce. The caller admits timestamp freshness. */
 export function stellarSignInChallengeTimes(challenge, owner, origin) {
@@ -97,7 +97,7 @@ export async function connectStellarWallet(network, admitTimes, signal) {
             const signed = await freighter.signMessage(message, { address: access.address, networkPassphrase: STELLAR_NETWORKS[network].passphrase });
             failed(signed.error);
             if (!signed.signedMessage || signed.signerAddress !== access.address)
-                throw new Error('Freighter signed with another account. Sign in again.');
+                throw new Error('Varial signed with another account. Sign in again.');
             const signature = base64Bytes(signed.signedMessage);
             if (signature.length !== 64 || !ed25519.verify(signature, stellarMessageDigest(message), stellarAccountKey(access.address), { zip215: false }))
                 throw new Error('The Stellar wallet signature could not be verified.');
@@ -108,7 +108,7 @@ export async function connectStellarWallet(network, admitTimes, signal) {
     };
 }
 /**
- * Freighter signs only. Returned bytes are the authority: an optional retain hook receives bounded bytes before the
+ * Varial signs only. Returned bytes are the authority: an optional retain hook receives bounded bytes before the
  * provider error, signer metadata or any further wallet or network await, so a valid proof survives stale metadata or a
  * failed post-sign check. The hook rejects altered bytes. Any metadata error still rejects. Nothing is broadcast here.
  */
@@ -124,7 +124,7 @@ export async function signStellarTransaction(transactionXdr, owner, network, ret
         await retain(signedXdr);
     failed(result.error);
     if (result.signerAddress !== owner || !bounded)
-        throw new Error('Freighter returned a transaction for another account.');
+        throw new Error('Varial returned a transaction for another account.');
     await currentAddress(owner);
     await checkNetwork(network);
     return signedXdr;
@@ -184,7 +184,7 @@ export async function signStellarSourceApproval(approval, policy, session, still
         const signed = await freighter.signMessage(approval.message, { address: session.address, networkPassphrase: STELLAR_NETWORKS[network].passphrase });
         failed(signed.error);
         if (signed.signerAddress !== session.address || !signed.signedMessage)
-            throw new Error('Freighter signed with another administrator. Nothing was activated.');
+            throw new Error('Varial signed with another administrator. Nothing was activated.');
         const signature = base64Bytes(signed.signedMessage);
         if (signature.length !== 64 || !ed25519.verify(signature, stellarMessageDigest(approval.message), stellarAccountKey(session.address), { zip215: false }))
             throw new Error('The policy approval signature could not be verified.');

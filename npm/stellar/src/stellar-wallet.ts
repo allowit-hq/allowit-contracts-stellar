@@ -16,13 +16,13 @@ function base64Bytes(value: string | Uint8Array): Uint8Array {
     const bytes = Uint8Array.from(atob(value), char => char.charCodeAt(0));
     if (btoa(String.fromCharCode(...bytes)) !== value) throw new Error();
     return bytes;
-  } catch {throw new Error('Freighter returned invalid signed bytes.');}
+  } catch {throw new Error('Varial returned invalid signed bytes.');}
 }
 function base64(bytes: Uint8Array): string {return btoa(String.fromCharCode(...bytes));}
 function failed(error: unknown): void {
   if (!error) return;
   const detail = error as {message?: string; code?: string | number};
-  throw Object.assign(new Error(detail.message || 'Freighter could not complete the request.'), {code: detail.code});
+  throw Object.assign(new Error(detail.message || 'Varial could not complete the request.'), {code: detail.code});
 }
 export async function freighterAvailable(): Promise<boolean> {
   const result = await freighter.isConnected();
@@ -30,12 +30,12 @@ export async function freighterAvailable(): Promise<boolean> {
 }
 async function currentAddress(expected?: string): Promise<string> {
   const value = await freighter.getAddress(); failed(value.error); stellarAccountKey(value.address);
-  if (expected !== undefined && value.address !== expected) throw new Error('The Freighter account changed. Sign in again.');
+  if (expected !== undefined && value.address !== expected) throw new Error('The Varial account changed. Sign in again.');
   return value.address;
 }
 async function checkNetwork(network: StellarNetwork): Promise<void> {
   const value = await freighter.getNetworkDetails(); failed(value.error);
-  if (value.networkPassphrase !== STELLAR_NETWORKS[network].passphrase) throw new Error(`Select ${STELLAR_NETWORKS[network].label} in Freighter, then try again.`);
+  if (value.networkPassphrase !== STELLAR_NETWORKS[network].passphrase) throw new Error(`Select ${STELLAR_NETWORKS[network].label} in Varial, then try again.`);
 }
 export interface StellarSignInChallenge {id: string; message: string; address: string; origin: string; expiresAt: string}
 /** Bind the exact sign-in purpose, account, Origin and nonce. The caller admits timestamp freshness. */
@@ -76,7 +76,7 @@ export async function connectStellarWallet(network: StellarNetwork, admitTimes:(
     async signMessage(message: string): Promise<string> {
       signal?.throwIfAborted();
       const signed = await freighter.signMessage(message, {address: access.address, networkPassphrase: STELLAR_NETWORKS[network].passphrase}); failed(signed.error);
-      if (!signed.signedMessage || signed.signerAddress !== access.address) throw new Error('Freighter signed with another account. Sign in again.');
+      if (!signed.signedMessage || signed.signerAddress !== access.address) throw new Error('Varial signed with another account. Sign in again.');
       const signature = base64Bytes(signed.signedMessage);
       if (signature.length !== 64 || !ed25519.verify(signature, stellarMessageDigest(message), stellarAccountKey(access.address), {zip215: false})) throw new Error('The Stellar wallet signature could not be verified.');
       await currentAddress(access.address); signal?.throwIfAborted();
@@ -86,7 +86,7 @@ export async function connectStellarWallet(network: StellarNetwork, admitTimes:(
 }
 
 /**
- * Freighter signs only. Returned bytes are the authority: an optional retain hook receives bounded bytes before the
+ * Varial signs only. Returned bytes are the authority: an optional retain hook receives bounded bytes before the
  * provider error, signer metadata or any further wallet or network await, so a valid proof survives stale metadata or a
  * failed post-sign check. The hook rejects altered bytes. Any metadata error still rejects. Nothing is broadcast here.
  */
@@ -97,7 +97,7 @@ export async function signStellarTransaction(transactionXdr: string, owner: stri
   const signedXdr = result.signedTxXdr, bounded = typeof signedXdr === 'string' && !!signedXdr && signedXdr.length <= 1_398_104 && /^[A-Za-z0-9+/]+={0,2}$/.test(signedXdr);
   if (retain && bounded) await retain(signedXdr);
   failed(result.error);
-  if (result.signerAddress !== owner || !bounded) throw new Error('Freighter returned a transaction for another account.');
+  if (result.signerAddress !== owner || !bounded) throw new Error('Varial returned a transaction for another account.');
   await currentAddress(owner); await checkNetwork(network);
   return signedXdr;
 }
@@ -144,7 +144,7 @@ export async function signStellarSourceApproval(approval: {payload:Record<string
     if(contract!==payload.asset)throw new Error('The source approval does not match this exact policy. Nothing was signed.');
     await currentAddress(session.address);current();await checkNetwork(network);current();
     const signed=await freighter.signMessage(approval.message,{address:session.address,networkPassphrase:STELLAR_NETWORKS[network].passphrase});failed(signed.error);
-    if(signed.signerAddress!==session.address||!signed.signedMessage)throw new Error('Freighter signed with another administrator. Nothing was activated.');
+    if(signed.signerAddress!==session.address||!signed.signedMessage)throw new Error('Varial signed with another administrator. Nothing was activated.');
     const signature=base64Bytes(signed.signedMessage);
     if(signature.length!==64||!ed25519.verify(signature,stellarMessageDigest(approval.message),stellarAccountKey(session.address),{zip215:false}))throw new Error('The policy approval signature could not be verified.');
     await currentAddress(session.address);current();await checkNetwork(network);current();return [{signer:session.address,signature:Array.from(signature)}];
