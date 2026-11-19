@@ -390,7 +390,7 @@ impl OwnerClient {
                 }
                 let templates: Templates = self.session.owner_request(
                     Method::Post,
-                    "/api/native/templates",
+                    &format!("/api/native/templates?network={canonical}"),
                     Some(&json!({})),
                     now,
                     false,
