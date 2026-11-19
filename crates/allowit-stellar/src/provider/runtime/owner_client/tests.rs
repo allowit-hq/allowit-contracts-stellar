@@ -356,10 +356,12 @@ fn the_wallet_asset_is_the_asset_of_the_servers_template_of_the_network() {
         json!({"network": network, "profiles": [], "asset": asset, "assetSymbol": symbol,
             "assetIssuer": issuer, "maxFeeUnits": 100_000, "tiers": {}})
     };
+    let server = selection().config.server;
     let read = |templates: Value, network: &str| {
         super::wallet_asset(
-            serde_json::from_value(json!({ "templates": templates })).unwrap(),
+            serde_json::from_value(json!({ "templates": templates, "server": server })).unwrap(),
             network,
+            &server,
         )
     };
     const PUBNET_ISSUER: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
@@ -394,6 +396,24 @@ fn the_wallet_asset_is_the_asset_of_the_servers_template_of_the_network() {
     renamed["assetSymbol"] = json!("USDC");
     renamed["assetIssuer"] = json!(PUBNET_ISSUER);
     assert!(read(json!([renamed]), "stellar:pubnet").is_err());
+    // A server whose signer on the network is another key than the configured authority's, or
+    // a server that states no signer: nothing is signed for a wallet that it would not serve.
+    let valid = json!([template("stellar:pubnet", "USDC", Some(PUBNET_ISSUER))]);
+    for stated in [json!(selection().config.agent), Value::Null] {
+        let refused = super::wallet_asset(
+            serde_json::from_value(json!({ "templates": valid, "server": stated })).unwrap(),
+            "stellar:pubnet",
+            &server,
+        )
+        .unwrap_err();
+        assert!(refused.message.contains("server authority"), "{stated}");
+    }
+    let unstated = super::wallet_asset(
+        serde_json::from_value(json!({ "templates": valid })).unwrap(),
+        "stellar:pubnet",
+        &server,
+    );
+    assert!(unstated.is_err());
 }
 /// A request ID binds its intent, the wallet asset included, also while nothing is signed: a
 /// run for another asset or another amount under the same ID is refused and signs nothing. A

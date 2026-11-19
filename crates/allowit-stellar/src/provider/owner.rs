@@ -219,8 +219,12 @@ impl OwnerProvider for Owner {
         // retains keeps its own asset: its resume does not depend on the template of today.
         // Such a resume asks the server nothing before its retained bytes are settled on the
         // ledger, as before: the owner's session starts at the registration.
-        let store = (cx.store)()?;
-        let (asset, session) = match workflow::retained_setup_asset(&store, r.request_id)? {
+        // The journal is open for the read of the retained request only: the sign-in and the
+        // template request hold no lock, so a slow server holds up no payment and no recovery
+        // of the same journal. The workflow opens the journal again and checks the request
+        // identity, the asset included, against whatever the journal retains by then.
+        let retained = workflow::retained_setup_asset(&(cx.store)()?, r.request_id)?;
+        let (asset, session) = match retained {
             Some(asset) => (asset, None),
             None => {
                 let client = client(cx)?;
@@ -230,6 +234,7 @@ impl OwnerProvider for Owner {
         };
         let request = request(asset);
         request.validate()?;
+        let store = (cx.store)()?;
         let mut configured = workflow::configure_native(
             &runtime,
             &store,

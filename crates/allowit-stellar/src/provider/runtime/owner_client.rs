@@ -50,6 +50,9 @@ struct OperationAdvertisement {
 #[derive(Deserialize)]
 struct Templates {
     templates: Vec<Template>,
+    /// The server's signer on the network of the request.
+    #[serde(default)]
+    server: Option<String>,
 }
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -183,8 +186,20 @@ fn lower_hash(value: &str) -> Result<()> {
 /// The issued asset that a Native wallet of `network` holds: the asset of the server's one
 /// template of the network, which must be the asset of its own contract address. `None` is a
 /// wallet that holds XLM. A server without a template of the network sets up no wallet there.
-fn wallet_asset(templates: Templates, network: &str) -> Result<Option<native::owner::Trustline>> {
+/// The server's signer on the network must be `server`, the key of the independently
+/// configured authority: the wallet takes that key as its server signer, and a server that
+/// signs with another key would never register or co-sign for the wallet.
+fn wallet_asset(
+    templates: Templates,
+    network: &str,
+    server: &str,
+) -> Result<Option<native::owner::Trustline>> {
     let canonical = crate::host::routing::normalize(network)?;
+    if templates.server.as_deref() != Some(server) {
+        return Err(Error::config(
+            "The server's signer on this network differs from the configured server authority",
+        ));
+    }
     let mut matching = templates
         .templates
         .into_iter()
@@ -209,21 +224,28 @@ fn wallet_asset(templates: Templates, network: &str) -> Result<Option<native::ow
         }))
 }
 impl OwnerClient {
-    /// The issued asset of a new Native wallet on `network`, from the server's template.
+    /// The issued asset of a new Native wallet on `network`, from the server's template. The
+    /// request names the network by its id, and the server's signer on it must be the key of
+    /// the configured authority.
     pub fn native_wallet_asset(
         &self,
         network: &str,
         now: u64,
     ) -> Result<Option<native::owner::Trustline>> {
+        let authority = self.authority.as_ref().ok_or_else(|| {
+            Error::config("Owner action requires independently configured server authority")
+        })?;
+        let network = crate::host::routing::normalize(network)?;
         wallet_asset(
             self.session.owner_request(
                 Method::Post,
-                "/api/native/templates",
+                &format!("/api/native/templates?network={network}"),
                 Some(&json!({})),
                 now,
                 false,
             )?,
             network,
+            authority.public_key(),
         )
     }
     pub fn new(backend: &str, origin: &str, owner: &str) -> Result<Self> {
