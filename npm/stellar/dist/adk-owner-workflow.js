@@ -138,8 +138,8 @@ export async function deployAdkOwnerDraft({ host, proposal, session, agent, amou
         if (!walletPattern.test(expectedWallet) || journal.wallet && journal.wallet !== expectedWallet)
             throw new Error('The saved wallet does not match the reviewed policy.');
         const [registry, service] = await Promise.all([
-            host.request(`native/templates?network=${network}`, {}, options),
-            host.request(`native/config?network=${network}`, undefined, options),
+            host.request('native/templates', {}, options),
+            host.request('native/config?network=stellar:testnet', undefined, options),
         ]);
         const template = registry.templates.find(item => item.network === network);
         const wasmHash = template?.tiers.common;
