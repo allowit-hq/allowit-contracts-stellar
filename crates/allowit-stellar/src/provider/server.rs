@@ -1580,9 +1580,10 @@ impl crate::host::vendors::RuntimeProvider for Provider {
     fn lapsed(&self, p: &Prepared) -> Result<bool> {
         self.network(p.network())?;
         let p = prepared(p)?;
-        // The same proofs as the agent client's: a payment authorization lapses when no
-        // transaction settled it by its expiry ledger, a policy wallet operation when its
-        // authorization can no longer run and the history holds no execution of it.
+        // The rail's evidence: a payment authorization lapses when no transaction settled it by
+        // its expiry ledger, a policy wallet operation when its authorization can no longer run
+        // and the history, read through the ledger that showed the expiry, holds no execution
+        // of it.
         if p.payment_authorization.is_some() {
             return checked(native::seller_settled::lapsed(self.rpc(), &p));
         }
@@ -2408,7 +2409,7 @@ mod capability_tests {
             Ok(expected["result"].clone())
         }
     }
-    /// The server reads a lapse as the agent client does (`rpc::operation_lapsed`). Once a ledger
+    /// The server reads the lapse of a policy wallet operation (`rpc::operation_lapsed`). Once a ledger
     /// closed at or after the signed time bound, the wallet runs the operation in no envelope, so
     /// the wallet's events read then hold every execution of it, in any envelope: none found, the
     /// operation lapsed. Once the history no longer holds the preparation's ledger, nothing proves
@@ -2427,6 +2428,8 @@ mod capability_tests {
             /// An execution of the operation, in an envelope that another account sent.
             executed: bool,
             events_fail: bool,
+            /// The latest ledger of the event read; the transaction read's is 900.
+            events_latest: u64,
             wallet: String,
             from: u32,
             calls: std::sync::Mutex<Vec<String>>,
@@ -2456,19 +2459,20 @@ mod capability_tests {
                         } else {
                             serde_json::json!([])
                         };
-                        Ok(serde_json::json!({"events": events, "latestLedger": 900}))
+                        Ok(serde_json::json!({"events": events, "latestLedger": self.events_latest}))
                     }
                     other => panic!("unexpected {other}"),
                 }
             }
         }
-        let read = |status, closed, oldest, executed, events_fail| {
+        let read_through = |status, closed, oldest, executed, events_fail, events_latest| {
             let ledger = Arc::new(Ledger {
                 status,
                 closed,
                 oldest,
                 executed,
                 events_fail,
+                events_latest,
                 wallet: p.config.wallet.clone(),
                 from: p.state.ledger,
                 calls: std::sync::Mutex::new(Vec::new()),
@@ -2477,6 +2481,9 @@ mod capability_tests {
             let lapsed = provider.lapsed(&provider.packet(&p).unwrap());
             let calls = ledger.calls.lock().unwrap().clone();
             (lapsed, calls)
+        };
+        let read = |status, closed, oldest, executed, events_fail| {
+            read_through(status, closed, oldest, executed, events_fail, 900)
         };
         let from = u64::from(p.state.ledger);
         // An operation that the agent never submitted: retired once the bound passed, also long
@@ -2516,6 +2523,16 @@ mod capability_tests {
         }
         // A reply without its history proves nothing.
         assert!(!read("NOT_FOUND", p.expires_at, 0, false, false).0.unwrap());
+        // An event read that does not reach the ledger that showed the expiry could miss an
+        // execution in the ledgers between: it proves nothing, and the operation stays open.
+        let (lapsed, calls) = read_through("NOT_FOUND", p.expires_at, from, false, false, 899);
+        assert!(!lapsed.unwrap());
+        assert_eq!(calls, ["getTransaction", "getEvents"]);
+        assert!(
+            read_through("NOT_FOUND", p.expires_at, from, false, false, 901)
+                .0
+                .unwrap()
+        );
     }
     /// The server cosigns no operation of a wallet whose instance lapsed after the operation's
     /// last simulation: the lapse is `contract_expired` before the signer is asked.

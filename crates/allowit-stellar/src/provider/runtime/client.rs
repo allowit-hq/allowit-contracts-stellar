@@ -984,9 +984,11 @@ pub fn status(c: &Client, journal: &Store, id: &str, wait: Duration) -> Result<E
 ///
 /// `wait` bounds only the engine status reads after the submit answer. Prepare and submit each
 /// wait up to [`ENGINE_TIMEOUT`] for the engine: a submit that stops early leaves its outcome
-/// unknown, so no caller bound ends it. A status answer that reports a released policy wallet
-/// operation also starts the lapse proof on the caller's RPC, which keeps its own timeouts and
-/// runs to its end, because a half-read proof decides nothing.
+/// unknown, so no caller bound ends it. A status answer that reports a released payment
+/// authorization also starts the lapse proof on the caller's RPC, which keeps its own timeouts
+/// and runs to its end, because a half-read proof decides nothing. A policy wallet operation
+/// that the engine released without a receipt stays `submissionUnknown`: the client decides no
+/// outcome from its lapse.
 pub fn exec(
     c: &Client,
     journal: &Store,

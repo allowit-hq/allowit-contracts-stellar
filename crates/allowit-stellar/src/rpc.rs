@@ -980,7 +980,8 @@ fn owner_never_applied(reply: &Value, hash: &str, expires_at: u64, since: u64) -
 /// executed. The time bound alone proves no lapse: once the history no longer holds the
 /// preparation's ledger, the operation stays open. `false` before
 /// that ledger, when its prepared transaction succeeded, when the RPC does not show the closing
-/// time or a history that holds the preparation, or when an execution is found; a read that fails
+/// time or a history that holds the preparation, when an execution is found, or when the event
+/// read does not reach the ledger that showed the expiry; a read that fails
 /// is an error, never a lapse.
 pub fn operation_lapsed(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<bool> {
     if p.config.route != WalletRoute::PolicyWallet {
@@ -998,16 +999,18 @@ pub fn operation_lapsed(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<bool> {
     }
     // The history starts after the preparation: an execution in it could be gone, so the time
     // bound alone proves nothing. A reply without its history bounds proves nothing either.
-    match number("oldestLedger") {
-        Some(oldest) if oldest != 0 && oldest <= u64::from(p.state.ledger) => {
-            Ok(!executed(rpc, p)?)
+    match (number("oldestLedger"), number("latestLedger")) {
+        (Some(oldest), Some(latest)) if oldest != 0 && oldest <= u64::from(p.state.ledger) => {
+            Ok(executed(rpc, p, latest)? == Some(false))
         }
         _ => Ok(false),
     }
 }
 /// Whether the wallet's events from the ledger of `p`'s preparation on hold an execution of `p`:
-/// its `allowit` event of the operation id, in any envelope.
-fn executed(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<bool> {
+/// its `allowit` event of the operation id, in any envelope. `None` when no event is found and
+/// the read does not reach the ledger `through`, which showed the expiry: an execution in the
+/// ledgers between could be missing.
+fn executed(rpc: &dyn Rpc, p: &PreparedOperation, through: u64) -> Result<Option<bool>> {
     let topics = [
         xdr(&value_symbol("allowit")?)?,
         xdr(&value_bytes(&p.request.operation.nonce)?)?,
@@ -1020,10 +1023,17 @@ fn executed(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<bool> {
             "pagination": {"limit": 1},
         }),
     )?;
-    Ok(!reply["events"]
+    if !reply["events"]
         .as_array()
         .ok_or("Missing ledger events")?
-        .is_empty())
+        .is_empty()
+    {
+        return Ok(Some(true));
+    }
+    Ok(reply["latestLedger"]
+        .as_u64()
+        .is_some_and(|latest| latest >= through)
+        .then_some(false))
 }
 /// The settlement of the policy wallet operation `p`, found by the wallet's `allowit` event of
 /// its operation id. The settled transaction is the sealed one, so its hash is not the prepared
