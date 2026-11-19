@@ -148,6 +148,12 @@ export declare function signedNativeSetupOf(signedPayload: string, network: stri
     asset: NativeWalletAsset;
     amount: string;
 } | null;
+/**
+ * Checks that signed setup bytes set up a wallet of `asset`, the asset of the reviewed policy, or of XLM without one:
+ * Core's `keypairSetup.checkAsset`. Throws an error whose `code` is `asset_mismatch` when they set up another asset,
+ * when they are no signed setup of `network`, or when `asset` is no Stellar asset.
+ */
+export declare function checkNativeSetupAsset(signedPayload: string, network: string, asset?: NativeWalletAsset | null | undefined): void;
 /** Sends signed setup bytes to Horizon. The ledger of the successful transaction, or null without a certain answer. */
 export declare function sendNativeSetup(network: string, signedPayload: string, hash: string, send?: typeof fetch): Promise<number | null>;
 /** The SEP-53 digest of a wallet message, as lowercase hexadecimal. */

@@ -313,6 +313,26 @@ export function signedNativeSetupOf(signedPayload, network) {
         return null;
     }
 }
+/**
+ * Checks that signed setup bytes set up a wallet of `asset`, the asset of the reviewed policy, or of XLM without one:
+ * Core's `keypairSetup.checkAsset`. Throws an error whose `code` is `asset_mismatch` when they set up another asset,
+ * when they are no signed setup of `network`, or when `asset` is no Stellar asset.
+ */
+export function checkNativeSetupAsset(signedPayload, network, asset) {
+    const refused = (message) => Object.assign(new Error(message), { code: 'asset_mismatch' });
+    let expected;
+    try {
+        expected = assetOf(issuedAsset(asset));
+    }
+    catch {
+        throw refused('The asset of the reviewed policy is not a Stellar asset. The signed wallet setup stays saved.');
+    }
+    const signed = signedNativeSetupOf(signedPayload, network);
+    if (!signed)
+        throw refused('The saved wallet setup is not signed setup bytes of this network, so its asset cannot be read. It stays saved.');
+    if (signed.asset.symbol !== expected.symbol || signed.asset.issuer !== expected.issuer)
+        throw refused(`The signed wallet setup is for ${signed.asset.symbol}, and the reviewed policy pays in ${expected.symbol}. It stays saved; resume the policy of that setup.`);
+}
 /** Sends signed setup bytes to Horizon. The ledger of the successful transaction, or null without a certain answer. */
 export async function sendNativeSetup(network, signedPayload, hash, send = fetch) {
     const base = horizonOrigin(network);

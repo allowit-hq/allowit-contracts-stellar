@@ -1,6 +1,6 @@
 import { Keypair } from '@stellar/stellar-sdk/base';
 import { expiredRecord, horizonGet } from './chain-record.js';
-import { OWNER_WEIGHT, approvalStep, nativeApprovalHolds, nativeWalletConfiguration, policyApproval, prepareNativeSetup, sendNativeSetup, signedNativeSetupOf } from './native-wallet.js';
+import { OWNER_WEIGHT, approvalStep, checkNativeSetupAsset, nativeApprovalHolds, nativeWalletConfiguration, policyApproval, prepareNativeSetup, sendNativeSetup, signedNativeSetupOf } from './native-wallet.js';
 const object = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 /** The record of a transaction in the public ledger history. */
 async function transaction(network, hash) {
@@ -41,6 +41,7 @@ export const ownerChain = Object.freeze({
     keypairSetup: Object.freeze({
         prepare: prepareNativeSetup,
         read: signedNativeSetupOf,
+        checkAsset: checkNativeSetupAsset,
         send: (network, signedPayload, hash) => sendNativeSetup(network, signedPayload, hash),
         configuration: nativeWalletConfiguration,
     }),
