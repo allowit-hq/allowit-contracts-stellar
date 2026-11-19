@@ -435,6 +435,68 @@ fn the_wallet_asset_is_the_asset_of_the_servers_template_of_the_network() {
     assert!(stated(&server, &other).is_ok());
     let refused = stated(&other, &server).unwrap_err();
     assert!(refused.message.contains("server authority"));
+    // The setup decodes the template of its network only: a field of another network's
+    // template in a form that it does not know does not stop it. The contract-wallet
+    // generation keeps its own decoder, which reads no signer in any form.
+    let mut unknown = template("stellar:testnet", "XLM", None);
+    unknown["server"] = json!({});
+    unknown["asset"] = json!(7);
+    let beside = super::wallet_asset(
+        serde_json::from_value(json!({
+            "templates": [template("stellar:pubnet", "USDC", Some(PUBNET_ISSUER)), unknown],
+            "server": server,
+        }))
+        .unwrap(),
+        "stellar:pubnet",
+        &server,
+    );
+    assert!(beside.is_ok(), "{:?}", beside.err().map(|e| e.message));
+    let mut typed = template("stellar:testnet", "XLM", None);
+    typed["server"] = json!({});
+    assert!(
+        serde_json::from_value::<super::Templates>(json!({ "templates": [typed], "server": {} }))
+            .is_ok()
+    );
+}
+/// The Native setup asks the server for the templates of its own network: the request names
+/// the network id, and the answer's signer is compared with the configured authority.
+#[test]
+#[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
+fn the_native_template_request_names_its_network() {
+    let now = wire::now();
+    let read = |stated: Value| {
+        let mut plan = wire::Plan::new(&account(11));
+        plan.templates["server"] = stated;
+        let server = wire::Server::new(plan);
+        let mut client = OwnerClient::with_authority(
+            &authority(&server.url),
+            "http://localhost:5173",
+            &account(11),
+        )
+        .unwrap();
+        client.authenticate(&key(), now).unwrap();
+        let asset = client.native_wallet_asset("stellar:testnet", now);
+        assert_eq!(
+            server.calls("/api/native/templates?network=stellar:testnet"),
+            1
+        );
+        assert_eq!(server.calls("/api/native/templates"), 0);
+        asset
+    };
+    // The fixture's template of Testnet is in USDC, and the authority's key is account 13.
+    assert_eq!(
+        read(json!(account(13))).unwrap(),
+        Some(crate::owner::Trustline {
+            code: "USDC".into(),
+            issuer: USDC_ISSUER.into(),
+        })
+    );
+    let refused = read(json!(account(14))).unwrap_err();
+    assert!(
+        refused.message.contains("server authority"),
+        "{}",
+        refused.message
+    );
 }
 /// A request ID binds its intent, the wallet asset included, also while nothing is signed: a
 /// run for another asset or another amount under the same ID is refused and signs nothing. A

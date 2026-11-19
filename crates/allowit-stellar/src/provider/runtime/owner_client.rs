@@ -50,7 +50,24 @@ struct OperationAdvertisement {
 #[derive(Deserialize)]
 struct Templates {
     templates: Vec<Template>,
+}
+/// The templates answer as the Native setup reads it. The setup decodes the server's signer
+/// and the one template of its network; it does not decode a template of another network. The
+/// contract-wallet generation keeps its own decoder, [`Templates`], which reads no signer.
+#[derive(Deserialize)]
+struct NativeTemplates {
+    templates: Vec<Value>,
     /// The server's signer on the network of the request.
+    #[serde(default)]
+    server: Value,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeTemplate {
+    asset: String,
+    asset_symbol: String,
+    asset_issuer: Option<String>,
+    /// The server's signer on the template's network, when the server states it per template.
     #[serde(default)]
     server: Option<String>,
 }
@@ -64,9 +81,6 @@ struct Template {
     asset_issuer: Option<String>,
     #[serde(rename = "maxFeeUnits")]
     max_fee_stroops: u32,
-    /// The server's signer on the template's network, when the server states it per template.
-    #[serde(default)]
-    server: Option<String>,
 }
 #[derive(Deserialize)]
 struct Installations {
@@ -193,32 +207,36 @@ fn lower_hash(value: &str) -> Result<()> {
 /// configured authority: the wallet takes that key as its server signer, and a server that
 /// signs with another key would never register or co-sign for the wallet.
 fn wallet_asset(
-    templates: Templates,
+    templates: NativeTemplates,
     network: &str,
     server: &str,
 ) -> Result<Option<native::owner::Trustline>> {
     let canonical = crate::host::routing::normalize(network)?;
-    if templates.server.as_deref() != Some(server) {
-        return Err(Error::config(
+    let other_signer = || {
+        Error::config(
             "The server's signer on this network differs from the configured server authority",
-        ));
+        )
+    };
+    if templates.server.as_str() != Some(server) {
+        return Err(other_signer());
     }
-    let mut matching = templates
-        .templates
-        .into_iter()
-        .filter(|t| crate::host::routing::normalize(&t.network).ok() == Some(canonical));
+    let mut matching = templates.templates.into_iter().filter(|template| {
+        template["network"]
+            .as_str()
+            .and_then(|named| crate::host::routing::normalize(named).ok())
+            == Some(canonical)
+    });
     let (Some(template), None) = (matching.next(), matching.next()) else {
         return Err(Error::config(
             "The server offers no Native wallet on this network",
         ));
     };
+    let invalid = || Error::config("The server's wallet asset of this network is invalid");
+    let template: NativeTemplate = serde_json::from_value(template).map_err(|_| invalid())?;
     // A server that states its signer on the template too states the same key there.
     if template.server.as_deref().is_some_and(|key| key != server) {
-        return Err(Error::config(
-            "The server's signer on this network differs from the configured server authority",
-        ));
+        return Err(other_signer());
     }
-    let invalid = || Error::config("The server's wallet asset of this network is invalid");
     let asset =
         native::asset_from_identity(&template.asset_symbol, template.asset_issuer.as_deref())
             .map_err(|_| invalid())?;
