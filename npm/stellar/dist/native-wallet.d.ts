@@ -10,6 +10,7 @@
  * send it again or replace it. The server takes no part in the setup.
  */
 import { type Transaction } from '@stellar/stellar-sdk/base';
+import type { ReviewedPolicy, WalletAsset } from '@allowit/core';
 /** The action of the owner step that creates the agent's wallet account. */
 export declare const SET_UP_WALLET = "set_up_wallet";
 /**
@@ -34,13 +35,11 @@ export declare const TRUSTLINE_RESERVE = 5000000n;
 /** The XLM that a new wallet holds above its reserve and its funding, in stroops. It pays the fees of the owner's own steps. */
 export declare const WALLET_FEE_FLOAT = 5000000n;
 /**
- * The asset that a wallet holds, by its code and its issuer. XLM has no issuer. A policy names its asset this way, and
- * the server's template of a network decides it.
+ * The asset that a wallet holds, by its code and its issuer: Core's `WalletAsset`, under the name of this rail's
+ * wallet. XLM has no issuer. A policy names its asset this way, and the server's template of a network decides it.
+ * This module validates it as a Stellar asset and converts it.
  */
-export interface NativeWalletAsset {
-    symbol: string;
-    issuer: string | null;
-}
+export type NativeWalletAsset = WalletAsset;
 /**
  * The XLM that a new wallet starts with, in stroops. A wallet that holds XLM starts with its reserve, its fee float and
  * the owner's funding. A wallet that holds an issued asset (`issued`) starts with its reserve, the reserve of its
@@ -176,17 +175,10 @@ export interface PolicyApproval {
  */
 export declare function policyApproval(message: unknown, network: string): PolicyApproval | null;
 /**
- * The policy that the owner reviewed before an approval: its exact source and every value. Its ordered rules and its
- * tier, which the service derives from the source, are checked too when the host states them. `asset` is the asset
- * that the reviewed policy pays in; without one it is XLM.
+ * The policy that the owner reviewed before an approval is Core's `ReviewedPolicy`: its exact source and every value,
+ * its ordered rules and its tier when the host states them, and the asset that it pays in, which is XLM without one.
  */
-export interface ReviewedPolicy {
-    source: string;
-    params: Record<string, unknown>;
-    rules?: unknown;
-    tier?: unknown;
-    asset?: NativeWalletAsset | null;
-}
+export type { ReviewedPolicy };
 /**
  * Whether a policy approval of `wallet` is exactly what the owner reviewed. Every field that the wallet signs is
  * checked: the policy and its revision come from the service; the source, rules, values and tier must be the

@@ -1549,7 +1549,9 @@ struct NativeSetupRecord {
 /// builds the same request whatever the server's template names now; the resume then checks
 /// the retained signed bytes against that request. A request that stopped before its
 /// signature retains nothing that the owner signed: its next run takes the asset from the
-/// server's template again, as a new request does.
+/// server's template again, as a new request does. A request ID binds its intent, the asset
+/// included: when the template names another asset by then, the run is refused as another
+/// intent, and the setup for that asset takes a new request ID.
 pub fn retained_setup_asset(
     store: &Store,
     request_id: &str,
@@ -1758,34 +1760,15 @@ pub fn configure_native(
     }
     network(runtime.rpc(), &request.network)?;
     let identity = intent_hash(&setup_identity(request))?;
-    // A request that stopped before its signature takes the wallet asset of the server's
-    // template again. When the template names another asset by then, the unsigned record
-    // differs from this request in that asset only: nothing of it was signed, so the request
-    // is prepared again, as a new request is. Any other difference, and any difference of a
-    // signed record, is another intent.
-    let asset_alone_differs = |record: &NativeSetupRecord| -> Result<bool> {
-        let earlier = crate::provider::runtime::owner::SetupRequest {
-            network: request.network.clone(),
-            owner: request.owner.clone(),
-            agent: request.agent.clone(),
-            server: request.server.clone(),
-            request_id: request.request_id.clone(),
-            fee_per_operation: request.fee_per_operation,
-            asset: record.setup.trustline.clone(),
-            funding: request.funding,
-        };
-        Ok(record.signed_xdr.is_none()
-            && record.identity == intent_hash(&setup_identity(&earlier))?)
-    };
     let mut made = None;
     let mut record = match store.load::<NativeSetupRecord>(&request.request_id)? {
         Some(record) if record.identity == identity => record,
-        Some(record) if !asset_alone_differs(&record)? => {
+        Some(_) => {
             return Err(Error::config(
                 "Native setup request ID already binds another intent",
             ));
         }
-        _ => {
+        None => {
             let key = checked(native::owner::WalletKey::random())?;
             let wallet = key.account();
             made = Some(key);

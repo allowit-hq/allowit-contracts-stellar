@@ -11,6 +11,7 @@
  */
 import {Account, Asset, Keypair, Memo, Operation, StrKey, TransactionBuilder, xdr, type Transaction} from '@stellar/stellar-sdk/base';
 import {sha256} from '@noble/hashes/sha256';
+import type {ReviewedPolicy, WalletAsset} from '@allowit/core';
 import {canonicalNetwork, networkPassphrase} from './networks.js';
 import {horizonOrigin} from './chain-record.js';
 import {stellarAssetContract} from './stellar-asset.js';
@@ -63,10 +64,11 @@ function currentEnvelope(payload: string): boolean {
 }
 
 /**
- * The asset that a wallet holds, by its code and its issuer. XLM has no issuer. A policy names its asset this way, and
- * the server's template of a network decides it.
+ * The asset that a wallet holds, by its code and its issuer: Core's `WalletAsset`, under the name of this rail's
+ * wallet. XLM has no issuer. A policy names its asset this way, and the server's template of a network decides it.
+ * This module validates it as a Stellar asset and converts it.
  */
-export interface NativeWalletAsset {symbol: string; issuer: string | null}
+export type NativeWalletAsset = WalletAsset;
 /**
  * The issued asset of `asset`, or null for XLM and for no asset. Any other value is refused, and so is an issued
  * asset with the code XLM: every amount of it would read as XLM.
@@ -405,11 +407,10 @@ export function policyApproval(message: unknown, network: string): PolicyApprova
 }
 
 /**
- * The policy that the owner reviewed before an approval: its exact source and every value. Its ordered rules and its
- * tier, which the service derives from the source, are checked too when the host states them. `asset` is the asset
- * that the reviewed policy pays in; without one it is XLM.
+ * The policy that the owner reviewed before an approval is Core's `ReviewedPolicy`: its exact source and every value,
+ * its ordered rules and its tier when the host states them, and the asset that it pays in, which is XLM without one.
  */
-export interface ReviewedPolicy {source: string; params: Record<string, unknown>; rules?: unknown; tier?: unknown; asset?: NativeWalletAsset | null}
+export type {ReviewedPolicy};
 /**
  * The fields of an approval that the server derives for its own records: its digests of the source and the name of
  * its installation. A Native wallet enforces none of them.

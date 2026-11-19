@@ -24,8 +24,14 @@ pub const MAX_SETUP_FUNDING: i64 =
     native::owner::MAX_STARTING_BALANCE - native::owner::default_starting_balance(false);
 impl SetupRequest {
     pub fn validate(&self) -> Result<()> {
-        native::passphrase(&self.network)
-            .map_err(|_| Error::unsupported("Native wallet setup needs a Stellar network"))?;
+        // A request names its network by the canonical id. An alias would be another request
+        // identity for the same ledger; the provider resolves a caller's alias before it builds
+        // the request.
+        if crate::host::routing::normalize(&self.network).ok() != Some(self.network.as_str()) {
+            return Err(Error::unsupported(
+                "Native wallet setup needs a Stellar network, named by its network id",
+            ));
+        }
         // An issued asset with the code of the network's own asset reads as that asset in
         // every amount, so no wallet holds one.
         if let Some(asset) = &self.asset

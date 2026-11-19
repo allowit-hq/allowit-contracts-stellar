@@ -60,8 +60,11 @@ pub fn validate_retained_owner_transaction(original: &OwnerTransaction) -> Resul
                 let function = call.function_name.0.as_slice();
                 // A server retains each step under its own name for the owner action. Those
                 // names describe these contract calls; a pause and a resume differ only in
-                // the first argument.
-                function == original.action.as_bytes()
+                // the first argument. The setup and the close of a wallet account are classic
+                // transactions only: no contract call stands for them, whatever its function
+                // is named.
+                !matches!(original.action.as_str(), "native_setup" | "close")
+                    && function == original.action.as_bytes()
                     || match (original.action.as_str(), function) {
                         // A creation runs through the network's deployer.
                         ("create_wallet", b"deploy")

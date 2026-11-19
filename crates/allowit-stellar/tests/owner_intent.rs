@@ -1146,6 +1146,31 @@ fn a_setup_of_an_issued_asset_is_signed_only_for_its_exact_asset_and_amount() {
             "{name}"
         );
     }
+    // No contract call stands for the setup or the close of a wallet account, whatever its
+    // function is named.
+    for action in ["native_setup", "close"] {
+        let mut call = packet.clone();
+        call.action = action.into();
+        modify_tx(&mut call, |tx| {
+            tx.operations = vec![x::Operation {
+                source_account: None,
+                body: x::OperationBody::InvokeHostFunction(x::InvokeHostFunctionOp {
+                    host_function: x::HostFunction::InvokeContract(x::InvokeContractArgs {
+                        contract_address: x::ScAddress::Contract(x::ContractId(x::Hash([7; 32]))),
+                        function_name: symbol(action),
+                        args: vec![].try_into().unwrap(),
+                    }),
+                    auth: vec![].try_into().unwrap(),
+                }),
+            }]
+            .try_into()
+            .unwrap();
+        });
+        assert!(
+            validate_retained_owner_transaction(&call).is_err(),
+            "a contract call named {action}"
+        );
+    }
     // A setup with the trustline alone stays a setup.
     let unfunded = reordered(&|ops| {
         ops.remove(2);
