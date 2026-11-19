@@ -88,8 +88,8 @@ impl Trustline {
     }
     /// An issued asset with the code of the network's own asset reads as that asset in every
     /// amount, so no new setup names one and no setup funds one. The builder of earlier
-    /// releases could add such a trustline without funding: that setup stays readable as
-    /// retained history.
+    /// releases could add such a trustline on Testnet, without funding: that setup stays
+    /// readable as retained history.
     fn names_the_native_code(&self) -> bool {
         self.code == "XLM"
     }
@@ -178,9 +178,7 @@ fn asset_funding(v: &NativeSetup) -> Result<Option<i64>> {
         return Ok(None);
     };
     let units: i64 = text.parse().map_err(err)?;
-    if v.trustline
-        .as_ref()
-        .is_none_or(Trustline::names_the_native_code)
+    if v.trustline.is_none()
         || !(1..=MAX_ASSET_FUNDING).contains(&units)
         || units.to_string() != *text
     {
@@ -204,7 +202,22 @@ fn transaction(v: &NativeSetup) -> Result<Transaction> {
 /// builds a setup with the memo of its request, and [`is_setup_transaction`] builds the setup
 /// of given bytes again: bytes are a setup only when this builder makes exactly them.
 fn setup_transaction(v: &NativeSetup, memo: [u8; 32]) -> Result<Transaction> {
+    // A setup names its network by the network id, when it is prepared and when it is read
+    // again. An alias selects the same ledger and the same transaction, and would give that
+    // transaction a second intent digest.
+    if !is_network_id(&v.network) {
+        return Err("A native setup names its network by its network id".into());
+    }
     passphrase(&v.network)?;
+    // An issued asset with the code of the network's own asset is in one setup only: the
+    // unfunded Testnet setup that the builder of earlier releases made, which stays readable.
+    if v.trustline
+        .as_ref()
+        .is_some_and(Trustline::names_the_native_code)
+        && (v.network != "stellar:testnet" || v.funding.is_some())
+    {
+        return Err("A wallet holds no issued asset with the code XLM".into());
+    }
     let owner = account_key(&v.owner)?;
     let wallet = account_key(&v.wallet)?;
     let agent = account_key(&v.agent)?;
@@ -445,11 +458,7 @@ pub fn prepare_native_setup(
     now: u64,
 ) -> Result<NativeSetup> {
     check_owner_source(state)?;
-    // A new setup names its network by the network id. An alias selects the same ledger and
-    // the same transaction, and would give that transaction a second intent digest.
-    if !is_network_id(terms.network) {
-        return Err("A native setup names its network by its network id".into());
-    }
+    // No new setup names an issued asset with the code XLM, on any network.
     if terms
         .trustline
         .is_some_and(Trustline::names_the_native_code)
@@ -1140,9 +1149,15 @@ mod tests {
         // readable as a retained setup. The funded form, which no builder made, does not.
         let memo = hash(unfunded.request_id.as_bytes());
         let mut earlier = unfunded.clone();
+        assert_eq!(earlier.network, "stellar:testnet");
         earlier.trustline = Some(native_code);
         let bytes = setup_transaction(&earlier, memo).unwrap();
         assert!(is_setup_transaction(&bytes, &earlier.network));
+        // The earlier builder made it on Testnet only: the same bytes are no setup of pubnet.
+        assert!(!is_setup_transaction(&bytes, "stellar:pubnet"));
+        let mut elsewhere = earlier.clone();
+        elsewhere.network = "stellar:pubnet".into();
+        assert!(setup_transaction(&elsewhere, memo).is_err());
         earlier.funding = Some("100000".into());
         earlier.fee_stroops = 600;
         assert!(setup_transaction(&earlier, memo).is_err());
@@ -1172,9 +1187,20 @@ mod tests {
         assert_eq!(testnet.transaction_xdr, pubnet.transaction_xdr);
         assert_ne!(testnet.transaction_hash, pubnet.transaction_hash);
         assert!(prepared("stellar:futurenet").is_err());
-        // An alias of a network is no second name of a setup.
+        // An alias of a network is no second name of a setup: not when it is prepared, and
+        // not in a retained record whose digest was computed for the alias.
         assert!(passphrase("stellar:mainnet").is_ok());
         assert!(prepared("stellar:mainnet").is_err());
+        let mut aliased = pubnet.clone();
+        aliased.network = "stellar:mainnet".into();
+        aliased.intent_digest = intent_digest(&aliased).unwrap();
+        assert_ne!(aliased.intent_digest, pubnet.intent_digest);
+        assert!(validate_native_setup(&aliased).is_err());
+        let TransactionEnvelope::Tx(envelope) = read(&pubnet.transaction_xdr).unwrap() else {
+            panic!()
+        };
+        assert!(is_setup_transaction(&envelope.tx, "stellar:pubnet"));
+        assert!(!is_setup_transaction(&envelope.tx, "stellar:mainnet"));
         // The bytes of one network are no setup of the other.
         let mut moved = testnet.clone();
         moved.network = "stellar:pubnet".into();
