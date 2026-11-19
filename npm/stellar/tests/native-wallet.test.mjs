@@ -126,6 +126,26 @@ test('a wallet of an issued asset adds its trustline and takes its funding in th
     assert.throws(() => nativeSetupTransaction(terms(wallet, {asset})), /wallet asset is invalid/, JSON.stringify(asset));
 });
 
+test('the rail checks that signed setup bytes set up the reviewed asset, and refuses others with asset_mismatch', async () => {
+  const {fetch} = ledger();
+  const signedOf = async asset => {
+    const prepared = await prepareNativeSetup({network, ...roles, amount: '1', asset, fetch});
+    return prepared.complete(await ownerSigns([])(prepared.step));
+  };
+  const xlm = await signedOf(null), issued = await signedOf(usdc);
+  const check = ownerChain.keypairSetup.checkAsset;
+  // A policy without an asset, or with XLM, pays in XLM.
+  for (const asset of [undefined, null, {symbol: 'XLM', issuer: null}]) assert.equal(check(xlm, network, asset), undefined);
+  assert.equal(check(issued, network, {...usdc}), undefined);
+  const refused = (payload, asset, on = network) => assert.throws(() => check(payload, on, asset), error => error.code === 'asset_mismatch' && error.message.length > 0);
+  refused(xlm, usdc);
+  for (const asset of [undefined, null, {symbol: 'XLM', issuer: null}, mainnetUsdc, {symbol: 'USDC', issuer: null}, {symbol: 'EURC', issuer: usdc.issuer}, 'USDC'])
+    refused(issued, asset);
+  // Bytes that are no signed setup of the network have no asset to compare.
+  for (const payload of ['not-xdr', nativeSetupTransaction(terms(Keypair.random().publicKey())).toXDR()]) refused(payload, null);
+  refused(xlm, null, 'stellar:pubnet');
+});
+
 test('a setup that moves another asset, another amount or another XLM balance than its wallet takes is not read as one', () => {
   const wallet = Keypair.random().publicKey();
   const build = ops => {
