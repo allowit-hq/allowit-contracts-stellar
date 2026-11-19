@@ -378,8 +378,6 @@ pub fn capabilities(network: &str) -> crate::host::execution::Capabilities {
         operations: &["transfer", "deposit", "redeem"],
         build_only: true,
         verbs: match crate::host::routing::info(network) {
-            // A network that the rail does not serve has no verb.
-            Err(_) => &[],
             Ok(rail) if rail.testnet => &[
                 "keys fund",
                 "wallet setup",
@@ -398,6 +396,21 @@ pub fn capabilities(network: &str) -> crate::host::execution::Capabilities {
             // Every verb of a test network but its faucet.
             Ok(_) => &[
                 "wallet setup",
+                "wallet import",
+                "policy deploy",
+                "policy fund",
+                "policy activate",
+                "policy export",
+                "policy owner-status",
+                "wallet show",
+                "policy show",
+                "policy generate",
+                "exec",
+                "status",
+            ],
+            // A network outside the rail keeps the list that it had: no setup, which the
+            // setup refuses there.
+            Err(_) => &[
                 "wallet import",
                 "policy deploy",
                 "policy fund",
@@ -499,12 +512,17 @@ mod capability_tests {
             );
         }
     }
-    /// A network that the rail does not serve advertises no verb: the setup refuses it.
+    /// A network that the rail does not serve advertises no wallet setup, which the setup
+    /// refuses there, and keeps the other verbs that it had.
     #[test]
-    fn a_network_outside_the_rail_advertises_no_verb() {
+    fn a_network_outside_the_rail_advertises_no_wallet_setup() {
         for network in ["stellar:futurenet", "example:testnet", ""] {
             assert!(crate::host::routing::info(network).is_err(), "{network}");
-            assert!(super::capabilities(network).verbs.is_empty(), "{network}");
+            let verbs = super::capabilities(network).verbs;
+            assert!(!verbs.contains(&"wallet setup"), "{network}");
+            assert!(!verbs.contains(&"keys fund"), "{network}");
+            assert_eq!(verbs.len(), 11, "{network}");
+            assert!(verbs.contains(&"wallet import") && verbs.contains(&"exec"));
         }
     }
 }

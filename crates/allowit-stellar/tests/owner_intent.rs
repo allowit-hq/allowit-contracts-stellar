@@ -1146,8 +1146,8 @@ fn a_setup_of_an_issued_asset_is_signed_only_for_its_exact_asset_and_amount() {
             "{name}"
         );
     }
-    // No contract call stands for the setup or the close of a wallet account, whatever its
-    // function is named.
+    // No contract call stands for the setup of a wallet account, whatever its function is
+    // named. Every other action keeps the reading of a call that is named as the action.
     for action in ["native_setup", "close"] {
         let mut call = packet.clone();
         call.action = action.into();
@@ -1166,8 +1166,9 @@ fn a_setup_of_an_issued_asset_is_signed_only_for_its_exact_asset_and_amount() {
             .try_into()
             .unwrap();
         });
-        assert!(
+        assert_eq!(
             validate_retained_owner_transaction(&call).is_err(),
+            action == "native_setup",
             "a contract call named {action}"
         );
     }
