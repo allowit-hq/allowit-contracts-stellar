@@ -196,9 +196,10 @@ impl OwnerProvider for Owner {
                 )));
             }
         }
-        // The caller's own values, the RPC endpoint among them, are checked first: a setup that
-        // must fail asks the owner for no sign-in, opens no journal and asks the server
-        // nothing. The wallet asset is checked after the server's template names it.
+        // The caller's own values are checked first, the RPC endpoint and the network that it
+        // serves among them: a setup that must fail asks the owner for no sign-in, opens no
+        // journal and asks the server nothing. The wallet asset is checked after the server's
+        // template names it.
         let request = |asset| SetupRequest {
             network: network.into(),
             owner: cx.signer.address().into(),
@@ -211,6 +212,7 @@ impl OwnerProvider for Owner {
         };
         request(None).validate_caller_values()?;
         let runtime = runtime(cx.rpc_url)?;
+        workflow::network(runtime.rpc(), network)?;
         // The server's template of the network names the asset that the wallet holds. It is
         // read before anything is signed for the ledger, so a server that offers no wallet on
         // this network stops the setup before an account exists. A request that the store
@@ -235,6 +237,10 @@ impl OwnerProvider for Owner {
             &super::OwnerSignerRef(cx.signer),
             cx.clock,
         )?;
+        // The registration reads and writes no journal, so the journal's lock is released
+        // before the server is asked: a slow registration holds up no payment and no recovery
+        // of the same journal.
+        drop(store);
         // The ledger now holds the wallet. The server registers it from the ledger, so no
         // server configuration names it. A refusal leaves the wallet set up: the same request
         // ID asks again and signs nothing.
@@ -617,5 +623,89 @@ mod storage_boundary_tests {
                 "{selected}"
             );
         }
+    }
+    /// A setup whose RPC endpoint serves another network than the setup fails before the
+    /// journal opens and before the owner signs a sign-in. The loopback endpoint answers one
+    /// `getNetwork` with the Testnet passphrase, for a setup on pubnet.
+    #[test]
+    #[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
+    fn a_setup_with_an_rpc_of_another_network_fails_before_the_journal_and_the_sign_in() {
+        use std::io::{Read, Write};
+        struct Owner(String);
+        impl crate::host::Signer for Owner {
+            fn network(&self) -> &str {
+                "stellar:pubnet"
+            }
+            fn address(&self) -> &str {
+                &self.0
+            }
+            fn sign_hash(&self, _: &[u8]) -> Result<Vec<u8>> {
+                panic!("a setup on another network requested a signature")
+            }
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let rpc = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            let header = String::from_utf8(request).unwrap().to_ascii_lowercase();
+            let length: usize = header
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .map(|value| value.trim().parse().unwrap())
+                .unwrap();
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).unwrap();
+            let call: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(call["method"], "getNetwork");
+            let reply = serde_json::json!({"jsonrpc":"2.0","id":call["id"],
+                "result":{"passphrase":crate::passphrase("stellar:testnet").unwrap()}})
+            .to_string();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+        });
+        let server = crate::account_for_seed(&[13; 32]);
+        let authority = crate::host::config::ServerAuthority::validated(
+            "stellar:pubnet",
+            "http://localhost:3000",
+            &server,
+        )
+        .unwrap();
+        let signer = Owner(crate::account_for_seed(&[11; 32]));
+        let context = Context {
+            network: "stellar:pubnet",
+            backend: authority.origin(),
+            authority: &authority,
+            origin: "http://localhost:5173",
+            rpc_url: &url,
+            store: &|| panic!("a setup on another network requested a journal"),
+            signer: &signer,
+            clock: &|| Ok(1),
+        };
+        let error = OWNER
+            .setup(
+                &context,
+                owner::Setup {
+                    agent: &crate::account_for_seed(&[12; 32]),
+                    server: &server,
+                    request_id: "setup-network-001",
+                    fee_per_operation: "100",
+                    amount: None,
+                },
+            )
+            .unwrap_err();
+        rpc.join().unwrap();
+        assert_eq!(
+            error.message,
+            "Owner RPC network differs from the selected policy"
+        );
     }
 }

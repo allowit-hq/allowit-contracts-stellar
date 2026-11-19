@@ -379,7 +379,7 @@ pub fn amount_units(amount: &str) -> Result<i128> {
         .filter(|v| *v > 0);
     units.ok_or_else(|| Error::usage("Asset amount exceeds the supported positive range"))
 }
-fn network(rpc: &dyn rpc::Rpc, selected: &str) -> Result<()> {
+pub(crate) fn network(rpc: &dyn rpc::Rpc, selected: &str) -> Result<()> {
     if checked(rpc.call("getNetwork", json!({})))?["passphrase"]
         != checked(native::passphrase(selected))?
     {
@@ -1559,10 +1559,27 @@ pub fn retained_setup_asset(
     if !crate::host::request::request_id_valid(request_id) {
         return Err(Error::usage("Invalid Stellar setup request ID"));
     }
-    Ok(store
-        .load::<NativeSetupRecord>(request_id)?
-        .filter(|record| record.signed_xdr.is_some())
-        .map(|record| record.setup.trustline))
+    match store.load::<NativeSetupRecord>(request_id)? {
+        Some(record) if record.is_signed()? => Ok(Some(record.setup.trustline)),
+        _ => Ok(None),
+    }
+}
+impl NativeSetupRecord {
+    /// Whether the record holds the setup that the owner signed. A record without its signed
+    /// transaction is a request that stopped before its signature, and its next run prepares
+    /// another account. A record that lost its signed transaction and still holds the owner's
+    /// signature, the mark of a submission or a receipt is damaged: its setup may be on the
+    /// ledger, so no run replaces it with another account.
+    fn is_signed(&self) -> Result<bool> {
+        if self.signed_xdr.is_none()
+            && (self.signature.is_some() || self.submitted || self.receipt.is_some())
+        {
+            return Err(Error::uncertain(
+                "The retained Native setup lost its signed transaction; do not replace it",
+            ));
+        }
+        Ok(self.signed_xdr.is_some())
+    }
 }
 /// The server's first record of a wallet: the account, its roles and a policy that admits
 /// transfers of the wallet's asset, which is `asset` or XLM. The owner's generated policy
@@ -1775,8 +1792,9 @@ pub fn configure_native(
             prepare_setup(runtime, request, &identity, &wallet, clock()?)?
         }
     };
+    let unsigned = !record.is_signed()?;
     store.save(&request.request_id, &record)?;
-    if record.signed_xdr.is_none() {
+    if unsigned {
         let key = match made.take() {
             Some(key) => key,
             None => {

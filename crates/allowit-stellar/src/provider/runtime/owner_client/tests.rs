@@ -481,6 +481,36 @@ fn a_request_id_binds_its_asset_and_a_signed_setup_keeps_its_hints() {
         assert!(message.contains("failed validation"), "{field}: {message}");
     }
     store.save("setup-template-001", &kept).unwrap();
+    // A record that lost its signed transaction and still holds the owner's signature, the
+    // mark of its submission or its receipt: its setup may be on the ledger. No run reads it
+    // as a request that stopped before its signature, so none prepares another account.
+    assert!(
+        kept["signature"].is_array() && kept["submitted"] == true && !kept["receipt"].is_null()
+    );
+    for keep in ["signature", "submitted", "receipt"] {
+        let mut record = kept.clone();
+        record["signedXdr"] = Value::Null;
+        for field in ["signature", "receipt"] {
+            if field != keep {
+                record[field] = Value::Null;
+            }
+        }
+        record["submitted"] = json!(keep == "submitted");
+        store.save("setup-template-001", &record).unwrap();
+        let message = refused(&request(Some(&usdc), 100_000), &signer);
+        assert!(
+            message.contains("lost its signed transaction"),
+            "{keep}: {message}"
+        );
+        let asset = workflow::retained_setup_asset(&store, "setup-template-001").unwrap_err();
+        assert!(
+            asset.message.contains("lost its signed transaction"),
+            "{keep}"
+        );
+        let after: Value = store.load("setup-template-001").unwrap().unwrap();
+        assert_eq!(after, record, "{keep}: the damaged record was replaced");
+    }
+    store.save("setup-template-001", &kept).unwrap();
     // The new account's signature under another hint: the retained bytes are refused.
     let mut record: Value = store.load("setup-template-001").unwrap().unwrap();
     let stellar_xdr::TransactionEnvelope::Tx(mut envelope) =
