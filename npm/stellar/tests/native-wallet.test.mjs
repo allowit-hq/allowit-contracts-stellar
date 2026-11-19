@@ -119,7 +119,8 @@ test('a wallet of an issued asset adds its trustline and takes its funding in th
   assert.deepEqual(nativeSetupOf(unfunded.toXDR(), network), {...roles, wallet, startingBalance: 35_000_000n, asset: usdc, funding: 0n});
   // XLM by its name is the wallet of today, with the same bytes.
   assert.equal(nativeSetupTransaction(terms(wallet, {asset: {symbol: 'XLM', issuer: null}})).toXDR(), nativeSetupTransaction(terms(wallet)).toXDR());
-  for (const asset of [{symbol: 'USDC', issuer: null}, {symbol: 'USDC', issuer: 'GISSUER'}, {symbol: '', issuer: usdc.issuer}, {symbol: 'US DC', issuer: usdc.issuer}, 'USDC', {issuer: usdc.issuer}])
+  for (const asset of [{symbol: 'USDC', issuer: null}, {symbol: 'USDC', issuer: 'GISSUER'}, {symbol: '', issuer: usdc.issuer}, {symbol: 'US DC', issuer: usdc.issuer}, 'USDC', {issuer: usdc.issuer},
+    {symbol: 'XLM', issuer: usdc.issuer}, {symbol: 'USDC'}])
     assert.throws(() => nativeSetupTransaction(terms(wallet, {asset})), /wallet asset is invalid/, JSON.stringify(asset));
 });
 
@@ -150,6 +151,7 @@ test('a setup that moves another asset, another amount or another XLM balance th
     'a trustline of the owner account': [create(), Operation.changeTrust({asset}), pay(), ...signers],
     'a trustline with a lower limit': [create(), trust({limit: '100'}), pay(), ...signers],
     'two trustlines': [create(), trust(), trust({asset: other}), ...signers],
+    'a trustline of an issued asset with the code XLM': [create(), trust({asset: new Asset('XLM', usdc.issuer)}), ...signers],
     'a trustline after the signers': [create(), ...signers, trust()],
     'more XLM than the reserve and the float': [create('8'), trust(), pay(), ...signers],
     'less XLM than the reserve of the trustline': [create('3'), trust(), pay(), ...signers],

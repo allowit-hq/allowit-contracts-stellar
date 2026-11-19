@@ -80,7 +80,12 @@ pub struct Trustline {
     pub issuer: String,
 }
 impl Trustline {
+    /// The issued asset. An issued asset with the code of the network's own asset reads as
+    /// that asset in every amount, so no wallet holds one.
     fn asset(&self) -> Result<Asset> {
+        if self.code == "XLM" {
+            return Err("A wallet holds no issued asset with the code XLM".into());
+        }
         asset_from_identity(&self.code, Some(&self.issuer))
     }
 }

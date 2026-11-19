@@ -26,10 +26,15 @@ impl SetupRequest {
     pub fn validate(&self) -> Result<()> {
         native::passphrase(&self.network)
             .map_err(|_| Error::unsupported("Native wallet setup needs a Stellar network"))?;
-        if let Some(asset) = &self.asset {
-            native::asset_from_identity(&asset.code, Some(&asset.issuer)).map_err(|_| {
-                Error::config("The wallet asset of this network is not an issued Stellar asset")
-            })?;
+        // An issued asset with the code of the network's own asset reads as that asset in
+        // every amount, so no wallet holds one.
+        if let Some(asset) = &self.asset
+            && (asset.code == "XLM"
+                || native::asset_from_identity(&asset.code, Some(&asset.issuer)).is_err())
+        {
+            return Err(Error::config(
+                "The wallet asset of this network is not an issued Stellar asset",
+            ));
         }
         for account in [&self.owner, &self.agent, &self.server] {
             native::account_key(account).map_err(Error::usage)?;

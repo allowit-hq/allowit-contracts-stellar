@@ -888,6 +888,154 @@ fn a_retained_setup_of_an_earlier_release_stays_readable_and_is_never_signed() {
     allowit_stellar::owner_intent::validate_retained_owner_transaction(&current).unwrap();
     assert_refused(&legacy, &expected, "the setup of an earlier release");
 }
+/// A setup of an issued asset: the trustline of the new account, then the owner's one payment
+/// of that asset, then the signers. The caller's intent names the asset and the amount, so a
+/// setup with another amount or asset, or without the payment, is never signed. Retained bytes
+/// are a setup only in that order: any other place, source or count of the trustline or the
+/// payment is refused as history too.
+#[test]
+fn a_setup_of_an_issued_asset_is_signed_only_for_its_exact_asset_and_amount() {
+    let state = AccountState {
+        address: owner(),
+        sequence: 41,
+        master_weight: 1,
+        low_threshold: 0,
+        medium_threshold: 0,
+        high_threshold: 0,
+        signers: vec![],
+    };
+    let trustline = owner::Trustline {
+        code: "USDC".into(),
+        issuer: account(21),
+    };
+    let prepared = owner::prepare_native_setup(
+        &state,
+        &owner::SetupTerms {
+            wallet: &account(15),
+            agent: &account(12),
+            engine: &account(13),
+            request_id: "intent-fixture-001",
+            network: "stellar:testnet",
+            fee_per_operation: 100,
+            starting_balance: None,
+            trustline: Some(&trustline),
+            funding: Some(100_000),
+        },
+        NOW,
+    )
+    .unwrap();
+    let packet = OwnerTransaction {
+        network: prepared.network.clone(),
+        action: "native_setup".into(),
+        transaction_xdr: prepared.transaction_xdr.clone(),
+        transaction_hash: unhex(&prepared.transaction_hash).unwrap(),
+        expires_at: prepared.expires_at,
+    };
+    let intent = |trustline: Option<owner::Trustline>, funding: Option<i64>| ExpectedOwnerIntent {
+        limits: limits(),
+        action: OwnerAction::NativeSetup {
+            state: state.clone(),
+            wallet: account(15),
+            starting_balance: None,
+            trustline,
+            funding,
+            agent: account(12),
+            engine: account(13),
+            request_id: "intent-fixture-001".into(),
+            fee_per_operation: 100,
+            created_at: NOW,
+        },
+    };
+    validate_owner_transaction(
+        &packet,
+        &intent(Some(trustline.clone()), Some(100_000)),
+        NOW,
+    )
+    .unwrap();
+    validate_retained_owner_transaction(&packet).unwrap();
+    let other = owner::Trustline {
+        code: "EURC".into(),
+        issuer: account(21),
+    };
+    for (name, expected) in [
+        (
+            "another amount",
+            intent(Some(trustline.clone()), Some(100_001)),
+        ),
+        ("no funding", intent(Some(trustline.clone()), None)),
+        ("another asset", intent(Some(other), Some(100_000))),
+        ("no asset", intent(None, None)),
+    ] {
+        assert_refused(&packet, &expected, name);
+    }
+    // The order of the retained operations: creation, trustline, payment, three signers.
+    let reordered = |f: &dyn Fn(&mut Vec<x::Operation>)| {
+        let mut changed = packet.clone();
+        modify_tx(&mut changed, |tx| {
+            let mut operations = tx.operations.to_vec();
+            f(&mut operations);
+            tx.operations = operations.try_into().unwrap();
+        });
+        changed
+    };
+    for (name, changed) in [
+        (
+            "the payment before the trustline",
+            reordered(&|ops| ops.swap(1, 2)),
+        ),
+        (
+            "the payment after a signer",
+            reordered(&|ops| ops.swap(2, 3)),
+        ),
+        (
+            "the trustline after the signers",
+            reordered(&|ops| {
+                let trust = ops.remove(1);
+                ops.push(trust);
+            }),
+        ),
+        (
+            "two payments",
+            reordered(&|ops| ops.insert(2, ops[2].clone())),
+        ),
+        (
+            "two trustlines",
+            reordered(&|ops| ops.insert(1, ops[1].clone())),
+        ),
+        (
+            "a payment without a trustline",
+            reordered(&|ops| {
+                ops.remove(1);
+            }),
+        ),
+        (
+            "a payment from the new account",
+            reordered(&|ops| {
+                ops[2].source_account = ops[1].source_account.clone();
+            }),
+        ),
+        (
+            "a trustline of the owner's account",
+            reordered(&|ops| ops[1].source_account = None),
+        ),
+        (
+            "a signer missing",
+            reordered(&|ops| {
+                ops.pop();
+            }),
+        ),
+    ] {
+        assert!(
+            validate_retained_owner_transaction(&changed).is_err(),
+            "{name}"
+        );
+    }
+    // A setup with the trustline alone stays a setup.
+    let unfunded = reordered(&|ops| {
+        ops.remove(2);
+    });
+    validate_retained_owner_transaction(&unfunded).unwrap();
+}
 /// The new account's own key signs its creation once, after the owner. A key of another
 /// account never co-signs.
 #[test]

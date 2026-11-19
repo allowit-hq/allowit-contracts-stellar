@@ -279,6 +279,7 @@ fn a_setup_of_an_issued_asset_adds_its_trustline_and_funds_it_in_the_one_owner_t
         ("USDC", "not-an-account"),
         ("", USDC_ISSUER),
         ("US DC", USDC_ISSUER),
+        ("XLM", USDC_ISSUER),
     ] {
         let invalid = request(Some(crate::owner::Trustline {
             code: code.into(),

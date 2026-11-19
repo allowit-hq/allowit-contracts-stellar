@@ -106,25 +106,33 @@ fn classic_action_matches(action: &str, operations: &[Operation]) -> bool {
         {
             true
         }
-        // The new account adds its trustline and its signers. The owner's account, the
-        // transaction source, sends at most one payment, which funds the trustline's asset.
+        // After the creation, the new account adds its trustline, if it holds an issued asset.
+        // The owner's account, the transaction source, then sends at most one payment, which
+        // funds that asset. The three signer operations of the new account end the setup.
         ("native_setup", [create, rest @ ..]) => {
-            let funded = |op: &Operation| {
-                !wallet_sourced(op) && matches!(op.body, OperationBody::Payment(_))
+            let signers = match rest {
+                [trust, pay, signers @ ..]
+                    if wallet_sourced(trust)
+                        && matches!(trust.body, OperationBody::ChangeTrust(_))
+                        && !wallet_sourced(pay)
+                        && matches!(pay.body, OperationBody::Payment(_)) =>
+                {
+                    signers
+                }
+                [trust, signers @ ..]
+                    if wallet_sourced(trust)
+                        && matches!(trust.body, OperationBody::ChangeTrust(_)) =>
+                {
+                    signers
+                }
+                signers => signers,
             };
-            let payments = rest.iter().filter(|op| funded(op)).count();
             matches!(create.body, OperationBody::CreateAccount(_))
                 && create.source_account.is_none()
-                && payments <= 1
-                && (3..=4).contains(&(rest.len() - payments))
-                && rest.iter().all(|op| {
-                    funded(op)
-                        || (wallet_sourced(op)
-                            && matches!(
-                                op.body,
-                                OperationBody::SetOptions(_) | OperationBody::ChangeTrust(_)
-                            ))
-                })
+                && signers.len() == 3
+                && signers
+                    .iter()
+                    .all(|op| wallet_sourced(op) && matches!(op.body, OperationBody::SetOptions(_)))
         }
         ("fund", [op]) => !wallet_sourced(op) && matches!(op.body, OperationBody::Payment(_)),
         ("withdraw", [op]) => wallet_sourced(op) && matches!(op.body, OperationBody::Payment(_)),

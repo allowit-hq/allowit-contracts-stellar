@@ -47,12 +47,15 @@ const BOOTSTRAP_SOURCE = 'use allowit::prelude::*;\n/// Bootstrap: transfers in 
 const hex = (bytes) => Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
 const digest = (text) => sha256(new TextEncoder().encode(text));
 const object = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
-/** The issued asset of `asset`, or null for XLM and for no asset. Any other value is refused. */
+/**
+ * The issued asset of `asset`, or null for XLM and for no asset. Any other value is refused, and so is an issued
+ * asset with the code XLM: every amount of it would read as XLM.
+ */
 function issuedAsset(asset) {
     if (asset === undefined || asset === null)
         return null;
     if (!object(asset) || typeof asset.symbol !== 'string' || !/^[A-Za-z0-9]{1,12}$/.test(asset.symbol)
-        || (asset.issuer === null ? asset.symbol !== 'XLM' : typeof asset.issuer !== 'string' || !StrKey.isValidEd25519PublicKey(asset.issuer)))
+        || (asset.symbol === 'XLM') !== (asset.issuer === null) || (asset.issuer !== null && (typeof asset.issuer !== 'string' || !StrKey.isValidEd25519PublicKey(asset.issuer))))
         throw new Error('The wallet asset is invalid.');
     return asset.issuer === null ? null : new Asset(asset.symbol, asset.issuer);
 }
@@ -168,7 +171,7 @@ export function nativeSetupOf(payload, network) {
     let issued = null, funding = null;
     const trust = after[0];
     if (trust?.type === 'changeTrust') {
-        if (trust.source !== wallet || !(trust.line instanceof Asset) || trust.line.isNative() || trust.limit !== TRUSTLINE_LIMIT)
+        if (trust.source !== wallet || !(trust.line instanceof Asset) || trust.line.isNative() || trust.line.getCode() === 'XLM' || trust.limit !== TRUSTLINE_LIMIT)
             return null;
         issued = trust.line;
         after.shift();
