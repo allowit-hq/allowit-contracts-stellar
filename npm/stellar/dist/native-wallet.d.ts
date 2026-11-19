@@ -133,8 +133,9 @@ export interface PreparedNativeSetup {
  */
 export declare function prepareNativeSetup({ network, owner, agent, server, amount, asset, fetch: send }: NativeSetupInput): Promise<PreparedNativeSetup>;
 /**
- * What signed setup bytes are: their hash, their roles, the asset of their wallet and their own time bound. Null for
- * bytes that are no setup of this network. The signed bytes decide; saved metadata is unsigned.
+ * What signed setup bytes are: their hash, their roles, the asset of their wallet, the amount of that asset that they
+ * fund it with, as decimal text, and their own time bound. Null for bytes that are no setup of this network. The
+ * signed bytes decide; saved metadata is unsigned.
  */
 export declare function signedNativeSetupOf(signedPayload: string, network: string): {
     hash: string;
@@ -144,6 +145,7 @@ export declare function signedNativeSetupOf(signedPayload: string, network: stri
     server: string;
     validUntil: number;
     asset: NativeWalletAsset;
+    amount: string;
 } | null;
 /** Sends signed setup bytes to Horizon. The ledger of the successful transaction, or null without a certain answer. */
 export declare function sendNativeSetup(network: string, signedPayload: string, hash: string, send?: typeof fetch): Promise<number | null>;

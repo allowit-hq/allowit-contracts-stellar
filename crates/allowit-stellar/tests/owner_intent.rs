@@ -1024,6 +1024,50 @@ fn a_setup_of_an_issued_asset_is_signed_only_for_its_exact_asset_and_amount() {
                 ops.pop();
             }),
         ),
+        (
+            "a payment of XLM",
+            reordered(&|ops| {
+                let x::OperationBody::Payment(payment) = &mut ops[2].body else {
+                    panic!()
+                };
+                payment.asset = x::Asset::Native;
+            }),
+        ),
+        (
+            "a payment of another issued asset",
+            reordered(&|ops| {
+                let x::OperationBody::Payment(payment) = &mut ops[2].body else {
+                    panic!()
+                };
+                payment.asset = asset_from_identity("EURC", Some(&account(21))).unwrap();
+            }),
+        ),
+        (
+            "a payment to the agent",
+            reordered(&|ops| {
+                let x::OperationBody::Payment(payment) = &mut ops[2].body else {
+                    panic!()
+                };
+                payment.destination = muxed(&account(12));
+            }),
+        ),
+        (
+            "a payment of nothing",
+            reordered(&|ops| {
+                let x::OperationBody::Payment(payment) = &mut ops[2].body else {
+                    panic!()
+                };
+                payment.amount = 0;
+            }),
+        ),
+        (
+            "a trustline of another account",
+            reordered(&|ops| ops[1].source_account = Some(muxed(&account(12)))),
+        ),
+        (
+            "a signer of another account",
+            reordered(&|ops| ops[3].source_account = Some(muxed(&account(12)))),
+        ),
     ] {
         assert!(
             validate_retained_owner_transaction(&changed).is_err(),

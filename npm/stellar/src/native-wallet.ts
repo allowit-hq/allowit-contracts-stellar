@@ -74,6 +74,8 @@ function stroops(amount: string): bigint | null {
   const match = /^([0-9]{1,12})(?:\.([0-9]{1,7}))?$/.exec(amount);
   return match ? BigInt(match[1]) * 10_000_000n + BigInt((match[2] ?? '').padEnd(7, '0')) : null;
 }
+/** Decimal text of base units as a person writes it: no trailing zeros. */
+const plainDecimal = (units: bigint): string => `${units / 10_000_000n}${units % 10_000_000n ? `.${(units % 10_000_000n).toString().padStart(7, '0').replace(/0+$/, '')}` : ''}`;
 /** Decimal text of base units, as an operation amount takes it. */
 function decimal(units: bigint): string {
   return `${units / 10_000_000n}.${(units % 10_000_000n).toString().padStart(7, '0')}`;
@@ -185,6 +187,8 @@ export function nativeSetupOf(payload: string, network: string): NativeSetupFact
     return null;
   }
   const [create, ...after] = tx.operations;
+  // The setup pays the fee that `nativeSetupTransaction` sets: 100 stroops for each operation.
+  if (tx.fee !== String(100 * tx.operations.length)) return null;
   if (create?.type !== 'createAccount' || create.source !== undefined) return null;
   const wallet = create.destination, starting = stroops(create.startingBalance);
   if (starting === null) return null;
@@ -199,11 +203,11 @@ export function nativeSetupOf(payload: string, network: string): NativeSetupFact
     const pay = after[0];
     if (pay?.type === 'payment') {
       funding = stroops(pay.amount);
-      if (pay.source !== undefined || pay.destination !== wallet || !pay.asset.equals(issued) || funding === null || funding <= 0n) return null;
+      if (pay.source !== undefined || pay.destination !== wallet || !pay.asset.equals(issued) || funding === null || funding <= 0n || funding > MAX_FUNDING) return null;
       after.shift();
     }
     if (starting !== walletStartingBalance(0n, true)) return null;
-  } else if (starting < walletStartingBalance(0n)) return null;
+  } else if (starting < walletStartingBalance(0n) || starting > walletStartingBalance(MAX_FUNDING)) return null;
   const [first, second, last, ...rest] = after;
   if (rest.length) return null;
   const plain = (op: typeof first, weight: number): string | null => {
@@ -291,10 +295,11 @@ export async function prepareNativeSetup({network, owner, agent, server, amount,
 }
 
 /**
- * What signed setup bytes are: their hash, their roles, the asset of their wallet and their own time bound. Null for
- * bytes that are no setup of this network. The signed bytes decide; saved metadata is unsigned.
+ * What signed setup bytes are: their hash, their roles, the asset of their wallet, the amount of that asset that they
+ * fund it with, as decimal text, and their own time bound. Null for bytes that are no setup of this network. The
+ * signed bytes decide; saved metadata is unsigned.
  */
-export function signedNativeSetupOf(signedPayload: string, network: string): {hash: string; owner: string; wallet: string; agent: string; server: string; validUntil: number; asset: NativeWalletAsset} | null {
+export function signedNativeSetupOf(signedPayload: string, network: string): {hash: string; owner: string; wallet: string; agent: string; server: string; validUntil: number; asset: NativeWalletAsset; amount: string} | null {
   const id = canonicalNetwork(network);
   const setup = id ? nativeSetupOf(signedPayload, id) : null;
   if (!id || !setup) return null;
@@ -303,7 +308,7 @@ export function signedNativeSetupOf(signedPayload: string, network: string): {ha
     if ('innerTransaction' in tx) return null;
     const validUntil = Number(tx.timeBounds?.maxTime);
     if (!Number.isSafeInteger(validUntil) || validUntil <= 0) return null;
-    return {hash: hex(tx.hash()), owner: setup.owner, wallet: setup.wallet, agent: setup.agent, server: setup.server, validUntil, asset: setup.asset};
+    return {hash: hex(tx.hash()), owner: setup.owner, wallet: setup.wallet, agent: setup.agent, server: setup.server, validUntil, asset: setup.asset, amount: plainDecimal(setup.funding)};
   } catch {
     return null;
   }
@@ -399,7 +404,8 @@ export function nativeApprovalHolds(approval: PolicyApproval, wallet: string, re
     tier: reviewed.tier === undefined ? approval.fields.tier : reviewed.tier,
   };
   const keys = Object.keys(approval.fields).filter(key => !SERVER_FIELDS.has(key));
-  return keys.length === Object.keys(expected).length && keys.every(key => key in expected && canonical(approval.fields[key]) === canonical(expected[key]))
+  // Only the fields of `expected` itself count: a name that every object inherits is no field of an approval.
+  return keys.length === Object.keys(expected).length && keys.every(key => Object.hasOwn(expected, key) && canonical(approval.fields[key]) === canonical(expected[key]))
     && typeof approval.fields.language === 'string' && /^[a-z0-9-]{1,64}$/.test(approval.fields.language);
 }
 /** The step that asks the owner's wallet to approve a policy. It signs the message and moves nothing. */

@@ -156,7 +156,16 @@ test('a setup that moves another asset, another amount or another XLM balance th
     'more XLM than the reserve and the float': [create('8'), trust(), pay(), ...signers],
     'less XLM than the reserve of the trustline': [create('3'), trust(), pay(), ...signers],
     'less XLM than the reserve of the account': [create('2.9'), ...signers],
+    'a funding above the most that a setup funds': [create(), trust(), pay({amount: '100000000.0000001'}), ...signers],
   })) assert.equal(nativeSetupOf(build(ops), network), null, name);
+  // The fee is the fee of the builder, 100 stroops for each operation: a setup that bids more is not read as one.
+  const bid = fee => {
+    const builder = new TransactionBuilder(new Account(roles.owner, '41'), {fee, networkPassphrase: Networks.TESTNET, timebounds: {minTime: 0, maxTime: 2_000_000_000}});
+    for (const op of [create(), trust(), pay(), ...signers]) builder.addOperation(op);
+    return builder.build().toXDR();
+  };
+  assert.ok(nativeSetupOf(bid('100'), network));
+  for (const fee of ['101', '10000000', '99']) assert.equal(nativeSetupOf(bid(fee), network), null, fee);
 });
 
 test('a setup is built and read for each network of the rail, and its bytes belong to one network', () => {
@@ -239,7 +248,7 @@ test('the owner signs once: the new account countersigns and the network takes t
     assert.ok(tx.signatures.some(s => key.verify(tx.hash(), Buffer.from(s.signature instanceof Uint8Array ? s.signature : s.signature.value))), key.publicKey());
   assert.deepEqual([prepared.step.hash, result], [hex(tx.hash()), 8]);
   // The signed bytes name their hash, roles and own time bound.
-  assert.deepEqual(signedNativeSetupOf(signedPayload, network), {hash: prepared.step.hash, ...roles, wallet: prepared.wallet, validUntil: Number(tx.timeBounds.maxTime), asset: {symbol: 'XLM', issuer: null}});
+  assert.deepEqual(signedNativeSetupOf(signedPayload, network), {hash: prepared.step.hash, ...roles, wallet: prepared.wallet, validUntil: Number(tx.timeBounds.maxTime), asset: {symbol: 'XLM', issuer: null}, amount: '5'});
   for (const other of ['not-xdr', nativeSetupTransaction(terms(Keypair.random().publicKey())).toXDR()])
     assert.equal(signedNativeSetupOf(other, network)?.hash === prepared.step.hash, false);
   assert.equal(signedNativeSetupOf(signedPayload, 'stellar:other'), null);
@@ -394,6 +403,12 @@ test('an approval names the asset of the reviewed policy: XLM without one, and n
   assert.equal(holds(inUsdc, {...reviewedOf(), asset: mainnetUsdc}), false);
   // The code and the issuer of the reviewed asset with the contract of another asset.
   assert.equal(holds(approval({wallet, asset: nativeXlm, assetSymbol: 'USDC', assetIssuer: usdc.issuer}).message, {...reviewedOf(), asset: usdc}), false);
+  // An approval that leaves the asset out and names properties that every object inherits holds for nothing.
+  const {payload} = approval({wallet});
+  const inherited = Object.fromEntries(Object.entries({...payload, constructor: null, toString: null, valueOf: null}).filter(([key]) => !['asset', 'assetSymbol', 'assetIssuer'].includes(key)).sort(([a], [b]) => (a < b ? -1 : 1)));
+  const withoutAsset = `AllowIt Native policy approval v1\n${JSON.stringify(inherited)}`;
+  assert.ok(ownerChain.approval.read(withoutAsset, network));
+  for (const asset of [usdc, undefined, null]) assert.equal(holds(withoutAsset, {...reviewedOf(), asset}), false, JSON.stringify(asset));
   // A reviewed asset that is no asset holds for nothing.
   for (const asset of [{symbol: 'USDC', issuer: null}, {symbol: 'USDC', issuer: 'GISSUER'}, 'USDC'])
     assert.equal(holds(inUsdc, {...reviewedOf(), asset}), false, JSON.stringify(asset));
@@ -401,7 +416,9 @@ test('an approval names the asset of the reviewed policy: XLM without one, and n
   globalThis.fetch = fetch;
   const prepared = await ownerChain.keypairSetup.prepare({network, ...roles, amount: '0.01', asset: usdc});
   const signedPayload = prepared.complete(await ownerSigns([])(prepared.step));
-  assert.deepEqual(ownerChain.keypairSetup.read(signedPayload, network).asset, usdc);
+  const signedRead = ownerChain.keypairSetup.read(signedPayload, network);
+  // The signed bytes state the asset and the amount that they fund, so a resume checks them and no saved metadata.
+  assert.deepEqual([signedRead.asset, signedRead.amount], [usdc, '0.01']);
   assert.deepEqual(nativeSetupOf(signedPayload, network), {...roles, wallet: prepared.wallet, startingBalance: 35_000_000n, asset: usdc, funding: 100_000n});
   const configuration = ownerChain.keypairSetup.configuration(network, prepared.wallet, roles.owner, roles.agent, roles.server, usdc);
   assert.deepEqual([configuration.asset, configuration.assetSymbol, configuration.assetIssuer], [usdcContract, 'USDC', usdc.issuer]);

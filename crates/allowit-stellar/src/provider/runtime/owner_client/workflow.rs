@@ -1544,6 +1544,20 @@ struct NativeSetupRecord {
     submitted: bool,
     receipt: Option<rpc::VerifiedReceipt>,
 }
+/// The asset of the setup that the store retains under `request_id`, when it retains one: the
+/// issued asset, or `None` for XLM. A retained setup keeps its asset, so a resume builds the
+/// same request whatever the server's template names now.
+pub fn retained_setup_asset(
+    store: &Store,
+    request_id: &str,
+) -> Result<Option<Option<native::owner::Trustline>>> {
+    if !crate::host::request::request_id_valid(request_id) {
+        return Err(Error::usage("Invalid Stellar setup request ID"));
+    }
+    Ok(store
+        .load::<NativeSetupRecord>(request_id)?
+        .map(|record| record.setup.trustline))
+}
 /// The server's first record of a wallet: the account, its roles and a policy that admits
 /// transfers of the wallet's asset, which is `asset` or XLM. The owner's generated policy
 /// replaces it at activation.

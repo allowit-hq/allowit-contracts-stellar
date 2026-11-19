@@ -180,8 +180,14 @@ impl OwnerProvider for Owner {
         let fee_per_operation = fee(r.fee_per_operation)?;
         // The server's template of the network names the asset that the wallet holds. It is
         // read before anything is signed for the ledger, so a server that offers no wallet on
-        // this network stops the setup before an account exists.
+        // this network stops the setup before an account exists. A request that the store
+        // retains keeps its own asset: its resume does not depend on the template of today.
         let client = client(cx)?;
+        let store = (cx.store)()?;
+        let asset = match workflow::retained_setup_asset(&store, r.request_id)? {
+            Some(asset) => asset,
+            None => client.native_wallet_asset(cx.network, (cx.clock)()?)?,
+        };
         let request = SetupRequest {
             network: cx.network.into(),
             owner: cx.signer.address().into(),
@@ -189,13 +195,13 @@ impl OwnerProvider for Owner {
             server: r.server.into(),
             request_id: r.request_id.into(),
             fee_per_operation,
-            asset: client.native_wallet_asset(cx.network, (cx.clock)()?)?,
+            asset,
             funding,
         };
         request.validate()?;
         let mut configured = workflow::configure_native(
             &runtime(cx.rpc_url)?,
-            &(cx.store)()?,
+            &store,
             &request,
             &super::OwnerSignerRef(cx.signer),
             cx.clock,

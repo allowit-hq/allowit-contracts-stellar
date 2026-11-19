@@ -36,8 +36,8 @@ signed step whose result is unknown and their typed errors. `ownerChain` supplie
   read past that bound and holds the failed transaction, or holds none while the source sequence is still below the
   transaction's. Anything else rejects, and the SDK keeps the step.
 - `keypairSetup`: `prepare` builds a Native wallet account's setup (below) and returns its step with `complete`, which
-  checks the owner's signed bytes and adds the new account's own signature; `read` reads the hash, roles, wallet asset
-  and time bound of signed setup bytes; `send` sends them to Horizon; `configuration` is the installation document of
+  checks the owner's signed bytes and adds the new account's own signature; `read` reads the hash, roles, wallet asset,
+  funded amount and time bound of signed setup bytes; `send` sends them to Horizon; `configuration` is the installation document of
   the account. `prepare` and `configuration` take the asset of the wallet, `{symbol, issuer}`; without one it is XLM.
 - `approval`: `read` reads the exact approval message of a network, `holds` checks it against the reviewed policy and
   the wallet's own configuration, `step` makes the `approve_policy` step, `walletOwner` reads the account's one signer
@@ -64,7 +64,8 @@ A Native policy needs the wallet account of its agent: a new classic account, on
 2. Has the host's `sign` sign it as the step `set_up_wallet`. The account's own key is random, lives in `complete` only
    and signs the creation once beside the owner. The `owner-sign` element reads the step from its bytes: it shows the
    wallet account, the agent, the asset with its issuer and the funding, and it refuses any transaction that is not
-   exactly this setup.
+   exactly this setup: another operation, source, destination, asset or XLM balance, or another fee than 100 stroops
+   for each operation.
 3. Saves the signed bytes in the host's journal under `<key>:wallet-setup` and sends them with `send`. They stay saved
    until the service has registered the wallet, so a run that stops in between names the same account again and signs
    no second setup. A result that is unknown is settled first: done when Horizon holds it as successful, sent again

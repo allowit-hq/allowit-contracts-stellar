@@ -153,6 +153,11 @@ fn a_funded_setup_is_one_owner_transaction_and_binds_its_amount() {
     );
     assert_eq!(signer.calls.load(Ordering::SeqCst), again);
     assert!(request(0).validate().is_err());
+    // The retained request of a wallet that holds XLM names no issued asset.
+    assert_eq!(
+        workflow::retained_setup_asset(&store, "setup-funded-001").unwrap(),
+        Some(None)
+    );
     // The ceiling of a request is the most that the setup transaction can carry.
     use crate::provider::runtime::owner::MAX_SETUP_FUNDING;
     assert!(request(MAX_SETUP_FUNDING).validate().is_ok());
@@ -264,6 +269,17 @@ fn a_setup_of_an_issued_asset_adds_its_trustline_and_funds_it_in_the_one_owner_t
     assert_eq!(payment.destination, wallet);
     assert_eq!(payment.asset, issued);
     assert_eq!(payment.amount, 100_000);
+    // The store names the asset of the retained request, so a resume asks for the same wallet
+    // whatever the server's template names now. An unknown request names none.
+    assert_eq!(
+        workflow::retained_setup_asset(&store, "setup-asset-001").unwrap(),
+        Some(Some(usdc.clone()))
+    );
+    assert_eq!(
+        workflow::retained_setup_asset(&store, "setup-asset-002").unwrap(),
+        None
+    );
+    assert!(workflow::retained_setup_asset(&store, "bad id").is_err());
     let again = signer.calls.load(Ordering::SeqCst);
     let refused =
         workflow::configure_native(&runtime, &store, &request(None), &signer, &|| Ok(now))
