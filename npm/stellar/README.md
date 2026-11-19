@@ -37,8 +37,8 @@ signed step whose result is unknown and their typed errors. `ownerChain` supplie
   transaction's. Anything else rejects, and the SDK keeps the step.
 - `keypairSetup`: `prepare` builds a Native wallet account's setup (below) and returns its step with `complete`, which
   checks the owner's signed bytes and adds the new account's own signature; `read` reads the hash, roles, wallet asset,
-  funded amount and time bound of signed setup bytes; `checkAsset` refuses signed setup bytes of another asset than the
-  reviewed one with `asset_mismatch`; `send` sends them to Horizon; `configuration` is the installation document of
+  funded amount and time bound of signed setup bytes; `checkAsset` refuses signed setup bytes, and a funding step that the
+  server prepared, of another asset than the reviewed one with `asset_mismatch`; `send` sends them to Horizon; `configuration` is the installation document of
   the account. `prepare` and `configuration` take the asset of the wallet, `{symbol, issuer}`; without one it is XLM.
 - `approval`: `read` reads the exact approval message of a network, `holds` checks it against the reviewed policy and
   the wallet's own configuration, `step` makes the `approve_policy` step, `walletOwner` reads the account's one signer

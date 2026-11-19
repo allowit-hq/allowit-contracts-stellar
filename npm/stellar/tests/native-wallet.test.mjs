@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import test from 'node:test';
-import {Asset, Keypair, Memo, Networks, Operation, TransactionBuilder, Account} from '@stellar/stellar-sdk/base';
+import {Asset, Keypair, Memo, Networks, Operation, TransactionBuilder, Account, xdr} from '@stellar/stellar-sdk/base';
 import {
   APPROVE_POLICY, SET_UP_WALLET, TRUSTLINE_RESERVE, WALLET_FEE_FLOAT, WALLET_RESERVE, approvalMessage, approvalStep, messageDigest,
   nativeSetupOf, nativeSetupTransaction, nativeWalletConfiguration, policyApproval, prepareNativeSetup, sendNativeSetup, signedNativeSetupOf,
@@ -139,11 +139,49 @@ test('the rail checks that signed setup bytes set up the reviewed asset, and ref
   assert.equal(check(issued, network, {...usdc}), undefined);
   const refused = (payload, asset, on = network) => assert.throws(() => check(payload, on, asset), error => error.code === 'asset_mismatch' && error.message.length > 0);
   refused(xlm, usdc);
+  // A signed setup of another asset stays saved: its refusal says so, and names no signature that is missing.
+  assert.throws(() => check(xlm, network, usdc), error => /stays saved/.test(error.message) && !/Nothing was signed/.test(error.message));
   for (const asset of [undefined, null, {symbol: 'XLM', issuer: null}, mainnetUsdc, {symbol: 'USDC', issuer: null}, {symbol: 'EURC', issuer: usdc.issuer}, 'USDC'])
     refused(issued, asset);
   // Bytes that are no signed setup of the network have no asset to compare.
   for (const payload of ['not-xdr', nativeSetupTransaction(terms(Keypair.random().publicKey())).toXDR()]) refused(payload, null);
   refused(xlm, null, 'stellar:pubnet');
+});
+
+test('the rail checks that a funding step pays the wallet in the reviewed asset, and refuses others with asset_mismatch', () => {
+  const wallet = Keypair.random().publicKey();
+  // The funding step of a Native wallet: one payment from the owner's account to the wallet, as the server builds it.
+  const funding = (ops, source = roles.owner) => {
+    const tx = new TransactionBuilder(new Account(source, '41'), {fee: '100', networkPassphrase: Networks.TESTNET}).setTimeout(300);
+    for (const op of ops) tx.addOperation(op);
+    return tx.build().toXDR();
+  };
+  const pay = (asset, extra = {}) => Operation.payment({destination: wallet, asset, amount: '1', ...extra});
+  const xlm = funding([pay(Asset.native())]), issued = funding([pay(new Asset(usdc.symbol, usdc.issuer))]);
+  const check = ownerChain.keypairSetup.checkAsset;
+  for (const asset of [undefined, null, {symbol: 'XLM', issuer: null}]) assert.equal(check(xlm, network, asset), undefined);
+  assert.equal(check(issued, network, {...usdc}), undefined);
+  const refused = (payload, asset) => assert.throws(() => check(payload, network, asset), error => error.code === 'asset_mismatch' && error.message.length > 0);
+  refused(xlm, usdc);
+  for (const asset of [null, mainnetUsdc, {symbol: 'EURC', issuer: usdc.issuer}]) refused(issued, asset);
+  // The refusal names both issuers when only the issuer differs.
+  assert.throws(() => check(issued, network, mainnetUsdc), error => error.message.includes(usdc.issuer) && error.message.includes(mainnetUsdc.issuer));
+  // Only one payment from the step's own account is a funding step.
+  refused(funding([pay(Asset.native()), pay(Asset.native())]), null);
+  refused(funding([pay(Asset.native(), {source: Keypair.random().publicKey()})]), null);
+  refused(funding([Operation.bumpSequence({bumpTo: '50'})]), null);
+  // Only the envelope that the server builds: unsigned, without a memo, and the asset in its own encoding.
+  const withMemo = new TransactionBuilder(new Account(roles.owner, '41'), {fee: '100', networkPassphrase: Networks.TESTNET, memo: Memo.text('receipt')})
+    .addOperation(pay(Asset.native())).setTimeout(300).build().toXDR();
+  refused(withMemo, null);
+  const signedFunding = TransactionBuilder.fromXDR(xlm, Networks.TESTNET);
+  signedFunding.sign(owner);
+  refused(signedFunding.toXDR(), null);
+  const long = Asset.fromOperation(xdr.Asset.assetTypeCreditAlphanum12(new xdr.AlphaNum12({assetCode: Buffer.from('USDC'.padEnd(12, '\0')), issuer: Keypair.fromPublicKey(usdc.issuer).xdrAccountId()})));
+  assert.equal(long.getAssetType(), 'credit_alphanum12');
+  refused(funding([pay(long)]), {...usdc});
+  // A setup of another asset stays saved: its refusal says so.
+  assert.throws(() => check(funding([pay(Asset.native())]), network, usdc), error => /Nothing was signed/.test(error.message));
 });
 
 test('a setup that moves another asset, another amount or another XLM balance than its wallet takes is not read as one', () => {
