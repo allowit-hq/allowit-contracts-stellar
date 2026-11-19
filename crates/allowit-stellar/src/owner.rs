@@ -30,6 +30,9 @@ pub const FEE_FLOAT_STROOPS: i64 = 5_000_000;
 const SIGNERS: i64 = 3;
 /// The most that one setup sends to a new account, in stroops.
 pub const MAX_STARTING_BALANCE: i64 = 1_000_000_000_000_000;
+/// The most that one setup pays into a new account in its issued asset, in base units. The
+/// browser package builds and reads the same ceiling.
+pub const MAX_ASSET_FUNDING: i64 = 1_000_000_000_000_000;
 
 /// The balance that the network locks in a wallet account: the account, its three signers and
 /// its trustline.
@@ -83,6 +86,13 @@ impl Trustline {
     fn asset(&self) -> Result<Asset> {
         asset_from_identity(&self.code, Some(&self.issuer))
     }
+    /// An issued asset with the code of the network's own asset reads as that asset in every
+    /// amount, so no new setup names one and no setup funds one. The builder of earlier
+    /// releases could add such a trustline on Testnet, without funding: that setup stays
+    /// readable as retained history.
+    fn names_the_native_code(&self) -> bool {
+        self.code == "XLM"
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -102,6 +112,10 @@ pub struct NativeSetup {
     pub starting_balance: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trustline: Option<Trustline>,
+    /// The base units of the trustline's asset that the owner's account sends to the new
+    /// account, after the trustline exists. Only a setup with a trustline has it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub funding: Option<String>,
     pub sequence: String,
     pub fee_stroops: u32,
     pub expires_at: u64,
@@ -122,6 +136,8 @@ pub struct SetupTerms<'a> {
     /// Stroops. `None` is the reserve and the fee float.
     pub starting_balance: Option<i64>,
     pub trustline: Option<&'a Trustline>,
+    /// Base units of the trustline's asset that the owner's account sends to the wallet.
+    pub funding: Option<i64>,
 }
 
 /// The owner's account pays for setup and signs it alone, so its own key must reach its own
@@ -154,12 +170,53 @@ fn signer_operation(wallet: &str, key: [u8; 32], weight: u32) -> Result<Operatio
     })
 }
 fn operation_count(v: &NativeSetup) -> u32 {
-    4 + u32::from(v.trustline.is_some())
+    4 + u32::from(v.trustline.is_some()) + u32::from(v.funding.is_some())
+}
+/// The funding of a setup in its trustline's asset, in base units.
+fn asset_funding(v: &NativeSetup) -> Result<Option<i64>> {
+    let Some(text) = &v.funding else {
+        return Ok(None);
+    };
+    let units: i64 = text.parse().map_err(err)?;
+    if v.trustline.is_none()
+        || !(1..=MAX_ASSET_FUNDING).contains(&units)
+        || units.to_string() != *text
+    {
+        return Err("The setup funds a positive amount of its trustline's asset".into());
+    }
+    Ok(Some(units))
 }
 
 fn transaction(v: &NativeSetup) -> Result<Transaction> {
-    if v.network != "stellar:testnet" {
-        return Err("Native wallet setup supports Stellar Testnet only".into());
+    if !(8..=100).contains(&v.request_id.len())
+        || !v
+            .request_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._:-".contains(&b))
+    {
+        return Err("Invalid native setup identity or fee".into());
+    }
+    setup_transaction(v, hash(v.request_id.as_bytes()))
+}
+/// The one builder of a setup transaction, for the fields of `v` and a memo. [`transaction`]
+/// builds a setup with the memo of its request, and [`is_setup_transaction`] builds the setup
+/// of given bytes again: bytes are a setup only when this builder makes exactly them.
+fn setup_transaction(v: &NativeSetup, memo: [u8; 32]) -> Result<Transaction> {
+    // A setup names its network by the network id, when it is prepared and when it is read
+    // again. An alias selects the same ledger and the same transaction, and would give that
+    // transaction a second intent digest.
+    if !is_network_id(&v.network) {
+        return Err("A native setup names its network by its network id".into());
+    }
+    passphrase(&v.network)?;
+    // An issued asset with the code of the network's own asset is in one setup only: the
+    // unfunded Testnet setup that the builder of earlier releases made, which stays readable.
+    if v.trustline
+        .as_ref()
+        .is_some_and(Trustline::names_the_native_code)
+        && (v.network != "stellar:testnet" || v.funding.is_some())
+    {
+        return Err("A wallet holds no issued asset with the code XLM".into());
     }
     let owner = account_key(&v.owner)?;
     let wallet = account_key(&v.wallet)?;
@@ -177,11 +234,6 @@ fn transaction(v: &NativeSetup) -> Result<Transaction> {
     let count = operation_count(v);
     if v.version != 2
         || v.profile != OWNER_PROFILE
-        || !(8..=100).contains(&v.request_id.len())
-        || !v
-            .request_id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"._:-".contains(&b))
         || v.expires_at == 0
         || v.expires_at > 9_007_199_254_740_991
         || !(100 * count..=100_000 * count).contains(&v.fee_stroops)
@@ -218,6 +270,19 @@ fn transaction(v: &NativeSetup) -> Result<Transaction> {
                 limit: i64::MAX,
             }),
         });
+        // The owner's account, the transaction source, sends the asset once the line exists.
+        if let Some(units) = asset_funding(v)? {
+            operations.push(Operation {
+                source_account: None,
+                body: OperationBody::Payment(PaymentOp {
+                    destination: muxed(&v.wallet)?,
+                    asset: trustline.asset()?,
+                    amount: units,
+                }),
+            });
+        }
+    } else {
+        asset_funding(v)?;
     }
     operations.push(signer_operation(&v.wallet, owner, OWNER_WEIGHT)?);
     operations.push(signer_operation(&v.wallet, agent, AUTOMATED_WEIGHT)?);
@@ -244,11 +309,115 @@ fn transaction(v: &NativeSetup) -> Result<Transaction> {
             min_time: TimePoint(0),
             max_time: TimePoint(v.expires_at),
         }),
-        memo: Memo::Hash(Hash(hash(v.request_id.as_bytes()))),
+        memo: Memo::Hash(Hash(memo)),
         operations: operations.try_into().map_err(err)?,
         ext: TransactionExt::V0,
     })
 }
+/// Whether `tx` is the setup of a new wallet account on `network`. The values of the setup are
+/// read from `tx` itself: the owner (its source), the new account, its trustline and funding,
+/// the agent and the server (the signers of its last two operations), the fee, the sequence,
+/// the time bound and the memo. The setup builder then makes the setup of those values again,
+/// and only the same transaction is a setup. So no operation, source, destination, asset,
+/// amount, weight, threshold, fee, condition or extension that the builder never makes is one.
+pub(crate) fn is_setup_transaction(tx: &Transaction, network: &str) -> bool {
+    let read = || -> Option<(NativeSetup, [u8; 32])> {
+        let MuxedAccount::Ed25519(Uint256(owner)) = &tx.source_account else {
+            return None;
+        };
+        let Memo::Hash(Hash(memo)) = &tx.memo else {
+            return None;
+        };
+        let Preconditions::Time(bounds) = &tx.cond else {
+            return None;
+        };
+        let (create, rest) = tx.operations.split_first()?;
+        let OperationBody::CreateAccount(created) = &create.body else {
+            return None;
+        };
+        let AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(wallet))) = &created.destination;
+        let code = |bytes: &[u8]| {
+            let end = bytes.iter().rposition(|b| *b != 0).map_or(0, |i| i + 1);
+            String::from_utf8(bytes[..end].to_vec()).ok()
+        };
+        let issuer = |AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(key))): &AccountId| {
+            account_for_public_key(key)
+        };
+        let (trustline, rest) = match rest.split_first() {
+            Some((
+                Operation {
+                    body: OperationBody::ChangeTrust(trust),
+                    ..
+                },
+                rest,
+            )) => {
+                let line = match &trust.line {
+                    ChangeTrustAsset::CreditAlphanum4(a) => Trustline {
+                        code: code(&a.asset_code.0)?,
+                        issuer: issuer(&a.issuer),
+                    },
+                    ChangeTrustAsset::CreditAlphanum12(a) => Trustline {
+                        code: code(&a.asset_code.0)?,
+                        issuer: issuer(&a.issuer),
+                    },
+                    _ => return None,
+                };
+                (Some(line), rest)
+            }
+            _ => (None, rest),
+        };
+        let (funding, rest) = match rest.split_first() {
+            Some((
+                Operation {
+                    body: OperationBody::Payment(payment),
+                    ..
+                },
+                rest,
+            )) => (Some(payment.amount.to_string()), rest),
+            _ => (None, rest),
+        };
+        let signer = |op: &Operation| match &op.body {
+            OperationBody::SetOptions(SetOptionsOp {
+                signer:
+                    Some(stellar_xdr::Signer {
+                        key: SignerKey::Ed25519(Uint256(key)),
+                        ..
+                    }),
+                ..
+            }) => Some(account_for_public_key(key)),
+            _ => None,
+        };
+        let [_, agent, engine] = rest else {
+            return None;
+        };
+        Some((
+            NativeSetup {
+                version: 2,
+                profile: OWNER_PROFILE.into(),
+                request_id: String::new(),
+                network: network.into(),
+                owner: account_for_public_key(owner),
+                wallet: account_for_public_key(wallet),
+                agent: signer(agent)?,
+                engine: signer(engine)?,
+                starting_balance: created.starting_balance.to_string(),
+                trustline,
+                funding,
+                sequence: tx.seq_num.0.to_string(),
+                fee_stroops: tx.fee,
+                expires_at: bounds.max_time.0,
+                transaction_xdr: String::new(),
+                transaction_hash: String::new(),
+                intent_digest: String::new(),
+            },
+            *memo,
+        ))
+    };
+    read().is_some_and(|(setup, memo)| {
+        setup_transaction(&setup, memo).is_ok_and(|rebuilt| rebuilt == *tx)
+    })
+}
+
 fn change_trust_asset(asset: &Asset) -> Result<ChangeTrustAsset> {
     match asset {
         Asset::CreditAlphanum4(a) => Ok(ChangeTrustAsset::CreditAlphanum4(a.clone())),
@@ -257,25 +426,28 @@ fn change_trust_asset(asset: &Asset) -> Result<ChangeTrustAsset> {
     }
 }
 
+/// The digest of a setup's fields. A setup without asset funding keeps the digest that it had
+/// before a setup could fund an asset.
 pub fn intent_digest(v: &NativeSetup) -> Result<String> {
-    Ok(hex(&hash(
-        serde_json::to_vec(&serde_json::json!([
-            OWNER_PROFILE,
-            v.request_id,
-            v.network,
-            v.owner,
-            v.wallet,
-            v.agent,
-            v.engine,
-            v.starting_balance,
-            v.trustline,
-            v.sequence,
-            v.fee_stroops,
-            v.expires_at,
-            v.transaction_hash
-        ]))
-        .map_err(err)?,
-    )))
+    let mut fields = serde_json::json!([
+        OWNER_PROFILE,
+        v.request_id,
+        v.network,
+        v.owner,
+        v.wallet,
+        v.agent,
+        v.engine,
+        v.starting_balance,
+        v.trustline,
+        v.sequence,
+        v.fee_stroops,
+        v.expires_at,
+        v.transaction_hash
+    ]);
+    if let (Some(funding), Some(fields)) = (&v.funding, fields.as_array_mut()) {
+        fields.push(serde_json::json!({ "funding": funding }));
+    }
+    Ok(hex(&hash(serde_json::to_vec(&fields).map_err(err)?)))
 }
 
 /// Prepare the one transaction that creates a wallet account for one agent. `state` is the
@@ -286,6 +458,13 @@ pub fn prepare_native_setup(
     now: u64,
 ) -> Result<NativeSetup> {
     check_owner_source(state)?;
+    // No new setup names an issued asset with the code XLM, on any network.
+    if terms
+        .trustline
+        .is_some_and(Trustline::names_the_native_code)
+    {
+        return Err("A wallet holds no issued asset with the code XLM".into());
+    }
     let trustline = terms.trustline.is_some();
     let mut v = NativeSetup {
         version: 2,
@@ -301,6 +480,7 @@ pub fn prepare_native_setup(
             .unwrap_or_else(|| default_starting_balance(trustline))
             .to_string(),
         trustline: terms.trustline.cloned(),
+        funding: terms.funding.map(|units| units.to_string()),
         sequence: state
             .sequence
             .checked_add(1)
@@ -632,6 +812,7 @@ mod tests {
             fee_per_operation: 100,
             starting_balance: None,
             trustline: None,
+            funding: None,
         }
     }
     fn setup(agent: &str) -> NativeSetup {
@@ -893,6 +1074,137 @@ mod tests {
         created(&v)
             .validate_roles(&v.owner, &agent, &server)
             .unwrap();
+    }
+    /// The owner's account pays the issued asset to the new account in the setup, after the
+    /// account's trustline and before the signers. A setup without that funding keeps its
+    /// operations, its fee and its digest fields.
+    #[test]
+    fn a_setup_funds_its_issued_asset_from_the_owner_after_the_trustline() {
+        let agent = agent(2);
+        let wallet = wallet_key(&agent, 0).account();
+        let trustline = Trustline {
+            code: "USDC".into(),
+            issuer: account_for_seed(&[7; 32]),
+        };
+        let server = engine();
+        let mut terms = terms(&wallet, &agent, &server);
+        terms.trustline = Some(&trustline);
+        let unfunded = prepare_native_setup(&owner_state(), &terms, 1).unwrap();
+        assert_eq!(unfunded.funding, None);
+        assert!(
+            !serde_json::to_string(&unfunded)
+                .unwrap()
+                .contains("funding")
+        );
+        terms.funding = Some(100_000);
+        let v = prepare_native_setup(&owner_state(), &terms, 1).unwrap();
+        validate_native_setup(&v).unwrap();
+        assert_ne!(v.intent_digest, unfunded.intent_digest);
+        let TransactionEnvelope::Tx(tx) = read(&v.transaction_xdr).unwrap() else {
+            panic!()
+        };
+        assert_eq!(tx.tx.operations.len(), 6);
+        assert_eq!(tx.tx.fee, 600);
+        // The XLM of the setup is the reserve and the float: the funding is the asset.
+        assert_eq!(v.starting_balance, "35000000");
+        let OperationBody::Payment(payment) = &tx.tx.operations[2].body else {
+            panic!()
+        };
+        assert_eq!(tx.tx.operations[2].source_account, None);
+        assert_eq!(payment.destination, muxed(&wallet).unwrap());
+        assert_eq!(payment.asset, trustline.asset().unwrap());
+        assert_eq!(payment.amount, 100_000);
+        created(&v)
+            .validate_roles(&v.owner, &agent, &server)
+            .unwrap();
+        // The funding is a positive canonical amount of the trustline's asset, and no setup
+        // without a trustline has one.
+        for funding in ["0", "-1", "0100", "1.5", ""] {
+            let mut changed = v.clone();
+            changed.funding = Some(funding.into());
+            assert!(validate_native_setup(&changed).is_err(), "{funding}");
+        }
+        let mut other = v.clone();
+        other.funding = Some("100001".into());
+        assert!(validate_native_setup(&other).is_err());
+        // The ceiling of the funding is the builder's own.
+        terms.funding = Some(MAX_ASSET_FUNDING);
+        assert!(prepare_native_setup(&owner_state(), &terms, 1).is_ok());
+        terms.funding = Some(MAX_ASSET_FUNDING + 1);
+        assert!(prepare_native_setup(&owner_state(), &terms, 1).is_err());
+        terms.funding = Some(100_000);
+        terms.trustline = None;
+        assert!(prepare_native_setup(&owner_state(), &terms, 1).is_err());
+        // No new setup names an issued asset with the code XLM, funded or not.
+        let native_code = Trustline {
+            code: "XLM".into(),
+            issuer: trustline.issuer.clone(),
+        };
+        terms.trustline = Some(&native_code);
+        for funding in [None, Some(100_000)] {
+            terms.funding = funding;
+            assert!(prepare_native_setup(&owner_state(), &terms, 1).is_err());
+        }
+        // The builder of earlier releases made that setup without funding. Its bytes stay
+        // readable as a retained setup. The funded form, which no builder made, does not.
+        let memo = hash(unfunded.request_id.as_bytes());
+        let mut earlier = unfunded.clone();
+        assert_eq!(earlier.network, "stellar:testnet");
+        earlier.trustline = Some(native_code);
+        let bytes = setup_transaction(&earlier, memo).unwrap();
+        assert!(is_setup_transaction(&bytes, &earlier.network));
+        // The earlier builder made it on Testnet only: the same bytes are no setup of pubnet.
+        assert!(!is_setup_transaction(&bytes, "stellar:pubnet"));
+        let mut elsewhere = earlier.clone();
+        elsewhere.network = "stellar:pubnet".into();
+        assert!(setup_transaction(&elsewhere, memo).is_err());
+        earlier.funding = Some("100000".into());
+        earlier.fee_stroops = 600;
+        assert!(setup_transaction(&earlier, memo).is_err());
+        // The current setups are read too.
+        for current in [&unfunded, &v] {
+            let TransactionEnvelope::Tx(envelope) = read(&current.transaction_xdr).unwrap() else {
+                panic!()
+            };
+            assert!(is_setup_transaction(&envelope.tx, &current.network));
+        }
+    }
+    /// A setup is prepared for each network of the rail, with that network's transaction hash,
+    /// and for no other network.
+    #[test]
+    fn a_setup_is_prepared_for_each_network_of_the_rail() {
+        let agent = agent(2);
+        let wallet = wallet_key(&agent, 0).account();
+        let server = engine();
+        let prepared = |network: &'static str| {
+            let mut terms = terms(&wallet, &agent, &server);
+            terms.network = network;
+            prepare_native_setup(&owner_state(), &terms, 1)
+        };
+        let testnet = prepared("stellar:testnet").unwrap();
+        let pubnet = prepared("stellar:pubnet").unwrap();
+        validate_native_setup(&pubnet).unwrap();
+        assert_eq!(testnet.transaction_xdr, pubnet.transaction_xdr);
+        assert_ne!(testnet.transaction_hash, pubnet.transaction_hash);
+        assert!(prepared("stellar:futurenet").is_err());
+        // An alias of a network is no second name of a setup: not when it is prepared, and
+        // not in a retained record whose digest was computed for the alias.
+        assert!(passphrase("stellar:mainnet").is_ok());
+        assert!(prepared("stellar:mainnet").is_err());
+        let mut aliased = pubnet.clone();
+        aliased.network = "stellar:mainnet".into();
+        aliased.intent_digest = intent_digest(&aliased).unwrap();
+        assert_ne!(aliased.intent_digest, pubnet.intent_digest);
+        assert!(validate_native_setup(&aliased).is_err());
+        let TransactionEnvelope::Tx(envelope) = read(&pubnet.transaction_xdr).unwrap() else {
+            panic!()
+        };
+        assert!(is_setup_transaction(&envelope.tx, "stellar:pubnet"));
+        assert!(!is_setup_transaction(&envelope.tx, "stellar:mainnet"));
+        // The bytes of one network are no setup of the other.
+        let mut moved = testnet.clone();
+        moved.network = "stellar:pubnet".into();
+        assert!(validate_native_setup(&moved).is_err());
     }
     #[test]
     fn the_owner_pauses_resumes_withdraws_and_closes_with_one_signature() {

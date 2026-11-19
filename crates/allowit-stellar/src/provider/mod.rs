@@ -377,8 +377,8 @@ pub fn capabilities(network: &str) -> crate::host::execution::Capabilities {
         address_is_key: true,
         operations: &["transfer", "deposit", "redeem"],
         build_only: true,
-        verbs: if crate::host::routing::info(network).is_ok_and(|v| v.testnet) {
-            &[
+        verbs: match crate::host::routing::info(network) {
+            Ok(rail) if rail.testnet => &[
                 "keys fund",
                 "wallet setup",
                 "wallet import",
@@ -392,9 +392,10 @@ pub fn capabilities(network: &str) -> crate::host::execution::Capabilities {
                 "policy generate",
                 "exec",
                 "status",
-            ]
-        } else {
-            &[
+            ],
+            // Every verb of a test network but its faucet.
+            Ok(_) => &[
+                "wallet setup",
                 "wallet import",
                 "policy deploy",
                 "policy fund",
@@ -406,7 +407,22 @@ pub fn capabilities(network: &str) -> crate::host::execution::Capabilities {
                 "policy generate",
                 "exec",
                 "status",
-            ]
+            ],
+            // A network outside the rail keeps the list that it had: no setup, which the
+            // setup refuses there.
+            Err(_) => &[
+                "wallet import",
+                "policy deploy",
+                "policy fund",
+                "policy activate",
+                "policy export",
+                "policy owner-status",
+                "wallet show",
+                "policy show",
+                "policy generate",
+                "exec",
+                "status",
+            ],
         },
     }
 }
@@ -477,5 +493,36 @@ mod source_shape_tests {
             "    allowit::set_state(ctx, question.as_str(), 1u32)?;\n    Ok(())",
         );
         assert!(source_shape(false, true, &dynamic).is_err());
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    /// Every network of the rail advertises the wallet setup. Only a test network has a faucet.
+    #[test]
+    fn each_network_advertises_the_wallet_setup() {
+        for network in crate::plugin::NETWORKS {
+            let verbs = super::capabilities(network.id).verbs;
+            assert!(verbs.contains(&"wallet setup"), "{}", network.id);
+            assert_eq!(
+                verbs.contains(&"keys fund"),
+                network.testnet,
+                "{}",
+                network.id
+            );
+        }
+    }
+    /// A network that the rail does not serve advertises no wallet setup, which the setup
+    /// refuses there, and keeps the other verbs that it had.
+    #[test]
+    fn a_network_outside_the_rail_advertises_no_wallet_setup() {
+        for network in ["stellar:futurenet", "example:testnet", ""] {
+            assert!(crate::host::routing::info(network).is_err(), "{network}");
+            let verbs = super::capabilities(network).verbs;
+            assert!(!verbs.contains(&"wallet setup"), "{network}");
+            assert!(!verbs.contains(&"keys fund"), "{network}");
+            assert_eq!(verbs.len(), 11, "{network}");
+            assert!(verbs.contains(&"wallet import") && verbs.contains(&"exec"));
+        }
     }
 }

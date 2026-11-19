@@ -51,6 +51,35 @@ struct OperationAdvertisement {
 struct Templates {
     templates: Vec<Template>,
 }
+/// The templates answer as the Native setup reads it. The contract-wallet generation keeps its
+/// own decoder, [`Templates`], which reads no signer.
+///
+/// The decoder names every field that the setup reads, so an answer that states one of them
+/// twice is refused as a whole: no later value replaces an earlier one unseen. It takes each
+/// value in any form, and the setup then requires the forms of its own network's template
+/// only: a template of another network in a form that the setup does not know does not stop it.
+#[derive(Deserialize)]
+struct NativeTemplates {
+    templates: Vec<NativeTemplate>,
+    /// The server's signer on the network of the request.
+    #[serde(default)]
+    server: Value,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeTemplate {
+    #[serde(default)]
+    network: Value,
+    #[serde(default)]
+    asset: Value,
+    #[serde(default)]
+    asset_symbol: Value,
+    #[serde(default)]
+    asset_issuer: Value,
+    /// The server's signer on the template's network, when the server states it per template.
+    #[serde(default)]
+    server: Value,
+}
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Template {
@@ -180,7 +209,85 @@ fn lower_hash(value: &str) -> Result<()> {
         Err(Error::config("Invalid lowercase Stellar identity"))
     }
 }
+/// The issued asset that a Native wallet of `network` holds: the asset of the server's one
+/// template of the network, which must be the asset of its own contract address. `None` is a
+/// wallet that holds XLM. A server without a template of the network sets up no wallet there.
+/// The server's signer on the network must be `server`, the key of the independently
+/// configured authority: the wallet takes that key as its server signer, and a server that
+/// signs with another key would never register or co-sign for the wallet.
+fn wallet_asset(
+    templates: NativeTemplates,
+    network: &str,
+    server: &str,
+) -> Result<Option<native::owner::Trustline>> {
+    let canonical = crate::host::routing::normalize(network)?;
+    let other_signer = || {
+        Error::config(
+            "The server's signer on this network differs from the configured server authority",
+        )
+    };
+    if templates.server.as_str() != Some(server) {
+        return Err(other_signer());
+    }
+    let mut matching = templates.templates.into_iter().filter(|template| {
+        template
+            .network
+            .as_str()
+            .and_then(|named| crate::host::routing::normalize(named).ok())
+            == Some(canonical)
+    });
+    let (Some(template), None) = (matching.next(), matching.next()) else {
+        return Err(Error::config(
+            "The server offers no Native wallet on this network",
+        ));
+    };
+    // A server that states its signer on the template too states the same key there.
+    if !template.server.is_null() && template.server.as_str() != Some(server) {
+        return Err(other_signer());
+    }
+    let invalid = || Error::config("The server's wallet asset of this network is invalid");
+    let symbol = template.asset_symbol.as_str().ok_or_else(invalid)?;
+    let issuer = match &template.asset_issuer {
+        Value::Null => None,
+        Value::String(issuer) => Some(issuer.as_str()),
+        _ => return Err(invalid()),
+    };
+    let asset = native::asset_from_identity(symbol, issuer).map_err(|_| invalid())?;
+    if template.asset.as_str()
+        != Some(&native::sac_address(canonical, &asset).map_err(|_| invalid())?)
+    {
+        return Err(invalid());
+    }
+    Ok(issuer.map(|issuer| native::owner::Trustline {
+        code: symbol.into(),
+        issuer: issuer.into(),
+    }))
+}
 impl OwnerClient {
+    /// The issued asset of a new Native wallet on `network`, from the server's template. The
+    /// request names the network by its id, and the server's signer on it must be the key of
+    /// the configured authority.
+    pub fn native_wallet_asset(
+        &self,
+        network: &str,
+        now: u64,
+    ) -> Result<Option<native::owner::Trustline>> {
+        let authority = self.authority.as_ref().ok_or_else(|| {
+            Error::config("Owner action requires independently configured server authority")
+        })?;
+        let network = crate::host::routing::normalize(network)?;
+        wallet_asset(
+            self.session.owner_request(
+                Method::Post,
+                &format!("/api/native/templates?network={network}"),
+                Some(&json!({})),
+                now,
+                false,
+            )?,
+            network,
+            authority.public_key(),
+        )
+    }
     pub fn new(backend: &str, origin: &str, owner: &str) -> Result<Self> {
         native::signing::canonical_account_key(owner)
             .map_err(|_| Error::config("Select a canonical Stellar G owner account"))?;

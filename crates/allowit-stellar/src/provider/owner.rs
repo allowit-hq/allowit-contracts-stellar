@@ -163,7 +163,8 @@ impl OwnerProvider for Owner {
         Ok(raw)
     }
     fn setup(&self, cx: &Context<'_>, r: owner::Setup<'_>) -> Result<serde_json::Value> {
-        /// The XLM amount of a setup, in stroops. A Native wallet holds XLM.
+        /// The amount of a setup in the base units of the wallet's asset. XLM and every issued
+        /// Stellar asset have seven decimals.
         fn setup_funding(amount: &str) -> Result<i64> {
             i64::try_from(workflow::amount_units(amount)?)
                 .ok()
@@ -175,32 +176,81 @@ impl OwnerProvider for Owner {
                 "Setup server differs from independently configured authority",
             ));
         }
-        if !crate::host::routing::info(cx.network)?.testnet {
-            return Err(Error::unsupported(
-                "Native setup is available on the selected test network only",
-            ));
+        let funding = r.amount.map(setup_funding).transpose()?;
+        let fee_per_operation = fee(r.fee_per_operation)?;
+        // The request, the retained record and the registration document name the network by
+        // its canonical id, whichever alias the caller selected: the server's templates and the
+        // identity of a resumed request then name the same network.
+        let network = crate::host::routing::normalize(cx.network)?;
+        // The owner's key and the server's key are those of this network. A key store or a
+        // server authority of another network of the rail holds a valid account of this one
+        // too, so the setup compares the ids: it never installs the server key of one network
+        // in a wallet of another.
+        for (role, other) in [
+            ("owner key", cx.signer.network()),
+            ("server authority", cx.authority.network()),
+        ] {
+            if crate::host::routing::normalize(other).ok() != Some(network) {
+                return Err(Error::config(format!(
+                    "The {role} belongs to another network than the wallet setup"
+                )));
+            }
         }
-        let request = SetupRequest {
-            network: cx.network.into(),
+        // The caller's own values are checked first, the RPC endpoint and the network that it
+        // serves among them: a setup that must fail asks the owner for no sign-in, opens no
+        // journal and asks the server nothing. The wallet asset is checked after the server's
+        // template names it.
+        let request = |asset| SetupRequest {
+            network: network.into(),
             owner: cx.signer.address().into(),
             agent: r.agent.into(),
             server: r.server.into(),
             request_id: r.request_id.into(),
-            fee_per_operation: fee(r.fee_per_operation)?,
-            funding: r.amount.map(setup_funding).transpose()?,
+            fee_per_operation,
+            asset,
+            funding,
         };
+        request(None).validate_caller_values()?;
+        let runtime = runtime(cx.rpc_url)?;
+        workflow::network(runtime.rpc(), network)?;
+        // The server's template of the network names the asset that the wallet holds. It is
+        // read before anything is signed for the ledger, so a server that offers no wallet on
+        // this network stops the setup before an account exists. A request that the store
+        // retains keeps its own asset: its resume does not depend on the template of today.
+        // Such a resume asks the server nothing before its retained bytes are settled on the
+        // ledger, as before: the owner's session starts at the registration.
+        // The journal is open for the read of the retained request only: the sign-in and the
+        // template request hold no lock, so a slow server holds up no payment and no recovery
+        // of the same journal. The workflow opens the journal again and checks the request
+        // identity, the asset included, against whatever the journal retains by then.
+        let retained = workflow::retained_setup_asset(&(cx.store)()?, r.request_id)?;
+        let (asset, session) = match retained {
+            Some(asset) => (asset, None),
+            None => {
+                let client = client(cx)?;
+                let asset = client.native_wallet_asset(network, (cx.clock)()?)?;
+                (asset, Some(client))
+            }
+        };
+        let request = request(asset);
         request.validate()?;
+        let store = (cx.store)()?;
         let mut configured = workflow::configure_native(
-            &runtime(cx.rpc_url)?,
-            &(cx.store)()?,
+            &runtime,
+            &store,
             &request,
             &super::OwnerSignerRef(cx.signer),
             cx.clock,
         )?;
+        // The registration reads and writes no journal, so the journal's lock is released
+        // before the server is asked: a slow registration holds up no payment and no recovery
+        // of the same journal.
+        drop(store);
         // The ledger now holds the wallet. The server registers it from the ledger, so no
         // server configuration names it. A refusal leaves the wallet set up: the same request
         // ID asks again and signs nothing.
-        let registration = client(cx)
+        let registration = session
+            .map_or_else(|| client(cx), Ok)
             .and_then(|client| {
                 client.register_native(&configured["configuration"], (cx.clock)()?)
             })
@@ -446,6 +496,221 @@ mod storage_boundary_tests {
         assert_eq!(
             error.message,
             "The request file must contain a JSON object."
+        );
+    }
+    /// A setup with an invalid value of the caller fails before the journal opens, before the
+    /// owner signs a sign-in and before the server is asked: the store and the signer of this
+    /// test panic when they are used, and the server origin answers nothing. So does a setup
+    /// whose owner key or server authority belongs to another network of the rail.
+    #[test]
+    fn an_invalid_setup_fails_before_the_journal_the_sign_in_and_the_server() {
+        struct Owner(&'static str, String);
+        impl crate::host::Signer for Owner {
+            fn network(&self) -> &str {
+                self.0
+            }
+            fn address(&self) -> &str {
+                &self.1
+            }
+            fn sign_hash(&self, _: &[u8]) -> Result<Vec<u8>> {
+                panic!("an invalid setup requested a signature")
+            }
+        }
+        let owner = crate::account_for_seed(&[11; 32]);
+        let agent = crate::account_for_seed(&[12; 32]);
+        let server = crate::account_for_seed(&[13; 32]);
+        // `selected` is the network of the call, `keys` the network of the owner's key store
+        // and `service` the network of the configured server authority.
+        let setup = |[selected, keys, service]: [&'static str; 3],
+                     agent: &str,
+                     request_id: &str,
+                     amount: Option<&str>| {
+            let authority = crate::host::config::ServerAuthority::validated(
+                service,
+                "http://localhost:3000",
+                &server,
+            )
+            .unwrap();
+            let signer = Owner(keys, owner.clone());
+            let context = Context {
+                network: selected,
+                backend: authority.origin(),
+                authority: &authority,
+                origin: "http://localhost:5173",
+                rpc_url: "invalid",
+                store: &|| panic!("an invalid setup requested a journal"),
+                signer: &signer,
+                clock: &|| Ok(1),
+            };
+            OWNER
+                .setup(
+                    &context,
+                    owner::Setup {
+                        agent,
+                        server: &server,
+                        request_id,
+                        fee_per_operation: "100",
+                        amount,
+                    },
+                )
+                .unwrap_err()
+                .message
+        };
+        let id = "setup-invalid-001";
+        for (selected, canonical) in [
+            ("stellar:testnet", "stellar:testnet"),
+            ("stellar:pubnet", "stellar:pubnet"),
+            ("stellar:mainnet", "stellar:pubnet"),
+        ] {
+            let same = [selected, selected, canonical];
+            for (agent, request_id, amount, message) in [
+                ("GAGENT", id, None, "Expected canonical Stellar G account"),
+                (
+                    agent.as_str(),
+                    "bad id",
+                    None,
+                    "Invalid Stellar setup request ID",
+                ),
+                (
+                    agent.as_str(),
+                    id,
+                    Some("0"),
+                    "Asset amount exceeds the supported positive range",
+                ),
+                (
+                    owner.as_str(),
+                    id,
+                    None,
+                    "Owner, agent and server must be distinct G accounts",
+                ),
+                // The most that a wallet of an issued asset takes passes the early check, which
+                // does not know the asset yet: the next check, of the RPC endpoint, stops it.
+                (
+                    agent.as_str(),
+                    id,
+                    Some("100000000"),
+                    "Invalid owner RPC endpoint",
+                ),
+                (
+                    agent.as_str(),
+                    id,
+                    Some("100000000.0000001"),
+                    "The setup funding amount is out of range",
+                ),
+            ] {
+                assert_eq!(
+                    setup(same, agent, request_id, amount),
+                    message,
+                    "{selected}"
+                );
+            }
+            // A valid request of this network with a key store or a server authority of the
+            // other network of the rail: the account of each key is valid on both.
+            let other = if canonical == "stellar:testnet" {
+                "stellar:pubnet"
+            } else {
+                "stellar:testnet"
+            };
+            assert_eq!(
+                setup([selected, other, canonical], &agent, id, None),
+                "The owner key belongs to another network than the wallet setup",
+                "{selected}"
+            );
+            assert_eq!(
+                setup([selected, selected, other], &agent, id, None),
+                "The server authority belongs to another network than the wallet setup",
+                "{selected}"
+            );
+            // A valid request whose RPC endpoint is no URL.
+            assert_eq!(
+                setup(same, &agent, id, None),
+                "Invalid owner RPC endpoint",
+                "{selected}"
+            );
+        }
+    }
+    /// A setup whose RPC endpoint serves another network than the setup fails before the
+    /// journal opens and before the owner signs a sign-in. The loopback endpoint answers one
+    /// `getNetwork` with the Testnet passphrase, for a setup on pubnet.
+    #[test]
+    #[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
+    fn a_setup_with_an_rpc_of_another_network_fails_before_the_journal_and_the_sign_in() {
+        use std::io::{Read, Write};
+        struct Owner(String);
+        impl crate::host::Signer for Owner {
+            fn network(&self) -> &str {
+                "stellar:pubnet"
+            }
+            fn address(&self) -> &str {
+                &self.0
+            }
+            fn sign_hash(&self, _: &[u8]) -> Result<Vec<u8>> {
+                panic!("a setup on another network requested a signature")
+            }
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let rpc = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            let header = String::from_utf8(request).unwrap().to_ascii_lowercase();
+            let length: usize = header
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .map(|value| value.trim().parse().unwrap())
+                .unwrap();
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).unwrap();
+            let call: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(call["method"], "getNetwork");
+            let reply = serde_json::json!({"jsonrpc":"2.0","id":call["id"],
+                "result":{"passphrase":crate::passphrase("stellar:testnet").unwrap()}})
+            .to_string();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+        });
+        let server = crate::account_for_seed(&[13; 32]);
+        let authority = crate::host::config::ServerAuthority::validated(
+            "stellar:pubnet",
+            "http://localhost:3000",
+            &server,
+        )
+        .unwrap();
+        let signer = Owner(crate::account_for_seed(&[11; 32]));
+        let context = Context {
+            network: "stellar:pubnet",
+            backend: authority.origin(),
+            authority: &authority,
+            origin: "http://localhost:5173",
+            rpc_url: &url,
+            store: &|| panic!("a setup on another network requested a journal"),
+            signer: &signer,
+            clock: &|| Ok(1),
+        };
+        let error = OWNER
+            .setup(
+                &context,
+                owner::Setup {
+                    agent: &crate::account_for_seed(&[12; 32]),
+                    server: &server,
+                    request_id: "setup-network-001",
+                    fee_per_operation: "100",
+                    amount: None,
+                },
+            )
+            .unwrap_err();
+        rpc.join().unwrap();
+        assert_eq!(
+            error.message,
+            "Owner RPC network differs from the selected policy"
         );
     }
 }

@@ -1,10 +1,12 @@
 import {canonicalNetwork, networkPassphrase, strkey} from '../plugin.js';
 import {base, emit, expiry, h, type Data} from './base.js';
 import {link} from './display.js';
-import {APPROVE_POLICY, SET_UP_WALLET, WALLET_FEE_FLOAT, WALLET_RESERVE, approvalMessage, nativeSetupOf, policyApproval} from '../native-wallet.js';
+import {APPROVE_POLICY, SET_UP_WALLET, TRUSTLINE_RESERVE, WALLET_FEE_FLOAT, WALLET_RESERVE, approvalMessage, nativeSetupOf, policyApproval} from '../native-wallet.js';
 
 /** XLM text of stroops, without trailing zeros. */
-const xlm = (units: bigint) => `${units / 10_000_000n}${units % 10_000_000n ? `.${(units % 10_000_000n).toString().padStart(7, '0').replace(/0+$/, '')}` : ''} XLM`;
+/** Base units as a decimal amount with its unit. XLM and every issued asset have seven decimals. */
+const units = (value: bigint, symbol: string) => `${value / 10_000_000n}${value % 10_000_000n ? `.${(value % 10_000_000n).toString().padStart(7, '0').replace(/0+$/, '')}` : ''} ${symbol}`;
+const xlm = (value: bigint) => units(value, 'XLM');
 
 
 type Failure = {code: string; message: string};
@@ -138,16 +140,23 @@ export function ownerSignElement() {
       }
       if (step.action === SET_UP_WALLET) {
         // The owner reads what this step creates before the wallet opens: the agent's wallet account, its
-        // signers and the XLM that it starts with. Any other transaction under this action is refused.
+        // signers, the asset that it holds and what it starts with. Any other transaction under this action is refused.
         const setup = nativeSetupOf(step.payload, id);
         if (!setup || (typeof data.owner === 'string' && data.owner !== setup.owner)) {
           this.replaceChildren(h('p', {class: 'invalid'}, 'This owner step is invalid.'));
           return;
         }
-        const funding = setup.startingBalance - WALLET_RESERVE - WALLET_FEE_FLOAT;
+        const {funding, asset} = setup;
         rows.push(h('dt', {}, 'Wallet account'), h('dd', {}, link(id, 'address', setup.wallet, setup.wallet)));
         rows.push(h('dt', {}, 'Agent'), h('dd', {}, link(id, 'address', setup.agent, setup.agent)));
-        rows.push(h('dt', {}, 'You fund it with'), h('dd', {}, `${xlm(setup.startingBalance)}: ${funding > 0n ? `${xlm(funding)} for your agent's payments, ` : ''}${xlm(WALLET_RESERVE)} that the network locks in the account and ${xlm(WALLET_FEE_FLOAT)} for the fees of your own steps. Only you can take it back.`));
+        if (asset.issuer === null) {
+          rows.push(h('dt', {}, 'You fund it with'), h('dd', {}, `${xlm(setup.startingBalance)}: ${funding > 0n ? `${xlm(funding)} for your agent's payments, ` : ''}${xlm(WALLET_RESERVE)} that the network locks in the account and ${xlm(WALLET_FEE_FLOAT)} for the fees of your own steps. Only you can take it back.`));
+        } else {
+          // A wallet of an issued asset: the asset by its code and its issuer, the funding in that asset, and the
+          // XLM that the account, its trustline and the owner's own steps need.
+          rows.push(h('dt', {}, 'Asset'), h('dd', {}, `${asset.symbol}, issued by `, link(id, 'address', asset.issuer, asset.issuer)));
+          rows.push(h('dt', {}, 'You fund it with'), h('dd', {}, `${funding > 0n ? `${units(funding, asset.symbol)} for your agent's payments, and ` : ''}${xlm(setup.startingBalance)}: ${xlm(WALLET_RESERVE + TRUSTLINE_RESERVE)} that the network locks in the account and its ${asset.symbol} trustline, and ${xlm(WALLET_FEE_FLOAT)} for network fees. Only you can close the wallet, which returns its XLM to you. The ${asset.symbol} follows the rules of its issuer.`));
+        }
         rows.push(h('dt', {}, 'Who can pay'), h('dd', {}, 'Your agent and the server, only together. You can do everything alone.'));
       }
       rows.push(h('dt', {}, 'Transaction'), h('dd', {}, link(id, 'tx', step.hash, `${step.hash.slice(0, 8)}…`)));

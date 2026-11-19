@@ -1,6 +1,7 @@
 /**
  * The Native wallet of an agent: a new classic account, one for each agent. The owner creates and funds it with one
- * signed transaction. That transaction also sets its signers: the owner alone reaches every threshold, and the agent
+ * signed transaction. The wallet holds one asset: XLM, or an issued asset whose trustline the same transaction adds.
+ * That transaction also sets its signers: the owner alone reaches every threshold, and the agent
  * key and the server pay from it only together. The account's own key is random, signs the creation once and then
  * has weight 0. The agent holds a key and no account.
  *
@@ -9,6 +10,7 @@
  * send it again or replace it. The server takes no part in the setup.
  */
 import { type Transaction } from '@stellar/stellar-sdk/base';
+import type { ReviewedPolicy, WalletAsset } from '@allowit/core';
 /** The action of the owner step that creates the agent's wallet account. */
 export declare const SET_UP_WALLET = "set_up_wallet";
 /**
@@ -26,19 +28,34 @@ export declare const AUTOMATED_WEIGHT = 1;
 export declare const PAYMENT_THRESHOLD = 2;
 /** The high threshold: the owner alone. */
 export declare const OWNER_THRESHOLD = 3;
-/** What the network locks in a wallet account, in stroops: the account and its three signers. */
+/** What the network locks in a wallet account that holds XLM, in stroops: the account and its three signers. */
 export declare const WALLET_RESERVE: bigint;
+/** What the network locks for the trustline of a wallet that holds an issued asset, in stroops. */
+export declare const TRUSTLINE_RESERVE = 5000000n;
 /** The XLM that a new wallet holds above its reserve and its funding, in stroops. It pays the fees of the owner's own steps. */
 export declare const WALLET_FEE_FLOAT = 5000000n;
-/** The balance that a new wallet starts with, in stroops: its reserve, its fee float and the owner's funding. */
-export declare function walletStartingBalance(funding: bigint): bigint;
+/**
+ * The asset that a wallet holds, by its code and its issuer: Core's `WalletAsset`, under the name of this rail's
+ * wallet. XLM has no issuer. A policy names its asset this way, and the server's template of a network decides it.
+ * This module validates it as a Stellar asset and converts it.
+ */
+export type NativeWalletAsset = WalletAsset;
+/**
+ * The XLM that a new wallet starts with, in stroops. A wallet that holds XLM starts with its reserve, its fee float and
+ * the owner's funding. A wallet that holds an issued asset (`issued`) starts with its reserve, the reserve of its
+ * trustline and its fee float: its funding is a payment of that asset.
+ */
+export declare function walletStartingBalance(funding: bigint, issued?: boolean): bigint;
 /**
  * The installation document of a wallet account, as the server registers it. It is the document of the rail's own
- * setup: the same identity, the bootstrap source and the native asset. The server reads the roles from the ledger
- * and refuses a document that the account does not match.
+ * setup: the same identity, the bootstrap source and the wallet's asset, which is `asset` or XLM. The server reads the
+ * roles from the ledger and refuses a document that the account does not match.
  */
-export declare function nativeWalletConfiguration(network: string, wallet: string, owner: string, agent: string, server: string): Record<string, unknown>;
-/** The terms of one wallet setup. `sequence` is the owner's current account sequence, and `expiresAt` a Unix time. */
+export declare function nativeWalletConfiguration(network: string, wallet: string, owner: string, agent: string, server: string, asset?: NativeWalletAsset | null | undefined): Record<string, unknown>;
+/**
+ * The terms of one wallet setup. `sequence` is the owner's current account sequence, and `expiresAt` a Unix time.
+ * `funding` is in base units of the wallet's asset, which is `asset` or XLM.
+ */
 export interface NativeSetupTerms {
     network: string;
     owner: string;
@@ -49,25 +66,36 @@ export interface NativeSetupTerms {
     funding: bigint;
     requestId: string;
     expiresAt: number;
+    asset?: NativeWalletAsset | null | undefined;
 }
 /**
  * The setup transaction of a wallet account. Its operations are one atomic unit: the creation with the starting
  * balance, the owner signer, the agent signer, and last the server signer with the thresholds and weight 0 for the
- * account's own key. The owner's account is the source and pays the fee.
+ * account's own key. A wallet that holds an issued asset adds its trustline after the creation, and the owner's
+ * account then pays the funding in that asset. The owner's account is the source and pays the fee.
  */
-export declare function nativeSetupTransaction({ network, owner, sequence, wallet, agent, server, funding, requestId, expiresAt }: NativeSetupTerms): Transaction;
+export declare function nativeSetupTransaction(terms: NativeSetupTerms): Transaction;
 /**
- * What a setup transaction does, read from its bytes: the wallet account that it creates, its roles and its
- * starting balance. Null for any other transaction: one that lacks an operation, adds another, names another
- * signer weight or threshold, or leaves the account's own key a weight.
+ * What a setup transaction does, read from its bytes: the wallet account that it creates, its roles, its XLM starting
+ * balance, the asset that it holds and the funding in that asset. Null for any other transaction. The bytes are a
+ * setup only when the setup builder makes exactly them from what was read: the same operations in the same encoding,
+ * the same fee, sequence, memo and time bound, and nothing else. So a transaction that lacks an operation, adds
+ * another, names another signer weight, threshold, source, destination, asset or balance, bids another fee or
+ * carries another condition or extension is no setup.
  */
-export declare function nativeSetupOf(payload: string, network: string): {
+export interface NativeSetupFacts {
     owner: string;
     wallet: string;
     agent: string;
     server: string;
+    /** The XLM that the owner's account sends at the creation, in stroops. */
     startingBalance: bigint;
-} | null;
+    /** The asset that the wallet holds. */
+    asset: NativeWalletAsset;
+    /** The owner's funding for the agent's payments, in base units of `asset`. */
+    funding: bigint;
+}
+export declare function nativeSetupOf(payload: string, network: string): NativeSetupFacts | null;
 /** The roles and funding of a Native wallet account's setup. */
 export interface NativeSetupInput {
     network: string;
@@ -77,8 +105,10 @@ export interface NativeSetupInput {
     agent: string;
     /** The server's signer account. */
     server: string;
-    /** The XLM that the wallet holds for the agent's payments, as decimal text with at most seven decimals. */
+    /** The amount of the wallet's asset that the wallet holds for the agent's payments, as decimal text with at most seven decimals. */
     amount: string;
+    /** The asset that the wallet holds, from the policy that the owner reviewed. Without one the wallet holds XLM. */
+    asset?: NativeWalletAsset | null | undefined;
     fetch?: typeof fetch;
 }
 /** A setup prepared for the owner's signature. */
@@ -102,10 +132,11 @@ export interface PreparedNativeSetup {
  * Prepares the setup of the wallet account of an agent: one transaction from the owner's own sequence. The account's
  * own key is random; it signs the creation once, beside the owner, in `complete`.
  */
-export declare function prepareNativeSetup({ network, owner, agent, server, amount, fetch: send }: NativeSetupInput): Promise<PreparedNativeSetup>;
+export declare function prepareNativeSetup({ network, owner, agent, server, amount, asset, fetch: send }: NativeSetupInput): Promise<PreparedNativeSetup>;
 /**
- * What signed setup bytes are: their hash, their roles and their own time bound. Null for bytes that are no setup of
- * this network. The signed bytes decide; saved metadata is unsigned.
+ * What signed setup bytes are: their hash, their roles, the asset of their wallet, the amount of that asset that they
+ * fund it with, as decimal text, and their own time bound. Null for bytes that are no setup of this network. The
+ * signed bytes decide; saved metadata is unsigned.
  */
 export declare function signedNativeSetupOf(signedPayload: string, network: string): {
     hash: string;
@@ -114,6 +145,8 @@ export declare function signedNativeSetupOf(signedPayload: string, network: stri
     agent: string;
     server: string;
     validUntil: number;
+    asset: NativeWalletAsset;
+    amount: string;
 } | null;
 /** Sends signed setup bytes to Horizon. The ledger of the successful transaction, or null without a certain answer. */
 export declare function sendNativeSetup(network: string, signedPayload: string, hash: string, send?: typeof fetch): Promise<number | null>;
@@ -142,21 +175,17 @@ export interface PolicyApproval {
  */
 export declare function policyApproval(message: unknown, network: string): PolicyApproval | null;
 /**
- * The policy that the owner reviewed before an approval: its exact source and every value. Its ordered rules and its
- * tier, which the service derives from the source, are checked too when the host states them.
+ * The policy that the owner reviewed before an approval is Core's `ReviewedPolicy`: its exact source and every value,
+ * its ordered rules and its tier when the host states them, and the asset that it pays in, which is XLM without one.
  */
-export interface ReviewedPolicy {
-    source: string;
-    params: Record<string, unknown>;
-    rules?: unknown;
-    tier?: unknown;
-}
+export type { ReviewedPolicy };
 /**
  * Whether a policy approval of `wallet` is exactly what the owner reviewed. Every field that the wallet signs is
  * checked: the policy and its revision come from the service; the source, rules, values and tier must be the
  * reviewed ones; the network, wallet, route, asset and fee ceiling must be the wallet account's own configuration,
- * as its setup made it. The server's digests of the source and the name of its installation are left to the server.
- * Any other field, or any other value, is refused.
+ * as its setup made it for the asset of the reviewed policy. The server's digests of the source and the name of its
+ * installation are left to the server. Any other field, or any other value, is refused, and so is a reviewed policy
+ * whose asset is no asset.
  */
 export declare function nativeApprovalHolds(approval: PolicyApproval, wallet: string, reviewed: ReviewedPolicy): boolean;
 /** The step that asks the owner's wallet to approve a policy. It signs the message and moves nothing. */

@@ -24,6 +24,7 @@ fn main() {
             fee_per_operation: 100,
             starting_balance: None,
             trustline: None,
+            funding: None,
         },
         1_800_000_000,
     )
