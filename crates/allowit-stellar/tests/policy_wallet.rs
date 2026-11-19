@@ -1053,7 +1053,15 @@ impl rpc::Rpc for ModelChain {
                 Ok(json!({"hash": tx_hash, "status": "PENDING"}))
             }
             "getEvents" => {
-                let start = params["startLedger"].as_u64().unwrap() as u32;
+                // A page after a cursor starts at the ledger after it; one page scans every
+                // ledger up to the head.
+                let start = match params["pagination"]["cursor"].as_str() {
+                    Some(cursor) => {
+                        let toid: u64 = cursor.split_once('-').unwrap().0.parse().unwrap();
+                        ((toid >> 32) + 1) as u32
+                    }
+                    None => params["startLedger"].as_u64().unwrap() as u32,
+                };
                 let filter = &params["filters"][0];
                 let wallet = m.wallet.as_ref().map(|w| w.address.clone());
                 assert_eq!(filter["contractIds"][0].as_str(), wallet.as_deref());
@@ -1068,7 +1076,12 @@ impl rpc::Rpc for ModelChain {
                     .filter(|(ledger, id, _)| *ledger >= start && json!(b64(id)) == topics[1])
                     .map(|(ledger, _, hash)| json!({"ledger": ledger, "txHash": hash}))
                     .collect();
-                Ok(json!({"events": events, "latestLedger": m.ledger}))
+                let cursor = format!(
+                    "{:019}-{:010}",
+                    (u64::from(m.ledger) << 32) | 0xffff_ffff,
+                    u32::MAX
+                );
+                Ok(json!({"events": events, "latestLedger": m.ledger, "cursor": cursor}))
             }
             "getTransaction" => {
                 let tx_hash = params["hash"].as_str().unwrap();

@@ -980,8 +980,8 @@ fn owner_never_applied(reply: &Value, hash: &str, expires_at: u64, since: u64) -
 /// executed. The time bound alone proves no lapse: once the history no longer holds the
 /// preparation's ledger, the operation stays open. `false` before
 /// that ledger, when its prepared transaction succeeded, when the RPC does not show the closing
-/// time or a history that holds the preparation, when an execution is found, or when the event
-/// read does not reach the ledger that showed the expiry; a read that fails
+/// time or a history that holds the preparation, when an execution is found, or when the scan of
+/// the events does not reach the ledger that showed the expiry; a read that fails
 /// is an error, never a lapse.
 pub fn operation_lapsed(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<bool> {
     if p.config.route != WalletRoute::PolicyWallet {
@@ -1006,34 +1006,53 @@ pub fn operation_lapsed(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<bool> {
         _ => Ok(false),
     }
 }
+/// The most pages of events that one lapse read follows. An RPC scans a bounded range of ledgers
+/// for each page (Stellar RPC: 10,000), and its history holds about 120,960 (seven days).
+const MAX_EVENT_PAGES: usize = 32;
 /// Whether the wallet's events from the ledger of `p`'s preparation on hold an execution of `p`:
-/// its `allowit` event of the operation id, in any envelope. `None` when no event is found and
-/// the read does not reach the ledger `through`, which showed the expiry: an execution in the
-/// ledgers between could be missing.
+/// its `allowit` event of the operation id, in any envelope. Each answer scans a bounded range of
+/// ledgers and names where its scan ended (`cursor`); the read follows the cursor until it passed
+/// the ledger `through`, which showed the expiry. `None` when no event is found and the scan does
+/// not reach that ledger, or an answer names no cursor: an execution in the ledgers that it did
+/// not scan could be missing.
 fn executed(rpc: &dyn Rpc, p: &PreparedOperation, through: u64) -> Result<Option<bool>> {
     let topics = [
         xdr(&value_symbol("allowit")?)?,
         xdr(&value_bytes(&p.request.operation.nonce)?)?,
     ];
-    let reply = rpc.call(
-        "getEvents",
-        json!({
-            "startLedger": p.state.ledger,
-            "filters": [{"type": "contract", "contractIds": [p.config.wallet], "topics": [topics]}],
-            "pagination": {"limit": 1},
-        }),
-    )?;
-    if !reply["events"]
-        .as_array()
-        .ok_or("Missing ledger events")?
-        .is_empty()
-    {
-        return Ok(Some(true));
+    let filters =
+        json!([{"type": "contract", "contractIds": [p.config.wallet], "topics": [topics]}]);
+    let mut request = json!({
+        "startLedger": p.state.ledger,
+        "filters": filters,
+        "pagination": {"limit": 1},
+    });
+    for _ in 0..MAX_EVENT_PAGES {
+        let reply = rpc.call("getEvents", request)?;
+        if !reply["events"]
+            .as_array()
+            .ok_or("Missing ledger events")?
+            .is_empty()
+        {
+            return Ok(Some(true));
+        }
+        let Some((cursor, scanned)) = reply["cursor"]
+            .as_str()
+            .and_then(|cursor| Some((cursor, cursor_ledger(cursor)?)))
+        else {
+            return Ok(None);
+        };
+        if scanned >= through {
+            return Ok(Some(false));
+        }
+        request = json!({"filters": filters, "pagination": {"cursor": cursor, "limit": 1}});
     }
-    Ok(reply["latestLedger"]
-        .as_u64()
-        .is_some_and(|latest| latest >= through)
-        .then_some(false))
+    Ok(None)
+}
+/// The ledger of an event cursor: the ledger of its TOID, the number before the dash.
+fn cursor_ledger(cursor: &str) -> Option<u64> {
+    let toid: u64 = cursor.split_once('-')?.0.parse().ok()?;
+    Some(toid >> 32)
 }
 /// The settlement of the policy wallet operation `p`, found by the wallet's `allowit` event of
 /// its operation id. The settled transaction is the sealed one, so its hash is not the prepared

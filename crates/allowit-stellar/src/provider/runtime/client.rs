@@ -3209,7 +3209,13 @@ mod native_revalidation_tests {
                 } else {
                     json!([])
                 };
-                json!({"events": events, "latestLedger": entries_ledger})
+                // One page scans every ledger up to the head.
+                let cursor = format!(
+                    "{:019}-{:010}",
+                    (entries_ledger << 32) | 0xffff_ffff,
+                    u32::MAX
+                );
+                json!({"events": events, "latestLedger": entries_ledger, "cursor": cursor})
             }
             "getLatestLedger" => json!({"sequence":130}),
             "getLedgerEntries" if params["keys"].as_array().unwrap().len() == 2 => {

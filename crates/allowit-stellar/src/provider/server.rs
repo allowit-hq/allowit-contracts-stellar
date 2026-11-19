@@ -2429,11 +2429,15 @@ mod capability_tests {
             status: &'static str,
             closed: u64,
             oldest: u64,
-            /// An execution of the operation, in an envelope that another account sent.
-            executed: bool,
+            /// The ledger of an execution of the operation, in an envelope that another account
+            /// sent.
+            executed: Option<u64>,
             events_fail: bool,
-            /// The latest ledger of the event read; the transaction read's is 900.
-            events_latest: u64,
+            /// The latest ledger of the event store, where a scan ends; the transaction read's
+            /// is 900.
+            head: u64,
+            /// How many ledgers one page of events scans.
+            scan: u64,
             wallet: String,
             from: u32,
             calls: std::sync::Mutex<Vec<String>>,
@@ -2454,29 +2458,49 @@ mod capability_tests {
                     })),
                     "getEvents" if self.events_fail => Err("The RPC is unreachable".into()),
                     "getEvents" => {
-                        assert_eq!(params["startLedger"], self.from);
+                        // A page starts where the cursor of the last one ended, or at the
+                        // preparation's ledger; it scans `scan` ledgers at most, up to the head.
+                        let start = match params["pagination"]["cursor"].as_str() {
+                            Some(cursor) => {
+                                let toid: u64 = cursor.split_once('-').unwrap().0.parse().unwrap();
+                                (toid >> 32) + 1
+                            }
+                            None => {
+                                assert_eq!(params["startLedger"], self.from);
+                                u64::from(self.from)
+                            }
+                        };
                         let filter = &params["filters"][0];
                         assert_eq!(filter["contractIds"], serde_json::json!([self.wallet]));
                         assert_eq!(filter["topics"][0].as_array().unwrap().len(), 2);
-                        let events = if self.executed {
-                            serde_json::json!([{"txHash": native::hex(&[0xee; 32]), "ledger": 130}])
-                        } else {
-                            serde_json::json!([])
+                        let end = (start + self.scan).min(self.head + 1);
+                        let events = match self.executed {
+                            Some(ledger) if (start..end).contains(&ledger) => serde_json::json!(
+                                [{"txHash": native::hex(&[0xee; 32]), "ledger": ledger}]
+                            ),
+                            _ => serde_json::json!([]),
                         };
-                        Ok(serde_json::json!({"events": events, "latestLedger": self.events_latest}))
+                        let cursor =
+                            format!("{:019}-{:010}", ((end - 1) << 32) | 0xffff_ffff, u32::MAX);
+                        Ok(serde_json::json!({
+                            "events": events,
+                            "latestLedger": self.head,
+                            "cursor": cursor,
+                        }))
                     }
                     other => panic!("unexpected {other}"),
                 }
             }
         }
-        let read_through = |status, closed, oldest, executed, events_fail, events_latest| {
+        let read_with = |status, closed, oldest, executed, events_fail, head, scan| {
             let ledger = Arc::new(Ledger {
                 status,
                 closed,
                 oldest,
                 executed,
                 events_fail,
-                events_latest,
+                head,
+                scan,
                 wallet: p.config.wallet.clone(),
                 from: p.state.ledger,
                 calls: std::sync::Mutex::new(Vec::new()),
@@ -2486,8 +2510,9 @@ mod capability_tests {
             let calls = ledger.calls.lock().unwrap().clone();
             (lapsed, calls)
         };
-        let read = |status, closed, oldest, executed, events_fail| {
-            read_through(status, closed, oldest, executed, events_fail, 900)
+        let read = |status, closed, oldest, executed: bool, events_fail| {
+            let executed = executed.then_some(130);
+            read_with(status, closed, oldest, executed, events_fail, 900, 10_000)
         };
         let from = u64::from(p.state.ledger);
         // An operation that the agent never submitted: retired once the bound passed, also long
@@ -2527,16 +2552,33 @@ mod capability_tests {
         }
         // A reply without its history proves nothing.
         assert!(!read("NOT_FOUND", p.expires_at, 0, false, false).0.unwrap());
-        // An event read that does not reach the ledger that showed the expiry could miss an
-        // execution in the ledgers between: it proves nothing, and the operation stays open.
-        let (lapsed, calls) = read_through("NOT_FOUND", p.expires_at, from, false, false, 899);
+        // A scan of the events that does not reach the ledger that showed the expiry could miss
+        // an execution in the ledgers between: it proves nothing, and the operation stays open.
+        let (lapsed, calls) = read_with("NOT_FOUND", p.expires_at, from, None, false, 899, 10_000);
         assert!(!lapsed.unwrap());
-        assert_eq!(calls, ["getTransaction", "getEvents"]);
+        assert!(calls.len() <= 33, "{}", calls.len());
         assert!(
-            read_through("NOT_FOUND", p.expires_at, from, false, false, 901)
+            read_with("NOT_FOUND", p.expires_at, from, None, false, 901, 10_000)
                 .0
                 .unwrap()
         );
+        // Each page scans a bounded range of ledgers and names where it ended, also when the
+        // event store's head is past the expiry: the read follows the pages, and an execution
+        // in a later page is found.
+        let (lapsed, calls) = read_with(
+            "NOT_FOUND",
+            p.expires_at,
+            from,
+            Some(from + 150),
+            false,
+            900,
+            100,
+        );
+        assert!(!lapsed.unwrap());
+        assert_eq!(calls, ["getTransaction", "getEvents", "getEvents"]);
+        let (lapsed, calls) = read_with("NOT_FOUND", p.expires_at, from, None, false, 900, 100);
+        assert!(lapsed.unwrap());
+        assert_eq!(calls.len(), 1 + 8);
     }
     /// The server cosigns no operation of a wallet whose instance lapsed after the operation's
     /// last simulation: the lapse is `contract_expired` before the signer is asked.
