@@ -4649,8 +4649,8 @@ mod settlement_api {
                 .expense(&installation(), &action, &CEILING)
                 .unwrap_err();
             assert_eq!(
-                error.api_code.as_deref(),
-                Some("sending_unavailable"),
+                (error.api_code.as_deref(), error.status),
+                (Some("sending_unavailable"), Some(503)),
                 "{action:?}"
             );
         }
@@ -4800,31 +4800,52 @@ mod settlement_api {
             native::validate_retained_signed(&crate::test_support::policy_sealed_at(&signed, -1))
                 .is_err()
         );
-        let mut other_sender = later.clone();
-        let stellar_xdr::TransactionEnvelope::Tx(mut envelope) =
-            native::read(&other_sender.transaction_xdr).unwrap()
-        else {
-            panic!()
+        // Each changed envelope is signed by its own source, so only the binding refuses it.
+        let resealed = |change: &dyn Fn(&mut stellar_xdr::Transaction), seed: [u8; 32]| {
+            use ed25519_dalek::Signer;
+            let stellar_xdr::TransactionEnvelope::Tx(mut envelope) =
+                native::read(&later.transaction_xdr).unwrap()
+            else {
+                panic!()
+            };
+            change(&mut envelope.tx);
+            let hash =
+                native::transaction_hash(&signed.prepared.config.network, &envelope.tx).unwrap();
+            let key = native::account_key(&native::account_for_seed(&seed)).unwrap();
+            envelope.signatures = vec![stellar_xdr::DecoratedSignature {
+                hint: stellar_xdr::SignatureHint(key[28..].try_into().unwrap()),
+                signature: stellar_xdr::Signature(
+                    ed25519_dalek::SigningKey::from_bytes(&seed)
+                        .sign(&hash)
+                        .to_bytes()
+                        .to_vec()
+                        .try_into()
+                        .unwrap(),
+                ),
+            }]
+            .try_into()
+            .unwrap();
+            SignedOperation {
+                transaction_xdr: native::xdr(&stellar_xdr::TransactionEnvelope::Tx(envelope))
+                    .unwrap(),
+                transaction_hash: hash,
+                ..later.clone()
+            }
         };
-        envelope.tx.source_account = stellar_xdr::MuxedAccount::Ed25519(stellar_xdr::Uint256(
-            native::account_key(&native::account_for_seed(&[11; 32])).unwrap(),
-        ));
-        other_sender.transaction_xdr =
-            native::xdr(&stellar_xdr::TransactionEnvelope::Tx(envelope.clone())).unwrap();
-        other_sender.transaction_hash =
-            native::transaction_hash(&signed.prepared.config.network, &envelope.tx).unwrap();
+        // The same sender re-signing the same later transaction is accepted: the helper signs
+        // as the checks expect.
+        native::validate_retained_signed(&resealed(&|_| {}, [10; 32])).unwrap();
+        let other = native::account_for_seed(&[11; 32]);
+        let other_sender = resealed(
+            &|tx| {
+                tx.source_account = stellar_xdr::MuxedAccount::Ed25519(stellar_xdr::Uint256(
+                    native::account_key(&other).unwrap(),
+                ))
+            },
+            [11; 32],
+        );
         assert!(native::validate_retained_signed(&other_sender).is_err());
-        let mut other_operation = later.clone();
-        let stellar_xdr::TransactionEnvelope::Tx(mut envelope) =
-            native::read(&other_operation.transaction_xdr).unwrap()
-        else {
-            panic!()
-        };
-        envelope.tx.memo = stellar_xdr::Memo::Id(7);
-        other_operation.transaction_xdr =
-            native::xdr(&stellar_xdr::TransactionEnvelope::Tx(envelope.clone())).unwrap();
-        other_operation.transaction_hash =
-            native::transaction_hash(&signed.prepared.config.network, &envelope.tx).unwrap();
+        let other_operation = resealed(&|tx| tx.memo = stellar_xdr::Memo::Id(7), [10; 32]);
         assert!(native::validate_retained_signed(&other_operation).is_err());
     }
 

@@ -497,15 +497,21 @@ impl ServerHooks for Hooks {
         asset: &str,
         native_units: u128,
     ) -> Result<i128> {
-        let fee = i128::try_from(native_units)
-            .map_err(|_| Error::coded(AMOUNT_OUT_OF_RANGE, "The native fee is out of range"))?;
-        let Some(rate) = asset_rate(network, config, asset)? else {
-            return Ok(fee);
+        let out_of_range =
+            || Error::coded(AMOUNT_OUT_OF_RANGE, "The price of the fee is out of range");
+        let price = match asset_rate(network, config, asset)? {
+            None => native_units,
+            // `rate` has 7 decimals, as XLM does, so units = ceil(fee * rate / 10^7), unsigned
+            // until the price, with no intermediate value wider than it, as the repayment of a
+            // preparation computes it.
+            Some(rate) => crate::mul_div_ceil(
+                native_units,
+                u128::try_from(rate).map_err(|_| out_of_range())?,
+                10_000_000,
+            )
+            .map_err(|_| out_of_range())?,
         };
-        // `rate` has 7 decimals, as XLM does, so units = ceil(fee * rate / 10^7), with no
-        // intermediate value wider than the price, as the repayment of a preparation computes it.
-        crate::mul_div_ceil(fee, rate, 10_000_000)
-            .map_err(|_| Error::coded(AMOUNT_OUT_OF_RANGE, "The price of the fee is out of range"))
+        i128::try_from(price).map_err(|_| out_of_range())
     }
 }
 
@@ -1026,6 +1032,24 @@ mod tests {
             settlement_hash: None,
         };
         assert_eq!(hooks.charged_fee(network, &ticker, &receipt).unwrap(), 150);
+        // A rate under the contract id comes before the ticker's.
+        let both = serde_json::json!({"asset": usdc.as_str(),
+            "gasRates": {"USDC": "0.15", usdc.as_str(): "0.20"}});
+        assert_eq!(hooks.charged_fee(network, &both, &receipt).unwrap(), 200);
+        // The price is exact for every native fee whose price fits: 2^127 stroops at 0.5.
+        let half = serde_json::json!({"gasRates": {usdc.as_str(): "0.5"}});
+        assert_eq!(
+            hooks.price_fee(network, &half, &usdc, 1 << 127).unwrap(),
+            1 << 126
+        );
+        assert_eq!(
+            hooks
+                .price_fee(network, &half, &usdc, u128::MAX)
+                .unwrap_err()
+                .api_code
+                .as_deref(),
+            Some(AMOUNT_OUT_OF_RANGE)
+        );
         // At an extreme rate the receipt hook keeps the server's refusal of today, and the
         // wallet's price is the exact one: 5,000,000 stroops at 10^30 are 5 * 10^36 units.
         let extreme = serde_json::json!({"asset": usdc.as_str(),
