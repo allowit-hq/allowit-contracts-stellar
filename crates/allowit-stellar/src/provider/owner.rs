@@ -59,10 +59,18 @@ fn client(cx: &Context<'_>) -> Result<OwnerClient> {
     c.authenticate(&super::OwnerSignerRef(cx.signer), (cx.clock)()?)?;
     Ok(c)
 }
+/// What Core's owner session answers, without asking the server, when it holds no session
+/// that is still valid.
+const NO_VALID_SESSION: &str = "Authenticate the selected owner first";
 /// Whether a request with a held session failed because the session ended: the client holds
 /// no valid session and the server was not asked, or the server answered that it knows none.
+/// No other failure is a reason to sign in again: a server that did not answer, or answered
+/// in a form that the client does not read, may have taken the request.
 fn session_ended(error: &Error) -> bool {
-    matches!(error.status, None | Some(401))
+    match error.status {
+        None => error.message == NO_VALID_SESSION,
+        Some(status) => status == 401,
+    }
 }
 fn emit(value: impl serde::Serialize) -> Result<serde_json::Value> {
     serde_json::to_value(value).map_err(|_| Error::config("Cannot encode owner result"))
@@ -514,12 +522,32 @@ mod storage_boundary_tests {
     /// refusal of the registration itself is the answer.
     #[test]
     fn a_registration_signs_in_again_only_when_its_session_ended() {
-        assert!(session_ended(&Error::config(
-            "Authenticate the selected owner first"
-        )));
+        // Core's own answer of a client without a session: no server is asked.
+        let unauthenticated = OwnerClient::new(
+            "http://localhost:3000",
+            "http://localhost:5173",
+            &crate::account_for_seed(&[11; 32]),
+        )
+        .unwrap()
+        .register_native(&serde_json::json!({}), 1)
+        .unwrap_err();
+        assert_eq!(unauthenticated.status, None);
+        assert!(
+            session_ended(&unauthenticated),
+            "{}",
+            unauthenticated.message
+        );
         assert!(session_ended(&Error::api(401, "Sign in")));
         for status in [400, 403, 409, 500, 503] {
             assert!(!session_ended(&Error::api(status, "refused")), "{status}");
+        }
+        // A server that did not answer, or whose answer the client does not read, may have
+        // taken the registration: the session did not end.
+        for message in [
+            "Invalid owner server response",
+            "Owner server request is unavailable",
+        ] {
+            assert!(!session_ended(&Error::config(message)), "{message}");
         }
     }
     /// A setup with an invalid value of the caller fails before the journal opens, before the
