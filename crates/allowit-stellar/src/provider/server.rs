@@ -541,9 +541,8 @@ pub type Sender = std::sync::Arc<dyn SendingAccounts>;
 pub const RETIRED_ROUTE: &str = "retired_route";
 /// The code of the refusal of a fee ceiling that no Stellar transaction of the wallet can carry.
 pub const UNSIGNABLE_CEILING: &str = "fee_ceiling_unsignable";
-/// The code of the refusal of a receipt whose fee bump the transaction's own source paid: a
-/// keypair wallet's own account, or the server's sending account of a contract wallet's
-/// operation. Allowit sends no such fee bump, and its receipt does not keep the fee.
+/// The code of the refusal of a receipt whose fee bump the wallet's own account or the server's
+/// sending account paid. Allowit sends no such fee bump, and its receipt does not keep the fee.
 pub const FEE_BUMP_UNSUPPORTED: &str = "fee_bump_unsupported";
 pub use crate::host::runtime::SendingAccounts;
 /// The fee that the signed transaction envelope `xdr` declares, in stroops: the most that the
@@ -1784,7 +1783,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         }
         let receipt: rpc::VerifiedReceipt = decode_packet(&r.0)?;
         let info = receipt_info(&r.0)?;
-        self.refuse_own_fee_bump(&receipt, info.fee.native_units)?;
+        self.refuse_own_fee_bump(&operation, &receipt)?;
         let usage = if operation.config.route == WalletRoute::PolicyWallet
             && info.status == Status::Confirmed
         {
@@ -2154,44 +2153,42 @@ impl crate::host::vendors::RuntimeProvider for Provider {
 }
 
 impl Provider {
-    /// Refuse the receipt of a transaction whose fee bump its own source paid
-    /// ([`FEE_BUMP_UNSUPPORTED`]). A fee bump leaves the inner result without a fee; the ledger
-    /// names its payer. A fee bump that another party paid, as a seller's facilitator, reads as
-    /// before: no fee of the wallet's.
+    /// Refuse the receipt of a transaction whose fee bump the wallet's own account or the
+    /// server's sending account paid ([`FEE_BUMP_UNSUPPORTED`]): Allowit sends no such fee bump,
+    /// and its receipt keeps no fee of it. A fee bump leaves the inner result without a fee, and
+    /// the ledger names its payer. The wallet's own account is a keypair wallet's account; the
+    /// server's sending account is the source of a contract wallet's own transaction. A fee bump
+    /// that another party paid, as a seller's facilitator for its own transaction, and a
+    /// transaction that the ledger no longer holds, read as before.
     fn refuse_own_fee_bump(
         &self,
+        operation: &PreparedOperation,
         receipt: &rpc::VerifiedReceipt,
-        native_units: u128,
     ) -> Result<()> {
-        if receipt.settles.is_some() || native_units != 0 {
+        let result: stellar_xdr::TransactionResult = checked(native::read(&receipt.result_xdr))?;
+        if result.fee_charged != 0 {
             return Ok(());
         }
-        let stellar_xdr::TransactionEnvelope::Tx(envelope) =
-            checked(native::read(&receipt.envelope_xdr))?
-        else {
-            return Ok(());
-        };
-        let source = match &envelope.tx.source_account {
-            stellar_xdr::MuxedAccount::Ed25519(stellar_xdr::Uint256(key)) => {
-                native::account_for_public_key(key)
-            }
-            stellar_xdr::MuxedAccount::MuxedEd25519(m) => {
-                native::account_for_public_key(&m.ed25519.0)
-            }
-        };
-        match checked(rpc::fee_bump_payer(
-            self.rpc(),
-            &self.network,
-            &receipt.transaction_hash,
-        ))? {
-            Some(payer) if payer == source => Err(Error::coded(
+        let mut own = vec![operation.config.wallet.clone()];
+        if receipt.settles.is_none()
+            && let stellar_xdr::TransactionEnvelope::Tx(envelope) =
+                checked(native::read(&receipt.envelope_xdr))?
+        {
+            own.push(match &envelope.tx.source_account {
+                stellar_xdr::MuxedAccount::Ed25519(stellar_xdr::Uint256(key)) => {
+                    native::account_for_public_key(key)
+                }
+                stellar_xdr::MuxedAccount::MuxedEd25519(m) => {
+                    native::account_for_public_key(&m.ed25519.0)
+                }
+            });
+        }
+        match checked(rpc::fee_bump_payer(self.rpc(), &self.network, receipt))? {
+            Some(payer) if own.contains(&payer) => Err(Error::coded(
                 FEE_BUMP_UNSUPPORTED,
-                "The transaction's own source paid its fee bump, which Allowit does not send.",
+                "The wallet's own account or the server's sending account paid this transaction's fee bump, which Allowit does not send.",
             )),
-            Some(_) => Ok(()),
-            None => Err(Error::uncertain(
-                "The receipt reports no fee, and the ledger does not show the fee bump that carried it now: read it again.",
-            )),
+            _ => Ok(()),
         }
     }
 }
@@ -4266,9 +4263,9 @@ mod settlement_api {
         );
     }
 
-    /// A receipt whose fee bump the transaction's own source paid is refused with its code: its
-    /// inner result keeps no fee. One that another party paid, as a seller's facilitator, reads
-    /// as before: no fee of the wallet's.
+    /// A receipt whose fee bump the wallet's own account paid is refused with its code: its inner
+    /// result keeps no fee. One that another party paid, and one whose transaction the ledger no
+    /// longer holds, read as before: no fee of the wallet's.
     #[test]
     fn a_fee_bump_that_the_transactions_own_source_paid_is_refused() {
         struct Answers(serde_json::Value);
@@ -4290,7 +4287,14 @@ mod settlement_api {
         let receipt = Receipt(super::packet(NETWORK, &bumped).unwrap());
         let wallet = signed.prepared.config.wallet.clone();
         let sponsor = native::account_for_seed(&[99; 32]);
-        for (payer, refused) in [(wallet, true), (sponsor, false)] {
+        // A transaction that the ledger no longer holds reads as before.
+        let pruned =
+            serde_json::json!({"status": "NOT_FOUND", "oldestLedger": 100, "latestLedger": 120});
+        let settled = Provider::from_rpc(NETWORK, Arc::new(Answers(pruned)))
+            .settle_receipt(&own, &packet, &receipt, Some(&accounting(9)), 0)
+            .unwrap();
+        assert_eq!(settled.fee_units, 0);
+        for (payer, refused) in [(wallet, true), (sponsor.clone(), false)] {
             let reply = crate::test_support::fee_bump_reply(&bumped, NETWORK, &payer, 5_000);
             let settled = Provider::from_rpc(NETWORK, Arc::new(Answers(reply))).settle_receipt(
                 &own,
@@ -4308,6 +4312,16 @@ mod settlement_api {
                 assert_eq!(settled.unwrap().fee_units, 0);
             }
         }
+        // A ledger answer whose inner result differs from the receipt is refused.
+        let mut other = bumped.clone();
+        let mut result: stellar_xdr::TransactionResult = native::read(&other.result_xdr).unwrap();
+        result.result = stellar_xdr::TransactionResultResult::TxSuccess(Default::default());
+        other.result_xdr = native::xdr(&result).unwrap();
+        let reply = crate::test_support::fee_bump_reply(&other, NETWORK, &sponsor, 5_000);
+        let error = Provider::from_rpc(NETWORK, Arc::new(Answers(reply)))
+            .settle_receipt(&own, &packet, &receipt, Some(&accounting(9)), 0)
+            .unwrap_err();
+        assert_eq!(error.api_code, None);
     }
 
     /// A retained packet of the historical route `Odc` settles nothing: the refusal is typed.

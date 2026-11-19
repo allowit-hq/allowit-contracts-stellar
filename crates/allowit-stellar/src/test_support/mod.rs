@@ -550,7 +550,7 @@ pub fn execution_response(
 }
 /// The ledger's reply to `getTransaction` when a fee bump that `payer` paid carried the
 /// transaction of `receipt`: the wrapper's envelope, and a result that charges the wrapper `fee`
-/// and the inner transaction nothing.
+/// and holds the receipt's own result as the inner result.
 pub fn fee_bump_reply(
     receipt: &rpc::VerifiedReceipt,
     network: &str,
@@ -561,6 +561,8 @@ pub fn fee_bump_reply(
         panic!()
     };
     let success = receipt.status == crate::OperationStatus::Confirmed;
+    // InnerTransactionResult has the same wire shape as a TransactionResult.
+    let own: x::InnerTransactionResult = crate::read(&receipt.result_xdr).unwrap();
     let outer = x::FeeBumpTransactionEnvelope {
         tx: x::FeeBumpTransaction {
             fee_source: x::MuxedAccount::Ed25519(x::Uint256(crate::account_key(payer).unwrap())),
@@ -572,15 +574,7 @@ pub fn fee_bump_reply(
     };
     let pair = x::InnerTransactionResultPair {
         transaction_hash: x::Hash(receipt.transaction_hash),
-        result: x::InnerTransactionResult {
-            fee_charged: 0,
-            result: if success {
-                x::InnerTransactionResultResult::TxSuccess(Default::default())
-            } else {
-                x::InnerTransactionResultResult::TxFailed(Default::default())
-            },
-            ext: x::InnerTransactionResultExt::V0,
-        },
+        result: own,
     };
     let result = x::TransactionResult {
         fee_charged: fee,

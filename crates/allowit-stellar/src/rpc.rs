@@ -1433,14 +1433,25 @@ pub fn receipt_by_reported_hash(
     let FeeBumpTransactionInnerTx::Tx(inner) = &outer.tx.inner_tx;
     receipt_from_response(&v, network, &transaction_hash_for(network, &inner.tx)?)
 }
-/// The account that paid the fee bump that carried the transaction `hash`, as the ledger answers
-/// it now, the wrapper verified: `None` for a transaction that no fee bump carried or that the
-/// ledger does not hold. Nothing of it is retained.
-pub fn fee_bump_payer(rpc: &dyn Rpc, network: &str, hash: &[u8; 32]) -> Result<Option<String>> {
+/// The account that paid the fee bump that carried the transaction of `receipt`, as the ledger
+/// answers it now, the wrapper verified: `None` for a transaction that no fee bump carried or
+/// that the ledger does not hold. A ledger answer whose inner transaction or result differs from
+/// the receipt is refused. Nothing of it is retained.
+pub fn fee_bump_payer(
+    rpc: &dyn Rpc,
+    network: &str,
+    receipt: &VerifiedReceipt,
+) -> Result<Option<String>> {
+    let hash = &receipt.transaction_hash;
     let v = rpc.call("getTransaction", json!({"hash": hex(hash)}))?;
-    settlement_reply(&v, network, hash)?;
+    let inner = settlement_reply(&v, network, hash)?;
     if !matches!(v["status"].as_str(), Some("SUCCESS" | "FAILED")) {
         return Ok(None);
+    }
+    if inner["envelopeXdr"].as_str() != Some(receipt.envelope_xdr.as_str())
+        || inner["resultXdr"].as_str() != Some(receipt.result_xdr.as_str())
+    {
+        return Err("The ledger's answer differs from the receipt".into());
     }
     let Some(envelope) = v["envelopeXdr"].as_str() else {
         return Ok(None);

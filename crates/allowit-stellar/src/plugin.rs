@@ -1053,6 +1053,11 @@ mod tests {
             ..receipt.clone()
         };
         assert!(hooks.charged_fee(network, &extreme, &wide).is_err());
+        // A product that fits but whose rounding does not is refused too, as the server's
+        // admission reads it.
+        let rounding = serde_json::json!({"asset": usdc.as_str(),
+            "gasRates": {usdc.as_str(): "3402823669209384634633746.0743176"}});
+        assert!(hooks.charged_fee(network, &rounding, &wide).is_err());
         assert_eq!(
             hooks
                 .price_fee(network, &extreme, &usdc, 5_000_000)
