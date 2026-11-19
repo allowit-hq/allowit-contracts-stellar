@@ -493,7 +493,15 @@ fn gas_carry(repays_gas: bool, carry: u128) -> Result<u128> {
 }
 pub fn receipt_info(p: &Packet) -> Result<ReceiptInfo> {
     let r: rpc::VerifiedReceipt = decode_packet(p)?;
-    let result: stellar_xdr::TransactionResult = checked(native::read(&r.result_xdr))?;
+    // The party that submitted a payment authorization paid the fee of its transaction. The
+    // wallet paid and counted none. Otherwise the fee is the transaction's own source's when it
+    // paid it, as itself or as a fee bump's payer, and none of the source's when another party
+    // paid a fee bump.
+    let native_units = if r.settles.is_some() {
+        0
+    } else {
+        native_fee(&r)?
+    };
     // A policy wallet counts the gas units of its signed expense. A keypair account has no
     // counters: the engine prices its fee through ServerHooks::charged_fee.
     let charged_units = checked(rpc::counted_gas_units(&r))?;
@@ -505,20 +513,28 @@ pub fn receipt_info(p: &Packet) -> Result<ReceiptInfo> {
         status: status(r.status),
         observed_height: u64::from(r.ledger),
         fee: crate::host::runtime::Fee {
-            // The party that submitted a payment authorization paid the fee of its
-            // transaction. The wallet paid and counted none.
-            native_units: if r.settles.is_some() {
-                0
-            } else {
-                u128::try_from(result.fee_charged)
-                    .map_err(|_| Error::config("Invalid Stellar receipt fee"))?
-            },
+            native_units,
             charged_units,
             repaid_native_units,
         },
         // The prepared operation carries its debits; the receipt adds only the fee.
         debits: Vec::new(),
         settlement_hash: r.settles.map(|_| r.transaction_hash),
+    })
+}
+/// The fee that the receipt `r`'s transaction cost its own source ([`rpc::fee_paid`]). A receipt
+/// that keeps no fee bump although its result reports no fee is read again from the network
+/// before its fee counts.
+fn native_fee(r: &rpc::VerifiedReceipt) -> Result<u128> {
+    let paid = checked(rpc::fee_paid(r))?.ok_or_else(|| {
+        Error::uncertain(
+            "This receipt's transaction came in a fee bump whose payer the receipt does not keep: read it again from the network.",
+        )
+    })?;
+    Ok(if paid.payer == checked(rpc::receipt_source(r))? {
+        paid.fee
+    } else {
+        0
     })
 }
 pub struct Provider {
@@ -1756,8 +1772,22 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 "The signed transaction carries another operation than the prepared one",
             ));
         }
-        let receipt: rpc::VerifiedReceipt = decode_packet(&r.0)?;
-        let info = receipt_info(&r.0)?;
+        let mut receipt: rpc::VerifiedReceipt = decode_packet(&r.0)?;
+        // A receipt that came in a fee bump without keeping it is read again from the network,
+        // which answers the fee bump, before its fee counts.
+        if receipt.settles.is_none()
+            && checked(rpc::fee_paid(&receipt))?.is_none()
+            && let Some(again) = checked(rpc::receipt_by_hash(
+                self.rpc(),
+                p.network(),
+                &receipt.transaction_hash,
+            ))?
+            && again.envelope_xdr == receipt.envelope_xdr
+            && again.result_xdr == receipt.result_xdr
+        {
+            receipt = again;
+        }
+        let info = receipt_info(&packet(r.network(), &receipt)?)?;
         let usage = if operation.config.route == WalletRoute::PolicyWallet
             && info.status == Status::Confirmed
         {
@@ -2553,6 +2583,7 @@ mod receipt_fee_tests {
             envelope_xdr: native::xdr(&TransactionEnvelope::Tx(envelope)).unwrap(),
             result_xdr: native::xdr(&result).unwrap(),
             settles: None,
+            fee_bump: None,
         };
         receipt_info(&packet(network, &receipt).unwrap()).unwrap()
     }
@@ -4169,6 +4200,147 @@ mod settlement_api {
                 .settle_receipt(&other, &packet, &receipt, Some(&accounting(9)), 0)
                 .is_err()
         );
+    }
+
+    /// A fee bump that the transaction's own source paid is its fee: a keypair wallet's fee, and
+    /// the fee that a contract wallet's carry takes. A fee bump that another party paid is no fee
+    /// of the source's.
+    #[test]
+    fn a_fee_bump_that_the_source_paid_is_its_fee() {
+        let (signed, packet, _) = keypair();
+        let own = Prepared(restored(Kind::Prepared, &of(&signed.prepared)));
+        let plain = crate::test_support::confirmed_payment_receipt(&signed, 9, 100);
+        let wallet = signed.prepared.config.wallet.clone();
+        for (payer, fee) in [(wallet, 5_000), (native::account_for_seed(&[99; 32]), 0)] {
+            let (bumped, _) = crate::test_support::fee_bumped(&plain, NETWORK, &payer, 5_000);
+            let bumped = Receipt(super::packet(NETWORK, &bumped).unwrap());
+            assert_eq!(bumped.info().unwrap().fee.native_units, fee);
+            let settled = provider()
+                .settle_receipt(&own, &packet, &bumped, Some(&accounting(9)), 0)
+                .unwrap();
+            assert_eq!(settled.fee_units, fee);
+        }
+        let (p, signed, receipt) = standard();
+        let verified: rpc::VerifiedReceipt = decode_packet(&receipt.0).unwrap();
+        let repaid = receipt.info().unwrap().fee.repaid_native_units;
+        let sender = rpc::receipt_source(&verified).unwrap();
+        let (bumped, _) = crate::test_support::fee_bumped(&verified, NETWORK, &sender, 100_000);
+        let settled = provider()
+            .settle_receipt(
+                &p,
+                &signed,
+                &Receipt(super::packet(NETWORK, &bumped).unwrap()),
+                None,
+                0,
+            )
+            .unwrap();
+        assert_eq!(settled.gas_carry, repaid - 100_000);
+    }
+
+    /// A retained fee bump is the wrapper of its own receipt: one of another transaction's
+    /// receipt is refused when the receipt is restored.
+    #[test]
+    fn a_retained_fee_bump_must_wrap_its_receipt() {
+        let (signed, _, _) = keypair();
+        let plain = crate::test_support::confirmed_payment_receipt(&signed, 9, 100);
+        let wallet = signed.prepared.config.wallet.clone();
+        let (bumped, _) = crate::test_support::fee_bumped(&plain, NETWORK, &wallet, 5_000);
+        let policy = crate::test_support::policy_sealed(&crate::test_support::policy_signed());
+        let other = rpc::VerifiedReceipt {
+            transaction_hash: policy.transaction_hash,
+            envelope_xdr: policy.transaction_xdr.clone(),
+            ..plain.clone()
+        };
+        let (other, _) = crate::test_support::fee_bumped(&other, NETWORK, &wallet, 5_000);
+        let swapped = rpc::VerifiedReceipt {
+            fee_bump: other.fee_bump,
+            ..bumped
+        };
+        assert!(receipt_info(&super::packet(NETWORK, &swapped).unwrap()).is_err());
+    }
+
+    /// A receipt that came in a fee bump without keeping it, as an older receipt, is no receipt
+    /// without a fee: its fee is unknown until the network answers the fee bump again, and its
+    /// settlement reads it again.
+    #[test]
+    fn a_receipt_without_its_fee_bump_is_read_again() {
+        struct Answers(serde_json::Value);
+        impl rpc::Rpc for Answers {
+            fn call(
+                &self,
+                method: &str,
+                _: serde_json::Value,
+            ) -> native::Result<serde_json::Value> {
+                match method {
+                    "getTransaction" => Ok(self.0.clone()),
+                    _ => Err(format!("Unexpected call {method}")),
+                }
+            }
+        }
+        let (signed, packet, _) = keypair();
+        let own = Prepared(restored(Kind::Prepared, &of(&signed.prepared)));
+        let plain = crate::test_support::confirmed_payment_receipt(&signed, 9, 100);
+        let wallet = signed.prepared.config.wallet.clone();
+        let (bumped, reply) = crate::test_support::fee_bumped(&plain, NETWORK, &wallet, 5_000);
+        let older = Receipt(
+            super::packet(
+                NETWORK,
+                &rpc::VerifiedReceipt {
+                    fee_bump: None,
+                    ..bumped
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(older.info().unwrap_err().code, Error::uncertain("").code);
+        let settled = Provider::from_rpc(NETWORK, Arc::new(Answers(reply)))
+            .settle_receipt(&own, &packet, &older, Some(&accounting(9)), 0)
+            .unwrap();
+        assert_eq!(settled.fee_units, 5_000);
+    }
+
+    /// Recovery finds a contract wallet's authorization that a fee bump carried: the event names
+    /// the wrapper, and its receipt is the inner transaction's.
+    #[test]
+    fn recovery_finds_an_authorization_inside_a_fee_bump() {
+        struct Ledger(serde_json::Value);
+        impl rpc::Rpc for Ledger {
+            fn call(
+                &self,
+                method: &str,
+                _: serde_json::Value,
+            ) -> native::Result<serde_json::Value> {
+                match method {
+                    "getEvents" => {
+                        Ok(serde_json::json!({"events": [{"txHash": self.0["txHash"]}]}))
+                    }
+                    "getTransaction" => Ok(self.0.clone()),
+                    _ => Err(format!("Unexpected call {method}")),
+                }
+            }
+        }
+        let sealed = crate::test_support::policy_sealed(&crate::test_support::policy_signed());
+        let receipt = rpc::VerifiedReceipt {
+            transaction_hash: sealed.transaction_hash,
+            status: native::OperationStatus::Confirmed,
+            ledger: 9,
+            envelope_xdr: sealed.transaction_xdr.clone(),
+            result_xdr: native::xdr(&stellar_xdr::TransactionResult {
+                fee_charged: 100,
+                result: stellar_xdr::TransactionResultResult::TxSuccess(Default::default()),
+                ext: stellar_xdr::TransactionResultExt::V0,
+            })
+            .unwrap(),
+            settles: None,
+            fee_bump: None,
+        };
+        let sponsor = native::account_for_seed(&[99; 32]);
+        let (_, reply) = crate::test_support::fee_bumped(&receipt, NETWORK, &sponsor, 5_000);
+        let (found, settled) = rpc::policy_wallet_settlement(&Ledger(reply), &sealed.prepared)
+            .unwrap()
+            .expect("the authorization's receipt");
+        assert_eq!(found.transaction_hash, sealed.transaction_hash);
+        assert!(settled.fee_bump.is_some());
     }
 
     /// A retained packet of the historical route `Odc` settles nothing: the refusal is typed.

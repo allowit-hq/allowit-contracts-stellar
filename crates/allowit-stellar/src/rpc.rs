@@ -1083,7 +1083,9 @@ pub fn policy_wallet_settlement(
                 .as_str()
                 .ok_or("Invalid event transaction")?,
         )?;
-        let Some(receipt) = receipt_by_hash(rpc, &p.config.network, &hash)? else {
+        // The event names the transaction that the ledger applied: a fee bump's wrapper, whose
+        // receipt is its inner transaction's.
+        let Some(receipt) = receipt_by_reported_hash(rpc, &p.config.network, &hash)? else {
             continue;
         };
         let signed = SignedOperation {
@@ -1104,9 +1106,9 @@ fn settlement_reply<'a>(
     v: &'a Value,
     network: &str,
     expected: &[u8; 32],
-) -> Result<std::borrow::Cow<'a, Value>> {
+) -> Result<(std::borrow::Cow<'a, Value>, Option<FeeBump>)> {
     if !matches!(v["status"].as_str(), Some("SUCCESS" | "FAILED")) {
-        return Ok(std::borrow::Cow::Borrowed(v));
+        return Ok((std::borrow::Cow::Borrowed(v), None));
     }
     let envelope: TransactionEnvelope = read(
         v["envelopeXdr"]
@@ -1114,7 +1116,7 @@ fn settlement_reply<'a>(
             .ok_or("Settlement envelope is required")?,
     )?;
     let TransactionEnvelope::TxFeeBump(outer) = envelope else {
-        return Ok(std::borrow::Cow::Borrowed(v));
+        return Ok((std::borrow::Cow::Borrowed(v), None));
     };
     let FeeBumpTransactionInnerTx::Tx(inner) = &outer.tx.inner_tx;
     if transaction_hash_for(network, &inner.tx)? != *expected {
@@ -1161,14 +1163,24 @@ fn settlement_reply<'a>(
     normalized["txHash"] = json!(hex(expected));
     normalized["envelopeXdr"] = json!(xdr(&TransactionEnvelope::Tx(inner.clone()))?);
     normalized["resultXdr"] = json!(xdr(&inner_result)?);
-    Ok(std::borrow::Cow::Owned(normalized))
+    let evidence = FeeBump {
+        envelope_xdr: v["envelopeXdr"]
+            .as_str()
+            .ok_or("Settlement envelope is required")?
+            .into(),
+        result_xdr: v["resultXdr"]
+            .as_str()
+            .ok_or("Settlement result is required")?
+            .into(),
+    };
+    Ok((std::borrow::Cow::Owned(normalized), Some(evidence)))
 }
 fn verify_settlement(
     v: &Value,
     network: &str,
     transaction_hash: &[u8; 32],
 ) -> Result<OperationStatus> {
-    let normalized = settlement_reply(v, network, transaction_hash)?;
+    let (normalized, _) = settlement_reply(v, network, transaction_hash)?;
     let v = normalized.as_ref();
     validate_response_identity(v, transaction_hash)?;
     if matches!(v["status"].as_str(), Some("SUCCESS" | "FAILED")) {
@@ -1255,6 +1267,64 @@ pub struct VerifiedReceipt {
     /// [`crate::seller_settled`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settles: Option<[u8; 32]>,
+    /// The fee bump that carried this transaction, as the ledger answered it: the wrapper's
+    /// envelope and result. A restore checks it against the inner envelope and result above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_bump: Option<FeeBump>,
+}
+/// The evidence of a fee bump ([`VerifiedReceipt::fee_bump`]): its envelope and its result.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FeeBump {
+    pub envelope_xdr: String,
+    pub result_xdr: String,
+}
+/// The fee that the ledger charged for a receipt's transaction, and the account that paid it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FeePaid {
+    pub payer: String,
+    pub fee: u128,
+}
+/// The account of a transaction's source or fee source.
+fn account_of(account: &MuxedAccount) -> String {
+    match account {
+        MuxedAccount::Ed25519(Uint256(key)) => account_for_public_key(key),
+        MuxedAccount::MuxedEd25519(m) => account_for_public_key(&m.ed25519.0),
+    }
+}
+/// The fee of the receipt `r`'s transaction and its payer, by one rule for every reader: the fee
+/// bump's payer and the fee that the ledger charged it, or the transaction's own source and its
+/// charge. `None` for a receipt whose inner result reports no fee and that keeps no fee bump: a
+/// fee bump whose payer the receipt does not hold, which a reader reads again from the network.
+pub fn fee_paid(r: &VerifiedReceipt) -> Result<Option<FeePaid>> {
+    if let Some(bump) = &r.fee_bump {
+        let TransactionEnvelope::TxFeeBump(outer) = read(&bump.envelope_xdr)? else {
+            return Err("A fee bump's envelope is a fee bump".into());
+        };
+        let result: TransactionResult = read(&bump.result_xdr)?;
+        return Ok(Some(FeePaid {
+            payer: account_of(&outer.tx.fee_source),
+            fee: u128::try_from(result.fee_charged).map_err(|_| "Invalid fee bump charge")?,
+        }));
+    }
+    let result: TransactionResult = read(&r.result_xdr)?;
+    if result.fee_charged == 0 {
+        return Ok(None);
+    }
+    let TransactionEnvelope::Tx(envelope) = read(&r.envelope_xdr)? else {
+        return Err("A receipt's transaction is a plain transaction".into());
+    };
+    Ok(Some(FeePaid {
+        payer: account_of(&envelope.tx.source_account),
+        fee: u128::try_from(result.fee_charged).map_err(|_| "Invalid receipt fee")?,
+    }))
+}
+/// The source account of the receipt `r`'s transaction.
+pub fn receipt_source(r: &VerifiedReceipt) -> Result<String> {
+    let TransactionEnvelope::Tx(envelope) = read(&r.envelope_xdr)? else {
+        return Err("A receipt's transaction is a plain transaction".into());
+    };
+    Ok(account_of(&envelope.tx.source_account))
 }
 /// Recheck a retained receipt before projecting it through another interface.
 pub fn validate_receipt(
@@ -1271,9 +1341,26 @@ pub fn validate_receipt(
     {
         return Err("Invalid retained Stellar receipt identity".into());
     }
-    let value = json!({"status":if receipt.status==OperationStatus::Confirmed {"SUCCESS"} else {"FAILED"},"envelopeXdr":receipt.envelope_xdr,"resultXdr":receipt.result_xdr});
+    let status = if receipt.status == OperationStatus::Confirmed {
+        "SUCCESS"
+    } else {
+        "FAILED"
+    };
+    let value =
+        json!({"status":status,"envelopeXdr":receipt.envelope_xdr,"resultXdr":receipt.result_xdr});
     if verify_settlement(&value, network, expected_hash)? != receipt.status {
         return Err("Retained Stellar receipt result differs".into());
+    }
+    // A retained fee bump is the wrapper of exactly this inner envelope and result.
+    if let Some(bump) = &receipt.fee_bump {
+        let wrapper = json!({"status":status,"txHash":hex(expected_hash),"envelopeXdr":bump.envelope_xdr,"resultXdr":bump.result_xdr});
+        let (inner, evidence) = settlement_reply(&wrapper, network, expected_hash)?;
+        if evidence.is_none()
+            || inner["envelopeXdr"].as_str() != Some(receipt.envelope_xdr.as_str())
+            || inner["resultXdr"].as_str() != Some(receipt.result_xdr.as_str())
+        {
+            return Err("Retained Stellar fee bump differs from its receipt".into());
+        }
     }
     Ok(())
 }
@@ -1438,7 +1525,7 @@ fn receipt_from_response(
     network: &str,
     transaction_hash: &[u8; 32],
 ) -> Result<Option<VerifiedReceipt>> {
-    let normalized = settlement_reply(v, network, transaction_hash)?;
+    let (normalized, fee_bump) = settlement_reply(v, network, transaction_hash)?;
     let v = normalized.as_ref();
     let status = verify_settlement(v, network, transaction_hash)?;
     if !matches!(status, OperationStatus::Confirmed | OperationStatus::Failed) {
@@ -1462,6 +1549,7 @@ fn receipt_from_response(
             .ok_or("Settlement result is required")?
             .into(),
         settles: None,
+        fee_bump,
     }))
 }
 /// The server's account of a wallet's standard figures: Core's `vendor::runtime::Accounting`.

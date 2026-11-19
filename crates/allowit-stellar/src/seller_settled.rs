@@ -1181,6 +1181,7 @@ mod tests {
                 envelope_xdr: xdr(&TransactionEnvelope::Tx(envelope.clone())).unwrap(),
                 result_xdr: xdr(&result).unwrap(),
                 settles: Some(p.transaction_hash),
+                fee_bump: None,
             }
         };
         let receipt = settling(&envelope, true);

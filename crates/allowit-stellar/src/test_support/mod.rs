@@ -167,6 +167,7 @@ pub fn confirmed_payment_receipt(
         envelope_xdr: signed.transaction_xdr.clone(),
         result_xdr: result.to_xdr_base64(x::Limits::none()).unwrap(),
         settles: None,
+        fee_bump: None,
     }
 }
 
@@ -541,4 +542,71 @@ pub fn execution_response(
         None
     };
     json!({"prepared":prepared,"operation":{"id":request_id,"status":status,"transactionHash":crate::hex(&prepared.transaction_hash)},"signedOperation":signed,"receipt":receipt})
+}
+/// `receipt` as the ledger answers it when a fee bump that `payer` paid carried its transaction:
+/// the inner result charges nothing, and the wrapper's result charges `fee`. With the wrapper's
+/// reply to `getTransaction`, as an endpoint gives it.
+pub fn fee_bumped(
+    receipt: &rpc::VerifiedReceipt,
+    network: &str,
+    payer: &str,
+    fee: i64,
+) -> (rpc::VerifiedReceipt, Value) {
+    let x::TransactionEnvelope::Tx(inner) = crate::read(&receipt.envelope_xdr).unwrap() else {
+        panic!()
+    };
+    let success = receipt.status == crate::OperationStatus::Confirmed;
+    let outer = x::FeeBumpTransactionEnvelope {
+        tx: x::FeeBumpTransaction {
+            fee_source: x::MuxedAccount::Ed25519(x::Uint256(crate::account_key(payer).unwrap())),
+            fee: fee * 2,
+            inner_tx: x::FeeBumpTransactionInnerTx::Tx(inner),
+            ext: x::FeeBumpTransactionExt::V0,
+        },
+        signatures: Default::default(),
+    };
+    let pair = x::InnerTransactionResultPair {
+        transaction_hash: x::Hash(receipt.transaction_hash),
+        result: x::InnerTransactionResult {
+            fee_charged: 0,
+            result: if success {
+                x::InnerTransactionResultResult::TxSuccess(Default::default())
+            } else {
+                x::InnerTransactionResultResult::TxFailed(Default::default())
+            },
+            ext: x::InnerTransactionResultExt::V0,
+        },
+    };
+    let inner_result: x::TransactionResult =
+        crate::read(&crate::xdr(&pair.result).unwrap()).unwrap();
+    let outer_result = x::TransactionResult {
+        fee_charged: fee,
+        result: if success {
+            x::TransactionResultResult::TxFeeBumpInnerSuccess(pair)
+        } else {
+            x::TransactionResultResult::TxFeeBumpInnerFailed(pair)
+        },
+        ext: x::TransactionResultExt::V0,
+    };
+    let envelope_xdr = crate::xdr(&x::TransactionEnvelope::TxFeeBump(outer.clone())).unwrap();
+    let result_xdr = crate::xdr(&outer_result).unwrap();
+    let tagged = x::TransactionSignaturePayload {
+        network_id: x::Hash(crate::network_id(network).unwrap()),
+        tagged_transaction: x::TransactionSignaturePayloadTaggedTransaction::TxFeeBump(outer.tx),
+    };
+    let outer_hash = crate::hash(tagged.to_xdr(x::Limits::none()).unwrap());
+    let reply = json!({"status": if success {"SUCCESS"} else {"FAILED"},
+        "txHash": crate::hex(&outer_hash), "ledger": receipt.ledger,
+        "envelopeXdr": envelope_xdr, "resultXdr": result_xdr});
+    (
+        rpc::VerifiedReceipt {
+            result_xdr: crate::xdr(&inner_result).unwrap(),
+            fee_bump: Some(rpc::FeeBump {
+                envelope_xdr,
+                result_xdr,
+            }),
+            ..receipt.clone()
+        },
+        reply,
+    )
 }

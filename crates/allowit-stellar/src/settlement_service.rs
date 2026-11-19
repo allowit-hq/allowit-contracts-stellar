@@ -391,8 +391,9 @@ fn outcome(
         return Ok(None);
     };
     let payer = authorization.as_ref().map(|a| a.payer.as_str());
-    let result: TransactionResult = read(&receipt.result_xdr).map_err(rail)?;
-    let fee_paid = u128::try_from(result.fee_charged).ok();
+    // The fee that the ledger charged for the service's transaction, the fee bump's charge when
+    // a fee bump carried it; unknown when the receipt does not hold it.
+    let fee_paid = rpc::fee_paid(&receipt).map_err(rail)?.map(|paid| paid.fee);
     // A successful transaction paid the seller only when its committed events are the one
     // transfer: a token can behave otherwise in the ledger than in the simulation. Without
     // the authorization or the committed events, the payment is not established.

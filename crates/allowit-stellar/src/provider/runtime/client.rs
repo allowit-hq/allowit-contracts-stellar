@@ -1367,7 +1367,7 @@ fn render(r: &Response) -> Result<ExecutionOutcome> {
         .receipt
         .as_ref()
         .filter(|receipt| receipt.settles.is_none())
-        .map(|receipt| receipt_settlement(receipt.ledger, &receipt.result_xdr))
+        .map(receipt_settlement)
         .transpose()?
         .flatten();
     let config = &r.prepared.config;
@@ -1579,11 +1579,19 @@ fn retained_limits(c: &Client, journal: &Store) -> Result<Option<Vec<LimitReport
 /// charges at least the base fee. A zero fee is the inner result of a fee-bumped transaction:
 /// the outer transaction paid, and the receipt does not hold that amount, so no fee is reported
 /// in place of a wrong one.
-fn receipt_settlement(ledger: u32, result_xdr: &str) -> Result<Option<(u32, u64)>> {
-    let result: stellar_xdr::TransactionResult = checked(sdk::read(result_xdr))?;
-    let fee = u64::try_from(result.fee_charged)
-        .map_err(|_| Error::uncertain("Invalid Stellar receipt fee"))?;
-    Ok((fee > 0).then_some((ledger, fee)))
+/// The ledger of a receipt and the fee that its transaction cost its own source, by the server's
+/// rule ([`sdk::rpc::fee_paid`]): a fee bump that the source paid is its fee, and one that another
+/// party paid is none of it. A receipt whose fee is unknown, or none of the source's, reports none.
+fn receipt_settlement(receipt: &sdk::rpc::VerifiedReceipt) -> Result<Option<(u32, u64)>> {
+    let Some(paid) = checked(sdk::rpc::fee_paid(receipt))? else {
+        return Ok(None);
+    };
+    if paid.payer != checked(sdk::rpc::receipt_source(receipt))? {
+        return Ok(None);
+    }
+    let fee =
+        u64::try_from(paid.fee).map_err(|_| Error::uncertain("Invalid Stellar receipt fee"))?;
+    Ok((fee > 0).then_some((receipt.ledger, fee)))
 }
 
 pub fn verify_native_members(account: &sdk::AccountState, c: &WalletConfig) -> Result<()> {
@@ -2259,28 +2267,29 @@ mod native_revalidation_tests {
         )
         .unwrap()
     }
+    /// A receipt reports its ledger and the fee that its transaction cost its own source, by the
+    /// server's rule: its own charge, or the charge of a fee bump that it paid; none for a fee
+    /// bump that another party paid, or whose payer the receipt does not keep.
     #[test]
-    fn a_receipt_reports_its_ledger_and_fee_and_no_fee_for_a_fee_bumped_inner_result() {
-        use stellar_xdr::{
-            Limits, TransactionResult, TransactionResultExt, TransactionResultResult, WriteXdr,
-        };
-        let result = |fee_charged| {
-            TransactionResult {
-                fee_charged,
-                result: TransactionResultResult::TxSuccess(Default::default()),
-                ext: TransactionResultExt::V0,
-            }
-            .to_xdr_base64(Limits::none())
-            .unwrap()
-        };
+    fn a_receipt_reports_the_fee_that_its_source_paid() {
+        let signed = crate::test_support::native_signed();
+        let network = &signed.prepared.config.network;
+        let wallet = &signed.prepared.config.wallet;
+        let plain = crate::test_support::confirmed_payment_receipt(&signed, 5_661_578, 123_456);
         assert_eq!(
-            receipt_settlement(5_661_578, &result(123_456)).unwrap(),
+            receipt_settlement(&plain).unwrap(),
             Some((5_661_578, 123_456))
         );
-        // The inner result of a fee-bumped transaction charges nothing; the outer fee is unknown.
-        assert_eq!(receipt_settlement(5_661_578, &result(0)).unwrap(), None);
-        assert!(receipt_settlement(1, &result(-1)).is_err());
-        assert!(receipt_settlement(1, "not-xdr").is_err());
+        let (own, _) = crate::test_support::fee_bumped(&plain, network, wallet, 5_000);
+        assert_eq!(receipt_settlement(&own).unwrap(), Some((5_661_578, 5_000)));
+        let other = sdk::account_for_seed(&[99; 32]);
+        let (sponsored, _) = crate::test_support::fee_bumped(&plain, network, &other, 5_000);
+        assert_eq!(receipt_settlement(&sponsored).unwrap(), None);
+        let unknown = sdk::rpc::VerifiedReceipt {
+            fee_bump: None,
+            ..sponsored
+        };
+        assert_eq!(receipt_settlement(&unknown).unwrap(), None);
     }
     #[test]
     #[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
@@ -3490,6 +3499,7 @@ mod native_revalidation_tests {
             envelope_xdr: signed.transaction_xdr.clone(),
             result_xdr: result.to_xdr_base64(Limits::none()).unwrap(),
             settles: None,
+            fee_bump: None,
         };
         sdk::rpc::validate_settled_policy_packet(&signed, &receipt).unwrap();
         let body = serde_json::to_vec(&json!({"prepared":signed.prepared,"signedOperation":signed,"operation":{"id":"wire-status-001","status":OperationStatus::SubmissionUnknown,"transactionHash":sdk::hex(&receipt.transaction_hash)},"receipt":receipt})).unwrap();
