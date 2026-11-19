@@ -288,20 +288,26 @@ fn expense_of(action: &Action, conversion: i128, ceiling: &FeeCeiling) -> Result
     // A Stellar transaction declares its fee in 32 bits and pays at least the inclusion fee, and
     // its expense names a ledger sequence: another ceiling cannot be signed.
     if ceiling.day > u64::MAX / allowit_core::DAY {
-        return Err(Error::config("The day of the fee ceiling is no UTC day"));
+        return Err(Error::coded(
+            UNSIGNABLE_CEILING,
+            "The day of the fee ceiling is no UTC day",
+        ));
     }
     if ceiling.observed_height == 0 || u32::try_from(ceiling.observed_height).is_err() {
-        return Err(Error::config(
+        return Err(Error::coded(
+            UNSIGNABLE_CEILING,
             "The observed ledger of the fee ceiling is no Stellar ledger",
         ));
     }
     if ceiling.max_fee_units < u128::from(native::INCLUSION_FEE_STROOPS) {
-        return Err(Error::config(
+        return Err(Error::coded(
+            UNSIGNABLE_CEILING,
             "The fee ceiling is below the inclusion fee of a Stellar transaction",
         ));
     }
     if ceiling.max_fee_units > u128::from(u32::MAX) {
-        return Err(Error::config(
+        return Err(Error::coded(
+            UNSIGNABLE_CEILING,
             "The fee ceiling is above what a Stellar transaction can declare",
         ));
     }
@@ -528,6 +534,8 @@ pub type Sender = std::sync::Arc<dyn SendingAccounts>;
 /// The code of the refusal of a retained packet of a historical route (`Odc`): such a packet only
 /// reads its status, and settles nothing.
 pub const RETIRED_ROUTE: &str = "retired_route";
+/// The code of the refusal of a fee ceiling that no Stellar transaction of the wallet can carry.
+pub const UNSIGNABLE_CEILING: &str = "fee_ceiling_unsignable";
 pub use crate::host::runtime::SendingAccounts;
 /// The fee that the signed transaction envelope `xdr` declares, in stroops: the most that the
 /// ledger charges its source.
@@ -1777,7 +1785,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         action: &Action,
         ceiling: &FeeCeiling,
     ) -> Result<ExpenseBound> {
-        self.config(i)?;
+        let c = self.config(i)?;
         let amounts = match action {
             Action::Transfer { units, .. } => [*units, 0],
             Action::Deposit {
@@ -1789,6 +1797,17 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         };
         if amounts.iter().chain([&ceiling.gas_units]).any(|a| *a < 0) {
             return Err(Error::usage("An expense amount is negative"));
+        }
+        // A policy wallet of XLM counts the fee that it repays one to one: its signing check
+        // refuses any other gas.
+        if c.route == WalletRoute::PolicyWallet
+            && checked(native::asset_xdr(&c))? == stellar_xdr::Asset::Native
+            && u128::try_from(ceiling.gas_units).ok() != Some(ceiling.max_fee_units)
+        {
+            return Err(Error::coded(
+                UNSIGNABLE_CEILING,
+                "An XLM wallet counts its fee one to one: the gas of the ceiling differs from its fee.",
+            ));
         }
         let conversion = match action {
             Action::Transfer { .. } => 0,
@@ -4229,12 +4248,42 @@ mod settlement_api {
             .unwrap(),
         )
     }
+    /// The fee ceiling of the XLM Standard wallet: 1,000 stroops, which it counts one to one.
     const CEILING: FeeCeiling = FeeCeiling {
         max_fee_units: 1_000,
-        gas_units: 2,
+        gas_units: 1_000,
         observed_height: 9,
         day: 1,
     };
+
+    /// A policy wallet of XLM counts the fee that it repays one to one, as its signing check
+    /// requires: a ceiling whose gas differs from its fee is refused with a typed error, before
+    /// any read.
+    #[test]
+    fn an_xlm_wallets_ceiling_counts_its_fee_one_to_one() {
+        let i = installation();
+        let transfer = Action::Transfer {
+            recipient: native::account_for_seed(&[31; 32]),
+            units: 100,
+        };
+        let bound = provider().expense(&i, &transfer, &CEILING).unwrap();
+        assert_eq!(
+            (bound.gas_units, bound.max_fee_units, bound.spent_units),
+            (1_000, 1_000, 1_100)
+        );
+        for gas_units in [2, 0, 1_001] {
+            let ceiling = FeeCeiling {
+                gas_units,
+                ..CEILING
+            };
+            let error = provider().expense(&i, &transfer, &ceiling).unwrap_err();
+            assert_eq!(
+                error.api_code.as_deref(),
+                Some(UNSIGNABLE_CEILING),
+                "{gas_units}"
+            );
+        }
+    }
 
     /// An expense of a negative amount is refused before any read.
     #[test]
@@ -4367,7 +4416,7 @@ mod settlement_api {
             let bound = reading.expense(&i, &action, &CEILING).unwrap();
             assert_eq!(
                 (bound.conversion_units, bound.spent_units),
-                (loss, loss + 2),
+                (loss, loss + 1_000),
                 "{action:?}"
             );
         }
@@ -4427,7 +4476,7 @@ mod settlement_api {
         let bound = provider().expense(&i, &deposit, &CEILING).unwrap();
         assert_eq!(
             (bound.conversion_units, bound.spent_units, bound.gas_units),
-            (100, 102, 2)
+            (100, 1_100, 1_000)
         );
         let redeem = Action::Redeem {
             vault,
