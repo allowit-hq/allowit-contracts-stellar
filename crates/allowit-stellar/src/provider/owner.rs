@@ -59,6 +59,11 @@ fn client(cx: &Context<'_>) -> Result<OwnerClient> {
     c.authenticate(&super::OwnerSignerRef(cx.signer), (cx.clock)()?)?;
     Ok(c)
 }
+/// Whether a request with a held session failed because the session ended: the client holds
+/// no valid session and the server was not asked, or the server answered that it knows none.
+fn session_ended(error: &Error) -> bool {
+    matches!(error.status, None | Some(401))
+}
 fn emit(value: impl serde::Serialize) -> Result<serde_json::Value> {
     serde_json::to_value(value).map_err(|_| Error::config("Cannot encode owner result"))
 }
@@ -249,23 +254,29 @@ impl OwnerProvider for Owner {
         // The ledger now holds the wallet. The server registers it from the ledger, so no
         // server configuration names it. A refusal leaves the wallet set up: the same request
         // ID asks again and signs nothing.
-        let registration = session
-            .map_or_else(|| client(cx), Ok)
-            .and_then(|client| {
-                client.register_native(&configured["configuration"], (cx.clock)()?)
-            })
-            .map_err(|error| {
-                let mut refused = Error::api(
-                    error.status.unwrap_or(409),
-                    format!(
-                        "The wallet account {} is set up on the ledger, but the server did not register it: {}. Run the same setup again.",
-                        configured["wallet"].as_str().unwrap_or_default(),
-                        error.message
-                    ),
-                );
-                refused.api_code = error.api_code;
-                refused
-            })?;
+        let register = |client: OwnerClient| {
+            client.register_native(&configured["configuration"], (cx.clock)()?)
+        };
+        // A new setup registers with the session of its template read. That session may have
+        // ended while the ledger settled the setup: the registration then signs in once more,
+        // as a setup without a session does. A registration writes nothing a second time.
+        let registration = match session.map(register) {
+            Some(Err(error)) if session_ended(&error) => client(cx).and_then(register),
+            Some(answer) => answer,
+            None => client(cx).and_then(register),
+        };
+        let registration = registration.map_err(|error| {
+            let mut refused = Error::api(
+                error.status.unwrap_or(409),
+                format!(
+                    "The wallet account {} is set up on the ledger, but the server did not register it: {}. Run the same setup again.",
+                    configured["wallet"].as_str().unwrap_or_default(),
+                    error.message
+                ),
+            );
+            refused.api_code = error.api_code;
+            refused
+        })?;
         configured["registered"] = registration["registered"].clone();
         configured["walletKind"] = serde_json::json!("native");
         Ok(configured)
@@ -497,6 +508,19 @@ mod storage_boundary_tests {
             error.message,
             "The request file must contain a JSON object."
         );
+    }
+    /// A registration with the session of the template read signs in once more when that
+    /// session has ended: the client held no valid session, or the server knows none. A
+    /// refusal of the registration itself is the answer.
+    #[test]
+    fn a_registration_signs_in_again_only_when_its_session_ended() {
+        assert!(session_ended(&Error::config(
+            "Authenticate the selected owner first"
+        )));
+        assert!(session_ended(&Error::api(401, "Sign in")));
+        for status in [400, 403, 409, 500, 503] {
+            assert!(!session_ended(&Error::api(status, "refused")), "{status}");
+        }
     }
     /// A setup with an invalid value of the caller fails before the journal opens, before the
     /// owner signs a sign-in and before the server is asked: the store and the signer of this
