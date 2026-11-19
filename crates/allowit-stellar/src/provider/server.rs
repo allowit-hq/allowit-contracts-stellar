@@ -578,7 +578,8 @@ impl Provider {
         }))
     }
     /// Send the code transaction `s` once. `Prepared` when the network did not accept it:
-    /// nothing is pending, and the caller can send the same bytes again while it is needed.
+    /// nothing is pending, and the caller can send the same bytes again while it is needed. A
+    /// send never returns a final status: only the receipt (`observe_code`) is final.
     fn broadcast_code(&self, s: &SignedCode, now: u64) -> Result<Status> {
         if now > s.code.expires_at {
             return Err(Error::usage("The code transaction expired"));
@@ -597,7 +598,7 @@ impl Provider {
                         network,
                         &s.code.transaction_hash,
                     ))? {
-                        Some(receipt) => status(receipt.status),
+                        Some(_) => Status::Submitted,
                         None => Status::Prepared,
                     }
                 }
@@ -609,10 +610,12 @@ impl Provider {
     /// transaction at most the fee that it declares: a receipt that reports more is refused.
     fn observe_code(&self, s: &SignedCode) -> Result<Option<Receipt>> {
         let network = &s.code.network;
-        let Some(receipt) = checked(rpc::receipt_by_hash(
+        // The ledger's own envelope is the signed transaction, before any fee bump is read.
+        let Some(receipt) = checked(rpc::own_receipt_by_hash(
             self.rpc(),
             network,
             &s.code.transaction_hash,
+            &s.signed_xdr,
         ))?
         else {
             return Ok(None);
@@ -1711,6 +1714,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         let (min_ledger, max_ledger) = checked(native::admin::code_ledger_bounds(&code.code))?;
         checked(rpc::code_transaction_lapsed(
             self.rpc(),
+            &code.code.network,
             &code.code.transaction_hash,
             min_ledger,
             max_ledger,

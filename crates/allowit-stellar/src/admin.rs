@@ -1802,11 +1802,13 @@ fn code_bounds(tx: &Transaction, expires_at: u64) -> Result<(u32, u32)> {
     if time.max_time.0 == 0 || time.max_time.0 != expires_at {
         return Err("The code transaction's time bound differs from its expiry".into());
     }
+    // The window is the one that preparation binds: a lookup history that holds its first
+    // ledger can prove the lapse soon after its last ledger closed.
     if !extra_signers.is_empty()
         || ledgers.min_ledger == 0
-        || ledgers.max_ledger < ledgers.min_ledger
+        || ledgers.max_ledger.checked_sub(ledgers.min_ledger) != Some(CODE_LEDGER_WINDOW)
     {
-        return Err("The code transaction's ledger bounds are not a bounded window".into());
+        return Err("The code transaction's ledger bounds are not its window".into());
     }
     Ok((ledgers.min_ledger, ledgers.max_ledger))
 }
@@ -1830,6 +1832,10 @@ pub fn check_signed_code(p: &PreparedDeployment, signed_xdr: &str) -> Result<()>
     let TransactionEnvelope::Tx(signed) = read(signed_xdr)? else {
         return Err("Expected a signed v1 code transaction".into());
     };
+    // The preparation is unsigned: its bytes, and so its packet, are the server's alone.
+    if !unsigned.signatures.is_empty() {
+        return Err("The prepared code transaction carries a signature".into());
+    }
     if signed.tx != unsigned.tx {
         return Err("The signed code transaction differs from its preparation".into());
     }

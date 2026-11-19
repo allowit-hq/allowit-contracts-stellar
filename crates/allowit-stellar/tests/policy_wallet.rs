@@ -69,6 +69,13 @@ fn b64<T: WriteXdr>(v: &T) -> String {
 fn de<T: ReadXdr>(v: &str) -> T {
     T::from_xdr_base64(v, Limits::none()).unwrap()
 }
+fn unhexs(text: &str) -> [u8; 32] {
+    let bytes: Vec<u8> = (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+        .collect();
+    bytes.try_into().unwrap()
+}
 fn hexs(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -357,6 +364,10 @@ struct Model {
     retry_later_restores: Option<[u8; 32]>,
     /// The network rejects the next submission.
     reject_next_send: bool,
+    /// The endpoint serves another network.
+    foreign_network: bool,
+    /// The ledger holds each settled transaction inside a fee bump of another source.
+    fee_bumped: bool,
     /// The oldest ledger of the history that a lookup of an unknown transaction searched, up to
     /// the head.
     history: Option<u32>,
@@ -585,7 +596,11 @@ impl rpc::Rpc for ModelChain {
     fn call(&self, method: &str, params: Value) -> Result<Value> {
         let mut m = self.0.lock().unwrap();
         match method {
-            "getNetwork" => Ok(json!({"passphrase": passphrase(NETWORK)?})),
+            "getNetwork" => Ok(json!({"passphrase": passphrase(if m.foreign_network {
+                "stellar:pubnet"
+            } else {
+                NETWORK
+            })?})),
             "getLatestLedger" => Ok(json!({"sequence": m.ledger})),
             "getLedgerEntries" => {
                 let encoded = params["keys"][0].as_str().unwrap();
@@ -963,17 +978,17 @@ impl rpc::Rpc for ModelChain {
                 };
                 let digest = tx_hash(&env.tx);
                 let tx_hash = hexs(&digest);
+                if std::mem::take(&mut m.reject_next_send) {
+                    return Ok(
+                        json!({"hash": tx_hash, "status": "ERROR", "errorResultXdr": "AAAAAAAAAGT////7AAAAAA=="}),
+                    );
+                }
                 if m.settled.contains_key(&tx_hash) {
                     return Ok(json!({"hash": tx_hash, "status": "DUPLICATE"}));
                 }
                 if let Some(code) = m.retry_later_restores.take() {
                     m.lapsed_code.remove(&code);
                     return Ok(json!({"hash": tx_hash, "status": "TRY_AGAIN_LATER"}));
-                }
-                if std::mem::take(&mut m.reject_next_send) {
-                    return Ok(
-                        json!({"hash": tx_hash, "status": "ERROR", "errorResultXdr": "AAAAAAAAAGT////7AAAAAA=="}),
-                    );
                 }
                 // The source signs alone.
                 let source = source_of(&env.tx);
@@ -1061,6 +1076,25 @@ impl rpc::Rpc for ModelChain {
                     });
                 };
                 let failed = m.failed.contains(tx_hash);
+                let envelope = if m.fee_bumped {
+                    let x::TransactionEnvelope::Tx(inner) = de(envelope) else {
+                        panic!()
+                    };
+                    b64(&x::TransactionEnvelope::TxFeeBump(
+                        x::FeeBumpTransactionEnvelope {
+                            tx: x::FeeBumpTransaction {
+                                fee_source: x::MuxedAccount::Ed25519(x::Uint256([9; 32])),
+                                fee: i64::from(inner.tx.fee) * 2,
+                                inner_tx: x::FeeBumpTransactionInnerTx::Tx(inner),
+                                ext: x::FeeBumpTransactionExt::V0,
+                            },
+                            signatures: Default::default(),
+                        },
+                    ))
+                } else {
+                    envelope.clone()
+                };
+                let envelope = &envelope;
                 let result = x::TransactionResult {
                     fee_charged: m.charged_fee.unwrap_or(100),
                     result: if failed {
@@ -1070,8 +1104,34 @@ impl rpc::Rpc for ModelChain {
                     },
                     ext: x::TransactionResultExt::V0,
                 };
+                // A fee bump reports the inner transaction's result, which its wrapper paid.
+                let result = if m.fee_bumped {
+                    let pair = x::InnerTransactionResultPair {
+                        transaction_hash: x::Hash(unhexs(tx_hash)),
+                        result: x::InnerTransactionResult {
+                            fee_charged: 0,
+                            result: if failed {
+                                x::InnerTransactionResultResult::TxFailed(Default::default())
+                            } else {
+                                x::InnerTransactionResultResult::TxSuccess(Default::default())
+                            },
+                            ext: x::InnerTransactionResultExt::V0,
+                        },
+                    };
+                    x::TransactionResult {
+                        fee_charged: 200,
+                        result: if failed {
+                            x::TransactionResultResult::TxFeeBumpInnerFailed(pair)
+                        } else {
+                            x::TransactionResultResult::TxFeeBumpInnerSuccess(pair)
+                        },
+                        ext: x::TransactionResultExt::V0,
+                    }
+                } else {
+                    result
+                };
                 Ok(
-                    json!({"status": if failed { "FAILED" } else { "SUCCESS" }, "ledger": m.ledger, "envelopeXdr": envelope, "resultXdr": b64(&result)}),
+                    json!({"status": if failed { "FAILED" } else { "SUCCESS" }, "txHash": tx_hash, "ledger": m.ledger, "envelopeXdr": envelope, "resultXdr": b64(&result)}),
                 )
             }
             other => panic!("unexpected RPC {other}"),
@@ -4173,6 +4233,16 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
                 .unwrap(),
         );
         assert!(settling.verify_operation(&code).is_err());
+        // A send never returns a final status: a rejected send of bytes that the ledger already
+        // included is pending, and only its receipt is final.
+        chain.0.lock().unwrap().reject_next_send = true;
+        assert_eq!(provider.broadcast(&code, NOW).unwrap(), Status::Submitted);
+        // The ledger holds the same transaction inside another source's fee bump: that is no
+        // receipt of this transaction, whose source would not have paid its fee.
+        chain.0.lock().unwrap().fee_bumped = true;
+        assert!(provider.observe(&code).is_err());
+        chain.0.lock().unwrap().fee_bumped = false;
+        assert!(provider.observe(&code).unwrap().is_some());
         // A sent transaction never lapses.
         chain.0.lock().unwrap().history = Some(1);
         assert!(!provider.code_lapsed(&code).unwrap());
@@ -4205,6 +4275,10 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         assert!(!provider.code_lapsed(&code).unwrap());
         chain.0.lock().unwrap().ledger = last + 1;
         assert!(provider.code_lapsed(&code).unwrap());
+        // An endpoint of another network proves nothing about this one.
+        chain.0.lock().unwrap().foreign_network = true;
+        assert!(provider.code_lapsed(&code).is_err());
+        chain.0.lock().unwrap().foreign_network = false;
         chain.0.lock().unwrap().history = Some(first + 1);
         assert!(!provider.code_lapsed(&code).unwrap());
         let mut m = chain.0.lock().unwrap();
@@ -4310,6 +4384,18 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
                 });
             }
         })));
+        // A ledger window of another length than the one that preparation binds.
+        assert!(refused(&resigned(&|tx, _| {
+            if let x::Preconditions::V2(v2) = &mut tx.cond
+                && let Some(bounds) = &mut v2.ledger_bounds
+            {
+                bounds.max_ledger += 1_000_000;
+            }
+        })));
+        // A preparation that carries a signature is not the server's unsigned preparation.
+        let mut presigned = document.clone();
+        presigned["code"]["transactionXdr"] = presigned["signedXdr"].clone();
+        assert!(refused(&presigned));
         // An upload re-signed by its source with another entry in its footprint.
         {
             let mut m = chain.0.lock().unwrap();

@@ -881,16 +881,18 @@ pub fn owner_transaction_lapsed(
     let reply = rpc.call("getTransaction", json!({ "hash": hex(hash) }))?;
     Ok(owner_never_applied(&reply, &hex(hash), expires_at, since))
 }
-/// Whether the code transaction with hash `hash`, which the network can include only in the
-/// ledgers `min_ledger..=max_ledger` of its signed bounds, lapsed: a lookup finds no such
-/// transaction in a history that reaches back to `min_ledger`, and a ledger after `max_ledger`
-/// closed, so it never applied and can no longer apply.
+/// Whether the code transaction with hash `hash` on `network`, which the network can include
+/// only in the ledgers `min_ledger..=max_ledger` of its signed bounds, lapsed: the endpoint serves
+/// `network`, a lookup finds no such transaction in a history that reaches back to `min_ledger`,
+/// and a ledger after `max_ledger` closed, so it never applied and can no longer apply.
 pub fn code_transaction_lapsed(
     rpc: &dyn Rpc,
+    network: &str,
     hash: &[u8; 32],
     min_ledger: u32,
     max_ledger: u32,
 ) -> Result<bool> {
+    owner_observation::network(rpc, network)?;
     let reply = rpc.call("getTransaction", json!({ "hash": hex(hash) }))?;
     let number = |key: &str| {
         reply[key]
@@ -1305,6 +1307,24 @@ pub fn repaid_gas_stroops(receipt: &VerifiedReceipt) -> Result<u128> {
         Some(value) => u128::try_from(wide(value)?).map_err(|_| "A negative gas repayment".into()),
         None => Err("The execute request has no gas repayment".into()),
     }
+}
+/// Read the verified terminal receipt of the transaction `envelope`, whose hash is
+/// `transaction_hash`, as the ledger holds it: the reply's own envelope is `envelope`, before any
+/// fee bump is read. The same transaction in another envelope is no receipt of this one. Absence
+/// remains unknown.
+pub fn own_receipt_by_hash(
+    rpc: &dyn Rpc,
+    network: &str,
+    transaction_hash: &[u8; 32],
+    envelope: &str,
+) -> Result<Option<VerifiedReceipt>> {
+    let v = rpc.call("getTransaction", json!({"hash":hex(transaction_hash)}))?;
+    if matches!(v["status"].as_str(), Some("SUCCESS" | "FAILED"))
+        && v["envelopeXdr"].as_str() != Some(envelope)
+    {
+        return Err("The ledger holds the transaction in another envelope".into());
+    }
+    receipt_from_response(&v, network, transaction_hash)
 }
 /// Read a verified terminal receipt. Absence remains unknown and does not release reservations.
 pub fn receipt_by_hash(
