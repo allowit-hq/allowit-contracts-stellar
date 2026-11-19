@@ -773,7 +773,7 @@ pub fn revalidate_prepared(
     authorization::server_signature(p, true)?;
     // The server's accounting of the figures that the wallet does not keep is the one that the
     // preparation retained; the ledger gives the rest.
-    let accounting = (crate::kept_figures(&p.config) != packed::ALL).then_some(NativeAccounting {
+    let accounting = (!crate::wallet_gives_every_figure(&p.config)).then_some(NativeAccounting {
         nonce: p.state.nonce,
         deployment_version: p.state.deployment_version,
         spent_daily: p.state.spent_daily,
@@ -1859,13 +1859,15 @@ fn current_wallet_state(
         }
     }
     let figures = figures(rpc, c, ledger)?;
-    // A wallet that keeps every figure needs no account of the server's.
-    let accounting = accounting.filter(|_| crate::kept_figures(c) != packed::ALL);
-    // The server's account of the figures that the wallet does not keep: a Simple wallet keeps
+    // A wallet that gives every figure needs no account of the server's.
+    let accounting = accounting.filter(|_| !crate::wallet_gives_every_figure(c));
+    // The server's account of the figures that the wallet does not give: a Simple wallet gives
     // none, a Common wallet those of its rules with params, and a Custom wallet whose source has
-    // a server part those of its on-chain part. An execution needs it; discovery reports the
+    // a server part the figures that Core names for its on-chain part. The decision is by figure,
+    // not by wallet entry: an entry can hold one figure that the wallet gives and one that it
+    // does not. An execution needs it; discovery reports the
     // wallet's own figures without it.
-    if require_customer_quorum && accounting.is_none() && crate::kept_figures(c) != packed::ALL {
+    if require_customer_quorum && accounting.is_none() && !crate::wallet_gives_every_figure(c) {
         return Err(
             "This wallet needs the server's accounting of the figures that it does not keep".into(),
         );

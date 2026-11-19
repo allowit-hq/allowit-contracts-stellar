@@ -647,8 +647,13 @@ fn validate_generated(
         || d.asset.address != policy.mint
         || d.asset.symbol != policy.token
         || d.asset.decimals != 7
-        || d.build.prefix != shape.prefix
-        || d.build.writes_state != shape.writes_state
+        || !crate::provider::report_matches(
+            kind == "owner-wallet",
+            request.profile == "allowit-custom-wallet-v1",
+            &policy.code,
+            &d.build.prefix,
+            d.build.writes_state,
+        )?
         || d.build.attempts == 0
         || d.build.attempts > 3
     {

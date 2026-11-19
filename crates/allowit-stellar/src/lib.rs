@@ -832,6 +832,8 @@ impl TrustedState {
         state.insert("day".to_owned(), PolicyValue::Int(i128::from(today)));
         let server_daily = if server_today { self.spent_daily } else { 0 };
         let server_volume = if server_today { self.volume_daily } else { 0 };
+        // A daily figure of an ended window reads as zero, as the contract's state map holds it
+        // (Core's `AllowitStandardState::write`).
         let own_daily = |value: i128| if open { value } else { 0 };
         state.insert(
             "day_spent".to_owned(),
@@ -1081,6 +1083,21 @@ fn server_part_figures(c: &WalletConfig) -> Option<Vec<&'static str>> {
         .flatten()
         .filter(|parts| parts.server_part)
         .map(|parts| parts.figures)
+}
+/// Every standard figure that a policy wallet can give to an evaluation.
+const FIGURE_KEYS: [&str; 6] = [
+    "calls",
+    "spent",
+    "unpriced",
+    "day_spent",
+    "day_total",
+    "day_unpriced",
+];
+/// Whether a policy wallet gives every standard figure to an evaluation, so that the server's
+/// accounting gives none ([`wallet_figures`]).
+pub fn wallet_gives_every_figure(c: &WalletConfig) -> bool {
+    let given = wallet_figures(c);
+    FIGURE_KEYS.iter().all(|key| given.contains(key))
 }
 /// The keys of the figures that a policy wallet gives to an evaluation from its own entries; the
 /// server's accounting gives the others. A Custom wallet whose source has a server part gives

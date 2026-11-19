@@ -402,8 +402,11 @@ pub fn host_compile(path: &str) -> Result<()> {
 }
 
 /// Bind an owner packet to its authored source. Every tier requires one self-contained file that
-/// binds `allowit` only to the canonical crate and passes `compile`, the std-only compile of the
-/// offchain server. Common binds the source's standard prefix; Simple and Custom bind none.
+/// binds `allowit` only to the canonical crate, and the file that its contract compiles passes
+/// `compile`, the std-only compile of the offchain server: the source itself, or the on-chain part
+/// of a Custom source with a server part. Such a source calls server functions that only the
+/// server links, from the registry of its host calls, so the server checks the whole source
+/// before it evaluates it. Common binds the source's standard prefix; Simple and Custom bind none.
 /// Custom also binds the source bytes. Returns the warning for prefix rules without a param.
 pub fn policy_rules(
     value: &Value,
@@ -421,10 +424,8 @@ pub fn policy_rules(
     let bytes = std::fs::read(path).map_err(|_| "Cannot read the policy source")?;
     let source = std::str::from_utf8(&bytes).map_err(|_| "Policy source is not UTF-8")?;
     let shape = policy::wallet_shape(tier, source)?;
-    // The server evaluates the whole source, so the whole source type-checks against the
-    // library. The contract of a Custom wallet compiles the on-chain part of its source, so
-    // that part type-checks by itself too.
-    compile(path)?;
+    // The contract compiles the on-chain part of a Custom source, which Core derives, and the
+    // whole source of any other wallet. Only the server links the server functions of the rest.
     let parts = (tier == PolicyTier::Custom)
         .then(|| policy::custom_parts(source))
         .transpose()?
@@ -435,6 +436,8 @@ pub fn policy_rules(
         std::fs::write(&onchain, &parts.onchain)
             .map_err(|_| "Cannot write the on-chain part of the policy source")?;
         compile(onchain.to_str().ok_or("Scratch path is not UTF-8")?)?;
+    } else {
+        compile(path)?;
     }
     let expected = if tier == PolicyTier::Common {
         shape.prefix

@@ -2905,6 +2905,36 @@ fn a_split_custom_wallet_gives_the_figures_that_core_names_from_the_wallet() {
     assert_eq!(figures(false), marked);
 }
 
+/// A Custom wallet whose on-chain part reads four figures directly, while only the server reads
+/// the lifetime unpriced flag. Every wallet entry is kept, yet Core leaves the flag to the
+/// server: the server's accounting gives it, so an execution needs that accounting.
+#[test]
+fn a_split_custom_wallet_takes_from_the_server_a_figure_that_core_leaves_to_it() {
+    let (mut c, r, s) = fixture(WalletRoute::PolicyWallet, true);
+    install(
+        &mut c,
+        PolicyTier::Custom,
+        "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    let calls: u64 = allowit::get_state(ctx, \"calls\")?.unwrap_or(0);\n    let spent: i128 = allowit::get_state(ctx, \"spent\")?.unwrap_or(0);\n    let day_spent: i128 = allowit::get_state(ctx, \"day_spent\")?.unwrap_or(0);\n    let day_total: i128 = allowit::get_state(ctx, \"day_total\")?.unwrap_or(0);\n    assert!(calls < 1_000 && spent < 1_000_000 && day_spent < 1_000 && day_total < 1_000);\n    let score = allowit::decision(ctx, &allowit::AllowitDecision { id: \"a\", query: \"Is this research?\", deny_below: 1, allow_above: 2 })?;\n    if score < 9000 {\n        let unpriced: bool = allowit::get_state(ctx, \"unpriced\")?.unwrap_or(false);\n        assert!(!unpriced);\n    }\n    Ok(())\n}\n",
+        json!({}),
+    );
+    assert_eq!(kept_figures(&c), allowit_stellar::packed::ALL);
+    assert!(!allowit_stellar::wallet_gives_every_figure(&c));
+    let rpc = preflight_rpc(&c, &r, &s);
+    let state = rpc::trusted_state(
+        &rpc,
+        &c,
+        Some(rpc::NativeAccounting {
+            unpriced_total: true,
+            ..server_accounting()
+        }),
+    )
+    .unwrap()
+    .policy_wallet_state(&c, 86_401)
+    .unwrap()
+    .0;
+    assert_eq!(state["unpriced"], PolicyValue::Bool(true));
+}
+
 #[test]
 fn simple_service_authorization_evaluates_the_full_policy() {
     let (mut c, r, s) = fixture(WalletRoute::PolicyWallet, true);

@@ -323,7 +323,7 @@ fn owner_packets_pass_the_std_only_compile_of_the_offchain_server() {
 /// source, which the server evaluates, and then the on-chain part, which the contract compiles.
 /// A source that is its own on-chain part is checked once.
 #[test]
-fn a_custom_owner_packet_checks_the_whole_source_and_its_on_chain_part() {
+fn a_custom_owner_packet_compiles_the_on_chain_part_of_a_source_with_a_server_part() {
     const ONE: &str = "use allowit::prelude::*;\nuse allowit::AllowitDecision;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::payment_limit(ctx, &ctx.params[allowit::PAYMENT_LIMIT])?;\n    let question: String = allowit::param(ctx, \"question\");\n    allowit::decision(ctx, &AllowitDecision { id: \"research\", query: question.as_str(), deny_below: 3000, allow_above: 8000 })?;\n    Ok(())\n}\n";
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("policy.rs");
@@ -339,15 +339,26 @@ fn a_custom_owner_packet_checks_the_whole_source_and_its_on_chain_part() {
     policy_rules(&packet, Some("custom"), path.to_str(), &record).unwrap();
     let onchain = allowit_stellar::policy::custom_parts(ONE).unwrap().onchain;
     assert!(!onchain.contains("decision") && onchain.contains("payment_limit"));
-    assert_eq!(*seen.borrow(), [ONE.to_owned(), onchain]);
-    // The whole source really type-checks against the std backend, and so does its part.
-    host_compile(path.to_str().unwrap()).unwrap();
-    // A failure of the whole source stops the packet before the part is checked.
+    // Only the on-chain part is compiled here: the whole source can call a function that only the
+    // server links, such as a function of a policy package that its host registers.
+    assert_eq!(*seen.borrow(), [onchain]);
+    let package = ONE.replace(
+        "    let question: String",
+        "    sanctions::screen(ctx, &ctx.request.recipient)?;\n    let question: String",
+    );
+    std::fs::write(&path, &package).unwrap();
+    let packet =
+        json!({"rules": [], "source_hash": allowit_stellar::hex(&allowit_stellar::hash(&package))});
+    policy_rules(&packet, Some("custom"), path.to_str(), &|file: &str| {
+        host_compile(file)
+    })
+    .unwrap();
+    // A failure of the part stops the packet.
     let failing = |_: &str| -> Result<()> { Err("std-only compile".into()) };
     assert!(policy_rules(&packet, Some("custom"), path.to_str(), &failing).is_err());
     // Another tier holds no server policy source.
     assert!(policy_rules(&packet, Some("simple"), path.to_str(), &record).is_err());
-    assert_eq!(seen.borrow().len(), 2);
+    assert_eq!(seen.borrow().len(), 1);
 }
 
 /// `tests/fixtures/policy-source-cases.json` records the std-only compile verdict of the Core
