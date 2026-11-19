@@ -820,6 +820,31 @@ fn a_call_below_the_threshold_renews_the_instance_and_a_custom_wallets_own_code(
     );
 }
 
+/// Every committed call of a wallet keeps it live, also a read of its state: at the threshold it
+/// renews the instance, and a Custom wallet's own code too; above it, nothing.
+#[test]
+fn a_committed_state_read_renews_the_wallet_under_the_threshold() {
+    for (wasm, owns_code) in [(SIMPLE, false), (COMMON, false), (CUSTOM, true)] {
+        let f = Fixture::new(wasm);
+        let instance = || f.env.deployer().get_contract_instance_ttl(&f.wallet);
+        let code = || f.env.deployer().get_contract_code_ttl(&f.wallet);
+        let advance = |ledgers: u32| f.env.ledger().with_mut(|l| l.sequence_number += ledgers);
+        advance(RENEWAL_LEDGERS - 2);
+        let (live_instance, live_code) = (instance(), code());
+        f.client().state();
+        assert_eq!((instance(), code()), (live_instance, live_code));
+        advance(1);
+        let shared_code = code();
+        f.client().state();
+        assert_eq!(instance(), TOTAL_LEDGERS - 1);
+        if owns_code {
+            assert_eq!(code(), TOTAL_LEDGERS - 1);
+        } else {
+            assert_eq!(code(), shared_code);
+        }
+    }
+}
+
 /// An upgrade keeps the code that it installs live, whatever the tier that it leaves or enters:
 /// the owner's upgrade renews the new code, whose own upload gave it the network's minimum
 /// lifetime only.

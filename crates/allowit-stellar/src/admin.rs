@@ -823,7 +823,7 @@ impl RecoverFunds for OwnerAdmin<'_> {
         }
         let amount = self.balance_of(&s, token)?;
         if amount <= 0 {
-            return Err(NO_RECOVERABLE_BALANCE.into());
+            return Err(self.nothing_to_recover());
         }
         let owner = s.owner.address.clone();
         let version = s.deployment_version;
@@ -871,10 +871,31 @@ impl OwnerAdmin<'_> {
         } else {
             self.balance_of(&s, &xlm)?
         };
-        let token = next_recovery(&asset, &xlm, asset_balance, xlm_balance)
-            .ok_or(NO_RECOVERABLE_BALANCE)?
-            .to_owned();
+        let Some(token) = next_recovery(&asset, &xlm, asset_balance, xlm_balance) else {
+            return Err(self.nothing_to_recover());
+        };
+        let token = token.to_owned();
         self.recover_funds(&token)
+    }
+    /// The refusal of a recovery that found nothing to return: `CONTRACT_EXPIRED` for a wallet
+    /// whose instance, or the code that it runs, lapsed, since no owner step reaches it; the
+    /// balance reads touch neither. A read that fails is its error.
+    fn nothing_to_recover(&self) -> String {
+        let lapsed =
+            || -> Result<bool> {
+                let Some(running) =
+                    rpc::instance_code(self.rpc, &self.config.network, &self.config.wallet)?
+                else {
+                    return Ok(false);
+                };
+                Ok(rpc::code_state(self.rpc, &self.config.network, &running)?
+                    == rpc::CodeState::Lapsed)
+            };
+        match lapsed() {
+            Ok(true) => rpc::CONTRACT_EXPIRED.into(),
+            Ok(false) => NO_RECOVERABLE_BALANCE.into(),
+            Err(error) => error.to_string(),
+        }
     }
     /// The balance of `token` that the wallet holds, read through the owner's simulation.
     fn balance_of(&self, s: &Snapshot, token: &str) -> Result<i128> {

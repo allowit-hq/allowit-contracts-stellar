@@ -1386,10 +1386,12 @@ macro_rules! policy_wallet {
             pub fn __constructor(env: soroban_sdk::Env, config: $crate::AllowitPolicyConfig) {
                 $crate::construct::<$policy>(&env, config).unwrap();
             }
-            /// Read the stored wallet.
+            /// Read the stored wallet. A committed read keeps the wallet live like every call; a
+            /// simulated read persists nothing.
             pub fn state(
                 env: soroban_sdk::Env,
             ) -> Result<$crate::AllowitState, $crate::AllowitWalletError> {
+                $crate::keep_live::<$policy>(&env);
                 $crate::state::<$policy>(&env)
             }
             /// Run one operation that the agent and the server signed, under the installed policy.

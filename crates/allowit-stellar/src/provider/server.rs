@@ -858,19 +858,28 @@ impl Provider {
         checked(native::validate_config(&c))?;
         Ok(c)
     }
-    /// Refuse a policy wallet whose instance or code lapsed (`CONTRACT_EXPIRED`), before the
-    /// server signs for it: the operation's last simulation may precede the lapse.
+    /// Before the server signs for a policy wallet, require its live instance to run the
+    /// installation's code, and that code to be live: a wallet whose instance or code lapsed is
+    /// `CONTRACT_EXPIRED`, and one whose owner installed other code, or that is gone, is refused.
+    /// The operation's last simulation may precede either.
     fn refuse_lapsed(&self, c: &WalletConfig) -> Result<()> {
         if c.route != WalletRoute::PolicyWallet {
             return Ok(());
         }
-        checked(rpc::instance_code(self.rpc(), &c.network, &c.wallet))?;
-        if checked(rpc::code_state(self.rpc(), &c.network, &c.module_digest))?
-            == rpc::CodeState::Lapsed
-        {
-            return Err(Error::config(rpc::CONTRACT_EXPIRED));
+        match checked(rpc::instance_code(self.rpc(), &c.network, &c.wallet))? {
+            Some(running) if running == c.module_digest => {}
+            Some(_) => {
+                return Err(Error::config(
+                    "The wallet runs other code than its installation names",
+                ));
+            }
+            None => return Err(Error::config("The wallet is not on the network")),
         }
-        Ok(())
+        match checked(rpc::code_state(self.rpc(), &c.network, &c.module_digest))? {
+            rpc::CodeState::Live => Ok(()),
+            rpc::CodeState::Lapsed => Err(Error::config(rpc::CONTRACT_EXPIRED)),
+            rpc::CodeState::Absent => Err(Error::config("The wallet's code is not on the network")),
+        }
     }
     fn fresh(&self, i: &Installation) -> Result<WalletConfig> {
         let c = self.config(i)?;
@@ -2406,8 +2415,8 @@ mod capability_tests {
     /// The server reads a lapse as the agent client does (`rpc::operation_lapsed`). Once a ledger
     /// closed at or after the signed time bound, the wallet runs the operation in no envelope, so
     /// the wallet's events read then hold every execution of it, in any envelope: none found, the
-    /// operation lapsed. Once the history no longer holds the preparation's ledger, the time bound
-    /// alone retires it. A read that fails proves nothing.
+    /// operation lapsed. Once the history no longer holds the preparation's ledger, nothing proves
+    /// a lapse: the operation stays open. A read that fails proves nothing.
     #[test]
     fn an_operation_lapses_once_its_time_bound_passed_and_no_execution_is_in_the_history() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
@@ -2502,10 +2511,13 @@ mod capability_tests {
                 .0
                 .is_err()
         );
-        // The history no longer holds the preparation's ledger: the time bound alone retires it.
-        let (lapsed, calls) = read("NOT_FOUND", p.expires_at, from + 1, true, false);
-        assert!(lapsed.unwrap());
-        assert_eq!(calls, ["getTransaction"]);
+        // The history no longer holds the preparation's ledger: an execution could be gone from
+        // it, so the time bound alone proves nothing, whether the operation executed or not.
+        for executed in [true, false] {
+            let (lapsed, calls) = read("NOT_FOUND", p.expires_at, from + 1, executed, false);
+            assert!(!lapsed.unwrap());
+            assert_eq!(calls, ["getTransaction"]);
+        }
         // A reply without its history proves nothing.
         assert!(!read("NOT_FOUND", p.expires_at, 0, false, false).0.unwrap());
     }
@@ -2522,11 +2534,13 @@ mod capability_tests {
         ))
         .unwrap();
         let p: PreparedOperation = serde_json::from_value(fixture["prepared"].clone()).unwrap();
-        /// The recorded network of the fixture; once `lapsed`, the wallet's instance lapsed.
+        /// The recorded network of the fixture; once `lapsed`, the wallet's instance lapsed, or,
+        /// with `running`, it runs that other code, which is live.
         struct Recorded {
             fixture: serde_json::Value,
             config: WalletConfig,
             lapsed: std::sync::atomic::AtomicBool,
+            running: std::sync::Mutex<Option<[u8; 32]>>,
         }
         impl rpc::Rpc for Recorded {
             fn call(
@@ -2562,16 +2576,24 @@ mod capability_tests {
                             durability: ContractDataDurability::Persistent,
                             val: ScVal::ContractInstance(ScContractInstance {
                                 executable: ContractExecutable::Wasm(Hash(
-                                    self.config.module_digest,
+                                    self.running
+                                        .lock()
+                                        .unwrap()
+                                        .unwrap_or(self.config.module_digest),
                                 )),
                                 storage: None,
                             }),
                         });
+                        let live = if self.running.lock().unwrap().is_some() {
+                            serde_json::json!(4_000_000)
+                        } else {
+                            serde_json::json!(0)
+                        };
                         serde_json::json!({
                             "latestLedger": recorded("getLatestLedger")["sequence"],
                             "entries": [{
                                 "xdr": instance.to_xdr_base64(Limits::none()).unwrap(),
-                                "liveUntilLedgerSeq": 0,
+                                "liveUntilLedgerSeq": live,
                             }],
                         })
                     }
@@ -2599,6 +2621,7 @@ mod capability_tests {
             fixture: fixture.clone(),
             config: p.config.clone(),
             lapsed: std::sync::atomic::AtomicBool::new(false),
+            running: std::sync::Mutex::new(None),
         });
         let provider = Provider::from_rpc("stellar:testnet", network.clone());
         let simulated = provider
@@ -2627,6 +2650,32 @@ mod capability_tests {
             )
             .unwrap_err();
         assert_eq!(refused.message, rpc::CONTRACT_EXPIRED);
+        // The owner installed other code after the preparation: the server signs nothing for it,
+        // whether the installation's code is live or not.
+        *network.running.lock().unwrap() = Some([0x42; 32]);
+        let refused = provider
+            .authorize_preparation(&installation, &simulated, &signer, None, 86_402)
+            .unwrap_err();
+        assert!(
+            refused.message.contains("other code"),
+            "{}",
+            refused.message
+        );
+        let refused = provider
+            .finalize(
+                &installation,
+                &simulated,
+                &signer,
+                None,
+                86_402,
+                Box::new(|_| Ok(())),
+            )
+            .unwrap_err();
+        assert!(
+            refused.message.contains("other code"),
+            "{}",
+            refused.message
+        );
         assert_eq!(signer.0.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
     #[test]

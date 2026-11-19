@@ -4142,6 +4142,26 @@ fn a_lapsed_wallet_takes_no_owner_step() {
     let version = owner.deployment_version().unwrap().0 + 1;
     let refused = owner.stop(DeploymentVersion(version)).unwrap_err();
     assert_eq!(refused.to_string(), rpc::CONTRACT_EXPIRED);
+    // A recovery of a wallet that holds nothing: a live wallet has nothing to return, a lapsed one
+    // is `contract_expired`, whether its instance or its code lapsed.
+    chain.0.lock().unwrap().wallet.as_mut().unwrap().balance = 0;
+    let recover = || {
+        OwnerAdmin {
+            rpc: &*chain,
+            config: &c,
+            now: NOW,
+        }
+        .recover_all()
+        .unwrap_err()
+        .to_string()
+    };
+    assert_eq!(recover(), allowit_stellar::admin::NO_RECOVERABLE_BALANCE);
+    chain.0.lock().unwrap().lapsed_instances = true;
+    assert_eq!(recover(), rpc::CONTRACT_EXPIRED);
+    chain.0.lock().unwrap().lapsed_instances = false;
+    chain.0.lock().unwrap().lapsed_code.insert(c.module_digest);
+    assert_eq!(recover(), rpc::CONTRACT_EXPIRED);
+    chain.0.lock().unwrap().lapsed_code.remove(&c.module_digest);
 }
 /// A transport that answers nothing: for the rail's naming of a problem, which reads no ledger.
 struct NoTransport;

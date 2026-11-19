@@ -977,10 +977,11 @@ fn owner_never_applied(reply: &Value, hash: &str, expires_at: u64, since: u64) -
 /// carries its authorization: no execution comes after that ledger. The wallet's events read
 /// then, from the preparation's ledger on, hold every execution of the operation, in any envelope,
 /// also one whose envelope no receipt of the operation adopts: an event found means that it
-/// executed. Once the history no longer holds the preparation's ledger, the signed time bound
-/// alone decides, so an operation that was never sent always ends. `false` before that ledger,
-/// when its prepared transaction succeeded, when the RPC does not show the closing time or its
-/// history, or when an execution is found; a read that fails is an error, never a lapse.
+/// executed. The time bound alone proves no lapse: once the history no longer holds the
+/// preparation's ledger, the operation stays open, and its owner can release it. `false` before
+/// that ledger, when its prepared transaction succeeded, when the RPC does not show the closing
+/// time or a history that holds the preparation, or when an execution is found; a read that fails
+/// is an error, never a lapse.
 pub fn operation_lapsed(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<bool> {
     if p.config.route != WalletRoute::PolicyWallet {
         return Ok(false);
@@ -995,12 +996,13 @@ pub fn operation_lapsed(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<bool> {
     if reply["status"].as_str() == Some("SUCCESS") || !closed.is_some_and(|t| t >= p.expires_at) {
         return Ok(false);
     }
-    // The history starts after the preparation: an execution in it could be gone. A reply
-    // without its history bounds proves nothing.
+    // The history starts after the preparation: an execution in it could be gone, so the time
+    // bound alone proves nothing. A reply without its history bounds proves nothing either.
     match number("oldestLedger") {
-        None | Some(0) => Ok(false),
-        Some(oldest) if oldest > u64::from(p.state.ledger) => Ok(true),
-        Some(_) => Ok(!executed(rpc, p)?),
+        Some(oldest) if oldest != 0 && oldest <= u64::from(p.state.ledger) => {
+            Ok(!executed(rpc, p)?)
+        }
+        _ => Ok(false),
     }
 }
 /// Whether the wallet's events from the ledger of `p`'s preparation on hold an execution of `p`:
