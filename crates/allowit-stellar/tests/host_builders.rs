@@ -384,6 +384,40 @@ fn observation_and_original_settlement_do_not_invent_missing_entries_or_receipts
     chain.entries.get_mut(&key).unwrap()["xdr"] = json!("broken");
     assert!(rpc::code_uploaded(&chain, NETWORK, &c.module_digest).is_err());
 }
+/// Code is live, lapsed (on the ledger past its lifetime, or served from the archive without a
+/// live-until ledger) or absent; a broken entry stays an error.
+#[test]
+fn code_state_tells_lapsed_code_from_absent_code() {
+    let c = config();
+    let mut chain = Chain::new(&c);
+    let code = xdr(&keys(&c)[1]).unwrap();
+    let state = |chain: &Chain| rpc::code_state(chain, NETWORK, &c.module_digest);
+    assert_eq!(state(&chain).unwrap(), rpc::CodeState::Live);
+    for lapsed in [json!(119), json!(0), Value::Null] {
+        chain.entries.get_mut(&code).unwrap()["liveUntilLedgerSeq"] = lapsed.clone();
+        assert_eq!(state(&chain).unwrap(), rpc::CodeState::Lapsed, "{lapsed}");
+        // The live-entry read keeps refusing lapsed code.
+        assert!(rpc::code_uploaded(&chain, NETWORK, &c.module_digest).is_err());
+    }
+    chain.entries.get_mut(&code).unwrap()["liveUntilLedgerSeq"] = json!("soon");
+    assert!(state(&chain).is_err());
+    chain.entries.get_mut(&code).unwrap()["liveUntilLedgerSeq"] = json!(120);
+    assert_eq!(state(&chain).unwrap(), rpc::CodeState::Live);
+    let moving = Advancing {
+        chain: &chain,
+        heads: 0.into(),
+    };
+    // Code whose last live ledger the closing head passed has lapsed.
+    assert_eq!(
+        rpc::code_state(&moving, NETWORK, &c.module_digest).unwrap(),
+        rpc::CodeState::Lapsed
+    );
+    chain.entries.get_mut(&code).unwrap()["xdr"] = json!("broken");
+    assert!(state(&chain).is_err());
+    chain.entries.remove(&code);
+    assert_eq!(state(&chain).unwrap(), rpc::CodeState::Absent);
+    assert!(rpc::code_state(&chain, NETWORK, &[0; 32]).is_err());
+}
 #[test]
 fn installation_preserves_policy_instance_salt_and_constructor_binding() {
     let c = config();

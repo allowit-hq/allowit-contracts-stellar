@@ -11,7 +11,8 @@ pub(crate) mod owner_observation;
 #[cfg(not(target_arch = "wasm32"))]
 use allowit_core::transport::rpc::{EnvelopeValidation, ErrorKind, RpcClient};
 pub use owner_actions::{
-    OwnerSettlement, code_uploaded, contract_exists, owner_settlement, vault_redeemable,
+    CodeState, OwnerSettlement, code_lifetime, code_state, code_uploaded, contract_exists,
+    instance_code, owner_settlement, vault_redeemable,
 };
 pub use owner_observation::{AssetBalance, WalletLifetime, asset_balance, wallet_lifetime};
 use serde_json::{Value, json};
@@ -355,12 +356,12 @@ pub fn prepare_with(
     }
     // The server's sending account is the source and pays the fee; the wallet repays its gas
     // to that same account.
-    state.source = get_account(rpc, &super::gas_repayment(request, terms)?.payee)?;
+    state.source = get_account(rpc, &super::gas_payee(request, terms)?)?;
     let ceiling = terms.expense.as_ref();
     let mut terms = priced_terms(rpc, c, request, terms, &state, now, expires_at)?;
     // The invocation that carries the priced expense is simulated on its own. A policy that
     // reads the gas can need more resources with it than with the provisional expense. Its
-    // bound then follows from its own resource fee, within the ceiling, at most
+    // bound then follows from its own resource fee, within the ceiling and the gas cap, at most
     // `REPRICE_ROUNDS` times. After that the bound decides, and `attach_simulation` refuses a
     // resource fee above it.
     let mut rounds = 0;
@@ -370,14 +371,16 @@ pub fn prepare_with(
         let repriced = match (ceiling, &terms.expense) {
             (Some(ceiling), Some(signed)) if rounds < REPRICE_ROUNDS => {
                 let resources: SorobanTransactionData = read(&encoded)?;
-                let bound = fee_bound(resources.resource_fee)?.min(ceiling.max_fee_stroops);
+                let bound = fee_bound(resources.resource_fee)?
+                    .min(ceiling.max_fee_stroops)
+                    .min(c.max_fee_stroops);
                 // The margin of the signed bound absorbs a small change. Only a declared fee
                 // above the signed bound prices the operation again, and only upward.
                 let declared = resources
                     .resource_fee
                     .saturating_add(i64::from(INCLUSION_FEE_STROOPS));
                 (declared > i64::from(signed.max_fee_stroops) && bound > signed.max_fee_stroops)
-                    .then(|| bounded(&terms, ceiling, bound))
+                    .then(|| bounded(&terms, ceiling, bound, i128::from(c.max_fee_stroops)))
             }
             _ => None,
         };
@@ -407,11 +410,17 @@ const REPRICE_ROUNDS: u8 = 2;
 /// The expense of `terms` at the fee bound `fee`: the default repayment follows the bound less
 /// the gas carry, and an explicit repayment keeps its gas. It always starts from the caller's
 /// `ceiling`, so a price taken again subtracts the carry once.
-fn bounded(terms: &ExecutionTerms, ceiling: &ExpenseBounds, fee: u32) -> Result<ExpenseBounds> {
+/// The repayment stays within the wallet's gas cap `gas_cap`.
+fn bounded(
+    terms: &ExecutionTerms,
+    ceiling: &ExpenseBounds,
+    fee: u32,
+    gas_cap: i128,
+) -> Result<ExpenseBounds> {
     if terms.gas.is_some() {
         ceiling.with_fee_bound_only(fee)
     } else {
-        ceiling.with_fee_bound(fee)?.with_gas_carry(terms.gas_carry)
+        ceiling.with_repayment(fee, terms.gas_carry, gas_cap)
     }
 }
 fn priced_terms(
@@ -423,13 +432,24 @@ fn priced_terms(
     now: u64,
     expires_at: u64,
 ) -> Result<ExecutionTerms> {
+    // An explicit repayment takes no carry, priced or not.
+    if terms.gas.is_some() {
+        terms.repaid_stroops()?;
+    }
     let Some(ceiling) = terms.expense.as_ref().filter(|e| e.max_fee_stroops > 0) else {
+        // An unpriced operation repays nothing.
         return Ok(terms.clone());
     };
+    // The wallet's gas cap is the installed fee ceiling, which its creation set. The fee bound
+    // stays within the quote and within the gas cap: the wallet repays no more than its gas cap, and the
+    // sending account declares no fee above it.
+    let gas_cap = i128::from(c.max_fee_stroops);
+    let limit = ceiling.max_fee_stroops.min(c.max_fee_stroops);
     let with_bound = |fee: u32| -> Result<ExecutionTerms> {
+        let expense = bounded(terms, ceiling, fee.min(limit), gas_cap)?;
         Ok(ExecutionTerms {
             args: terms.args.clone(),
-            expense: Some(bounded(terms, ceiling, fee.min(ceiling.max_fee_stroops))?),
+            expense: Some(expense),
             gas: terms.gas.clone(),
             sender: terms.sender.clone(),
             gas_carry: terms.gas_carry,
@@ -443,14 +463,69 @@ fn priced_terms(
     };
     let simulated = match resource_fee(INCLUSION_FEE_STROOPS) {
         Ok(fee) => fee,
-        Err(lowest) => resource_fee(ceiling.max_fee_stroops).map_err(|_| lowest)?,
+        Err(lowest) => resource_fee(limit).map_err(|_| lowest)?,
     };
     with_bound(fee_bound(simulated)?)
+}
+/// The refusal of a step on a wallet whose instance or code lapsed: nothing restores it (Core's
+/// `CONTRACT_EXPIRED`).
+pub const CONTRACT_EXPIRED: &str =
+    "The wallet's instance or code lapsed on the network: nothing restores it";
+/// Refuse the simulation `value` of a step on the wallet `wallet`, whose code is `code`, when it
+/// would restore that wallet's instance or code, in place or in a separate restoration first
+/// (`CONTRACT_EXPIRED`). A creation names the code of the wallet that it creates and no wallet.
+/// An owner step names no code: it calls the wallet alone, whatever code the wallet runs or an
+/// upgrade installs, so it refuses any code entry. Other entries, such as `t` or another
+/// contract's instance, are left to `restoring_in_place`.
+pub(crate) fn refuse_expired(
+    value: &Value,
+    wallet: Option<&str>,
+    code: Option<&[u8; 32]>,
+) -> Result<()> {
+    let instance = wallet
+        .map(|wallet| {
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(LedgerKey::ContractData(
+                LedgerKeyContractData {
+                    contract: address(wallet)?,
+                    key: ScVal::LedgerKeyContractInstance,
+                    durability: ContractDataDurability::Persistent,
+                },
+            ))
+        })
+        .transpose()
+        .map_err(|e| e.to_string())?;
+    let expired = |key: &LedgerKey| match key {
+        LedgerKey::ContractCode(entry) => code.is_none_or(|code| entry.hash == Hash(*code)),
+        key => Some(key) == instance.as_ref(),
+    };
+    let data = |value: &Value| -> Result<Option<SorobanTransactionData>> {
+        value.as_str().map(read).transpose()
+    };
+    if let Some(preamble) = value.get("restorePreamble").filter(|v| !v.is_null())
+        && let Some(restored) = data(&preamble["transactionData"])?
+        && restored.resources.footprint.read_write.iter().any(expired)
+    {
+        return Err(CONTRACT_EXPIRED.into());
+    }
+    if let Some(data) = data(&value["transactionData"])?
+        && let SorobanTransactionDataExt::V1(ext) = &data.ext
+    {
+        let written = data.resources.footprint.read_write.as_slice();
+        if ext
+            .archived_soroban_entries
+            .iter()
+            .any(|index| written.get(*index as usize).is_some_and(expired))
+        {
+            return Err(CONTRACT_EXPIRED.into());
+        }
+    }
+    Ok(())
 }
 /// Refuse a simulation that needs a separate restoration first, and accept one whose archived
 /// entries the transaction restores itself: each named by its index in the read-write
 /// footprint. The transaction's fee pays for that restoration. A policy wallet operation and an
-/// owner transaction restore a lapsed entry, such as `t` or the instance, in this way.
+/// owner transaction restore a lapsed data entry, such as `t`, in this way; a wallet whose
+/// instance or code lapsed is refused first (`refuse_expired`).
 pub(crate) fn restoring_in_place(value: &Value) -> Result<()> {
     if value
         .get("restorePreamble")
@@ -528,6 +603,7 @@ pub fn seal(
     if v.get("error").is_some_and(|value| !value.is_null()) {
         return Err("policy wallet simulation rejected the authorized operation".into());
     }
+    refuse_expired(&v, Some(&p.config.wallet), Some(&p.config.module_digest))?;
     restoring_in_place(&v)?;
     if readonly_result(&v)? != ScVal::Void {
         return Err("Native simulation returned a value from execute".into());
@@ -617,6 +693,7 @@ fn simulated_resources(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<String> {
     if v.get("error").is_some_and(|value| !value.is_null()) {
         return Err("policy wallet simulation rejected the exact policy operation".into());
     }
+    refuse_expired(&v, Some(&p.config.wallet), Some(&p.config.module_digest))?;
     restoring_in_place(&v)?;
     if readonly_result(&v)? != ScVal::Void {
         return Err("Native simulation returned a value from execute".into());
@@ -853,6 +930,29 @@ pub fn owner_transaction_lapsed(
     let reply = rpc.call("getTransaction", json!({ "hash": hex(hash) }))?;
     Ok(owner_never_applied(&reply, &hex(hash), expires_at, since))
 }
+/// The network's minimum lifetime of a persistent entry, in ledgers: the lifetime of code that
+/// an upload creates, and the lifetime to which a renewal extends shared code.
+pub fn minimum_persistent_lifetime(rpc: &dyn Rpc) -> Result<u32> {
+    let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+        config_setting_id: ConfigSettingId::StateArchival,
+    });
+    let value = rpc.call("getLedgerEntries", json!({"keys":[xdr(&key)?]}))?;
+    let [entry] = value["entries"]
+        .as_array()
+        .map(Vec::as_slice)
+        .ok_or("Missing state archival settings")?
+    else {
+        return Err("Unexpected state archival settings".into());
+    };
+    let data: LedgerEntryData = read(entry["xdr"].as_str().ok_or("Missing settings XDR")?)?;
+    let LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(settings)) = data else {
+        return Err("Unexpected state archival settings".into());
+    };
+    if settings.min_persistent_ttl == 0 {
+        return Err("The network names no persistent lifetime".into());
+    }
+    Ok(settings.min_persistent_ttl)
+}
 /// Whether a `getTransaction` reply proves that the transaction with this hash never applied and
 /// can no longer apply: see [`owner_transaction_lapsed`].
 fn owner_never_applied(reply: &Value, hash: &str, expires_at: u64, since: u64) -> bool {
@@ -871,68 +971,88 @@ fn owner_never_applied(reply: &Value, hash: &str, expires_at: u64, since: u64) -
         && (reply["txHash"].is_null() || reply["txHash"] == hash)
         && number("latestLedgerCloseTime").is_some_and(|closed| closed > expires_at)
 }
-/// Whether the policy wallet operation `p` lapsed without executing. Every preparation of the
-/// operation carries the same nonce in the wallet's authorization. When the ledger runs one, the
-/// host keeps that nonce in a temporary entry of the wallet, and the entry lives at least the
-/// network's minimum temporary lifetime from the ledger that ran it, which is no earlier than
-/// `WALLET_AUTH_LEDGERS` before the authorization's expiration ledger. The operation lapsed when
-/// a ledger closed at or after its `expires_at`, the ledger is past that expiration ledger (no
-/// submission of this authorization can run), and inside the lifetime that a spent nonce is sure
-/// to have, the wallet holds no such nonce. `false` means not proven: before the expiration
-/// ledger, after that lifetime, or when the RPC does not show it.
+/// Whether the policy wallet operation `p` lapsed: it can no longer execute, and the network's
+/// history holds no execution of it. A ledger closed at or after its signed `expires_at`, and the
+/// wallet refuses an execution whose expiry is not after the ledger's time, in any envelope that
+/// carries its authorization: no execution comes after that ledger. The wallet's events read
+/// then, from the preparation's ledger on, hold every execution of the operation, in any envelope,
+/// also one whose envelope no receipt of the operation adopts: an event found means that it
+/// executed. The time bound alone proves no lapse: once the history no longer holds the
+/// preparation's ledger, the operation stays open. `false` before
+/// that ledger, when its prepared transaction succeeded, when the RPC does not show the closing
+/// time or a history that holds the preparation, when an execution is found, or when the scan of
+/// the events does not reach the ledger that showed the expiry; a read that fails
+/// is an error, never a lapse.
 pub fn operation_lapsed(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<bool> {
     if p.config.route != WalletRoute::PolicyWallet {
         return Ok(false);
     }
     let reply = rpc.call("getTransaction", json!({"hash":hex(&p.transaction_hash)}))?;
-    let closed = reply["latestLedgerCloseTime"]
-        .as_u64()
-        .or_else(|| reply["latestLedgerCloseTime"].as_str()?.parse().ok());
-    if reply["status"].as_str() == Some("SUCCESS") || closed.is_none_or(|t| t < p.expires_at) {
+    let number = |key: &str| {
+        reply[key]
+            .as_u64()
+            .or_else(|| reply[key].as_str()?.parse().ok())
+    };
+    let closed = number("latestLedgerCloseTime");
+    if reply["status"].as_str() == Some("SUCCESS") || !closed.is_some_and(|t| t >= p.expires_at) {
         return Ok(false);
     }
-    let entry = authorization::wallet_authorization(p)?;
-    let SorobanCredentials::Address(credentials) = &entry.credentials else {
-        return Ok(false);
-    };
-    let expiration = u64::from(credentials.signature_expiration_ledger);
-    let nonce = LedgerKey::ContractData(LedgerKeyContractData {
-        contract: address(&p.config.wallet)?,
-        key: ScVal::LedgerKeyNonce(ScNonceKey {
-            nonce: credentials.nonce,
-        }),
-        durability: ContractDataDurability::Temporary,
-    });
-    let archival = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-        config_setting_id: ConfigSettingId::StateArchival,
-    });
-    let entries = rpc.call(
-        "getLedgerEntries",
-        json!({"keys":[xdr(&nonce)?, xdr(&archival)?]}),
-    )?;
-    let Some(observed) = entries["latestLedger"].as_u64() else {
-        return Ok(false);
-    };
-    let mut lifetime = None;
-    for item in entries["entries"]
-        .as_array()
-        .ok_or("Missing ledger entries")?
-    {
-        match read::<LedgerEntryData>(item["xdr"].as_str().ok_or("Missing entry XDR")?)? {
-            LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(settings)) => {
-                lifetime = Some(u64::from(settings.min_temporary_ttl));
-            }
-            // The wallet's nonce entry: the ledger ran the operation.
-            _ => return Ok(false),
+    // The history starts after the preparation: an execution in it could be gone, so the time
+    // bound alone proves nothing. A reply without its history bounds proves nothing either.
+    match (number("oldestLedger"), number("latestLedger")) {
+        (Some(oldest), Some(latest)) if oldest != 0 && oldest <= u64::from(p.state.ledger) => {
+            Ok(executed(rpc, p, latest)? == Some(false))
         }
+        _ => Ok(false),
     }
-    let Some(lifetime) = lifetime else {
-        return Ok(false);
-    };
-    // A nonce spent at any ledger that this authorization could run in is live through here.
-    let live_through =
-        (expiration + lifetime).saturating_sub(u64::from(authorization::WALLET_AUTH_LEDGERS) + 1);
-    Ok(observed > expiration && observed <= live_through)
+}
+/// The most pages of events that one lapse read follows. An RPC scans a bounded range of ledgers
+/// for each page (Stellar RPC: 10,000), and its history holds about 120,960 (seven days).
+const MAX_EVENT_PAGES: usize = 32;
+/// Whether the wallet's events from the ledger of `p`'s preparation on hold an execution of `p`:
+/// its `allowit` event of the operation id, in any envelope. Each answer scans a bounded range of
+/// ledgers and names where its scan ended (`cursor`); the read follows the cursor until it passed
+/// the ledger `through`, which showed the expiry. `None` when no event is found and the scan does
+/// not reach that ledger, or an answer names no cursor: an execution in the ledgers that it did
+/// not scan could be missing.
+fn executed(rpc: &dyn Rpc, p: &PreparedOperation, through: u64) -> Result<Option<bool>> {
+    let topics = [
+        xdr(&value_symbol("allowit")?)?,
+        xdr(&value_bytes(&p.request.operation.nonce)?)?,
+    ];
+    let filters =
+        json!([{"type": "contract", "contractIds": [p.config.wallet], "topics": [topics]}]);
+    let mut request = json!({
+        "startLedger": p.state.ledger,
+        "filters": filters,
+        "pagination": {"limit": 1},
+    });
+    for _ in 0..MAX_EVENT_PAGES {
+        let reply = rpc.call("getEvents", request)?;
+        if !reply["events"]
+            .as_array()
+            .ok_or("Missing ledger events")?
+            .is_empty()
+        {
+            return Ok(Some(true));
+        }
+        let Some((cursor, scanned)) = reply["cursor"]
+            .as_str()
+            .and_then(|cursor| Some((cursor, cursor_ledger(cursor)?)))
+        else {
+            return Ok(None);
+        };
+        if scanned >= through {
+            return Ok(Some(false));
+        }
+        request = json!({"filters": filters, "pagination": {"cursor": cursor, "limit": 1}});
+    }
+    Ok(None)
+}
+/// The ledger of an event cursor: the ledger of its TOID, the number before the dash.
+fn cursor_ledger(cursor: &str) -> Option<u64> {
+    let toid: u64 = cursor.split_once('-')?.0.parse().ok()?;
+    Some(toid >> 32)
 }
 /// The settlement of the policy wallet operation `p`, found by the wallet's `allowit` event of
 /// its operation id. The settled transaction is the sealed one, so its hash is not the prepared
@@ -1255,6 +1375,24 @@ pub fn repaid_gas_stroops(receipt: &VerifiedReceipt) -> Result<u128> {
         Some(value) => u128::try_from(wide(value)?).map_err(|_| "A negative gas repayment".into()),
         None => Err("The execute request has no gas repayment".into()),
     }
+}
+/// Read the verified terminal receipt of the transaction `envelope`, whose hash is
+/// `transaction_hash`, as the ledger holds it: the reply's own envelope is `envelope`, before any
+/// fee bump is read. The same transaction in another envelope is no receipt of this one. Absence
+/// remains unknown.
+pub fn own_receipt_by_hash(
+    rpc: &dyn Rpc,
+    network: &str,
+    transaction_hash: &[u8; 32],
+    envelope: &str,
+) -> Result<Option<VerifiedReceipt>> {
+    let v = rpc.call("getTransaction", json!({"hash":hex(transaction_hash)}))?;
+    if matches!(v["status"].as_str(), Some("SUCCESS" | "FAILED"))
+        && v["envelopeXdr"].as_str() != Some(envelope)
+    {
+        return Err("The ledger holds the transaction in another envelope".into());
+    }
+    receipt_from_response(&v, network, transaction_hash)
 }
 /// Read a verified terminal receipt. Absence remains unknown and does not release reservations.
 pub fn receipt_by_hash(
@@ -1710,6 +1848,15 @@ fn current_wallet_state(
     verify_binding(c, &config)?;
     if require_customer_quorum {
         verify_configuration(c, &config)?;
+        // An operation repays gas under the wallet's current gas cap, which the owner can change
+        // on the ledger. An installation with another gas cap would price repayments that the
+        // wallet refuses, so it is verified again first. Owner actions do not depend on it.
+        if config.gas_cap != i128::from(c.max_fee_stroops) {
+            return Err(
+                "The wallet's gas cap differs from this installation. Verify the installation first."
+                    .into(),
+            );
+        }
     }
     let figures = figures(rpc, c, ledger)?;
     // A wallet that keeps every figure needs no account of the server's.

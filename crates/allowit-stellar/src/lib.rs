@@ -380,9 +380,6 @@ impl ExpenseBounds {
             day: now / allowit_core::DAY,
         })
     }
-    /// These bounds with the fee bound lowered to `fee_stroops`. Gas falls pro rata and rounds
-    /// up, so it never counts less than the gas rate of these bounds prices `fee_stroops`; for
-    /// XLM it is `fee_stroops` itself. Spent units fall by the same gas.
     /// The bound of a transaction fee for terms whose gas repayment the server set itself, such
     /// as the gas that it repays after a carry: only the fee bound moves, and the gas that the
     /// wallet repays and counts stays.
@@ -432,6 +429,43 @@ impl ExpenseBounds {
             ..self.clone()
         })
     }
+    /// These bounds, the ceiling of the server's quote, at the transaction fee bound `fee_stroops`,
+    /// when the wallet repays that bound less `carry`, at least zero. The repayment converts once,
+    /// at the rate of these bounds, and rounds up, so an XLM wallet counts exactly what it repays
+    /// and another asset counts its units at the quoted rate; spent units change by the same gas.
+    /// Without a carry this is [`Self::with_fee_bound`]. A repayment above the gas cap `gas_cap` is
+    /// refused: the wallet repays at most its gas cap.
+    pub fn with_repayment(&self, fee_stroops: u32, carry: u128, gas_cap: i128) -> Result<Self> {
+        if fee_stroops == 0 || fee_stroops > self.max_fee_stroops || self.gas_units < 0 {
+            return Err("A fee bound lowers a positive fee ceiling".into());
+        }
+        let bound = i128::from(fee_stroops);
+        let base = bound - i128::try_from(carry).unwrap_or(i128::MAX).min(bound);
+        if base > gas_cap {
+            return Err("The repayment exceeds the wallet's gas cap".into());
+        }
+        let repaid = base;
+        let ceiling = i128::from(self.max_fee_stroops);
+        let gas_units = self
+            .gas_units
+            .checked_mul(repaid)
+            .and_then(|units| units.checked_add(ceiling - 1))
+            .map(|units| units / ceiling)
+            .ok_or("Expense overflow")?;
+        Ok(Self {
+            gas_units,
+            spent_units: self
+                .spent_units
+                .checked_sub(self.gas_units)
+                .and_then(|principal| principal.checked_add(gas_units))
+                .ok_or("Expense overflow")?,
+            max_fee_stroops: fee_stroops,
+            ..self.clone()
+        })
+    }
+    /// These bounds with the fee bound lowered to `fee_stroops`. Gas falls pro rata and rounds
+    /// up, so it never counts less than the gas rate of these bounds prices `fee_stroops`; for
+    /// XLM it is `fee_stroops` itself. Spent units fall by the same gas.
     pub fn with_fee_bound(&self, fee_stroops: u32) -> Result<Self> {
         if fee_stroops == 0 || fee_stroops > self.max_fee_stroops || self.gas_units < 0 {
             return Err("A fee bound lowers a positive fee ceiling".into());
@@ -490,8 +524,8 @@ impl ExecutionTerms {
             && self.gas_carry == 0
     }
     /// The stroops that a policy wallet repays under these terms: the explicit repayment, else
-    /// the fee bound of the expense less the gas carry, at least zero; nothing when unpriced.
-    /// An explicit repayment takes no carry.
+    /// the fee bound of the expense less the gas carry, at least zero; nothing when unpriced. An
+    /// explicit repayment takes no carry.
     pub fn repaid_stroops(&self) -> Result<i128> {
         match &self.gas {
             Some(_) if self.gas_carry != 0 => {
@@ -1632,8 +1666,14 @@ fn verify_wallet_portable(
     {
         return Err("Installed policy wallet binding differs from the installation".into());
     }
+    // As the wallet checks (`ExcessGas`): it repays at most its gas cap, the installed fee
+    // ceiling, whatever the terms add to the fee bound.
+    let repaid = terms.repaid_stroops()?;
+    if repaid > i128::from(c.max_fee_stroops) {
+        return Err("The gas repayment exceeds the wallet's gas cap".into());
+    }
     if let Some(expense) = &terms.expense {
-        validate_expense(c, expense, terms.repaid_stroops()?, operation, state, now)?;
+        validate_expense(c, expense, repaid, operation, state, now)?;
     }
     let shape = policy::source_shape(&c.policy_source)?;
     let request = policy::RuleRequest::new(
@@ -1730,6 +1770,22 @@ fn legacy_wallet_request(
 /// server's sending account, which `terms` or the request's fee payer names; when both name one,
 /// they agree. An unpriced request repays nothing.
 pub(crate) fn gas_repayment(r: &ExecutionRequest, terms: &ExecutionTerms) -> Result<GasRepayment> {
+    if let Some(gas) = &terms.gas {
+        terms.repaid_stroops()?;
+        named_sender(r, terms)?;
+        return Ok(gas.clone());
+    }
+    let payee = named_sender(r, terms)?
+        .ok_or("A policy wallet operation needs the server's sending account as its gas payee")?;
+    Ok(GasRepayment {
+        stroops: terms.repaid_stroops()?,
+        payee,
+    })
+}
+/// The one sending account that a request and its terms name: the payer of the request's fee
+/// bound, the terms' sending account and the payee of an explicit repayment, when they name one.
+/// It does not depend on how much the wallet repays.
+fn named_sender(r: &ExecutionRequest, terms: &ExecutionTerms) -> Result<Option<String>> {
     let payer = match &r.fee_bounds {
         Some(fees) => Some(workflow_address(
             &fees.first().ok_or("Native fee bound required")?.payer,
@@ -1750,21 +1806,14 @@ pub(crate) fn gas_repayment(r: &ExecutionRequest, terms: &ExecutionTerms) -> Res
         }
         sender = Some(account);
     }
-    let stroops = terms.repaid_stroops()?;
-    if let Some(gas) = &terms.gas {
-        return Ok(gas.clone());
-    }
-    Ok(GasRepayment {
-        stroops,
-        payee: sender.ok_or(
-            "A policy wallet operation needs the server's sending account as its gas payee",
-        )?,
-    })
+    Ok(sender)
 }
 /// The sending account that a policy wallet operation names: the payee of its gas repayment and
 /// the fee payer of its request.
 pub fn gas_payee(r: &ExecutionRequest, terms: &ExecutionTerms) -> Result<String> {
-    Ok(gas_repayment(r, terms)?.payee)
+    named_sender(r, terms)?.ok_or_else(|| {
+        "A policy wallet operation needs the server's sending account as its gas payee".into()
+    })
 }
 /// The layout 5 `AllowitExecutionRequest` of one operation: its id, the wallet's deployment
 /// version, the expiry, the typed native operation, the expense, the gas repayment and the

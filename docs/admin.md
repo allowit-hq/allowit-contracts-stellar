@@ -193,7 +193,9 @@ Use `read --contract POLICY_WALLET_ADDRESS --source "$OWNER" --method state` to 
 wallet: its layout, owner, agent and server keys, asset, deployment version, pause, source hash,
 gas cap, rules, params, the figures that its checks keep, and the figures. Archived data requires
 native restoration and is never reinitialized; the owner's calls restore a lapsed `t` in the same
-transaction. The SDK rejects unavailable or ambiguous state observations before new signing. Owner
+transaction. Each call keeps the wallet's instance live, and a Custom wallet's own code too. The
+server refuses a step on a wallet whose instance or code lapsed (`contract_expired`) and restores
+nothing. The SDK rejects unavailable or ambiguous state observations before new signing. Owner
 pause, deployment and recovery do not depend on shared engine availability.
 
 Wallets of an earlier layout (`contract_version` 1 to 4) cannot execute under layout 5, and their

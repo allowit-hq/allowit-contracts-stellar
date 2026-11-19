@@ -88,7 +88,13 @@ exactly the figures of its rules. A word in a trailing comment or a string liter
 
 `t` is created by the constructor and paid for 2,073,600 ledgers (the Mainnet minimum lifetime of a
 persistent entry, about 120 days). Nothing extends it; after it lapses, the next operation restores
-it with its values. `d` opens at the first operation after the last window ended and holds its own
+it with its values. The instance lives as long from its creation, and each call keeps it live: once
+it has at most `TOTAL_LEDGERS - RENEWAL_LEDGERS` ledgers left (`RENEWAL_LEDGERS` is 720, about one
+hour), the call renews it to `TOTAL_LEDGERS - 1`, so most calls renew nothing. A Custom wallet's code
+is built from its policy and is its own: its creation renews the code to the same lifetime, and each
+call keeps it live with the instance. The code of a Simple or Standard wallet is shared by every
+wallet of its kind, and Allowit keeps it live. The rent is part of the call's network fee, which the
+wallet repays as gas within its gas cap. Nothing restores a wallet whose instance or code lapsed. `d` opens at the first operation after the last window ended and holds its own
 end ledger, 17,279 ledgers later (the Mainnet minimum lifetime of a temporary entry, about one
 day). The daily figures of the policy are the figures of that window, not of a UTC day. A window
 whose end ledger has passed reads as zero, even if someone paid to keep the entry alive.

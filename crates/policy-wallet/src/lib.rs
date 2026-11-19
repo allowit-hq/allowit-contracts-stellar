@@ -45,6 +45,10 @@ pub const DAY_LEDGERS: u32 = 17_280;
 /// Ledgers that `t` and the instance live from their creation: the Mainnet minimum lifetime of a
 /// persistent entry, about 120 days.
 pub const TOTAL_LEDGERS: u32 = 2_073_600;
+/// Ledgers between two renewals of a wallet's lifetime, about one hour. A call renews the
+/// instance once it has at most `TOTAL_LEDGERS - RENEWAL_LEDGERS` ledgers left, so most calls
+/// renew nothing, and each renewal pays the rent of about one hour. See [`keep_live`].
+pub const RENEWAL_LEDGERS: u32 = 720;
 
 /// Instance key of the packed configuration.
 const CONFIG: Symbol = symbol_short!("c");
@@ -214,6 +218,9 @@ pub trait AllowitPolicy {
     /// The state entries that a compiled source reads and writes, from its build. The standard
     /// tiers keep none.
     const STATE: &'static [AllowitStateKey] = &[];
+    /// The wallet's code is its own, built from its policy, and the wallet keeps it live. The code
+    /// of a fixed tier is shared by every wallet of its kind, and Allowit keeps it live.
+    const OWNS_CODE: bool = false;
     /// A bespoke implementation binds the owner's source hash. Fixed tiers take the owner's.
     fn source_digest(_env: &Env) -> Option<BytesN<32>> {
         None
@@ -801,7 +808,7 @@ fn validated<P: AllowitPolicy>(
 }
 
 /// Initialize custody from an owner-signed configuration. The instance and `t` live
-/// `TOTAL_LEDGERS`, paid by this transaction.
+/// `TOTAL_LEDGERS`, and so does the code of a wallet that owns its code, paid by this transaction.
 pub fn construct<P: AllowitPolicy>(
     env: &Env,
     config: AllowitPolicyConfig,
@@ -835,12 +842,27 @@ pub fn construct<P: AllowitPolicy>(
         write_total(env, kept, &Figures::default(), false)?;
     }
     create_policy_state::<P>(env);
-    env.deployer().extend_ttl_for_contract_instance(
-        env.current_contract_address(),
-        TOTAL_LEDGERS - 1,
-        TOTAL_LEDGERS - 1,
-    );
+    renew::<P>(env, TOTAL_LEDGERS - 1);
     Ok(())
+}
+
+/// Keep the wallet live on each call: once the instance has at most `TOTAL_LEDGERS -
+/// RENEWAL_LEDGERS` ledgers left, it lives `TOTAL_LEDGERS - 1` ledgers again, and so does the code
+/// of a wallet that owns its code (`AllowitPolicy::OWNS_CODE`). The rent is part of the call's
+/// network fee, which the wallet repays as gas within its gas cap. A call that fails renews nothing.
+/// No call restores a wallet whose instance or code lapsed: a lapsed entry cannot be renewed.
+pub fn keep_live<P: AllowitPolicy>(env: &Env) {
+    renew::<P>(env, TOTAL_LEDGERS - RENEWAL_LEDGERS);
+}
+/// Renew the instance, and the code that the wallet owns, to `TOTAL_LEDGERS - 1` ledgers once at
+/// most `threshold` are left.
+fn renew<P: AllowitPolicy>(env: &Env, threshold: u32) {
+    let (deployer, wallet) = (env.deployer(), env.current_contract_address());
+    if P::OWNS_CODE {
+        deployer.extend_ttl(wallet, threshold, TOTAL_LEDGERS - 1);
+    } else {
+        deployer.extend_ttl_for_contract_instance(wallet, threshold, TOTAL_LEDGERS - 1);
+    }
 }
 
 /// Read the stored wallet.
@@ -1208,6 +1230,15 @@ pub fn deploy_policy<P: AllowitPolicy>(
         env.deployer()
             .update_current_contract(soroban_sdk::ContractExecutable::Wasm(hash));
     }
+    if upgrade {
+        // The owner pays to keep the code that the upgrade installs live, whatever its tier:
+        // the instance and that code live `TOTAL_LEDGERS - 1` ledgers.
+        env.deployer().extend_ttl(
+            env.current_contract_address(),
+            TOTAL_LEDGERS - 1,
+            TOTAL_LEDGERS - 1,
+        );
+    }
     Ok(())
 }
 /// Validation of a packet that installs new code: the new code checks its own rules on its next call.
@@ -1355,10 +1386,12 @@ macro_rules! policy_wallet {
             pub fn __constructor(env: soroban_sdk::Env, config: $crate::AllowitPolicyConfig) {
                 $crate::construct::<$policy>(&env, config).unwrap();
             }
-            /// Read the stored wallet.
+            /// Read the stored wallet. A committed read keeps the wallet live like every call; a
+            /// simulated read persists nothing.
             pub fn state(
                 env: soroban_sdk::Env,
             ) -> Result<$crate::AllowitState, $crate::AllowitWalletError> {
+                $crate::keep_live::<$policy>(&env);
                 $crate::state::<$policy>(&env)
             }
             /// Run one operation that the agent and the server signed, under the installed policy.
@@ -1366,6 +1399,7 @@ macro_rules! policy_wallet {
                 env: soroban_sdk::Env,
                 execution: allowit_wallet_protocol::AllowitExecutionRequest,
             ) -> Result<(), $crate::AllowitWalletError> {
+                $crate::keep_live::<$policy>(&env);
                 $crate::execute::<$policy>(&env, execution)
             }
             /// Apply a complete owner update at the next deployment version.
@@ -1373,7 +1407,10 @@ macro_rules! policy_wallet {
                 env: soroban_sdk::Env,
                 update: $crate::AllowitPolicyUpdate,
             ) -> Result<(), $crate::AllowitWalletError> {
-                $crate::deploy_policy::<$policy>(&env, update)
+                $crate::deploy_policy::<$policy>(&env, update)?;
+                // After an upgrade the wallet runs its new code: the renewal keeps that code live.
+                $crate::keep_live::<$policy>(&env);
+                Ok(())
             }
             /// Pause or resume the agent path at the next deployment version.
             pub fn set_pause(
@@ -1381,6 +1418,7 @@ macro_rules! policy_wallet {
                 paused: bool,
                 deployment_version: u32,
             ) -> Result<(), $crate::AllowitWalletError> {
+                $crate::keep_live::<$policy>(&env);
                 $crate::set_pause(&env, paused, deployment_version)
             }
             /// Pause and return the asset and XLM to the owner.
@@ -1388,6 +1426,7 @@ macro_rules! policy_wallet {
                 env: soroban_sdk::Env,
                 deployment_version: u32,
             ) -> Result<(), $crate::AllowitWalletError> {
+                $crate::keep_live::<$policy>(&env);
                 $crate::stop(&env, deployment_version)
             }
             /// Owner transfer of any token the wallet holds.
@@ -1397,6 +1436,7 @@ macro_rules! policy_wallet {
                 recipient: soroban_sdk::Address,
                 amount: i128,
             ) -> Result<(), $crate::AllowitWalletError> {
+                $crate::keep_live::<$policy>(&env);
                 $crate::recover(&env, token, recipient, amount)
             }
             /// Owner-signed passthrough call with explicit nested authorization.
@@ -1407,6 +1447,7 @@ macro_rules! policy_wallet {
                 args: soroban_sdk::Vec<soroban_sdk::Val>,
                 auth: soroban_sdk::Vec<soroban_sdk::auth::InvokerContractAuthEntry>,
             ) -> Result<soroban_sdk::Val, $crate::AllowitWalletError> {
+                $crate::keep_live::<$policy>(&env);
                 $crate::invoke(&env, contract, function, args, auth)
             }
         }

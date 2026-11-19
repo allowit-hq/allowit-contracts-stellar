@@ -1621,6 +1621,11 @@ impl rpc::Rpc for AdminRpc {
             {
                 return self.base.call(method, params);
             }
+            if matches!(key, LedgerKey::ContractCode(_)) {
+                // The wallet's code is not on the model network: an owner step's liveness read
+                // finds a live instance and no lapsed code.
+                return Ok(json!({"latestLedger":120,"entries":[]}));
+            }
             if matches!(key, LedgerKey::Account(_)) {
                 // Trusted delegated discovery reads the agent; owner administration reads the
                 // current owner and a new owner of a handoff.
@@ -1685,6 +1690,9 @@ impl rpc::Rpc for AdminRpc {
             storage[0].val = ScVal::Bytes(bytes.try_into().unwrap());
             instance.storage = Some(storage.try_into().unwrap());
             response["entries"][0]["xdr"] = json!(entry.to_xdr_base64(Limits::none()).unwrap());
+            // The instance is live: the ledger of the reply, and the instance's live-until ledger.
+            response["latestLedger"] = json!(120);
+            response["entries"][0]["liveUntilLedgerSeq"] = json!(100_000);
             return Ok(response);
         }
         if method == "simulateTransaction" {

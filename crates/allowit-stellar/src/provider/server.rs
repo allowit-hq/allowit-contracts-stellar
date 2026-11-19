@@ -248,6 +248,15 @@ pub fn info(p: &Packet, k: Kind) -> Result<PacketInfo> {
             Ok(info_of(&value, value.transaction_hash))
         }
         Kind::Signed => {
+            // A code transaction's identity is its transaction hash.
+            if let Some(code) = signed_code(p)? {
+                return Ok(PacketInfo {
+                    operation_id: code.code.transaction_hash,
+                    transaction_hash: code.code.transaction_hash,
+                    wallet: code.code.source,
+                    expires_at: code.code.expires_at,
+                });
+            }
             let s: SignedOperation = decode_packet(p)?;
             Ok(info_of(&s.prepared, s.transaction_hash))
         }
@@ -267,12 +276,15 @@ fn owner_payload(p: &OwnerSignedData) -> Result<&str> {
 pub fn restore(k: Kind, document: Box<RawValue>) -> Result<Packet> {
     let network = match k {
         Kind::Prepared => decode::<PreparedOperation>(&document)?.config.network,
-        Kind::Signed => {
-            decode::<SignedOperation>(&document)?
-                .prepared
-                .config
-                .network
-        }
+        Kind::Signed => match decode::<SignedCode>(&document) {
+            Ok(code) => code.code.network,
+            Err(_) => {
+                decode::<SignedOperation>(&document)?
+                    .prepared
+                    .config
+                    .network
+            }
+        },
         Kind::Owner => decode::<native::owner_intent::OwnerTransaction>(&document)?.network,
         Kind::OwnerSigned => decode::<OwnerSignedData>(&document)?.original.network,
         Kind::Receipt => {
@@ -300,7 +312,9 @@ pub fn restore(k: Kind, document: Box<RawValue>) -> Result<Packet> {
             decode_packet::<PreparedOperation>(&packet)?;
         }
         Kind::Signed => {
-            decode_packet::<SignedOperation>(&packet)?;
+            if signed_code(&packet)?.is_none() {
+                decode_packet::<SignedOperation>(&packet)?;
+            }
         }
         Kind::Owner => {
             decode_packet::<native::owner_intent::OwnerTransaction>(&packet)?;
@@ -405,6 +419,16 @@ pub struct Provider {
 /// signature of a transaction hash with an account's key.
 pub type Sender = std::sync::Arc<dyn SendingAccounts>;
 pub use crate::host::runtime::SendingAccounts;
+/// The fee that the signed transaction envelope `xdr` declares, in stroops: the most that the
+/// ledger charges its source.
+fn declared_fee(xdr: &str) -> Result<u32> {
+    match checked(native::read::<stellar_xdr::TransactionEnvelope>(xdr))? {
+        stellar_xdr::TransactionEnvelope::Tx(envelope) => Ok(envelope.tx.fee),
+        _ => Err(Error::config(
+            "A wallet code transaction is a plain transaction",
+        )),
+    }
+}
 /// The Ed25519 transaction signature of `hash` by the sending account `account`.
 fn sending_signature(sender: &Sender, account: &str, hash: &[u8; 32]) -> Result<[u8; 64]> {
     sender
@@ -412,7 +436,249 @@ fn sending_signature(sender: &Sender, account: &str, hash: &[u8; 32]) -> Result<
         .try_into()
         .map_err(|_| Error::config("A sending account returned a signature of another size"))
 }
+/// A wallet code transaction that a sending account signed: the upload of wallet code, or the
+/// restoration of lapsed code by its hash (`RuntimeProvider::prepare_code_within`). The rail
+/// sends nothing: the caller submits it with `broadcast` and follows it with `status` and
+/// `observe`, as any signed operation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SignedCode {
+    /// The transaction, `upload_wasm` or `restore_code`, from the sending account, unsigned.
+    pub code: native::admin::PreparedDeployment,
+    /// The same transaction with the sending account's signature.
+    pub signed_xdr: String,
+}
+/// The code transaction that the signed packet `p` carries, `None` for any other signed packet.
+/// Its bytes are checked: the signed envelope is the prepared transaction with one signature
+/// of its source, and the transaction uploads or restores its code alone.
+fn signed_code(p: &Packet) -> Result<Option<SignedCode>> {
+    let Ok(s) = serde_json::from_str::<SignedCode>(p.document().get()) else {
+        return Ok(None);
+    };
+    if crate::host::routing::normalize(&s.code.network)? != p.network() {
+        return Err(Error::config(
+            "The code transaction's network differs from its packet",
+        ));
+    }
+    checked(native::admin::check_signed_code(&s.code, &s.signed_xdr))?;
+    Ok(Some(s))
+}
+fn code_of(p: &Signed) -> Result<SignedCode> {
+    signed_code(&p.0)?.ok_or_else(|| Error::usage("This packet is not a wallet code transaction"))
+}
 impl Provider {
+    /// The upload of the wallet code `wasm`, from a sending account and signed by it. A simulated
+    /// fee above `max_fee_stroops` is refused before anything is signed. `None` when the code is
+    /// live. Code that lapsed is refused as `CONTRACT_EXPIRED`: nothing restores it.
+    ///
+    /// The step trusts the reads and simulations of the one RPC that the server configured (see
+    /// the crate README). Another transaction, from another sending account or from the same
+    /// one, can make the code live while the step runs: the code is read first, again after
+    /// every refusal on the way to the signature, and again just before the signature, and
+    /// live code needs nothing.
+    fn prepare_code(
+        &self,
+        i: &Installation,
+        wasm: &[u8],
+        max_fee_stroops: u32,
+        now: u64,
+    ) -> Result<Option<SignedCode>> {
+        let c = self.config(i)?;
+        if c.route != WalletRoute::PolicyWallet {
+            return Err(Error::unsupported(
+                "A keypair wallet has no code: its owner creates it with the wallet setup",
+            ));
+        }
+        let code_hash = checked(native::admin::check_wallet_code(wasm))?;
+        let live = || {
+            matches!(
+                rpc::code_state(self.rpc(), &c.network, &code_hash),
+                Ok(rpc::CodeState::Live)
+            )
+        };
+        match checked(rpc::code_state(self.rpc(), &c.network, &code_hash))? {
+            rpc::CodeState::Live => return Ok(None),
+            rpc::CodeState::Lapsed => return Err(Error::config(rpc::CONTRACT_EXPIRED)),
+            rpc::CodeState::Absent => {}
+        }
+        // A refusal can come from the transaction that made the code live: a simulated fee above
+        // the ceiling for a write that is no longer needed, the sending account's sequence that
+        // its own upload advanced, or sending accounts that are all busy with it. Live code
+        // needs nothing; otherwise the refusal stands.
+        let unless_live = |refused: Error| if live() { Ok(None) } else { Err(refused) };
+        let prepare = || -> Result<Option<(&Sender, String, native::admin::PreparedDeployment)>> {
+            let sender = self.sender.as_ref().ok_or_else(|| {
+                Error::config("This server has no sending account to upload wallet code")
+            })?;
+            let account = sender.account()?;
+            // The server pays the upload, a cost that the ledger consumes; the simulation sets
+            // it, within the ceiling.
+            let deployer = native::admin::Deployer {
+                rpc: self.rpc(),
+                network: &c.network,
+                now,
+                max_fee_stroops,
+            };
+            Ok(checked(deployer.upload_wasm(&account, wasm))?.map(|p| (sender, account, p)))
+        };
+        let (sender, account, p) = match prepare() {
+            Ok(Some(prepared)) => prepared,
+            Ok(None) => return Ok(None),
+            Err(refused) => return unless_live(refused),
+        };
+        if checked(rpc::code_state(self.rpc(), &c.network, &code_hash))? == rpc::CodeState::Live {
+            return Ok(None);
+        }
+        let signed_xdr = match self.code_signature(sender, &account, &c.network, &p) {
+            Ok(signed) => signed,
+            Err(refused) => return unless_live(refused),
+        };
+        Ok(Some(SignedCode {
+            code: p,
+            signed_xdr,
+        }))
+    }
+    /// The extension that the live code `code_hash` needs now: the network's minimum lifetime of a
+    /// persistent entry once at most half of it is left, `None` before. Code that lapsed or that is
+    /// not on the network is refused: nothing restores it.
+    fn renewal_due(&self, code_hash: &[u8; 32]) -> Result<Option<u32>> {
+        let Some((live_until, closing)) =
+            checked(rpc::code_lifetime(self.rpc(), &self.network, code_hash))?
+        else {
+            return Err(Error::usage("The wallet code is not on the network"));
+        };
+        if live_until < closing {
+            return Err(Error::usage(
+                "The wallet code lapsed on the network: nothing restores it",
+            ));
+        }
+        let minimum = checked(rpc::minimum_persistent_lifetime(self.rpc()))?;
+        Ok((live_until - closing <= minimum / 2).then_some(minimum))
+    }
+    /// Prepare the renewal of the live code `code_hash`, signed by a sending account, once it is
+    /// due (`renewal_due`). The code is read again before the signature: a renewal that another
+    /// transaction made needless is not signed.
+    fn prepare_renewal(
+        &self,
+        code_hash: &[u8; 32],
+        max_fee_stroops: u32,
+        now: u64,
+    ) -> Result<Option<SignedCode>> {
+        let Some(extend_to) = self.renewal_due(code_hash)? else {
+            return Ok(None);
+        };
+        let unless_renewed = |refused: Error| match self.renewal_due(code_hash) {
+            Ok(None) => Ok(None),
+            _ => Err(refused),
+        };
+        let sender = self.sender.as_ref().ok_or_else(|| {
+            Error::config("This server has no sending account to renew wallet code")
+        })?;
+        let prepared = sender.account().and_then(|account| {
+            let deployer = native::admin::Deployer {
+                rpc: self.rpc(),
+                network: &self.network,
+                now,
+                max_fee_stroops,
+            };
+            Ok((
+                checked(deployer.renew_code(&account, *code_hash, extend_to))?,
+                account,
+            ))
+        });
+        let (p, account) = match prepared {
+            Ok(prepared) => prepared,
+            Err(refused) => return unless_renewed(refused),
+        };
+        if self.renewal_due(code_hash)?.is_none() {
+            return Ok(None);
+        }
+        let signed_xdr = match self.code_signature(sender, &account, &self.network, &p) {
+            Ok(signed) => signed,
+            Err(refused) => return unless_renewed(refused),
+        };
+        Ok(Some(SignedCode {
+            code: p,
+            signed_xdr,
+        }))
+    }
+    /// The envelope of the code transaction `p` with the signature of its source `account`.
+    fn code_signature(
+        &self,
+        sender: &Sender,
+        account: &str,
+        network: &str,
+        p: &native::admin::PreparedDeployment,
+    ) -> Result<String> {
+        sending_signature(sender, account, &p.transaction_hash).and_then(|signature| {
+            checked(native::admin::with_source_signature(
+                network,
+                &p.transaction_xdr,
+                &signature,
+            ))
+        })
+    }
+    /// Send the code transaction `s` once. `Prepared` when the network did not accept it:
+    /// nothing is pending, and the caller can send the same bytes again while it is needed. A
+    /// send never returns a final status: only the receipt (`observe_code`) is final.
+    fn broadcast_code(&self, s: &SignedCode, now: u64) -> Result<Status> {
+        if now > s.code.expires_at {
+            return Err(Error::usage("The code transaction expired"));
+        }
+        let network = &s.code.network;
+        Ok(
+            match checked(rpc::send_transaction(self.rpc(), network, &s.signed_xdr))? {
+                rpc::Broadcast::Submitted => Status::Submitted,
+                rpc::Broadcast::RetryLater => Status::Prepared,
+                rpc::Broadcast::Unknown => Status::SubmissionUnknown,
+                // A transaction that the network rejected is not pending and cost nothing, unless
+                // an earlier send of the same bytes applied: then its receipt decides.
+                rpc::Broadcast::Rejected { .. } => {
+                    match checked(rpc::receipt_by_hash(
+                        self.rpc(),
+                        network,
+                        &s.code.transaction_hash,
+                    ))? {
+                        Some(_) => Status::Submitted,
+                        None => Status::Prepared,
+                    }
+                }
+            },
+        )
+    }
+    /// The receipt of the code transaction `s`, once the ledger included it. A transaction that
+    /// the ledger failed has a receipt too, whose fee its source paid. The ledger charges a
+    /// transaction at most the fee that it declares: a receipt that reports more is refused.
+    fn observe_code(&self, s: &SignedCode) -> Result<Option<Receipt>> {
+        let network = &s.code.network;
+        // The ledger's own envelope is the signed transaction, before any fee bump is read.
+        let Some(receipt) = checked(rpc::own_receipt_by_hash(
+            self.rpc(),
+            network,
+            &s.code.transaction_hash,
+            &s.signed_xdr,
+        ))?
+        else {
+            return Ok(None);
+        };
+        checked(rpc::validate_own_receipt(
+            &receipt,
+            network,
+            &s.code.transaction_hash,
+        ))?;
+        if receipt.envelope_xdr != s.signed_xdr {
+            return Err(Error::config(
+                "The receipt's envelope differs from the code transaction",
+            ));
+        }
+        let packet = packet(network, &receipt)?;
+        if receipt_info(&packet)?.fee.native_units > u128::from(declared_fee(&s.signed_xdr)?) {
+            return Err(crate::provider::failure(
+                "The receipt reports a fee above the fee of its transaction",
+            ));
+        }
+        Ok(Some(Receipt(packet)))
+    }
     /// One owner action on a keypair wallet: a transaction from the owner's account whose
     /// operations the owner's signature authorizes alone. `Recover` without an amount closes
     /// the wallet: every signer is removed and the account merges into the owner's account.
@@ -587,6 +853,35 @@ impl Provider {
         self.network(&c.network)?;
         checked(native::validate_config(&c))?;
         Ok(c)
+    }
+    /// Before the server signs for a policy wallet, require its live instance to run the
+    /// installation's code, and that code to be live: a wallet whose instance or code lapsed is
+    /// `CONTRACT_EXPIRED`, and one whose owner installed other code, or that is gone, is refused.
+    /// The operation's last simulation may precede either.
+    /// The refusal of a wallet whose instance runs `running`, other code than its installation
+    /// names: `CONTRACT_EXPIRED` when that code lapsed, `EXECUTABLE_DIFFERS` otherwise. A read
+    /// that fails is its error.
+    fn other_code(&self, c: &WalletConfig, running: &[u8; 32]) -> Error {
+        match checked(rpc::code_state(self.rpc(), &c.network, running)) {
+            Ok(rpc::CodeState::Lapsed) => Error::config(rpc::CONTRACT_EXPIRED),
+            Ok(_) => Error::config(rpc::EXECUTABLE_DIFFERS),
+            Err(error) => error,
+        }
+    }
+    fn refuse_lapsed(&self, c: &WalletConfig) -> Result<()> {
+        if c.route != WalletRoute::PolicyWallet {
+            return Ok(());
+        }
+        match checked(rpc::instance_code(self.rpc(), &c.network, &c.wallet))? {
+            Some(running) if running == c.module_digest => {}
+            Some(running) => return Err(self.other_code(c, &running)),
+            None => return Err(Error::config("The wallet is not on the network")),
+        }
+        match checked(rpc::code_state(self.rpc(), &c.network, &c.module_digest))? {
+            rpc::CodeState::Live => Ok(()),
+            rpc::CodeState::Lapsed => Err(Error::config(rpc::CONTRACT_EXPIRED)),
+            rpc::CodeState::Absent => Err(Error::config("The wallet's code is not on the network")),
+        }
     }
     fn fresh(&self, i: &Installation) -> Result<WalletConfig> {
         let c = self.config(i)?;
@@ -875,9 +1170,22 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 lifetime: None,
             });
         }
-        let code_present = checked(rpc::code_uploaded(self.rpc(), &c.network, &c.module_digest))?;
-        let wallet_present = checked(rpc::contract_exists(self.rpc(), &c.network, &c.wallet))?;
-        let lifetime = if wallet_present {
+        // Nothing restores a lapsed wallet: a wallet whose instance or code lapsed is
+        // `CONTRACT_EXPIRED`. Code that is absent, for a wallet not created yet, is not present.
+        // The code is the one that the instance runs: a wallet whose owner installed other code
+        // outside Allowit lapsed only if that code did.
+        let code = checked(rpc::code_state(self.rpc(), &c.network, &c.module_digest))?;
+        let running = checked(rpc::instance_code(self.rpc(), &c.network, &c.wallet))?;
+        if let Some(running) = running.filter(|running| *running != c.module_digest) {
+            return Err(self.other_code(&c, &running));
+        }
+        let wallet_present = running.is_some();
+        if wallet_present && code == rpc::CodeState::Lapsed {
+            return Err(Error::config(rpc::CONTRACT_EXPIRED));
+        }
+        let code_present = code == rpc::CodeState::Live;
+        // A lifetime reads live entries only: lapsed code has none until it is restored.
+        let lifetime = if wallet_present && code_present {
             let l = checked(rpc::wallet_lifetime(
                 self.rpc(),
                 &c.network,
@@ -1018,6 +1326,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 "Authorization differs from selected installation",
             ));
         }
+        self.refuse_lapsed(&c)?;
         // A classic account has no server authorization entry: the server admits the
         // operation here, with its evaluator, and signs the transaction at execution.
         if c.route == WalletRoute::Native {
@@ -1064,6 +1373,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 "Authorization differs from selected installation",
             ));
         }
+        self.refuse_lapsed(&c)?;
         let finalized = checked(self.runtime.finalize_authorization(
             &p,
             |p| {
@@ -1155,10 +1465,19 @@ impl crate::host::vendors::RuntimeProvider for Provider {
     }
     fn validate_signed(&self, p: &Signed, now: u64) -> Result<()> {
         self.network(p.network())?;
+        if let Some(code) = signed_code(&p.0)? {
+            if now > code.code.expires_at {
+                return Err(Error::usage("The code transaction expired"));
+            }
+            return Ok(());
+        }
         checked(native::validate_signed(&signed(p)?, now))
     }
     fn broadcast(&self, p: &Signed, now: u64) -> Result<Status> {
         self.network(p.network())?;
+        if let Some(code) = signed_code(&p.0)? {
+            return self.broadcast_code(&code, now);
+        }
         let s = signed(p)?;
         if s.prepared.payment_authorization.is_some() {
             // The seller's facilitator submits a payment authorization. The service releases
@@ -1183,6 +1502,13 @@ impl crate::host::vendors::RuntimeProvider for Provider {
     }
     fn status(&self, p: &Signed) -> Result<Status> {
         self.network(p.network())?;
+        if let Some(code) = signed_code(&p.0)? {
+            return Ok(status(checked(rpc::status_by_hash(
+                self.rpc(),
+                &code.code.network,
+                &code.code.transaction_hash,
+            ))?));
+        }
         let s = signed(p)?;
         if s.prepared.payment_authorization.is_some() {
             // The ledger names the transaction that settled the entry, or shows that no
@@ -1208,6 +1534,9 @@ impl crate::host::vendors::RuntimeProvider for Provider {
     }
     fn observe(&self, p: &Signed) -> Result<Option<Receipt>> {
         self.network(p.network())?;
+        if let Some(code) = signed_code(&p.0)? {
+            return self.observe_code(&code);
+        }
         let s = signed(p)?;
         if s.prepared.payment_authorization.is_some() {
             return checked(native::seller_settled::settlement(self.rpc(), &s.prepared))?
@@ -1255,9 +1584,10 @@ impl crate::host::vendors::RuntimeProvider for Provider {
     fn lapsed(&self, p: &Prepared) -> Result<bool> {
         self.network(p.network())?;
         let p = prepared(p)?;
-        // The same proofs as the agent client's: a payment authorization lapses when no
-        // transaction settled it by its expiry ledger, a policy wallet operation when its
-        // authorization can no longer run and its nonce is not on the ledger.
+        // The rail's evidence: a payment authorization lapses when no transaction settled it by
+        // its expiry ledger, a policy wallet operation when its authorization can no longer run
+        // and the history, read through the ledger that showed the expiry, holds no execution
+        // of it.
         if p.payment_authorization.is_some() {
             return checked(native::seller_settled::lapsed(self.rpc(), &p));
         }
@@ -1370,6 +1700,14 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                     }
                     .custody(),
                 )?;
+                // A transfer does not call the wallet: its lifetimes are read first, and a wallet
+                // whose instance or code lapsed takes no funds (`CONTRACT_EXPIRED`).
+                checked(rpc::wallet_lifetime(
+                    self.rpc(),
+                    &c.network,
+                    &c.wallet,
+                    &c.module_digest,
+                ))?;
                 checked(d.fund(&c, units))?
             }
             OwnerAction::Extend => {
@@ -1446,57 +1784,40 @@ impl crate::host::vendors::RuntimeProvider for Provider {
             },
         )?))
     }
-    fn upload_code(
+    fn prepare_code_within(
         &self,
         i: &Installation,
         wasm: &[u8],
-        poll: Poll,
+        max_fee: u64,
         now: u64,
-    ) -> Result<Option<Receipt>> {
-        let c = self.config(i)?;
-        if c.route != WalletRoute::PolicyWallet {
-            return Err(Error::unsupported(
-                "A keypair wallet has no code: its owner creates it with the wallet setup",
-            ));
-        }
-        let code_hash = checked(native::admin::check_wallet_code(wasm))?;
-        if checked(rpc::code_uploaded(self.rpc(), &c.network, &code_hash))? {
+    ) -> Result<Option<Signed>> {
+        let Some(code) = self.prepare_code(i, wasm, fee(max_fee)?, now)? else {
             return Ok(None);
+        };
+        Ok(Some(Signed(packet(&code.code.network, &code)?)))
+    }
+    fn prepare_code_renewal(
+        &self,
+        code: &[u8; 32],
+        max_fee: u64,
+        now: u64,
+    ) -> Result<Option<Signed>> {
+        let Some(code) = self.prepare_renewal(code, fee(max_fee)?, now)? else {
+            return Ok(None);
+        };
+        Ok(Some(Signed(packet(&code.code.network, &code)?)))
+    }
+    fn code_needed(&self, p: &Signed) -> Result<bool> {
+        self.network(p.network())?;
+        let code = code_of(p)?;
+        match code.code.function.as_str() {
+            "renew_code" => Ok(self.renewal_due(&code.code.wasm_hash)?.is_some()),
+            _ => Ok(checked(rpc::code_state(
+                self.rpc(),
+                &code.code.network,
+                &code.code.wasm_hash,
+            ))? != rpc::CodeState::Live),
         }
-        let sender = self.sender.as_ref().ok_or_else(|| {
-            Error::config("This server has no sending account to upload wallet code")
-        })?;
-        let account = sender.account()?;
-        // The server pays the upload, a cost that the ledger consumes; the simulation sets it.
-        let p = checked(
-            native::admin::Deployer {
-                rpc: self.rpc(),
-                network: &c.network,
-                now,
-                max_fee_stroops: u32::MAX,
-            }
-            .upload_wasm(&account, wasm),
-        )?;
-        let signature = sending_signature(sender, &account, &p.transaction_hash)?;
-        let signed = checked(native::admin::with_source_signature(
-            &c.network,
-            &p.transaction_xdr,
-            &signature,
-        ))?;
-        let receipt = checked(self.runtime.send_and_poll(
-            &c.network,
-            &signed,
-            crate::provider::runtime::Poll {
-                attempts: poll.attempts,
-                interval: poll.interval,
-            },
-        ))?;
-        checked(rpc::validate_receipt(
-            &receipt,
-            &c.network,
-            &p.transaction_hash,
-        ))?;
-        Ok(Some(Receipt(packet(&c.network, &receipt)?)))
     }
     fn submit_owner<'a>(
         &self,
@@ -1603,6 +1924,11 @@ pub fn prepared_metadata(p: &Packet) -> Result<PreparedMetadata> {
     })
 }
 pub fn signed_preparation(p: &Packet) -> Result<Prepared> {
+    if signed_code(p)?.is_some() {
+        return Err(Error::usage(
+            "A wallet code transaction has no wallet operation to prepare",
+        ));
+    }
     let value: SignedOperation = decode_packet(p)?;
     Ok(Prepared(packet(
         &value.prepared.config.network,
@@ -1693,15 +2019,37 @@ fn retained_signed_shape(s: &SignedOperation) -> Result<()> {
     checked(native::validate_retained_signed(s))
 }
 pub fn validate_signed(p: &Packet) -> Result<()> {
+    if signed_code(p)?.is_some() {
+        return Ok(());
+    }
     let signed: SignedOperation = decode_packet(p)?;
     checked(native::validate_retained_signed(&signed))
 }
 pub fn verify_receipt(r: &Packet, p: &Packet) -> Result<()> {
-    let signed: SignedOperation = decode_packet(p)?;
     let receipt: rpc::VerifiedReceipt = decode_packet(r)?;
     if r.network() != p.network() {
         return Err(Error::config("Receipt network differs from operation"));
     }
+    if let Some(code) = signed_code(p)? {
+        checked(rpc::validate_own_receipt(
+            &receipt,
+            &code.code.network,
+            &code.code.transaction_hash,
+        ))?;
+        if receipt.envelope_xdr != code.signed_xdr {
+            return Err(Error::config(
+                "The receipt's envelope differs from the code transaction",
+            ));
+        }
+        // The ledger charges a transaction at most the fee that it declares.
+        if receipt_info(r)?.fee.native_units > u128::from(declared_fee(&code.signed_xdr)?) {
+            return Err(Error::config(
+                "The receipt reports a fee above the fee of its transaction",
+            ));
+        }
+        return Ok(());
+    }
+    let signed: SignedOperation = decode_packet(p)?;
     verify_native_receipt(&signed, &receipt)
 }
 fn verify_native_receipt(signed: &SignedOperation, receipt: &rpc::VerifiedReceipt) -> Result<()> {
@@ -2065,19 +2413,34 @@ mod capability_tests {
             Ok(expected["result"].clone())
         }
     }
-    /// The server proves a lapse as the agent client does (`rpc::operation_lapsed`): a ledger
-    /// closed at or after the expiry, past the authorization's expiration ledger, and inside the
-    /// lifetime that a spent nonce is sure to have, the wallet holds no such nonce.
+    /// The server reads the lapse of a policy wallet operation (`rpc::operation_lapsed`). Once a ledger
+    /// closed at or after the signed time bound, the wallet runs the operation in no envelope, so
+    /// the wallet's events read then hold every execution of it, in any envelope: none found, the
+    /// operation lapsed. Once the history no longer holds the preparation's ledger, nothing proves
+    /// a lapse: the operation stays open. A read that fails proves nothing.
     #[test]
-    fn the_server_proves_a_lapse_as_the_agent_client_does() {
-        use stellar_xdr::{
-            ConfigSettingEntry, ContractDataEntry, ExtensionPoint, LedgerEntryData, LedgerKey,
-            Limits, ReadXdr, StateArchivalSettings, WriteXdr,
-        };
+    fn an_operation_lapses_once_its_time_bound_passed_and_no_execution_is_in_the_history() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/provider/stellar-policy-wallet-revalidation-rpc.json"
+        ))
+        .unwrap();
+        let p: PreparedOperation = serde_json::from_value(fixture["prepared"].clone()).unwrap();
         struct Ledger {
+            status: &'static str,
             closed: u64,
-            sequence: u64,
-            spent: bool,
+            oldest: u64,
+            /// The ledger of an execution of the operation, in an envelope that another account
+            /// sent.
+            executed: Option<u64>,
+            events_fail: bool,
+            /// The latest ledger of the event store, where a scan ends; the transaction read's
+            /// is 900.
+            head: u64,
+            /// How many ledgers one page of events scans.
+            scan: u64,
+            wallet: String,
+            from: u32,
+            calls: std::sync::Mutex<Vec<String>>,
         }
         impl rpc::Rpc for Ledger {
             fn call(
@@ -2085,71 +2448,301 @@ mod capability_tests {
                 method: &str,
                 params: serde_json::Value,
             ) -> native::Result<serde_json::Value> {
-                Ok(match method {
-                    "getTransaction" => serde_json::json!({
-                        "status": "NOT_FOUND",
-                        "latestLedger": self.sequence,
+                self.calls.lock().unwrap().push(method.into());
+                match method {
+                    "getTransaction" => Ok(serde_json::json!({
+                        "status": self.status,
+                        "oldestLedger": self.oldest,
+                        "latestLedger": 900,
                         "latestLedgerCloseTime": self.closed.to_string(),
-                    }),
-                    "getLedgerEntries" => {
-                        let mut entries = vec![];
-                        for key in params["keys"].as_array().unwrap() {
-                            let key = key.as_str().unwrap();
-                            let entry =
-                                match LedgerKey::from_xdr_base64(key, Limits::none()).unwrap() {
-                                    LedgerKey::ConfigSetting(_) => LedgerEntryData::ConfigSetting(
-                                        ConfigSettingEntry::StateArchival(StateArchivalSettings {
-                                            min_temporary_ttl: 720,
-                                            ..Default::default()
-                                        }),
-                                    ),
-                                    LedgerKey::ContractData(data) if self.spent => {
-                                        LedgerEntryData::ContractData(ContractDataEntry {
-                                            ext: ExtensionPoint::V0,
-                                            contract: data.contract,
-                                            key: data.key,
-                                            durability: data.durability,
-                                            val: stellar_xdr::ScVal::Void,
-                                        })
-                                    }
-                                    _ => continue,
-                                };
-                            entries.push(serde_json::json!({
-                                "key": key,
-                                "xdr": entry.to_xdr_base64(Limits::none()).unwrap(),
-                            }));
-                        }
-                        serde_json::json!({"latestLedger": self.sequence, "entries": entries})
+                    })),
+                    "getEvents" if self.events_fail => Err("The RPC is unreachable".into()),
+                    "getEvents" => {
+                        // A page starts where the cursor of the last one ended, or at the
+                        // preparation's ledger; it scans `scan` ledgers at most, up to the head.
+                        let start = match params["pagination"]["cursor"].as_str() {
+                            Some(cursor) => {
+                                let toid: u64 = cursor.split_once('-').unwrap().0.parse().unwrap();
+                                (toid >> 32) + 1
+                            }
+                            None => {
+                                assert_eq!(params["startLedger"], self.from);
+                                u64::from(self.from)
+                            }
+                        };
+                        let filter = &params["filters"][0];
+                        assert_eq!(filter["contractIds"], serde_json::json!([self.wallet]));
+                        assert_eq!(filter["topics"][0].as_array().unwrap().len(), 2);
+                        let end = (start + self.scan).min(self.head + 1);
+                        let events = match self.executed {
+                            Some(ledger) if (start..end).contains(&ledger) => serde_json::json!(
+                                [{"txHash": native::hex(&[0xee; 32]), "ledger": ledger}]
+                            ),
+                            _ => serde_json::json!([]),
+                        };
+                        let cursor =
+                            format!("{:019}-{:010}", ((end - 1) << 32) | 0xffff_ffff, u32::MAX);
+                        Ok(serde_json::json!({
+                            "events": events,
+                            "latestLedger": self.head,
+                            "cursor": cursor,
+                        }))
                     }
                     other => panic!("unexpected {other}"),
-                })
+                }
             }
         }
+        let read_with = |status, closed, oldest, executed, events_fail, head, scan| {
+            let ledger = Arc::new(Ledger {
+                status,
+                closed,
+                oldest,
+                executed,
+                events_fail,
+                head,
+                scan,
+                wallet: p.config.wallet.clone(),
+                from: p.state.ledger,
+                calls: std::sync::Mutex::new(Vec::new()),
+            });
+            let provider = Provider::from_rpc("stellar:testnet", ledger.clone());
+            let lapsed = provider.lapsed(&provider.packet(&p).unwrap());
+            let calls = ledger.calls.lock().unwrap().clone();
+            (lapsed, calls)
+        };
+        let read = |status, closed, oldest, executed: bool, events_fail| {
+            let executed = executed.then_some(130);
+            read_with(status, closed, oldest, executed, events_fail, 900, 10_000)
+        };
+        let from = u64::from(p.state.ledger);
+        // An operation that the agent never submitted: retired once the bound passed, also long
+        // after it.
+        let (lapsed, calls) = read("NOT_FOUND", p.expires_at, from, false, false);
+        assert!(lapsed.unwrap());
+        assert_eq!(calls, ["getTransaction", "getEvents"]);
+        assert!(
+            read("NOT_FOUND", p.expires_at + 86_400, from, false, false)
+                .0
+                .unwrap()
+        );
+        // An execution in another envelope, which no receipt of the operation adopts: no lapse.
+        assert!(
+            !read("NOT_FOUND", p.expires_at, from, true, false)
+                .0
+                .unwrap()
+        );
+        // Before the bound the wallet can still run it: the events are not read.
+        let (lapsed, calls) = read("NOT_FOUND", p.expires_at - 1, from, false, false);
+        assert!(!lapsed.unwrap());
+        assert_eq!(calls, ["getTransaction"]);
+        // The prepared transaction applied.
+        assert!(!read("SUCCESS", p.expires_at, from, false, false).0.unwrap());
+        // A read of the events that fails proves nothing.
+        assert!(
+            read("NOT_FOUND", p.expires_at, from, false, true)
+                .0
+                .is_err()
+        );
+        // The history no longer holds the preparation's ledger: an execution could be gone from
+        // it, so the time bound alone proves nothing, whether the operation executed or not.
+        for executed in [true, false] {
+            let (lapsed, calls) = read("NOT_FOUND", p.expires_at, from + 1, executed, false);
+            assert!(!lapsed.unwrap());
+            assert_eq!(calls, ["getTransaction"]);
+        }
+        // A reply without its history proves nothing.
+        assert!(!read("NOT_FOUND", p.expires_at, 0, false, false).0.unwrap());
+        // A scan of the events that does not reach the ledger that showed the expiry could miss
+        // an execution in the ledgers between: it proves nothing, and the operation stays open.
+        let (lapsed, calls) = read_with("NOT_FOUND", p.expires_at, from, None, false, 899, 10_000);
+        assert!(!lapsed.unwrap());
+        assert!(calls.len() <= 33, "{}", calls.len());
+        assert!(
+            read_with("NOT_FOUND", p.expires_at, from, None, false, 901, 10_000)
+                .0
+                .unwrap()
+        );
+        // Each page scans a bounded range of ledgers and names where it ended, also when the
+        // event store's head is past the expiry: the read follows the pages, and an execution
+        // in a later page is found.
+        let (lapsed, calls) = read_with(
+            "NOT_FOUND",
+            p.expires_at,
+            from,
+            Some(from + 150),
+            false,
+            900,
+            100,
+        );
+        assert!(!lapsed.unwrap());
+        assert_eq!(calls, ["getTransaction", "getEvents", "getEvents"]);
+        let (lapsed, calls) = read_with("NOT_FOUND", p.expires_at, from, None, false, 900, 100);
+        assert!(lapsed.unwrap());
+        assert_eq!(calls.len(), 1 + 8);
+    }
+    /// The server cosigns no operation of a wallet whose instance lapsed after the operation's
+    /// last simulation: the lapse is `contract_expired` before the signer is asked.
+    #[test]
+    fn the_server_signs_nothing_for_a_wallet_that_lapsed_after_its_simulation() {
+        use stellar_xdr::{
+            ContractDataDurability, ContractDataEntry, ContractExecutable, ExtensionPoint, Hash,
+            LedgerEntryData, Limits, ScContractInstance, ScVal, WriteXdr,
+        };
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../tests/fixtures/provider/stellar-policy-wallet-revalidation-rpc.json"
         ))
         .unwrap();
         let p: PreparedOperation = serde_json::from_value(fixture["prepared"].clone()).unwrap();
-        let lapsed = |closed, sequence, spent| {
-            let provider = Provider::from_rpc(
-                "stellar:testnet",
-                Arc::new(Ledger {
-                    closed,
-                    sequence,
-                    spent,
-                }),
-            );
-            provider.lapsed(&provider.packet(&p).unwrap()).unwrap()
-        };
-        // The authorization of the fixture expires at ledger 184.
-        assert!(lapsed(p.expires_at, 185, false));
-        // A spent nonce shows that the operation ran, in whatever envelope.
-        assert!(!lapsed(p.expires_at, 185, true));
-        // At its expiration ledger, or before the expiry time, the authorization can still run.
-        assert!(!lapsed(p.expires_at, 184, false));
-        assert!(!lapsed(p.expires_at - 1, 185, false));
-        // Past the lifetime that a spent nonce is sure to have, its absence proves nothing.
-        assert!(!lapsed(p.expires_at, 184 - 64 + 720, false));
+        /// The recorded network of the fixture; once `lapsed`, the wallet's instance lapsed, or,
+        /// with `running`, it runs that other code, which is live.
+        struct Recorded {
+            fixture: serde_json::Value,
+            config: WalletConfig,
+            lapsed: std::sync::atomic::AtomicBool,
+            running: std::sync::Mutex<Option<[u8; 32]>>,
+        }
+        impl rpc::Rpc for Recorded {
+            fn call(
+                &self,
+                method: &str,
+                params: serde_json::Value,
+            ) -> native::Result<serde_json::Value> {
+                let recorded = |method: &str| {
+                    self.fixture["calls"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|call| call["method"] == method)
+                        .map(|call| call["result"].clone())
+                        .unwrap()
+                };
+                if !self.lapsed.load(std::sync::atomic::Ordering::SeqCst) {
+                    return self.fixture["calls"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|call| call["method"] == method && call["params"] == params)
+                        .map(|call| call["result"].clone())
+                        .ok_or_else(|| format!("Unexpected RPC {method}"));
+                }
+                Ok(match method {
+                    "getNetwork" | "getLatestLedger" => recorded(method),
+                    // The other code that the owner installed is not on this network.
+                    "getLedgerEntries"
+                        if matches!(
+                            <stellar_xdr::LedgerKey as stellar_xdr::ReadXdr>::from_xdr_base64(
+                                params["keys"][0].as_str().unwrap_or_default(),
+                                Limits::none()
+                            ),
+                            Ok(stellar_xdr::LedgerKey::ContractCode(_))
+                        ) =>
+                    {
+                        serde_json::json!({
+                            "latestLedger": recorded("getLatestLedger")["sequence"],
+                            "entries": [],
+                        })
+                    }
+                    "getLedgerEntries" => {
+                        let instance = LedgerEntryData::ContractData(ContractDataEntry {
+                            ext: ExtensionPoint::V0,
+                            contract: native::address(&self.config.wallet)?,
+                            key: ScVal::LedgerKeyContractInstance,
+                            durability: ContractDataDurability::Persistent,
+                            val: ScVal::ContractInstance(ScContractInstance {
+                                executable: ContractExecutable::Wasm(Hash(
+                                    self.running
+                                        .lock()
+                                        .unwrap()
+                                        .unwrap_or(self.config.module_digest),
+                                )),
+                                storage: None,
+                            }),
+                        });
+                        let live = if self.running.lock().unwrap().is_some() {
+                            serde_json::json!(4_000_000)
+                        } else {
+                            serde_json::json!(0)
+                        };
+                        serde_json::json!({
+                            "latestLedger": recorded("getLatestLedger")["sequence"],
+                            "entries": [{
+                                "xdr": instance.to_xdr_base64(Limits::none()).unwrap(),
+                                "liveUntilLedgerSeq": live,
+                            }],
+                        })
+                    }
+                    other => panic!("unexpected {other} after the lapse"),
+                })
+            }
+        }
+        struct Counting(std::sync::atomic::AtomicUsize, String);
+        impl Signer for Counting {
+            fn identity(&self) -> &str {
+                &self.1
+            }
+            fn sign_hash(&self, _: &[u8; 32]) -> Result<Vec<u8>> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(vec![0; 64])
+            }
+        }
+        let configuration = super::super::server_owner::configuration(
+            "stellar:testnet",
+            &serde_json::to_vec(&p.config).unwrap(),
+        )
+        .unwrap();
+        let installation = installation(&configuration);
+        let network = Arc::new(Recorded {
+            fixture: fixture.clone(),
+            config: p.config.clone(),
+            lapsed: std::sync::atomic::AtomicBool::new(false),
+            running: std::sync::Mutex::new(None),
+        });
+        let provider = Provider::from_rpc("stellar:testnet", network.clone());
+        let simulated = provider
+            .revalidate(&installation, &retained(&fixture["prepared"]), 86_402)
+            .unwrap();
+        network
+            .lapsed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let signer = Counting(
+            std::sync::atomic::AtomicUsize::new(0),
+            p.config.server.clone(),
+        );
+        // The liveness check comes first, before any step that signs.
+        let refused = provider
+            .authorize_preparation(&installation, &simulated, &signer, None, 86_402)
+            .unwrap_err();
+        assert_eq!(refused.message, rpc::CONTRACT_EXPIRED);
+        let refused = provider
+            .finalize(
+                &installation,
+                &simulated,
+                &signer,
+                None,
+                86_402,
+                Box::new(|_| Ok(())),
+            )
+            .unwrap_err();
+        assert_eq!(refused.message, rpc::CONTRACT_EXPIRED);
+        // The owner installed other code after the preparation: the server signs nothing for it,
+        // whether the installation's code is live or not.
+        *network.running.lock().unwrap() = Some([0x42; 32]);
+        let refused = provider
+            .authorize_preparation(&installation, &simulated, &signer, None, 86_402)
+            .unwrap_err();
+        assert_eq!(refused.message, rpc::EXECUTABLE_DIFFERS);
+        let refused = provider
+            .finalize(
+                &installation,
+                &simulated,
+                &signer,
+                None,
+                86_402,
+                Box::new(|_| Ok(())),
+            )
+            .unwrap_err();
+        assert_eq!(refused.message, rpc::EXECUTABLE_DIFFERS);
+        assert_eq!(signer.0.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
     #[test]
     fn genuine_preflight_survives_carrier_but_not_serialization_or_document_changes() {
