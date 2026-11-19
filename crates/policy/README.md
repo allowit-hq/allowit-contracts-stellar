@@ -8,4 +8,3 @@ The offchain rail uses Core's `std` types. SDK engine composes shared authoring 
 The server retains trusted admission and publication authority.
 
 The [manifest](Cargo.toml) records the native backend's source provenance.
-The native binding and embedded portable rule source retain their `UNLICENSED` terms.

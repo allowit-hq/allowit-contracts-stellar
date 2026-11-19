@@ -360,4 +360,4 @@ Keep contract code, the `crates/allowit-stellar` rail crate, build and API docum
 
 ## License
 
-The source is public, but every contract crate declares `license = "UNLICENSED"` and the repository has no license file, so no open-source license is granted for the contracts. `crates/allowit-stellar` declares `license = "MIT"`.
+MIT. See [LICENSE](LICENSE).

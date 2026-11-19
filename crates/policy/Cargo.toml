@@ -3,7 +3,7 @@ name = "allowit-stellar-policy"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
-license = "UNLICENSED"
+license = "MIT"
 publish = false
 description = "Stellar native bindings for the shared Allowit policy rules"
 
