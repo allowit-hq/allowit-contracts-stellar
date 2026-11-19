@@ -858,17 +858,23 @@ impl Provider {
     /// installation's code, and that code to be live: a wallet whose instance or code lapsed is
     /// `CONTRACT_EXPIRED`, and one whose owner installed other code, or that is gone, is refused.
     /// The operation's last simulation may precede either.
+    /// The refusal of a wallet whose instance runs `running`, other code than its installation
+    /// names: `CONTRACT_EXPIRED` when that code lapsed, a configuration mismatch otherwise. A
+    /// read that fails is its error.
+    fn other_code(&self, c: &WalletConfig, running: &[u8; 32]) -> Error {
+        match checked(rpc::code_state(self.rpc(), &c.network, running)) {
+            Ok(rpc::CodeState::Lapsed) => Error::config(rpc::CONTRACT_EXPIRED),
+            Ok(_) => Error::config("The wallet runs other code than its installation names"),
+            Err(error) => error,
+        }
+    }
     fn refuse_lapsed(&self, c: &WalletConfig) -> Result<()> {
         if c.route != WalletRoute::PolicyWallet {
             return Ok(());
         }
         match checked(rpc::instance_code(self.rpc(), &c.network, &c.wallet))? {
             Some(running) if running == c.module_digest => {}
-            Some(_) => {
-                return Err(Error::config(
-                    "The wallet runs other code than its installation names",
-                ));
-            }
+            Some(running) => return Err(self.other_code(c, &running)),
             None => return Err(Error::config("The wallet is not on the network")),
         }
         match checked(rpc::code_state(self.rpc(), &c.network, &c.module_digest))? {
@@ -1167,13 +1173,11 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         // Nothing restores a lapsed wallet: a wallet whose instance or code lapsed is
         // `CONTRACT_EXPIRED`. Code that is absent, for a wallet not created yet, is not present.
         // The code is the one that the instance runs: a wallet whose owner installed other code
-        // outside Allowit did not lapse with the installation's code.
+        // outside Allowit lapsed only if that code did.
         let code = checked(rpc::code_state(self.rpc(), &c.network, &c.module_digest))?;
         let running = checked(rpc::instance_code(self.rpc(), &c.network, &c.wallet))?;
-        if running.is_some_and(|running| running != c.module_digest) {
-            return Err(Error::config(
-                "The wallet runs other code than its installation names",
-            ));
+        if let Some(running) = running.filter(|running| *running != c.module_digest) {
+            return Err(self.other_code(&c, &running));
         }
         let wallet_present = running.is_some();
         if wallet_present && code == rpc::CodeState::Lapsed {
@@ -2581,6 +2585,21 @@ mod capability_tests {
                 }
                 Ok(match method {
                     "getNetwork" | "getLatestLedger" => recorded(method),
+                    // The other code that the owner installed is not on this network.
+                    "getLedgerEntries"
+                        if matches!(
+                            <stellar_xdr::LedgerKey as stellar_xdr::ReadXdr>::from_xdr_base64(
+                                params["keys"][0].as_str().unwrap_or_default(),
+                                Limits::none()
+                            ),
+                            Ok(stellar_xdr::LedgerKey::ContractCode(_))
+                        ) =>
+                    {
+                        serde_json::json!({
+                            "latestLedger": recorded("getLatestLedger")["sequence"],
+                            "entries": [],
+                        })
+                    }
                     "getLedgerEntries" => {
                         let instance = LedgerEntryData::ContractData(ContractDataEntry {
                             ext: ExtensionPoint::V0,

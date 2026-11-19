@@ -4125,6 +4125,29 @@ fn a_lapsed_wallet_takes_no_owner_step() {
         "{}",
         refused.message
     );
+    // The other code that it runs, on the network, lapsed too: the wallet lapsed.
+    let other = wasm_for(PolicyTier::Simple);
+    {
+        let mut m = chain.0.lock().unwrap();
+        m.code_bytes.insert(hash(&other), other.clone());
+        m.running = Some(hash(&other));
+        m.lapsed_code.insert(hash(&other));
+    }
+    let refused = provider.resources(&installation).unwrap_err();
+    assert_eq!(
+        provider.problem(&refused).code,
+        allowit_core::vendor::runtime::CONTRACT_EXPIRED,
+        "{}",
+        refused.message
+    );
+    // Live, that other code is still not the installation's.
+    chain.0.lock().unwrap().lapsed_code.remove(&hash(&other));
+    let refused = provider.resources(&installation).unwrap_err();
+    assert!(
+        refused.message.contains("other code"),
+        "{}",
+        refused.message
+    );
     chain.0.lock().unwrap().running = None;
     chain.0.lock().unwrap().lapsed_code.remove(&c.module_digest);
     // The owner installed other code outside Allowit, and that code lapsed: the stop's simulation
