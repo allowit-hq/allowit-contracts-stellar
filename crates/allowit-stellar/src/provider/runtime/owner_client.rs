@@ -64,6 +64,9 @@ struct Template {
     asset_issuer: Option<String>,
     #[serde(rename = "maxFeeUnits")]
     max_fee_stroops: u32,
+    /// The server's signer on the template's network, when the server states it per template.
+    #[serde(default)]
+    server: Option<String>,
 }
 #[derive(Deserialize)]
 struct Installations {
@@ -209,6 +212,12 @@ fn wallet_asset(
             "The server offers no Native wallet on this network",
         ));
     };
+    // A server that states its signer on the template too states the same key there.
+    if template.server.as_deref().is_some_and(|key| key != server) {
+        return Err(Error::config(
+            "The server's signer on this network differs from the configured server authority",
+        ));
+    }
     let invalid = || Error::config("The server's wallet asset of this network is invalid");
     let asset =
         native::asset_from_identity(&template.asset_symbol, template.asset_issuer.as_deref())

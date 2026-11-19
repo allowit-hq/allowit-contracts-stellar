@@ -414,6 +414,27 @@ fn the_wallet_asset_is_the_asset_of_the_servers_template_of_the_network() {
         &server,
     );
     assert!(unstated.is_err());
+    // A server that states its signer on each template: the template of the network names the
+    // configured key too, or nothing is signed. The template of another network is not read.
+    let stated = |pubnet: &str, testnet: &str| {
+        let mut on_pubnet = template("stellar:pubnet", "USDC", Some(PUBNET_ISSUER));
+        on_pubnet["server"] = json!(pubnet);
+        let mut on_testnet = template("stellar:testnet", "XLM", None);
+        on_testnet["server"] = json!(testnet);
+        super::wallet_asset(
+            serde_json::from_value(
+                json!({ "templates": [on_pubnet, on_testnet], "server": server }),
+            )
+            .unwrap(),
+            "stellar:pubnet",
+            &server,
+        )
+    };
+    let other = selection().config.agent;
+    assert!(stated(&server, &server).is_ok());
+    assert!(stated(&server, &other).is_ok());
+    let refused = stated(&other, &server).unwrap_err();
+    assert!(refused.message.contains("server authority"));
 }
 /// A request ID binds its intent, the wallet asset included, also while nothing is signed: a
 /// run for another asset or another amount under the same ID is refused and signs nothing. A
