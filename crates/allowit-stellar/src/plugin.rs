@@ -460,24 +460,9 @@ impl ServerHooks for Hooks {
             .get("asset")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::config("The fee needs the installed asset"))?;
-        let id = self::network(network)?.id;
-        let listed = provider::tokens_for(id)
-            .iter()
-            .find(|t| provider::token_contract(id, t).as_deref() == Some(asset));
-        let ticker = listed
-            .and_then(|t| config.get("gasRates")?.get(t.code))
-            .cloned();
-        let config = match ticker {
-            Some(rate) if config.get("gasRates").and_then(|r| r.get(asset)).is_none() => {
-                let mut config = config.clone();
-                config["gasRates"][asset] = rate;
-                config
-            }
-            _ => config.clone(),
-        };
         let fee = i128::try_from(receipt.fee.native_units)
             .map_err(|_| Error::config("The receipt fee is out of range"))?;
-        let Some(rate) = asset_rate(network, &config, asset)? else {
+        let Some(rate) = asset_rate(network, config, asset)? else {
             return Ok(fee);
         };
         // The arithmetic of this hook stays the one that the server's admission reads today:
@@ -488,8 +473,7 @@ impl ServerHooks for Hooks {
             .ok_or_else(|| Error::config("The fee is out of range"))
     }
     /// The XLM fee of `native_units` in the wallet's asset `asset` (its contract id), rounded
-    /// up. XLM, the network's own asset, is one to one; any other asset takes the `gasRates`
-    /// entry that the server keys by its contract id. No list of known assets decides.
+    /// up, at the rate of [`asset_rate`], as `charged_fee` finds it.
     fn price_fee(
         &self,
         network: &str,
@@ -517,17 +501,25 @@ impl ServerHooks for Hooks {
 
 /// The code of a fee or a price that its type cannot hold.
 pub const AMOUNT_OUT_OF_RANGE: &str = "amount_out_of_range";
-/// The rate of the wallet's asset `asset` (its contract id) in `config`, scaled by 10^7; `None`
-/// for XLM, the network's own asset, which is one to one. No list of known assets decides.
+/// The rate of the wallet's asset `asset` (its contract id) in `config`, scaled by 10^7, for
+/// both fee hooks: the rate under the asset's contract id, else, for a token of the network's
+/// list, the rate under its ticker. `None` for XLM, the network's own asset, one to one.
 fn asset_rate(network: &str, config: &Value, asset: &str) -> Result<Option<i128>> {
     let network = self::network(network)?.id;
     let xlm = crate::sac_address(network, &stellar_xdr::Asset::Native).map_err(Error::config)?;
     if asset == xlm {
         return Ok(None);
     }
-    config
-        .get("gasRates")
+    let rates = config.get("gasRates");
+    let ticker = || {
+        let listed = provider::tokens_for(network)
+            .iter()
+            .find(|t| provider::token_contract(network, t).as_deref() == Some(asset))?;
+        rates?.get(listed.code)
+    };
+    rates
         .and_then(|rates| rates.get(asset))
+        .or_else(ticker)
         .and_then(Value::as_str)
         .and_then(rate)
         .map(Some)
@@ -974,9 +966,8 @@ mod tests {
         );
     }
 
-    /// A fee is priced by the rate that the server keys by the wallet's asset, its contract id.
-    /// No list of known assets decides: an issued asset outside the list takes its rate, and a
-    /// ticker names no asset. XLM, the network's own asset, is one to one.
+    /// A fee is priced at the rate of the wallet's asset: the rate under its contract id, else the
+    /// ticker rate of a listed token, one lookup for both hooks. XLM is one to one.
     #[test]
     fn a_fee_is_priced_by_the_rate_of_the_wallets_asset() {
         let hooks = PLUGIN.server();
@@ -1068,17 +1059,39 @@ mod tests {
                 .unwrap(),
             5 * 10_i128.pow(36)
         );
-        // A rate under a ticker prices no asset, a listed one neither.
-        assert!(
-            hooks
-                .price_fee(network, &rates("USDC"), &usdc, 1_000)
-                .is_err()
-        );
-        assert!(
-            hooks
-                .price_fee(network, &rates("FOO"), &foo, 1_000)
-                .is_err()
-        );
+        // One lookup for both hooks: a listed token's ticker rate prices it in each, a contract
+        // id rate comes first, and the ticker of a token outside the list names no asset.
+        let receipt_of = |native_units| ReceiptInfo {
+            fee: allowit_core::vendor::runtime::Fee {
+                native_units,
+                ..receipt.fee
+            },
+            ..receipt.clone()
+        };
+        for (config, asset, expected) in [
+            (rates("USDC"), &usdc, Some(150)),
+            (
+                serde_json::json!({"gasRates": {"USDC": "0.15", usdc.as_str(): "0.20"}}),
+                &usdc,
+                Some(200),
+            ),
+            (rates("FOO"), &foo, None),
+        ] {
+            let mut with_asset = config.clone();
+            with_asset["asset"] = serde_json::json!(asset);
+            assert_eq!(
+                hooks.price_fee(network, &config, asset, 1_000).ok(),
+                expected,
+                "{config}"
+            );
+            assert_eq!(
+                hooks
+                    .charged_fee(network, &with_asset, &receipt_of(1_000))
+                    .ok(),
+                expected,
+                "{config}"
+            );
+        }
     }
 
     #[test]

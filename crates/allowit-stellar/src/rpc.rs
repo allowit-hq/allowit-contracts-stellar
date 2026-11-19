@@ -1433,6 +1433,26 @@ pub fn receipt_by_reported_hash(
     let FeeBumpTransactionInnerTx::Tx(inner) = &outer.tx.inner_tx;
     receipt_from_response(&v, network, &transaction_hash_for(network, &inner.tx)?)
 }
+/// The account that paid the fee bump that carried the transaction `hash`, as the ledger answers
+/// it now, the wrapper verified: `None` for a transaction that no fee bump carried or that the
+/// ledger does not hold. Nothing of it is retained.
+pub fn fee_bump_payer(rpc: &dyn Rpc, network: &str, hash: &[u8; 32]) -> Result<Option<String>> {
+    let v = rpc.call("getTransaction", json!({"hash": hex(hash)}))?;
+    settlement_reply(&v, network, hash)?;
+    if !matches!(v["status"].as_str(), Some("SUCCESS" | "FAILED")) {
+        return Ok(None);
+    }
+    let Some(envelope) = v["envelopeXdr"].as_str() else {
+        return Ok(None);
+    };
+    let TransactionEnvelope::TxFeeBump(outer) = read(envelope)? else {
+        return Ok(None);
+    };
+    Ok(Some(match &outer.tx.fee_source {
+        MuxedAccount::Ed25519(Uint256(key)) => account_for_public_key(key),
+        MuxedAccount::MuxedEd25519(m) => account_for_public_key(&m.ed25519.0),
+    }))
+}
 fn receipt_from_response(
     v: &Value,
     network: &str,
