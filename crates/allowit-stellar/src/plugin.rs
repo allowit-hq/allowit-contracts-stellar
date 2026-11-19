@@ -452,26 +452,36 @@ impl ServerHooks for Hooks {
         )
         .map_err(|_| Error::usage("The wallet sign-in signature is invalid"))
     }
-    /// The XLM fee in installed-asset units, rounded up. Native XLM is one to one; another
-    /// asset needs its `gasRates` entry, keyed by contract id or symbol.
+    /// The XLM fee in installed-asset units, rounded up: [`ServerHooks::price_fee`] of the
+    /// installed asset `config["asset"]`.
     fn charged_fee(&self, network: &str, config: &Value, receipt: &ReceiptInfo) -> Result<i128> {
-        let network = self::network(network)?.id;
-        let fee = i128::try_from(receipt.fee.native_units)
-            .map_err(|_| Error::config("The receipt fee is out of range"))?;
         let asset = config
             .get("asset")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::config("The fee needs the installed asset"))?;
-        let tokens = provider::tokens_for(network);
-        let token = tokens
-            .iter()
-            .find(|t| crate::provider::token_contract(network, t).as_deref() == Some(asset));
-        if token.is_some_and(|t| t.native) {
+        self.price_fee(network, config, asset, receipt.fee.native_units)
+    }
+    /// The XLM fee of `native_units` in the wallet's asset `asset` (its contract id), rounded
+    /// up. XLM, the network's own asset, is one to one; any other asset takes the `gasRates`
+    /// entry that the server keys by its contract id. No list of known assets decides.
+    fn price_fee(
+        &self,
+        network: &str,
+        config: &Value,
+        asset: &str,
+        native_units: u128,
+    ) -> Result<i128> {
+        let network = self::network(network)?.id;
+        let fee = i128::try_from(native_units)
+            .map_err(|_| Error::config("The receipt fee is out of range"))?;
+        let xlm =
+            crate::sac_address(network, &stellar_xdr::Asset::Native).map_err(Error::config)?;
+        if asset == xlm {
             return Ok(fee);
         }
-        let rates = config.get("gasRates").and_then(Value::as_object);
-        let rate = rates
-            .and_then(|r| r.get(asset).or_else(|| token.and_then(|t| r.get(t.code))))
+        let rate = config
+            .get("gasRates")
+            .and_then(|rates| rates.get(asset))
             .and_then(Value::as_str)
             .and_then(rate)
             .ok_or_else(|| {
@@ -890,7 +900,8 @@ mod tests {
         let tokens = provider::tokens_for("stellar:testnet");
         let xlm = provider::token_contract("stellar:testnet", &tokens[0]).unwrap();
         let usdc = provider::token_contract("stellar:testnet", &tokens[1]).unwrap();
-        let config = |asset: &str| serde_json::json!({"asset":asset,"gasRates":{"USDC":"0.15"}});
+        let config =
+            |asset: &str| serde_json::json!({"asset":asset,"gasRates":{usdc.as_str():"0.15"}});
         assert_eq!(
             hooks
                 .charged_fee("stellar:testnet", &config(&xlm), &receipt(1_234))
@@ -918,6 +929,54 @@ mod tests {
                     &serde_json::json!({"asset":usdc}),
                     &receipt(1)
                 )
+                .is_err()
+        );
+    }
+
+    /// A fee is priced by the rate that the server keys by the wallet's asset, its contract id.
+    /// No list of known assets decides: an issued asset outside the list takes its rate, and a
+    /// ticker names no asset. XLM, the network's own asset, is one to one.
+    #[test]
+    fn a_fee_is_priced_by_the_rate_of_the_wallets_asset() {
+        let hooks = PLUGIN.server();
+        let network = "stellar:testnet";
+        let issued = |code: &str| {
+            let issuer = crate::account_for_seed(&[40; 32]);
+            crate::sac_address(
+                network,
+                &crate::asset_from_identity(code, Some(&issuer)).unwrap(),
+            )
+            .unwrap()
+        };
+        let foo = issued("FOO");
+        let usdc = provider::token_contract(network, &provider::tokens_for(network)[1]).unwrap();
+        let xlm = crate::sac_address(network, &stellar_xdr::Asset::Native).unwrap();
+        let rates = |key: &str| serde_json::json!({"gasRates": {key: "0.15"}});
+        assert_eq!(
+            hooks.price_fee(network, &rates(&foo), &foo, 1_000).unwrap(),
+            150
+        );
+        assert_eq!(
+            hooks
+                .price_fee(network, &rates(&usdc), &usdc, 1_000)
+                .unwrap(),
+            150
+        );
+        assert_eq!(
+            hooks
+                .price_fee(network, &serde_json::json!({}), &xlm, 1_000)
+                .unwrap(),
+            1_000
+        );
+        // A rate under a ticker prices no asset, a listed one neither.
+        assert!(
+            hooks
+                .price_fee(network, &rates("USDC"), &usdc, 1_000)
+                .is_err()
+        );
+        assert!(
+            hooks
+                .price_fee(network, &rates("FOO"), &foo, 1_000)
                 .is_err()
         );
     }

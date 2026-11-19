@@ -209,6 +209,119 @@ fn status(v: native::OperationStatus) -> Status {
 #[derive(Clone, Debug)]
 pub struct PreparationCapability(PreparedOperation);
 
+/// What a verified receipt changes, by the wallet's custody (`contract`: a policy wallet). A
+/// confirmed transaction executed the operation. A failed one ends a keypair wallet's operation,
+/// whose transaction consumed its sequence; it leaves a contract wallet's operation open, since
+/// the wallet's authorization can still run in another envelope. A keypair wallet's server keeps
+/// its nonce, one more after each executed operation. A contract wallet counts its own gas and
+/// repays it to the sending account: the gas it counted is the receipt's charged units (none for
+/// a failed transaction), and the server's carry takes what it repaid less the fee that the
+/// ledger charged, at least zero. The fee that the operation's wallet is charged: a keypair
+/// wallet's account pays its transaction's fee, which the receipt reports as zero when a
+/// settlement service paid it; a contract wallet pays what it repaid to the sending account,
+/// nothing when its envelope failed. A Stellar transaction carries one operation.
+fn settlement_of(
+    contract: bool,
+    transaction: [u8; 32],
+    info: &ReceiptInfo,
+    usage: Option<Usage>,
+    accounting: Option<&Accounting>,
+    carry: u128,
+) -> Result<Settlement> {
+    let outcome = match info.status {
+        Status::Confirmed => OperationOutcome::Executed,
+        Status::Failed if contract => OperationOutcome::Open,
+        Status::Failed => OperationOutcome::Failed,
+        _ => return Err(Error::config("A receipt holds a final status")),
+    };
+    let executed = outcome == OperationOutcome::Executed;
+    // A keypair wallet's server keeps its nonce: its receipt needs the server's account.
+    let next_nonce = match (contract, accounting) {
+        (true, _) => None,
+        (false, None) => {
+            return Err(Error::config(
+                "The receipt of a keypair wallet needs the server's account of the wallet",
+            ));
+        }
+        (false, Some(a)) if executed => Some(
+            a.nonce
+                .checked_add(1)
+                .ok_or_else(|| Error::config("The wallet's nonce is out of range"))?,
+        ),
+        (false, Some(a)) => Some(a.nonce),
+    };
+    // The carry moves by what the wallet repaid less the ledger fee, down to zero; only a carry
+    // that its result cannot hold is out of range.
+    let gas_carry = match (contract && executed, info.fee) {
+        (true, fee) if fee.repaid_native_units >= fee.native_units => carry
+            .checked_add(fee.repaid_native_units - fee.native_units)
+            .ok_or_else(|| Error::config("The gas carry is out of range"))?,
+        (true, fee) => carry.saturating_sub(fee.native_units - fee.repaid_native_units),
+        (false, _) => carry,
+    };
+    let fee_units = if contract {
+        if executed {
+            info.fee.repaid_native_units
+        } else {
+            0
+        }
+    } else {
+        info.fee.native_units
+    };
+    Ok(Settlement {
+        transaction: transaction.to_vec(),
+        outcome,
+        fee_units,
+        usage: if contract && executed { usage } else { None },
+        counted_gas: contract.then_some(if executed { info.fee.charged_units } else { 0 }),
+        next_nonce,
+        gas_carry,
+    })
+}
+/// The expense of `action` with the worst-case `conversion` that the vault valued: see
+/// `RuntimeProvider::expense`.
+fn expense_of(action: &Action, conversion: i128, ceiling: &FeeCeiling) -> Result<ExpenseBound> {
+    let principal = match action {
+        Action::Transfer { units, .. } => *units,
+        Action::Deposit { .. } | Action::Redeem { .. } => conversion,
+    };
+    // A Stellar transaction declares its fee in 32 bits and pays at least the inclusion fee, and
+    // its expense names a ledger sequence: another ceiling cannot be signed.
+    if ceiling.day > u64::MAX / allowit_core::DAY {
+        return Err(Error::coded(
+            UNSIGNABLE_CEILING,
+            "The day of the fee ceiling is no UTC day",
+        ));
+    }
+    if ceiling.observed_height == 0 || u32::try_from(ceiling.observed_height).is_err() {
+        return Err(Error::coded(
+            UNSIGNABLE_CEILING,
+            "The observed ledger of the fee ceiling is no Stellar ledger",
+        ));
+    }
+    if ceiling.max_fee_units < u128::from(native::INCLUSION_FEE_STROOPS) {
+        return Err(Error::coded(
+            UNSIGNABLE_CEILING,
+            "The fee ceiling is below the inclusion fee of a Stellar transaction",
+        ));
+    }
+    if ceiling.max_fee_units > u128::from(u32::MAX) {
+        return Err(Error::coded(
+            UNSIGNABLE_CEILING,
+            "The fee ceiling is above what a Stellar transaction can declare",
+        ));
+    }
+    Ok(ExpenseBound {
+        gas_units: ceiling.gas_units,
+        conversion_units: conversion,
+        spent_units: principal
+            .checked_add(ceiling.gas_units)
+            .ok_or_else(|| Error::config("The operation amount overflows."))?,
+        max_fee_units: ceiling.max_fee_units,
+        observed_height: ceiling.observed_height,
+        day: ceiling.day,
+    })
+}
 fn prepared(p: &Prepared) -> Result<PreparedOperation> {
     let v = if let Some(capability) = p.0.capability::<PreparationCapability>() {
         let original = &capability.0;
@@ -418,6 +531,11 @@ pub struct Provider {
 /// policy wallet operation or code upload, pays its fee and receives its gas, and the
 /// signature of a transaction hash with an account's key.
 pub type Sender = std::sync::Arc<dyn SendingAccounts>;
+/// The code of the refusal of a retained packet of a historical route (`Odc`): such a packet only
+/// reads its status, and settles nothing.
+pub const RETIRED_ROUTE: &str = "retired_route";
+/// The code of the refusal of a fee ceiling that no Stellar transaction of the wallet can carry.
+pub const UNSIGNABLE_CEILING: &str = "fee_ceiling_unsignable";
 pub use crate::host::runtime::SendingAccounts;
 /// The fee that the signed transaction envelope `xdr` declares, in stroops: the most that the
 /// ledger charges its source.
@@ -838,6 +956,27 @@ impl Provider {
     fn rpc(&self) -> &dyn rpc::Rpc {
         self.runtime.rpc()
     }
+    /// The vault's value of `shares` in asset units. The read simulates from an account that
+    /// exists: the sending account of a policy wallet, or the keypair wallet itself. A failure to
+    /// reach that account is the outer error, and the vault's own refusal to value the shares the
+    /// inner one; `expense` counts a deposit whole on either, as the server does.
+    fn vault_value(&self, i: &Installation, vault: &str, shares: i128) -> Result<Result<i128>> {
+        let c = self.fresh(i)?;
+        let source = if c.route == WalletRoute::PolicyWallet {
+            checked(rpc::get_account(self.rpc(), &self.sending_account()?))?
+        } else {
+            checked(rpc::trusted_state_for_discovery(self.rpc(), &c, None))?
+                .state
+                .source
+        };
+        Ok(checked(rpc::vault_redeemable(
+            self.rpc(),
+            &c,
+            &source,
+            vault,
+            shares,
+        )))
+    }
     fn network(&self, network: &str) -> Result<()> {
         if crate::host::routing::normalize(network)? != self.network {
             Err(Error::config(
@@ -1209,23 +1348,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         })
     }
     fn redeemable(&self, i: &Installation, vault: &str, shares: i128) -> Result<i128> {
-        let c = self.fresh(i)?;
-        // The read simulates from an account that exists: the sending account of a policy
-        // wallet, or the keypair wallet itself.
-        let source = if c.route == WalletRoute::PolicyWallet {
-            checked(rpc::get_account(self.rpc(), &self.sending_account()?))?
-        } else {
-            checked(rpc::trusted_state_for_discovery(self.rpc(), &c, None))?
-                .state
-                .source
-        };
-        checked(rpc::vault_redeemable(
-            self.rpc(),
-            &c,
-            &source,
-            vault,
-            shares,
-        ))
+        self.vault_value(i, vault, shares)?
     }
     fn finish<'a>(
         &self,
@@ -1601,6 +1724,120 @@ impl crate::host::vendors::RuntimeProvider for Provider {
             expires_at,
             since,
         ))
+    }
+    /// What a receipt changes: the outcome by the wallet's custody, a keypair wallet's next nonce,
+    /// a contract wallet's gas carry, counted gas and usage. See [`settlement_of`].
+    fn settle_receipt(
+        &self,
+        p: &Prepared,
+        signed: &Signed,
+        r: &Receipt,
+        accounting: Option<&Accounting>,
+        carry: u128,
+    ) -> Result<Settlement> {
+        for network in [p.network(), signed.network(), r.network()] {
+            self.network(network)?;
+        }
+        let operation = prepared(p)?;
+        // A retained packet of the historical route only reads its status.
+        if operation.config.route == WalletRoute::Odc {
+            return Err(Error::coded(
+                RETIRED_ROUTE,
+                "A retained packet of a historical route settles nothing; it only reads its status.",
+            ));
+        }
+        // The receipt is of `signed`'s transaction, or of the transaction that settled it.
+        verify_receipt(&r.0, &signed.0)?;
+        // `signed` carries the operation of `p`: its whole preparation, the wallet, the operation
+        // ID, the request and the signed terms included. The envelope can differ, as another
+        // envelope of a contract wallet's authorization.
+        if self::signed(signed)?.prepared != operation {
+            return Err(Error::config(
+                "The signed transaction carries another operation than the prepared one",
+            ));
+        }
+        let receipt: rpc::VerifiedReceipt = decode_packet(&r.0)?;
+        let info = receipt_info(&r.0)?;
+        let usage = if operation.config.route == WalletRoute::PolicyWallet
+            && info.status == Status::Confirmed
+        {
+            self.usage(p)?
+        } else {
+            None
+        };
+        settlement_of(
+            operation.config.route == WalletRoute::PolicyWallet,
+            receipt.transaction_hash,
+            &info,
+            usage,
+            accounting,
+            carry,
+        )
+    }
+    /// An operation's expense bound: the principal of a transfer is its amount; a vault
+    /// operation's is its worst-case conversion, which the vault values from the account that the
+    /// operation is read from. A deposit whose shares the vault cannot value, or whose valuation
+    /// cannot be read, counts its whole assets, as the server counts it; a redeem whose shares it
+    /// cannot value is refused. An action or a ceiling with a negative amount is refused.
+    fn expense(
+        &self,
+        i: &Installation,
+        action: &Action,
+        ceiling: &FeeCeiling,
+    ) -> Result<ExpenseBound> {
+        let c = self.config(i)?;
+        let amounts = match action {
+            Action::Transfer { units, .. } => [*units, 0],
+            Action::Deposit {
+                assets, min_shares, ..
+            } => [*assets, *min_shares],
+            Action::Redeem {
+                shares, min_assets, ..
+            } => [*shares, *min_assets],
+        };
+        if amounts.iter().chain([&ceiling.gas_units]).any(|a| *a < 0) {
+            return Err(Error::usage("An expense amount is negative"));
+        }
+        // A policy wallet of XLM counts the fee that it repays one to one: its signing check
+        // refuses any other gas.
+        if c.route == WalletRoute::PolicyWallet
+            && checked(native::asset_xdr(&c))? == stellar_xdr::Asset::Native
+            && u128::try_from(ceiling.gas_units).ok() != Some(ceiling.max_fee_units)
+        {
+            return Err(Error::coded(
+                UNSIGNABLE_CEILING,
+                "An XLM wallet counts its fee one to one: the gas of the ceiling differs from its fee.",
+            ));
+        }
+        let conversion = match action {
+            Action::Transfer { .. } => 0,
+            Action::Deposit {
+                vault,
+                assets,
+                min_shares,
+            } => {
+                let floor = self
+                    .vault_value(i, vault, *min_shares)
+                    .ok()
+                    .and_then(|value| value.ok())
+                    .unwrap_or(0)
+                    .clamp(0, *assets);
+                assets - floor
+            }
+            Action::Redeem {
+                vault,
+                shares,
+                min_assets,
+            } => {
+                let value = self.vault_value(i, vault, *shares)?.map_err(|_| {
+                    Error::config(
+                        "The vault cannot value these shares, so the redeem cannot be priced.",
+                    )
+                })?;
+                value.saturating_sub(*min_assets).max(0)
+            }
+        };
+        expense_of(action, conversion, ceiling)
     }
     fn usage(&self, p: &Prepared) -> Result<Option<Usage>> {
         self.network(p.network())?;
@@ -3609,5 +3846,643 @@ mod keypair_wallet_owner_tests {
                     .is_err()
             );
         }
+    }
+}
+
+/// What a receipt changes, and an operation's expense bound: the rules that the server kept in
+/// its own code until TASK-1263, with its cases.
+#[cfg(test)]
+mod settlement {
+    use super::*;
+    fn receipt(status: Status, native: u128, charged: i128, repaid: u128) -> ReceiptInfo {
+        ReceiptInfo {
+            transaction_hash: [7; 32],
+            status,
+            observed_height: 10,
+            fee: crate::host::runtime::Fee {
+                native_units: native,
+                charged_units: charged,
+                repaid_native_units: repaid,
+            },
+            debits: Vec::new(),
+            settlement_hash: None,
+        }
+    }
+    fn accounting(nonce: u64) -> Accounting {
+        Accounting {
+            nonce,
+            ..Accounting::default()
+        }
+    }
+    const USAGE: Usage = Usage {
+        amount_units: 2_000,
+        gas_units: 136,
+        spent_units: 2_136,
+        unpriced: false,
+    };
+    /// A contract wallet's confirmed operation executed: its usage counts, the gas it counted is
+    /// the receipt's charged units, and the carry takes what it repaid less the fee charged.
+    #[test]
+    fn a_contract_wallets_confirmed_operation_executed_and_moves_the_carry() {
+        let s = settlement_of(
+            true,
+            [9; 32],
+            &receipt(Status::Confirmed, 100, 136, 150),
+            Some(USAGE),
+            None,
+            20,
+        )
+        .unwrap();
+        assert_eq!(s.transaction, vec![9; 32]);
+        assert_eq!(s.outcome, OperationOutcome::Executed);
+        assert_eq!(s.usage, Some(USAGE));
+        assert_eq!(s.counted_gas, Some(136));
+        assert_eq!(s.next_nonce, None);
+        // The wallet is charged what it repaid.
+        assert_eq!(s.fee_units, 150);
+        // 20 + 150 − 100.
+        assert_eq!(s.gas_carry, 70);
+        // A fee above the carry and the repayment leaves no carry, never a debt.
+        let s = settlement_of(
+            true,
+            [9; 32],
+            &receipt(Status::Confirmed, 500, 0, 150),
+            None,
+            None,
+            20,
+        )
+        .unwrap();
+        assert_eq!((s.gas_carry, s.counted_gas), (0, Some(0)));
+    }
+    /// A contract wallet's failed envelope leaves the operation open: its authorization can run
+    /// in another envelope. Nothing counts and the carry stays.
+    #[test]
+    fn a_contract_wallets_failed_envelope_leaves_the_operation_open() {
+        let s = settlement_of(
+            true,
+            [9; 32],
+            &receipt(Status::Failed, 100, 136, 0),
+            Some(USAGE),
+            None,
+            20,
+        )
+        .unwrap();
+        assert_eq!(s.outcome, OperationOutcome::Open);
+        assert_eq!(s.fee_units, 0);
+        assert_eq!((s.usage, s.counted_gas, s.gas_carry), (None, Some(0), 20));
+    }
+    /// A keypair wallet's server keeps its nonce and prices its fee: an executed operation takes
+    /// the next nonce, a failed one ends the operation and keeps it, and neither counts gas.
+    #[test]
+    fn a_keypair_wallets_operation_moves_the_servers_nonce() {
+        let done = settlement_of(
+            false,
+            [9; 32],
+            &receipt(Status::Confirmed, 100, 0, 0),
+            None,
+            Some(&accounting(4)),
+            0,
+        )
+        .unwrap();
+        assert_eq!(done.outcome, OperationOutcome::Executed);
+        assert_eq!(
+            (done.next_nonce, done.counted_gas, done.usage),
+            (Some(5), None, None)
+        );
+        // The keypair wallet's account paid its transaction's fee.
+        assert_eq!(done.fee_units, 100);
+        let failed = settlement_of(
+            false,
+            [9; 32],
+            &receipt(Status::Failed, 100, 0, 0),
+            None,
+            Some(&accounting(4)),
+            0,
+        )
+        .unwrap();
+        assert_eq!(failed.outcome, OperationOutcome::Failed);
+        assert_eq!(failed.next_nonce, Some(4));
+        // A keypair wallet's receipt without the server's account is refused.
+        assert!(
+            settlement_of(
+                false,
+                [9; 32],
+                &receipt(Status::Confirmed, 100, 0, 0),
+                None,
+                None,
+                0
+            )
+            .is_err()
+        );
+        // A receipt without a final status settles nothing.
+        assert!(
+            settlement_of(
+                false,
+                [9; 32],
+                &receipt(Status::Submitted, 0, 0, 0),
+                None,
+                None,
+                0
+            )
+            .is_err()
+        );
+    }
+    /// The expense bound: a transfer spends its amount and the fee ceiling; a vault operation
+    /// spends its worst-case conversion and the ceiling.
+    #[test]
+    fn an_expense_counts_the_principal_and_the_fee_ceiling() {
+        let ceiling = FeeCeiling {
+            max_fee_units: 1_000,
+            gas_units: 2,
+            observed_height: 50,
+            day: 9,
+        };
+        let transfer = Action::Transfer {
+            recipient: String::new(),
+            units: 100,
+        };
+        let e = expense_of(&transfer, 0, &ceiling).unwrap();
+        assert_eq!(
+            (
+                e.spent_units,
+                e.conversion_units,
+                e.gas_units,
+                e.max_fee_units,
+                e.day
+            ),
+            (102, 0, 2, 1_000, 9)
+        );
+        let deposit = Action::Deposit {
+            vault: String::new(),
+            assets: 100,
+            min_shares: 1,
+        };
+        // A deposit of 100 whose shares redeem for at least 95 spends 5 and the ceiling.
+        assert_eq!(expense_of(&deposit, 5, &ceiling).unwrap().spent_units, 7);
+        // The ceiling keeps its width; one above what a transaction can declare is refused.
+        let wide = FeeCeiling {
+            max_fee_units: u128::from(u32::MAX),
+            ..ceiling
+        };
+        assert_eq!(
+            expense_of(&transfer, 0, &wide).unwrap().max_fee_units,
+            u128::from(u32::MAX)
+        );
+        let wider = FeeCeiling {
+            max_fee_units: u128::from(u32::MAX) + 1,
+            ..ceiling
+        };
+        assert!(expense_of(&transfer, 0, &wider).is_err());
+    }
+}
+
+/// The settlement, expense and fee hooks as a server calls them: through the public methods,
+/// with retained packets and an RPC endpoint that answers no read.
+#[cfg(test)]
+mod settlement_api {
+    use super::*;
+    use crate::host::vendors::RuntimeProvider;
+    use std::sync::Arc;
+    const NETWORK: &str = "stellar:testnet";
+    /// An endpoint that answers no read.
+    struct Unreachable;
+    impl rpc::Rpc for Unreachable {
+        fn call(&self, method: &str, _: serde_json::Value) -> native::Result<serde_json::Value> {
+            Err(format!("{method}: the endpoint is unreachable"))
+        }
+    }
+    /// The server's sending account, which signs nothing here.
+    struct Account(String);
+    impl SendingAccounts for Account {
+        fn account(&self) -> Result<String> {
+            Ok(self.0.clone())
+        }
+        fn sign(&self, _: &str, _: &[u8; 32]) -> Result<Vec<u8>> {
+            Err(Error::unsupported("This sending account signs nothing"))
+        }
+    }
+    fn provider() -> Provider {
+        Provider::from_rpc(NETWORK, Arc::new(Unreachable))
+            .with_sender(Arc::new(Account(native::account_for_seed(&[10; 32]))))
+    }
+    fn restored(kind: Kind, value: &serde_json::Value) -> Packet {
+        restore(kind, RawValue::from_string(value.to_string()).unwrap()).unwrap()
+    }
+    fn of(value: &impl Serialize) -> serde_json::Value {
+        serde_json::to_value(value).unwrap()
+    }
+    fn accounting(nonce: u64) -> Accounting {
+        Accounting {
+            nonce,
+            ..Accounting::default()
+        }
+    }
+    /// One transfer of a Standard policy wallet on Stellar Testnet, as a server retained it:
+    /// the preparation, the signed envelope and the receipt of its confirmed transaction.
+    fn standard() -> (Prepared, Signed, Receipt) {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/provider/stellar-testnet-standard-transfer-settled.json"
+        ))
+        .unwrap();
+        (
+            Prepared(restored(Kind::Prepared, &fixture["prepared"])),
+            Signed(restored(Kind::Signed, &fixture["signed"])),
+            Receipt(restored(Kind::Receipt, &fixture["receipt"])),
+        )
+    }
+    /// A keypair wallet's signed transfer and the receipt of its confirmed transaction.
+    fn keypair() -> (SignedOperation, Signed, Receipt) {
+        let signed = crate::test_support::native_signed();
+        let receipt = crate::test_support::confirmed_payment_receipt(&signed, 9, 100);
+        let packet = Signed(restored(Kind::Signed, &of(&signed)));
+        let receipt = Receipt(super::packet(NETWORK, &receipt).unwrap());
+        (signed, packet, receipt)
+    }
+    /// A transfer of another keypair wallet under the operation ID of `p`.
+    fn other_wallet(p: &PreparedOperation) -> PreparedOperation {
+        let wallet = native::account_for_seed(&[30; 32]);
+        let mut c = p.config.clone();
+        c.wallet = wallet.clone();
+        c.owner = wallet.clone();
+        let mut state = p.state.clone();
+        state.source.address = wallet;
+        let request = crate::request::transfer(
+            &c,
+            &state,
+            p.request.operation.nonce,
+            &native::account_for_seed(&[31; 32]),
+            20_000_000,
+        )
+        .unwrap();
+        crate::prepare(&c, &request, &state, p.created_at, p.expires_at).unwrap()
+    }
+
+    /// A receipt settles the operation of the wallet whose envelope it verified, and no
+    /// operation of another wallet under the same operation ID.
+    #[test]
+    fn a_receipt_settles_only_the_operation_of_its_own_wallet() {
+        let (signed, packet, receipt) = keypair();
+        let own = Prepared(restored(Kind::Prepared, &of(&signed.prepared)));
+        let settled = provider()
+            .settle_receipt(&own, &packet, &receipt, Some(&accounting(9)), 0)
+            .unwrap();
+        assert_eq!(settled.outcome, OperationOutcome::Executed);
+        assert_eq!(settled.next_nonce, Some(10));
+        let other = other_wallet(&signed.prepared);
+        assert_eq!(
+            other.request.operation.nonce,
+            signed.prepared.request.operation.nonce
+        );
+        assert_ne!(other.config.wallet, signed.prepared.config.wallet);
+        let other = Prepared(restored(Kind::Prepared, &of(&other)));
+        assert!(
+            provider()
+                .settle_receipt(&other, &packet, &receipt, Some(&accounting(9)), 0)
+                .is_err()
+        );
+    }
+
+    /// A receipt settles no other operation of its own wallet under the same operation ID: the
+    /// signed envelope carries the preparation of the operation, whole.
+    #[test]
+    fn a_receipt_settles_no_other_operation_of_its_wallet_under_the_same_id() {
+        let (signed, packet, receipt) = keypair();
+        let p = &signed.prepared;
+        let request = crate::request::transfer(
+            &p.config,
+            &p.state,
+            p.request.operation.nonce,
+            &native::account_for_seed(&[31; 32]),
+            10_000_000,
+        )
+        .unwrap();
+        let other =
+            crate::prepare(&p.config, &request, &p.state, p.created_at, p.expires_at).unwrap();
+        assert_eq!(
+            (other.config.wallet.as_str(), other.request.operation.nonce),
+            (p.config.wallet.as_str(), p.request.operation.nonce)
+        );
+        assert_ne!(other.request, p.request);
+        let other = Prepared(restored(Kind::Prepared, &of(&other)));
+        assert!(
+            provider()
+                .settle_receipt(&other, &packet, &receipt, Some(&accounting(9)), 0)
+                .is_err()
+        );
+    }
+
+    /// A retained packet of the historical route `Odc` settles nothing: the refusal is typed.
+    #[test]
+    fn a_receipt_of_the_historical_route_is_refused_with_its_code() {
+        let signed: SignedOperation = serde_json::from_str(include_str!(
+            "../../tests/fixtures/canonical-main-9682-odc-signed.json"
+        ))
+        .unwrap();
+        assert_eq!(signed.prepared.config.route, WalletRoute::Odc);
+        let receipt = crate::test_support::confirmed_payment_receipt(&signed, 9, 100);
+        let error = provider()
+            .settle_receipt(
+                &Prepared(restored(Kind::Prepared, &of(&signed.prepared))),
+                &Signed(restored(Kind::Signed, &of(&signed))),
+                &Receipt(super::packet(NETWORK, &receipt).unwrap()),
+                Some(&accounting(9)),
+                0,
+            )
+            .unwrap_err();
+        assert_eq!(error.api_code.as_deref(), Some(RETIRED_ROUTE));
+    }
+
+    /// A contract wallet's confirmed transfer: the receipt's charged units are the gas it
+    /// counted, what it repaid is its fee, and the carry takes the repayment less the ledger fee,
+    /// also when the server keeps an account of the wallet. A carry whose sum would pass the
+    /// widest value before the ledger fee comes off still settles.
+    #[test]
+    fn a_contract_wallets_receipt_moves_the_carry_without_overflow() {
+        let (p, signed, receipt) = standard();
+        let fee = receipt.info().unwrap().fee;
+        assert!(fee.repaid_native_units > fee.native_units);
+        let surplus = fee.repaid_native_units - fee.native_units;
+        let settled = provider()
+            .settle_receipt(&p, &signed, &receipt, Some(&accounting(4)), 0)
+            .unwrap();
+        assert_eq!(
+            (
+                settled.outcome,
+                settled.next_nonce,
+                settled.fee_units,
+                settled.counted_gas,
+                settled.gas_carry
+            ),
+            (
+                OperationOutcome::Executed,
+                None,
+                fee.repaid_native_units,
+                Some(fee.charged_units),
+                surplus
+            )
+        );
+        // The transfer of 2,000,000 units, with the gas that the wallet counted.
+        let usage = Usage {
+            amount_units: 2_000_000,
+            gas_units: 154_039,
+            spent_units: 2_154_039,
+            unpriced: false,
+        };
+        assert_eq!(fee.charged_units, usage.gas_units);
+        assert_eq!(settled.usage, Some(usage));
+        assert_eq!(settled.usage_for(0), Some(usage));
+        let settled = provider()
+            .settle_receipt(&p, &signed, &receipt, None, u128::MAX - surplus)
+            .unwrap();
+        assert_eq!(settled.gas_carry, u128::MAX);
+    }
+
+    fn installation() -> Installation {
+        let (p, _, _) = standard();
+        let config = prepared(&p).unwrap().config;
+        super::installation(
+            &super::super::server_owner::configuration(
+                NETWORK,
+                &serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap(),
+        )
+    }
+    /// The fee ceiling of the XLM Standard wallet: 1,000 stroops, which it counts one to one.
+    const CEILING: FeeCeiling = FeeCeiling {
+        max_fee_units: 1_000,
+        gas_units: 1_000,
+        observed_height: 9,
+        day: 1,
+    };
+
+    /// A policy wallet of XLM counts the fee that it repays one to one, as its signing check
+    /// requires: a ceiling whose gas differs from its fee is refused with a typed error, before
+    /// any read.
+    #[test]
+    fn an_xlm_wallets_ceiling_counts_its_fee_one_to_one() {
+        let i = installation();
+        let transfer = Action::Transfer {
+            recipient: native::account_for_seed(&[31; 32]),
+            units: 100,
+        };
+        let bound = provider().expense(&i, &transfer, &CEILING).unwrap();
+        assert_eq!(
+            (bound.gas_units, bound.max_fee_units, bound.spent_units),
+            (1_000, 1_000, 1_100)
+        );
+        for gas_units in [2, 0, 1_001] {
+            let ceiling = FeeCeiling {
+                gas_units,
+                ..CEILING
+            };
+            let error = provider().expense(&i, &transfer, &ceiling).unwrap_err();
+            assert_eq!(
+                error.api_code.as_deref(),
+                Some(UNSIGNABLE_CEILING),
+                "{gas_units}"
+            );
+        }
+    }
+
+    /// An expense of a negative amount is refused before any read.
+    #[test]
+    fn an_expense_of_a_negative_amount_is_refused() {
+        let i = installation();
+        let vault = crate::test_support::vault(0);
+        for action in [
+            Action::Transfer {
+                recipient: native::account_for_seed(&[31; 32]),
+                units: -1,
+            },
+            Action::Deposit {
+                vault: vault.clone(),
+                assets: -1,
+                min_shares: 1,
+            },
+            Action::Deposit {
+                vault: vault.clone(),
+                assets: 100,
+                min_shares: -1,
+            },
+            Action::Redeem {
+                vault: vault.clone(),
+                shares: -1,
+                min_assets: 1,
+            },
+            Action::Redeem {
+                vault: vault.clone(),
+                shares: 100,
+                min_assets: -1,
+            },
+        ] {
+            let error = provider().expense(&i, &action, &CEILING).unwrap_err();
+            assert!(error.message.contains("negative"), "{action:?}: {error:?}");
+        }
+        let negative_gas = FeeCeiling {
+            gas_units: -1,
+            ..CEILING
+        };
+        let transfer = Action::Transfer {
+            recipient: native::account_for_seed(&[31; 32]),
+            units: 100,
+        };
+        assert!(provider().expense(&i, &transfer, &negative_gas).is_err());
+    }
+
+    /// An endpoint that holds the server's sending account and values `n` of a vault's shares at
+    /// `n` less `self.0` asset units.
+    struct Vault(i128);
+    impl rpc::Rpc for Vault {
+        fn call(
+            &self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> native::Result<serde_json::Value> {
+            use stellar_xdr as x;
+            Ok(match method {
+                "getNetwork" => serde_json::json!({"passphrase": native::passphrase(NETWORK)?}),
+                "getLatestLedger" => serde_json::json!({"sequence": 120}),
+                "getLedgerEntries" => {
+                    let key = native::account_key(&native::account_for_seed(&[10; 32]))?;
+                    let entry = x::LedgerEntryData::Account(x::AccountEntry {
+                        account_id: x::AccountId(x::PublicKey::PublicKeyTypeEd25519(x::Uint256(
+                            key,
+                        ))),
+                        seq_num: x::SequenceNumber(41),
+                        balance: 1_000_000_000,
+                        thresholds: x::Thresholds([1, 0, 0, 0]),
+                        ..Default::default()
+                    });
+                    serde_json::json!({"latestLedger": 120, "entries": [{
+                        "key": params["keys"][0], "xdr": native::xdr(&entry)?, "liveUntilLedgerSeq": 520
+                    }]})
+                }
+                "simulateTransaction" => {
+                    let x::TransactionEnvelope::Tx(envelope) =
+                        native::read(params["transaction"].as_str().unwrap())?
+                    else {
+                        unreachable!()
+                    };
+                    let x::OperationBody::InvokeHostFunction(op) = &envelope.tx.operations[0].body
+                    else {
+                        unreachable!()
+                    };
+                    let x::HostFunction::InvokeContract(call) = &op.host_function else {
+                        unreachable!()
+                    };
+                    let x::ScVal::I128(shares) = &call.args[0] else {
+                        unreachable!()
+                    };
+                    let value = x::ScVal::I128(x::Int128Parts {
+                        hi: 0,
+                        lo: shares.lo - u64::try_from(self.0).unwrap(),
+                    });
+                    serde_json::json!({"latestLedger": 120,
+                        "results": [{"xdr": native::xdr(&value)?, "auth": []}]})
+                }
+                _ => return Err(format!("Unexpected call {method}")),
+            })
+        }
+    }
+
+    /// A vault operation's principal is its worst-case conversion, as the vault values it: a
+    /// deposit of 100 whose least shares redeem for 55 loses 45, and a redeem of shares worth 95
+    /// that accepts 90 loses 5; each spends its loss and the gas of the ceiling.
+    #[test]
+    fn a_vault_operation_spends_the_conversion_that_the_vault_values() {
+        let i = installation();
+        let reading = Provider::from_rpc(NETWORK, Arc::new(Vault(5)))
+            .with_sender(Arc::new(Account(native::account_for_seed(&[10; 32]))));
+        let vault = crate::test_support::vault(0);
+        for (action, loss) in [
+            (
+                Action::Deposit {
+                    vault: vault.clone(),
+                    assets: 100,
+                    min_shares: 60,
+                },
+                45,
+            ),
+            (
+                Action::Redeem {
+                    vault: vault.clone(),
+                    shares: 100,
+                    min_assets: 90,
+                },
+                5,
+            ),
+        ] {
+            let bound = reading.expense(&i, &action, &CEILING).unwrap();
+            assert_eq!(
+                (bound.conversion_units, bound.spent_units),
+                (loss, loss + 1_000),
+                "{action:?}"
+            );
+        }
+    }
+
+    /// A ceiling that a Stellar transaction cannot carry is refused: a fee below the inclusion
+    /// fee or wider than 32 bits, an observed ledger that is none or wider than a ledger
+    /// sequence, and a day after the last UTC day of a Unix time.
+    #[test]
+    fn an_expense_ceiling_that_stellar_cannot_sign_is_refused() {
+        let i = installation();
+        let transfer = Action::Transfer {
+            recipient: native::account_for_seed(&[31; 32]),
+            units: 100,
+        };
+        assert!(provider().expense(&i, &transfer, &CEILING).is_ok());
+        for ceiling in [
+            FeeCeiling {
+                max_fee_units: u128::from(native::INCLUSION_FEE_STROOPS) - 1,
+                ..CEILING
+            },
+            FeeCeiling {
+                observed_height: 0,
+                ..CEILING
+            },
+            FeeCeiling {
+                observed_height: u64::from(u32::MAX) + 1,
+                ..CEILING
+            },
+            FeeCeiling {
+                max_fee_units: u128::from(u32::MAX) + 1,
+                ..CEILING
+            },
+            FeeCeiling {
+                day: u64::MAX / allowit_core::DAY + 1,
+                ..CEILING
+            },
+        ] {
+            assert!(
+                provider().expense(&i, &transfer, &ceiling).is_err(),
+                "{ceiling:?}"
+            );
+        }
+    }
+
+    /// A deposit whose shares cannot be valued, because the sending account cannot be read,
+    /// counts its whole assets, as the server counts them. A redeem is refused.
+    #[test]
+    fn a_deposit_counts_its_whole_assets_when_the_sending_account_cannot_be_read() {
+        let i = installation();
+        let vault = crate::test_support::vault(0);
+        let deposit = Action::Deposit {
+            vault: vault.clone(),
+            assets: 100,
+            min_shares: 1,
+        };
+        let bound = provider().expense(&i, &deposit, &CEILING).unwrap();
+        assert_eq!(
+            (bound.conversion_units, bound.spent_units, bound.gas_units),
+            (100, 1_100, 1_000)
+        );
+        let redeem = Action::Redeem {
+            vault,
+            shares: 100,
+            min_assets: 1,
+        };
+        assert!(provider().expense(&i, &redeem, &CEILING).is_err());
     }
 }

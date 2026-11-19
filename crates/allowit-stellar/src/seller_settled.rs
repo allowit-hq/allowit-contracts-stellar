@@ -1239,6 +1239,41 @@ mod tests {
         assert!(
             rpc::validate_settled_policy_packet(&test_support::policy_signed(), &receipt).is_err()
         );
+        // The server settles the authorization by the facilitator's transaction: that
+        // transaction's identity, and no fee for the wallet, which paid none.
+        use crate::host::runtime::{Accounting, Kind, OperationOutcome, Prepared, Receipt, Signed};
+        use crate::host::vendors::RuntimeProvider;
+        let restored = |kind, value: String| {
+            crate::provider::server::restore(
+                kind,
+                serde_json::value::RawValue::from_string(value).unwrap(),
+            )
+            .unwrap()
+        };
+        let settled = crate::provider::server::Provider::new(network, "https://rpc.example")
+            .unwrap()
+            .settle_receipt(
+                &Prepared(restored(Kind::Prepared, serde_json::to_string(&p).unwrap())),
+                &Signed(restored(
+                    Kind::Signed,
+                    serde_json::to_string(&signed).unwrap(),
+                )),
+                &Receipt(restored(
+                    Kind::Receipt,
+                    serde_json::to_string(&receipt).unwrap(),
+                )),
+                Some(&Accounting::default()),
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            (settled.outcome, settled.transaction, settled.fee_units),
+            (
+                OperationOutcome::Executed,
+                receipt.transaction_hash.to_vec(),
+                0
+            )
+        );
     }
 
     #[test]
