@@ -62,7 +62,8 @@ pub fn contract_exists(rpc: &dyn Rpc, network: &str, contract: &str) -> Result<b
 fn live_entry(rpc: &dyn Rpc, network: &str, key: LedgerKey) -> Result<bool> {
     let (live_until, closing) = observed_entry(rpc, network, &key)?;
     if live_until.is_some_and(|until| until < closing) {
-        return Err("Native resource is archived or expired at the closing observation".into());
+        // Nothing restores it.
+        return Err(super::CONTRACT_EXPIRED.into());
     }
     Ok(live_until.is_some())
 }

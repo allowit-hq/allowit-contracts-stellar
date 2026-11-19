@@ -1505,7 +1505,9 @@ impl Deployer<'_> {
         if let TransactionExt::V1(data) = &tx.ext
             && matches!(&data.ext, SorobanTransactionDataExt::V1(ext) if !ext.archived_soroban_entries.is_empty())
         {
-            return Err("The upload restores an archived entry: nothing restores lapsed code".into());
+            return Err(
+                "The upload restores an archived entry: nothing restores lapsed code".into(),
+            );
         }
         // An upload writes the code entry alone. Code that is live, for example because another
         // transaction uploaded it after it was read, is only read: nothing to upload or pay.
@@ -1733,7 +1735,9 @@ pub fn with_source_signature(
 /// ends at `expires_at`: Stellar reads a zero upper bound as no bound at all.
 fn code_time_bound(tx: &Transaction, expires_at: u64) -> Result<()> {
     match &tx.cond {
-        Preconditions::Time(time) if time.max_time.0 != 0 && time.max_time.0 == expires_at => Ok(()),
+        Preconditions::Time(time) if time.max_time.0 != 0 && time.max_time.0 == expires_at => {
+            Ok(())
+        }
         _ => Err("The code transaction's time bound differs from its expiry".into()),
     }
 }

@@ -1230,6 +1230,15 @@ pub fn deploy_policy<P: AllowitPolicy>(
         env.deployer()
             .update_current_contract(soroban_sdk::ContractExecutable::Wasm(hash));
     }
+    if upgrade {
+        // The owner pays to keep the code that the upgrade installs live, whatever its tier:
+        // the instance and that code live `TOTAL_LEDGERS - 1` ledgers.
+        env.deployer().extend_ttl(
+            env.current_contract_address(),
+            TOTAL_LEDGERS - 1,
+            TOTAL_LEDGERS - 1,
+        );
+    }
     Ok(())
 }
 /// Validation of a packet that installs new code: the new code checks its own rules on its next call.

@@ -605,103 +605,109 @@ impl rpc::Rpc for ModelChain {
             "getLedgerEntries" => {
                 let mut entries: Vec<Value> = Vec::new();
                 for encoded in params["keys"].as_array().unwrap() {
-                let encoded = encoded.as_str().unwrap();
-                let key: x::LedgerKey = de(encoded);
-                if m.failing_code_reads && matches!(key, x::LedgerKey::ContractCode(_)) {
-                    return Err("The RPC is unreachable".into());
-                }
-                let entry = match &key {
-                    x::LedgerKey::Account(a) => {
-                        let x::PublicKey::PublicKeyTypeEd25519(k) = &a.account_id.0;
-                        let address = stellar_strkey::ed25519::PublicKey(k.0).to_string();
-                        m.accounts.get(&address).map(account_entry)
+                    let encoded = encoded.as_str().unwrap();
+                    let key: x::LedgerKey = de(encoded);
+                    if m.failing_code_reads && matches!(key, x::LedgerKey::ContractCode(_)) {
+                        return Err("The RPC is unreachable".into());
                     }
-                    x::LedgerKey::ContractData(data) => m.wallet.as_ref().and_then(|w| {
-                        if data.contract != address(&w.address).unwrap() {
-                            return None;
+                    let entry = match &key {
+                        x::LedgerKey::Account(a) => {
+                            let x::PublicKey::PublicKeyTypeEd25519(k) = &a.account_id.0;
+                            let address = stellar_strkey::ed25519::PublicKey(k.0).to_string();
+                            m.accounts.get(&address).map(account_entry)
                         }
-                        let val = match &data.key {
-                            x::ScVal::LedgerKeyContractInstance => {
-                                x::ScVal::ContractInstance(x::ScContractInstance {
-                                    executable: x::ContractExecutable::Wasm(x::Hash(
-                                        *m.code
-                                            .iter()
-                                            .find(|(_, tier)| **tier == w.tier)
-                                            .unwrap()
-                                            .0,
-                                    )),
-                                    storage: Some(
-                                        vec![x::ScMapEntry {
-                                            key: x::ScVal::Symbol(x::ScSymbol(
-                                                b"c".to_vec().try_into().unwrap(),
-                                            )),
-                                            val: bytes(&packed::encode(&w.config).unwrap()),
-                                        }]
-                                        .try_into()
-                                        .unwrap(),
-                                    ),
-                                })
+                        x::LedgerKey::ContractData(data) => m.wallet.as_ref().and_then(|w| {
+                            if data.contract != address(&w.address).unwrap() {
+                                return None;
                             }
-                            x::ScVal::Symbol(s)
-                                if s.0.as_slice() == b"t"
-                                    && data.durability == x::ContractDataDurability::Persistent =>
-                            {
-                                bytes(&w.t_bytes()?)
-                            }
-                            x::ScVal::Symbol(s)
-                                if s.0.as_slice() == b"d"
-                                    && data.durability == x::ContractDataDurability::Temporary =>
-                            {
-                                // A temporary entry lives through its window's end ledger.
-                                if m.ledger > w.stored.daily?.0 {
-                                    return None;
+                            let val = match &data.key {
+                                x::ScVal::LedgerKeyContractInstance => {
+                                    x::ScVal::ContractInstance(x::ScContractInstance {
+                                        executable: x::ContractExecutable::Wasm(x::Hash(
+                                            *m.code
+                                                .iter()
+                                                .find(|(_, tier)| **tier == w.tier)
+                                                .unwrap()
+                                                .0,
+                                        )),
+                                        storage: Some(
+                                            vec![x::ScMapEntry {
+                                                key: x::ScVal::Symbol(x::ScSymbol(
+                                                    b"c".to_vec().try_into().unwrap(),
+                                                )),
+                                                val: bytes(&packed::encode(&w.config).unwrap()),
+                                            }]
+                                            .try_into()
+                                            .unwrap(),
+                                        ),
+                                    })
                                 }
-                                bytes(&w.d_bytes()?)
-                            }
-                            _ => return None,
-                        };
-                        Some(x::LedgerEntryData::ContractData(x::ContractDataEntry {
-                            ext: x::ExtensionPoint::V0,
-                            contract: data.contract.clone(),
-                            key: data.key.clone(),
-                            durability: data.durability,
-                            val,
-                        }))
-                    }),
-                    x::LedgerKey::ConfigSetting(x::LedgerKeyConfigSetting {
-                        config_setting_id: x::ConfigSettingId::StateArchival,
-                    }) => Some(x::LedgerEntryData::ConfigSetting(
-                        x::ConfigSettingEntry::StateArchival(x::StateArchivalSettings {
-                            max_entry_ttl: 3_110_400,
-                            min_persistent_ttl: m.persistent_lifetime.unwrap_or(120_960),
-                            ..Default::default()
+                                x::ScVal::Symbol(s)
+                                    if s.0.as_slice() == b"t"
+                                        && data.durability
+                                            == x::ContractDataDurability::Persistent =>
+                                {
+                                    bytes(&w.t_bytes()?)
+                                }
+                                x::ScVal::Symbol(s)
+                                    if s.0.as_slice() == b"d"
+                                        && data.durability
+                                            == x::ContractDataDurability::Temporary =>
+                                {
+                                    // A temporary entry lives through its window's end ledger.
+                                    if m.ledger > w.stored.daily?.0 {
+                                        return None;
+                                    }
+                                    bytes(&w.d_bytes()?)
+                                }
+                                _ => return None,
+                            };
+                            Some(x::LedgerEntryData::ContractData(x::ContractDataEntry {
+                                ext: x::ExtensionPoint::V0,
+                                contract: data.contract.clone(),
+                                key: data.key.clone(),
+                                durability: data.durability,
+                                val,
+                            }))
                         }),
-                    )),
-                    x::LedgerKey::ContractCode(code) => {
-                        m.code_bytes.get(&code.hash.0).map(|bytes| {
-                            x::LedgerEntryData::ContractCode(x::ContractCodeEntry {
-                                ext: x::ContractCodeEntryExt::V0,
-                                hash: code.hash.clone(),
-                                code: bytes.clone().try_into().unwrap(),
+                        x::LedgerKey::ConfigSetting(x::LedgerKeyConfigSetting {
+                            config_setting_id: x::ConfigSettingId::StateArchival,
+                        }) => Some(x::LedgerEntryData::ConfigSetting(
+                            x::ConfigSettingEntry::StateArchival(x::StateArchivalSettings {
+                                max_entry_ttl: 3_110_400,
+                                min_persistent_ttl: m.persistent_lifetime.unwrap_or(120_960),
+                                ..Default::default()
+                            }),
+                        )),
+                        x::LedgerKey::ContractCode(code) => {
+                            m.code_bytes.get(&code.hash.0).map(|bytes| {
+                                x::LedgerEntryData::ContractCode(x::ContractCodeEntry {
+                                    ext: x::ContractCodeEntryExt::V0,
+                                    hash: code.hash.clone(),
+                                    code: bytes.clone().try_into().unwrap(),
+                                })
                             })
-                        })
-                    }
-                    _ => None,
-                };
-                let live_until = match &key {
-                    x::LedgerKey::ContractCode(code) if m.lapsed_code.contains(&code.hash.0) => 0,
-                    x::LedgerKey::ContractCode(code) => m
-                        .code_live_until
-                        .get(&code.hash.0)
-                        .copied()
-                        .unwrap_or(m.ledger + 10_000),
-                    x::LedgerKey::ContractData(x::LedgerKeyContractData {
-                        key: x::ScVal::LedgerKeyContractInstance,
-                        ..
-                    }) if m.lapsed_instances => 0,
-                    _ => m.ledger + 10_000,
-                };
-                entries.extend(entry.into_iter().map(
+                        }
+                        _ => None,
+                    };
+                    let live_until = match &key {
+                        x::LedgerKey::ContractCode(code)
+                            if m.lapsed_code.contains(&code.hash.0) =>
+                        {
+                            0
+                        }
+                        x::LedgerKey::ContractCode(code) => m
+                            .code_live_until
+                            .get(&code.hash.0)
+                            .copied()
+                            .unwrap_or(m.ledger + 10_000),
+                        x::LedgerKey::ContractData(x::LedgerKeyContractData {
+                            key: x::ScVal::LedgerKeyContractInstance,
+                            ..
+                        }) if m.lapsed_instances => 0,
+                        _ => m.ledger + 10_000,
+                    };
+                    entries.extend(entry.into_iter().map(
                     |e| json!({"key": encoded, "xdr": b64(&e), "liveUntilLedgerSeq": live_until}),
                 ));
                 }
@@ -1008,7 +1014,10 @@ impl rpc::Rpc for ModelChain {
                         let x::LedgerKey::ContractCode(code) = key else {
                             panic!("the model renews code only")
                         };
-                        assert!(!m.lapsed_code.contains(&code.hash.0), "renewal of lapsed code");
+                        assert!(
+                            !m.lapsed_code.contains(&code.hash.0),
+                            "renewal of lapsed code"
+                        );
                         if !m.failing_renewal {
                             m.code_live_until.insert(code.hash.0, ledger + op.extend_to);
                         }
@@ -3212,12 +3221,10 @@ fn send_prepared<T: allowit_core::vendor::RuntimeProvider + ?Sized>(
     let info = receipt.info()?;
     if info.status != Status::Confirmed {
         return Err(
-            Error::config("The wallet code transaction failed on the ledger").with_details(
-                json!({
-                    "transactionHash": hexs(&info.transaction_hash),
-                    "nativeUnits": info.fee.native_units.to_string(),
-                }),
-            ),
+            Error::config("The wallet code transaction failed on the ledger").with_details(json!({
+                "transactionHash": hexs(&info.transaction_hash),
+                "nativeUnits": info.fee.native_units.to_string(),
+            })),
         );
     }
     Ok(Some(receipt))
@@ -3518,7 +3525,14 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     // refuses it before anything is signed or sent.
     let installed = c.module_digest;
     chain.0.lock().unwrap().lapsed_code.insert(installed);
-    assert!(!provider.resources(&installation).unwrap().code_present);
+    // The wallet's instance is live and its code lapsed: the wallet is expired.
+    let expired = provider.resources(&installation).unwrap_err();
+    assert_eq!(
+        provider.problem(&expired).code,
+        allowit_core::vendor::runtime::CONTRACT_EXPIRED,
+        "{}",
+        expired.message
+    );
     let (signed, sent) = (signatures(), chain.0.lock().unwrap().steps.len());
     let refused = provider
         .send_code(&installation, &wasm, u64::from(u32::MAX))
@@ -3795,7 +3809,12 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         assert_eq!(provider.broadcast(&code, NOW).unwrap(), Status::Prepared);
         assert!(provider.observe(&code).unwrap().is_none());
         // Sent, it uploads the code, and its receipt is the caller's.
-        chain.0.lock().unwrap().tiers.insert(hash(&unsent), PolicyTier::Custom);
+        chain
+            .0
+            .lock()
+            .unwrap()
+            .tiers
+            .insert(hash(&unsent), PolicyTier::Custom);
         chain.step("upload by a code transaction");
         assert_eq!(provider.broadcast(&code, NOW).unwrap(), Status::Submitted);
         assert_eq!(provider.status(&code).unwrap(), Status::Confirmed);
@@ -4066,13 +4085,23 @@ fn a_lapsed_wallet_takes_no_owner_step() {
             refused.message
         );
     };
-    // Its instance lapsed: nothing is simulated or signed.
+    // Its instance lapsed: nothing is simulated or signed, and its resources say so.
     chain.0.lock().unwrap().lapsed_instances = true;
+    let refused = provider.resources(&installation).unwrap_err();
+    assert_eq!(
+        provider.problem(&refused).code,
+        allowit_core::vendor::runtime::CONTRACT_EXPIRED
+    );
     expired(OwnerAction::Fund { units: 5 });
     expired(OwnerAction::Extend);
     chain.0.lock().unwrap().lapsed_instances = false;
-    // Its code lapsed.
+    // Its code lapsed: so do its resources.
     chain.0.lock().unwrap().lapsed_code.insert(c.module_digest);
+    let refused = provider.resources(&installation).unwrap_err();
+    assert_eq!(
+        provider.problem(&refused).code,
+        allowit_core::vendor::runtime::CONTRACT_EXPIRED
+    );
     expired(OwnerAction::Fund { units: 5 });
     expired(OwnerAction::Extend);
     chain.0.lock().unwrap().lapsed_code.remove(&c.module_digest);
@@ -4137,8 +4166,10 @@ fn a_lapsed_wallet_is_expired_before_anything_is_signed_or_sent() {
         NETWORK,
         std::sync::Arc::new(NoTransport),
     )
-        .unwrap()
-        .problem(&allowit_core::client::error::Error::config(refused.to_string()));
+    .unwrap()
+    .problem(&allowit_core::client::error::Error::config(
+        refused.to_string(),
+    ));
     assert_eq!(
         (problem.status, problem.code),
         (409, allowit_core::vendor::runtime::CONTRACT_EXPIRED)

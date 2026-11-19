@@ -216,12 +216,20 @@ pub fn wallet_lifetime(
                 if state.executable != ContractExecutable::Wasm(Hash(*code)) {
                     return Err("Wallet lifetime instance names another executable".into());
                 }
-                (&instance_key, 1, Some(live_until(&entry["liveUntilLedgerSeq"])?))
+                (
+                    &instance_key,
+                    1,
+                    Some(live_until(&entry["liveUntilLedgerSeq"])?),
+                )
             }
             LedgerEntryData::ContractCode(data)
                 if data.hash == Hash(*code) && hash(data.code.as_slice()) == *code =>
             {
-                (&code_key, 2, Some(live_until(&entry["liveUntilLedgerSeq"])?))
+                (
+                    &code_key,
+                    2,
+                    Some(live_until(&entry["liveUntilLedgerSeq"])?),
+                )
             }
             _ => return Err("Wallet lifetime entry differs from the exact selected keys".into()),
         };

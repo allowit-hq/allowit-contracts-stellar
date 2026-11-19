@@ -11,8 +11,8 @@ pub(crate) mod owner_observation;
 #[cfg(not(target_arch = "wasm32"))]
 use allowit_core::transport::rpc::{EnvelopeValidation, ErrorKind, RpcClient};
 pub use owner_actions::{
-    CodeState, OwnerSettlement, code_lifetime, code_state, code_uploaded, contract_exists, owner_settlement,
-    vault_redeemable,
+    CodeState, OwnerSettlement, code_lifetime, code_state, code_uploaded, contract_exists,
+    owner_settlement, vault_redeemable,
 };
 pub use owner_observation::{AssetBalance, WalletLifetime, asset_balance, wallet_lifetime};
 use serde_json::{Value, json};
@@ -499,10 +499,7 @@ pub(crate) fn refuse_expired(
         key => Some(key) == instance.as_ref(),
     };
     let data = |value: &Value| -> Result<Option<SorobanTransactionData>> {
-        value
-            .as_str()
-            .map(read)
-            .transpose()
+        value.as_str().map(read).transpose()
     };
     if let Some(preamble) = value.get("restorePreamble").filter(|v| !v.is_null())
         && let Some(restored) = data(&preamble["transactionData"])?
@@ -974,15 +971,12 @@ fn owner_never_applied(reply: &Value, hash: &str, expires_at: u64, since: u64) -
         && (reply["txHash"].is_null() || reply["txHash"] == hash)
         && number("latestLedgerCloseTime").is_some_and(|closed| closed > expires_at)
 }
-/// Whether the policy wallet operation `p` lapsed without executing. Every preparation of the
-/// operation carries the same nonce in the wallet's authorization. When the ledger runs one, the
-/// host keeps that nonce in a temporary entry of the wallet, and the entry lives at least the
-/// network's minimum temporary lifetime from the ledger that ran it, which is no earlier than
-/// `WALLET_AUTH_LEDGERS` before the authorization's expiration ledger. The operation lapsed when
-/// a ledger closed at or after its `expires_at`, the ledger is past that expiration ledger (no
-/// submission of this authorization can run), and inside the lifetime that a spent nonce is sure
-/// to have, the wallet holds no such nonce. `false` means not proven: before the expiration
-/// ledger, after that lifetime, or when the RPC does not show it.
+/// Whether the policy wallet operation `p` can no longer execute: a ledger closed at or after its
+/// signed `expires_at`, and the wallet refuses an execution whose expiry is not after the ledger's
+/// time, in any envelope that carries its authorization. The signed time bound alone decides; a
+/// caller looks for the operation's receipt first, since this says nothing of an execution in
+/// a ledger before the expiry. `false` before that ledger, when its prepared transaction
+/// succeeded, or when the RPC does not show the closing time.
 pub fn operation_lapsed(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<bool> {
     if p.config.route != WalletRoute::PolicyWallet {
         return Ok(false);
@@ -991,51 +985,7 @@ pub fn operation_lapsed(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<bool> {
     let closed = reply["latestLedgerCloseTime"]
         .as_u64()
         .or_else(|| reply["latestLedgerCloseTime"].as_str()?.parse().ok());
-    if reply["status"].as_str() == Some("SUCCESS") || closed.is_none_or(|t| t < p.expires_at) {
-        return Ok(false);
-    }
-    let entry = authorization::wallet_authorization(p)?;
-    let SorobanCredentials::Address(credentials) = &entry.credentials else {
-        return Ok(false);
-    };
-    let expiration = u64::from(credentials.signature_expiration_ledger);
-    let nonce = LedgerKey::ContractData(LedgerKeyContractData {
-        contract: address(&p.config.wallet)?,
-        key: ScVal::LedgerKeyNonce(ScNonceKey {
-            nonce: credentials.nonce,
-        }),
-        durability: ContractDataDurability::Temporary,
-    });
-    let archival = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-        config_setting_id: ConfigSettingId::StateArchival,
-    });
-    let entries = rpc.call(
-        "getLedgerEntries",
-        json!({"keys":[xdr(&nonce)?, xdr(&archival)?]}),
-    )?;
-    let Some(observed) = entries["latestLedger"].as_u64() else {
-        return Ok(false);
-    };
-    let mut lifetime = None;
-    for item in entries["entries"]
-        .as_array()
-        .ok_or("Missing ledger entries")?
-    {
-        match read::<LedgerEntryData>(item["xdr"].as_str().ok_or("Missing entry XDR")?)? {
-            LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(settings)) => {
-                lifetime = Some(u64::from(settings.min_temporary_ttl));
-            }
-            // The wallet's nonce entry: the ledger ran the operation.
-            _ => return Ok(false),
-        }
-    }
-    let Some(lifetime) = lifetime else {
-        return Ok(false);
-    };
-    // A nonce spent at any ledger that this authorization could run in is live through here.
-    let live_through =
-        (expiration + lifetime).saturating_sub(u64::from(authorization::WALLET_AUTH_LEDGERS) + 1);
-    Ok(observed > expiration && observed <= live_through)
+    Ok(reply["status"].as_str() != Some("SUCCESS") && closed.is_some_and(|t| t >= p.expires_at))
 }
 /// The settlement of the policy wallet operation `p`, found by the wallet's `allowit` event of
 /// its operation id. The settled transaction is the sealed one, so its hash is not the prepared

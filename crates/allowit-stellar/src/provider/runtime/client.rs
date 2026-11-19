@@ -3308,16 +3308,15 @@ mod native_revalidation_tests {
                 &p,
                 true,
             ),
-            // At the expiration ledger of the wallet's authorization it can still run.
+            // The signed time bound alone decides: a ledger closed at or after the expiry.
             (
                 json!({"status":"NOT_FOUND","latestLedger":184,"latestLedgerCloseTime":"86700"}),
                 184,
                 &p,
-                false,
+                true,
             ),
-            // Past the lifetime that a spent nonce is sure to have, its absence proves nothing.
             (not_found.clone(), 184 - 64 + 720 - 1, &p, true),
-            (not_found.clone(), 184 - 64 + 720, &p, false),
+            (not_found.clone(), 184 - 64 + 720, &p, true),
             // The closing ledger precedes the expiry: the wallet can still execute it.
             (
                 json!({"status":"NOT_FOUND","latestLedger":130,"latestLedgerCloseTime":"86699"}),
@@ -3344,13 +3343,13 @@ mod native_revalidation_tests {
             server.join().unwrap();
             assert_eq!(result, Ok(lapsed), "{transaction} at {entries_ledger}");
         }
-        // A sealed transaction has another hash than the prepared one, so a prepared hash that
-        // the network does not know proves nothing: the spent nonce shows that the operation ran.
+        // The nonce is not read: the receipt and the wallet's event, read first, tell an
+        // execution apart.
         let (rpc, stop, server) = rpc_server(lapse_rpc_spent(not_found.clone(), 185, true));
         let result = sdk::rpc::operation_lapsed(&sdk::rpc::HttpRpc::new(&rpc).unwrap(), &p);
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         server.join().unwrap();
-        assert_eq!(result, Ok(false));
+        assert_eq!(result, Ok(true));
     }
     #[test]
     #[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
@@ -3394,9 +3393,9 @@ mod native_revalidation_tests {
             )
             .unwrap();
 
-        // A node that answers before the authorization's expiration ledger proves no lapse.
+        // A node whose last ledger closed before the expiry proves no lapse.
         let early =
-            json!({"status":"NOT_FOUND","latestLedger":150,"latestLedgerCloseTime":"86700"});
+            json!({"status":"NOT_FOUND","latestLedger":150,"latestLedgerCloseTime":"86699"});
         let (moved, stop, server) = rpc_server(lapse_rpc(early, 130));
         assert_eq!(
             sdk::rpc::operation_lapsed(&sdk::rpc::HttpRpc::new(&moved).unwrap(), &p),

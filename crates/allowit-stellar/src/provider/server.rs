@@ -1145,10 +1145,14 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 lifetime: None,
             });
         }
-        // Lapsed code is not present, and nothing restores it.
-        let code_present = checked(rpc::code_state(self.rpc(), &c.network, &c.module_digest))?
-            == rpc::CodeState::Live;
+        // Nothing restores a lapsed wallet: a wallet whose instance or code lapsed is
+        // `CONTRACT_EXPIRED`. Code that is absent, for a wallet not created yet, is not present.
+        let code = checked(rpc::code_state(self.rpc(), &c.network, &c.module_digest))?;
         let wallet_present = checked(rpc::contract_exists(self.rpc(), &c.network, &c.wallet))?;
+        if wallet_present && code == rpc::CodeState::Lapsed {
+            return Err(Error::config(rpc::CONTRACT_EXPIRED));
+        }
+        let code_present = code == rpc::CodeState::Live;
         // A lifetime reads live entries only: lapsed code has none until it is restored.
         let lifetime = if wallet_present && code_present {
             let l = checked(rpc::wallet_lifetime(
@@ -2296,7 +2300,6 @@ mod receipt_fee_tests {
         );
     }
 
-
     /// A policy wallet receipt reports the fee paid and, beside it, the gas units that the
     /// wallet counted and the stroops that it repaid: without a carry, the signed expense, never
     /// less than the fee that its bound admits. A failed transaction, an unpriced request and a
@@ -2376,11 +2379,11 @@ mod capability_tests {
             Ok(expected["result"].clone())
         }
     }
-    /// The server proves a lapse as the agent client does (`rpc::operation_lapsed`): a ledger
-    /// closed at or after the expiry, past the authorization's expiration ledger, and inside the
-    /// lifetime that a spent nonce is sure to have, the wallet holds no such nonce.
+    /// The server reads a lapse as the agent client does (`rpc::operation_lapsed`): the signed
+    /// time bound alone decides. Once a ledger closed at or after the expiry, the wallet runs the
+    /// operation in no envelope, whatever the nonce and however long ago the expiry was.
     #[test]
-    fn the_server_proves_a_lapse_as_the_agent_client_does() {
+    fn the_signed_time_bound_alone_retires_an_operation() {
         use stellar_xdr::{
             ConfigSettingEntry, ContractDataEntry, ExtensionPoint, LedgerEntryData, LedgerKey,
             Limits, ReadXdr, StateArchivalSettings, WriteXdr,
@@ -2452,15 +2455,18 @@ mod capability_tests {
             );
             provider.lapsed(&provider.packet(&p).unwrap()).unwrap()
         };
-        // The authorization of the fixture expires at ledger 184.
         assert!(lapsed(p.expires_at, 185, false));
-        // A spent nonce shows that the operation ran, in whatever envelope.
-        assert!(!lapsed(p.expires_at, 185, true));
-        // At its expiration ledger, or before the expiry time, the authorization can still run.
-        assert!(!lapsed(p.expires_at, 184, false));
+        assert!(lapsed(p.expires_at, 184, false));
+        // An operation that the agent never submitted, read long after its expiry: retired.
+        assert!(lapsed(
+            p.expires_at + 86_400,
+            184 - 64 + 720 + 17_280,
+            false
+        ));
+        // The receipt, read first, tells an execution apart; a spent nonce is not read.
+        assert!(lapsed(p.expires_at, 185, true));
+        // Before the expiry the wallet can still run it.
         assert!(!lapsed(p.expires_at - 1, 185, false));
-        // Past the lifetime that a spent nonce is sure to have, its absence proves nothing.
-        assert!(!lapsed(p.expires_at, 184 - 64 + 720, false));
     }
     #[test]
     fn genuine_preflight_survives_carrier_but_not_serialization_or_document_changes() {

@@ -820,19 +820,26 @@ fn a_call_below_the_threshold_renews_the_instance_and_a_custom_wallets_own_code(
     );
 }
 
-/// An upgrade keeps the code that it installs live: a Custom wallet's upgrade renews its new code,
-/// whose own upload gave it the network's minimum lifetime only.
+/// An upgrade keeps the code that it installs live, whatever the tier that it leaves or enters:
+/// the owner's upgrade renews the new code, whose own upload gave it the network's minimum
+/// lifetime only.
 #[test]
-fn a_custom_upgrade_renews_the_code_that_it_installs() {
-    let f = Fixture::new(CUSTOM);
-    let next = f.env.deployer().upload_contract_wasm(CATCHING);
-    let mut u = f.update();
-    u.wasm_hash = Some(next.clone());
-    assert_eq!(f.owner_call("deploy_policy", (u,).into_val(&f.env)), Ok(()));
-    assert_eq!(
-        f.env.deployer().get_contract_code_ttl(&f.wallet),
-        TOTAL_LEDGERS - 1
-    );
+fn an_upgrade_renews_the_code_that_it_installs() {
+    for (from, to) in [
+        (CUSTOM, CATCHING),
+        (SIMPLE, CATCHING),
+        (CUSTOM, DAILY_STATE),
+    ] {
+        let f = Fixture::new(from);
+        let next = f.env.deployer().upload_contract_wasm(to);
+        let mut u = f.update();
+        u.wasm_hash = Some(next.clone());
+        assert_eq!(f.owner_call("deploy_policy", (u,).into_val(&f.env)), Ok(()));
+        assert_eq!(
+            f.env.deployer().get_contract_code_ttl(&f.wallet),
+            TOTAL_LEDGERS - 1
+        );
+    }
 }
 
 #[test]
