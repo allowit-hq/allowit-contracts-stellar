@@ -275,6 +275,10 @@ impl OwnerClient {
         let mut selected_template = None;
         let mut selected_config = None;
         let installation = match &request.target {
+            // A new Native wallet is an account that the deployment creates from the owner's
+            // account. The server drafts it in the network's asset, and the deployment binds the
+            // draft to the account, as the app does.
+            Target::NewWallet if wallet.kind == "owner-wallet" => NEW_WALLET.to_owned(),
             Target::NewWallet => {
                 if wallet.kind != "contract-wallet" {
                     return Err(Error::usage(
@@ -424,6 +428,9 @@ impl OwnerClient {
         Ok(policy)
     }
 }
+/// The installation id of a draft for a new Native wallet: the server drafts for an account that
+/// the deployment creates, also when the owner has other wallet accounts on the network.
+const NEW_WALLET: &str = "new";
 /// The selected policy of a workspace reply, with only its public generation fields.
 fn selected_policy(result: Generated) -> Result<GeneratedPolicy> {
     if result.policies.len() > 30 || result.selected_id.is_empty() {
@@ -684,13 +691,16 @@ fn validate_generated(
         .map_err(|_| Error::uncertain("Invalid returned canonical rules"))?;
     let asset = native::asset_from_identity(&b.asset_symbol, b.asset_issuer.as_deref())
         .map_err(crate::provider::failure)?;
+    // A Native draft for a new wallet holds the network template's fee bound. Its deployment
+    // replaces it with the account's own, which the bound draft states and which is checked then.
+    let fee_route = if kind == "contract-wallet" || b.template == Some(true) {
+        native::WalletRoute::PolicyWallet
+    } else {
+        native::WalletRoute::Native
+    };
     if native::sac_address(network, &asset).map_err(crate::provider::failure)? != b.asset
         || !(super::super::server_owner::fee_bounds().minimum
-            ..=u64::from(native::max_fee_ceiling(&if kind == "contract-wallet" {
-                native::WalletRoute::PolicyWallet
-            } else {
-                native::WalletRoute::Native
-            })))
+            ..=u64::from(native::max_fee_ceiling(&fee_route)))
             .contains(&u64::from(b.max_fee_stroops))
     {
         return Err(Error::uncertain(
@@ -726,6 +736,16 @@ fn validate_generated(
         }
     }
     match &request.target {
+        // A Native draft for a new wallet account names no account until its deployment.
+        // The setup funds the account in XLM and adds no trustline: the draft pays in XLM.
+        Target::NewWallet
+            if kind == "owner-wallet"
+                && b.template == Some(true)
+                && b.route == "native"
+                && b.wallet.is_empty()
+                && b.deployment_id.is_empty()
+                && b.asset_symbol == "XLM"
+                && b.asset_issuer.is_none() => {}
         Target::NewWallet
             if b.template == Some(true)
                 && b.route == "policyWallet"
