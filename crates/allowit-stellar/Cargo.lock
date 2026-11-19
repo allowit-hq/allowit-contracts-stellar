@@ -4,8 +4,8 @@ version = 4
 
 [[package]]
 name = "allowit-core"
-version = "0.13.0"
-source = "git+https://github.com/allowit-hq/allowit-core.git?rev=8d806e13429c5447bd2300b49f3632c9748cd19e#8d806e13429c5447bd2300b49f3632c9748cd19e"
+version = "0.14.0"
+source = "git+https://github.com/allowit-hq/allowit-core.git?rev=a6bf9dae367b0fe9c3f8e1f1e58fe84fe8f4bda4#a6bf9dae367b0fe9c3f8e1f1e58fe84fe8f4bda4"
 dependencies = [
  "libc",
  "reqwest",
