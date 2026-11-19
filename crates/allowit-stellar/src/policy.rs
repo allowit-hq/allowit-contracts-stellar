@@ -707,9 +707,12 @@ pub type BuildInput = (&'static str, Vec<u8>);
 /// (`policy.rs`), the keys of its figures (`policy.figures`), the state keys that the contract
 /// keeps (`policy.state`) and, when the part differs from the source, the source itself
 /// (`source.rs`), whose hash the contract embeds. Everything in them comes from Core's derivation;
-/// the build hook and `scripts/build-custom-policy.sh` both write these files.
+/// the build hook and `scripts/build-custom-policy.sh` both write these files. A compiled part
+/// that the build's text check refuses (`state_keys::one_safe_file`) is refused here too.
 pub fn custom_build_inputs(source: &str) -> Result<(CustomParts, Vec<BuildInput>)> {
     let parts = custom_parts(source)?;
+    // The contract's build checks the compiled part's text by the same function.
+    crate::state_keys::one_safe_file(&parts.onchain)?;
     let figures: String = parts.figures.iter().map(|key| format!("{key}\n")).collect();
     let state: String = parts
         .stored

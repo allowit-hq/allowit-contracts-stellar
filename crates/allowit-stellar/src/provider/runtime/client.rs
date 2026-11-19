@@ -3490,6 +3490,7 @@ mod native_revalidation_tests {
             envelope_xdr: signed.transaction_xdr.clone(),
             result_xdr: result.to_xdr_base64(Limits::none()).unwrap(),
             settles: None,
+            closed_at: None,
         };
         sdk::rpc::validate_settled_policy_packet(&signed, &receipt).unwrap();
         let body = serde_json::to_vec(&json!({"prepared":signed.prepared,"signedOperation":signed,"operation":{"id":"wire-status-001","status":OperationStatus::SubmissionUnknown,"transactionHash":sdk::hex(&receipt.transaction_hash)},"receipt":receipt})).unwrap();

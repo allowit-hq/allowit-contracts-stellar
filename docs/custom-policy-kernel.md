@@ -49,7 +49,8 @@ derivation; the build reads no policy decision from the source itself.
   [Policy state](#policy-state)).
 
 The build refuses a `policy.rs` that contains `unsafe`, `include!`, `include_str!`,
-`include_bytes!` or `#[path`: the policy is one safe file. Core's source gate
+`include_bytes!` or `#[path`, comments included: the policy is one safe file
+(`state_keys::one_safe_file`, which the rail's `check` runs too). Core's source gate
 (`scripts/check-policy-bindings.py`) applies its own checks as well.
 
 The owner's deployment signature names the code hash. The owner's client compares it with the
@@ -125,10 +126,12 @@ hour), the call renews it to `TOTAL_LEDGERS - 1`, so most calls renew nothing. A
 is built from its policy and is its own: its creation renews the code to the same lifetime, and each
 call keeps it live with the instance. The code of a Simple or Standard wallet is shared by every
 wallet of its kind, and Allowit keeps it live. The rent is part of the call's network fee, which the
-wallet repays as gas within its gas cap. Nothing restores a wallet whose instance or code lapsed. `d` opens at the first operation after the last window ended and holds its own
+wallet repays as gas within its gas cap. Nothing restores a wallet whose instance or code lapsed. `d` opens at the first operation after the last window ended that changes a daily figure that the wallet keeps (an operation that changes only another figure, such as a deposit in a wallet that keeps only the daily spending figures, opens nothing) and holds its own
 end ledger, 17,279 ledgers later (the Mainnet minimum lifetime of a temporary entry, about one
 day). The daily figures of the policy are the figures of that window, not of a UTC day. A window
-whose end ledger has passed reads as zero, even if someone paid to keep the entry alive.
+whose end ledger has passed reads as zero, even if someone paid to keep the entry alive. The
+contract and the rail's host take the window from Core's portable rule (`allowit::daily_window_end`,
+`allowit::daily_window_open`; the end ledger is the window's last ledger), as for a daily policy key.
 
 ## Policy state
 
@@ -219,7 +222,7 @@ The name of a key states its lifetime:
 
 | Key | Storage | Lifetime |
 | --- | --- | --- |
-| `day_…` | Temporary | One daily window: 17,280 ledgers (the Mainnet minimum for a temporary entry, about one day) from the write that opens it. Writes in an open window keep its end. After the end ledger the entry reads as absent, even if someone paid to keep it alive; the next write opens a new window |
+| `day_…` | Temporary | One daily window: 17,280 ledgers (the Mainnet minimum for a temporary entry, about one day) from the write that opens it. Writes in an open window keep its end. After the end ledger the entry reads as absent, even if someone paid to keep it alive; the next write opens a new window. The contract keeps the window by Core's portable rule (`allowit::daily_window_end`, `allowit::daily_window_open`), which the server applies to the keys that it keeps: the end ledger is the window's last ledger, inclusive |
 | Any other | Persistent | 2,073,600 ledgers (the Mainnet minimum for a persistent entry, about 120 days) from its creation |
 
 No read extends an entry, and no write extends it later. A persistent entry that has lapsed is
