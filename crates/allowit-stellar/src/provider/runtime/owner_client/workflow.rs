@@ -1545,16 +1545,25 @@ struct NativeSetupRecord {
     receipt: Option<rpc::VerifiedReceipt>,
 }
 /// The server's first record of a wallet: the account, its roles and a policy that admits
-/// transfers of XLM. The owner's generated policy replaces it at activation.
+/// transfers of the wallet's asset, which is `asset` or XLM. The owner's generated policy
+/// replaces it at activation.
 pub fn bootstrap_configuration(
     network: &str,
     wallet: &str,
     owner: &str,
     agent: &str,
     server: &str,
+    asset: Option<&native::owner::Trustline>,
 ) -> Result<native::WalletConfig> {
     const SOURCE: &str = "use allowit::prelude::*;\n/// Bootstrap: transfers in the installed asset.\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::operations(ctx, &ctx.params[allowit::OPERATIONS])?;\n    allowit::tokens(ctx, &ctx.params[allowit::TOKENS])?;\n    Ok(())\n}\n";
-    let asset = checked(native::sac_address(network, &stellar_xdr::Asset::Native))?;
+    let (symbol, issuer) = match asset {
+        Some(asset) => (asset.code.as_str(), Some(asset.issuer.as_str())),
+        None => ("XLM", None),
+    };
+    let asset = checked(native::sac_address(
+        network,
+        &checked(native::asset_from_identity(symbol, issuer))?,
+    ))?;
     let instance = native::hash(format!(
         "allowit-stellar-native-wallet-v1:{network}:{wallet}"
     ));
@@ -1562,7 +1571,7 @@ pub fn bootstrap_configuration(
         "network": network, "policyInstance": instance, "wallet": wallet, "owner": owner,
         "agent": agent, "server": server, "route": "native", "language": "portable",
         "params": {"operations": {"List": [{"Str": "transfer"}]}, "tokens": {"List": [{"Addr": asset}]}},
-        "asset": asset, "assetSymbol": "XLM", "assetIssuer": null, "policySource": SOURCE,
+        "asset": asset, "assetSymbol": symbol, "assetIssuer": issuer, "policySource": SOURCE,
         "sourceHash": native::hash(SOURCE), "moduleDigest": vec![0u8; 32],
         "maxFeeStroops": 100_000,
     }))
@@ -1582,31 +1591,41 @@ fn configured(
         &request.owner,
         &request.agent,
         &request.server,
+        request.asset.as_ref(),
     )?;
     Ok(
         json!({"state":"configured","requestId":request.request_id,"network":request.network,"wallet":wallet,"owner":request.owner,"agent":request.agent,"server":request.server,
         "installation":native::hex(&configuration.policy_instance),"configuration":configuration,
         "signers":{"owner":native::owner::OWNER_WEIGHT,"agent":native::owner::AUTOMATED_WEIGHT,"server":native::owner::AUTOMATED_WEIGHT,"walletKey":0},
         "thresholds":{"low":native::owner::PAYMENT_THRESHOLD,"medium":native::owner::PAYMENT_THRESHOLD,"high":native::owner::OWNER_THRESHOLD},
-        "reserveStroops":native::owner::wallet_reserve(false).to_string(),
+        "reserveStroops":native::owner::wallet_reserve(request.asset.is_some()).to_string(),
         "transactionHash":transaction.map(|t|t.0),"ledger":transaction.map(|t|t.1)}),
     )
 }
 /// Prepare the setup of the wallet account `wallet` from the owner's current account.
-/// What one setup request binds. A funded setup also binds its amount; an unfunded one keeps the
-/// identity of earlier releases, so their retained requests resume.
+/// What one setup request binds. A funded setup also binds its amount, and a setup of an issued
+/// asset binds that asset; a setup with neither keeps the identity of earlier releases, so
+/// their retained requests resume.
 fn setup_identity(request: &crate::provider::runtime::owner::SetupRequest) -> Value {
     let mut identity = json!({"network":request.network,"owner":request.owner,"agent":request.agent,"server":request.server,"requestId":request.request_id,"fee":request.fee_per_operation});
     if let Some(funding) = request.funding {
         identity["funding"] = json!(funding.to_string());
     }
+    if let Some(asset) = &request.asset {
+        identity["asset"] = json!(asset);
+    }
     identity
 }
-/// The starting balance of a setup: the reserve and the float, and the owner's funding on top.
-/// The owner's account sends all of it in the setup transaction.
+/// The XLM starting balance of a setup. A wallet that holds XLM starts with the reserve, the
+/// float and the owner's funding on top. A wallet of an issued asset starts with the reserve of
+/// its account and trustline and the float: its funding is a payment of the asset. The owner's
+/// account sends all of it in the setup transaction.
 fn setup_starting_balance(
     request: &crate::provider::runtime::owner::SetupRequest,
 ) -> Result<Option<i64>> {
+    if request.asset.is_some() {
+        return Ok(None);
+    }
     request
         .funding
         .map(|funding| {
@@ -1615,6 +1634,10 @@ fn setup_starting_balance(
                 .ok_or_else(|| Error::usage("The setup funding amount is out of range"))
         })
         .transpose()
+}
+/// The funding of a setup in the wallet's issued asset, in base units.
+fn setup_asset_funding(request: &crate::provider::runtime::owner::SetupRequest) -> Option<i64> {
+    request.asset.as_ref().and(request.funding)
 }
 fn prepare_setup(
     runtime: &crate::provider::runtime::Runtime,
@@ -1634,7 +1657,8 @@ fn prepare_setup(
             network: &request.network,
             fee_per_operation: request.fee_per_operation,
             starting_balance: setup_starting_balance(request)?,
-            trustline: None,
+            trustline: request.asset.as_ref(),
+            funding: setup_asset_funding(request),
         },
         now,
     ))?;
@@ -1870,7 +1894,8 @@ fn expected_setup(
             request_id: request.request_id.clone(),
             fee_per_operation: request.fee_per_operation,
             starting_balance: setup_starting_balance(request)?,
-            trustline: None,
+            trustline: request.asset.clone(),
+            funding: setup_asset_funding(request),
             created_at: record.created_at,
         },
     })

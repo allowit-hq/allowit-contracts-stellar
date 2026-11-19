@@ -9,21 +9,27 @@ pub struct SetupRequest {
     pub server: String,
     pub request_id: String,
     pub fee_per_operation: u32,
-    /// The stroops that the setup moves into the wallet for the agent's payments, on top of the
-    /// account's reserve and its fee float. The owner's account pays all of it in the setup
-    /// transaction. `None` funds the reserve and the float only.
+    /// The issued asset that the wallet holds, from the server's template of the network. The
+    /// setup adds its trustline. `None` is a wallet that holds XLM.
+    pub asset: Option<native::owner::Trustline>,
+    /// The base units of the wallet's asset that the setup moves into the wallet for the
+    /// agent's payments: stroops of XLM on top of the account's reserve and its fee float, or
+    /// units of the issued asset. The owner's account pays all of it in the setup transaction.
+    /// `None` funds the reserve and the float only.
     pub funding: Option<i64>,
 }
-/// The most that one setup funds, in stroops: the transaction's ceiling on the starting balance,
-/// less the reserve and the fee float that the starting balance also holds.
+/// The most that one setup funds, in base units: the transaction's ceiling on the starting
+/// balance, less the reserve and the fee float that the starting balance also holds.
 pub const MAX_SETUP_FUNDING: i64 =
     native::owner::MAX_STARTING_BALANCE - native::owner::default_starting_balance(false);
 impl SetupRequest {
     pub fn validate(&self) -> Result<()> {
-        if self.network != "stellar:testnet" {
-            return Err(Error::unsupported(
-                "Native wallet setup supports Stellar Testnet only",
-            ));
+        native::passphrase(&self.network)
+            .map_err(|_| Error::unsupported("Native wallet setup needs a Stellar network"))?;
+        if let Some(asset) = &self.asset {
+            native::asset_from_identity(&asset.code, Some(&asset.issuer)).map_err(|_| {
+                Error::config("The wallet asset of this network is not an issued Stellar asset")
+            })?;
         }
         for account in [&self.owner, &self.agent, &self.server] {
             native::account_key(account).map_err(Error::usage)?;

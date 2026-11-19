@@ -43,6 +43,7 @@ fn native_setup_retains_before_sign_and_recovers_lost_reply_without_another_sign
         server: c.server.clone(),
         request_id: "setup-test-001".into(),
         fee_per_operation: 100,
+        asset: None,
         funding: None,
     };
     let clock = Cell::new(wire::now());
@@ -113,6 +114,7 @@ fn a_funded_setup_is_one_owner_transaction_and_binds_its_amount() {
         server: c.server.clone(),
         request_id: "setup-funded-001".into(),
         fee_per_operation: 100,
+        asset: None,
         funding: Some(funding),
     };
     let now = wire::now();
@@ -176,10 +178,187 @@ fn a_funded_setup_is_one_owner_transaction_and_binds_its_amount() {
                 crate::owner::default_starting_balance(false) + MAX_SETUP_FUNDING,
             ),
             trustline: None,
+            funding: None,
         },
         now,
     );
     assert!(at_ceiling.is_ok(), "{at_ceiling:?}");
+}
+/// The Testnet USDC of the rail's token list.
+const USDC_ISSUER: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+/// A wallet of an issued asset is still one owner transaction: the new account adds the
+/// trustline, and the owner's account pays the amount in that asset. The XLM that the owner
+/// sends is the reserve of the account with its trustline and the fee float. The request binds
+/// the asset, so the same request ID for a wallet that holds XLM signs nothing.
+#[test]
+fn a_setup_of_an_issued_asset_adds_its_trustline_and_funds_it_in_the_one_owner_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().canonicalize().unwrap().join("proof")).unwrap();
+    let c = selection().config;
+    let chain = Arc::new(Chain::new(c.clone()));
+    let runtime = Runtime::from_rpc(chain.clone());
+    let usdc = crate::owner::Trustline {
+        code: "USDC".into(),
+        issuer: USDC_ISSUER.into(),
+    };
+    let request = |asset: Option<crate::owner::Trustline>| SetupRequest {
+        network: c.network.clone(),
+        owner: c.owner.clone(),
+        agent: c.agent.clone(),
+        server: c.server.clone(),
+        request_id: "setup-asset-001".into(),
+        fee_per_operation: 100,
+        asset,
+        funding: Some(100_000),
+    };
+    let now = wire::now();
+    let signer = key();
+    let out = workflow::configure_native(
+        &runtime,
+        &store,
+        &request(Some(usdc.clone())),
+        &signer,
+        &|| Ok(now),
+    )
+    .unwrap();
+    assert_eq!(out["state"], "configured");
+    assert_eq!(signer.calls.load(Ordering::SeqCst), 1);
+    let issued = crate::asset_from_identity("USDC", Some(USDC_ISSUER)).unwrap();
+    assert_eq!(out["configuration"]["assetSymbol"], "USDC");
+    assert_eq!(out["configuration"]["assetIssuer"], USDC_ISSUER);
+    assert_eq!(
+        out["configuration"]["asset"],
+        crate::sac_address(&c.network, &issued).unwrap()
+    );
+    assert_eq!(
+        out["reserveStroops"],
+        crate::owner::wallet_reserve(true).to_string()
+    );
+    let sent = chain.direct_signed.lock().unwrap().clone().unwrap();
+    let stellar_xdr::TransactionEnvelope::Tx(envelope) = crate::read(&sent).unwrap() else {
+        panic!()
+    };
+    let wallet = stellar_xdr::MuxedAccount::Ed25519(stellar_xdr::Uint256(
+        crate::account_key(out["wallet"].as_str().unwrap()).unwrap(),
+    ));
+    let operations = envelope.tx.operations.as_slice();
+    assert_eq!(operations.len(), 6);
+    assert_eq!(envelope.tx.fee, 600);
+    let stellar_xdr::OperationBody::CreateAccount(create) = &operations[0].body else {
+        panic!()
+    };
+    assert_eq!(
+        create.starting_balance,
+        crate::owner::default_starting_balance(true)
+    );
+    assert_eq!(operations[1].source_account.as_ref(), Some(&wallet));
+    assert!(matches!(
+        operations[1].body,
+        stellar_xdr::OperationBody::ChangeTrust(_)
+    ));
+    // The owner's account, the transaction source, pays the asset to the new account.
+    let stellar_xdr::OperationBody::Payment(payment) = &operations[2].body else {
+        panic!()
+    };
+    assert_eq!(operations[2].source_account, None);
+    assert_eq!(payment.destination, wallet);
+    assert_eq!(payment.asset, issued);
+    assert_eq!(payment.amount, 100_000);
+    let again = signer.calls.load(Ordering::SeqCst);
+    let refused =
+        workflow::configure_native(&runtime, &store, &request(None), &signer, &|| Ok(now))
+            .unwrap_err();
+    assert!(
+        refused.message.contains("another intent"),
+        "{}",
+        refused.message
+    );
+    assert_eq!(signer.calls.load(Ordering::SeqCst), again);
+    // An asset that is no issued Stellar asset is refused before anything is read or signed.
+    for (code, issuer) in [
+        ("USDC", "not-an-account"),
+        ("", USDC_ISSUER),
+        ("US DC", USDC_ISSUER),
+    ] {
+        let invalid = request(Some(crate::owner::Trustline {
+            code: code.into(),
+            issuer: issuer.into(),
+        }));
+        assert!(invalid.validate().is_err(), "{code} {issuer}");
+    }
+}
+/// A setup is admitted on each network of the rail, and on no other network.
+#[test]
+fn a_setup_request_is_admitted_on_each_network_of_the_rail() {
+    let c = selection().config;
+    let request = |network: &str| SetupRequest {
+        network: network.into(),
+        owner: c.owner.clone(),
+        agent: c.agent.clone(),
+        server: c.server.clone(),
+        request_id: "setup-network-001".into(),
+        fee_per_operation: 100,
+        asset: None,
+        funding: None,
+    };
+    for network in crate::plugin::NETWORKS {
+        request(network.id).validate().unwrap();
+    }
+    assert!(request("stellar:futurenet").validate().is_err());
+    assert!(request("example:testnet").validate().is_err());
+}
+/// The asset of a new wallet is the asset of the server's one template of its network: an
+/// issued asset with its issuer, or XLM. A template whose contract address is not the address
+/// of its named asset is refused, and so is a network without a template.
+#[test]
+fn the_wallet_asset_is_the_asset_of_the_servers_template_of_the_network() {
+    let template = |network: &str, symbol: &str, issuer: Option<&str>| {
+        let asset = crate::sac_address(
+            network,
+            &crate::asset_from_identity(symbol, issuer).unwrap(),
+        )
+        .unwrap();
+        json!({"network": network, "profiles": [], "asset": asset, "assetSymbol": symbol,
+            "assetIssuer": issuer, "maxFeeUnits": 100_000, "tiers": {}})
+    };
+    let read = |templates: Value, network: &str| {
+        super::wallet_asset(
+            serde_json::from_value(json!({ "templates": templates })).unwrap(),
+            network,
+        )
+    };
+    const PUBNET_ISSUER: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+    let both = json!([
+        template("stellar:testnet", "XLM", None),
+        template("stellar:pubnet", "USDC", Some(PUBNET_ISSUER)),
+    ]);
+    assert_eq!(read(both.clone(), "stellar:testnet").unwrap(), None);
+    let usdc = crate::owner::Trustline {
+        code: "USDC".into(),
+        issuer: PUBNET_ISSUER.into(),
+    };
+    assert_eq!(
+        read(both.clone(), "stellar:pubnet").unwrap(),
+        Some(usdc.clone())
+    );
+    // An alias of the network names the same template.
+    assert_eq!(read(both, "stellar:mainnet").unwrap(), Some(usdc));
+    // No template of the network, or two of them.
+    let only_testnet = json!([template("stellar:testnet", "XLM", None)]);
+    assert!(read(only_testnet, "stellar:pubnet").is_err());
+    let twice = json!([
+        template("stellar:pubnet", "XLM", None),
+        template("stellar:mainnet", "USDC", Some(PUBNET_ISSUER)),
+    ]);
+    assert!(read(twice, "stellar:pubnet").is_err());
+    // The contract address of another network's asset, and of another asset.
+    let mut foreign = template("stellar:testnet", "USDC", Some(PUBNET_ISSUER));
+    foreign["network"] = json!("stellar:pubnet");
+    assert!(read(json!([foreign]), "stellar:pubnet").is_err());
+    let mut renamed = template("stellar:pubnet", "XLM", None);
+    renamed["assetSymbol"] = json!("USDC");
+    renamed["assetIssuer"] = json!(PUBNET_ISSUER);
+    assert!(read(json!([renamed]), "stellar:pubnet").is_err());
 }
 /// The setup key of a wallet account is random and lives in one run. A request that settled
 /// reports its wallet again and signs nothing. A request that stopped before its signature
@@ -198,6 +377,7 @@ fn a_settled_setup_signs_nothing_again_and_an_unsigned_one_takes_a_new_key() {
         server: c.server.clone(),
         request_id: id.into(),
         fee_per_operation: 100,
+        asset: None,
         funding: None,
     };
     let now = wire::now();
@@ -438,6 +618,7 @@ fn failed_signed_retention_prevents_native_transmission() {
         server: c.server,
         request_id: "native-retain-001".into(),
         fee_per_operation: 100,
+        asset: None,
         funding: None,
     };
     let fail_retention =

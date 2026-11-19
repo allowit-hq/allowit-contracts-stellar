@@ -180,7 +180,52 @@ fn lower_hash(value: &str) -> Result<()> {
         Err(Error::config("Invalid lowercase Stellar identity"))
     }
 }
+/// The issued asset that a Native wallet of `network` holds: the asset of the server's one
+/// template of the network, which must be the asset of its own contract address. `None` is a
+/// wallet that holds XLM. A server without a template of the network sets up no wallet there.
+fn wallet_asset(templates: Templates, network: &str) -> Result<Option<native::owner::Trustline>> {
+    let canonical = crate::host::routing::normalize(network)?;
+    let mut matching = templates
+        .templates
+        .into_iter()
+        .filter(|t| crate::host::routing::normalize(&t.network).ok() == Some(canonical));
+    let (Some(template), None) = (matching.next(), matching.next()) else {
+        return Err(Error::config(
+            "The server offers no Native wallet on this network",
+        ));
+    };
+    let invalid = || Error::config("The server's wallet asset of this network is invalid");
+    let asset =
+        native::asset_from_identity(&template.asset_symbol, template.asset_issuer.as_deref())
+            .map_err(|_| invalid())?;
+    if native::sac_address(canonical, &asset).map_err(|_| invalid())? != template.asset {
+        return Err(invalid());
+    }
+    Ok(template
+        .asset_issuer
+        .map(|issuer| native::owner::Trustline {
+            code: template.asset_symbol,
+            issuer,
+        }))
+}
 impl OwnerClient {
+    /// The issued asset of a new Native wallet on `network`, from the server's template.
+    pub fn native_wallet_asset(
+        &self,
+        network: &str,
+        now: u64,
+    ) -> Result<Option<native::owner::Trustline>> {
+        wallet_asset(
+            self.session.owner_request(
+                Method::Post,
+                "/api/native/templates",
+                Some(&json!({})),
+                now,
+                false,
+            )?,
+            network,
+        )
+    }
     pub fn new(backend: &str, origin: &str, owner: &str) -> Result<Self> {
         native::signing::canonical_account_key(owner)
             .map_err(|_| Error::config("Select a canonical Stellar G owner account"))?;

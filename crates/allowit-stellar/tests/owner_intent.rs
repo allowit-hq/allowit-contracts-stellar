@@ -377,6 +377,7 @@ fn native() -> (OwnerTransaction, ExpectedOwnerIntent) {
             fee_per_operation: 100,
             starting_balance: None,
             trustline: None,
+            funding: None,
         },
         NOW,
     )
@@ -396,6 +397,7 @@ fn native() -> (OwnerTransaction, ExpectedOwnerIntent) {
                 wallet: account(15),
                 starting_balance: None,
                 trustline: None,
+                funding: None,
                 agent: account(12),
                 engine: account(13),
                 request_id: "intent-fixture-001".into(),
@@ -909,6 +911,7 @@ fn native_setup_takes_the_owner_signature_and_the_wallet_key_signature() {
         fee_per_operation: 100,
         starting_balance: None,
         trustline: None,
+        funding: None,
     };
     let prepared = owner::prepare_native_setup(&state, &terms, NOW).unwrap();
     let expected = ExpectedOwnerIntent {
@@ -922,6 +925,7 @@ fn native_setup_takes_the_owner_signature_and_the_wallet_key_signature() {
             fee_per_operation: 100,
             starting_balance: None,
             trustline: None,
+            funding: None,
             created_at: NOW,
         },
     };
@@ -1063,6 +1067,7 @@ fn deployment_and_setup_adapters_validate_all_public_metadata() {
             fee_per_operation: *fee_per_operation,
             starting_balance: None,
             trustline: None,
+            funding: None,
         },
         *created_at,
     )

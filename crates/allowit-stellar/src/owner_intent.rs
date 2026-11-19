@@ -106,16 +106,24 @@ fn classic_action_matches(action: &str, operations: &[Operation]) -> bool {
         {
             true
         }
+        // The new account adds its trustline and its signers. The owner's account, the
+        // transaction source, sends at most one payment, which funds the trustline's asset.
         ("native_setup", [create, rest @ ..]) => {
+            let funded = |op: &Operation| {
+                !wallet_sourced(op) && matches!(op.body, OperationBody::Payment(_))
+            };
+            let payments = rest.iter().filter(|op| funded(op)).count();
             matches!(create.body, OperationBody::CreateAccount(_))
                 && create.source_account.is_none()
-                && (3..=4).contains(&rest.len())
+                && payments <= 1
+                && (3..=4).contains(&(rest.len() - payments))
                 && rest.iter().all(|op| {
-                    wallet_sourced(op)
-                        && matches!(
-                            op.body,
-                            OperationBody::SetOptions(_) | OperationBody::ChangeTrust(_)
-                        )
+                    funded(op)
+                        || (wallet_sourced(op)
+                            && matches!(
+                                op.body,
+                                OperationBody::SetOptions(_) | OperationBody::ChangeTrust(_)
+                            ))
                 })
         }
         ("fund", [op]) => !wallet_sourced(op) && matches!(op.body, OperationBody::Payment(_)),
@@ -237,6 +245,8 @@ pub enum OwnerAction {
         fee_per_operation: u32,
         starting_balance: Option<i64>,
         trustline: Option<owner::Trustline>,
+        /// Base units of the trustline's asset that the owner's account sends to the wallet.
+        funding: Option<i64>,
         created_at: u64,
     },
     /// One owner action on a wallet account (fund, pause, resume, withdraw or close),
@@ -736,6 +746,7 @@ fn exact_native_setup(action: &OwnerAction, network: &str, now: u64) -> Result<o
         fee_per_operation,
         starting_balance,
         trustline,
+        funding,
         created_at,
     } = action
     else {
@@ -755,6 +766,7 @@ fn exact_native_setup(action: &OwnerAction, network: &str, now: u64) -> Result<o
             fee_per_operation: *fee_per_operation,
             starting_balance: *starting_balance,
             trustline: trustline.as_ref(),
+            funding: *funding,
         },
         *created_at,
     )

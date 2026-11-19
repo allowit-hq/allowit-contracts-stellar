@@ -3033,6 +3033,7 @@ mod retained_projection_tests {
                 fee_per_operation: 100,
                 starting_balance: None,
                 trustline: None,
+                funding: None,
             },
             1,
         )
@@ -3168,6 +3169,7 @@ mod owner_carrier_tests {
                 fee_per_operation: 100,
                 starting_balance: None,
                 trustline: None,
+                funding: None,
             },
             1,
         )

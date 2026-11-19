@@ -163,7 +163,8 @@ impl OwnerProvider for Owner {
         Ok(raw)
     }
     fn setup(&self, cx: &Context<'_>, r: owner::Setup<'_>) -> Result<serde_json::Value> {
-        /// The XLM amount of a setup, in stroops. A Native wallet holds XLM.
+        /// The amount of a setup in the base units of the wallet's asset. XLM and every issued
+        /// Stellar asset have seven decimals.
         fn setup_funding(amount: &str) -> Result<i64> {
             i64::try_from(workflow::amount_units(amount)?)
                 .ok()
@@ -175,19 +176,21 @@ impl OwnerProvider for Owner {
                 "Setup server differs from independently configured authority",
             ));
         }
-        if !crate::host::routing::info(cx.network)?.testnet {
-            return Err(Error::unsupported(
-                "Native setup is available on the selected test network only",
-            ));
-        }
+        let funding = r.amount.map(setup_funding).transpose()?;
+        let fee_per_operation = fee(r.fee_per_operation)?;
+        // The server's template of the network names the asset that the wallet holds. It is
+        // read before anything is signed for the ledger, so a server that offers no wallet on
+        // this network stops the setup before an account exists.
+        let client = client(cx)?;
         let request = SetupRequest {
             network: cx.network.into(),
             owner: cx.signer.address().into(),
             agent: r.agent.into(),
             server: r.server.into(),
             request_id: r.request_id.into(),
-            fee_per_operation: fee(r.fee_per_operation)?,
-            funding: r.amount.map(setup_funding).transpose()?,
+            fee_per_operation,
+            asset: client.native_wallet_asset(cx.network, (cx.clock)()?)?,
+            funding,
         };
         request.validate()?;
         let mut configured = workflow::configure_native(
@@ -200,10 +203,8 @@ impl OwnerProvider for Owner {
         // The ledger now holds the wallet. The server registers it from the ledger, so no
         // server configuration names it. A refusal leaves the wallet set up: the same request
         // ID asks again and signs nothing.
-        let registration = client(cx)
-            .and_then(|client| {
-                client.register_native(&configured["configuration"], (cx.clock)()?)
-            })
+        let registration = (cx.clock)()
+            .and_then(|now| client.register_native(&configured["configuration"], now))
             .map_err(|error| {
                 let mut refused = Error::api(
                     error.status.unwrap_or(409),
