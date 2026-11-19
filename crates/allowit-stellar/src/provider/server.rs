@@ -858,6 +858,20 @@ impl Provider {
         checked(native::validate_config(&c))?;
         Ok(c)
     }
+    /// Refuse a policy wallet whose instance or code lapsed (`CONTRACT_EXPIRED`), before the
+    /// server signs for it: the operation's last simulation may precede the lapse.
+    fn refuse_lapsed(&self, c: &WalletConfig) -> Result<()> {
+        if c.route != WalletRoute::PolicyWallet {
+            return Ok(());
+        }
+        checked(rpc::instance_code(self.rpc(), &c.network, &c.wallet))?;
+        if checked(rpc::code_state(self.rpc(), &c.network, &c.module_digest))?
+            == rpc::CodeState::Lapsed
+        {
+            return Err(Error::config(rpc::CONTRACT_EXPIRED));
+        }
+        Ok(())
+    }
     fn fresh(&self, i: &Installation) -> Result<WalletConfig> {
         let c = self.config(i)?;
         if c.route == WalletRoute::Native {
@@ -1147,8 +1161,16 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         }
         // Nothing restores a lapsed wallet: a wallet whose instance or code lapsed is
         // `CONTRACT_EXPIRED`. Code that is absent, for a wallet not created yet, is not present.
+        // The code is the one that the instance runs: a wallet whose owner installed other code
+        // outside Allowit did not lapse with the installation's code.
         let code = checked(rpc::code_state(self.rpc(), &c.network, &c.module_digest))?;
-        let wallet_present = checked(rpc::contract_exists(self.rpc(), &c.network, &c.wallet))?;
+        let running = checked(rpc::instance_code(self.rpc(), &c.network, &c.wallet))?;
+        if running.is_some_and(|running| running != c.module_digest) {
+            return Err(Error::config(
+                "The wallet runs other code than its installation names",
+            ));
+        }
+        let wallet_present = running.is_some();
         if wallet_present && code == rpc::CodeState::Lapsed {
             return Err(Error::config(rpc::CONTRACT_EXPIRED));
         }
@@ -1295,6 +1317,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 "Authorization differs from selected installation",
             ));
         }
+        self.refuse_lapsed(&c)?;
         // A classic account has no server authorization entry: the server admits the
         // operation here, with its evaluator, and signs the transaction at execution.
         if c.route == WalletRoute::Native {
@@ -1341,6 +1364,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 "Authorization differs from selected installation",
             ));
         }
+        self.refuse_lapsed(&c)?;
         let finalized = checked(self.runtime.finalize_authorization(
             &p,
             |p| {
@@ -1553,7 +1577,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         let p = prepared(p)?;
         // The same proofs as the agent client's: a payment authorization lapses when no
         // transaction settled it by its expiry ledger, a policy wallet operation when its
-        // authorization can no longer run and its nonce is not on the ledger.
+        // authorization can no longer run and the history holds no execution of it.
         if p.payment_authorization.is_some() {
             return checked(native::seller_settled::lapsed(self.rpc(), &p));
         }
@@ -2379,19 +2403,28 @@ mod capability_tests {
             Ok(expected["result"].clone())
         }
     }
-    /// The server reads a lapse as the agent client does (`rpc::operation_lapsed`): the signed
-    /// time bound alone decides. Once a ledger closed at or after the expiry, the wallet runs the
-    /// operation in no envelope, whatever the nonce and however long ago the expiry was.
+    /// The server reads a lapse as the agent client does (`rpc::operation_lapsed`). Once a ledger
+    /// closed at or after the signed time bound, the wallet runs the operation in no envelope, so
+    /// the wallet's events read then hold every execution of it, in any envelope: none found, the
+    /// operation lapsed. Once the history no longer holds the preparation's ledger, the time bound
+    /// alone retires it. A read that fails proves nothing.
     #[test]
-    fn the_signed_time_bound_alone_retires_an_operation() {
-        use stellar_xdr::{
-            ConfigSettingEntry, ContractDataEntry, ExtensionPoint, LedgerEntryData, LedgerKey,
-            Limits, ReadXdr, StateArchivalSettings, WriteXdr,
-        };
+    fn an_operation_lapses_once_its_time_bound_passed_and_no_execution_is_in_the_history() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/provider/stellar-policy-wallet-revalidation-rpc.json"
+        ))
+        .unwrap();
+        let p: PreparedOperation = serde_json::from_value(fixture["prepared"].clone()).unwrap();
         struct Ledger {
+            status: &'static str,
             closed: u64,
-            sequence: u64,
-            spent: bool,
+            oldest: u64,
+            /// An execution of the operation, in an envelope that another account sent.
+            executed: bool,
+            events_fail: bool,
+            wallet: String,
+            from: u32,
+            calls: std::sync::Mutex<Vec<String>>,
         }
         impl rpc::Rpc for Ledger {
             fn call(
@@ -2399,74 +2432,202 @@ mod capability_tests {
                 method: &str,
                 params: serde_json::Value,
             ) -> native::Result<serde_json::Value> {
-                Ok(match method {
-                    "getTransaction" => serde_json::json!({
-                        "status": "NOT_FOUND",
-                        "latestLedger": self.sequence,
+                self.calls.lock().unwrap().push(method.into());
+                match method {
+                    "getTransaction" => Ok(serde_json::json!({
+                        "status": self.status,
+                        "oldestLedger": self.oldest,
+                        "latestLedger": 900,
                         "latestLedgerCloseTime": self.closed.to_string(),
-                    }),
-                    "getLedgerEntries" => {
-                        let mut entries = vec![];
-                        for key in params["keys"].as_array().unwrap() {
-                            let key = key.as_str().unwrap();
-                            let entry =
-                                match LedgerKey::from_xdr_base64(key, Limits::none()).unwrap() {
-                                    LedgerKey::ConfigSetting(_) => LedgerEntryData::ConfigSetting(
-                                        ConfigSettingEntry::StateArchival(StateArchivalSettings {
-                                            min_temporary_ttl: 720,
-                                            ..Default::default()
-                                        }),
-                                    ),
-                                    LedgerKey::ContractData(data) if self.spent => {
-                                        LedgerEntryData::ContractData(ContractDataEntry {
-                                            ext: ExtensionPoint::V0,
-                                            contract: data.contract,
-                                            key: data.key,
-                                            durability: data.durability,
-                                            val: stellar_xdr::ScVal::Void,
-                                        })
-                                    }
-                                    _ => continue,
-                                };
-                            entries.push(serde_json::json!({
-                                "key": key,
-                                "xdr": entry.to_xdr_base64(Limits::none()).unwrap(),
-                            }));
-                        }
-                        serde_json::json!({"latestLedger": self.sequence, "entries": entries})
+                    })),
+                    "getEvents" if self.events_fail => Err("The RPC is unreachable".into()),
+                    "getEvents" => {
+                        assert_eq!(params["startLedger"], self.from);
+                        let filter = &params["filters"][0];
+                        assert_eq!(filter["contractIds"], serde_json::json!([self.wallet]));
+                        assert_eq!(filter["topics"][0].as_array().unwrap().len(), 2);
+                        let events = if self.executed {
+                            serde_json::json!([{"txHash": native::hex(&[0xee; 32]), "ledger": 130}])
+                        } else {
+                            serde_json::json!([])
+                        };
+                        Ok(serde_json::json!({"events": events, "latestLedger": 900}))
                     }
                     other => panic!("unexpected {other}"),
-                })
+                }
             }
         }
+        let read = |status, closed, oldest, executed, events_fail| {
+            let ledger = Arc::new(Ledger {
+                status,
+                closed,
+                oldest,
+                executed,
+                events_fail,
+                wallet: p.config.wallet.clone(),
+                from: p.state.ledger,
+                calls: std::sync::Mutex::new(Vec::new()),
+            });
+            let provider = Provider::from_rpc("stellar:testnet", ledger.clone());
+            let lapsed = provider.lapsed(&provider.packet(&p).unwrap());
+            let calls = ledger.calls.lock().unwrap().clone();
+            (lapsed, calls)
+        };
+        let from = u64::from(p.state.ledger);
+        // An operation that the agent never submitted: retired once the bound passed, also long
+        // after it.
+        let (lapsed, calls) = read("NOT_FOUND", p.expires_at, from, false, false);
+        assert!(lapsed.unwrap());
+        assert_eq!(calls, ["getTransaction", "getEvents"]);
+        assert!(
+            read("NOT_FOUND", p.expires_at + 86_400, from, false, false)
+                .0
+                .unwrap()
+        );
+        // An execution in another envelope, which no receipt of the operation adopts: no lapse.
+        assert!(
+            !read("NOT_FOUND", p.expires_at, from, true, false)
+                .0
+                .unwrap()
+        );
+        // Before the bound the wallet can still run it: the events are not read.
+        let (lapsed, calls) = read("NOT_FOUND", p.expires_at - 1, from, false, false);
+        assert!(!lapsed.unwrap());
+        assert_eq!(calls, ["getTransaction"]);
+        // The prepared transaction applied.
+        assert!(!read("SUCCESS", p.expires_at, from, false, false).0.unwrap());
+        // A read of the events that fails proves nothing.
+        assert!(
+            read("NOT_FOUND", p.expires_at, from, false, true)
+                .0
+                .is_err()
+        );
+        // The history no longer holds the preparation's ledger: the time bound alone retires it.
+        let (lapsed, calls) = read("NOT_FOUND", p.expires_at, from + 1, true, false);
+        assert!(lapsed.unwrap());
+        assert_eq!(calls, ["getTransaction"]);
+        // A reply without its history proves nothing.
+        assert!(!read("NOT_FOUND", p.expires_at, 0, false, false).0.unwrap());
+    }
+    /// The server cosigns no operation of a wallet whose instance lapsed after the operation's
+    /// last simulation: the lapse is `contract_expired` before the signer is asked.
+    #[test]
+    fn the_server_signs_nothing_for_a_wallet_that_lapsed_after_its_simulation() {
+        use stellar_xdr::{
+            ContractDataDurability, ContractDataEntry, ContractExecutable, ExtensionPoint, Hash,
+            LedgerEntryData, Limits, ScContractInstance, ScVal, WriteXdr,
+        };
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../tests/fixtures/provider/stellar-policy-wallet-revalidation-rpc.json"
         ))
         .unwrap();
         let p: PreparedOperation = serde_json::from_value(fixture["prepared"].clone()).unwrap();
-        let lapsed = |closed, sequence, spent| {
-            let provider = Provider::from_rpc(
-                "stellar:testnet",
-                Arc::new(Ledger {
-                    closed,
-                    sequence,
-                    spent,
-                }),
-            );
-            provider.lapsed(&provider.packet(&p).unwrap()).unwrap()
-        };
-        assert!(lapsed(p.expires_at, 185, false));
-        assert!(lapsed(p.expires_at, 184, false));
-        // An operation that the agent never submitted, read long after its expiry: retired.
-        assert!(lapsed(
-            p.expires_at + 86_400,
-            184 - 64 + 720 + 17_280,
-            false
-        ));
-        // The receipt, read first, tells an execution apart; a spent nonce is not read.
-        assert!(lapsed(p.expires_at, 185, true));
-        // Before the expiry the wallet can still run it.
-        assert!(!lapsed(p.expires_at - 1, 185, false));
+        /// The recorded network of the fixture; once `lapsed`, the wallet's instance lapsed.
+        struct Recorded {
+            fixture: serde_json::Value,
+            config: WalletConfig,
+            lapsed: std::sync::atomic::AtomicBool,
+        }
+        impl rpc::Rpc for Recorded {
+            fn call(
+                &self,
+                method: &str,
+                params: serde_json::Value,
+            ) -> native::Result<serde_json::Value> {
+                let recorded = |method: &str| {
+                    self.fixture["calls"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|call| call["method"] == method)
+                        .map(|call| call["result"].clone())
+                        .unwrap()
+                };
+                if !self.lapsed.load(std::sync::atomic::Ordering::SeqCst) {
+                    return self.fixture["calls"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|call| call["method"] == method && call["params"] == params)
+                        .map(|call| call["result"].clone())
+                        .ok_or_else(|| format!("Unexpected RPC {method}"));
+                }
+                Ok(match method {
+                    "getNetwork" | "getLatestLedger" => recorded(method),
+                    "getLedgerEntries" => {
+                        let instance = LedgerEntryData::ContractData(ContractDataEntry {
+                            ext: ExtensionPoint::V0,
+                            contract: native::address(&self.config.wallet)?,
+                            key: ScVal::LedgerKeyContractInstance,
+                            durability: ContractDataDurability::Persistent,
+                            val: ScVal::ContractInstance(ScContractInstance {
+                                executable: ContractExecutable::Wasm(Hash(
+                                    self.config.module_digest,
+                                )),
+                                storage: None,
+                            }),
+                        });
+                        serde_json::json!({
+                            "latestLedger": recorded("getLatestLedger")["sequence"],
+                            "entries": [{
+                                "xdr": instance.to_xdr_base64(Limits::none()).unwrap(),
+                                "liveUntilLedgerSeq": 0,
+                            }],
+                        })
+                    }
+                    other => panic!("unexpected {other} after the lapse"),
+                })
+            }
+        }
+        struct Counting(std::sync::atomic::AtomicUsize, String);
+        impl Signer for Counting {
+            fn identity(&self) -> &str {
+                &self.1
+            }
+            fn sign_hash(&self, _: &[u8; 32]) -> Result<Vec<u8>> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(vec![0; 64])
+            }
+        }
+        let configuration = super::super::server_owner::configuration(
+            "stellar:testnet",
+            &serde_json::to_vec(&p.config).unwrap(),
+        )
+        .unwrap();
+        let installation = installation(&configuration);
+        let network = Arc::new(Recorded {
+            fixture: fixture.clone(),
+            config: p.config.clone(),
+            lapsed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let provider = Provider::from_rpc("stellar:testnet", network.clone());
+        let simulated = provider
+            .revalidate(&installation, &retained(&fixture["prepared"]), 86_402)
+            .unwrap();
+        network
+            .lapsed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let signer = Counting(
+            std::sync::atomic::AtomicUsize::new(0),
+            p.config.server.clone(),
+        );
+        // The liveness check comes first, before any step that signs.
+        let refused = provider
+            .authorize_preparation(&installation, &simulated, &signer, None, 86_402)
+            .unwrap_err();
+        assert_eq!(refused.message, rpc::CONTRACT_EXPIRED);
+        let refused = provider
+            .finalize(
+                &installation,
+                &simulated,
+                &signer,
+                None,
+                86_402,
+                Box::new(|_| Ok(())),
+            )
+            .unwrap_err();
+        assert_eq!(refused.message, rpc::CONTRACT_EXPIRED);
+        assert_eq!(signer.0.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
     #[test]
     fn genuine_preflight_survives_carrier_but_not_serialization_or_document_changes() {

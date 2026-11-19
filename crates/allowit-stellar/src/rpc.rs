@@ -12,7 +12,7 @@ pub(crate) mod owner_observation;
 use allowit_core::transport::rpc::{EnvelopeValidation, ErrorKind, RpcClient};
 pub use owner_actions::{
     CodeState, OwnerSettlement, code_lifetime, code_state, code_uploaded, contract_exists,
-    owner_settlement, vault_redeemable,
+    instance_code, owner_settlement, vault_redeemable,
 };
 pub use owner_observation::{AssetBalance, WalletLifetime, asset_balance, wallet_lifetime};
 use serde_json::{Value, json};
@@ -971,21 +971,57 @@ fn owner_never_applied(reply: &Value, hash: &str, expires_at: u64, since: u64) -
         && (reply["txHash"].is_null() || reply["txHash"] == hash)
         && number("latestLedgerCloseTime").is_some_and(|closed| closed > expires_at)
 }
-/// Whether the policy wallet operation `p` can no longer execute: a ledger closed at or after its
-/// signed `expires_at`, and the wallet refuses an execution whose expiry is not after the ledger's
-/// time, in any envelope that carries its authorization. The signed time bound alone decides; a
-/// caller looks for the operation's receipt first, since this says nothing of an execution in
-/// a ledger before the expiry. `false` before that ledger, when its prepared transaction
-/// succeeded, or when the RPC does not show the closing time.
+/// Whether the policy wallet operation `p` lapsed: it can no longer execute, and the network's
+/// history holds no execution of it. A ledger closed at or after its signed `expires_at`, and the
+/// wallet refuses an execution whose expiry is not after the ledger's time, in any envelope that
+/// carries its authorization: no execution comes after that ledger. The wallet's events read
+/// then, from the preparation's ledger on, hold every execution of the operation, in any envelope,
+/// also one whose envelope no receipt of the operation adopts: an event found means that it
+/// executed. Once the history no longer holds the preparation's ledger, the signed time bound
+/// alone decides, so an operation that was never sent always ends. `false` before that ledger,
+/// when its prepared transaction succeeded, when the RPC does not show the closing time or its
+/// history, or when an execution is found; a read that fails is an error, never a lapse.
 pub fn operation_lapsed(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<bool> {
     if p.config.route != WalletRoute::PolicyWallet {
         return Ok(false);
     }
     let reply = rpc.call("getTransaction", json!({"hash":hex(&p.transaction_hash)}))?;
-    let closed = reply["latestLedgerCloseTime"]
-        .as_u64()
-        .or_else(|| reply["latestLedgerCloseTime"].as_str()?.parse().ok());
-    Ok(reply["status"].as_str() != Some("SUCCESS") && closed.is_some_and(|t| t >= p.expires_at))
+    let number = |key: &str| {
+        reply[key]
+            .as_u64()
+            .or_else(|| reply[key].as_str()?.parse().ok())
+    };
+    let closed = number("latestLedgerCloseTime");
+    if reply["status"].as_str() == Some("SUCCESS") || !closed.is_some_and(|t| t >= p.expires_at) {
+        return Ok(false);
+    }
+    // The history starts after the preparation: an execution in it could be gone. A reply
+    // without its history bounds proves nothing.
+    match number("oldestLedger") {
+        None | Some(0) => Ok(false),
+        Some(oldest) if oldest > u64::from(p.state.ledger) => Ok(true),
+        Some(_) => Ok(!executed(rpc, p)?),
+    }
+}
+/// Whether the wallet's events from the ledger of `p`'s preparation on hold an execution of `p`:
+/// its `allowit` event of the operation id, in any envelope.
+fn executed(rpc: &dyn Rpc, p: &PreparedOperation) -> Result<bool> {
+    let topics = [
+        xdr(&value_symbol("allowit")?)?,
+        xdr(&value_bytes(&p.request.operation.nonce)?)?,
+    ];
+    let reply = rpc.call(
+        "getEvents",
+        json!({
+            "startLedger": p.state.ledger,
+            "filters": [{"type": "contract", "contractIds": [p.config.wallet], "topics": [topics]}],
+            "pagination": {"limit": 1},
+        }),
+    )?;
+    Ok(!reply["events"]
+        .as_array()
+        .ok_or("Missing ledger events")?
+        .is_empty())
 }
 /// The settlement of the policy wallet operation `p`, found by the wallet's `allowit` event of
 /// its operation id. The settled transaction is the sealed one, so its hash is not the prepared

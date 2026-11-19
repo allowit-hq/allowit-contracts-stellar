@@ -362,6 +362,9 @@ struct Model {
     /// Every contract instance is past its lifetime: the RPC serves it with a live-until ledger
     /// of 0.
     lapsed_instances: bool,
+    /// The code that the wallet's instance runs, when its owner installed other code outside
+    /// Allowit; its tier's code otherwise.
+    running: Option<[u8; 32]>,
     /// The ledger holds each settled transaction inside a fee bump of another source.
     fee_bumped: bool,
     pending_name: String,
@@ -624,11 +627,13 @@ impl rpc::Rpc for ModelChain {
                                 x::ScVal::LedgerKeyContractInstance => {
                                     x::ScVal::ContractInstance(x::ScContractInstance {
                                         executable: x::ContractExecutable::Wasm(x::Hash(
-                                            *m.code
-                                                .iter()
-                                                .find(|(_, tier)| **tier == w.tier)
-                                                .unwrap()
-                                                .0,
+                                            m.running.unwrap_or(
+                                                *m.code
+                                                    .iter()
+                                                    .find(|(_, tier)| **tier == w.tier)
+                                                    .unwrap()
+                                                    .0,
+                                            ),
                                         )),
                                         storage: Some(
                                             vec![x::ScMapEntry {
@@ -4104,6 +4109,22 @@ fn a_lapsed_wallet_takes_no_owner_step() {
     );
     expired(OwnerAction::Fund { units: 5 });
     expired(OwnerAction::Extend);
+    // Its owner installed other code outside Allowit, which runs: the installation's code that
+    // lapsed is not the wallet's, so the wallet did not lapse; it runs other code.
+    chain.0.lock().unwrap().running = Some([0x42; 32]);
+    let refused = provider.resources(&installation).unwrap_err();
+    assert_ne!(
+        provider.problem(&refused).code,
+        allowit_core::vendor::runtime::CONTRACT_EXPIRED,
+        "{}",
+        refused.message
+    );
+    assert!(
+        refused.message.contains("other code"),
+        "{}",
+        refused.message
+    );
+    chain.0.lock().unwrap().running = None;
     chain.0.lock().unwrap().lapsed_code.remove(&c.module_digest);
     // The owner installed other code outside Allowit, and that code lapsed: the stop's simulation
     // would restore it, and is refused.

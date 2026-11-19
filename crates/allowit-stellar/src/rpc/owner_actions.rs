@@ -59,6 +59,32 @@ pub fn contract_exists(rpc: &dyn Rpc, network: &str, contract: &str) -> Result<b
         }),
     )
 }
+/// The code that the live instance of `contract` runs, `None` when the network has no such
+/// instance. An instance that lapsed is `CONTRACT_EXPIRED`.
+pub fn instance_code(rpc: &dyn Rpc, network: &str, contract: &str) -> Result<Option<[u8; 32]>> {
+    Contract::from_string(contract).map_err(err)?;
+    let key = LedgerKey::ContractData(LedgerKeyContractData {
+        contract: address(contract)?,
+        key: ScVal::LedgerKeyContractInstance,
+        durability: ContractDataDurability::Persistent,
+    });
+    let (live_until, closing, data) = observed(rpc, network, &key)?;
+    if live_until.is_some_and(|until| until < closing) {
+        // Nothing restores it.
+        return Err(super::CONTRACT_EXPIRED.into());
+    }
+    Ok(match data {
+        Some(LedgerEntryData::ContractData(ContractDataEntry {
+            val:
+                ScVal::ContractInstance(ScContractInstance {
+                    executable: ContractExecutable::Wasm(Hash(code)),
+                    ..
+                }),
+            ..
+        })) => Some(code),
+        _ => None,
+    })
+}
 fn live_entry(rpc: &dyn Rpc, network: &str, key: LedgerKey) -> Result<bool> {
     let (live_until, closing) = observed_entry(rpc, network, &key)?;
     if live_until.is_some_and(|until| until < closing) {
@@ -71,6 +97,15 @@ fn live_entry(rpc: &dyn Rpc, network: &str, key: LedgerKey) -> Result<bool> {
 /// entry, and the closing head of the observation. An archived entry that the RPC serves without
 /// a live-until ledger reads as 0.
 fn observed_entry(rpc: &dyn Rpc, network: &str, key: &LedgerKey) -> Result<(Option<u32>, u32)> {
+    let (live_until, closing, _) = observed(rpc, network, key)?;
+    Ok((live_until, closing))
+}
+/// [`observed_entry`] with the verified entry.
+fn observed(
+    rpc: &dyn Rpc,
+    network: &str,
+    key: &LedgerKey,
+) -> Result<(Option<u32>, u32, Option<LedgerEntryData>)> {
     owner_observation::network(rpc, network)?;
     let before = owner_observation::head(rpc)?;
     let value = rpc.call("getLedgerEntries", json!({"keys":[xdr(key)?]}))?;
@@ -81,6 +116,7 @@ fn observed_entry(rpc: &dyn Rpc, network: &str, key: &LedgerKey) -> Result<(Opti
         None | Some(Value::Null) => &none,
         Some(entries) => entries.as_array().ok_or("Invalid native entries")?,
     };
+    let mut verified = None;
     let live_until = match entries.as_slice() {
         [] => None,
         [entry] => {
@@ -92,7 +128,7 @@ fn observed_entry(rpc: &dyn Rpc, network: &str, key: &LedgerKey) -> Result<(Opti
             }
             let data: LedgerEntryData =
                 read(entry["xdr"].as_str().ok_or("Missing native entry XDR")?)?;
-            let matches = match (key, data) {
+            let matches = match (key, data.clone()) {
                 (LedgerKey::ContractCode(expected), LedgerEntryData::ContractCode(actual)) => {
                     actual.hash == expected.hash && hash(actual.code.as_slice()) == expected.hash.0
                 }
@@ -113,6 +149,7 @@ fn observed_entry(rpc: &dyn Rpc, network: &str, key: &LedgerKey) -> Result<(Opti
             if !matches {
                 return Err("Native entry differs from the selected resource".into());
             }
+            verified = Some(data);
             Some(match &entry["liveUntilLedgerSeq"] {
                 Value::Null => 0,
                 value if value.as_u64() == Some(0) => 0,
@@ -124,6 +161,7 @@ fn observed_entry(rpc: &dyn Rpc, network: &str, key: &LedgerKey) -> Result<(Opti
     Ok((
         live_until,
         owner_observation::current(rpc, before, observed)?,
+        verified,
     ))
 }
 /// Only a verified native receipt is terminal. A missing lookup or expiry cannot prove absence.

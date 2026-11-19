@@ -3184,8 +3184,8 @@ mod native_revalidation_tests {
     ) -> impl Fn(&str, &serde_json::Value) -> serde_json::Value + Send + 'static {
         lapse_rpc_spent(transaction, entries_ledger, false)
     }
-    /// The lapse reads: the transaction, then the wallet's nonce entry, present when `spent`,
-    /// and the network's minimum temporary lifetime of 720 ledgers.
+    /// The lapse reads: the transaction, with the history from ledger 100 unless it names its
+    /// own, then the wallet's events, which hold an execution of the operation when `spent`.
     fn lapse_rpc_spent(
         transaction: serde_json::Value,
         entries_ledger: u64,
@@ -3197,7 +3197,21 @@ mod native_revalidation_tests {
         };
         let calls = fixture()["calls"].as_array().unwrap().clone();
         move |method, params| match method {
-            "getTransaction" => transaction.clone(),
+            "getTransaction" => {
+                let mut reply = transaction.clone();
+                if reply.get("oldestLedger").is_none() {
+                    reply["oldestLedger"] = json!(100);
+                }
+                reply
+            }
+            "getEvents" => {
+                let events = if spent {
+                    json!([{"txHash": sdk::hex(&[0xee; 32]), "ledger": 130}])
+                } else {
+                    json!([])
+                };
+                json!({"events": events, "latestLedger": entries_ledger})
+            }
             "getLatestLedger" => json!({"sequence":130}),
             "getLedgerEntries" if params["keys"].as_array().unwrap().len() == 2 => {
                 let mut entries = vec![];
@@ -3308,7 +3322,7 @@ mod native_revalidation_tests {
                 &p,
                 true,
             ),
-            // The signed time bound alone decides: a ledger closed at or after the expiry.
+            // A ledger closed at or after the expiry, and no execution in the history.
             (
                 json!({"status":"NOT_FOUND","latestLedger":184,"latestLedgerCloseTime":"86700"}),
                 184,
@@ -3343,13 +3357,12 @@ mod native_revalidation_tests {
             server.join().unwrap();
             assert_eq!(result, Ok(lapsed), "{transaction} at {entries_ledger}");
         }
-        // The nonce is not read: the receipt and the wallet's event, read first, tell an
-        // execution apart.
+        // An execution in the wallet's events, in any envelope: no lapse.
         let (rpc, stop, server) = rpc_server(lapse_rpc_spent(not_found.clone(), 185, true));
         let result = sdk::rpc::operation_lapsed(&sdk::rpc::HttpRpc::new(&rpc).unwrap(), &p);
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         server.join().unwrap();
-        assert_eq!(result, Ok(true));
+        assert_eq!(result, Ok(false));
     }
     #[test]
     #[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
