@@ -51,12 +51,16 @@ struct OperationAdvertisement {
 struct Templates {
     templates: Vec<Template>,
 }
-/// The templates answer as the Native setup reads it. The setup decodes the server's signer
-/// and the one template of its network; it does not decode a template of another network. The
-/// contract-wallet generation keeps its own decoder, [`Templates`], which reads no signer.
+/// The templates answer as the Native setup reads it. The contract-wallet generation keeps its
+/// own decoder, [`Templates`], which reads no signer.
+///
+/// The decoder names every field that the setup reads, so an answer that states one of them
+/// twice is refused as a whole: no later value replaces an earlier one unseen. It takes each
+/// value in any form, and the setup then requires the forms of its own network's template
+/// only: a template of another network in a form that the setup does not know does not stop it.
 #[derive(Deserialize)]
 struct NativeTemplates {
-    templates: Vec<Value>,
+    templates: Vec<NativeTemplate>,
     /// The server's signer on the network of the request.
     #[serde(default)]
     server: Value,
@@ -64,12 +68,17 @@ struct NativeTemplates {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct NativeTemplate {
-    asset: String,
-    asset_symbol: String,
-    asset_issuer: Option<String>,
+    #[serde(default)]
+    network: Value,
+    #[serde(default)]
+    asset: Value,
+    #[serde(default)]
+    asset_symbol: Value,
+    #[serde(default)]
+    asset_issuer: Value,
     /// The server's signer on the template's network, when the server states it per template.
     #[serde(default)]
-    server: Option<String>,
+    server: Value,
 }
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -221,7 +230,8 @@ fn wallet_asset(
         return Err(other_signer());
     }
     let mut matching = templates.templates.into_iter().filter(|template| {
-        template["network"]
+        template
+            .network
             .as_str()
             .and_then(|named| crate::host::routing::normalize(named).ok())
             == Some(canonical)
@@ -231,24 +241,27 @@ fn wallet_asset(
             "The server offers no Native wallet on this network",
         ));
     };
-    let invalid = || Error::config("The server's wallet asset of this network is invalid");
-    let template: NativeTemplate = serde_json::from_value(template).map_err(|_| invalid())?;
     // A server that states its signer on the template too states the same key there.
-    if template.server.as_deref().is_some_and(|key| key != server) {
+    if !template.server.is_null() && template.server.as_str() != Some(server) {
         return Err(other_signer());
     }
-    let asset =
-        native::asset_from_identity(&template.asset_symbol, template.asset_issuer.as_deref())
-            .map_err(|_| invalid())?;
-    if native::sac_address(canonical, &asset).map_err(|_| invalid())? != template.asset {
+    let invalid = || Error::config("The server's wallet asset of this network is invalid");
+    let symbol = template.asset_symbol.as_str().ok_or_else(invalid)?;
+    let issuer = match &template.asset_issuer {
+        Value::Null => None,
+        Value::String(issuer) => Some(issuer.as_str()),
+        _ => return Err(invalid()),
+    };
+    let asset = native::asset_from_identity(symbol, issuer).map_err(|_| invalid())?;
+    if template.asset.as_str()
+        != Some(&native::sac_address(canonical, &asset).map_err(|_| invalid())?)
+    {
         return Err(invalid());
     }
-    Ok(template
-        .asset_issuer
-        .map(|issuer| native::owner::Trustline {
-            code: template.asset_symbol,
-            issuer,
-        }))
+    Ok(issuer.map(|issuer| native::owner::Trustline {
+        code: symbol.into(),
+        issuer: issuer.into(),
+    }))
 }
 impl OwnerClient {
     /// The issued asset of a new Native wallet on `network`, from the server's template. The

@@ -451,6 +451,37 @@ fn the_wallet_asset_is_the_asset_of_the_servers_template_of_the_network() {
         &server,
     );
     assert!(beside.is_ok(), "{:?}", beside.err().map(|e| e.message));
+    // An answer that states a field of a template, or its own signer, twice is refused as a
+    // whole, whichever of the two values is the valid one.
+    let pubnet = template("stellar:pubnet", "USDC", Some(PUBNET_ISSUER)).to_string();
+    let twice = |field: &str, first: &str, top: &str| {
+        let doubled = pubnet.replacen('{', &format!("{{\"{field}\":{first},"), 1);
+        serde_json::from_str::<super::NativeTemplates>(&format!(
+            "{{\"templates\":[{doubled}]{top},\"server\":\"{server}\"}}"
+        ))
+    };
+    assert!(twice("unknownField", "1", "").is_ok());
+    let stated_twice = format!(",\"server\":\"{other}\"");
+    assert!(twice("unknownField", "1", &stated_twice).is_err());
+    for (field, first) in [
+        ("network", "\"stellar:testnet\"".to_owned()),
+        ("asset", "\"C\"".to_owned()),
+        ("assetSymbol", "\"XLM\"".to_owned()),
+        ("assetIssuer", "null".to_owned()),
+    ] {
+        assert!(twice(field, &first, "").is_err(), "{field}");
+    }
+    let signer_twice = pubnet.replacen(
+        '{',
+        &format!("{{\"server\":\"{other}\",\"server\":\"{server}\","),
+        1,
+    );
+    assert!(
+        serde_json::from_str::<super::NativeTemplates>(&format!(
+            "{{\"templates\":[{signer_twice}],\"server\":\"{server}\"}}"
+        ))
+        .is_err()
+    );
     let mut typed = template("stellar:testnet", "XLM", None);
     typed["server"] = json!({});
     assert!(

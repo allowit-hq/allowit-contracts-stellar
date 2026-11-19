@@ -116,7 +116,7 @@ export function walletStartingBalance(funding: bigint, issued = false): bigint {
  * setup: the same identity, the bootstrap source and the wallet's asset, which is `asset` or XLM. The server reads the
  * roles from the ledger and refuses a document that the account does not match.
  */
-export function nativeWalletConfiguration(network: string, wallet: string, owner: string, agent: string, server: string, asset?: NativeWalletAsset | null): Record<string, unknown> {
+export function nativeWalletConfiguration(network: string, wallet: string, owner: string, agent: string, server: string, asset?: NativeWalletAsset | null | undefined): Record<string, unknown> {
   const id = canonicalNetwork(network);
   if (!id) throw new Error('Select a supported Stellar network.');
   roles(owner, wallet, agent, server);
@@ -131,7 +131,7 @@ export function nativeWalletConfiguration(network: string, wallet: string, owner
 }
 
 /** What a wallet account's configuration states of itself: its policy instance, its asset and its fee ceiling. */
-function walletFacts(network: string, wallet: string, asset?: NativeWalletAsset | null) {
+function walletFacts(network: string, wallet: string, asset?: NativeWalletAsset | null | undefined) {
   const {symbol, issuer} = assetOf(issuedAsset(asset));
   return {
     policyInstance: digest(`allowit-stellar-native-wallet-v1:${network}:${wallet}`),
@@ -144,7 +144,7 @@ function walletFacts(network: string, wallet: string, asset?: NativeWalletAsset 
  * `funding` is in base units of the wallet's asset, which is `asset` or XLM.
  */
 export interface NativeSetupTerms {network: string; owner: string; sequence: string; wallet: string; agent: string; server: string; funding: bigint; requestId: string; expiresAt: number;
-  asset?: NativeWalletAsset | null}
+  asset?: NativeWalletAsset | null | undefined}
 
 /**
  * The setup transaction of a wallet account. Its operations are one atomic unit: the creation with the starting
@@ -270,7 +270,7 @@ export interface NativeSetupInput {
   /** The amount of the wallet's asset that the wallet holds for the agent's payments, as decimal text with at most seven decimals. */
   amount: string;
   /** The asset that the wallet holds, from the policy that the owner reviewed. Without one the wallet holds XLM. */
-  asset?: NativeWalletAsset | null;
+  asset?: NativeWalletAsset | null | undefined;
   fetch?: typeof fetch;
 }
 /** A setup prepared for the owner's signature. */

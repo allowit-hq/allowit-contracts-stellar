@@ -51,7 +51,7 @@ export declare function walletStartingBalance(funding: bigint, issued?: boolean)
  * setup: the same identity, the bootstrap source and the wallet's asset, which is `asset` or XLM. The server reads the
  * roles from the ledger and refuses a document that the account does not match.
  */
-export declare function nativeWalletConfiguration(network: string, wallet: string, owner: string, agent: string, server: string, asset?: NativeWalletAsset | null): Record<string, unknown>;
+export declare function nativeWalletConfiguration(network: string, wallet: string, owner: string, agent: string, server: string, asset?: NativeWalletAsset | null | undefined): Record<string, unknown>;
 /**
  * The terms of one wallet setup. `sequence` is the owner's current account sequence, and `expiresAt` a Unix time.
  * `funding` is in base units of the wallet's asset, which is `asset` or XLM.
@@ -66,7 +66,7 @@ export interface NativeSetupTerms {
     funding: bigint;
     requestId: string;
     expiresAt: number;
-    asset?: NativeWalletAsset | null;
+    asset?: NativeWalletAsset | null | undefined;
 }
 /**
  * The setup transaction of a wallet account. Its operations are one atomic unit: the creation with the starting
@@ -108,7 +108,7 @@ export interface NativeSetupInput {
     /** The amount of the wallet's asset that the wallet holds for the agent's payments, as decimal text with at most seven decimals. */
     amount: string;
     /** The asset that the wallet holds, from the policy that the owner reviewed. Without one the wallet holds XLM. */
-    asset?: NativeWalletAsset | null;
+    asset?: NativeWalletAsset | null | undefined;
     fetch?: typeof fetch;
 }
 /** A setup prepared for the owner's signature. */
