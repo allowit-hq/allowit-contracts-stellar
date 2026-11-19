@@ -327,6 +327,17 @@ it, so a status read of a retained request can prove that a payment authorizatio
 The outcome document of a paid operation shows the recorded context under `paidService` and the wallet's
 network under `network`.
 
+## Typed refusals
+
+`provider::diagnostics` gives a refusal its client-visible code: `policy_denied`, with the rule when the wallet
+names one, the wallet contract's `wallet_paused`, `insufficient_funds`, `stale_request` and `wallet_rejected`, the
+owner's `stale_owner_observation` and `nothing_to_return`, `params_differ_from_wallet`, Core's `contract_expired`, and
+`custom_code_hash_mismatch` for a policy wallet whose live code is not its installed executable. Each code has an
+entry in the error catalogue of Allowit core (`allowit_core::errors`): a title and a help page, which a host shows
+with the rail's own message. `tests/error_catalogue.rs` fails for a code of that module, a code that the runtime
+clients name, or a code of Core that the rail gives, without an entry. The reason codes of the payment protocol that
+the settlement service returns (`invalidReason`, `errorReason`) belong to that protocol and are not in the catalogue.
+
 ## Owner setup
 
 `admin::PolicyConfig::for_policy` builds the `AllowitPolicyConfig` constructor packet of a validated installation, and `constructor_args` emits it. `admin::Deployer` prepares unsigned setup transactions through Stellar RPC simulation:
