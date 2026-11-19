@@ -163,8 +163,12 @@ export function nativeSetupOf(payload, network) {
         return null;
     }
     const [create, ...after] = tx.operations;
-    // The setup pays the fee that `nativeSetupTransaction` sets: 100 stroops for each operation.
+    // The setup pays the fee that `nativeSetupTransaction` sets: 100 stroops for each operation. Its one condition is
+    // its upper time bound: no lower time bound, ledger bounds, sequence condition or further signer.
     if (tx.fee !== String(100 * tx.operations.length))
+        return null;
+    if (!tx.timeBounds || Number(tx.timeBounds.minTime) !== 0 || !(Number(tx.timeBounds.maxTime) > 0) || tx.ledgerBounds || tx.minAccountSequence
+        || Number(tx.minAccountSequenceAge ?? 0) !== 0 || Number(tx.minAccountSequenceLedgerGap ?? 0) !== 0 || (tx.extraSigners?.length ?? 0) !== 0)
         return null;
     if (create?.type !== 'createAccount' || create.source !== undefined)
         return null;
@@ -273,6 +277,11 @@ export function signedNativeSetupOf(signedPayload, network) {
             return null;
         const validUntil = Number(tx.timeBounds?.maxTime);
         if (!Number.isSafeInteger(validUntil) || validUntil <= 0)
+            return null;
+        // Signed setup bytes carry exactly two signatures over their hash on this network: the owner's and the new
+        // account's own. Bytes without them, or signed for another network, are no signed setup of this network.
+        const digest = tx.hash(), signedBy = (account) => tx.signatures.filter(s => Keypair.fromPublicKey(account).verify(digest, s.signature.value)).length === 1;
+        if (tx.signatures.length !== 2 || !signedBy(setup.owner) || !signedBy(setup.wallet))
             return null;
         return { hash: hex(tx.hash()), owner: setup.owner, wallet: setup.wallet, agent: setup.agent, server: setup.server, validUntil, asset: setup.asset, amount: plainDecimal(setup.funding) };
     }

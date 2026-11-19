@@ -1061,6 +1061,15 @@ fn a_setup_of_an_issued_asset_is_signed_only_for_its_exact_asset_and_amount() {
             }),
         ),
         (
+            "a trustline with a lower limit",
+            reordered(&|ops| {
+                let x::OperationBody::ChangeTrust(trust) = &mut ops[1].body else {
+                    panic!()
+                };
+                trust.limit = 0;
+            }),
+        ),
+        (
             "a trustline of another account",
             reordered(&|ops| ops[1].source_account = Some(muxed(&account(12)))),
         ),

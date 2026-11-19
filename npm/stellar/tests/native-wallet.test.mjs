@@ -166,6 +166,24 @@ test('a setup that moves another asset, another amount or another XLM balance th
   };
   assert.ok(nativeSetupOf(bid('100'), network));
   for (const fee of ['101', '10000000', '99']) assert.equal(nativeSetupOf(bid(fee), network), null, fee);
+  // The one condition of a setup is its upper time bound. A setup with another condition is not read as one: the
+  // owner's and the new account's signatures could not meet it, or it would apply at another time.
+  const conditioned = (change, timebounds = {minTime: 0, maxTime: 2_000_000_000}) => {
+    const builder = new TransactionBuilder(new Account(roles.owner, '41'), {fee: '100', networkPassphrase: Networks.TESTNET, timebounds});
+    for (const op of [create(), trust(), pay(), ...signers]) builder.addOperation(op);
+    change(builder);
+    return builder.build().toXDR();
+  };
+  assert.ok(nativeSetupOf(conditioned(() => {}), network));
+  for (const [name, change] of Object.entries({
+    'a further signer': b => b.setExtraSigners([roles.agent]),
+    'ledger bounds': b => b.setLedgerbounds(1, 1_000_000_000),
+    'a minimum account sequence': b => b.setMinAccountSequence('7'),
+    'a minimum sequence age': b => b.setMinAccountSequenceAge(60n),
+    'a minimum sequence ledger gap': b => b.setMinAccountSequenceLedgerGap(5),
+  })) assert.equal(nativeSetupOf(conditioned(change), network), null, name);
+  assert.equal(nativeSetupOf(conditioned(() => {}, {minTime: 1_900_000_000, maxTime: 2_000_000_000}), network), null, 'a lower time bound');
+  assert.equal(nativeSetupOf(conditioned(() => {}, {minTime: 0, maxTime: 0}), network), null, 'no upper time bound');
 });
 
 test('a setup is built and read for each network of the rail, and its bytes belong to one network', () => {
@@ -251,6 +269,25 @@ test('the owner signs once: the new account countersigns and the network takes t
   assert.deepEqual(signedNativeSetupOf(signedPayload, network), {hash: prepared.step.hash, ...roles, wallet: prepared.wallet, validUntil: Number(tx.timeBounds.maxTime), asset: {symbol: 'XLM', issuer: null}, amount: '5'});
   for (const other of ['not-xdr', nativeSetupTransaction(terms(Keypair.random().publicKey())).toXDR()])
     assert.equal(signedNativeSetupOf(other, network)?.hash === prepared.step.hash, false);
+  // Signed setup bytes carry the owner's and the new account's signatures over their hash on this network. Bytes
+  // without both, with another key's signature, or signed for the other network are no signed setup.
+  const resigned = keys => {
+    const copy = TransactionBuilder.fromXDR(prepared.step.payload, Networks.TESTNET);
+    for (const key of keys) copy.sign(key);
+    return copy.toXDR();
+  };
+  const walletSignature = () => {
+    // The new account's own key lives in `prepare` only: its signature is taken from the completed bytes.
+    const own = tx.signatures.find(s => Keypair.fromPublicKey(prepared.wallet).verify(tx.hash(), Buffer.from(s.signature instanceof Uint8Array ? s.signature : s.signature.value)));
+    return copy => { copy.signatures.push(own); return copy.toXDR(); };
+  };
+  assert.equal(signedNativeSetupOf(prepared.step.payload, network), null, 'unsigned');
+  assert.equal(signedNativeSetupOf(resigned([owner]), network), null, 'the owner alone');
+  assert.equal(signedNativeSetupOf(resigned([owner, agent]), network), null, 'the owner and another key');
+  assert.equal(signedNativeSetupOf(resigned([owner, owner]), network), null, 'the owner twice');
+  assert.equal(signedNativeSetupOf(walletSignature()(TransactionBuilder.fromXDR(resigned([agent]), Networks.TESTNET)), network), null, 'another key and the new account');
+  assert.equal(signedNativeSetupOf(signedPayload, 'stellar:pubnet'), null, 'the bytes of the other network');
+  assert.ok(signedNativeSetupOf(walletSignature()(TransactionBuilder.fromXDR(resigned([owner]), Networks.TESTNET)), network));
   assert.equal(signedNativeSetupOf(signedPayload, 'stellar:other'), null);
   // Each setup makes a new account: the key is random and nothing keeps it.
   const second = await prepareNativeSetup({network, ...roles, amount: '5', fetch});

@@ -182,11 +182,16 @@ impl OwnerProvider for Owner {
         // read before anything is signed for the ledger, so a server that offers no wallet on
         // this network stops the setup before an account exists. A request that the store
         // retains keeps its own asset: its resume does not depend on the template of today.
-        let client = client(cx)?;
+        // Such a resume asks the server nothing before its retained bytes are settled on the
+        // ledger, as before: the owner's session starts at the registration.
         let store = (cx.store)()?;
-        let asset = match workflow::retained_setup_asset(&store, r.request_id)? {
-            Some(asset) => asset,
-            None => client.native_wallet_asset(cx.network, (cx.clock)()?)?,
+        let (asset, session) = match workflow::retained_setup_asset(&store, r.request_id)? {
+            Some(asset) => (asset, None),
+            None => {
+                let client = client(cx)?;
+                let asset = client.native_wallet_asset(cx.network, (cx.clock)()?)?;
+                (asset, Some(client))
+            }
         };
         let request = SetupRequest {
             network: cx.network.into(),
@@ -209,8 +214,11 @@ impl OwnerProvider for Owner {
         // The ledger now holds the wallet. The server registers it from the ledger, so no
         // server configuration names it. A refusal leaves the wallet set up: the same request
         // ID asks again and signs nothing.
-        let registration = (cx.clock)()
-            .and_then(|now| client.register_native(&configured["configuration"], now))
+        let registration = session
+            .map_or_else(|| client(cx), Ok)
+            .and_then(|client| {
+                client.register_native(&configured["configuration"], (cx.clock)()?)
+            })
             .map_err(|error| {
                 let mut refused = Error::api(
                     error.status.unwrap_or(409),
