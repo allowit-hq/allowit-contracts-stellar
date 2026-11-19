@@ -451,6 +451,22 @@ fn a_request_id_binds_its_asset_and_a_signed_setup_keeps_its_hints() {
     assert_eq!(signer.calls.load(Ordering::SeqCst), 1);
     let message = refused(&request(None, 100_000), &signer);
     assert!(message.contains("another intent"), "{message}");
+    // A retained field of the signed setup that differs from the caller's intent: the resume
+    // refuses the record, as the status read does, although the signed bytes are unchanged.
+    let kept: Value = store.load("setup-template-001").unwrap().unwrap();
+    assert_eq!(kept["setup"]["funding"], "100000");
+    for (field, value) in [
+        ("funding", json!("100001")),
+        ("funding", Value::Null),
+        ("intentDigest", json!("00".repeat(32))),
+    ] {
+        let mut record = kept.clone();
+        record["setup"][field] = value;
+        store.save("setup-template-001", &record).unwrap();
+        let message = refused(&request(Some(&usdc), 100_000), &signer);
+        assert!(message.contains("failed validation"), "{field}: {message}");
+    }
+    store.save("setup-template-001", &kept).unwrap();
     // The new account's signature under another hint: the retained bytes are refused.
     let mut record: Value = store.load("setup-template-001").unwrap().unwrap();
     let stellar_xdr::TransactionEnvelope::Tx(mut envelope) =

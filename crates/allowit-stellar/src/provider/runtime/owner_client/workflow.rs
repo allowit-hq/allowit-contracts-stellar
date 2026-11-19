@@ -1826,10 +1826,11 @@ pub fn configure_native(
         .ok_or_else(|| Error::config("Missing retained Native setup signature"))?
         .try_into()
         .map_err(|_| Error::config("Invalid retained Native signature"))?;
-    // The retained unsigned packet is still the exact setup of the caller's intent, and the
-    // retained signed bytes are that packet with the owner's and the wallet key's signatures.
-    checked(owner_intent::validate_owner_transaction(
-        &packet,
+    // The whole retained setup is still the exact setup of the caller's intent: its fields and
+    // its digest as well as its transaction, as before its signature. The retained signed bytes
+    // are that transaction with the owner's and the wallet key's signatures.
+    checked(owner_intent::validate_native_setup(
+        &record.setup,
         &expected,
         record.created_at,
     ))?;

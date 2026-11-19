@@ -60,7 +60,9 @@ A Native policy needs the wallet account of its agent: a new classic account, on
    The policy that the owner reviewed names it, and the server's template of the network decides it at the draft. For
    an issued asset, such as USDC, the same transaction adds the account's trustline after the creation, and the
    owner's account then pays the funding amount in that asset; the starting balance is 3.0 XLM of reserve, for the
-   account and its trustline, and the 0.5 XLM. The setup works on every network of the rail.
+   account and its trustline, and the 0.5 XLM. The setup works on every network of the rail. The issuer's flags hold
+   for the wallet's asset: an issuer that authorizes each trustline itself makes a funded setup fail as a whole, and
+   an issuer with clawback can take the asset back. So the element says that only the owner can take the XLM back.
 2. Has the host's `sign` sign it as the step `set_up_wallet`. The account's own key is random, lives in `complete` only
    and signs the creation once beside the owner. The `owner-sign` element reads the step from its bytes: it shows the
    wallet account, the agent, the asset with its issuer and the funding, and it refuses any transaction that is not
