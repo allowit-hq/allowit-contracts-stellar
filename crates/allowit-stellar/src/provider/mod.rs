@@ -89,9 +89,26 @@ pub(crate) fn failure(message: impl Into<String>) -> Error {
         error
     } else if message.contains(native::rpc::TRANSPORT_UNKNOWN) {
         Error::uncertain(message)
+    } else if message == native::rpc::owner_observation::STALE_OBSERVATION {
+        // A caller prepares the owner step once more: the typed code says so, and the text and
+        // kind stay those of a plain refusal.
+        let mut error = Error::config(message);
+        error.api_code = Some(allowit_core::vendor::runtime::STALE_OWNER_OBSERVATION.to_owned());
+        error
     } else {
         Error::config(message)
     }
+}
+#[cfg(test)]
+#[test]
+fn a_stale_owner_observation_carries_its_code() {
+    let error = failure(native::rpc::owner_observation::STALE_OBSERVATION);
+    assert_eq!(
+        error.api_code.as_deref(),
+        Some(allowit_core::vendor::runtime::STALE_OWNER_OBSERVATION)
+    );
+    assert!(error.config);
+    assert_eq!(failure("another refusal").api_code, None);
 }
 
 pub static KEYS: Keys = Keys;
