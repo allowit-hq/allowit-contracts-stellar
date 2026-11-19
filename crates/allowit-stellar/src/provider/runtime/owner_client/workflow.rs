@@ -1544,9 +1544,12 @@ struct NativeSetupRecord {
     submitted: bool,
     receipt: Option<rpc::VerifiedReceipt>,
 }
-/// The asset of the setup that the store retains under `request_id`, when it retains one: the
-/// issued asset, or `None` for XLM. A retained setup keeps its asset, so a resume builds the
-/// same request whatever the server's template names now.
+/// The asset of the signed setup that the store retains under `request_id`, when it retains
+/// one: the issued asset, or `None` for XLM. A signed setup keeps its asset, so its resume
+/// builds the same request whatever the server's template names now; the resume then checks
+/// the retained signed bytes against that request. A request that stopped before its
+/// signature retains nothing that the owner signed: its next run takes the asset from the
+/// server's template again, as a new request does.
 pub fn retained_setup_asset(
     store: &Store,
     request_id: &str,
@@ -1556,6 +1559,7 @@ pub fn retained_setup_asset(
     }
     Ok(store
         .load::<NativeSetupRecord>(request_id)?
+        .filter(|record| record.signed_xdr.is_some())
         .map(|record| record.setup.trustline))
 }
 /// The server's first record of a wallet: the account, its roles and a policy that admits

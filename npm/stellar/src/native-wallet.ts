@@ -9,7 +9,7 @@
  * installation document that the server registers. The SDK's owner workflow keeps the signed setup and decides when to
  * send it again or replace it. The server takes no part in the setup.
  */
-import {Account, Asset, Keypair, Memo, Operation, StrKey, TransactionBuilder, type Transaction} from '@stellar/stellar-sdk/base';
+import {Account, Asset, Keypair, Memo, Operation, StrKey, TransactionBuilder, xdr, type Transaction} from '@stellar/stellar-sdk/base';
 import {sha256} from '@noble/hashes/sha256';
 import {canonicalNetwork, networkPassphrase} from './networks.js';
 import {horizonOrigin} from './chain-record.js';
@@ -49,6 +49,18 @@ const BOOTSTRAP_SOURCE = 'use allowit::prelude::*;\n/// Bootstrap: transfers in 
 const hex = (bytes: Uint8Array) => Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
 const digest = (text: string) => sha256(new TextEncoder().encode(text));
 const object = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+/**
+ * True when `payload` is a transaction envelope of the current form. An envelope of the earlier form has the same
+ * transaction hash for the same content, so the hash alone does not tell the two apart; a setup is never one.
+ */
+function currentEnvelope(payload: string): boolean {
+  try {
+    return 'v1' in xdr.TransactionEnvelope.fromXDR(payload, 'base64');
+  } catch {
+    return false;
+  }
+}
 
 /**
  * The asset that a wallet holds, by its code and its issuer. XLM has no issuer. A policy names its asset this way, and
@@ -191,7 +203,7 @@ export function nativeSetupOf(payload: string, network: string): NativeSetupFact
   let tx: Transaction;
   try {
     const parsed = TransactionBuilder.fromXDR(payload, networkPassphrase(network));
-    if ('innerTransaction' in parsed) return null;
+    if ('innerTransaction' in parsed || !currentEnvelope(payload)) return null;
     tx = parsed;
   } catch {
     return null;
@@ -302,7 +314,7 @@ export async function prepareNativeSetup({network, owner, agent, server, amount,
     step: {action: SET_UP_WALLET, payload: tx.toXDR(), hash, expiresAt},
     complete(ownerSigned: string): string {
       const signed = TransactionBuilder.fromXDR(ownerSigned, passphrase);
-      if ('innerTransaction' in signed || hex(signed.hash()) !== hash || signed.signatures.length !== 1) throw new Error('The wallet returned another transaction. Nothing was sent.');
+      if ('innerTransaction' in signed || !currentEnvelope(ownerSigned) || hex(signed.hash()) !== hash || signed.signatures.length !== 1) throw new Error('The wallet returned another transaction. Nothing was sent.');
       // The one signature must be the owner's: the transaction hash leaves signatures out, so another key's signature
       // would pass the check above and the network would refuse the setup.
       if (!signs(owner, signed.hash(), signed.signatures[0]))

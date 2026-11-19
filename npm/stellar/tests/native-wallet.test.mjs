@@ -298,6 +298,18 @@ test('the owner signs once: the new account countersigns and the network takes t
   assert.equal(signedNativeSetupOf(resigned([owner, owner]), network), null, 'the owner twice');
   assert.equal(signedNativeSetupOf(walletSignature()(TransactionBuilder.fromXDR(resigned([agent]), Networks.TESTNET)), network), null, 'another key and the new account');
   assert.equal(signedNativeSetupOf(signedPayload, 'stellar:pubnet'), null, 'the bytes of the other network');
+  // The same transaction in the envelope form of earlier protocol versions has the same hash and the same
+  // signatures. The builder never makes that form, so it is no setup, signed or not, and `complete` refuses it.
+  const earlierForm = payload => {
+    const raw = Buffer.from(payload, 'base64');
+    // Form 2 names its source as a tagged account; form 0 holds the bare key. The rest is the same bytes.
+    return Buffer.concat([Buffer.alloc(4), raw.subarray(8)]).toString('base64');
+  };
+  const v0 = TransactionBuilder.fromXDR(earlierForm(signedPayload), Networks.TESTNET);
+  assert.deepEqual([hex(v0.hash()), v0.signatures.length], [prepared.step.hash, 2]);
+  assert.equal(signedNativeSetupOf(earlierForm(signedPayload), network), null, 'the earlier envelope form, signed');
+  assert.equal(nativeSetupOf(earlierForm(prepared.step.payload), network), null, 'the earlier envelope form');
+  assert.throws(() => prepared.complete(earlierForm(resigned([owner]))), /another transaction/);
   // The network matches a signature to its key by the hint. The owner's signature under another hint is no signature
   // of the owner there, and `complete` does not take it either.
   const rehinted = TransactionBuilder.fromXDR(signedPayload, Networks.TESTNET);

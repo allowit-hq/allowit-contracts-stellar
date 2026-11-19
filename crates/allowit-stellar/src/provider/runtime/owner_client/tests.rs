@@ -423,6 +423,12 @@ fn a_settled_setup_signs_nothing_again_and_an_unsigned_one_takes_a_new_key() {
     .unwrap_err();
     let unsigned: Value = store.load("setup-first-001").unwrap().unwrap();
     assert!(unsigned["signedXdr"].is_null());
+    // Nothing of this request was signed, so it names no asset of its own for a resume: the
+    // next run asks the server's template again, as a new request does.
+    assert_eq!(
+        workflow::retained_setup_asset(&store, "setup-first-001").unwrap(),
+        None
+    );
     assert_eq!(sends(), 0);
     let abandoned = unsigned["setup"]["wallet"].as_str().unwrap().to_owned();
     // No file of the store holds a seed: the record names the account and nothing else of the key.

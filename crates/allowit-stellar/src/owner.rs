@@ -180,6 +180,20 @@ fn asset_funding(v: &NativeSetup) -> Result<Option<i64>> {
 }
 
 fn transaction(v: &NativeSetup) -> Result<Transaction> {
+    if !(8..=100).contains(&v.request_id.len())
+        || !v
+            .request_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._:-".contains(&b))
+    {
+        return Err("Invalid native setup identity or fee".into());
+    }
+    setup_transaction(v, hash(v.request_id.as_bytes()))
+}
+/// The one builder of a setup transaction, for the fields of `v` and a memo. [`transaction`]
+/// builds a setup with the memo of its request, and [`is_setup_transaction`] builds the setup
+/// of given bytes again: bytes are a setup only when this builder makes exactly them.
+fn setup_transaction(v: &NativeSetup, memo: [u8; 32]) -> Result<Transaction> {
     passphrase(&v.network)?;
     let owner = account_key(&v.owner)?;
     let wallet = account_key(&v.wallet)?;
@@ -197,11 +211,6 @@ fn transaction(v: &NativeSetup) -> Result<Transaction> {
     let count = operation_count(v);
     if v.version != 2
         || v.profile != OWNER_PROFILE
-        || !(8..=100).contains(&v.request_id.len())
-        || !v
-            .request_id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"._:-".contains(&b))
         || v.expires_at == 0
         || v.expires_at > 9_007_199_254_740_991
         || !(100 * count..=100_000 * count).contains(&v.fee_stroops)
@@ -277,11 +286,115 @@ fn transaction(v: &NativeSetup) -> Result<Transaction> {
             min_time: TimePoint(0),
             max_time: TimePoint(v.expires_at),
         }),
-        memo: Memo::Hash(Hash(hash(v.request_id.as_bytes()))),
+        memo: Memo::Hash(Hash(memo)),
         operations: operations.try_into().map_err(err)?,
         ext: TransactionExt::V0,
     })
 }
+/// Whether `tx` is the setup of a new wallet account on `network`. The values of the setup are
+/// read from `tx` itself: the owner (its source), the new account, its trustline and funding,
+/// the agent and the server (the signers of its last two operations), the fee, the sequence,
+/// the time bound and the memo. The setup builder then makes the setup of those values again,
+/// and only the same transaction is a setup. So no operation, source, destination, asset,
+/// amount, weight, threshold, fee, condition or extension that the builder never makes is one.
+pub(crate) fn is_setup_transaction(tx: &Transaction, network: &str) -> bool {
+    let read = || -> Option<(NativeSetup, [u8; 32])> {
+        let MuxedAccount::Ed25519(Uint256(owner)) = &tx.source_account else {
+            return None;
+        };
+        let Memo::Hash(Hash(memo)) = &tx.memo else {
+            return None;
+        };
+        let Preconditions::Time(bounds) = &tx.cond else {
+            return None;
+        };
+        let (create, rest) = tx.operations.split_first()?;
+        let OperationBody::CreateAccount(created) = &create.body else {
+            return None;
+        };
+        let AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(wallet))) = &created.destination;
+        let code = |bytes: &[u8]| {
+            let end = bytes.iter().rposition(|b| *b != 0).map_or(0, |i| i + 1);
+            String::from_utf8(bytes[..end].to_vec()).ok()
+        };
+        let issuer = |AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(key))): &AccountId| {
+            account_for_public_key(key)
+        };
+        let (trustline, rest) = match rest.split_first() {
+            Some((
+                Operation {
+                    body: OperationBody::ChangeTrust(trust),
+                    ..
+                },
+                rest,
+            )) => {
+                let line = match &trust.line {
+                    ChangeTrustAsset::CreditAlphanum4(a) => Trustline {
+                        code: code(&a.asset_code.0)?,
+                        issuer: issuer(&a.issuer),
+                    },
+                    ChangeTrustAsset::CreditAlphanum12(a) => Trustline {
+                        code: code(&a.asset_code.0)?,
+                        issuer: issuer(&a.issuer),
+                    },
+                    _ => return None,
+                };
+                (Some(line), rest)
+            }
+            _ => (None, rest),
+        };
+        let (funding, rest) = match rest.split_first() {
+            Some((
+                Operation {
+                    body: OperationBody::Payment(payment),
+                    ..
+                },
+                rest,
+            )) => (Some(payment.amount.to_string()), rest),
+            _ => (None, rest),
+        };
+        let signer = |op: &Operation| match &op.body {
+            OperationBody::SetOptions(SetOptionsOp {
+                signer:
+                    Some(stellar_xdr::Signer {
+                        key: SignerKey::Ed25519(Uint256(key)),
+                        ..
+                    }),
+                ..
+            }) => Some(account_for_public_key(key)),
+            _ => None,
+        };
+        let [_, agent, engine] = rest else {
+            return None;
+        };
+        Some((
+            NativeSetup {
+                version: 2,
+                profile: OWNER_PROFILE.into(),
+                request_id: String::new(),
+                network: network.into(),
+                owner: account_for_public_key(owner),
+                wallet: account_for_public_key(wallet),
+                agent: signer(agent)?,
+                engine: signer(engine)?,
+                starting_balance: created.starting_balance.to_string(),
+                trustline,
+                funding,
+                sequence: tx.seq_num.0.to_string(),
+                fee_stroops: tx.fee,
+                expires_at: bounds.max_time.0,
+                transaction_xdr: String::new(),
+                transaction_hash: String::new(),
+                intent_digest: String::new(),
+            },
+            *memo,
+        ))
+    };
+    read().is_some_and(|(setup, memo)| {
+        setup_transaction(&setup, memo).is_ok_and(|rebuilt| rebuilt == *tx)
+    })
+}
+
 fn change_trust_asset(asset: &Asset) -> Result<ChangeTrustAsset> {
     match asset {
         Asset::CreditAlphanum4(a) => Ok(ChangeTrustAsset::CreditAlphanum4(a.clone())),

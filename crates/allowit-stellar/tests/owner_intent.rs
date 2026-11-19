@@ -1086,6 +1086,43 @@ fn a_setup_of_an_issued_asset_is_signed_only_for_its_exact_asset_and_amount() {
                 payment.asset = xlm;
             }),
         ),
+        ("a fee that no setup bids", {
+            let mut changed = packet.clone();
+            modify_tx(&mut changed, |tx| tx.fee = 601);
+            changed
+        }),
+        ("no memo", {
+            let mut changed = packet.clone();
+            modify_tx(&mut changed, |tx| tx.memo = x::Memo::None);
+            changed
+        }),
+        (
+            "a starting balance above the most that a setup sends",
+            reordered(&|ops| {
+                let x::OperationBody::CreateAccount(create) = &mut ops[0].body else {
+                    panic!()
+                };
+                create.starting_balance = owner::MAX_STARTING_BALANCE + 1;
+            }),
+        ),
+        (
+            "an agent that pays alone",
+            reordered(&|ops| {
+                let x::OperationBody::SetOptions(options) = &mut ops[4].body else {
+                    panic!()
+                };
+                options.signer.as_mut().unwrap().weight = 2;
+            }),
+        ),
+        (
+            "a home domain in a signer operation",
+            reordered(&|ops| {
+                let x::OperationBody::SetOptions(options) = &mut ops[5].body else {
+                    panic!()
+                };
+                options.home_domain = Some(x::String32("example.com".try_into().unwrap()));
+            }),
+        ),
         (
             "a trustline with a lower limit",
             reordered(&|ops| {

@@ -83,66 +83,18 @@ pub fn validate_retained_owner_transaction(original: &OwnerTransaction) -> Resul
                 ..
             },
         ] => original.action == "extend",
-        operations => classic_action_matches(&original.action, operations),
+        // The setup of a wallet account is exactly what the setup builder makes from the values
+        // of the bytes themselves. Every other classic action is described by its operations.
+        operations => {
+            classic_action_matches(&original.action, operations)
+                || (original.action == "native_setup"
+                    && owner::is_setup_transaction(tx, &original.network))
+        }
     };
     if !action_matches {
         return Err("Retained owner action differs from its transaction".into());
     }
     Ok(())
-}
-
-/// Whether `create` and `rest` are the setup of a new wallet account. The owner's account, the
-/// transaction source, creates the account. The new account then adds its trustline, if it
-/// holds an issued asset, and the owner's account sends at most one payment: a positive amount
-/// of that trustline's asset to the new account. The three signer operations of the new account
-/// end the setup. No operation names another account as its source or as its destination. The
-/// fields of the signer operations are not read here: this describes retained bytes, and the
-/// exact roles, weights and thresholds are rebuilt from the caller's intent before a signature.
-fn created_wallet_setup(create: &Operation, rest: &[Operation]) -> bool {
-    let OperationBody::CreateAccount(created) = &create.body else {
-        return false;
-    };
-    if create.source_account.is_some() {
-        return false;
-    }
-    let AccountId(PublicKey::PublicKeyTypeEd25519(key)) = &created.destination;
-    let wallet = MuxedAccount::Ed25519(key.clone());
-    let own = |op: &Operation| op.source_account.as_ref() == Some(&wallet);
-    // The setup adds its trustline with the full limit; a lower limit is another operation. No
-    // wallet holds an issued asset with the code of the network's own asset.
-    let trusted = |op: &Operation| match &op.body {
-        OperationBody::ChangeTrust(trust) if own(op) && trust.limit == i64::MAX => {
-            match &trust.line {
-                ChangeTrustAsset::CreditAlphanum4(asset) if asset.asset_code.0 == *b"XLM\0" => None,
-                ChangeTrustAsset::CreditAlphanum4(asset) => {
-                    Some(Asset::CreditAlphanum4(asset.clone()))
-                }
-                ChangeTrustAsset::CreditAlphanum12(asset) => {
-                    Some(Asset::CreditAlphanum12(asset.clone()))
-                }
-                _ => None,
-            }
-        }
-        _ => None,
-    };
-    let funds = |op: &Operation, asset: &Asset| {
-        op.source_account.is_none()
-            && matches!(&op.body, OperationBody::Payment(payment)
-                if payment.destination == wallet && payment.asset == *asset && payment.amount > 0)
-    };
-    let (trustline, signers) = match rest {
-        [trust, pay, signers @ ..] if trusted(trust).is_some_and(|asset| funds(pay, &asset)) => {
-            (true, signers)
-        }
-        [trust, signers @ ..] if trusted(trust).is_some() => (true, signers),
-        signers => (false, signers),
-    };
-    // The account starts with at least the reserve of its entries, as the setup requires.
-    created.starting_balance >= owner::wallet_reserve(trustline) + 100
-        && signers.len() == 3
-        && signers
-            .iter()
-            .all(|op| own(op) && matches!(op.body, OperationBody::SetOptions(_)))
 }
 
 /// Whether a classic owner transaction has the operations of its named action: the creation
@@ -160,7 +112,6 @@ fn classic_action_matches(action: &str, operations: &[Operation]) -> bool {
         {
             true
         }
-        ("native_setup", [create, rest @ ..]) => created_wallet_setup(create, rest),
         ("fund", [op]) => !wallet_sourced(op) && matches!(op.body, OperationBody::Payment(_)),
         ("withdraw", [op]) => wallet_sourced(op) && matches!(op.body, OperationBody::Payment(_)),
         ("pause" | "resume", [op]) => {
