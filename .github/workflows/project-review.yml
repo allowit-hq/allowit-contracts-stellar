@@ -1,13 +1,19 @@
 name: Project review
+# Reports the maintainers' project review of a pull request head: the commit status
+# allowit-project/review, which the knowledge repository's project-review command posts on that head.
+# A status posted after the check ran runs the check again, so the check follows the latest review.
 on:
   pull_request:
-permissions:
-  statuses: read
+  status:
+permissions: {}
 jobs:
   project-review:
     name: Project review
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      statuses: read
     steps:
       - name: Report the maintainers' project review
         env:
@@ -15,8 +21,9 @@ jobs:
           REPO: ${{ github.repository }}
           SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          status=$(gh api "repos/$REPO/commits/$SHA/statuses" \
-            --jq '[.[] | select(.context == "allowit-project/review")][0] // empty | "\(.state)\t\(.description)"')
+          # The combined status holds the latest status of each context. Every page is read.
+          status=$(gh api --paginate "repos/$REPO/commits/$SHA/status?per_page=100" \
+            --jq '.statuses[] | select(.context == "allowit-project/review") | "\(.state)\t\(.description)"' | sed -n 1p)
           state=${status%%$'\t'*}
           description=${status#*$'\t'}
           case "$state" in
@@ -24,3 +31,27 @@ jobs:
             failure|error) echo "::error::allowit-project/review: $state - $description"; exit 1 ;;
             *) echo "::notice::Maintainers run the project review before merging; no action needed." ;;
           esac
+  refresh:
+    name: Refresh the project review check
+    if: github.event_name == 'status' && github.event.context == 'allowit-project/review'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Run the Project review check of that head again
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.sha }}
+        run: |
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::not a commit id: $SHA"; exit 1; }
+          # The latest pull-request run of this workflow on that head carries the check.
+          run=$(gh api "repos/$REPO/actions/workflows/project-review.yml/runs?event=pull_request&head_sha=$SHA&per_page=1" \
+            --jq '.workflow_runs[0] | select(.status == "completed") | .id')
+          if [ -z "$run" ]; then
+            echo "::notice::No finished Project review check on $SHA; a check that runs later reads the new status."
+            exit 0
+          fi
+          gh api -X POST "repos/$REPO/actions/runs/$run/rerun" > /dev/null
+          echo "Project review check of $SHA runs again (run $run)."
