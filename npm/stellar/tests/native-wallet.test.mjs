@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import test from 'node:test';
-import {Asset, Keypair, Networks, Operation, TransactionBuilder, Account} from '@stellar/stellar-sdk/base';
+import {Asset, Keypair, Memo, Networks, Operation, TransactionBuilder, Account} from '@stellar/stellar-sdk/base';
 import {
   APPROVE_POLICY, SET_UP_WALLET, TRUSTLINE_RESERVE, WALLET_FEE_FLOAT, WALLET_RESERVE, approvalMessage, approvalStep, messageDigest,
   nativeSetupOf, nativeSetupTransaction, nativeWalletConfiguration, policyApproval, prepareNativeSetup, sendNativeSetup, signedNativeSetupOf,
@@ -14,6 +14,8 @@ const owner = Keypair.random(), agent = Keypair.random(), server = Keypair.rando
 const roles = {owner: owner.publicKey(), agent: agent.publicKey(), server: server.publicKey()};
 const sha = text => createHash('sha256').update(text).digest();
 const hex = bytes => Buffer.from(bytes).toString('hex');
+/** The memo of a setup is the hash of its request identity: every hand-built setup of these tests carries one. */
+const setupMemo = Memo.hash('ab'.repeat(32));
 const terms = (wallet, extra = {}) => ({network, ...roles, sequence: '41', wallet, funding: 50_000_000n, requestId: 'wallet-0001', expiresAt: 2_000_000_000, ...extra});
 function journalOf(entries = {}) {
   const map = new Map(Object.entries(entries));
@@ -127,7 +129,7 @@ test('a wallet of an issued asset adds its trustline and takes its funding in th
 test('a setup that moves another asset, another amount or another XLM balance than its wallet takes is not read as one', () => {
   const wallet = Keypair.random().publicKey();
   const build = ops => {
-    const builder = new TransactionBuilder(new Account(roles.owner, '41'), {fee: '100', networkPassphrase: Networks.TESTNET, timebounds: {minTime: 0, maxTime: 2_000_000_000}});
+    const builder = new TransactionBuilder(new Account(roles.owner, '41'), {fee: '100', networkPassphrase: Networks.TESTNET, timebounds: {minTime: 0, maxTime: 2_000_000_000}, memo: setupMemo});
     for (const op of ops) builder.addOperation(op);
     return builder.build().toXDR();
   };
@@ -160,7 +162,7 @@ test('a setup that moves another asset, another amount or another XLM balance th
   })) assert.equal(nativeSetupOf(build(ops), network), null, name);
   // The fee is the fee of the builder, 100 stroops for each operation: a setup that bids more is not read as one.
   const bid = fee => {
-    const builder = new TransactionBuilder(new Account(roles.owner, '41'), {fee, networkPassphrase: Networks.TESTNET, timebounds: {minTime: 0, maxTime: 2_000_000_000}});
+    const builder = new TransactionBuilder(new Account(roles.owner, '41'), {fee, networkPassphrase: Networks.TESTNET, timebounds: {minTime: 0, maxTime: 2_000_000_000}, memo: setupMemo});
     for (const op of [create(), trust(), pay(), ...signers]) builder.addOperation(op);
     return builder.build().toXDR();
   };
@@ -169,7 +171,7 @@ test('a setup that moves another asset, another amount or another XLM balance th
   // The one condition of a setup is its upper time bound. A setup with another condition is not read as one: the
   // owner's and the new account's signatures could not meet it, or it would apply at another time.
   const conditioned = (change, timebounds = {minTime: 0, maxTime: 2_000_000_000}) => {
-    const builder = new TransactionBuilder(new Account(roles.owner, '41'), {fee: '100', networkPassphrase: Networks.TESTNET, timebounds});
+    const builder = new TransactionBuilder(new Account(roles.owner, '41'), {fee: '100', networkPassphrase: Networks.TESTNET, timebounds, memo: setupMemo});
     for (const op of [create(), trust(), pay(), ...signers]) builder.addOperation(op);
     change(builder);
     return builder.build().toXDR();
@@ -184,6 +186,15 @@ test('a setup that moves another asset, another amount or another XLM balance th
   })) assert.equal(nativeSetupOf(conditioned(change), network), null, name);
   assert.equal(nativeSetupOf(conditioned(() => {}, {minTime: 1_900_000_000, maxTime: 2_000_000_000}), network), null, 'a lower time bound');
   assert.equal(nativeSetupOf(conditioned(() => {}, {minTime: 0, maxTime: 0}), network), null, 'no upper time bound');
+  // The memo of a setup is a hash. A setup without one, or with a text, is not read as one.
+  const memoed = memo => {
+    const builder = new TransactionBuilder(new Account(roles.owner, '41'), {fee: '100', networkPassphrase: Networks.TESTNET, timebounds: {minTime: 0, maxTime: 2_000_000_000}, ...(memo ? {memo} : {})});
+    for (const op of [create(), trust(), pay(), ...signers]) builder.addOperation(op);
+    return builder.build().toXDR();
+  };
+  assert.ok(nativeSetupOf(memoed(Memo.hash('cd'.repeat(32))), network));
+  assert.equal(nativeSetupOf(memoed(null), network), null, 'no memo');
+  assert.equal(nativeSetupOf(memoed(Memo.text('setup')), network), null, 'a text memo');
 });
 
 test('a setup is built and read for each network of the rail, and its bytes belong to one network', () => {
@@ -209,7 +220,7 @@ test('a setup is built and read for each network of the rail, and its bytes belo
 test('a transaction that is not exactly the setup is not read as one', () => {
   const wallet = Keypair.random().publicKey();
   const build = ops => {
-    const builder = new TransactionBuilder(new Account(roles.owner, '41'), {fee: '100', networkPassphrase: Networks.TESTNET, timebounds: {minTime: 0, maxTime: 2_000_000_000}});
+    const builder = new TransactionBuilder(new Account(roles.owner, '41'), {fee: '100', networkPassphrase: Networks.TESTNET, timebounds: {minTime: 0, maxTime: 2_000_000_000}, memo: setupMemo});
     for (const op of ops) builder.addOperation(op);
     return builder.build().toXDR();
   };
@@ -287,6 +298,15 @@ test('the owner signs once: the new account countersigns and the network takes t
   assert.equal(signedNativeSetupOf(resigned([owner, owner]), network), null, 'the owner twice');
   assert.equal(signedNativeSetupOf(walletSignature()(TransactionBuilder.fromXDR(resigned([agent]), Networks.TESTNET)), network), null, 'another key and the new account');
   assert.equal(signedNativeSetupOf(signedPayload, 'stellar:pubnet'), null, 'the bytes of the other network');
+  // The network matches a signature to its key by the hint. The owner's signature under another hint is no signature
+  // of the owner there, and `complete` does not take it either.
+  const rehinted = TransactionBuilder.fromXDR(signedPayload, Networks.TESTNET);
+  for (const s of rehinted.signatures) if (owner.verify(rehinted.hash(), Buffer.from(s.signature.value))) s.hint.value = Buffer.alloc(4);
+  assert.notEqual(rehinted.toXDR(), signedPayload);
+  assert.equal(signedNativeSetupOf(rehinted.toXDR(), network), null, 'the owner signature under another hint');
+  const ownerOnly = TransactionBuilder.fromXDR(resigned([owner]), Networks.TESTNET);
+  ownerOnly.signatures[0].hint.value = Buffer.alloc(4);
+  assert.throws(() => prepared.complete(ownerOnly.toXDR()), /another account than the owner/);
   assert.ok(signedNativeSetupOf(walletSignature()(TransactionBuilder.fromXDR(resigned([owner]), Networks.TESTNET)), network));
   assert.equal(signedNativeSetupOf(signedPayload, 'stellar:other'), null);
   // Each setup makes a new account: the key is random and nothing keeps it.

@@ -138,15 +138,23 @@ export interface NativeSetupTerms {network: string; owner: string; sequence: str
  * account's own key. A wallet that holds an issued asset adds its trustline after the creation, and the owner's
  * account then pays the funding in that asset. The owner's account is the source and pays the fee.
  */
-export function nativeSetupTransaction({network, owner, sequence, wallet, agent, server, funding, requestId, expiresAt, asset}: NativeSetupTerms): Transaction {
+export function nativeSetupTransaction(terms: NativeSetupTerms): Transaction {
+  if (!/^[A-Za-z0-9._:-]{8,100}$/.test(terms.requestId)) throw new Error('The setup request identity is invalid.');
+  return buildSetup(terms, Memo.hash(hex(digest(terms.requestId))));
+}
+/**
+ * The one builder of a setup transaction, for its terms and its memo. `nativeSetupTransaction` builds a new setup
+ * with it, and `nativeSetupOf` builds the setup of given bytes again with it: bytes are a setup only when this
+ * builder makes exactly them.
+ */
+function buildSetup({network, owner, sequence, wallet, agent, server, funding, expiresAt, asset}: Omit<NativeSetupTerms, 'requestId'>, memo: Memo): Transaction {
   const issued = issuedAsset(asset);
   roles(owner, wallet, agent, server);
   if (!/^[0-9]{1,19}$/.test(sequence)) throw new Error('The owner account sequence is invalid.');
-  if (!/^[A-Za-z0-9._:-]{8,100}$/.test(requestId)) throw new Error('The setup request identity is invalid.');
   if (!Number.isSafeInteger(expiresAt) || expiresAt <= 0) throw new Error('The setup time bound is invalid.');
   const signer = (ed25519PublicKey: string, weight: number) => ({ed25519PublicKey, weight});
   const builder = new TransactionBuilder(new Account(owner, sequence), {
-    fee: '100', networkPassphrase: networkPassphrase(network), timebounds: {minTime: 0, maxTime: expiresAt}, memo: Memo.hash(hex(digest(requestId))),
+    fee: '100', networkPassphrase: networkPassphrase(network), timebounds: {minTime: 0, maxTime: expiresAt}, memo,
   })
     .addOperation(Operation.createAccount({destination: wallet, startingBalance: decimal(walletStartingBalance(funding, issued !== null))}));
   if (issued) {
@@ -166,9 +174,11 @@ export function nativeSetupTransaction({network, owner, sequence, wallet, agent,
 
 /**
  * What a setup transaction does, read from its bytes: the wallet account that it creates, its roles, its XLM starting
- * balance, the asset that it holds and the funding in that asset. Null for any other transaction: one that lacks an
- * operation, adds another, names another signer weight or threshold, leaves the account's own key a weight, starts
- * with another XLM balance than its asset takes, or pays anything but the wallet's own asset to the wallet.
+ * balance, the asset that it holds and the funding in that asset. Null for any other transaction. The bytes are a
+ * setup only when the setup builder makes exactly them from what was read: the same operations in the same encoding,
+ * the same fee, sequence, memo and time bound, and nothing else. So a transaction that lacks an operation, adds
+ * another, names another signer weight, threshold, source, destination, asset or balance, bids another fee or
+ * carries another condition or extension is no setup.
  */
 export interface NativeSetupFacts {owner: string; wallet: string; agent: string; server: string;
   /** The XLM that the owner's account sends at the creation, in stroops. */
@@ -187,11 +197,6 @@ export function nativeSetupOf(payload: string, network: string): NativeSetupFact
     return null;
   }
   const [create, ...after] = tx.operations;
-  // The setup pays the fee that `nativeSetupTransaction` sets: 100 stroops for each operation. Its one condition is
-  // its upper time bound: no lower time bound, ledger bounds, sequence condition or further signer.
-  if (tx.fee !== String(100 * tx.operations.length)) return null;
-  if (!tx.timeBounds || Number(tx.timeBounds.minTime) !== 0 || !(Number(tx.timeBounds.maxTime) > 0) || tx.ledgerBounds || tx.minAccountSequence
-    || Number(tx.minAccountSequenceAge ?? 0) !== 0 || Number(tx.minAccountSequenceLedgerGap ?? 0) !== 0 || (tx.extraSigners?.length ?? 0) !== 0) return null;
   if (create?.type !== 'createAccount' || create.source !== undefined) return null;
   const wallet = create.destination, starting = stroops(create.startingBalance);
   if (starting === null) return null;
@@ -226,12 +231,17 @@ export function nativeSetupOf(payload: string, network: string): NativeSetupFact
     || [last.inflationDest, last.clearFlags, last.setFlags, last.homeDomain].some(value => value !== undefined)) return null;
   const server = last.signer.ed25519PublicKey;
   if (typeof server !== 'string') return null;
+  const facts: NativeSetupFacts = {owner, wallet, agent, server, startingBalance: starting, asset: assetOf(issued), funding: issued ? funding ?? 0n : starting - walletStartingBalance(0n)};
+  // The builder makes the setup of these facts again, with the memo, the sequence and the time bound of the bytes.
+  // Only the same transaction is a setup: its hash covers every byte that the owner signs.
   try {
-    roles(owner, wallet, agent, server);
+    const sequence = BigInt(tx.sequence) - 1n, expiresAt = Number(tx.timeBounds?.maxTime);
+    if (sequence < 0n || tx.memo.type !== 'hash') return null;
+    const rebuilt = buildSetup({network, owner, sequence: sequence.toString(), wallet, agent, server, funding: facts.funding, expiresAt, asset: facts.asset}, tx.memo);
+    return hex(rebuilt.hash()) === hex(tx.hash()) ? facts : null;
   } catch {
     return null;
   }
-  return {owner, wallet, agent, server, startingBalance: starting, asset: assetOf(issued), funding: issued ? funding ?? 0n : starting - walletStartingBalance(0n)};
 }
 
 /** The roles and funding of a Native wallet account's setup. */
@@ -262,6 +272,12 @@ export interface PreparedNativeSetup {
   complete(ownerSigned: string): string;
 }
 
+/** True when a decorated signature is `account`'s signature over `digest`, with the hint that the network matches to that key. */
+function signs(account: string, digest: ReturnType<Transaction['hash']>, decorated: Transaction['signatures'][number]): boolean {
+  const key = Keypair.fromPublicKey(account);
+  return hex(decorated.hint.value) === hex(key.signatureHint()) && key.verify(digest, decorated.signature.value);
+}
+
 /**
  * Prepares the setup of the wallet account of an agent: one transaction from the owner's own sequence. The account's
  * own key is random; it signs the creation once, beside the owner, in `complete`.
@@ -289,7 +305,7 @@ export async function prepareNativeSetup({network, owner, agent, server, amount,
       if ('innerTransaction' in signed || hex(signed.hash()) !== hash || signed.signatures.length !== 1) throw new Error('The wallet returned another transaction. Nothing was sent.');
       // The one signature must be the owner's: the transaction hash leaves signatures out, so another key's signature
       // would pass the check above and the network would refuse the setup.
-      if (!Keypair.fromPublicKey(owner).verify(signed.hash(), signed.signatures[0].signature.value))
+      if (!signs(owner, signed.hash(), signed.signatures[0]))
         throw new Error('The wallet signed with another account than the owner. Nothing was saved or sent; sign with the owner account.');
       signed.sign(setupKey);
       return signed.toXDR();
@@ -313,7 +329,7 @@ export function signedNativeSetupOf(signedPayload: string, network: string): {ha
     if (!Number.isSafeInteger(validUntil) || validUntil <= 0) return null;
     // Signed setup bytes carry exactly two signatures over their hash on this network: the owner's and the new
     // account's own. Bytes without them, or signed for another network, are no signed setup of this network.
-    const digest = tx.hash(), signedBy = (account: string) => tx.signatures.filter(s => Keypair.fromPublicKey(account).verify(digest, s.signature.value)).length === 1;
+    const digest = tx.hash(), signedBy = (account: string) => tx.signatures.filter(s => signs(account, digest, s)).length === 1;
     if (tx.signatures.length !== 2 || !signedBy(setup.owner) || !signedBy(setup.wallet)) return null;
     return {hash: hex(tx.hash()), owner: setup.owner, wallet: setup.wallet, agent: setup.agent, server: setup.server, validUntil, asset: setup.asset, amount: plainDecimal(setup.funding)};
   } catch {

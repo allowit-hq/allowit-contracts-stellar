@@ -178,6 +178,10 @@ impl OwnerProvider for Owner {
         }
         let funding = r.amount.map(setup_funding).transpose()?;
         let fee_per_operation = fee(r.fee_per_operation)?;
+        // The request, the retained record and the registration document name the network by
+        // its canonical id, whichever alias the caller selected: the server's templates and the
+        // identity of a resumed request then name the same network.
+        let network = crate::host::routing::normalize(cx.network)?;
         // The server's template of the network names the asset that the wallet holds. It is
         // read before anything is signed for the ledger, so a server that offers no wallet on
         // this network stops the setup before an account exists. A request that the store
@@ -189,12 +193,12 @@ impl OwnerProvider for Owner {
             Some(asset) => (asset, None),
             None => {
                 let client = client(cx)?;
-                let asset = client.native_wallet_asset(cx.network, (cx.clock)()?)?;
+                let asset = client.native_wallet_asset(network, (cx.clock)()?)?;
                 (asset, Some(client))
             }
         };
         let request = SetupRequest {
-            network: cx.network.into(),
+            network: network.into(),
             owner: cx.signer.address().into(),
             agent: r.agent.into(),
             server: r.server.into(),

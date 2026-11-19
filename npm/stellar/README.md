@@ -64,9 +64,10 @@ A Native policy needs the wallet account of its agent: a new classic account, on
 2. Has the host's `sign` sign it as the step `set_up_wallet`. The account's own key is random, lives in `complete` only
    and signs the creation once beside the owner. The `owner-sign` element reads the step from its bytes: it shows the
    wallet account, the agent, the asset with its issuer and the funding, and it refuses any transaction that is not
-   exactly this setup: another operation, source, destination, asset or XLM balance, another fee than 100 stroops
-   for each operation, or a condition beside its upper time bound. `read` reads only bytes that carry the owner's and
-   the new account's signatures over their hash on the named network.
+   exactly this setup. The reader builds the setup of what it read again with the one setup builder and takes the
+   bytes only when the transaction is the same: its hash covers every byte that the owner signs. `read` reads only
+   bytes that also carry the owner's and the new account's signatures over that hash on the named network, each
+   under the hint of its key.
 3. Saves the signed bytes in the host's journal under `<key>:wallet-setup` and sends them with `send`. They stay saved
    until the service has registered the wallet, so a run that stops in between names the same account again and signs
    no second setup. A result that is unknown is settled first: done when Horizon holds it as successful, sent again

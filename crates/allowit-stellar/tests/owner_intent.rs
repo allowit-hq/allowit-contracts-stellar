@@ -1061,6 +1061,32 @@ fn a_setup_of_an_issued_asset_is_signed_only_for_its_exact_asset_and_amount() {
             }),
         ),
         (
+            "a starting balance below the reserve of the account and its trustline",
+            reordered(&|ops| {
+                let x::OperationBody::CreateAccount(create) = &mut ops[0].body else {
+                    panic!()
+                };
+                create.starting_balance = owner::wallet_reserve(true) + 99;
+            }),
+        ),
+        (
+            "an issued asset with the code XLM",
+            reordered(&|ops| {
+                let xlm = asset_from_identity("XLM", Some(&account(21))).unwrap();
+                let x::Asset::CreditAlphanum4(code) = &xlm else {
+                    panic!()
+                };
+                let x::OperationBody::ChangeTrust(trust) = &mut ops[1].body else {
+                    panic!()
+                };
+                trust.line = x::ChangeTrustAsset::CreditAlphanum4(code.clone());
+                let x::OperationBody::Payment(payment) = &mut ops[2].body else {
+                    panic!()
+                };
+                payment.asset = xlm;
+            }),
+        ),
+        (
             "a trustline with a lower limit",
             reordered(&|ops| {
                 let x::OperationBody::ChangeTrust(trust) = &mut ops[1].body else {

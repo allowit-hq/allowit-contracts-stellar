@@ -108,10 +108,12 @@ fn created_wallet_setup(create: &Operation, rest: &[Operation]) -> bool {
     let AccountId(PublicKey::PublicKeyTypeEd25519(key)) = &created.destination;
     let wallet = MuxedAccount::Ed25519(key.clone());
     let own = |op: &Operation| op.source_account.as_ref() == Some(&wallet);
-    // The setup adds its trustline with the full limit; a lower limit is another operation.
+    // The setup adds its trustline with the full limit; a lower limit is another operation. No
+    // wallet holds an issued asset with the code of the network's own asset.
     let trusted = |op: &Operation| match &op.body {
         OperationBody::ChangeTrust(trust) if own(op) && trust.limit == i64::MAX => {
             match &trust.line {
+                ChangeTrustAsset::CreditAlphanum4(asset) if asset.asset_code.0 == *b"XLM\0" => None,
                 ChangeTrustAsset::CreditAlphanum4(asset) => {
                     Some(Asset::CreditAlphanum4(asset.clone()))
                 }
@@ -128,14 +130,16 @@ fn created_wallet_setup(create: &Operation, rest: &[Operation]) -> bool {
             && matches!(&op.body, OperationBody::Payment(payment)
                 if payment.destination == wallet && payment.asset == *asset && payment.amount > 0)
     };
-    let signers = match rest {
+    let (trustline, signers) = match rest {
         [trust, pay, signers @ ..] if trusted(trust).is_some_and(|asset| funds(pay, &asset)) => {
-            signers
+            (true, signers)
         }
-        [trust, signers @ ..] if trusted(trust).is_some() => signers,
-        signers => signers,
+        [trust, signers @ ..] if trusted(trust).is_some() => (true, signers),
+        signers => (false, signers),
     };
-    signers.len() == 3
+    // The account starts with at least the reserve of its entries, as the setup requires.
+    created.starting_balance >= owner::wallet_reserve(trustline) + 100
+        && signers.len() == 3
         && signers
             .iter()
             .all(|op| own(op) && matches!(op.body, OperationBody::SetOptions(_)))

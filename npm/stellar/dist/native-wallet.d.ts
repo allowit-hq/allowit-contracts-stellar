@@ -75,12 +75,14 @@ export interface NativeSetupTerms {
  * account's own key. A wallet that holds an issued asset adds its trustline after the creation, and the owner's
  * account then pays the funding in that asset. The owner's account is the source and pays the fee.
  */
-export declare function nativeSetupTransaction({ network, owner, sequence, wallet, agent, server, funding, requestId, expiresAt, asset }: NativeSetupTerms): Transaction;
+export declare function nativeSetupTransaction(terms: NativeSetupTerms): Transaction;
 /**
  * What a setup transaction does, read from its bytes: the wallet account that it creates, its roles, its XLM starting
- * balance, the asset that it holds and the funding in that asset. Null for any other transaction: one that lacks an
- * operation, adds another, names another signer weight or threshold, leaves the account's own key a weight, starts
- * with another XLM balance than its asset takes, or pays anything but the wallet's own asset to the wallet.
+ * balance, the asset that it holds and the funding in that asset. Null for any other transaction. The bytes are a
+ * setup only when the setup builder makes exactly them from what was read: the same operations in the same encoding,
+ * the same fee, sequence, memo and time bound, and nothing else. So a transaction that lacks an operation, adds
+ * another, names another signer weight, threshold, source, destination, asset or balance, bids another fee or
+ * carries another condition or extension is no setup.
  */
 export interface NativeSetupFacts {
     owner: string;
