@@ -40,7 +40,7 @@ type Verifier = {
 };
 
 const inputLimit = 512 * 1024;
-const verifierHash = 'f61bfdcb232d2b7709dda244c1251223b98d6bf23234d4cf87740863d187ccac';
+const verifierHash = 'ebde8c4946c69ead6dafa5ff6136242ab190ec1306135bf334439ea46ae4f38f';
 let verifier: Promise<Verifier> | undefined;
 
 async function loadVerifier(): Promise<Verifier> {
