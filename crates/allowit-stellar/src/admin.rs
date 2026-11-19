@@ -467,7 +467,14 @@ impl OwnerAdmin<'_> {
         })
     }
     /// Set the fee and resource data from a simulation, within the configured fee ceiling.
+    /// Take the simulated resources and fee of an owner step. Nothing restores a wallet whose
+    /// instance or code lapsed: such a simulation is refused (`rpc::refuse_expired`).
     fn apply_resources(&self, tx: &mut Transaction, response: &serde_json::Value) -> Result<()> {
+        rpc::refuse_expired(
+            response,
+            Some(&self.config.wallet),
+            &self.config.module_digest,
+        )?;
         let fee = response["minResourceFee"]
             .as_str()
             .ok_or("Missing resource fee")?
@@ -1278,25 +1285,13 @@ pub fn check_assembled(
     Ok(())
 }
 
-/// What a simulated restoration of a code entry found: the decision between a restoration and an
-/// upload, whatever a read of the entry showed. An RPC can serve no archived entry, and another
-/// transaction can make the code live after it was read.
-#[derive(Clone, Debug)]
-pub enum CodeRestoration {
-    /// The network's archive holds the code: this restoration of its entry makes it live.
-    Prepared(PreparedDeployment),
-    /// The code is live: nothing is needed.
-    Live,
-    /// Neither archived nor live: the code needs an upload of its bytes.
-    Absent,
-}
 /// Unsigned Wasm upload or wallet creation for the source account to sign.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PreparedDeployment {
     pub network: String,
     pub source: String,
-    /// `upload_wasm` or `create_wallet`.
+    /// `upload_wasm`, `renew_code` or `create_wallet`.
     pub function: String,
     pub wasm_hash: [u8; 32],
     /// The derived wallet address of a creation.
@@ -1381,7 +1376,11 @@ impl Deployer<'_> {
         if response.get("error").is_some_and(|v| !v.is_null()) {
             return Err("Deployment simulation rejected the transaction".into());
         }
-        // Archived code or deployer entries restore in the same transaction.
+        // Archived deployer entries restore in the same transaction; archived wallet code does not:
+        // nothing restores it.
+        if let Some(code) = expected_wasm {
+            rpc::refuse_expired(&response, None, &code)?;
+        }
         rpc::restoring_in_place(&response)?;
         let results = response["results"]
             .as_array()
@@ -1505,15 +1504,12 @@ impl Deployer<'_> {
         if !op.auth.is_empty() {
             return Err("Wasm upload needs no contract authorization".into());
         }
-        // An upload whose simulation restores an archived entry in place would upload code that
-        // the archive holds: lapsed code is restored, not uploaded (`restore_code`).
+        // An upload whose simulation restores an archived entry in place would restore code
+        // that lapsed: nothing restores lapsed code.
         if let TransactionExt::V1(data) = &tx.ext
             && matches!(&data.ext, SorobanTransactionDataExt::V1(ext) if !ext.archived_soroban_entries.is_empty())
         {
-            return Err(
-                "The upload restores an archived entry: lapsed code is restored, not uploaded"
-                    .into(),
-            );
+            return Err("The upload restores an archived entry: nothing restores lapsed code".into());
         }
         // An upload writes the code entry alone. Code that is live, for example because another
         // transaction uploaded it after it was read, is only read: nothing to upload or pay.
@@ -1535,17 +1531,22 @@ impl Deployer<'_> {
         if tx.fee > self.max_fee_stroops {
             return Err("Simulated fee exceeds the explicitly selected ceiling".into());
         }
-        let mut tx = tx;
-        self.bind_code_bounds(&mut tx)?;
         self.prepared(&account, "upload_wasm", wasm_hash, None, tx)
             .map(Some)
     }
-    /// Prepare `RestoreFootprint` of the code entry `wasm_hash` from `source` when the network's
-    /// archive holds it. It names that entry alone and gives no authority; the simulation sets
-    /// its fee, within the ceiling. After a simulation that names no entry, or that refuses the
-    /// restoration, the code is read again: live or absent code is the answer, and lapsed code
-    /// is refused.
-    pub fn restore_code(&self, source: &str, wasm_hash: [u8; 32]) -> Result<CodeRestoration> {
+    /// Prepare `ExtendFootprintTtl` of the live code entry `wasm_hash` from `source`, so that the
+    /// code lives `extend_to` ledgers after the ledger that includes it. It names that entry alone,
+    /// read-only, and gives no authority; the simulation sets its fee, within the ceiling. Code
+    /// that lapsed is refused: nothing restores it.
+    pub fn renew_code(
+        &self,
+        source: &str,
+        wasm_hash: [u8; 32],
+        extend_to: u32,
+    ) -> Result<PreparedDeployment> {
+        if extend_to == 0 {
+            return Err("A renewal extends the code's lifetime".into());
+        }
         let account = self.account(source)?;
         let key = LedgerKey::ContractCode(LedgerKeyContractCode {
             hash: Hash(wasm_hash),
@@ -1561,8 +1562,9 @@ impl Deployer<'_> {
             memo: Memo::None,
             operations: vec![Operation {
                 source_account: None,
-                body: OperationBody::RestoreFootprint(RestoreFootprintOp {
+                body: OperationBody::ExtendFootprintTtl(ExtendFootprintTtlOp {
                     ext: ExtensionPoint::V0,
+                    extend_to,
                 }),
             }]
             .try_into()
@@ -1571,8 +1573,8 @@ impl Deployer<'_> {
                 ext: SorobanTransactionDataExt::V0,
                 resources: SorobanResources {
                     footprint: LedgerFootprint {
-                        read_only: VecM::default(),
-                        read_write: vec![key.clone()].try_into().map_err(err)?,
+                        read_only: vec![key.clone()].try_into().map_err(err)?,
+                        read_write: VecM::default(),
                     },
                     instructions: 0,
                     disk_read_bytes: 0,
@@ -1585,98 +1587,48 @@ impl Deployer<'_> {
             tx: tx.clone(),
             signatures: VecM::default(),
         }))?;
-        // A simulation that restores nothing leaves the code to a second read. Live code needs
-        // nothing: another transaction restored or uploaded it since it was read, from this
-        // account too, which then changed during the simulation. Lapsed code has an archived
-        // entry that this restoration did not name, and an upload does not replace it: that is
-        // refused. A read that fails is an error.
-        let read_again = || -> Result<CodeRestoration> {
-            match crate::rpc::code_state(self.rpc, self.network, &wasm_hash)? {
-                crate::rpc::CodeState::Live => Ok(CodeRestoration::Live),
-                crate::rpc::CodeState::Absent => Ok(CodeRestoration::Absent),
-                crate::rpc::CodeState::Lapsed => {
-                    Err("The wallet code lapsed, but no restoration of it can be prepared".into())
-                }
-            }
-        };
-        let response = match self.simulate(&account, &raw, false) {
-            Ok(response) if response.get("error").is_none_or(|v| v.is_null()) => response,
-            // A refused restoration restores nothing. An upload of code that the archive holds
-            // is refused in its own simulation.
-            Ok(_) => return read_again(),
-            Err(error) => {
-                return match read_again() {
-                    Ok(CodeRestoration::Live) => Ok(CodeRestoration::Live),
-                    _ => Err(error),
-                };
-            }
-        };
+        let response = self.simulate(&account, &raw, false)?;
+        if response.get("error").is_some_and(|v| !v.is_null()) {
+            return Err("The network refused the simulation of the code renewal".into());
+        }
+        if response
+            .get("restorePreamble")
+            .is_some_and(|value| !value.is_null())
+        {
+            return Err("The wallet code lapsed: nothing restores it".into());
+        }
         let data: SorobanTransactionData = read(
             response["transactionData"]
                 .as_str()
-                .ok_or("Missing restoration resources")?,
+                .ok_or("Missing renewal resources")?,
         )?;
-        // Archived entries are named by their index in the read-write footprint: only the code
-        // entry is there. A simulation that names an archived entry outside it is refused, also
-        // when its footprint is empty.
-        crate::rpc::archived_in_footprint(&data)?;
-        // The simulation restores only archived entries: it names none for code that is live or
-        // absent.
-        if data.resources.footprint.read_only.is_empty()
-            && data.resources.footprint.read_write.is_empty()
+        if matches!(&data.ext, SorobanTransactionDataExt::V1(ext) if !ext.archived_soroban_entries.is_empty())
         {
-            return read_again();
+            return Err("The wallet code lapsed: nothing restores it".into());
         }
-        if !data.resources.footprint.read_only.is_empty()
-            || data.resources.footprint.read_write.as_slice() != [key]
+        if data.resources.footprint.read_only.as_slice() != [key]
+            || !data.resources.footprint.read_write.is_empty()
         {
-            return Err("Restoration resources name another entry".into());
+            return Err("Renewal resources name another entry".into());
         }
         let fee = response["minResourceFee"]
             .as_str()
-            .ok_or("Missing restoration fee")?
+            .ok_or("Missing renewal fee")?
             .parse::<u32>()
             .map_err(err)?
             .checked_add(100)
-            .ok_or("Restoration fee overflow")?;
+            .ok_or("Renewal fee overflow")?;
         if fee > self.max_fee_stroops {
             return Err("Simulated fee exceeds the explicitly selected ceiling".into());
         }
         if data.resource_fee < 0
             || u64::try_from(data.resource_fee).map_err(err)? + 100 != u64::from(fee)
         {
-            return Err("Restoration resource fee differs from simulation".into());
+            return Err("Renewal resource fee differs from simulation".into());
         }
         tx.fee = fee;
         tx.ext = TransactionExt::V1(data);
-        self.bind_code_bounds(&mut tx)?;
-        self.prepared(&account, "restore_code", wasm_hash, None, tx)
-            .map(CodeRestoration::Prepared)
-    }
-    /// Bound the code transaction `tx` by ledgers as well as by time, in its signed
-    /// preconditions: the network can include it only from the head that this preparation reads
-    /// to [`CODE_LEDGER_WINDOW`] ledgers later, and by its time bound. Once a later ledger
-    /// closed, a lookup that does not find it proves that it never applied and can no longer
-    /// apply, from signed data alone (`rpc::code_transaction_lapsed`).
-    fn bind_code_bounds(&self, tx: &mut Transaction) -> Result<()> {
-        let Preconditions::Time(time) = &tx.cond else {
-            return Err("A code transaction is prepared with a time bound".into());
-        };
-        let head = rpc::owner_observation::head(self.rpc)?;
-        tx.cond = Preconditions::V2(PreconditionsV2 {
-            time_bounds: Some(time.clone()),
-            ledger_bounds: Some(LedgerBounds {
-                min_ledger: head,
-                max_ledger: head
-                    .checked_add(CODE_LEDGER_WINDOW)
-                    .ok_or("Ledger bound overflow")?,
-            }),
-            min_seq_num: None,
-            min_seq_age: stellar_xdr::Duration(0),
-            min_seq_ledger_gap: 0,
-            extra_signers: VecM::default(),
-        });
-        Ok(())
+        self.prepared(&account, "renew_code", wasm_hash, None, tx)
     }
     /// Prepare the owner's one transaction that creates the policy wallet of `wasm` (uploaded by
     /// the server) through `deployer` and funds it with each `(asset, amount)` of `funding`. The
@@ -1781,50 +1733,20 @@ pub fn with_source_signature(
     .map_err(err)?;
     xdr(&TransactionEnvelope::Tx(envelope))
 }
-/// The ledgers in which the network can include a code transaction after the head that its
-/// preparation read: about five minutes, as its time bound.
-pub const CODE_LEDGER_WINDOW: u32 = 60;
-/// The ledger bounds `(min, max)` of the code transaction `tx`, which also has a time bound
-/// that ends at `expires_at`. Both are required and nonzero: Stellar reads a zero upper bound
-/// as no bound at all, so such a transaction would never lapse.
-fn code_bounds(tx: &Transaction, expires_at: u64) -> Result<(u32, u32)> {
-    let Preconditions::V2(PreconditionsV2 {
-        time_bounds: Some(time),
-        ledger_bounds: Some(ledgers),
-        min_seq_num: None,
-        min_seq_age: stellar_xdr::Duration(0),
-        min_seq_ledger_gap: 0,
-        extra_signers,
-    }) = &tx.cond
-    else {
-        return Err("A code transaction is bounded by time and by ledgers".into());
-    };
-    if time.max_time.0 == 0 || time.max_time.0 != expires_at {
-        return Err("The code transaction's time bound differs from its expiry".into());
+/// Check that the code transaction `tx` is bounded by time alone, with a nonzero time bound that
+/// ends at `expires_at`: Stellar reads a zero upper bound as no bound at all.
+fn code_time_bound(tx: &Transaction, expires_at: u64) -> Result<()> {
+    match &tx.cond {
+        Preconditions::Time(time) if time.max_time.0 != 0 && time.max_time.0 == expires_at => Ok(()),
+        _ => Err("The code transaction's time bound differs from its expiry".into()),
     }
-    // The window is the one that preparation binds: a lookup history that holds its first
-    // ledger can prove the lapse soon after its last ledger closed.
-    if !extra_signers.is_empty()
-        || ledgers.min_ledger == 0
-        || ledgers.max_ledger.checked_sub(ledgers.min_ledger) != Some(CODE_LEDGER_WINDOW)
-    {
-        return Err("The code transaction's ledger bounds are not its window".into());
-    }
-    Ok((ledgers.min_ledger, ledgers.max_ledger))
 }
-/// The signed ledger bounds `(min, max)` of the prepared code transaction `p`.
-pub fn code_ledger_bounds(p: &PreparedDeployment) -> Result<(u32, u32)> {
-    let TransactionEnvelope::Tx(envelope) = read(&p.transaction_xdr)? else {
-        return Err("Expected a v1 code transaction".into());
-    };
-    code_bounds(&envelope.tx, p.expires_at)
-}
-/// Check a wallet code transaction that its source signed: `signed_xdr` is the prepared
-/// transaction `p` with one signature of its source over its hash, under the source key's
-/// hint; the transaction is bounded by ledgers and by a time bound that is `p.expires_at`
-/// (`code_bounds`); and it uploads the code `p.wasm_hash`
-/// (`upload_wasm`) or restores that code's entry (`restore_code`), with the code entry alone
-/// in its read-write footprint, no read-only entry and no archived entry restored in place.
+/// Check a wallet code transaction that its source signed: `signed_xdr` is the unsigned prepared
+/// transaction `p` with one signature of its source over its hash, under the source key's hint;
+/// the transaction is bounded by a time bound that is `p.expires_at` (`code_time_bound`); and it
+/// uploads the code `p.wasm_hash` (`upload_wasm`), with the code entry alone in its read-write
+/// footprint, or renews that code's entry (`renew_code`), with the code entry alone in its
+/// read-only footprint. It restores no archived entry in place.
 pub fn check_signed_code(p: &PreparedDeployment, signed_xdr: &str) -> Result<()> {
     let TransactionEnvelope::Tx(unsigned) = read(&p.transaction_xdr)? else {
         return Err("Expected a v1 code transaction".into());
@@ -1845,7 +1767,7 @@ pub fn check_signed_code(p: &PreparedDeployment, signed_xdr: &str) -> Result<()>
     if signed.tx.source_account != muxed(&p.source)? {
         return Err("The code transaction has another source".into());
     }
-    code_bounds(&signed.tx, p.expires_at)?;
+    code_time_bound(&signed.tx, p.expires_at)?;
     let [signature] = signed.signatures.as_slice() else {
         return Err("A code transaction carries one signature, its source's".into());
     };
@@ -1863,20 +1785,23 @@ pub fn check_signed_code(p: &PreparedDeployment, signed_xdr: &str) -> Result<()>
     let key = LedgerKey::ContractCode(LedgerKeyContractCode {
         hash: Hash(p.wasm_hash),
     });
-    // Both name the code entry alone. An upload restores no archived entry in place: lapsed
-    // code is restored, not uploaded. A restoration names that entry as archived at most.
+    // Both name the code entry alone and restore nothing in place: nothing restores lapsed code.
+    let key = [key];
     let footprint = match &signed.tx.ext {
         TransactionExt::V1(data) => {
-            data.resources.footprint.read_only.is_empty()
-                && data.resources.footprint.read_write.as_slice() == [key]
-                && match (&data.ext, p.function.as_str()) {
-                    (SorobanTransactionDataExt::V0, _) => true,
-                    (SorobanTransactionDataExt::V1(ext), "restore_code") => {
-                        matches!(ext.archived_soroban_entries.as_slice(), [] | [0])
-                    }
-                    (SorobanTransactionDataExt::V1(ext), _) => {
-                        ext.archived_soroban_entries.is_empty()
-                    }
+            let (read_only, read_write) = (
+                data.resources.footprint.read_only.as_slice(),
+                data.resources.footprint.read_write.as_slice(),
+            );
+            let named = match p.function.as_str() {
+                "upload_wasm" => read_only.is_empty() && read_write == key,
+                "renew_code" => read_only == key && read_write.is_empty(),
+                _ => false,
+            };
+            named
+                && match &data.ext {
+                    SorobanTransactionDataExt::V0 => true,
+                    SorobanTransactionDataExt::V1(ext) => ext.archived_soroban_entries.is_empty(),
                 }
         }
         TransactionExt::V0 => false,
@@ -1888,11 +1813,11 @@ pub fn check_signed_code(p: &PreparedDeployment, signed_xdr: &str) -> Result<()>
                     && matches!(&op.host_function,
                     HostFunction::UploadContractWasm(code) if hash(code.as_slice()) == p.wasm_hash)
             }
-            ("restore_code", OperationBody::RestoreFootprint(_)) => true,
+            ("renew_code", OperationBody::ExtendFootprintTtl(op)) => op.extend_to > 0,
             _ => false,
         };
     if !alone || operation.source_account.is_some() || p.wallet.is_some() {
-        return Err("The code transaction neither uploads nor restores its code alone".into());
+        return Err("The code transaction neither uploads nor renews its code alone".into());
     }
     Ok(())
 }

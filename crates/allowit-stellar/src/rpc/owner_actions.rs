@@ -17,8 +17,8 @@ pub fn code_uploaded(rpc: &dyn Rpc, network: &str, code: &[u8; 32]) -> Result<bo
 pub enum CodeState {
     /// Live at the closing observation.
     Live,
-    /// Past its lifetime, on the ledger or in the network's archive. A restoration of the entry
-    /// makes it live again; an upload of the same code can fail once the network archived it.
+    /// Past its lifetime, on the ledger or in the network's archive. Nothing restores it, and an
+    /// upload of the same code can fail once the network archived it.
     Lapsed,
     /// Not on the network. This does not prove that it never existed.
     Absent,
@@ -34,6 +34,17 @@ pub fn code_state(rpc: &dyn Rpc, network: &str, code: &[u8; 32]) -> Result<CodeS
         (Some(until), closing) if until >= closing => CodeState::Live,
         (Some(_), _) => CodeState::Lapsed,
     })
+}
+/// The live-until ledger of an exact code entry and the closing head of the observation, `None`
+/// when the network has no such entry. An archived entry that the RPC serves without a live-until
+/// ledger reads as 0.
+pub fn code_lifetime(rpc: &dyn Rpc, network: &str, code: &[u8; 32]) -> Result<Option<(u32, u32)>> {
+    if *code == [0; 32] {
+        return Err("Missing executable identity".into());
+    }
+    let key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: Hash(*code) });
+    let (live_until, closing) = observed_entry(rpc, network, &key)?;
+    Ok(live_until.map(|until| (until, closing)))
 }
 /// Whether a native C-address currently has a live Wasm instance. This grants no trust in its config.
 pub fn contract_exists(rpc: &dyn Rpc, network: &str, contract: &str) -> Result<bool> {

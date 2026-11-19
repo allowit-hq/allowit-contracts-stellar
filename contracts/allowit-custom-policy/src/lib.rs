@@ -29,6 +29,8 @@ pub const STATE: &[AllowitStateKey] = include!(concat!(env!("OUT_DIR"), "/state.
 pub struct AllowitCustom;
 impl AllowitPolicy for AllowitCustom {
     const KIND: &'static str = "custom_policy";
+    /// The code is built from this policy alone: the wallet keeps it live.
+    const OWNS_CODE: bool = true;
     /// Every native operation. The compiled policy's `operations` rule selects among them.
     const OPERATIONS: &'static [AllowitOperation] = &[
         AllowitOperation::transfer,

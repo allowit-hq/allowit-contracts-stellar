@@ -378,17 +378,6 @@ fn gas_carry(repays_gas: bool, carry: u128) -> Result<u128> {
         )),
     }
 }
-/// The gas due of an operation, as for its carry: only a policy wallet operation that repays its
-/// gas repays one.
-fn gas_due(repays_gas: bool, due: u128) -> Result<u128> {
-    match (repays_gas, due) {
-        (true, due) => Ok(due),
-        (false, 0) => Ok(0),
-        (false, _) => Err(Error::usage(
-            "Only a policy wallet operation that repays its gas takes a gas due",
-        )),
-    }
-}
 pub fn receipt_info(p: &Packet) -> Result<ReceiptInfo> {
     let r: rpc::VerifiedReceipt = decode_packet(p)?;
     let result: stellar_xdr::TransactionResult = checked(native::read(&r.result_xdr))?;
@@ -478,10 +467,9 @@ fn code_of(p: &Signed) -> Result<SignedCode> {
     signed_code(&p.0)?.ok_or_else(|| Error::usage("This packet is not a wallet code transaction"))
 }
 impl Provider {
-    /// The transaction that makes wallet code live, from a sending account and signed by it:
-    /// the code of `wasm`, or without it the installation's code. Absent code is uploaded,
-    /// which needs its bytes; lapsed code is restored by its hash. A simulated fee above
-    /// `max_fee_stroops` is refused before anything is signed. `None` when the code is live.
+    /// The upload of the wallet code `wasm`, from a sending account and signed by it. A simulated
+    /// fee above `max_fee_stroops` is refused before anything is signed. `None` when the code is
+    /// live. Code that lapsed is refused: nothing restores it.
     ///
     /// The step trusts the reads and simulations of the one RPC that the server configured (see
     /// the crate README). Another transaction, from another sending account or from the same
@@ -491,7 +479,7 @@ impl Provider {
     fn prepare_code(
         &self,
         i: &Installation,
-        wasm: Option<&[u8]>,
+        wasm: &[u8],
         max_fee_stroops: u32,
         now: u64,
     ) -> Result<Option<SignedCode>> {
@@ -501,18 +489,21 @@ impl Provider {
                 "A keypair wallet has no code: its owner creates it with the wallet setup",
             ));
         }
-        let code_hash = match wasm {
-            Some(wasm) => checked(native::admin::check_wallet_code(wasm))?,
-            None => c.module_digest,
-        };
+        let code_hash = checked(native::admin::check_wallet_code(wasm))?;
         let live = || {
             matches!(
                 rpc::code_state(self.rpc(), &c.network, &code_hash),
                 Ok(rpc::CodeState::Live)
             )
         };
-        if checked(rpc::code_state(self.rpc(), &c.network, &code_hash))? == rpc::CodeState::Live {
-            return Ok(None);
+        match checked(rpc::code_state(self.rpc(), &c.network, &code_hash))? {
+            rpc::CodeState::Live => return Ok(None),
+            rpc::CodeState::Lapsed => {
+                return Err(Error::usage(
+                    "The wallet code lapsed on the network: nothing restores it",
+                ));
+            }
+            rpc::CodeState::Absent => {}
         }
         // A refusal can come from the transaction that made the code live: a simulated fee above
         // the ceiling for a write that is no longer needed, the sending account's sequence that
@@ -524,34 +515,15 @@ impl Provider {
                 Error::config("This server has no sending account to upload wallet code")
             })?;
             let account = sender.account()?;
-            // The server pays the upload or the restoration, a cost that the ledger consumes;
-            // the simulation sets it, within the ceiling. Lapsed code is restored, never
-            // uploaded again: the network refuses an upload of code that its archive holds.
+            // The server pays the upload, a cost that the ledger consumes; the simulation sets
+            // it, within the ceiling.
             let deployer = native::admin::Deployer {
                 rpc: self.rpc(),
                 network: &c.network,
                 now,
                 max_fee_stroops,
             };
-            // A simulated restoration of the code entry decides between a restoration and an
-            // upload: it names the entry only when the network's archive holds it. Absent code
-            // needs its bytes.
-            let p = match checked(deployer.restore_code(&account, code_hash))? {
-                native::admin::CodeRestoration::Prepared(p) => p,
-                native::admin::CodeRestoration::Live => return Ok(None),
-                native::admin::CodeRestoration::Absent => match wasm {
-                    Some(wasm) => match checked(deployer.upload_wasm(&account, wasm))? {
-                        Some(p) => p,
-                        None => return Ok(None),
-                    },
-                    None => {
-                        return Err(Error::usage(
-                            "The wallet code is not on the network: a restoration needs code that lapsed",
-                        ));
-                    }
-                },
-            };
-            Ok(Some((sender, account, p)))
+            Ok(checked(deployer.upload_wasm(&account, wasm))?.map(|p| (sender, account, p)))
         };
         let (sender, account, p) = match prepare() {
             Ok(Some(prepared)) => prepared,
@@ -561,21 +533,94 @@ impl Provider {
         if checked(rpc::code_state(self.rpc(), &c.network, &code_hash))? == rpc::CodeState::Live {
             return Ok(None);
         }
-        let signed_xdr =
-            match sending_signature(sender, &account, &p.transaction_hash).and_then(|signature| {
-                checked(native::admin::with_source_signature(
-                    &c.network,
-                    &p.transaction_xdr,
-                    &signature,
-                ))
-            }) {
-                Ok(signed) => signed,
-                Err(refused) => return unless_live(refused),
-            };
+        let signed_xdr = match self.code_signature(sender, &account, &c.network, &p) {
+            Ok(signed) => signed,
+            Err(refused) => return unless_live(refused),
+        };
         Ok(Some(SignedCode {
             code: p,
             signed_xdr,
         }))
+    }
+    /// The extension that the live code `code_hash` needs now: the network's minimum lifetime of a
+    /// persistent entry once at most half of it is left, `None` before. Code that lapsed or that is
+    /// not on the network is refused: nothing restores it.
+    fn renewal_due(&self, code_hash: &[u8; 32]) -> Result<Option<u32>> {
+        let Some((live_until, closing)) =
+            checked(rpc::code_lifetime(self.rpc(), &self.network, code_hash))?
+        else {
+            return Err(Error::usage("The wallet code is not on the network"));
+        };
+        if live_until < closing {
+            return Err(Error::usage(
+                "The wallet code lapsed on the network: nothing restores it",
+            ));
+        }
+        let minimum = checked(rpc::minimum_persistent_lifetime(self.rpc()))?;
+        Ok((live_until - closing <= minimum / 2).then_some(minimum))
+    }
+    /// Prepare the renewal of the live code `code_hash`, signed by a sending account, once it is
+    /// due (`renewal_due`). The code is read again before the signature: a renewal that another
+    /// transaction made needless is not signed.
+    fn prepare_renewal(
+        &self,
+        code_hash: &[u8; 32],
+        max_fee_stroops: u32,
+        now: u64,
+    ) -> Result<Option<SignedCode>> {
+        let Some(extend_to) = self.renewal_due(code_hash)? else {
+            return Ok(None);
+        };
+        let unless_renewed = |refused: Error| match self.renewal_due(code_hash) {
+            Ok(None) => Ok(None),
+            _ => Err(refused),
+        };
+        let sender = self.sender.as_ref().ok_or_else(|| {
+            Error::config("This server has no sending account to renew wallet code")
+        })?;
+        let prepared = sender.account().and_then(|account| {
+            let deployer = native::admin::Deployer {
+                rpc: self.rpc(),
+                network: &self.network,
+                now,
+                max_fee_stroops,
+            };
+            Ok((
+                checked(deployer.renew_code(&account, *code_hash, extend_to))?,
+                account,
+            ))
+        });
+        let (p, account) = match prepared {
+            Ok(prepared) => prepared,
+            Err(refused) => return unless_renewed(refused),
+        };
+        if self.renewal_due(code_hash)?.is_none() {
+            return Ok(None);
+        }
+        let signed_xdr = match self.code_signature(sender, &account, &self.network, &p) {
+            Ok(signed) => signed,
+            Err(refused) => return unless_renewed(refused),
+        };
+        Ok(Some(SignedCode {
+            code: p,
+            signed_xdr,
+        }))
+    }
+    /// The envelope of the code transaction `p` with the signature of its source `account`.
+    fn code_signature(
+        &self,
+        sender: &Sender,
+        account: &str,
+        network: &str,
+        p: &native::admin::PreparedDeployment,
+    ) -> Result<String> {
+        sending_signature(sender, account, &p.transaction_hash).and_then(|signature| {
+            checked(native::admin::with_source_signature(
+                network,
+                &p.transaction_xdr,
+                &signature,
+            ))
+        })
     }
     /// Send the code transaction `s` once. `Prepared` when the network did not accept it:
     /// nothing is pending, and the caller can send the same bytes again while it is needed. A
@@ -1199,7 +1244,6 @@ impl crate::host::vendors::RuntimeProvider for Provider {
             gas: None,
             sender: None,
             gas_carry: 0,
-            gas_due: 0,
         };
         let accounting = accounting(a);
         let request: native::workflow::ExecutionRequest = decode_packet(&r.0)?;
@@ -1212,7 +1256,6 @@ impl crate::host::vendors::RuntimeProvider for Provider {
             terms.sender = Some(self.sending_account()?);
         }
         terms.gas_carry = gas_carry(repays_gas, t.gas_carry_units)?;
-        terms.gas_due = gas_due(repays_gas, t.gas_due_units)?;
         if native::seller_settled::is_request(&request) {
             return self.packet(&checked(native::seller_settled::prepare(
                 self.rpc(),
@@ -1698,7 +1741,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
     fn prepare_code_within(
         &self,
         i: &Installation,
-        wasm: Option<&[u8]>,
+        wasm: &[u8],
         max_fee: u64,
         now: u64,
     ) -> Result<Option<Signed>> {
@@ -1707,27 +1750,28 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         };
         Ok(Some(Signed(packet(&code.code.network, &code)?)))
     }
-    fn code_lapsed(&self, p: &Signed) -> Result<bool> {
-        self.network(p.network())?;
-        let code = code_of(p)?;
-        // The proof reads only the transaction's signed ledger bounds.
-        let (min_ledger, max_ledger) = checked(native::admin::code_ledger_bounds(&code.code))?;
-        checked(rpc::code_transaction_lapsed(
-            self.rpc(),
-            &code.code.network,
-            &code.code.transaction_hash,
-            min_ledger,
-            max_ledger,
-        ))
+    fn prepare_code_renewal(
+        &self,
+        code: &[u8; 32],
+        max_fee: u64,
+        now: u64,
+    ) -> Result<Option<Signed>> {
+        let Some(code) = self.prepare_renewal(code, fee(max_fee)?, now)? else {
+            return Ok(None);
+        };
+        Ok(Some(Signed(packet(&code.code.network, &code)?)))
     }
     fn code_needed(&self, p: &Signed) -> Result<bool> {
         self.network(p.network())?;
         let code = code_of(p)?;
-        Ok(checked(rpc::code_state(
-            self.rpc(),
-            &code.code.network,
-            &code.code.wasm_hash,
-        ))? != rpc::CodeState::Live)
+        match code.code.function.as_str() {
+            "renew_code" => Ok(self.renewal_due(&code.code.wasm_hash)?.is_some()),
+            _ => Ok(checked(rpc::code_state(
+                self.rpc(),
+                &code.code.network,
+                &code.code.wasm_hash,
+            ))? != rpc::CodeState::Live),
+        }
     }
     fn submit_owner<'a>(
         &self,
@@ -2244,18 +2288,6 @@ mod receipt_fee_tests {
         );
     }
 
-    /// Only an operation that repays its gas takes a gas due.
-    #[test]
-    fn only_an_operation_that_repays_its_gas_takes_a_gas_due() {
-        assert_eq!(gas_due(true, 7).unwrap(), 7);
-        assert_eq!(gas_due(false, 0).unwrap(), 0);
-        assert!(
-            gas_due(false, 1)
-                .unwrap_err()
-                .message
-                .contains("takes a gas due")
-        );
-    }
 
     /// A policy wallet receipt reports the fee paid and, beside it, the gas units that the
     /// wallet counted and the stroops that it repaid: without a carry, the signed expense, never

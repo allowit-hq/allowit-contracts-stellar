@@ -770,6 +770,56 @@ fn daily_figures_live_in_a_window_that_ends_with_its_own_ledger() {
     assert_eq!(f.run(&f.transfer(100, 0)), Ok(()));
 }
 
+/// Each call keeps the wallet live. Once the instance has at most `TOTAL_LEDGERS - RENEWAL_LEDGERS`
+/// ledgers left, a call renews it to `TOTAL_LEDGERS - 1`; a call above that threshold renews
+/// nothing. A Custom wallet's code is its own, and a call renews it the same way;
+/// the code that a fixed tier shares with every wallet of its kind is Allowit's to keep live, and
+/// no call of a wallet renews it.
+#[test]
+fn a_call_below_the_threshold_renews_the_instance_and_a_custom_wallets_own_code() {
+    for (wasm, owns_code) in [(SIMPLE, false), (COMMON, false), (CUSTOM, true)] {
+        let f = Fixture::new(wasm);
+        let instance = || f.env.deployer().get_contract_instance_ttl(&f.wallet);
+        let code = || f.env.deployer().get_contract_code_ttl(&f.wallet);
+        let advance = |ledgers: u32| f.env.ledger().with_mut(|l| l.sequence_number += ledgers);
+        assert_eq!(instance(), TOTAL_LEDGERS - 1);
+        if owns_code {
+            assert_eq!(code(), TOTAL_LEDGERS - 1);
+        }
+        // Each owner call names the next deployment version.
+        let mut version = 0u32;
+        let mut pause = |paused: bool| {
+            version += 1;
+            f.owner_call("set_pause", (paused, version).into_val(&f.env))
+        };
+        // Above the threshold a call renews nothing.
+        advance(RENEWAL_LEDGERS - 2);
+        let (live_instance, live_code) = (instance(), code());
+        assert_eq!(pause(true), Ok(()));
+        assert_eq!((instance(), code()), (live_instance, live_code));
+        // At it, the instance lives `TOTAL_LEDGERS - 1` again, and a Custom wallet's code too.
+        advance(1);
+        let shared_code = code();
+        assert_eq!(pause(false), Ok(()));
+        assert_eq!(instance(), TOTAL_LEDGERS - 1);
+        if owns_code {
+            assert_eq!(code(), TOTAL_LEDGERS - 1);
+        } else {
+            assert_eq!(code(), shared_code);
+        }
+    }
+    // The agent's operation keeps the wallet live as well.
+    let f = Fixture::new(COMMON);
+    f.env
+        .ledger()
+        .with_mut(|l| l.sequence_number += RENEWAL_LEDGERS + 1);
+    assert_eq!(f.run(&f.transfer(10, 0)), Ok(()));
+    assert_eq!(
+        f.env.deployer().get_contract_instance_ttl(&f.wallet),
+        TOTAL_LEDGERS - 1
+    );
+}
+
 #[test]
 fn total_figures_are_created_at_deployment_and_kept_for_their_checks() {
     let f = Fixture::with(COMMON, false, |env, c| {

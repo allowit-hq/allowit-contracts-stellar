@@ -39,7 +39,7 @@ const RECORD_FEE: i64 = 1_500;
 /// The resource fee of the sending account's enforcing simulation.
 const ENFORCE_FEE: i64 = 1_000;
 /// The resource fee of a code restoration in the model.
-const RESTORE_FEE: i64 = 4_000;
+const RENEW_FEE: i64 = 4_000;
 /// The XLM that the owner's creation moves into the wallet.
 const FUNDING: i128 = 500_000_000;
 const DAY_LEDGERS: u32 = 17_280;
@@ -317,39 +317,32 @@ struct Model {
     code: BTreeMap<[u8; 32], PolicyTier>,
     /// The uploaded code by its hash.
     code_bytes: BTreeMap<[u8; 32], Vec<u8>>,
-    /// Uploaded code past its lifetime: Stellar RPC serves it with a live-until ledger of 0,
-    /// an upload of it fails and a `RestoreFootprint` of its entry makes it live again.
+    /// Uploaded code past its lifetime: Stellar RPC serves it with a live-until ledger of 0, an
+    /// upload of it fails, and nothing renews it.
     lapsed_code: BTreeSet<[u8; 32]>,
-    /// The next restorations fail when the ledger applies them: the code stays lapsed and the
+    /// The live-until ledger of uploaded code, when not the head and 10,000 ledgers.
+    code_live_until: BTreeMap<[u8; 32], u32>,
+    /// The network's minimum lifetime of a persistent entry, when not 120,960 ledgers.
+    persistent_lifetime: Option<u32>,
+    /// The next renewals fail when the ledger applies them: the code keeps its lifetime and the
     /// source still pays the fee.
-    failing_restore: bool,
-    /// The archived entries that a restoration's simulation names, by their index in the
-    /// read-write footprint.
-    restore_archived: Vec<u32>,
+    failing_renewal: bool,
     /// The transactions that the ledger included and failed.
     failed: BTreeSet<String>,
-    /// Another transaction restores lapsed code just before the next restoration's simulation.
-    restored_meanwhile: bool,
-    /// That transaction came from the restoration's own source, whose sequence it advanced.
-    restored_by_source: bool,
     /// The fee that the next receipts report as charged, when not the usual 100 stroops.
     charged_fee: Option<i64>,
-    /// The RPC serves no archived entry: a read of lapsed code finds nothing.
-    hide_archived: bool,
     /// An upload simulation of lapsed code restores the code entry in place instead of failing.
     upload_restores_in_place: bool,
     /// A read that finds no entry omits the entry list.
     omit_empty_entries: bool,
-    /// The network refuses the simulation of the next restorations.
-    refused_restore: bool,
     /// Reads of code entries fail, as a broken transport does.
     failing_code_reads: bool,
     /// Another transaction uploads the code of the next upload just before its simulation.
     uploaded_meanwhile: bool,
     /// The next upload simulations also write another entry than the code.
     upload_names_another_entry: bool,
-    /// Another sending account restores the code just after the next restoration's simulation.
-    restored_after_simulation: bool,
+    /// Another sending account renews the code just after the next renewal's simulation.
+    renewed_after_simulation: bool,
     /// Another sending account uploads the code just after the next upload's simulation.
     uploaded_after_simulation: bool,
     /// The upload of `uploaded_meanwhile` came from the upload's own source, whose sequence it
@@ -359,18 +352,15 @@ struct Model {
     wallet: Option<Wallet>,
     settled: BTreeMap<String, String>,
     steps: Vec<Step>,
-    /// The next submission is not accepted (`TRY_AGAIN_LATER`) while another account restores
+    /// The next submission is not accepted (`TRY_AGAIN_LATER`) while another account uploads
     /// this code.
-    retry_later_restores: Option<[u8; 32]>,
+    retry_later_uploads: Option<(Vec<u8>, PolicyTier)>,
     /// The network rejects the next submission.
     reject_next_send: bool,
     /// The endpoint serves another network.
     foreign_network: bool,
     /// The ledger holds each settled transaction inside a fee bump of another source.
     fee_bumped: bool,
-    /// The oldest ledger of the history that a lookup of an unknown transaction searched, up to
-    /// the head.
-    history: Option<u32>,
     pending_name: String,
     /// The resource fee of the next enforcing simulations.
     enforce_fee: i64,
@@ -409,6 +399,13 @@ impl ModelChain {
             );
         }
         Self(Mutex::new(model))
+    }
+    /// Another sending account renewed the code `code`: it lives the network's minimum lifetime of
+    /// a persistent entry from the head.
+    fn renewed(&self, code: [u8; 32]) {
+        let mut m = self.0.lock().unwrap();
+        let until = m.ledger + m.persistent_lifetime.unwrap_or(120_960);
+        m.code_live_until.insert(code, until);
     }
     fn step(&self, name: &str) {
         self.0.lock().unwrap().pending_name = name.into();
@@ -666,11 +663,15 @@ impl rpc::Rpc for ModelChain {
                             val,
                         }))
                     }),
-                    x::LedgerKey::ContractCode(code)
-                        if m.hide_archived && m.lapsed_code.contains(&code.hash.0) =>
-                    {
-                        None
-                    }
+                    x::LedgerKey::ConfigSetting(x::LedgerKeyConfigSetting {
+                        config_setting_id: x::ConfigSettingId::StateArchival,
+                    }) => Some(x::LedgerEntryData::ConfigSetting(
+                        x::ConfigSettingEntry::StateArchival(x::StateArchivalSettings {
+                            max_entry_ttl: 3_110_400,
+                            min_persistent_ttl: m.persistent_lifetime.unwrap_or(120_960),
+                            ..Default::default()
+                        }),
+                    )),
                     x::LedgerKey::ContractCode(code) => {
                         m.code_bytes.get(&code.hash.0).map(|bytes| {
                             x::LedgerEntryData::ContractCode(x::ContractCodeEntry {
@@ -684,6 +685,11 @@ impl rpc::Rpc for ModelChain {
                 };
                 let live_until = match &key {
                     x::LedgerKey::ContractCode(code) if m.lapsed_code.contains(&code.hash.0) => 0,
+                    x::LedgerKey::ContractCode(code) => m
+                        .code_live_until
+                        .get(&code.hash.0)
+                        .copied()
+                        .unwrap_or(m.ledger + 10_000),
                     _ => m.ledger + 10_000,
                 };
                 let entries: Vec<Value> = entry
@@ -700,62 +706,39 @@ impl rpc::Rpc for ModelChain {
                 else {
                     panic!()
                 };
-                if let x::OperationBody::RestoreFootprint(_) = &env.tx.operations[0].body {
+                if let x::OperationBody::ExtendFootprintTtl(_) = &env.tx.operations[0].body {
                     let x::TransactionExt::V1(data) = &env.tx.ext else {
-                        return Ok(json!({"error": "a restoration names its footprint"}));
+                        return Ok(json!({"error": "a renewal names its footprint"}));
                     };
-                    if m.refused_restore {
-                        return Ok(json!({
-                            "latestLedger": m.ledger,
-                            "error": "the restoration cannot be simulated",
-                        }));
-                    }
-                    if m.restored_meanwhile {
-                        for key in data.resources.footprint.read_write.iter() {
-                            if let x::LedgerKey::ContractCode(code) = key {
-                                m.lapsed_code.remove(&code.hash.0);
-                            }
-                        }
-                        if m.restored_by_source {
-                            m.accounts.get_mut(&source_of(&env.tx)).unwrap().sequence += 1;
-                        }
-                    }
-                    let mut data = x::SorobanTransactionData {
-                        resource_fee: RESTORE_FEE,
-                        ..data.clone()
-                    };
-                    // As Stellar RPC, the simulation restores only entries that are archived.
-                    let archived: Vec<x::LedgerKey> = data
+                    let codes: Vec<[u8; 32]> = data
                         .resources
                         .footprint
-                        .read_write
+                        .read_only
                         .iter()
-                        .filter(|key| {
-                            matches!(key, x::LedgerKey::ContractCode(code) if m.lapsed_code.contains(&code.hash.0))
+                        .filter_map(|key| match key {
+                            x::LedgerKey::ContractCode(code) => Some(code.hash.0),
+                            _ => None,
                         })
-                        .cloned()
                         .collect();
-                    data.resources.footprint.read_write = archived.try_into().unwrap();
-                    if m.restored_after_simulation {
-                        m.restored_after_simulation = false;
-                        for key in data.resources.footprint.read_write.iter() {
-                            if let x::LedgerKey::ContractCode(code) = key {
-                                m.lapsed_code.remove(&code.hash.0);
-                            }
+                    if codes.iter().any(|code| m.lapsed_code.contains(code)) {
+                        return Ok(json!({
+                            "latestLedger": m.ledger,
+                            "error": "trying to extend an archived entry",
+                        }));
+                    }
+                    if std::mem::take(&mut m.renewed_after_simulation) {
+                        let until = m.ledger + m.persistent_lifetime.unwrap_or(120_960);
+                        for code in codes {
+                            m.code_live_until.insert(code, until);
                         }
                     }
-                    if !m.restore_archived.is_empty() {
-                        data.ext = x::SorobanTransactionDataExt::V1(x::SorobanResourcesExtV0 {
-                            archived_soroban_entries: m
-                                .restore_archived
-                                .clone()
-                                .try_into()
-                                .unwrap(),
-                        });
-                    }
+                    let data = x::SorobanTransactionData {
+                        resource_fee: RENEW_FEE,
+                        ..data.clone()
+                    };
                     return Ok(json!({
                         "latestLedger": m.ledger,
-                        "minResourceFee": RESTORE_FEE.to_string(),
+                        "minResourceFee": RENEW_FEE.to_string(),
                         "transactionData": b64(&data),
                     }));
                 }
@@ -986,8 +969,9 @@ impl rpc::Rpc for ModelChain {
                 if m.settled.contains_key(&tx_hash) {
                     return Ok(json!({"hash": tx_hash, "status": "DUPLICATE"}));
                 }
-                if let Some(code) = m.retry_later_restores.take() {
-                    m.lapsed_code.remove(&code);
+                if let Some((wasm, tier)) = m.retry_later_uploads.take() {
+                    m.code.insert(hash(&wasm), tier);
+                    m.code_bytes.insert(hash(&wasm), wasm);
                     return Ok(json!({"hash": tx_hash, "status": "TRY_AGAIN_LATER"}));
                 }
                 // The source signs alone.
@@ -1007,20 +991,20 @@ impl rpc::Rpc for ModelChain {
                 assert_eq!(env.tx.seq_num.0, account.sequence + 1, "sequence");
                 account.sequence += 1;
                 let ledger = m.ledger;
-                if let x::OperationBody::RestoreFootprint(_) = &env.tx.operations[0].body {
+                if let x::OperationBody::ExtendFootprintTtl(op) = &env.tx.operations[0].body {
                     let x::TransactionExt::V1(data) = &env.tx.ext else {
-                        panic!("a restoration names its footprint")
+                        panic!("a renewal names its footprint")
                     };
-                    for key in data.resources.footprint.read_write.iter() {
+                    for key in data.resources.footprint.read_only.iter() {
                         let x::LedgerKey::ContractCode(code) = key else {
-                            panic!("the model restores code only")
+                            panic!("the model renews code only")
                         };
-                        assert!(m.lapsed_code.contains(&code.hash.0), "restore of live code");
-                        if !m.failing_restore {
-                            m.lapsed_code.remove(&code.hash.0);
+                        assert!(!m.lapsed_code.contains(&code.hash.0), "renewal of lapsed code");
+                        if !m.failing_renewal {
+                            m.code_live_until.insert(code.hash.0, ledger + op.extend_to);
                         }
                     }
-                    if m.failing_restore {
+                    if m.failing_renewal {
                         m.failed.insert(tx_hash.clone());
                     }
                     let name = std::mem::take(&mut m.pending_name);
@@ -1066,14 +1050,7 @@ impl rpc::Rpc for ModelChain {
             "getTransaction" => {
                 let tx_hash = params["hash"].as_str().unwrap();
                 let Some(envelope) = m.settled.get(tx_hash) else {
-                    return Ok(match m.history {
-                        Some(oldest) => json!({
-                            "status": "NOT_FOUND",
-                            "oldestLedger": oldest,
-                            "latestLedger": m.ledger,
-                        }),
-                        None => json!({"status": "NOT_FOUND"}),
-                    });
+                    return Ok(json!({"status": "NOT_FOUND"}));
                 };
                 let failed = m.failed.contains(tx_hash);
                 let envelope = if m.fee_bumped {
@@ -1509,7 +1486,6 @@ fn terms(principal: i128, ledger: u32) -> ExecutionTerms {
         gas: None,
         sender: Some(sender()),
         gas_carry: 0,
-        gas_due: 0,
     }
 }
 fn seal(chain: &ModelChain, authorized: &SignedOperation) -> Result<SignedOperation> {
@@ -2002,7 +1978,6 @@ fn workflow(tier: PolicyTier) -> Vec<Step> {
         gas: None,
         sender: Some(sender()),
         gas_carry: 0,
-        gas_due: 0,
     };
     run(&chain, &c, &deposit, &priced(ledger), "deposit").unwrap();
     let ledger = chain.ledger();
@@ -2611,7 +2586,6 @@ fn a_simple_wallet_counts_the_gross_volume_of_a_lossless_deposit() {
         gas: None,
         sender: Some(sender()),
         gas_carry: 0,
-        gas_due: 0,
     };
     run(&chain, &c, &deposit, &lossless, "deposit").unwrap();
     // The deposit spent only its gas; its gross amount fills the day's volume.
@@ -2956,203 +2930,32 @@ fn a_contract_wallet_reports_the_roles_that_its_configuration_holds() {
     assert_eq!(weight(&c.wallet), 0);
     assert!(state.policy_role_weight("not an address").is_err());
 }
-/// A wallet that counts an asset other than XLM converts its whole repayment once, at the rate of
-/// the server's ceiling: a due that fills the gas cap counts the ceiling's asset units, not the
-/// rounded units of a small fee bound scaled up to the repayment.
+/// A repayment never exceeds the wallet's gas cap: a fee bound above it, less no carry, is refused.
 #[test]
 fn a_repayment_never_exceeds_the_gas_cap() {
     let ceiling = ExpenseBounds::xlm(5, 0, 2_000, LEDGER, NOW).unwrap();
-    // A fee bound above the gas cap, less no carry, is a repayment above it: refused, with a
-    // due or without.
-    for due in [0, 100] {
-        assert!(
-            ceiling.with_repayment(1_009, 0, due, 1_000).is_err(),
-            "{due}"
-        );
-    }
-    // After a carry the repayment fits, and the due fills the rest of the gas cap.
-    let (bounds, part) = ceiling.with_repayment(1_009, 100, 500, 1_000).unwrap();
-    assert_eq!((part, bounds.gas_units), (91, 1_000));
+    assert!(ceiling.with_repayment(1_009, 0, 1_000).is_err());
+    // After a carry the repayment fits.
+    assert_eq!(
+        ceiling.with_repayment(1_009, 100, 1_000).unwrap().gas_units,
+        909
+    );
 }
+/// A wallet that counts an asset other than XLM converts its repayment once, at the rate of the
+/// server's ceiling.
 #[test]
-fn a_gas_due_of_another_asset_counts_units_at_the_ceiling_rate() {
+fn a_repayment_of_another_asset_counts_units_at_the_ceiling_rate() {
     // The ceiling prices 1,000,000 stroops at 10 asset units, over a principal of 5.
     let ceiling = ExpenseBounds {
         gas_units: 10,
         spent_units: 15,
         ..ExpenseBounds::xlm(5, 0, 1_000_000, LEDGER, NOW).unwrap()
     };
-    let (priced, part) = ceiling
-        .with_repayment(2_000, 0, 2_000_000, 1_000_000)
-        .unwrap();
-    // Without a carry or a due the conversion is the fee bound's own.
+    // Without a carry the conversion is the fee bound's own.
     assert_eq!(
-        ceiling.with_repayment(2_000, 0, 0, 1_000_000).unwrap().0,
+        ceiling.with_repayment(2_000, 0, 1_000_000).unwrap(),
         ceiling.with_fee_bound(2_000).unwrap()
     );
-    // The repayment is the bound of 2,000 and 998,000 of the due: the whole ceiling.
-    assert_eq!(part, 998_000);
-    assert_eq!(
-        (priced.gas_units, priced.spent_units, priced.max_fee_stroops),
-        (10, 15, 2_000)
-    );
-}
-/// A fee that the server paid for the operation outside its transaction, such as the restoration
-/// of the wallet's lapsed code, joins the repayment as far as the wallet's gas cap allows, after
-/// the carry. The priced terms keep the part that the wallet repays, the wallet counts it as gas,
-/// and the transaction still declares only its own fee bound.
-#[test]
-fn a_gas_due_joins_the_repayment_within_the_gas_cap() {
-    let wasm = wasm_for(PolicyTier::Common);
-    let chain = ModelChain::new(BTreeMap::from([(hash(&wasm), PolicyTier::Common)]));
-    let c = create(&chain, PolicyTier::Common, &wasm, [0x37; 32]);
-    let recipient = account_for_seed(&RECIPIENT);
-    let gas_cap = i128::from(c.max_fee_stroops);
-    // A due that fits, a due beyond the gas cap and a due after a carry.
-    for (id, carry, due) in [
-        (1u8, 0u128, 500u128),
-        (2, 0, gas_cap as u128 * 2),
-        (3, 300, 1_000),
-    ] {
-        let state = sending_state(&chain, &c);
-        let ledger = chain.ledger();
-        let transfer = request::transfer(&c, &state, [id; 32], &recipient, 1_000_000).unwrap();
-        let owed = ExecutionTerms {
-            gas_carry: carry,
-            gas_due: due,
-            ..terms(1_000_000, ledger)
-        };
-        let prepared = rpc::prepare_with(
-            &chain,
-            &c,
-            &transfer,
-            &owed,
-            Some(chain.accounting()),
-            NOW,
-            NOW + 300,
-        )
-        .unwrap();
-        let base = (gas() - carry as i128).max(0);
-        let part = (due as i128).min(gas_cap - base);
-        let repaid = base + part;
-        assert!(repaid <= gas_cap);
-        assert_eq!(prepared.terms.gas_due, part as u128, "{id}");
-        assert_eq!(prepared.terms.repaid_stroops().unwrap(), repaid);
-        let expense = prepared.terms.expense.as_ref().unwrap();
-        assert_eq!(
-            (
-                expense.gas_units,
-                expense.spent_units,
-                i128::from(expense.max_fee_stroops)
-            ),
-            (repaid, 1_000_000 + repaid, gas())
-        );
-        let before = chain.balance();
-        let served = authorize_server(&prepared, &SERVER, NOW, None).unwrap();
-        let simulated = rpc::simulate(&chain, &served).unwrap();
-        let proof = sign(&simulated, &AGENT, NOW).unwrap();
-        let signed = authorize(&simulated, &[proof], NOW).unwrap();
-        let sealed = seal(&chain, &signed).unwrap();
-        let x::TransactionEnvelope::Tx(envelope) = de(&sealed.transaction_xdr) else {
-            panic!()
-        };
-        assert_eq!(i128::from(envelope.tx.fee), gas());
-        chain.step("transfer");
-        assert_eq!(
-            rpc::broadcast(&chain, &sealed, NOW).unwrap(),
-            rpc::Broadcast::Submitted
-        );
-        assert_eq!(chain.balance(), before - 1_000_000 - repaid);
-        let settled = rpc::receipt_by_hash(&chain, &c.network, &sealed.transaction_hash)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            (
-                rpc::repaid_gas_stroops(&settled).unwrap(),
-                rpc::counted_gas_units(&settled).unwrap()
-            ),
-            (repaid as u128, repaid)
-        );
-    }
-    // A due of any size repays what fits under the gas cap.
-    let state = sending_state(&chain, &c);
-    let transfer = request::transfer(&c, &state, [4; 32], &recipient, 1_000_000).unwrap();
-    let unbounded = ExecutionTerms {
-        gas_due: u128::MAX,
-        ..terms(1_000_000, chain.ledger())
-    };
-    let prepared = rpc::prepare_with(
-        &chain,
-        &c,
-        &transfer,
-        &unbounded,
-        Some(chain.accounting()),
-        NOW,
-        NOW + 300,
-    )
-    .unwrap();
-    assert_eq!(prepared.terms.repaid_stroops().unwrap(), gas_cap);
-    // Local preparation admits no repayment above the gas cap, as the wallet does not.
-    let ledger = chain.ledger();
-    let mut over = terms(1_000_000, ledger);
-    over.gas_due = 500;
-    let expense = over.expense.as_mut().unwrap();
-    expense.gas_units = gas_cap + 500;
-    expense.spent_units = 1_000_000 + gas_cap + 500;
-    assert_eq!(over.repaid_stroops().unwrap(), gas_cap + 500);
-    let refused = allowit_stellar::prepare_with(&c, &transfer, &over, &state, NOW, NOW + 300)
-        .unwrap_err()
-        .to_string();
-    assert!(refused.contains("gas cap"), "{refused}");
-    // The owner changed the gas cap on the ledger: an installation with another gas cap would
-    // price repayments that the wallet refuses, so its operations are refused until it is
-    // verified again.
-    let stale = WalletConfig {
-        max_fee_stroops: c.max_fee_stroops + 1,
-        ..c.clone()
-    };
-    let refused = rpc::prepare_with(
-        &chain,
-        &stale,
-        &transfer,
-        &terms(1_000_000, chain.ledger()),
-        Some(chain.accounting()),
-        NOW,
-        NOW + 300,
-    )
-    .unwrap_err();
-    assert!(refused.contains("gas cap"), "{refused}");
-    // An explicit repayment takes no due, priced or not: an unpriced operation does not drop it.
-    let unpriced = ExecutionTerms {
-        expense: None,
-        gas: Some(GasRepayment {
-            stroops: 0,
-            payee: sender(),
-        }),
-        gas_due: 500,
-        ..terms(1_000_000, chain.ledger())
-    };
-    let refused = rpc::prepare_with(
-        &chain,
-        &c,
-        &transfer,
-        &unpriced,
-        Some(chain.accounting()),
-        NOW,
-        NOW + 300,
-    )
-    .unwrap_err();
-    assert!(refused.contains("takes no gas due"), "{refused}");
-    // An explicit repayment takes no due.
-    let explicit = ExecutionTerms {
-        gas: Some(GasRepayment {
-            stroops: 500,
-            payee: sender(),
-        }),
-        gas_due: 100,
-        ..terms(1_000_000, chain.ledger())
-    };
-    assert!(explicit.repaid_stroops().is_err());
 }
 #[test]
 fn a_gas_carry_lowers_the_repayment_and_the_gas_that_the_wallet_counts() {
@@ -3328,10 +3131,17 @@ fn code_doc(p: &allowit_core::vendor::runtime::Signed) -> Value {
 /// transaction that the ledger included and failed is an error that names it and the fee that
 /// its source paid.
 trait SendCode {
+    /// Upload `wasm`.
     fn send_code(
         &self,
         i: &allowit_core::vendor::runtime::Installation,
-        wasm: Option<&[u8]>,
+        wasm: &[u8],
+        max_fee: u64,
+    ) -> allowit_core::client::error::Result<Option<allowit_core::vendor::runtime::Receipt>>;
+    /// Renew the live code `code` once it is due.
+    fn renew_code(
+        &self,
+        code: &[u8; 32],
         max_fee: u64,
     ) -> allowit_core::client::error::Result<Option<allowit_core::vendor::runtime::Receipt>>;
 }
@@ -3339,49 +3149,64 @@ impl<T: allowit_core::vendor::RuntimeProvider + ?Sized> SendCode for T {
     fn send_code(
         &self,
         i: &allowit_core::vendor::runtime::Installation,
-        wasm: Option<&[u8]>,
+        wasm: &[u8],
         max_fee: u64,
     ) -> allowit_core::client::error::Result<Option<allowit_core::vendor::runtime::Receipt>> {
-        use allowit_core::client::error::Error;
-        use allowit_core::vendor::runtime::Status;
-        let Some(signed) = self.prepare_code_within(i, wasm, max_fee, NOW)? else {
-            return Ok(None);
-        };
-        let mut status = Status::Prepared;
-        for _ in 0..3 {
-            if !self.code_needed(&signed)? {
-                return Ok(None);
-            }
-            status = self.broadcast(&signed, NOW)?;
-            if status != Status::Prepared {
-                break;
-            }
-        }
-        if status == Status::Prepared {
-            return Err(Error::config(
-                "The network did not accept the code transaction",
-            ));
-        }
-        let receipt = self
-            .observe(&signed)?
-            .ok_or_else(|| Error::config("The code transaction has no receipt"))?;
-        let info = receipt.info()?;
-        if info.status != Status::Confirmed {
-            return Err(
-                Error::config("The wallet code transaction failed on the ledger").with_details(
-                    json!({
-                        "transactionHash": hexs(&info.transaction_hash),
-                        "nativeUnits": info.fee.native_units.to_string(),
-                    }),
-                ),
-            );
-        }
-        Ok(Some(receipt))
+        let prepared = self.prepare_code_within(i, wasm, max_fee, NOW)?;
+        send_prepared(self, prepared)
+    }
+    fn renew_code(
+        &self,
+        code: &[u8; 32],
+        max_fee: u64,
+    ) -> allowit_core::client::error::Result<Option<allowit_core::vendor::runtime::Receipt>> {
+        let prepared = self.prepare_code_renewal(code, max_fee, NOW)?;
+        send_prepared(self, prepared)
     }
 }
+fn send_prepared<T: allowit_core::vendor::RuntimeProvider + ?Sized>(
+    provider: &T,
+    prepared: Option<allowit_core::vendor::runtime::Signed>,
+) -> allowit_core::client::error::Result<Option<allowit_core::vendor::runtime::Receipt>> {
+    use allowit_core::client::error::Error;
+    use allowit_core::vendor::runtime::Status;
+    let Some(signed) = prepared else {
+        return Ok(None);
+    };
+    let mut status = Status::Prepared;
+    for _ in 0..3 {
+        if !provider.code_needed(&signed)? {
+            return Ok(None);
+        }
+        status = provider.broadcast(&signed, NOW)?;
+        if status != Status::Prepared {
+            break;
+        }
+    }
+    if status == Status::Prepared {
+        return Err(Error::config(
+            "The network did not accept the code transaction",
+        ));
+    }
+    let receipt = provider
+        .observe(&signed)?
+        .ok_or_else(|| Error::config("The code transaction has no receipt"))?;
+    let info = receipt.info()?;
+    if info.status != Status::Confirmed {
+        return Err(
+            Error::config("The wallet code transaction failed on the ledger").with_details(
+                json!({
+                    "transactionHash": hexs(&info.transaction_hash),
+                    "nativeUnits": info.fee.native_units.to_string(),
+                }),
+            ),
+        );
+    }
+    Ok(Some(receipt))
+}
 /// The server's runtime from the plugin sends with the server's own accounts, and so does its
-/// diagnostic session: a code upload through either reaches them. Code that lapsed is restored
-/// from those accounts, never uploaded again.
+/// diagnostic session: a code upload through either reaches them, and so does the renewal of
+/// shared code before it lapses. Nothing restores code that lapsed.
 #[test]
 fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts() {
     use allowit_core::vendor::plugin::RailPlugin;
@@ -3417,13 +3242,13 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
                 .to_vec())
         }
     }
-    // Sending accounts that are all leased; another account may restore the code `restores` at
-    // the same time.
+    // Sending accounts that are all leased; another account may renew the code `renews` at the
+    // same time.
     struct Leased(Arc<ModelChain>, Option<[u8; 32]>);
     impl SendingAccounts for Leased {
         fn account(&self) -> allowit_core::client::error::Result<String> {
             if let Some(code) = self.1 {
-                self.0.0.lock().unwrap().lapsed_code.remove(&code);
+                self.0.renewed(code);
             }
             Err(allowit_core::client::error::Error::config(
                 "All sending accounts are leased",
@@ -3433,17 +3258,17 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
             panic!("a leased account signs nothing")
         }
     }
-    // A sending account whose signer refuses while another account restores the code.
+    // A sending account whose signer refuses while another account renews the code.
     struct Refusing(Arc<ModelChain>, [u8; 32]);
     // A sending account whose signer gives a signature that does not verify while another
-    // account restores the code.
+    // account renews the code.
     struct Garbled(Arc<ModelChain>, [u8; 32]);
     impl SendingAccounts for Garbled {
         fn account(&self) -> allowit_core::client::error::Result<String> {
             Ok(sender())
         }
         fn sign(&self, _: &str, _: &[u8; 32]) -> allowit_core::client::error::Result<Vec<u8>> {
-            self.0.0.lock().unwrap().lapsed_code.remove(&self.1);
+            self.0.renewed(self.1);
             Ok(vec![0; 64])
         }
     }
@@ -3452,7 +3277,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
             Ok(sender())
         }
         fn sign(&self, _: &str, _: &[u8; 32]) -> allowit_core::client::error::Result<Vec<u8>> {
-            self.0.0.lock().unwrap().lapsed_code.remove(&self.1);
+            self.0.renewed(self.1);
             Err(allowit_core::client::error::Error::config(
                 "The signer is unavailable",
             ))
@@ -3497,7 +3322,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     let unsent = wasm_for(PolicyTier::Custom);
     assert!(
         plain
-            .send_code(&installation, Some(&unsent), u64::from(u32::MAX))
+            .send_code(&installation, &unsent, u64::from(u32::MAX))
             .unwrap_err()
             .message
             .contains("no sending account")
@@ -3512,24 +3337,11 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         .tiers
         .insert(hash(&other), PolicyTier::Simple);
     let signed = signatures();
-    // A restoration simulation that names an archived entry outside its footprint is refused
-    // before anything is signed, also when the footprint is empty, as for absent code.
-    chain.0.lock().unwrap().restore_archived = vec![0];
-    let refused = session
-        .provider
-        .send_code(&installation, Some(&other), u64::from(u32::MAX))
-        .unwrap_err();
-    assert!(
-        refused.message.contains("outside the read-write footprint"),
-        "{}",
-        refused.message
-    );
-    chain.0.lock().unwrap().restore_archived.clear();
     // An upload whose simulation writes another entry than the code is refused.
     chain.0.lock().unwrap().upload_names_another_entry = true;
     let refused = session
         .provider
-        .send_code(&installation, Some(&other), u64::from(u32::MAX))
+        .send_code(&installation, &other, u64::from(u32::MAX))
         .unwrap_err();
     assert!(
         refused.message.contains("another entry than its code"),
@@ -3543,7 +3355,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     assert!(
         session
             .provider
-            .send_code(&installation, Some(&other), u64::from(u32::MAX))
+            .send_code(&installation, &other, u64::from(u32::MAX))
             .unwrap()
             .is_none()
     );
@@ -3560,7 +3372,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     assert!(
         session
             .provider
-            .send_code(&installation, Some(&other), 100)
+            .send_code(&installation, &other, 100)
             .unwrap()
             .is_none()
     );
@@ -3575,7 +3387,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     assert!(
         session
             .provider
-            .send_code(&installation, Some(&other), u64::from(u32::MAX))
+            .send_code(&installation, &other, u64::from(u32::MAX))
             .unwrap()
             .is_none()
     );
@@ -3591,7 +3403,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     assert!(
         session
             .provider
-            .send_code(&installation, Some(&other), 100)
+            .send_code(&installation, &other, 100)
             .unwrap()
             .is_none()
     );
@@ -3610,7 +3422,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     assert!(
         session
             .provider
-            .send_code(&installation, Some(&other), u64::from(u32::MAX))
+            .send_code(&installation, &other, u64::from(u32::MAX))
             .unwrap()
             .is_none()
     );
@@ -3625,7 +3437,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     // refuses it before anything is signed or sent.
     let refused = session
         .provider
-        .send_code(&installation, Some(&other), 100)
+        .send_code(&installation, &other, 100)
         .unwrap_err();
     assert!(
         refused
@@ -3639,14 +3451,14 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     assert!(
         session
             .provider
-            .send_code(&installation, Some(&other), u64::MAX)
+            .send_code(&installation, &other, u64::MAX)
             .is_err()
     );
     assert_eq!(signatures(), signed);
     chain.step("upload");
     let receipt = session
         .provider
-        .send_code(&installation, Some(&other), u64::from(u32::MAX))
+        .send_code(&installation, &other, u64::from(u32::MAX))
         .unwrap();
     assert!(receipt.is_some());
     assert!(chain.0.lock().unwrap().code.contains_key(&hash(&other)));
@@ -3666,7 +3478,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     assert!(
         session
             .provider
-            .send_code(&installation, Some(&other), u64::from(u32::MAX))
+            .send_code(&installation, &other, u64::from(u32::MAX))
             .unwrap()
             .is_none()
     );
@@ -3680,319 +3492,28 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
     chain.step("upload");
     assert!(
         provider
-            .send_code(&installation, Some(&unsent), u64::from(u32::MAX))
+            .send_code(&installation, &unsent, u64::from(u32::MAX))
             .unwrap()
             .is_some()
     );
-    // The installation's code lapsed: it is not present, and the server's upload step restores
-    // it from a sending account, within the ceiling, with the code entry as its only footprint.
+    // The installation's code lapsed: it is not present, and nothing restores it. The upload step
+    // refuses it before anything is signed or sent.
     let installed = c.module_digest;
     chain.0.lock().unwrap().lapsed_code.insert(installed);
     assert!(!provider.resources(&installation).unwrap().code_present);
-    let signed = signatures();
+    let (signed, sent) = (signatures(), chain.0.lock().unwrap().steps.len());
     let refused = provider
-        .send_code(&installation, Some(&wasm), 100)
+        .send_code(&installation, &wasm, u64::from(u32::MAX))
         .unwrap_err();
     assert!(
-        refused
-            .message
-            .contains("exceeds the explicitly selected ceiling"),
+        refused.message.contains("nothing restores it"),
         "{}",
         refused.message
     );
-    assert!(chain.0.lock().unwrap().lapsed_code.contains(&installed));
     assert_eq!(signatures(), signed);
-    chain.step("restore");
-    let restored = provider
-        .send_code(
-            &installation,
-            Some(&wasm),
-            u64::try_from(RESTORE_FEE).unwrap() + 100,
-        )
-        .unwrap();
-    assert!(restored.is_some());
-    {
-        let m = chain.0.lock().unwrap();
-        assert!(m.lapsed_code.is_empty());
-        let (name, signed, ..) = m.steps.last().unwrap();
-        assert_eq!(name, "restore");
-        let x::TransactionEnvelope::Tx(env) = de(signed) else {
-            panic!()
-        };
-        assert!(matches!(
-            env.tx.operations.as_slice(),
-            [x::Operation {
-                body: x::OperationBody::RestoreFootprint(_),
-                ..
-            }]
-        ));
-        let x::TransactionExt::V1(data) = &env.tx.ext else {
-            panic!()
-        };
-        assert_eq!(
-            data.resources.footprint.read_write.as_slice(),
-            [x::LedgerKey::ContractCode(x::LedgerKeyContractCode {
-                hash: x::Hash(installed)
-            })]
-        );
-        assert!(data.resources.footprint.read_only.is_empty());
-        assert_eq!(source_of(&env.tx), sender());
-    }
-    assert_eq!(
-        rpc::code_state(&*chain, NETWORK, &installed).unwrap(),
-        rpc::CodeState::Live
-    );
-    assert!(
-        provider
-            .send_code(&installation, Some(&wasm), u64::from(u32::MAX))
-            .unwrap()
-            .is_none()
-    );
-    // Before a wallet operation the server restores the installation's lapsed code by its hash,
-    // without its bytes, and nothing when the code is live.
-    let ceiling = u64::try_from(RESTORE_FEE).unwrap() + 100;
-    assert!(
-        provider
-            .send_code(&installation, None, ceiling)
-            .unwrap()
-            .is_none()
-    );
-    chain.0.lock().unwrap().lapsed_code.insert(installed);
-    let signed = signatures();
-    assert!(
-        plain
-            .send_code(&installation, None, ceiling)
-            .unwrap_err()
-            .message
-            .contains("no sending account")
-    );
-    assert!(
-        provider
-            .send_code(&installation, None, 100)
-            .unwrap_err()
-            .message
-            .contains("exceeds the explicitly selected ceiling")
-    );
-    assert_eq!(signatures(), signed);
-    chain.step("restore before an operation");
-    assert!(
-        provider
-            .send_code(&installation, None, ceiling)
-            .unwrap()
-            .is_some()
-    );
-    {
-        let m = chain.0.lock().unwrap();
-        assert!(m.lapsed_code.is_empty());
-        assert_eq!(m.steps.last().unwrap().0, "restore before an operation");
-    }
-    // A simulation that names an archived entry outside the restoration's footprint is refused
-    // before anything is signed.
-    {
-        let mut m = chain.0.lock().unwrap();
-        m.lapsed_code.insert(installed);
-        m.restore_archived = vec![1];
-    }
-    let sent = chain.0.lock().unwrap().steps.len();
-    let signed = signatures();
-    let refused = provider
-        .send_code(&installation, None, ceiling)
-        .unwrap_err();
-    assert_eq!(signatures(), signed);
-    assert!(
-        refused.message.contains("outside the read-write footprint"),
-        "{}",
-        refused.message
-    );
-    {
-        let mut m = chain.0.lock().unwrap();
-        assert_eq!(m.steps.len(), sent);
-        assert!(m.lapsed_code.contains(&installed));
-        m.restore_archived.clear();
-        // The next restoration fails when the ledger applies it.
-        m.failing_restore = true;
-    }
-    // A restoration that the ledger includes but fails leaves the code lapsed. It is an error,
-    // not a receipt of live code, and it names the transaction and the fee that the sending
-    // account paid for it, which the server accounts for.
-    chain.step("failed restoration");
-    let failed = provider
-        .send_code(&installation, None, ceiling)
-        .unwrap_err();
-    assert!(
-        failed.message.contains("failed on the ledger"),
-        "{}",
-        failed.message
-    );
-    {
-        let m = chain.0.lock().unwrap();
-        assert!(m.lapsed_code.contains(&installed));
-        let (name, signed, ..) = m.steps.last().unwrap();
-        assert_eq!(name, "failed restoration");
-        let x::TransactionEnvelope::Tx(env) = de(signed) else {
-            panic!()
-        };
-        let details = failed
-            .details
-            .as_ref()
-            .expect("the failed restoration's details");
-        assert_eq!(
-            details,
-            &json!({"transactionHash": hexs(&tx_hash(&env.tx)), "nativeUnits": "100"})
-        );
-    }
-    // The upload step refuses a failed restoration too.
-    chain.step("failed restoration of the upload step");
-    assert!(
-        provider
-            .send_code(&installation, Some(&wasm), ceiling)
-            .unwrap_err()
-            .message
-            .contains("failed on the ledger")
-    );
-    assert!(chain.0.lock().unwrap().lapsed_code.contains(&installed));
-    // A receipt that reports a fee above the fee that its transaction declared is refused, and
-    // names no fee to charge.
-    chain.0.lock().unwrap().charged_fee = Some(i64::from(u32::MAX));
-    chain.step("failed restoration with an inflated fee");
-    let inflated = provider
-        .send_code(&installation, None, ceiling)
-        .unwrap_err();
-    assert!(
-        inflated
-            .message
-            .contains("above the fee of its transaction"),
-        "{}",
-        inflated.message
-    );
-    assert!(inflated.details.is_none());
-    chain.0.lock().unwrap().charged_fee = None;
-    // The next restoration that the ledger applies makes the code live.
-    chain.0.lock().unwrap().failing_restore = false;
-    chain.step("restore after a failure");
-    assert!(
-        provider
-            .send_code(&installation, None, ceiling)
-            .unwrap()
-            .is_some()
-    );
-    assert!(chain.0.lock().unwrap().lapsed_code.is_empty());
-    // Another request restores the code after this one read it as lapsed: the simulation of the
-    // restoration names no entry, the code is live, and nothing is sent. When that request sent
-    // from the same account, the account changed during the simulation: the code, read again,
-    // is live all the same.
-    for by_source in [false, true] {
-        {
-            let mut m = chain.0.lock().unwrap();
-            m.lapsed_code.insert(installed);
-            m.restored_meanwhile = true;
-            m.restored_by_source = by_source;
-        }
-        let sent = chain.0.lock().unwrap().steps.len();
-        let signed = signatures();
-        assert!(
-            provider
-                .send_code(&installation, None, ceiling)
-                .unwrap()
-                .is_none(),
-            "{by_source}"
-        );
-        assert_eq!(signatures(), signed);
-        let mut m = chain.0.lock().unwrap();
-        assert_eq!(m.steps.len(), sent);
-        assert!(m.lapsed_code.is_empty());
-        m.restored_meanwhile = false;
-        m.restored_by_source = false;
-    }
-    // An RPC that serves no archived entry reads lapsed code as absent. A simulated restoration
-    // of the code entry tells them apart: the step before an operation restores the code, and
-    // the upload step restores it instead of uploading it again, which the network refuses.
-    {
-        let mut m = chain.0.lock().unwrap();
-        m.lapsed_code.insert(installed);
-        m.hide_archived = true;
-    }
-    assert_eq!(
-        rpc::code_state(&*chain, NETWORK, &installed).unwrap(),
-        rpc::CodeState::Absent
-    );
-    for (name, upload) in [
-        ("restore of unread code", false),
-        ("upload step of unread code", true),
-    ] {
-        chain.0.lock().unwrap().lapsed_code.insert(installed);
-        chain.step(name);
-        let restored = if upload {
-            provider.send_code(&installation, Some(&wasm), ceiling)
-        } else {
-            provider.send_code(&installation, None, ceiling)
-        };
-        assert!(restored.unwrap().is_some(), "{name}");
-        let m = chain.0.lock().unwrap();
-        assert!(m.lapsed_code.is_empty(), "{name}");
-        let (step, signed, ..) = m.steps.last().unwrap();
-        assert_eq!(step, name);
-        let x::TransactionEnvelope::Tx(env) = de(signed) else {
-            panic!()
-        };
-        assert!(matches!(
-            env.tx.operations.as_slice(),
-            [x::Operation {
-                body: x::OperationBody::RestoreFootprint(_),
-                ..
-            }]
-        ));
-    }
-    // A restoration of such code that the ledger fails: the sending account sent a restoration,
-    // and its failure names that transaction and the fee that its source paid.
-    {
-        let mut m = chain.0.lock().unwrap();
-        m.lapsed_code.insert(installed);
-        m.failing_restore = true;
-    }
-    chain.step("failed restoration of unread code");
-    let failed = provider
-        .send_code(&installation, None, ceiling)
-        .unwrap_err();
-    assert!(
-        failed.message.contains("failed on the ledger"),
-        "{}",
-        failed.message
-    );
-    {
-        let m = chain.0.lock().unwrap();
-        let sent = &m.steps.last().unwrap().1;
-        let x::TransactionEnvelope::Tx(env) = de(sent) else {
-            panic!()
-        };
-        assert!(matches!(
-            env.tx.operations.as_slice(),
-            [x::Operation {
-                body: x::OperationBody::RestoreFootprint(_),
-                ..
-            }]
-        ));
-        let details = failed.details.as_ref().unwrap();
-        assert_eq!(details["transactionHash"], json!(hexs(&tx_hash(&env.tx))));
-        assert!(details["nativeUnits"].as_str().is_some());
-    }
-    chain.0.lock().unwrap().failing_restore = false;
-    chain.step("restore of unread code after a failure");
-    assert!(
-        provider
-            .send_code(&installation, None, ceiling)
-            .unwrap()
-            .is_some()
-    );
-    chain.0.lock().unwrap().hide_archived = false;
-    // An upload simulation that restores the archived code entry in place is refused: lapsed
-    // code is restored by a restoration of the code entry alone, never uploaded. The upload step
-    // restores it.
-    {
-        let mut m = chain.0.lock().unwrap();
-        m.lapsed_code.insert(installed);
-        m.upload_restores_in_place = true;
-    }
+    assert_eq!(chain.0.lock().unwrap().steps.len(), sent);
+    // An upload simulation that restores the archived code entry in place is refused too.
+    chain.0.lock().unwrap().upload_restores_in_place = true;
     let deployer = Deployer {
         rpc: &*chain,
         network: NETWORK,
@@ -4000,28 +3521,11 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         max_fee_stroops: u32::MAX,
     };
     let refused = deployer.upload_wasm(&sender(), &wasm).unwrap_err();
-    assert!(refused.contains("restored, not uploaded"), "{refused}");
-    chain.step("upload step of code that an upload would restore");
-    assert!(
-        provider
-            .send_code(&installation, Some(&wasm), ceiling)
-            .unwrap()
-            .is_some()
-    );
+    assert!(refused.contains("nothing restores"), "{refused}");
     {
         let mut m = chain.0.lock().unwrap();
-        assert!(m.lapsed_code.is_empty());
-        let x::TransactionEnvelope::Tx(env) = de(&m.steps.last().unwrap().1) else {
-            panic!()
-        };
-        assert!(matches!(
-            env.tx.operations.as_slice(),
-            [x::Operation {
-                body: x::OperationBody::RestoreFootprint(_),
-                ..
-            }]
-        ));
         m.upload_restores_in_place = false;
+        m.lapsed_code.remove(&installed);
     }
     // A read that finds no entry can omit the entry list: the code is absent.
     chain.0.lock().unwrap().omit_empty_entries = true;
@@ -4030,123 +3534,197 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         rpc::CodeState::Absent
     );
     chain.0.lock().unwrap().omit_empty_entries = false;
-    // A restoration whose simulation the network refuses restores nothing, and the code is read
-    // again. A read that fails is an error, not absent code that an upload would replace.
-    {
-        let mut m = chain.0.lock().unwrap();
-        m.refused_restore = true;
-        m.failing_code_reads = true;
-    }
-    let refused = deployer
-        .restore_code(&sender(), installed)
-        .expect_err("a failed read is an error");
-    assert!(refused.contains("unreachable"), "{refused}");
-    // Code that the read finds lapsed has an archived entry that the restoration did not name:
-    // that is refused too, never read as absent.
-    chain.0.lock().unwrap().failing_code_reads = false;
-    chain.0.lock().unwrap().lapsed_code.insert(installed);
-    let refused = deployer
-        .restore_code(&sender(), installed)
-        .expect_err("lapsed code that a restoration does not name is an error");
-    assert!(refused.contains("lapsed"), "{refused}");
+    // The server renews the code that wallets share before it lapses. Once at most half of the
+    // network's minimum lifetime of a persistent entry is left, a renewal extends the code to that
+    // lifetime, from a sending account, within the ceiling, with the code entry alone in its
+    // read-only footprint. It renews nothing before.
+    let lifetime = 120_960;
+    let ceiling = u64::try_from(RENEW_FEE).unwrap() + 100;
+    let due = |left: u32| {
+        let head = chain.ledger();
+        chain
+            .0
+            .lock()
+            .unwrap()
+            .code_live_until
+            .insert(installed, head + left);
+    };
+    due(lifetime / 2 + 1);
     let signed = signatures();
-    let refused = provider
-        .send_code(&installation, Some(&wasm), ceiling)
-        .unwrap_err();
-    assert!(refused.message.contains("lapsed"), "{}", refused.message);
-    assert_eq!(signatures(), signed);
-    // Live code needs nothing, whatever the simulation answers.
-    chain.0.lock().unwrap().lapsed_code.remove(&installed);
-    assert!(matches!(
-        deployer.restore_code(&sender(), installed).unwrap(),
-        CodeRestoration::Live
-    ));
-    chain.0.lock().unwrap().refused_restore = false;
-    // Another sending account restores the code just after the simulation, which still names
-    // the entry: the code, read again before the signature, is live, and nothing is signed.
-    {
-        let mut m = chain.0.lock().unwrap();
-        m.lapsed_code.insert(installed);
-        m.restored_after_simulation = true;
-    }
-    let signed = signatures();
+    assert!(provider.renew_code(&installed, ceiling).unwrap().is_none());
+    due(lifetime / 2);
+    assert!(
+        plain
+            .renew_code(&installed, ceiling)
+            .unwrap_err()
+            .message
+            .contains("no sending account")
+    );
     assert!(
         provider
-            .send_code(&installation, None, ceiling)
-            .unwrap()
-            .is_none()
+            .renew_code(&installed, 100)
+            .unwrap_err()
+            .message
+            .contains("exceeds the explicitly selected ceiling")
     );
     assert_eq!(signatures(), signed);
+    chain.step("renew");
+    assert!(provider.renew_code(&installed, ceiling).unwrap().is_some());
     {
         let m = chain.0.lock().unwrap();
-        assert!(!m.restored_after_simulation);
-        assert!(!m.lapsed_code.contains(&installed));
+        let (name, signed, ledger, ..) = m.steps.last().unwrap();
+        assert_eq!(name, "renew");
+        let x::TransactionEnvelope::Tx(env) = de(signed) else {
+            panic!()
+        };
+        assert!(matches!(
+            env.tx.operations.as_slice(),
+            [x::Operation {
+                body: x::OperationBody::ExtendFootprintTtl(x::ExtendFootprintTtlOp { extend_to, .. }),
+                ..
+            }] if *extend_to == lifetime
+        ));
+        let x::TransactionExt::V1(data) = &env.tx.ext else {
+            panic!()
+        };
+        assert_eq!(
+            data.resources.footprint.read_only.as_slice(),
+            [x::LedgerKey::ContractCode(x::LedgerKeyContractCode {
+                hash: x::Hash(installed)
+            })]
+        );
+        assert!(data.resources.footprint.read_write.is_empty());
+        assert_eq!(source_of(&env.tx), sender());
+        assert_eq!(m.code_live_until[&installed], ledger + lifetime);
     }
-    // So with a fee ceiling below the restoration's fee: no restoration is needed, so no ceiling
-    // refuses it.
-    {
-        let mut m = chain.0.lock().unwrap();
-        m.lapsed_code.insert(installed);
-        m.restored_after_simulation = true;
-    }
+    assert!(provider.renew_code(&installed, ceiling).unwrap().is_none());
+    // The network's own lifetime decides: a network whose entries live longer renews earlier.
+    chain.0.lock().unwrap().persistent_lifetime = Some(lifetime * 4);
     assert!(
         provider
-            .send_code(&installation, None, 100)
+            .prepare_code_renewal(&installed, ceiling, NOW)
             .unwrap()
-            .is_none()
+            .is_some()
     );
-    assert_eq!(signatures(), signed);
-    assert!(!chain.0.lock().unwrap().lapsed_code.contains(&installed));
-    // Every sending account is leased while another account restores the code: no restoration
-    // is needed, so the allocation's refusal does not stand.
+    chain.0.lock().unwrap().persistent_lifetime = None;
+    // Lapsed code is not renewed: nothing restores it. Neither is code that the network does not
+    // have, nor code that an endpoint of another network or a failed read reports.
+    let signed = signatures();
     chain.0.lock().unwrap().lapsed_code.insert(installed);
-    let leased = |restores| {
+    for refusal in [
+        provider.renew_code(&installed, ceiling),
+        provider.renew_code(&[0x5b; 32], ceiling),
+    ] {
+        let refused = refusal.unwrap_err();
+        assert!(
+            refused.message.contains("nothing restores it")
+                || refused.message.contains("not on the network"),
+            "{}",
+            refused.message
+        );
+    }
+    chain.0.lock().unwrap().lapsed_code.remove(&installed);
+    due(lifetime / 2);
+    chain.0.lock().unwrap().foreign_network = true;
+    assert!(provider.renew_code(&installed, ceiling).is_err());
+    chain.0.lock().unwrap().foreign_network = false;
+    chain.0.lock().unwrap().failing_code_reads = true;
+    assert!(provider.renew_code(&installed, ceiling).is_err());
+    chain.0.lock().unwrap().failing_code_reads = false;
+    assert_eq!(signatures(), signed);
+    // Another sending account renews the code just after the simulation: read again before the
+    // signature, the code needs nothing, and nothing is signed.
+    chain.0.lock().unwrap().renewed_after_simulation = true;
+    assert!(provider.renew_code(&installed, ceiling).unwrap().is_none());
+    assert!(!chain.0.lock().unwrap().renewed_after_simulation);
+    assert_eq!(signatures(), signed);
+    // Every sending account is leased while another account renews the code: nothing is needed,
+    // so the allocation's refusal does not stand. While the code stays due, it stands.
+    let leased = |renews| {
         allowit_stellar::PLUGIN
             .sending_runtime(
                 NETWORK,
                 Arc::new(Wire(chain.clone())),
-                Arc::new(Leased(chain.clone(), restores)),
+                Arc::new(Leased(chain.clone(), renews)),
             )
             .unwrap()
     };
+    due(lifetime / 2);
     assert!(
         leased(Some(installed))
-            .send_code(&installation, None, ceiling)
+            .renew_code(&installed, ceiling)
             .unwrap()
             .is_none()
     );
-    // While the code stays lapsed, the refusal stands.
-    chain.0.lock().unwrap().lapsed_code.insert(installed);
-    let refused = leased(None)
-        .send_code(&installation, None, ceiling)
-        .unwrap_err();
+    due(lifetime / 2);
+    let refused = leased(None).renew_code(&installed, ceiling).unwrap_err();
     assert!(refused.message.contains("leased"), "{}", refused.message);
-    // The signer refuses while another account restores the code: nothing is needed.
-    assert!(
+    // The signer refuses, or gives a signature that does not verify, while another account renews
+    // the code: nothing is needed.
+    for runtime in [
         allowit_stellar::PLUGIN
             .sending_runtime(
                 NETWORK,
                 Arc::new(Wire(chain.clone())),
                 Arc::new(Refusing(chain.clone(), installed)),
             )
-            .unwrap()
-            .send_code(&installation, None, ceiling)
-            .unwrap()
-            .is_none()
+            .unwrap(),
+        allowit_stellar::PLUGIN
+            .sending_runtime(
+                NETWORK,
+                Arc::new(Wire(chain.clone())),
+                Arc::new(Garbled(chain.clone(), installed)),
+            )
+            .unwrap(),
+    ] {
+        due(lifetime / 2);
+        assert!(runtime.renew_code(&installed, ceiling).unwrap().is_none());
+    }
+    // A renewal that the ledger includes but fails leaves the code's lifetime as it was. It is an
+    // error that names the transaction and the fee that the sending account paid.
+    due(lifetime / 2);
+    chain.0.lock().unwrap().failing_renewal = true;
+    chain.step("failed renewal");
+    let failed = provider.renew_code(&installed, ceiling).unwrap_err();
+    assert!(
+        failed.message.contains("failed on the ledger"),
+        "{}",
+        failed.message
     );
-    assert!(!chain.0.lock().unwrap().lapsed_code.contains(&installed));
+    {
+        let mut m = chain.0.lock().unwrap();
+        let x::TransactionEnvelope::Tx(env) = de(&m.steps.last().unwrap().1) else {
+            panic!()
+        };
+        assert_eq!(
+            failed.details.as_ref().unwrap(),
+            &json!({"transactionHash": hexs(&tx_hash(&env.tx)), "nativeUnits": "100"})
+        );
+        m.failing_renewal = false;
+    }
+    assert!(
+        provider
+            .prepare_code_renewal(&installed, ceiling, NOW)
+            .unwrap()
+            .is_some()
+    );
+    chain.renewed(installed);
     // A code transaction is a signed packet that the caller sends: the rail prepares it, signed
     // by the sending account, and sends nothing. Its identity is its transaction hash.
+    let absent = |m: &mut Model| {
+        m.code.remove(&hash(&unsent));
+        m.code_bytes.remove(&hash(&unsent));
+    };
+    let upload_ceiling = u64::from(u32::MAX);
     {
         use allowit_core::vendor::runtime::{Kind, Status};
-        chain.0.lock().unwrap().lapsed_code.insert(installed);
+        absent(&mut chain.0.lock().unwrap());
         let signed = signatures();
         let code = provider
-            .prepare_code_within(&installation, None, ceiling, NOW)
+            .prepare_code_within(&installation, &unsent, upload_ceiling, NOW)
             .unwrap()
             .unwrap();
         assert_eq!(signatures(), signed + 1);
-        assert!(chain.0.lock().unwrap().lapsed_code.contains(&installed));
         let info = code.info().unwrap();
         assert_eq!(info.operation_id, info.transaction_hash);
         assert_eq!(info.wallet, sender());
@@ -4159,7 +3737,7 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         assert!(code.preparation().is_err());
         assert!(provider.code_needed(&code).unwrap());
         // Its exact bytes restore, and bytes that differ do not: an envelope without the
-        // source's signature, or a restoration named an upload.
+        // source's signature, or an upload named a renewal.
         let raw =
             |value: &Value| serde_json::value::RawValue::from_string(value.to_string()).unwrap();
         let document: Value = serde_json::from_slice(code.bytes()).unwrap();
@@ -4176,37 +3754,36 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
                 .is_err()
         );
         let mut renamed = document.clone();
-        renamed["code"]["function"] = json!("upload_wasm");
+        renamed["code"]["function"] = json!("renew_code");
         assert!(
             allowit_stellar::PLUGIN
                 .restore(Kind::Signed, raw(&renamed))
                 .is_err()
         );
-        // The network does not accept it yet while another account restores the code: nothing is
+        // The network does not accept it yet while another account uploads the code: nothing is
         // pending, the transaction is no longer needed, and it is not sent again.
-        chain.0.lock().unwrap().retry_later_restores = Some(installed);
+        chain.0.lock().unwrap().retry_later_uploads = Some((unsent.clone(), PolicyTier::Custom));
         assert_eq!(provider.broadcast(&code, NOW).unwrap(), Status::Prepared);
         assert!(!provider.code_needed(&code).unwrap());
         assert!(provider.observe(&code).unwrap().is_none());
         // A transaction that the network rejects is not pending and cost nothing: it was not
         // accepted.
-        chain.0.lock().unwrap().lapsed_code.insert(installed);
+        absent(&mut chain.0.lock().unwrap());
         let code = provider
-            .prepare_code_within(&installation, None, ceiling, NOW)
+            .prepare_code_within(&installation, &unsent, upload_ceiling, NOW)
             .unwrap()
             .unwrap();
         chain.0.lock().unwrap().reject_next_send = true;
         assert_eq!(provider.broadcast(&code, NOW).unwrap(), Status::Prepared);
         assert!(provider.observe(&code).unwrap().is_none());
-        assert!(chain.0.lock().unwrap().lapsed_code.contains(&installed));
-        // Sent, it restores the code, and its receipt is the caller's.
-        chain.step("restore by a code transaction");
+        // Sent, it uploads the code, and its receipt is the caller's.
+        chain.0.lock().unwrap().tiers.insert(hash(&unsent), PolicyTier::Custom);
+        chain.step("upload by a code transaction");
         assert_eq!(provider.broadcast(&code, NOW).unwrap(), Status::Submitted);
         assert_eq!(provider.status(&code).unwrap(), Status::Confirmed);
         let receipt = provider.observe(&code).unwrap().unwrap();
         receipt.verify_operation(&code).unwrap();
         assert_eq!(receipt.info().unwrap().status, Status::Confirmed);
-        assert!(!chain.0.lock().unwrap().lapsed_code.contains(&installed));
         assert!(!provider.code_needed(&code).unwrap());
         // A retained receipt that reports a fee above the declared fee does not verify.
         let x::TransactionEnvelope::Tx(signed) = de(code_doc(&code)["signedXdr"].as_str().unwrap())
@@ -4243,48 +3820,26 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         assert!(provider.observe(&code).is_err());
         chain.0.lock().unwrap().fee_bumped = false;
         assert!(provider.observe(&code).unwrap().is_some());
-        // A sent transaction never lapses.
-        chain.0.lock().unwrap().history = Some(1);
-        assert!(!provider.code_lapsed(&code).unwrap());
-        chain.0.lock().unwrap().history = None;
-    }
-    // A code transaction that was never sent lapses once a ledger after its signed ledger bound
-    // closed, in a history that reaches back to its first ledger. The proof reads nothing else.
-    {
-        chain.0.lock().unwrap().lapsed_code.insert(installed);
-        let code = provider
-            .prepare_code_within(&installation, None, ceiling, NOW)
+        // A renewal is the same kind of packet, and needed only while it is due.
+        due(lifetime / 2);
+        let renewal = provider
+            .prepare_code_renewal(&installed, ceiling, NOW)
             .unwrap()
             .unwrap();
-        let x::TransactionEnvelope::Tx(signed) = de(code_doc(&code)["signedXdr"].as_str().unwrap())
-        else {
-            panic!()
-        };
-        let x::Preconditions::V2(x::PreconditionsV2 {
-            ledger_bounds: Some(bounds),
-            ..
-        }) = &signed.tx.cond
-        else {
-            panic!("a code transaction is bounded by ledgers")
-        };
-        let (first, last) = (bounds.min_ledger, bounds.max_ledger);
-        assert!(first > 0 && last > first);
-        let head = chain.0.lock().unwrap().ledger;
-        assert!(!provider.code_lapsed(&code).unwrap());
-        chain.0.lock().unwrap().history = Some(1);
-        assert!(!provider.code_lapsed(&code).unwrap());
-        chain.0.lock().unwrap().ledger = last + 1;
-        assert!(provider.code_lapsed(&code).unwrap());
-        // An endpoint of another network proves nothing about this one.
-        chain.0.lock().unwrap().foreign_network = true;
-        assert!(provider.code_lapsed(&code).is_err());
-        chain.0.lock().unwrap().foreign_network = false;
-        chain.0.lock().unwrap().history = Some(first + 1);
-        assert!(!provider.code_lapsed(&code).unwrap());
-        let mut m = chain.0.lock().unwrap();
-        m.history = None;
-        m.ledger = head;
-        m.lapsed_code.remove(&installed);
+        let info = renewal.info().unwrap();
+        assert_eq!(info.operation_id, info.transaction_hash);
+        provider.validate_signed(&renewal, NOW).unwrap();
+        assert!(provider.code_needed(&renewal).unwrap());
+        let document = code_doc(&renewal);
+        let mut renamed = document.clone();
+        renamed["code"]["function"] = json!("upload_wasm");
+        assert!(
+            allowit_stellar::PLUGIN
+                .restore(Kind::Signed, raw(&renamed))
+                .is_err()
+        );
+        chain.renewed(installed);
+        assert!(!provider.code_needed(&renewal).unwrap());
     }
     // The packet binds its time bound, its source's signature hint and a footprint of the code
     // entry alone.
@@ -4297,12 +3852,11 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
                 .restore(Kind::Signed, raw(document))
                 .is_err()
         };
-        chain.0.lock().unwrap().lapsed_code.insert(installed);
+        absent(&mut chain.0.lock().unwrap());
         let code = provider
-            .prepare_code_within(&installation, None, ceiling, NOW)
+            .prepare_code_within(&installation, &unsent, upload_ceiling, NOW)
             .unwrap()
             .unwrap();
-        chain.0.lock().unwrap().lapsed_code.remove(&installed);
         let document = code_doc(&code);
         assert!(!refused(&document));
         let mut later = document.clone();
@@ -4318,13 +3872,17 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
         envelope.signatures = signatures.try_into().unwrap();
         hinted["signedXdr"] = json!(b64(&x::TransactionEnvelope::Tx(envelope)));
         assert!(refused(&hinted));
-        // The packet holds nothing outside the signature that a proof could read.
+        // The packet holds nothing outside the signature.
         let mut anchored = document.clone();
         anchored["ledger"] = json!(1);
         assert!(refused(&anchored));
-        // Re-signed by its source with other bounds: a time bound alone, a time bound of zero,
-        // which Stellar reads as none, or a ledger window without an upper bound.
-        let resigned = |change: &dyn Fn(&mut x::Transaction, &mut Value)| {
+        // A preparation that carries a signature is not the server's unsigned preparation.
+        let mut presigned = document.clone();
+        presigned["code"]["transactionXdr"] = presigned["signedXdr"].clone();
+        assert!(refused(&presigned));
+        // Re-signed by its source with other bounds: a time bound of zero, which Stellar reads as
+        // none, or bounds by ledgers.
+        let resigned = |document: &Value, change: &dyn Fn(&mut x::Transaction, &mut Value)| {
             let mut document = document.clone();
             let x::TransactionEnvelope::Tx(mut envelope) =
                 de(document["code"]["transactionXdr"].as_str().unwrap())
@@ -4353,129 +3911,94 @@ fn the_sending_runtime_and_its_diagnostic_session_send_with_the_servers_accounts
             document
         };
         let expires = code.info().unwrap().expires_at;
-        assert!(!refused(&resigned(&|_, _| {})));
-        assert!(refused(&resigned(&|tx, _| {
-            tx.cond = x::Preconditions::Time(x::TimeBounds {
-                min_time: x::TimePoint(0),
-                max_time: x::TimePoint(expires),
-            });
-        })));
-        assert!(refused(&resigned(&|tx, document| {
+        assert!(!refused(&resigned(&document, &|_, _| {})));
+        assert!(refused(&resigned(&document, &|tx, document| {
             tx.cond = x::Preconditions::Time(x::TimeBounds {
                 min_time: x::TimePoint(0),
                 max_time: x::TimePoint(0),
             });
             document["code"]["expiresAt"] = json!(0);
         })));
-        assert!(refused(&resigned(&|tx, document| {
-            if let x::Preconditions::V2(v2) = &mut tx.cond {
-                v2.time_bounds = Some(x::TimeBounds {
+        assert!(refused(&resigned(&document, &|tx, _| {
+            tx.cond = x::Preconditions::V2(x::PreconditionsV2 {
+                time_bounds: Some(x::TimeBounds {
                     min_time: x::TimePoint(0),
-                    max_time: x::TimePoint(0),
-                });
-            }
-            document["code"]["expiresAt"] = json!(0);
-        })));
-        assert!(refused(&resigned(&|tx, _| {
-            if let x::Preconditions::V2(v2) = &mut tx.cond {
-                v2.ledger_bounds = Some(x::LedgerBounds {
+                    max_time: x::TimePoint(expires),
+                }),
+                ledger_bounds: Some(x::LedgerBounds {
                     min_ledger: 1,
-                    max_ledger: 0,
-                });
-            }
+                    max_ledger: 61,
+                }),
+                min_seq_num: None,
+                min_seq_age: x::Duration(0),
+                min_seq_ledger_gap: 0,
+                extra_signers: Default::default(),
+            });
         })));
-        // A ledger window of another length than the one that preparation binds.
-        assert!(refused(&resigned(&|tx, _| {
-            if let x::Preconditions::V2(v2) = &mut tx.cond
-                && let Some(bounds) = &mut v2.ledger_bounds
-            {
-                bounds.max_ledger += 1_000_000;
+        // An upload re-signed by its source with another entry in its footprint, or with its code
+        // entry read-only, as a renewal names it.
+        let widen = |extra: bool| {
+            move |tx: &mut x::Transaction, _: &mut Value| {
+                let x::TransactionExt::V1(data) = &mut tx.ext else {
+                    panic!()
+                };
+                let mut written = data.resources.footprint.read_write.to_vec();
+                if extra {
+                    written.push(x::LedgerKey::ContractCode(x::LedgerKeyContractCode {
+                        hash: x::Hash([0x77; 32]),
+                    }));
+                } else {
+                    data.resources.footprint.read_only = written.clone().try_into().unwrap();
+                    written.clear();
+                }
+                data.resources.footprint.read_write = written.try_into().unwrap();
             }
+        };
+        assert!(refused(&resigned(&document, &widen(true))));
+        assert!(refused(&resigned(&document, &widen(false))));
+        // A renewal re-signed with its code entry written, or with no extension.
+        due(lifetime / 2);
+        let renewal = code_doc(
+            &provider
+                .prepare_code_renewal(&installed, ceiling, NOW)
+                .unwrap()
+                .unwrap(),
+        );
+        assert!(!refused(&renewal));
+        assert!(refused(&resigned(&renewal, &|tx, _| {
+            let x::TransactionExt::V1(data) = &mut tx.ext else {
+                panic!()
+            };
+            data.resources.footprint.read_write =
+                std::mem::take(&mut data.resources.footprint.read_only);
         })));
-        // A preparation that carries a signature is not the server's unsigned preparation.
-        let mut presigned = document.clone();
-        presigned["code"]["transactionXdr"] = presigned["signedXdr"].clone();
-        assert!(refused(&presigned));
-        // An upload re-signed by its source with another entry in its footprint.
-        {
-            let mut m = chain.0.lock().unwrap();
-            m.code.remove(&hash(&unsent));
-            m.code_bytes.remove(&hash(&unsent));
-        }
-        let upload = provider
-            .prepare_code_within(&installation, Some(&unsent), ceiling, NOW)
-            .unwrap()
-            .unwrap();
-        let mut widened = code_doc(&upload);
-        assert!(!refused(&widened));
-        let x::TransactionEnvelope::Tx(mut envelope) =
-            de(widened["code"]["transactionXdr"].as_str().unwrap())
-        else {
-            panic!()
-        };
-        let x::TransactionExt::V1(data) = &mut envelope.tx.ext else {
-            panic!()
-        };
-        let mut written = data.resources.footprint.read_write.to_vec();
-        written.push(x::LedgerKey::ContractCode(x::LedgerKeyContractCode {
-            hash: x::Hash([0x5b; 32]),
-        }));
-        data.resources.footprint.read_write = written.try_into().unwrap();
-        let digest = tx_hash(&envelope.tx);
-        widened["code"]["transactionXdr"] =
-            json!(b64(&x::TransactionEnvelope::Tx(envelope.clone())));
-        widened["code"]["transactionHash"] = json!(digest.to_vec());
-        envelope.signatures = vec![x::DecoratedSignature {
-            hint: x::SignatureHint(account_key(&sender()).unwrap()[28..].try_into().unwrap()),
-            signature: x::Signature(
-                SigningKey::from_bytes(&SENDER)
-                    .sign(&digest)
-                    .to_bytes()
-                    .to_vec()
-                    .try_into()
-                    .unwrap(),
-            ),
-        }]
-        .try_into()
-        .unwrap();
-        widened["signedXdr"] = json!(b64(&x::TransactionEnvelope::Tx(envelope)));
-        assert!(refused(&widened));
+        assert!(refused(&resigned(&renewal, &|tx, _| {
+            let mut operations = tx.operations.to_vec();
+            operations[0].body = x::OperationBody::ExtendFootprintTtl(x::ExtendFootprintTtlOp {
+                ext: x::ExtensionPoint::V0,
+                extend_to: 0,
+            });
+            tx.operations = operations.try_into().unwrap();
+        })));
+        chain.renewed(installed);
         let mut m = chain.0.lock().unwrap();
         m.code.insert(hash(&unsent), PolicyTier::Custom);
         m.code_bytes.insert(hash(&unsent), unsent.clone());
     }
-    // The signature does not verify while another account restores the code: nothing is needed.
-    chain.0.lock().unwrap().lapsed_code.insert(installed);
-    assert!(
-        allowit_stellar::PLUGIN
-            .sending_runtime(
-                NETWORK,
-                Arc::new(Wire(chain.clone())),
-                Arc::new(Garbled(chain.clone(), installed)),
-            )
-            .unwrap()
-            .prepare_code_within(&installation, None, ceiling, NOW)
-            .unwrap()
-            .is_none()
-    );
-    assert!(!chain.0.lock().unwrap().lapsed_code.contains(&installed));
-    // Code that the network does not have cannot be restored: it needs an upload.
-    chain.0.lock().unwrap().code_bytes.remove(&installed);
-    let signed = signatures();
-    assert!(
-        provider
-            .send_code(&installation, None, ceiling)
-            .unwrap_err()
-            .message
-            .contains("not on the network")
-    );
-    assert_eq!(signatures(), signed);
 }
-/// A wallet whose instance and `t` lapsed: the ledger still gives their values, so the server
-/// reads the wallet and the agent's payment restores both in place; the owner's stop then
-/// restores them too and returns everything with one signature.
+/// A transport that answers nothing: for the rail's naming of a problem, which reads no ledger.
+struct NoTransport;
+impl allowit_core::vendor::runtime::Transport for NoTransport {
+    fn call(&self, _: &str, _: Value) -> allowit_core::client::error::Result<Value> {
+        Err(allowit_core::client::error::Error::config("no transport"))
+    }
+}
+/// A wallet whose instance lapsed is expired, and nothing restores it: the agent's payment and the
+/// owner's stop are refused with `CONTRACT_EXPIRED` before anything is signed or sent, and the
+/// rail names that problem `contract_expired`. A lapsed `t` alone still restores in the operation
+/// that needs it.
 #[test]
-fn a_lapsed_instance_restores_in_the_payment_and_in_the_owners_stop() {
+fn a_lapsed_wallet_is_expired_before_anything_is_signed_or_sent() {
     let wasm = wasm_for(PolicyTier::Common);
     let chain = ModelChain::new(BTreeMap::from([(hash(&wasm), PolicyTier::Common)]));
     let c = create(&chain, PolicyTier::Common, &wasm, [0x37; 32]);
@@ -4489,7 +4012,8 @@ fn a_lapsed_instance_restores_in_the_payment_and_in_the_owners_stop() {
     let ledger = chain.ledger();
     let recipient = account_for_seed(&RECIPIENT);
     let transfer = request::transfer(&c, &state, [1; 32], &recipient, 1_000_000).unwrap();
-    let prepared = rpc::prepare_with(
+    let sent = chain.0.lock().unwrap().steps.len();
+    let refused = rpc::prepare_with(
         &lapsed,
         &c,
         &transfer,
@@ -4498,49 +4022,27 @@ fn a_lapsed_instance_restores_in_the_payment_and_in_the_owners_stop() {
         NOW,
         NOW + 300,
     )
-    .unwrap();
-    let served = authorize_server(&prepared, &SERVER, NOW, None).unwrap();
-    let simulated = rpc::simulate(&lapsed, &served).unwrap();
-    let proof = sign(&simulated, &AGENT, NOW).unwrap();
-    let signed = authorize(&simulated, &[proof], NOW).unwrap();
-    let sealed = rpc::seal(&lapsed, &signed, |hash| {
-        Ok(SigningKey::from_bytes(&SENDER).sign(hash).to_bytes())
-    })
-    .unwrap();
-    let x::TransactionEnvelope::Tx(envelope) = de(&sealed.transaction_xdr) else {
-        panic!()
-    };
-    let x::TransactionExt::V1(data) = &envelope.tx.ext else {
-        panic!()
-    };
-    assert!(matches!(
-        &data.ext,
-        x::SorobanTransactionDataExt::V1(ext) if ext.archived_soroban_entries.as_slice() == [0, 1]
-    ));
-    chain.step("transfer");
+    .unwrap_err();
+    assert_eq!(refused.to_string(), rpc::CONTRACT_EXPIRED);
+    let problem = allowit_core::vendor::plugin::RailPlugin::runtime(
+        &allowit_stellar::PLUGIN,
+        NETWORK,
+        std::sync::Arc::new(NoTransport),
+    )
+        .unwrap()
+        .problem(&allowit_core::client::error::Error::config(refused.to_string()));
     assert_eq!(
-        rpc::broadcast(&chain, &sealed, NOW).unwrap(),
-        rpc::Broadcast::Submitted
+        (problem.status, problem.code),
+        (409, allowit_core::vendor::runtime::CONTRACT_EXPIRED)
     );
-    // The owner alone: the stop reads the lapsed instance and restores it in the same call.
+    // The owner's stop too.
     let mut owner = OwnerAdmin {
         rpc: &lapsed,
         config: &c,
         now: NOW,
     };
     let version = owner.deployment_version().unwrap().0 + 1;
-    let stop = owner.stop(DeploymentVersion(version)).unwrap();
-    let x::TransactionEnvelope::Tx(envelope) = de(&stop.transaction_xdr) else {
-        panic!()
-    };
-    let x::TransactionExt::V1(data) = &envelope.tx.ext else {
-        panic!()
-    };
-    assert!(matches!(
-        &data.ext,
-        x::SorobanTransactionDataExt::V1(ext) if ext.archived_soroban_entries.len() == 2
-    ));
-    owner_submit(&chain, "stop", &stop.transaction_xdr);
-    assert_eq!(chain.balance(), 0);
-    assert!(chain.config().paused);
+    let refused = owner.stop(DeploymentVersion(version)).unwrap_err();
+    assert_eq!(refused.to_string(), rpc::CONTRACT_EXPIRED);
+    assert_eq!(chain.0.lock().unwrap().steps.len(), sent);
 }

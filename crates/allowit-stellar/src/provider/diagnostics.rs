@@ -106,6 +106,13 @@ pub fn denial(message: &str, contract: Option<&ContractFault>, wallet: &str) -> 
     if contract.is_none() && [NOTHING_TO_RETURN, NOTHING_TO_RECOVER].contains(&message) {
         return coded(409, "nothing_to_return", message);
     }
+    if contract.is_none() && message == crate::rpc::CONTRACT_EXPIRED {
+        return coded(
+            409,
+            allowit_core::vendor::runtime::CONTRACT_EXPIRED,
+            "The wallet lapsed on the network: nothing restores it, and nothing was signed or sent. Its owner restores it outside Allowit.",
+        );
+    }
     if contract.is_none() && message == crate::rpc::EXECUTABLE_DIFFERS {
         return coded(
             409,

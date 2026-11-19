@@ -681,7 +681,9 @@ Owner pause, stop, configuration, recovery, upgrades and exact `invoke` bypass a
 business checks and never call an engine. Owner authorization binds exact target, arguments and
 supplied subtrees. `stop` pauses the wallet at the next version and returns its asset and XLM to
 the owner in one call. The owner acts alone: a wallet whose `t` has lapsed restores it in the same
-transaction. `state()` returns the configuration, the kept figure set and the figures. Unknown
+transaction. Each call keeps the wallet's instance live, and a Custom wallet's own code too
+(`keep_live`); the rail refuses a step on a wallet whose instance or code lapsed with
+`CONTRACT_EXPIRED`, and nothing restores it. `state()` returns the configuration, the kept figure set and the figures. Unknown
 stored layouts reject. Upgrades do not migrate state.
 
 The owner creates and funds a wallet with one signature through the stateless deployer contract:

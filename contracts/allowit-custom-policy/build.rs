@@ -37,6 +37,8 @@ const ALL: [&str; 5] = [
 ];
 
 /// The policy's state keys: the same scan as the rail's server evaluation.
+// The build reads the keys; the server alone reads the value bound.
+#[allow(dead_code)]
 #[path = "state_keys.rs"]
 mod state_keys;
 
