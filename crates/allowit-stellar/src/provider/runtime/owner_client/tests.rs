@@ -1143,6 +1143,11 @@ fn generation_sends_the_chosen_wallet_kind_keeps_the_bound_one_and_reports_a_typ
             wallet_kind: kind,
         };
         let result = client.generate(&request, now);
+        // The generation names the network of its templates request.
+        assert_eq!(
+            server.calls("/api/native/templates?network=stellar:testnet"),
+            1
+        );
         let sent = server.state.lock().unwrap().generated.clone();
         (result, sent)
     };

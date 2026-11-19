@@ -87,7 +87,7 @@ function browser(submit) {
       trace.push(path);
       switch (path) {
         case 'authoring/adopt': return {policies: [policy], selectedId: policyId};
-        case 'native/templates': return {server, templates: [{network, asset, assetSymbol: 'XLM', assetIssuer: null, maxFeeUnits: 1000, tiers: {common: moduleDigest}}]};
+        case 'native/templates?network=stellar:testnet': return {server, templates: [{network, asset, assetSymbol: 'XLM', assetIssuer: null, maxFeeUnits: 1000, tiers: {common: moduleDigest}}]};
         case 'native/config?network=stellar:testnet': return {enginePublicKey: server};
         case 'native/deploy/prepare':
           if (state.walletMissing) return {policyId, wallet, step: {...fundStep('9'), action: 'create_wallet'}};

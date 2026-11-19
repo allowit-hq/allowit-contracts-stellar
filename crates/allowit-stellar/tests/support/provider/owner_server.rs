@@ -295,9 +295,8 @@ impl Server {
                         );
                     }
                     "/api/micro/runtime" => reply(&mut stream, 200, plan.discovery.clone(), ""),
-                    // The contract-wallet generation names no network; the Native setup names
-                    // its own. `calls` counts each under its whole path.
-                    "/api/native/templates" | "/api/native/templates?network=stellar:testnet" => {
+                    // Every caller names the network of its templates request.
+                    "/api/native/templates?network=stellar:testnet" => {
                         assert_eq!(body, json!({}));
                         reply(&mut stream, 200, plan.templates.clone(), "")
                     }
