@@ -31,7 +31,7 @@ export declare function connectStellarWallet(network: StellarNetwork, admitTimes
     signMessage(message: string): Promise<string>;
 }>;
 /**
- * Freighter signs only. Returned bytes are the authority: an optional retain hook receives bounded bytes before the
+ * Varial signs only. Returned bytes are the authority: an optional retain hook receives bounded bytes before the
  * provider error, signer metadata or any further wallet or network await, so a valid proof survives stale metadata or a
  * failed post-sign check. The hook rejects altered bytes. Any metadata error still rejects. Nothing is broadcast here.
  */
