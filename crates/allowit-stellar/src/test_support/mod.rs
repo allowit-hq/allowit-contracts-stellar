@@ -98,11 +98,19 @@ pub fn policy_signed() -> SignedOperation {
 /// `signed` as its sending account seals it for settlement: the prepared resources and fee, and
 /// the account's signature. The fixture's sending account is the seed `[10; 32]`.
 pub fn policy_sealed(signed: &SignedOperation) -> SignedOperation {
+    let sealed = policy_sealed_at(signed, 0);
+    crate::validate_retained_signed(&sealed).unwrap();
+    sealed
+}
+/// [`policy_sealed`] at the sending account's sequence `later` numbers after the prepared one,
+/// unchecked: the same authorization, sent again in another transaction of the same sender.
+pub fn policy_sealed_at(signed: &SignedOperation, later: i64) -> SignedOperation {
     use ed25519_dalek::Signer;
     let x::TransactionEnvelope::Tx(mut envelope) = crate::read(&signed.transaction_xdr).unwrap()
     else {
         panic!()
     };
+    envelope.tx.seq_num = x::SequenceNumber(envelope.tx.seq_num.0 + later);
     let x::MuxedAccount::Ed25519(x::Uint256(key)) = envelope.tx.source_account.clone() else {
         panic!()
     };
@@ -124,13 +132,11 @@ pub fn policy_sealed(signed: &SignedOperation) -> SignedOperation {
     }]
     .try_into()
     .unwrap();
-    let sealed = SignedOperation {
+    SignedOperation {
         transaction_xdr: crate::xdr(&x::TransactionEnvelope::Tx(envelope)).unwrap(),
         transaction_hash: hash,
         ..signed.clone()
-    };
-    crate::validate_retained_signed(&sealed).unwrap();
-    sealed
+    }
 }
 pub fn transaction_status(signed: &SignedOperation, success: bool, ledger: u32, fee: i64) -> Value {
     let result = x::TransactionResult {

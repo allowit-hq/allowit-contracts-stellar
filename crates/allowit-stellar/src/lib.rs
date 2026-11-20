@@ -346,6 +346,41 @@ pub fn fee_bound(resource_fee: i64) -> Result<u32> {
         .and_then(|fee| fee.checked_add(resource.div_ceil(FEE_BOUND_MARGIN_DIVISOR)))
         .ok_or_else(|| "Resource fee overflow".into())
 }
+/// The refusal of [`mul_div_ceil`] and [`scale_units`]: a negative operand, a zero divisor, or
+/// a result that its type cannot hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutOfRange;
+impl std::fmt::Display for OutOfRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The amount is out of range")
+    }
+}
+/// `ceil(x * y / d)` for `d > 0`, with no intermediate value wider than the result: with
+/// `y = yq * d + yr` and `x = xq * d + xr`, it is `x * yq + xq * yr` plus `ceil(xr * yr / d)`.
+/// A 32-bit divisor keeps `xr * yr` below `2^64`; every step is checked.
+pub fn mul_div_ceil(x: u128, y: u128, d: u32) -> std::result::Result<u128, OutOfRange> {
+    if d == 0 {
+        return Err(OutOfRange);
+    }
+    let d = u128::from(d);
+    let (yq, yr) = (y / d, y % d);
+    let (xq, xr) = (x / d, x % d);
+    let tail = xr
+        .checked_mul(yr)
+        .and_then(|p| p.checked_add(d - 1))
+        .map(|p| p / d)
+        .ok_or(OutOfRange)?;
+    x.checked_mul(yq)
+        .and_then(|v| v.checked_add(xq.checked_mul(yr)?))
+        .and_then(|v| v.checked_add(tail))
+        .ok_or(OutOfRange)
+}
+/// [`mul_div_ceil`] of nonnegative `i128` units: `ceil(units * by / d)`.
+pub fn scale_units(units: i128, by: i128, d: u32) -> std::result::Result<i128, OutOfRange> {
+    let units = u128::try_from(units).map_err(|_| OutOfRange)?;
+    let by = u128::try_from(by).map_err(|_| OutOfRange)?;
+    i128::try_from(mul_div_ceil(units, by, d)?).map_err(|_| OutOfRange)
+}
 /// Request-bound conservative economic ceilings in the wallet asset, attested by the server
 /// signer with its authorization: `AllowitExpenseBounds`. Amounts use the wallet asset's seven
 /// decimals. For XLM, gas equals the fee bound in stroops.
@@ -415,14 +450,9 @@ impl ExpenseBounds {
         if self.gas_units < 0 {
             return Err("A gas carry lowers nonnegative gas".into());
         }
-        let bound = i128::from(self.max_fee_stroops);
         let repaid = self.repaid_after_carry(carry);
-        let gas_units = self
-            .gas_units
-            .checked_mul(repaid)
-            .and_then(|units| units.checked_add(bound - 1))
-            .map(|units| units / bound)
-            .ok_or("Expense overflow")?;
+        let gas_units = scale_units(self.gas_units, repaid, self.max_fee_stroops)
+            .map_err(|_| "Expense overflow")?;
         Ok(Self {
             gas_units,
             spent_units: self
@@ -449,13 +479,8 @@ impl ExpenseBounds {
             return Err("The repayment exceeds the wallet's gas cap".into());
         }
         let repaid = base;
-        let ceiling = i128::from(self.max_fee_stroops);
-        let gas_units = self
-            .gas_units
-            .checked_mul(repaid)
-            .and_then(|units| units.checked_add(ceiling - 1))
-            .map(|units| units / ceiling)
-            .ok_or("Expense overflow")?;
+        let gas_units = scale_units(self.gas_units, repaid, self.max_fee_stroops)
+            .map_err(|_| "Expense overflow")?;
         Ok(Self {
             gas_units,
             spent_units: self
@@ -474,13 +499,12 @@ impl ExpenseBounds {
         if fee_stroops == 0 || fee_stroops > self.max_fee_stroops || self.gas_units < 0 {
             return Err("A fee bound lowers a positive fee ceiling".into());
         }
-        let ceiling = i128::from(self.max_fee_stroops);
-        let gas_units = self
-            .gas_units
-            .checked_mul(i128::from(fee_stroops))
-            .and_then(|units| units.checked_add(ceiling - 1))
-            .map(|units| units / ceiling)
-            .ok_or("Expense overflow")?;
+        let gas_units = scale_units(
+            self.gas_units,
+            i128::from(fee_stroops),
+            self.max_fee_stroops,
+        )
+        .map_err(|_| "Expense overflow")?;
         Ok(Self {
             gas_units,
             spent_units: self
@@ -1279,7 +1303,8 @@ pub fn operation_usage(p: &PreparedOperation) -> Result<Option<OperationUsage>> 
     if p.config.route != WalletRoute::PolicyWallet || p.payment_authorization.is_some() {
         return Ok(None);
     }
-    let operation = operation_from_request(&p.config, &p.request)?;
+    // The figures of the operation that executed, under the rules that admitted it.
+    let operation = retained_operation_from_request(&p.config, &p.request)?;
     let facts = policy::RuleRequest::new(
         &operation,
         &p.config.asset,
@@ -2592,6 +2617,13 @@ fn validate_wallet_signed(s: &SignedOperation) -> Result<()> {
     let mut normalized = env.tx.clone();
     normalized.fee = unsigned.tx.fee;
     normalized.ext = unsigned.tx.ext.clone();
+    // The sender can send the same authorization again in a later transaction of its own: the
+    // wallet's authorization, not the sender's sequence, is the operation.
+    if env.tx.source_account == unsigned.tx.source_account
+        && env.tx.seq_num.0 >= unsigned.tx.seq_num.0
+    {
+        normalized.seq_num = unsigned.tx.seq_num.clone();
+    }
     let mut operations = normalized.operations.to_vec();
     let mut original = unsigned.tx.operations.to_vec();
     if let (
@@ -2824,4 +2856,54 @@ fn attach_resources(
         transaction_signers(&out, &automated_roles(&out.config))?;
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod repayment_width {
+    use super::*;
+    /// The gas of a wide ceiling scales down to the repayment without an intermediate overflow,
+    /// as the price of the same rate does: 10^37 units for 10,000,000 stroops are 10^32 for 100.
+    /// The helper is exact where the result fits, and refuses with its typed error where it
+    /// does not, or where an operand is outside its domain.
+    #[test]
+    fn mul_div_ceil_is_exact_or_out_of_range() {
+        assert_eq!(mul_div_ceil(1, 15, 10), Ok(2));
+        assert_eq!(
+            mul_div_ceil(10_u128.pow(30), 100, 10_000_000),
+            Ok(10_u128.pow(25))
+        );
+        let d = u32::MAX;
+        let wide = u128::from(d) - 1;
+        assert_eq!(mul_div_ceil(wide, wide, d), Ok(wide));
+        // An operand wider than `i128` whose result fits.
+        assert_eq!(mul_div_ceil(1 << 127, 5_000_000, 10_000_000), Ok(1 << 126));
+        assert_eq!(mul_div_ceil(u128::MAX, 2, 1), Err(OutOfRange));
+        assert_eq!(mul_div_ceil(1, 2, 0), Err(OutOfRange));
+        assert_eq!(scale_units(-1, 2, 3), Err(OutOfRange));
+        assert_eq!(scale_units(i128::MAX, 2, 1), Err(OutOfRange));
+        assert_eq!(scale_units(7, 3, 2), Ok(11));
+    }
+    #[test]
+    fn a_wide_ceiling_scales_to_its_repayment() {
+        let bounds = ExpenseBounds {
+            gas_units: 10_i128.pow(37),
+            conversion_units: 0,
+            spent_units: 10_i128.pow(37) + 1,
+            max_fee_stroops: 10_000_000,
+            observed_ledger: 9,
+            day: 1,
+        };
+        assert_eq!(
+            bounds.with_repayment(100, 0, i128::MAX).unwrap().gas_units,
+            10_i128.pow(32)
+        );
+        assert_eq!(
+            bounds.with_fee_bound(100).unwrap().gas_units,
+            10_i128.pow(32)
+        );
+        assert_eq!(
+            bounds.with_gas_carry(10_000_000 - 100).unwrap().gas_units,
+            10_i128.pow(32)
+        );
+    }
 }
