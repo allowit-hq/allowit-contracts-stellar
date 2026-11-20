@@ -59,6 +59,26 @@ fn client(cx: &Context<'_>) -> Result<OwnerClient> {
     c.authenticate(&super::OwnerSignerRef(cx.signer), (cx.clock)()?)?;
     Ok(c)
 }
+/// The network of a Native wallet setup, by its canonical id, whichever alias the caller
+/// selected: the request, the retained record and the registration document name it, so the
+/// server's templates and the identity of a resumed request name the same network. The owner's
+/// key and the server's key are those of this network. A key store or a server authority of
+/// another network of the rail holds a valid account of this one too, so the ids are compared:
+/// no setup installs the server key of one network in a wallet of another.
+fn setup_network(cx: &Context<'_>) -> Result<&'static str> {
+    let network = crate::host::routing::normalize(cx.network)?;
+    for (role, other) in [
+        ("owner key", cx.signer.network()),
+        ("server authority", cx.authority.network()),
+    ] {
+        if crate::host::routing::normalize(other).ok() != Some(network) {
+            return Err(Error::config(format!(
+                "The {role} belongs to another network than the wallet setup"
+            )));
+        }
+    }
+    Ok(network)
+}
 fn emit(value: impl serde::Serialize) -> Result<serde_json::Value> {
     serde_json::to_value(value).map_err(|_| Error::config("Cannot encode owner result"))
 }
@@ -162,6 +182,25 @@ impl OwnerProvider for Owner {
         let raw = client(cx)?.export_raw(&store, &p, runtime.rpc(), id, (cx.clock)()?)?;
         Ok(raw)
     }
+    /// The asset of a new Native wallet as [`Self::setup`] reads and checks it: the same network
+    /// and key checks, the server's template through the same reader, and the same asset
+    /// check, so a host shows what the setup would fund and the lookup refuses what the setup
+    /// refuses. The owner signs in to read it and signs nothing else.
+    fn native_wallet_asset(&self, cx: &Context<'_>) -> Result<owner::NativeWalletAsset> {
+        let network = setup_network(cx)?;
+        let asset = client(cx)?.native_wallet_asset(network, (cx.clock)()?)?;
+        super::runtime::owner::check_wallet_asset(asset.as_ref())?;
+        Ok(match asset {
+            Some(asset) => owner::NativeWalletAsset {
+                symbol: asset.code,
+                issuer: Some(asset.issuer),
+            },
+            None => owner::NativeWalletAsset {
+                symbol: "XLM".into(),
+                issuer: None,
+            },
+        })
+    }
     fn setup(&self, cx: &Context<'_>, r: owner::Setup<'_>) -> Result<serde_json::Value> {
         /// The amount of a setup in the base units of the wallet's asset. XLM and every issued
         /// Stellar asset have seven decimals.
@@ -178,24 +217,7 @@ impl OwnerProvider for Owner {
         }
         let funding = r.amount.map(setup_funding).transpose()?;
         let fee_per_operation = fee(r.fee_per_operation)?;
-        // The request, the retained record and the registration document name the network by
-        // its canonical id, whichever alias the caller selected: the server's templates and the
-        // identity of a resumed request then name the same network.
-        let network = crate::host::routing::normalize(cx.network)?;
-        // The owner's key and the server's key are those of this network. A key store or a
-        // server authority of another network of the rail holds a valid account of this one
-        // too, so the setup compares the ids: it never installs the server key of one network
-        // in a wallet of another.
-        for (role, other) in [
-            ("owner key", cx.signer.network()),
-            ("server authority", cx.authority.network()),
-        ] {
-            if crate::host::routing::normalize(other).ok() != Some(network) {
-                return Err(Error::config(format!(
-                    "The {role} belongs to another network than the wallet setup"
-                )));
-            }
-        }
+        let network = setup_network(cx)?;
         // The caller's own values are checked first, the RPC endpoint and the network that it
         // serves among them: a setup that must fail asks the owner for no sign-in, opens no
         // journal and asks the server nothing. The wallet asset is checked after the server's

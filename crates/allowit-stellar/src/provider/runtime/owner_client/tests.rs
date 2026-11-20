@@ -529,6 +529,87 @@ fn the_native_template_request_names_its_network() {
         refused.message
     );
 }
+/// A host reads the asset of a new Native wallet before the setup through the provider's owner
+/// call, which runs the setup's network check, its template reader and its asset check: the
+/// lookup names the asset that the setup funds and refuses what the setup refuses.
+#[test]
+#[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
+fn a_host_reads_the_native_wallet_asset_that_the_setup_funds() {
+    use crate::host::{
+        owner::{Context, NativeWalletAsset},
+        vendors::OwnerProvider,
+    };
+    struct Owner(String);
+    impl crate::host::Signer for Owner {
+        fn network(&self) -> &str {
+            "stellar:testnet"
+        }
+        fn address(&self) -> &str {
+            &self.0
+        }
+        fn sign_hash(&self, digest: &[u8]) -> crate::host::error::Result<Vec<u8>> {
+            let digest: [u8; 32] = digest.try_into().unwrap();
+            Ok(crate::test_support::sign_digest([11; 32], &digest).to_vec())
+        }
+    }
+    let now = wire::now();
+    let read = |asset: Option<(&str, Option<&str>)>, signer: Value| {
+        let mut plan = wire::Plan::new(&account(11));
+        if let Some((symbol, issuer)) = asset {
+            let identity = crate::asset_from_identity(symbol, issuer).unwrap();
+            let template = &mut plan.templates["templates"][0];
+            template["assetSymbol"] = json!(symbol);
+            template["assetIssuer"] = json!(issuer);
+            template["asset"] = json!(crate::sac_address("stellar:testnet", &identity).unwrap());
+        }
+        plan.templates["server"] = signer;
+        let server = wire::Server::new(plan);
+        let authority = authority(&server.url);
+        let store =
+            || -> crate::host::error::Result<Store> { unreachable!("the lookup opens no store") };
+        let owner = Owner(account(11));
+        let cx = Context {
+            network: "stellar:testnet",
+            backend: &server.url,
+            authority: &authority,
+            origin: "http://localhost:5173",
+            rpc_url: "http://127.0.0.1:1",
+            store: &store,
+            signer: &owner,
+            clock: &|| Ok(now),
+        };
+        crate::provider::owner::OWNER.native_wallet_asset(&cx)
+    };
+    // The fixture's template of Testnet is in USDC, and the authority's key is account 13.
+    assert_eq!(
+        read(None, json!(account(13))).unwrap(),
+        NativeWalletAsset {
+            symbol: "USDC".into(),
+            issuer: Some(USDC_ISSUER.into()),
+        }
+    );
+    assert_eq!(
+        read(Some(("XLM", None)), json!(account(13))).unwrap(),
+        NativeWalletAsset {
+            symbol: "XLM".into(),
+            issuer: None,
+        }
+    );
+    // An issued asset with the code of the network's own asset, which no setup funds, and a
+    // signer other than the configured authority are refused.
+    let issued = read(Some(("XLM", Some(USDC_ISSUER))), json!(account(13))).unwrap_err();
+    assert!(
+        issued.message.contains("not an issued Stellar asset"),
+        "{}",
+        issued.message
+    );
+    let other = read(None, json!(account(14))).unwrap_err();
+    assert!(
+        other.message.contains("server authority"),
+        "{}",
+        other.message
+    );
+}
 /// A request ID binds its intent, the wallet asset included, also while nothing is signed: a
 /// run for another asset or another amount under the same ID is refused and signs nothing. A
 /// retained signed setup is checked under the hint of each key: a signature under another

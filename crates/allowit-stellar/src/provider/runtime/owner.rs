@@ -23,6 +23,20 @@ pub struct SetupRequest {
 /// balance also holds. A wallet of an issued asset takes `owner::MAX_ASSET_FUNDING`.
 pub const MAX_SETUP_FUNDING: i64 =
     native::owner::MAX_STARTING_BALANCE - native::owner::default_starting_balance(false);
+/// The check of a Native wallet's asset that every setup runs, and the asset read of a host
+/// before the setup: an issued asset with the code of the network's own asset reads as that
+/// asset in every amount, so no wallet holds one. `None` is a wallet that holds XLM.
+pub fn check_wallet_asset(asset: Option<&native::owner::Trustline>) -> Result<()> {
+    if let Some(asset) = asset
+        && (asset.code == "XLM"
+            || native::asset_from_identity(&asset.code, Some(&asset.issuer)).is_err())
+    {
+        return Err(Error::config(
+            "The wallet asset of this network is not an issued Stellar asset",
+        ));
+    }
+    Ok(())
+}
 impl SetupRequest {
     /// The checks of the caller's own values, which need no asset: the network, the three
     /// roles, the request ID, the fee and the bounds that every funding has. The provider runs
@@ -62,16 +76,7 @@ impl SetupRequest {
     }
     pub fn validate(&self) -> Result<()> {
         self.validate_caller_values()?;
-        // An issued asset with the code of the network's own asset reads as that asset in
-        // every amount, so no wallet holds one.
-        if let Some(asset) = &self.asset
-            && (asset.code == "XLM"
-                || native::asset_from_identity(&asset.code, Some(&asset.issuer)).is_err())
-        {
-            return Err(Error::config(
-                "The wallet asset of this network is not an issued Stellar asset",
-            ));
-        }
+        check_wallet_asset(self.asset.as_ref())?;
         // The funding of a wallet that holds XLM is part of the starting balance. The funding
         // of an issued asset is a payment of its own, with the ceiling of the setup builder.
         self.funding_within(if self.asset.is_some() {
