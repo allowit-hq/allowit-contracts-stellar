@@ -40,7 +40,7 @@ const LATEST_LEDGER: &str = "getLatestLedger";
 /// ledger beside its sequence, so its size follows the content of that ledger and not the
 /// request. Testnet ledger 5684062 answered with 1,155,616 characters of metadata, above
 /// [`MAX_BYTES`], and every call that read the head during that ledger failed. Callers read
-/// only the sequence.
+/// only the sequence and the close time.
 #[cfg(not(target_arch = "wasm32"))]
 const LATEST_LEDGER_MAX_BYTES: usize = 16 * MAX_BYTES;
 /// Stellar JSON-RPC protocol adapter over the bounded common host transport.
@@ -1264,20 +1264,20 @@ pub struct VerifiedReceipt {
 /// The close time of the settlement ledger in a `getTransaction` reply (`createdAt`, Unix seconds
 /// as decimal text or a number), or `None` when the reply does not state it.
 fn closed_at(v: &Value) -> Result<Option<u64>> {
-    match v.get("createdAt") {
+    unix_seconds(v, "createdAt", "Invalid settlement time")
+}
+/// The time that `field` of an RPC reply states, in Unix seconds as decimal text or a number, or
+/// `None` when the reply does not state it. Any other value is the error `invalid`.
+fn unix_seconds(v: &Value, field: &str, invalid: &'static str) -> Result<Option<u64>> {
+    match v.get(field) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(text))
             if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) =>
         {
-            text.parse()
-                .map(Some)
-                .map_err(|_| "Invalid settlement time".into())
+            text.parse().map(Some).map_err(|_| invalid.into())
         }
-        Some(Value::Number(number)) => number
-            .as_u64()
-            .map(Some)
-            .ok_or_else(|| "Invalid settlement time".into()),
-        Some(_) => Err("Invalid settlement time".into()),
+        Some(Value::Number(number)) => number.as_u64().map(Some).ok_or_else(|| invalid.into()),
+        Some(_) => Err(invalid.into()),
     }
 }
 /// Recheck a retained receipt before projecting it through another interface.
@@ -1681,6 +1681,25 @@ pub fn trusted_state(
 pub struct DiscoveredState {
     pub state: TrustedState,
     pub paused: bool,
+    /// When the ledger `state.ledger` closed, in Unix seconds: the `closeTime` of the
+    /// `getLatestLedger` reply that gave that ledger, at the start of the read. The entries of
+    /// the state are read after that reply, so they can be of a later ledger than
+    /// `state.ledger`: the time is then earlier than the close of their ledger, never later. It
+    /// is a time that the network had reached when the state was read, so an operation that a
+    /// caller signs after the read settles in a ledger that closes at or after it. It does not
+    /// date the entries themselves. `None` for an observation that this rail retained before it
+    /// kept the time, and for an RPC that does not state it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_at: Option<u64>,
+}
+/// The admission read of [`trusted_state`] with the close time of its ledger
+/// ([`DiscoveredState::closed_at`]).
+pub fn trusted_state_observed(
+    rpc: &dyn Rpc,
+    c: &WalletConfig,
+    accounting: Option<NativeAccounting>,
+) -> Result<DiscoveredState> {
+    trusted_state_inner(rpc, c, accounting, true)
 }
 /// Read public live authority without requiring a previously configured customer key.
 /// Discovery reports authority; it does not authorize an execution.
@@ -1757,6 +1776,8 @@ fn trusted_state_inner(
             .ok_or("Missing ledger sequence")?,
     )
     .map_err(err)?;
+    // The same reply states when that ledger closed.
+    let closed_at = unix_seconds(&latest, "closeTime", "Invalid ledger close time")?;
     if c.route == WalletRoute::Native {
         let source = get_account(rpc, &c.wallet)?;
         // The wallet account holds exactly the roles of its installation. A signer or a
@@ -1793,6 +1814,7 @@ fn trusted_state_inner(
                 policy_instance: c.policy_instance,
             },
             paused,
+            closed_at,
         });
     }
     let key = LedgerKey::ContractData(LedgerKeyContractData {
@@ -1838,8 +1860,8 @@ fn trusted_state_inner(
         .find(|e| e.key == state_key)
         .map(|e| &e.val)
         .ok_or("Missing policy wallet custody state")?;
-    if c.route == WalletRoute::PolicyWallet {
-        return current_wallet_state(
+    let mut observed = if c.route == WalletRoute::PolicyWallet {
+        current_wallet_state(
             rpc,
             c,
             state,
@@ -1847,9 +1869,12 @@ fn trusted_state_inner(
             ledger,
             accounting,
             require_customer_quorum,
-        );
-    }
-    historical_wallet_state(rpc, c, state, module.0, ledger, require_customer_quorum)
+        )?
+    } else {
+        historical_wallet_state(rpc, c, state, module.0, ledger, require_customer_quorum)?
+    };
+    observed.closed_at = closed_at;
+    Ok(observed)
 }
 /// Layout 5 discovery: decode the packed configuration, check it against the installation, and
 /// read the figures from `t` and an open `d`. The transaction source is the server's sending
@@ -1949,6 +1974,7 @@ fn current_wallet_state(
             policy_instance: c.policy_instance,
         },
         paused: config.paused,
+        closed_at: None,
     })
 }
 /// The figures of the wallet at `ledger`: `t`, and `d` while its window is open.
@@ -2085,7 +2111,11 @@ fn historical_wallet_state(
         server: addr(map_field(state, "engine")?)?,
         policy_instance: c.policy_instance,
     };
-    Ok(DiscoveredState { state: out, paused })
+    Ok(DiscoveredState {
+        state: out,
+        paused,
+        closed_at: None,
+    })
 }
 
 fn persistent_entry(rpc: &dyn Rpc, key: &LedgerKey) -> Result<Option<ScVal>> {
