@@ -3905,8 +3905,8 @@ mod keypair_wallet_owner_tests {
             .unwrap();
         assert_eq!(close.info().unwrap().action, "close");
         assert!(!provider.wallet_closed(&installation).unwrap());
-        /// An endpoint of the network `0` that holds no account.
-        struct Gone(&'static str);
+        /// An endpoint of the network `0` that answers an account read with `1`.
+        struct Gone(&'static str, serde_json::Value);
         impl rpc::Rpc for Gone {
             fn call(
                 &self,
@@ -3918,9 +3918,7 @@ mod keypair_wallet_owner_tests {
                         Ok(serde_json::json!({"passphrase": native::passphrase(self.0)?}))
                     }
                     "getLatestLedger" => Ok(serde_json::json!({"sequence": 120})),
-                    "getLedgerEntries" => {
-                        Ok(serde_json::json!({"latestLedger": 120, "entries": []}))
-                    }
+                    "getLedgerEntries" => Ok(self.1.clone()),
                     _ => Err(format!("Unexpected call {method}")),
                 }
             }
@@ -3930,17 +3928,36 @@ mod keypair_wallet_owner_tests {
         } else {
             panic!("the fixture is on Testnet")
         };
-        let gone = Provider::from_rpc(&c.network, Arc::new(Gone(network)));
-        assert!(gone.wallet_closed(&installation).unwrap());
+        // The endpoint finds no account: an empty list, or no list beside its ledger.
+        let empty = serde_json::json!({"latestLedger": 120, "entries": []});
+        for found_none in [
+            empty.clone(),
+            serde_json::json!({"latestLedger": 120}),
+            serde_json::json!({"latestLedger": 120, "entries": null}),
+        ] {
+            let gone = Provider::from_rpc(&c.network, Arc::new(Gone(network, found_none)));
+            assert!(gone.wallet_closed(&installation).unwrap());
+        }
+        // A reply with neither a list nor a ledger is no answer.
+        for malformed in [serde_json::json!({}), serde_json::json!({"entries": 1})] {
+            let unread = Provider::from_rpc(&c.network, Arc::new(Gone(network, malformed)));
+            assert!(unread.wallet_closed(&installation).is_err());
+        }
         // An account that is absent from another network says nothing about this wallet, and no
-        // close is prepared from another network's state.
-        let elsewhere = Provider::from_rpc(&c.network, Arc::new(Gone("stellar:pubnet")));
-        assert!(elsewhere.wallet_closed(&installation).is_err());
-        assert!(
+        // close is prepared from another network's state: the transport's network is refused
+        // before any account is read.
+        let elsewhere = Provider::from_rpc(&c.network, Arc::new(Gone("stellar:pubnet", empty)));
+        for refused in [
+            elsewhere.wallet_closed(&installation).map(drop),
             elsewhere
                 .prepare_close(&installation, 100_000, 86_401)
-                .is_err()
-        );
+                .map(drop),
+        ] {
+            assert_eq!(
+                refused.unwrap_err().message,
+                "Runtime transport network differs"
+            );
+        }
     }
     #[test]
     fn the_server_prepares_each_owner_action_of_a_keypair_wallet_for_one_owner_signature() {
@@ -5106,6 +5123,10 @@ mod owner_steps {
         send: Option<&'static str>,
         holds: bool,
         reads_fail: bool,
+        /// The close time of the endpoint's latest ledger.
+        closed_at: u64,
+        /// The transaction hashes that were looked up.
+        looked_up: Mutex<Vec<String>>,
         calls: Mutex<Vec<String>>,
         receipt: serde_json::Value,
     }
@@ -5115,6 +5136,8 @@ mod owner_steps {
                 send: Some("PENDING"),
                 holds: false,
                 reads_fail: false,
+                closed_at: NOW + 1_000,
+                looked_up: Mutex::new(Vec::new()),
                 calls: Mutex::new(Vec::new()),
                 receipt: serde_json::Value::Null,
             }
@@ -5134,6 +5157,10 @@ mod owner_steps {
             params: serde_json::Value,
         ) -> native::Result<serde_json::Value> {
             self.calls.lock().unwrap().push(method.into());
+            if method == "getTransaction" {
+                let hash = params["hash"].as_str().unwrap_or_default().to_owned();
+                self.looked_up.lock().unwrap().push(hash);
+            }
             if self.reads_fail && method != "sendTransaction" {
                 return Err(format!("{method}: the endpoint is unreachable"));
             }
@@ -5152,8 +5179,9 @@ mod owner_steps {
                 }
                 "getTransaction" if self.holds => self.receipt.clone(),
                 "getTransaction" => serde_json::json!({"status": "NOT_FOUND",
+                    "txHash": params["hash"],
                     "oldestLedger": 10, "latestLedger": 120,
-                    "latestLedgerCloseTime": (NOW + 1_000).to_string()}),
+                    "latestLedgerCloseTime": self.closed_at.to_string()}),
                 _ => return Err(format!("Unexpected call {method}")),
             })
         }
@@ -5367,6 +5395,21 @@ mod owner_steps {
         assert!(provider(&steps).owner_step_lapsed(&step, 20).unwrap());
         // A step prepared before the history that the endpoint keeps is not proven lapsed.
         assert!(!provider(&steps).owner_step_lapsed(&step, 5).unwrap());
+        // The proof is of the step's own hash and its own time bound: a ledger that closed at
+        // the bound proves nothing, one that closed a second later does.
+        let own = native::hex(&data.original.transaction_hash);
+        assert_eq!(*steps.looked_up.lock().unwrap(), [own.clone(), own.clone()]);
+        for (closed_at, lapsed) in [(info.expires_at, false), (info.expires_at + 1, true)] {
+            let steps = Arc::new(Steps {
+                closed_at,
+                ..Steps::new()
+            });
+            assert_eq!(
+                provider(&steps).owner_step_lapsed(&step, 20).unwrap(),
+                lapsed
+            );
+            assert_eq!(*steps.looked_up.lock().unwrap(), std::slice::from_ref(&own));
+        }
     }
 
     /// A policy wallet never closes: it is not closed, and its close is refused before any read.
