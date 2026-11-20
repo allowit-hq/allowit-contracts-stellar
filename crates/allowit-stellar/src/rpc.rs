@@ -1682,8 +1682,13 @@ pub struct DiscoveredState {
     pub state: TrustedState,
     pub paused: bool,
     /// When the ledger `state.ledger` closed, in Unix seconds: the `closeTime` of the
-    /// `getLatestLedger` reply that gave that ledger. `None` for an observation that this rail
-    /// retained before it kept the time, and for an RPC that does not state it.
+    /// `getLatestLedger` reply that gave that ledger, at the start of the read. The entries of
+    /// the state are read after that reply, so they can be of a later ledger than
+    /// `state.ledger`: the time is then earlier than the close of their ledger, never later. It
+    /// is a time that the network had reached when the state was read, so an operation that a
+    /// caller signs after the read settles in a ledger that closes at or after it. It does not
+    /// date the entries themselves. `None` for an observation that this rail retained before it
+    /// kept the time, and for an RPC that does not state it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed_at: Option<u64>,
 }
