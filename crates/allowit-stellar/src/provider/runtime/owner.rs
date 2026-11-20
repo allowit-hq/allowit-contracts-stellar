@@ -37,6 +37,20 @@ pub fn check_wallet_asset(asset: Option<&native::owner::Trustline>) -> Result<()
     }
     Ok(())
 }
+/// The keys of a setup's roles: each one a Stellar G account and no two the same. The setup
+/// checks its owner, agent and server with it, and the asset lookup its owner and server, before
+/// the owner signs in.
+pub fn check_roles(accounts: &[&str]) -> Result<()> {
+    for account in accounts {
+        native::account_key(account).map_err(Error::usage)?;
+    }
+    if (1..accounts.len()).any(|i| accounts[..i].contains(&accounts[i])) {
+        return Err(Error::usage(
+            "Owner, agent and server must be distinct G accounts",
+        ));
+    }
+    Ok(())
+}
 impl SetupRequest {
     /// The checks of the caller's own values, which need no asset: the network, the three
     /// roles, the request ID, the fee and the bounds that every funding has. The provider runs
@@ -50,14 +64,7 @@ impl SetupRequest {
                 "Native wallet setup needs a Stellar network, named by its network id",
             ));
         }
-        for account in [&self.owner, &self.agent, &self.server] {
-            native::account_key(account).map_err(Error::usage)?;
-        }
-        if self.owner == self.agent || self.owner == self.server || self.agent == self.server {
-            return Err(Error::usage(
-                "Owner, agent and server must be distinct G accounts",
-            ));
-        }
+        check_roles(&[&self.owner, &self.agent, &self.server])?;
         if !crate::host::request::request_id_valid(&self.request_id) {
             return Err(Error::usage("Invalid Stellar setup request ID"));
         }

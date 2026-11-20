@@ -554,7 +554,7 @@ fn a_host_reads_the_native_wallet_asset_that_the_setup_funds() {
         }
     }
     let now = wire::now();
-    let read_with = |asset: Option<(&str, Option<&str>)>, signer: Value, key: u8| {
+    let read_with = |asset: Option<(&str, Option<&str>)>, signer: Value, key: &str| {
         let mut plan = wire::Plan::new(&account(11));
         if let Some((symbol, issuer)) = asset {
             let identity = crate::asset_from_identity(symbol, issuer).unwrap();
@@ -565,12 +565,9 @@ fn a_host_reads_the_native_wallet_asset_that_the_setup_funds() {
         }
         plan.templates["server"] = signer;
         let server = wire::Server::new(plan);
-        let authority = crate::host::config::ServerAuthority::validated(
-            "stellar:testnet",
-            &server.url,
-            &account(key),
-        )
-        .unwrap();
+        let authority =
+            crate::host::config::ServerAuthority::validated("stellar:testnet", &server.url, key)
+                .unwrap();
         let store =
             || -> crate::host::error::Result<Store> { unreachable!("the lookup opens no store") };
         let owner = Owner(account(11), AtomicUsize::new(0));
@@ -587,7 +584,7 @@ fn a_host_reads_the_native_wallet_asset_that_the_setup_funds() {
         let asset = crate::provider::owner::OWNER.native_wallet_asset(&cx);
         (asset, owner.1.load(Ordering::SeqCst))
     };
-    let read = |asset, signer| read_with(asset, signer, 13).0;
+    let read = |asset, signer| read_with(asset, signer, &account(13)).0;
     // The fixture's template of Testnet is in USDC, and the authority's key is account 13.
     assert_eq!(
         read(None, json!(account(13))).unwrap(),
@@ -617,14 +614,20 @@ fn a_host_reads_the_native_wallet_asset_that_the_setup_funds() {
         "{}",
         other.message
     );
-    // An owner whose key is the configured authority's, which no setup accepts, is refused
-    // before the owner signs in.
-    let (same, signed) = read_with(None, json!(account(11)), 11);
+    // An owner whose key is the configured authority's, and an authority key that is no
+    // Stellar account, which no setup accepts, are refused before the owner signs in.
+    let (same, signed) = read_with(None, json!(account(11)), &account(11));
     let same = same.unwrap_err();
     assert!(
         same.message.contains("must be distinct"),
         "{}",
         same.message
+    );
+    assert_eq!(signed, 0);
+    let (invalid, signed) = read_with(None, json!("not-a-G-account"), "not-a-G-account");
+    assert_eq!(
+        invalid.unwrap_err().message,
+        crate::account_key("not-a-G-account").unwrap_err()
     );
     assert_eq!(signed, 0);
 }

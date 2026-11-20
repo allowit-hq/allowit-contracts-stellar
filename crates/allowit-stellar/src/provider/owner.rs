@@ -183,17 +183,13 @@ impl OwnerProvider for Owner {
         Ok(raw)
     }
     /// The asset of a new Native wallet as [`Self::setup`] reads and checks it: the same network
-    /// and key checks, the server's template through the same reader, and the same asset
-    /// check, so a host shows what the setup would fund and the lookup refuses what the setup
-    /// refuses. The owner signs in to read it and signs nothing else.
+    /// and key checks, the setup's role check of the owner and the server, the server's template
+    /// through the same reader, and the same asset check, so a host shows what the setup would
+    /// fund and the lookup refuses what the setup refuses. The owner signs in to read it and
+    /// signs nothing else; the lookup asks the RPC nothing.
     fn native_wallet_asset(&self, cx: &Context<'_>) -> Result<owner::NativeWalletAsset> {
         let network = setup_network(cx)?;
-        // The setup refuses an owner whose key is the server's before the owner signs in.
-        if cx.signer.address() == cx.authority.public_key() {
-            return Err(Error::usage(
-                "Owner, agent and server must be distinct G accounts",
-            ));
-        }
+        super::runtime::owner::check_roles(&[cx.signer.address(), cx.authority.public_key()])?;
         let asset = client(cx)?.native_wallet_asset(network, (cx.clock)()?)?;
         super::runtime::owner::check_wallet_asset(asset.as_ref())?;
         Ok(match asset {
