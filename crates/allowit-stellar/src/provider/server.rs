@@ -480,9 +480,12 @@ pub fn same_snapshot(a: &Snapshot, b: &Snapshot) -> Result<bool> {
     }
     let mut a: rpc::DiscoveredState = decode_observation(&a.evidence)?;
     let mut b: rpc::DiscoveredState = decode_observation(&b.evidence)?;
-    // Match the native revalidation rule: only the observation ledger can advance.
+    // Match the native revalidation rule: only the observation ledger can advance, and with it
+    // the time at which it closed.
     a.state.ledger = 0;
     b.state.ledger = 0;
+    a.closed_at = None;
+    b.closed_at = None;
     Ok(a == b)
 }
 /// The gas carry of an operation: only a policy wallet operation that repays its gas takes one,
@@ -1292,13 +1295,13 @@ impl crate::host::vendors::RuntimeProvider for Provider {
     }
     fn snapshot(&self, i: &Installation, a: Option<&Accounting>) -> Result<Snapshot> {
         let c = self.fresh(i)?;
-        let state = checked(rpc::trusted_state(self.rpc(), &c, accounting(a)))?;
+        let observed = checked(rpc::trusted_state_observed(self.rpc(), &c, accounting(a)))?;
         // Fresh admission rejects paused automation. Read-only discovery has a separate API.
         snapshot_from(
             &c.network,
             rpc::DiscoveredState {
-                state,
                 paused: false,
+                ..observed
             },
         )
     }
@@ -2548,6 +2551,11 @@ impl PacketProvider for Packets {
         let r: rpc::VerifiedReceipt = decode_packet(p)?;
         Ok(r.closed_at)
     }
+    /// The close time of the ledger of the read that gave the snapshot, which the RPC states
+    /// with that ledger (`closeTime` of `getLatestLedger`).
+    fn snapshot_observed_at(&self, s: &Snapshot) -> Result<Option<u64>> {
+        Ok(decode_observation(&s.evidence)?.closed_at)
+    }
     /// A signed owner step's identity: its 32-byte transaction hash.
     fn owner_signed_info(&self, p: &Packet) -> Result<OwnerSignedInfo> {
         let data: OwnerSignedData = decode_packet(p)?;
@@ -2618,6 +2626,7 @@ mod role_weight_tests {
                 rpc::DiscoveredState {
                     state: contract.clone(),
                     paused,
+                    closed_at: None,
                 },
             )
             .unwrap();
@@ -2641,6 +2650,7 @@ mod role_weight_tests {
             rpc::DiscoveredState {
                 state: owned.clone(),
                 paused: false,
+                closed_at: None,
             },
         )
         .unwrap();
@@ -2656,6 +2666,7 @@ mod role_weight_tests {
             rpc::DiscoveredState {
                 state: keypair.clone(),
                 paused: false,
+                closed_at: None,
             },
         )
         .unwrap();
@@ -4059,6 +4070,54 @@ mod keypair_wallet_owner_tests {
                 .unwrap()
                 .paused
         );
+    }
+    /// A snapshot states when the ledger of its read closed, as the RPC states it with that
+    /// ledger (`closeTime` of `getLatestLedger`, decimal text or a number): the admission read
+    /// and discovery alike. An RPC that states none gives none, and another value is refused.
+    /// The time is no part of the known state: two reads of one state are the same state.
+    #[test]
+    fn a_snapshot_states_the_close_time_of_its_ledger() {
+        let (c, ledger, provider, _) = fixture();
+        let configuration =
+            super::super::server_owner::configuration(&c.network, &serde_json::to_vec(&c).unwrap())
+                .unwrap();
+        let usage = Accounting {
+            deployment_version: 1,
+            ..Accounting::default()
+        };
+        // Discovery, and the admission read that `snapshot` takes.
+        let stated = |time: Option<serde_json::Value>| {
+            *ledger.0.close_time.lock().unwrap() = time;
+            let discovered = provider.discover_snapshot(&configuration, Some(&usage))?;
+            let admitted = checked(rpc::trusted_state_observed(
+                ledger.as_ref(),
+                &c,
+                accounting(Some(&usage)),
+            ))?;
+            assert_eq!(admitted.closed_at, discovered.observed_at()?);
+            Ok::<_, Error>(discovered)
+        };
+        let plain = stated(None).unwrap();
+        assert_eq!(plain.observed_at().unwrap(), None);
+        for time in [
+            serde_json::json!("1795130120"),
+            serde_json::json!(1_795_130_120u64),
+        ] {
+            let discovered = stated(Some(time)).unwrap();
+            assert_eq!(discovered.observed_height, 120);
+            assert_eq!(discovered.observed_at().unwrap(), Some(1_795_130_120));
+            // The same state read at another time is the same known state.
+            assert!(discovered.same_known_state(&plain).unwrap());
+        }
+        for time in [
+            serde_json::json!(""),
+            serde_json::json!("soon"),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(true),
+        ] {
+            assert!(stated(Some(time.clone())).is_err(), "{time}");
+        }
     }
     /// The server signs for a wallet only while the ledger holds exactly the registered roles.
     #[test]
