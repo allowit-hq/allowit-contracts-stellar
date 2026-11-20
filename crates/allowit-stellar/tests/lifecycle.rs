@@ -2863,18 +2863,35 @@ fn a_simple_wallet_reads_the_daily_volume_and_unpriced_flags_from_the_servers_ac
     }
 }
 
-/// A Custom wallet whose on-chain part keeps the daily spending figure, while its daily volume
-/// rule runs only on the server. The wallet gives the figures that Core names for its on-chain
-/// part, the daily spending and the daily unpriced flag, and the server's accounting gives the
-/// daily volume.
+/// A Custom wallet whose on-chain part keeps the daily spending figure, while only the server
+/// reads the daily volume. The wallet gives the figures that Core names for its on-chain part,
+/// the daily spending and the daily unpriced flag, and the server's accounting gives the daily
+/// volume. A daily volume rule that only the server runs is refused: it reads the daily unpriced
+/// flag, which the wallet keeps in a window of its own (Core 0.18).
 #[test]
 fn a_split_custom_wallet_gives_the_figures_that_core_names_from_the_wallet() {
     let (mut c, r, s) = fixture(WalletRoute::PolicyWallet, true);
+    let split = |server: &str| {
+        format!(
+            "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {{\n    allowit::daily_spending_limit(ctx, &ctx.params[allowit::DAILY_SPENDING_LIMIT])?;\n    let score = allowit::decision(ctx, &allowit::AllowitDecision {{ id: \"a\", query: \"Is this research?\", deny_below: 1, allow_above: 2 }})?;\n    if score < 9000 {{\n{server}    }}\n    Ok(())\n}}\n"
+        )
+    };
+    let refused = policy::tier_rules(
+        PolicyTier::Custom,
+        &split("        allowit::daily_volume_limit(ctx, &ctx.params[allowit::DAILY_VOLUME_LIMIT])?;\n"),
+    )
+    .unwrap_err();
+    assert!(
+        refused.contains("depends on the daily figure \"day_unpriced\""),
+        "{refused}"
+    );
     install(
         &mut c,
         PolicyTier::Custom,
-        "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::daily_spending_limit(ctx, &ctx.params[allowit::DAILY_SPENDING_LIMIT])?;\n    let score = allowit::decision(ctx, &allowit::AllowitDecision { id: \"a\", query: \"Is this research?\", deny_below: 1, allow_above: 2 })?;\n    if score < 9000 {\n        allowit::daily_volume_limit(ctx, &ctx.params[allowit::DAILY_VOLUME_LIMIT])?;\n    }\n    Ok(())\n}\n",
-        json!({"daily_spending_limit": 100, "daily_volume_limit": 100}),
+        &split(
+            "        let total: i128 = allowit::get_state(ctx, \"day_total\")?.unwrap_or(0);\n        assert!(total < 1_000);\n",
+        ),
+        json!({"daily_spending_limit": 100}),
     );
     assert_eq!(kept_figures(&c), 4);
     let rpc = preflight_rpc(&c, &r, &s);
