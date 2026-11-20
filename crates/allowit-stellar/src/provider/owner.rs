@@ -188,6 +188,12 @@ impl OwnerProvider for Owner {
     /// refuses. The owner signs in to read it and signs nothing else.
     fn native_wallet_asset(&self, cx: &Context<'_>) -> Result<owner::NativeWalletAsset> {
         let network = setup_network(cx)?;
+        // The setup refuses an owner whose key is the server's before the owner signs in.
+        if cx.signer.address() == cx.authority.public_key() {
+            return Err(Error::usage(
+                "Owner, agent and server must be distinct G accounts",
+            ));
+        }
         let asset = client(cx)?.native_wallet_asset(network, (cx.clock)()?)?;
         super::runtime::owner::check_wallet_asset(asset.as_ref())?;
         Ok(match asset {

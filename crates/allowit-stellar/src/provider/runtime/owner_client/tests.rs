@@ -539,7 +539,7 @@ fn a_host_reads_the_native_wallet_asset_that_the_setup_funds() {
         owner::{Context, NativeWalletAsset},
         vendors::OwnerProvider,
     };
-    struct Owner(String);
+    struct Owner(String, AtomicUsize);
     impl crate::host::Signer for Owner {
         fn network(&self) -> &str {
             "stellar:testnet"
@@ -548,12 +548,13 @@ fn a_host_reads_the_native_wallet_asset_that_the_setup_funds() {
             &self.0
         }
         fn sign_hash(&self, digest: &[u8]) -> crate::host::error::Result<Vec<u8>> {
+            self.1.fetch_add(1, Ordering::SeqCst);
             let digest: [u8; 32] = digest.try_into().unwrap();
             Ok(crate::test_support::sign_digest([11; 32], &digest).to_vec())
         }
     }
     let now = wire::now();
-    let read = |asset: Option<(&str, Option<&str>)>, signer: Value| {
+    let read_with = |asset: Option<(&str, Option<&str>)>, signer: Value, key: u8| {
         let mut plan = wire::Plan::new(&account(11));
         if let Some((symbol, issuer)) = asset {
             let identity = crate::asset_from_identity(symbol, issuer).unwrap();
@@ -564,10 +565,15 @@ fn a_host_reads_the_native_wallet_asset_that_the_setup_funds() {
         }
         plan.templates["server"] = signer;
         let server = wire::Server::new(plan);
-        let authority = authority(&server.url);
+        let authority = crate::host::config::ServerAuthority::validated(
+            "stellar:testnet",
+            &server.url,
+            &account(key),
+        )
+        .unwrap();
         let store =
             || -> crate::host::error::Result<Store> { unreachable!("the lookup opens no store") };
-        let owner = Owner(account(11));
+        let owner = Owner(account(11), AtomicUsize::new(0));
         let cx = Context {
             network: "stellar:testnet",
             backend: &server.url,
@@ -578,8 +584,10 @@ fn a_host_reads_the_native_wallet_asset_that_the_setup_funds() {
             signer: &owner,
             clock: &|| Ok(now),
         };
-        crate::provider::owner::OWNER.native_wallet_asset(&cx)
+        let asset = crate::provider::owner::OWNER.native_wallet_asset(&cx);
+        (asset, owner.1.load(Ordering::SeqCst))
     };
+    let read = |asset, signer| read_with(asset, signer, 13).0;
     // The fixture's template of Testnet is in USDC, and the authority's key is account 13.
     assert_eq!(
         read(None, json!(account(13))).unwrap(),
@@ -609,6 +617,16 @@ fn a_host_reads_the_native_wallet_asset_that_the_setup_funds() {
         "{}",
         other.message
     );
+    // An owner whose key is the configured authority's, which no setup accepts, is refused
+    // before the owner signs in.
+    let (same, signed) = read_with(None, json!(account(11)), 11);
+    let same = same.unwrap_err();
+    assert!(
+        same.message.contains("must be distinct"),
+        "{}",
+        same.message
+    );
+    assert_eq!(signed, 0);
 }
 /// A request ID binds its intent, the wallet asset included, also while nothing is signed: a
 /// run for another asset or another amount under the same ID is refused and signs nothing. A
