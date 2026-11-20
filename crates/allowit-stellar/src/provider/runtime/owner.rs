@@ -23,6 +23,34 @@ pub struct SetupRequest {
 /// balance also holds. A wallet of an issued asset takes `owner::MAX_ASSET_FUNDING`.
 pub const MAX_SETUP_FUNDING: i64 =
     native::owner::MAX_STARTING_BALANCE - native::owner::default_starting_balance(false);
+/// The check of a Native wallet's asset that every setup runs, and the asset read of a host
+/// before the setup: an issued asset with the code of the network's own asset reads as that
+/// asset in every amount, so no wallet holds one. `None` is a wallet that holds XLM.
+pub fn check_wallet_asset(asset: Option<&native::owner::Trustline>) -> Result<()> {
+    if let Some(asset) = asset
+        && (asset.code == "XLM"
+            || native::asset_from_identity(&asset.code, Some(&asset.issuer)).is_err())
+    {
+        return Err(Error::config(
+            "The wallet asset of this network is not an issued Stellar asset",
+        ));
+    }
+    Ok(())
+}
+/// The keys of a setup's roles: each one a Stellar G account and no two the same. The setup
+/// checks its owner, agent and server with it, and the asset lookup its owner and server, before
+/// the owner signs in.
+pub fn check_roles(accounts: &[&str]) -> Result<()> {
+    for account in accounts {
+        native::account_key(account).map_err(Error::usage)?;
+    }
+    if (1..accounts.len()).any(|i| accounts[..i].contains(&accounts[i])) {
+        return Err(Error::usage(
+            "Owner, agent and server must be distinct G accounts",
+        ));
+    }
+    Ok(())
+}
 impl SetupRequest {
     /// The checks of the caller's own values, which need no asset: the network, the three
     /// roles, the request ID, the fee and the bounds that every funding has. The provider runs
@@ -36,14 +64,7 @@ impl SetupRequest {
                 "Native wallet setup needs a Stellar network, named by its network id",
             ));
         }
-        for account in [&self.owner, &self.agent, &self.server] {
-            native::account_key(account).map_err(Error::usage)?;
-        }
-        if self.owner == self.agent || self.owner == self.server || self.agent == self.server {
-            return Err(Error::usage(
-                "Owner, agent and server must be distinct G accounts",
-            ));
-        }
+        check_roles(&[&self.owner, &self.agent, &self.server])?;
         if !crate::host::request::request_id_valid(&self.request_id) {
             return Err(Error::usage("Invalid Stellar setup request ID"));
         }
@@ -62,16 +83,7 @@ impl SetupRequest {
     }
     pub fn validate(&self) -> Result<()> {
         self.validate_caller_values()?;
-        // An issued asset with the code of the network's own asset reads as that asset in
-        // every amount, so no wallet holds one.
-        if let Some(asset) = &self.asset
-            && (asset.code == "XLM"
-                || native::asset_from_identity(&asset.code, Some(&asset.issuer)).is_err())
-        {
-            return Err(Error::config(
-                "The wallet asset of this network is not an issued Stellar asset",
-            ));
-        }
+        check_wallet_asset(self.asset.as_ref())?;
         // The funding of a wallet that holds XLM is part of the starting balance. The funding
         // of an issued asset is a payment of its own, with the ceiling of the setup builder.
         self.funding_within(if self.asset.is_some() {
