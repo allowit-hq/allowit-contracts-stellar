@@ -117,7 +117,8 @@ const plugin = Object.freeze({
     nativeAsset,
     assetDisplay,
     /** Review and sign links: the fragment, its parser, the agent prompt and the owner-readable params. */
-    review: Object.freeze({ fragment: ADK_OWNER_FRAGMENT, parseLink: parseReviewLink, agentPrompt: reviewAgentPrompt, paramLines: adkParamLines }),
+    review: Object.freeze({ fragment: ADK_OWNER_FRAGMENT, parseLink: parseReviewLink, agentPrompt: reviewAgentPrompt,
+        paramLines: (params, network) => adkParamLines(params, assets(network)) }),
     /**
      * What the SDK's owner workflows read from Stellar and check with its keys: transaction records, the record of an
      * expired step, the Native wallet's setup and the owner's approval. The SDK holds the workflows and their journal.
