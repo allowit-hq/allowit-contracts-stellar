@@ -2230,12 +2230,8 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         let Some(installation) = on else {
             return Ok(());
         };
+        // The installation is of this rail's network, as the step is.
         let c = self.config(installation)?;
-        if c.network != data.original.network {
-            return Err(Error::config(
-                "The installation is of another network than the owner step",
-            ));
-        }
         if c.route != WalletRoute::PolicyWallet
             || checked(native::owner_intent::renews_lifetime(&data.original))?
         {
@@ -5354,6 +5350,15 @@ mod owner_steps {
         /// The `transaction` argument of each send.
         sent_bytes: Mutex<Vec<String>>,
         receipt: serde_json::Value,
+        /// The ledgers up to which the wallet's instance and its code live, as the read of its
+        /// lifetime entries gives them; zero is an archived entry.
+        lifetime: (u32, u32),
+        /// The ledger of the read of the wallet's lifetime entries; the head is ledger 120.
+        entries_ledger: u32,
+        /// The read of the wallet's lifetime entries fails with this text.
+        entries_fail: Option<&'static str>,
+        /// The read of the wallet's lifetime entries gives no code entry.
+        entries_lack_code: bool,
     }
     impl Steps {
         fn new() -> Self {
@@ -5366,6 +5371,10 @@ mod owner_steps {
                 calls: Mutex::new(Vec::new()),
                 sent_bytes: Mutex::new(Vec::new()),
                 receipt: serde_json::Value::Null,
+                lifetime: (520, 1_119),
+                entries_ledger: 120,
+                entries_fail: None,
+                entries_lack_code: false,
             }
         }
         fn sent(&self) -> bool {
@@ -5401,6 +5410,51 @@ mod owner_steps {
                         Some(status) => serde_json::json!({"hash": hash, "status": status}),
                         None => return Err("sendTransaction: the endpoint is unreachable".into()),
                     }
+                }
+                "getLedgerEntries" => {
+                    if let Some(failure) = self.entries_fail {
+                        return Err(failure.into());
+                    }
+                    let c = deployed_wallet();
+                    let archival = x::LedgerEntryData::ConfigSetting(
+                        x::ConfigSettingEntry::StateArchival(x::StateArchivalSettings {
+                            max_entry_ttl: 2_000,
+                            ..Default::default()
+                        }),
+                    );
+                    let instance = x::LedgerEntryData::ContractData(x::ContractDataEntry {
+                        ext: x::ExtensionPoint::V0,
+                        contract: x::ScAddress::Contract(x::ContractId(x::Hash(
+                            stellar_strkey::Contract::from_string(&c.wallet).unwrap().0,
+                        ))),
+                        key: x::ScVal::LedgerKeyContractInstance,
+                        durability: x::ContractDataDurability::Persistent,
+                        val: x::ScVal::ContractInstance(x::ScContractInstance {
+                            executable: x::ContractExecutable::Wasm(x::Hash(c.module_digest)),
+                            storage: None,
+                        }),
+                    });
+                    let code = x::LedgerEntryData::ContractCode(x::ContractCodeEntry {
+                        ext: x::ContractCodeEntryExt::V0,
+                        hash: x::Hash(c.module_digest),
+                        code: crate::test_support::owner::wasm().try_into().unwrap(),
+                    });
+                    // An archived entry comes without its last live ledger.
+                    let entry = |data: &x::LedgerEntryData, until: u32| {
+                        let mut entry = serde_json::json!({"xdr": native::xdr(data).unwrap()});
+                        if until > 0 {
+                            entry["liveUntilLedgerSeq"] = until.into();
+                        }
+                        entry
+                    };
+                    let mut entries = vec![
+                        serde_json::json!({"xdr": native::xdr(&archival).unwrap()}),
+                        entry(&instance, self.lifetime.0),
+                    ];
+                    if !self.entries_lack_code {
+                        entries.push(entry(&code, self.lifetime.1));
+                    }
+                    serde_json::json!({"latestLedger": self.entries_ledger, "entries": entries})
                 }
                 "getTransaction" if self.holds => self.receipt.clone(),
                 "getTransaction" => serde_json::json!({"status": "NOT_FOUND",
@@ -5449,11 +5503,48 @@ mod owner_steps {
     }
     /// A funding of `units` of the policy wallet of `c`.
     fn funding_of(c: &WalletConfig, units: i128) -> OwnerSigned {
-        let step = crate::test_support::owner::fund_step(c, units, NOW);
+        owner_signed(crate::test_support::owner::fund_step(c, units, NOW))
+    }
+    /// The return of the funds of the policy wallet of `c`: a call of the wallet itself.
+    fn returning(c: &WalletConfig) -> OwnerSigned {
+        let mut step = crate::test_support::owner::fund_step(c, 10, NOW);
+        step["action"] = "withdraw".into();
+        crate::test_support::owner::change_step(&mut step, |tx| {
+            let x::OperationBody::InvokeHostFunction(invoke) = &tx.operations[0].body else {
+                panic!()
+            };
+            let x::HostFunction::InvokeContract(call) = &invoke.host_function else {
+                panic!()
+            };
+            let recover = x::InvokeContractArgs {
+                contract_address: x::ScAddress::Contract(x::ContractId(x::Hash(
+                    stellar_strkey::Contract::from_string(&c.wallet).unwrap().0,
+                ))),
+                function_name: x::ScSymbol("recover".try_into().unwrap()),
+                args: call.args.clone(),
+            };
+            tx.operations = vec![x::Operation {
+                source_account: None,
+                body: x::OperationBody::InvokeHostFunction(x::InvokeHostFunctionOp {
+                    host_function: x::HostFunction::InvokeContract(recover),
+                    auth: Default::default(),
+                }),
+            }]
+            .try_into()
+            .unwrap();
+        });
+        owner_signed(step)
+    }
+    /// The renewal of the lifetime of the policy wallet of `c`.
+    fn renewal(c: &WalletConfig) -> OwnerSigned {
+        owner_signed(crate::test_support::owner::extend_step(c, 999, NOW))
+    }
+    /// The owner step `step`, signed by the owner.
+    fn owner_signed(step: serde_json::Value) -> OwnerSigned {
         signed(
             native::owner_intent::OwnerTransaction {
                 network: NETWORK.into(),
-                action: "fund".into(),
+                action: step["action"].as_str().unwrap().into(),
                 transaction_xdr: step["payload"].as_str().unwrap().into(),
                 transaction_hash: native::unhex(step["transactionHash"].as_str().unwrap()).unwrap(),
                 expires_at: step["expiresAt"].as_u64().unwrap(),
@@ -5464,6 +5555,38 @@ mod owner_steps {
     fn policy_wallet() -> WalletConfig {
         crate::test_support::request_config(WalletRoute::PolicyWallet, false)
     }
+    /// A policy wallet whose code is the test code, so that the endpoint can answer its lifetime
+    /// entries.
+    fn deployed_wallet() -> WalletConfig {
+        use crate::test_support::owner::{account, wasm};
+        let policy = serde_json::from_value(
+            crate::test_support::owner_generation_fixture()["policy"].clone(),
+        )
+        .unwrap();
+        // The owner is the account that signs the steps of these tests.
+        crate::provider::runtime::owner_client::workflow::deployment_policy(
+            policy,
+            &account(1),
+            &account(12),
+            &account(13),
+            &wasm(),
+        )
+        .unwrap()
+        .config
+    }
+    /// The installation of the wallet of `c`.
+    fn installed(c: &WalletConfig) -> Installation {
+        let configuration =
+            super::super::server_owner::configuration(&c.network, &serde_json::to_vec(c).unwrap())
+                .unwrap();
+        super::installation(&configuration)
+    }
+    /// How often the endpoint read ledger entries.
+    fn entry_reads(steps: &Steps) -> usize {
+        let calls = steps.calls.lock().unwrap();
+        calls.iter().filter(|m| *m == "getLedgerEntries").count()
+    }
+    const LAPSED: &str = allowit_core::vendor::runtime::CONTRACT_EXPIRED;
     fn provider(steps: &Arc<Steps>) -> Provider {
         Provider::from_rpc(NETWORK, steps.clone())
     }
@@ -5566,7 +5689,9 @@ mod owner_steps {
             reads_fail: true,
             ..Steps::new()
         });
-        provider(&steps).validate_owner_signed(&step, None, NOW).unwrap();
+        provider(&steps)
+            .validate_owner_signed(&step, None, NOW)
+            .unwrap();
         assert!(steps.calls.lock().unwrap().is_empty());
         assert_eq!(
             provider(&steps).broadcast_owner(&step, None, NOW).unwrap(),
@@ -5737,6 +5862,214 @@ mod owner_steps {
             );
             assert_eq!(*steps.looked_up.lock().unwrap(), std::slice::from_ref(&own));
         }
+    }
+
+    /// With its installation, a step on a contract wallet is sent only while one read shows the
+    /// wallet live past the ledgers in which the step can first apply. A funding, which does
+    /// not call the wallet, and a return, which calls it, are refused on a lapsed wallet, and
+    /// nothing is sent. The renewal of the wallet's lifetime is never refused for a lapse.
+    #[test]
+    fn a_step_on_a_lapsed_wallet_is_refused_at_its_send_but_never_its_renewal() {
+        let c = deployed_wallet();
+        let installation = installed(&c);
+        let on = Some(&installation);
+        // A live wallet: each step passes, a funding and a return after one read of the
+        // wallet's entries, the renewal with none.
+        for (step, reads) in [(funding(&c), 1), (returning(&c), 1), (renewal(&c), 0)] {
+            let steps = Arc::new(Steps::new());
+            provider(&steps)
+                .validate_owner_signed(&step, on, NOW)
+                .unwrap();
+            assert_eq!(entry_reads(&steps), reads);
+        }
+        // The read is of ledger 120, and the step applies after the head that closes the read,
+        // which is 5 ledgers later at most: an entry that lives up to ledger 125 has lapsed for
+        // the step, and so has an archived one.
+        for lifetime in [(125, 1_119), (520, 125), (119, 1_119), (0, 1_119), (520, 0)] {
+            for step in [funding(&c), returning(&c)] {
+                let steps = Arc::new(Steps {
+                    lifetime,
+                    ..Steps::new()
+                });
+                for refused in [
+                    provider(&steps).validate_owner_signed(&step, on, NOW),
+                    provider(&steps).broadcast_owner(&step, on, NOW).map(drop),
+                ] {
+                    assert_eq!(
+                        refused.unwrap_err().api_code.as_deref(),
+                        Some(LAPSED),
+                        "{lifetime:?}"
+                    );
+                }
+                assert!(!steps.sent());
+            }
+            // The renewal is how the owner keeps the wallet live: it is sent, and the ledger
+            // decides.
+            let steps = Arc::new(Steps {
+                lifetime,
+                ..Steps::new()
+            });
+            let step = renewal(&c);
+            provider(&steps)
+                .validate_owner_signed(&step, on, NOW)
+                .unwrap();
+            assert_eq!(
+                provider(&steps).broadcast_owner(&step, on, NOW).unwrap(),
+                Status::Submitted
+            );
+            assert_eq!(entry_reads(&steps), 0);
+        }
+        // One ledger more of life: the step is sent.
+        let steps = Arc::new(Steps {
+            lifetime: (126, 126),
+            ..Steps::new()
+        });
+        assert_eq!(
+            provider(&steps)
+                .broadcast_owner(&funding(&c), on, NOW)
+                .unwrap(),
+            Status::Submitted
+        );
+        // A step past its time bound is refused for that first, with no read of the wallet.
+        let steps = Arc::new(Steps {
+            lifetime: (0, 0),
+            ..Steps::new()
+        });
+        let step = funding(&c);
+        let late = step.info().unwrap().expires_at;
+        assert_eq!(
+            provider(&steps)
+                .validate_owner_signed(&step, on, late)
+                .unwrap_err()
+                .api_code
+                .as_deref(),
+            Some(OWNER_TRANSACTION_EXPIRED)
+        );
+        assert_eq!(entry_reads(&steps), 0);
+    }
+
+    /// Nothing in Allowit restores a lapsed wallet. Its owner restores it on the ledger, and
+    /// the wallet then takes the return of its funds: the same signed step that was refused
+    /// passes once the read shows the wallet live.
+    #[test]
+    fn a_wallet_that_its_owner_restored_takes_the_return_of_its_funds() {
+        let c = deployed_wallet();
+        let installation = installed(&c);
+        let step = returning(&c);
+        let lapsed = Arc::new(Steps {
+            lifetime: (0, 0),
+            ..Steps::new()
+        });
+        assert_eq!(
+            provider(&lapsed)
+                .broadcast_owner(&step, Some(&installation), NOW)
+                .unwrap_err()
+                .api_code
+                .as_deref(),
+            Some(LAPSED)
+        );
+        assert!(!lapsed.sent());
+        let restored = Arc::new(Steps::new());
+        assert_eq!(
+            provider(&restored)
+                .broadcast_owner(&step, Some(&installation), NOW + 1)
+                .unwrap(),
+            Status::Submitted
+        );
+        assert!(restored.sent());
+    }
+
+    /// A read of the wallet's liveness that gives no answer proves nothing: it is an uncertain
+    /// error, never a lapse and never a pass, and nothing is sent.
+    #[test]
+    fn a_liveness_read_that_fails_is_uncertain_and_never_a_lapse() {
+        let c = deployed_wallet();
+        let installation = installed(&c);
+        let step = funding(&c);
+        let uncertain = Error::uncertain("").code;
+        for (case, steps, code) in [
+            (
+                "the endpoint does not answer",
+                Steps {
+                    entries_fail: Some(rpc::NETWORK_UNAVAILABLE),
+                    ..Steps::new()
+                },
+                crate::provider::NETWORK_UNAVAILABLE,
+            ),
+            (
+                "the endpoint fails",
+                Steps {
+                    entries_fail: Some("The endpoint failed"),
+                    ..Steps::new()
+                },
+                uncertain,
+            ),
+            (
+                "every read fails",
+                Steps {
+                    reads_fail: true,
+                    ..Steps::new()
+                },
+                uncertain,
+            ),
+            (
+                "the reply lacks an entry of the wallet",
+                Steps {
+                    entries_lack_code: true,
+                    ..Steps::new()
+                },
+                uncertain,
+            ),
+            (
+                "the reply is of an earlier ledger than the head",
+                Steps {
+                    entries_ledger: 119,
+                    ..Steps::new()
+                },
+                uncertain,
+            ),
+        ] {
+            let steps = Arc::new(steps);
+            for answer in [
+                provider(&steps).validate_owner_signed(&step, Some(&installation), NOW),
+                provider(&steps)
+                    .broadcast_owner(&step, Some(&installation), NOW)
+                    .map(drop),
+            ] {
+                let error = answer.unwrap_err();
+                assert_eq!(
+                    (error.code, error.api_code.as_deref()),
+                    (code, None),
+                    "{case}"
+                );
+            }
+            assert!(!steps.sent(), "{case}");
+        }
+    }
+
+    /// A step that is sent without its installation, as a creation, is not read for liveness,
+    /// and a keypair wallet has no lifetime to read.
+    #[test]
+    fn a_step_without_an_installation_or_on_a_keypair_wallet_reads_no_liveness() {
+        let c = deployed_wallet();
+        let step = funding(&c);
+        let lapsed = || {
+            Arc::new(Steps {
+                lifetime: (0, 0),
+                ..Steps::new()
+            })
+        };
+        let steps = lapsed();
+        provider(&steps)
+            .validate_owner_signed(&step, None, NOW)
+            .unwrap();
+        let keypair = crate::test_support::owner::native_selection().config;
+        assert_eq!(keypair.route, WalletRoute::Native);
+        let keypair = installed(&keypair);
+        provider(&steps)
+            .validate_owner_signed(&step, Some(&keypair), NOW)
+            .unwrap();
+        assert_eq!(entry_reads(&steps), 0);
     }
 
     /// A policy wallet never closes: it is not closed, and its close is refused before any read.
