@@ -710,10 +710,12 @@ impl rpc::Rpc for ModelChain {
                             key: x::ScVal::LedgerKeyContractInstance,
                             ..
                         }) if m.lapsed_instances => 0,
+                        // The network's setting has no lifetime.
+                        x::LedgerKey::ConfigSetting(_) => 0,
                         _ => m.ledger + 10_000,
                     };
                     entries.extend(entry.into_iter().map(
-                    |e| json!({"key": encoded, "xdr": b64(&e), "liveUntilLedgerSeq": live_until}),
+                    |e| json!({"key": encoded, "xdr": b64(&e), "lastModifiedLedgerSeq": 1, "liveUntilLedgerSeq": live_until}),
                 ));
                 }
                 if entries.is_empty() && m.omit_empty_entries {

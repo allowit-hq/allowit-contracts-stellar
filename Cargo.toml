@@ -11,7 +11,7 @@ repository = "https://github.com/allowit-hq/allowit-contracts-stellar"
 [workspace.dependencies]
 soroban-sdk = "=28.0.0"
 allowit = { package = "allowit-stellar-policy", path = "crates/policy", version = "0.4" }
-allowit-core = { git = "https://github.com/allowit-hq/allowit-core.git", rev = "15824bf04ca79094701c1e721e3b5c5a1f3580ba", version = "0.18", default-features = false, features = ["std"] }
+allowit-core = { git = "https://github.com/allowit-hq/allowit-core.git", rev = "2631c66a47465268d160eee66c9f8d1a3c2300d5", version = "0.19", default-features = false, features = ["std"] }
 
 # Every Allowit workspace uses this profile block, so a shared target directory
 # builds each shared crate once. Release builds keep overflow checks, which the

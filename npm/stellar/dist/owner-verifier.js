@@ -1,5 +1,5 @@
 const inputLimit = 512 * 1024;
-const verifierHash = '54566bc4c5ed67b6b5ff53a559cc777f830d1b73720b70e0329e9e4635f6971b';
+const verifierHash = '0fa5ce25021e56a010bb943faf615c11f5b5ce32a1a695e2b662acb8529b70d9';
 let verifier;
 async function loadVerifier() {
     const response = await fetch(new URL('./owner-verifier.wasm', import.meta.url));
