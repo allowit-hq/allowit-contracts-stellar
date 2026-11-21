@@ -224,6 +224,13 @@ struct ValidEntry {
 /// with an entry that fails is an invalid reply: an error, never a decision. The truth table of
 /// the test module `decode_table` states every row, and the decode says nothing else.
 fn valid_lifetime_reply(response: &Value) -> Result<(u32, u32, Vec<ValidEntry>)> {
+    // An invalid reply keeps its kind for every caller: an uncertain error at the rail's
+    // boundary, at a preparation as at a send.
+    decoded_lifetime_reply(response).map_err(|invalid| format!("{INVALID_REPLY}: {invalid}"))
+}
+/// The first words of the error of an invalid lifetime reply ([`valid_lifetime_reply`]).
+pub const INVALID_REPLY: &str = "Invalid wallet lifetime reply";
+fn decoded_lifetime_reply(response: &Value) -> Result<(u32, u32, Vec<ValidEntry>)> {
     let observed = ledger(&response["latestLedger"])?;
     let listed = response["entries"]
         .as_array()

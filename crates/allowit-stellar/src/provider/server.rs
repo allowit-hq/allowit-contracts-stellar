@@ -6527,6 +6527,40 @@ mod owner_steps {
         );
     }
 
+    /// An invalid lifetime reply is an uncertain error at a preparation's read too, as at a
+    /// send: the resources of the wallet are not answered from it, and it is no configuration
+    /// fault and no lapse. The rows here are those that the single-entry reads before the
+    /// lifetime read let through: an entry without its change ledger, and a lifetime beyond the
+    /// network's limit.
+    #[test]
+    fn an_invalid_lifetime_reply_is_uncertain_at_a_preparations_read() {
+        let c = deployed_wallet();
+        let installation = installed(&c);
+        provider(&Arc::new(Steps::new()))
+            .resources(&installation)
+            .unwrap();
+        for steps in [
+            Steps {
+                unchanged: true,
+                ..Steps::new()
+            },
+            Steps {
+                lifetime: (520, 2_120),
+                ..Steps::new()
+            },
+        ] {
+            let error = provider(&Arc::new(steps))
+                .resources(&installation)
+                .map(drop)
+                .unwrap_err();
+            assert_eq!(
+                (error.code, error.api_code.clone(), error.config),
+                (Error::uncertain("").code, None, false),
+                "{}",
+                error.message
+            );
+        }
+    }
     /// A step that is sent without its installation, as a creation, is not read for liveness,
     /// and a keypair wallet has no lifetime to read.
     #[test]
