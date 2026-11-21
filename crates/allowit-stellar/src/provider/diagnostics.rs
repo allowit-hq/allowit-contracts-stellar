@@ -99,6 +99,10 @@ pub fn rule_denial(code: u32) -> Problem {
 /// vault, or whose origin is unknown, is a plain wallet rejection with the raw code. A stale owner
 /// observation is `stale_owner_observation`, which a caller can retry once. Anything else stays
 /// a plain conflict.
+/// The problem of an error that names no refusal: a plain conflict with the error's own text.
+pub fn unnamed(message: impl Into<String>) -> Problem {
+    fail(message)
+}
 /// The problem of the typed refusal of one attempt to send an owner step to a lapsed wallet.
 pub fn lapsed_at_send() -> Problem {
     coded(

@@ -1191,16 +1191,28 @@ fn diagnostic_events(reply: &serde_json::Value) -> Vec<String> {
         })
         .unwrap_or_default()
 }
+/// The problem of an error that no simulation fault explains. The refusal of a send to a lapsed
+/// wallet is named by its typed code. An uncertain error is no refusal: its text names nothing,
+/// whatever it says. Any other error is named by its text, as a preparation's refusal is
+/// ([`super::diagnostics::denial`]).
+fn problem_of(error: &Error) -> Problem {
+    if error.api_code.as_deref() == Some(allowit_core::vendor::runtime::CONTRACT_EXPIRED)
+        && error.message == rpc::LAPSED_AT_SEND
+    {
+        return super::diagnostics::lapsed_at_send();
+    }
+    let uncertain = [
+        Error::uncertain("").code,
+        crate::provider::NETWORK_UNAVAILABLE,
+    ];
+    if error.api_code.is_none() && uncertain.contains(&error.code) {
+        return super::diagnostics::unnamed(error.to_string());
+    }
+    super::diagnostics::denial(&error.to_string(), None, "")
+}
 impl crate::host::vendors::RuntimeProvider for Provider {
     fn problem(&self, error: &Error) -> Problem {
-        // The refusal of a send to a lapsed wallet is named by its typed code: an error of
-        // another class with the same text is not that refusal.
-        if error.api_code.as_deref() == Some(allowit_core::vendor::runtime::CONTRACT_EXPIRED)
-            && error.message == rpc::LAPSED_AT_SEND
-        {
-            return super::diagnostics::lapsed_at_send();
-        }
-        super::diagnostics::denial(&error.to_string(), None, "")
+        problem_of(error)
     }
     fn diagnostic_session(&self, installation: &Installation) -> Result<Option<DiagnosticSession>> {
         let config = self.config(installation)?;
@@ -1256,7 +1268,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                     .and_then(|mut capture| capture.take())
                     .filter(|(message, _)| message == &error.message)
                     .map(|(_, problem)| problem)
-                    .unwrap_or_else(|| super::diagnostics::denial(&error.to_string(), None, ""))
+                    .unwrap_or_else(|| problem_of(error))
             }),
         }))
     }
@@ -6224,30 +6236,47 @@ mod owner_steps {
             .unwrap();
         assert_eq!(entry_reads(&lapsed), 1);
     }
-    /// The adapter names the send refusal by its typed code: an error of another class with the
-    /// same text, as a transport can give, is not that refusal.
+    /// The adapter names the send refusal by its typed code, in `problem` and in the classifier
+    /// of a diagnostic session alike. An uncertain error is no refusal: its text names nothing,
+    /// also when a transport fails with the text of the send refusal or of a preparation's.
     #[test]
-    fn an_uncertain_error_with_the_refusals_text_is_not_named_a_lapse() {
+    fn an_uncertain_error_with_a_refusals_text_is_not_named_a_lapse() {
+        let c = deployed_wallet();
+        let installation = installed(&c);
         let steps = Arc::new(Steps::new());
         let rail = provider(&steps);
+        // A session classifies one error.
+        let classify = |error: &Error| {
+            let session = rail.diagnostic_session(&installation).unwrap().unwrap();
+            (session.classify)(error)
+        };
         let refusal = Error::coded(LAPSED, rpc::LAPSED_AT_SEND);
-        assert_eq!(rail.problem(&refusal).code, LAPSED);
-        let uncertain = Error::uncertain(rpc::LAPSED_AT_SEND);
-        assert_ne!(rail.problem(&uncertain).code, LAPSED);
-        // An endpoint that fails with that text is an uncertain error of the check, too.
-        let failing = Arc::new(Steps {
-            entries_fail: Some(rpc::LAPSED_AT_SEND),
-            ..Steps::new()
-        });
-        let c = deployed_wallet();
-        let error = provider(&failing)
-            .validate_owner_signed(&funding(&c), Some(&installed(&c)), NOW)
-            .unwrap_err();
-        assert_eq!(
-            (error.code, error.api_code.clone()),
-            (Error::uncertain("").code, None)
-        );
-        assert_ne!(provider(&failing).problem(&error).code, LAPSED);
+        for problem in [rail.problem(&refusal), classify(&refusal)] {
+            assert_eq!((problem.status, problem.code), (409, LAPSED));
+        }
+        // A preparation's refusal, a plain error with its text, is named by that text as before.
+        let prepared = Error::config(rpc::CONTRACT_EXPIRED);
+        assert_eq!(rail.problem(&prepared).code, LAPSED);
+        for text in [rpc::LAPSED_AT_SEND, rpc::CONTRACT_EXPIRED] {
+            let uncertain = Error::uncertain(text);
+            for problem in [rail.problem(&uncertain), classify(&uncertain)] {
+                assert_eq!((problem.status, problem.code), (409, ""), "{text}");
+            }
+            // An endpoint that fails with that text gives an uncertain error of the check.
+            let failing = Arc::new(Steps {
+                entries_fail: Some(text),
+                ..Steps::new()
+            });
+            let error = provider(&failing)
+                .validate_owner_signed(&funding(&c), Some(&installation), NOW)
+                .unwrap_err();
+            assert_eq!(
+                (error.code, error.api_code.clone()),
+                (Error::uncertain("").code, None),
+                "{text}"
+            );
+            assert_eq!(provider(&failing).problem(&error).code, "", "{text}");
+        }
     }
     /// A wallet that runs other code than the code that Allowit installed is judged by its
     /// instance alone, from the one reply: the liveness of the code that its owner installed is
