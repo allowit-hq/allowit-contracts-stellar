@@ -28,6 +28,6 @@ scope = "soroban module"
 
 [package.metadata.allowit-core-source]
 repository = "https://github.com/allowit-hq/allowit-core"
-revision = "15824bf04ca79094701c1e721e3b5c5a1f3580ba"
+revision = "2a0b99fcc77c203a680a925d98fb251f70d6888a"
 path = "crates/allowit-core/src/portable/core.rs"
 resource = "allowit_core::SOURCE_CORE_RS"

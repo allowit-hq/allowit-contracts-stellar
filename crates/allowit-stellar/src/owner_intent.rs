@@ -98,6 +98,22 @@ pub fn validate_retained_owner_transaction(original: &OwnerTransaction) -> Resul
     Ok(())
 }
 
+/// Whether the retained owner transaction renews a wallet's lifetime: its one operation extends
+/// the lifetime of ledger entries. The transaction itself says so, not its action name. Such a
+/// step moves nothing.
+pub fn renews_lifetime(original: &OwnerTransaction) -> Result<bool> {
+    let TransactionEnvelope::Tx(envelope) = read(&original.transaction_xdr)? else {
+        return Err("Expected a v1 owner transaction".into());
+    };
+    Ok(matches!(
+        envelope.tx.operations.as_slice(),
+        [Operation {
+            body: OperationBody::ExtendFootprintTtl(_),
+            ..
+        }]
+    ))
+}
+
 /// Whether a classic owner transaction has the operations of its named action: the creation
 /// of a wallet account or one owner action on it. This describes retained bytes; the exact
 /// roles and amounts are checked against caller intent before signing.

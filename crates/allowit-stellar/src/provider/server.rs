@@ -1027,6 +1027,45 @@ impl Provider {
         checked(native::validate_config(&c))?;
         Ok(c)
     }
+    /// The liveness of the contract wallet of `c` at the send of an owner step: one read of its
+    /// instance and its code at one ledger ([`rpc::wallet_lifetime`]). The step applies in a
+    /// ledger after the head that closes the read, and that head is at most
+    /// [`rpc::owner_observation::MAX_OBSERVATION_LAG`] ledgers after the read's own, so both
+    /// entries must be live past the read's ledger by more than that: a wallet in its last
+    /// ledgers reads as lapsed. A lapse is the typed refusal `CONTRACT_EXPIRED`. Any other answer
+    /// of the read, a failure, a stale observation or a reply that is not the wallet's two
+    /// entries, proves nothing: it is an uncertain error, never a lapse and never a pass.
+    fn live_at_send(&self, c: &WalletConfig) -> Result<()> {
+        let lapsed = || {
+            Error::coded(
+                allowit_core::vendor::runtime::CONTRACT_EXPIRED,
+                rpc::CONTRACT_EXPIRED,
+            )
+        };
+        match rpc::wallet_lifetime(self.rpc(), &c.network, &c.wallet, &c.module_digest) {
+            Ok(lifetime) => {
+                let applies_after = lifetime
+                    .ledger
+                    .saturating_add(rpc::owner_observation::MAX_OBSERVATION_LAG);
+                if lifetime.instance_live_until > applies_after
+                    && lifetime.code_live_until > applies_after
+                {
+                    Ok(())
+                } else {
+                    Err(lapsed())
+                }
+            }
+            Err(read) if read == rpc::CONTRACT_EXPIRED => Err(lapsed()),
+            Err(read) => {
+                let failed = crate::provider::failure(read);
+                let mut uncertain = Error::uncertain(failed.message);
+                if failed.code == crate::provider::NETWORK_UNAVAILABLE {
+                    uncertain.code = failed.code;
+                }
+                Err(uncertain)
+            }
+        }
+    }
     /// Before the server signs for a policy wallet, require its live instance to run the
     /// installation's code, and that code to be live: a wallet whose instance or code lapsed is
     /// `CONTRACT_EXPIRED`, and one whose owner installed other code, or that is gone, is refused.
@@ -2162,12 +2201,24 @@ impl crate::host::vendors::RuntimeProvider for Provider {
     }
     /// A step at or past its time bound, its send cutoff, is never sent again
     /// (`OWNER_TRANSACTION_EXPIRED`); this says nothing about a send before it, which the ledger
-    /// can still apply while its own clock is not past the bound. This check reads nothing: a
-    /// signed step does not name the installation that it acts on, so the liveness of a contract
-    /// wallet is not read here. The preparation of a funding refuses a lapsed wallet
-    /// ([`Self::prepare_owner`]), and a caller that sends a funding later reads the wallet again
-    /// with [`Self::resources`], as the server does.
-    fn validate_owner_signed(&self, p: &OwnerSigned, now: u64) -> Result<()> {
+    /// can still apply while its own clock is not past the bound.
+    ///
+    /// With the installation `on` of a contract wallet, the wallet's liveness is read once
+    /// ([`Self::live_at_send`]) and a step on a lapsed wallet is refused (`CONTRACT_EXPIRED`): a
+    /// funding does not call the wallet, so the ledger would apply it, and any other step would
+    /// fail on the ledger at its owner's cost. The installation decides alone; no action name is
+    /// read. One step is never refused for a lapse: the renewal of the wallet's lifetime, known
+    /// by the signed transaction itself ([`native::owner_intent::renews_lifetime`]). It moves
+    /// nothing, and it is how an owner keeps a wallet live. Nothing in Allowit restores a lapsed
+    /// wallet: its owner restores it on the ledger outside Allowit, and the next read then
+    /// finds it live. A keypair wallet has no lifetime, and a step without an installation, as
+    /// a creation, is not read.
+    fn validate_owner_signed(
+        &self,
+        p: &OwnerSigned,
+        on: Option<&Installation>,
+        now: u64,
+    ) -> Result<()> {
         self.network(p.network())?;
         let data: OwnerSignedData = decode_packet(&p.0)?;
         if now >= data.original.expires_at {
@@ -2176,7 +2227,21 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 "The owner step is at or past its time bound: it is not sent again.",
             ));
         }
-        Ok(())
+        let Some(installation) = on else {
+            return Ok(());
+        };
+        let c = self.config(installation)?;
+        if c.network != data.original.network {
+            return Err(Error::config(
+                "The installation is of another network than the owner step",
+            ));
+        }
+        if c.route != WalletRoute::PolicyWallet
+            || checked(native::owner_intent::renews_lifetime(&data.original))?
+        {
+            return Ok(());
+        }
+        self.live_at_send(&c)
     }
     /// Send the signed owner step once, after [`Self::validate_owner_signed`]. A step that the
     /// network did not take now, by a rejection or by `TRY_AGAIN_LATER`, was sent before when
@@ -2184,8 +2249,13 @@ impl crate::host::vendors::RuntimeProvider for Provider {
     /// applied. A send that the network rejected, with no transaction of the step held, is an
     /// error of this send: by Core's contract it decides nothing about an earlier send whose
     /// outcome was uncertain.
-    fn broadcast_owner(&self, p: &OwnerSigned, now: u64) -> Result<Status> {
-        self.validate_owner_signed(p, now)?;
+    fn broadcast_owner(
+        &self,
+        p: &OwnerSigned,
+        on: Option<&Installation>,
+        now: u64,
+    ) -> Result<Status> {
+        self.validate_owner_signed(p, on, now)?;
         let data: OwnerSignedData = decode_packet(&p.0)?;
         let network = &data.original.network;
         let hash = &data.original.transaction_hash;
@@ -5434,8 +5504,8 @@ mod owner_steps {
         let late = step.info().unwrap().expires_at;
         for at in [late, late + 1] {
             for result in [
-                provider(&steps).validate_owner_signed(&step, at),
-                provider(&steps).broadcast_owner(&step, at).map(drop),
+                provider(&steps).validate_owner_signed(&step, None, at),
+                provider(&steps).broadcast_owner(&step, None, at).map(drop),
             ] {
                 assert_eq!(
                     result.unwrap_err().api_code.as_deref(),
@@ -5445,7 +5515,7 @@ mod owner_steps {
         }
         assert!(!steps.sent());
         provider(&steps)
-            .validate_owner_signed(&step, late - 1)
+            .validate_owner_signed(&step, None, late - 1)
             .unwrap();
     }
 
@@ -5477,8 +5547,8 @@ mod owner_steps {
         let steps = Arc::new(Steps::new());
         let mixed = OwnerSigned(mixed);
         let provider = provider(&steps);
-        assert!(provider.validate_owner_signed(&mixed, NOW).is_err());
-        assert!(provider.broadcast_owner(&mixed, NOW).is_err());
+        assert!(provider.validate_owner_signed(&mixed, None, NOW).is_err());
+        assert!(provider.broadcast_owner(&mixed, None, NOW).is_err());
         assert!(provider.owner_status(&mixed).is_err());
         assert!(provider.observe_owner(&mixed).is_err());
         assert!(provider.owner_step_lapsed(&mixed, 20).is_err());
@@ -5496,10 +5566,10 @@ mod owner_steps {
             reads_fail: true,
             ..Steps::new()
         });
-        provider(&steps).validate_owner_signed(&step, NOW).unwrap();
+        provider(&steps).validate_owner_signed(&step, None, NOW).unwrap();
         assert!(steps.calls.lock().unwrap().is_empty());
         assert_eq!(
-            provider(&steps).broadcast_owner(&step, NOW).unwrap(),
+            provider(&steps).broadcast_owner(&step, None, NOW).unwrap(),
             Status::Submitted
         );
         assert_eq!(*steps.calls.lock().unwrap(), ["sendTransaction"]);
@@ -5547,7 +5617,7 @@ mod owner_steps {
                 receipt: confirmed(&step),
                 ..Steps::new()
             });
-            let sent = provider(&steps).broadcast_owner(&step, NOW);
+            let sent = provider(&steps).broadcast_owner(&step, None, NOW);
             assert_eq!(
                 sent.as_ref().ok(),
                 expected.as_ref(),
@@ -5589,7 +5659,7 @@ mod owner_steps {
                     ..Steps::new()
                 });
                 assert_eq!(
-                    provider(&steps).broadcast_owner(&step, NOW).unwrap(),
+                    provider(&steps).broadcast_owner(&step, None, NOW).unwrap(),
                     expected,
                     "{send}"
                 );
