@@ -87,10 +87,7 @@ pub(crate) fn failure(message: impl Into<String>) -> Error {
         let mut error = Error::uncertain(message);
         error.code = NETWORK_UNAVAILABLE;
         error
-    } else if message.contains(native::rpc::TRANSPORT_UNKNOWN)
-        // An invalid lifetime reply decides nothing: it is uncertain for every caller.
-        || message.starts_with(native::rpc::owner_observation::INVALID_REPLY)
-    {
+    } else if message.contains(native::rpc::TRANSPORT_UNKNOWN) {
         Error::uncertain(message)
     } else if message == native::rpc::owner_observation::STALE_OBSERVATION {
         // A caller prepares the owner step once more: the typed code says so, and the text and
@@ -112,20 +109,6 @@ fn a_stale_owner_observation_carries_its_code() {
     );
     assert!(error.config);
     assert_eq!(failure("another refusal").api_code, None);
-}
-#[cfg(test)]
-#[test]
-fn an_invalid_lifetime_reply_is_uncertain() {
-    let invalid = format!(
-        "{}: an entry has no change ledger",
-        native::rpc::owner_observation::INVALID_REPLY
-    );
-    let error = failure(invalid);
-    assert_eq!(
-        (error.code, error.api_code, error.config),
-        (Error::uncertain("").code, None, false)
-    );
-    assert!(failure("another refusal").config);
 }
 
 pub static KEYS: Keys = Keys;

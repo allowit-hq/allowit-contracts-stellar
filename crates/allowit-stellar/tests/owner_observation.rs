@@ -409,60 +409,6 @@ fn a_lifetime_reply_says_a_lapse_only_when_it_is_current_and_valid() {
         assert_eq!(error, "Wallet lifetime instance names another executable");
     }
 }
-/// A reply with an entry under another key, a second entry of a key or an entry of another
-/// contract is an invalid reply, by the first words of its error. An entry that the network does
-/// not hold is no invalid reply.
-#[test]
-fn a_reply_with_a_wrong_key_a_duplicate_or_a_foreign_entry_is_an_invalid_reply() {
-    const INVALID: &str = "Invalid wallet lifetime reply";
-    let read = |change: &dyn Fn(&mut Value)| {
-        let (hash, mut entries) = lifetime_entries();
-        change(&mut entries);
-        rpc::wallet_lifetime(
-            &Lifetime { entries, head: 120 },
-            "stellar:testnet",
-            &wallet(),
-            &hash,
-        )
-        .map(|l| l.ledger)
-        .unwrap_err()
-    };
-    // Entry 0 is the code, entry 1 the setting, entry 2 the instance.
-    let another = stellar_strkey::Contract([8; 32]).to_string();
-    for (case, change) in [
-        (
-            "an entry under another key",
-            &(|e: &mut Value| e["entries"][0]["key"] = json!("other-key")) as &dyn Fn(&mut Value),
-        ),
-        ("a key that is no text", &|e| {
-            e["entries"][2]["key"] = json!(7)
-        }),
-        ("a second entry of the code", &|e| {
-            e["entries"][2] = e["entries"][0].clone()
-        }),
-        ("the instance of another contract", &|e| {
-            let instance = x::LedgerEntryData::ContractData(x::ContractDataEntry {
-                ext: x::ExtensionPoint::V0,
-                contract: address(&another),
-                key: x::ScVal::LedgerKeyContractInstance,
-                durability: x::ContractDataDurability::Persistent,
-                val: x::ScVal::ContractInstance(x::ScContractInstance {
-                    executable: x::ContractExecutable::Wasm(x::Hash([7; 32])),
-                    storage: None,
-                }),
-            });
-            e["entries"][2]["xdr"] = json!(enc(&instance));
-        }),
-    ] {
-        let error = read(change);
-        assert!(error.starts_with(INVALID), "{case}: {error}");
-    }
-    // The network does not hold the code: the reply is valid, and the code is missing.
-    let absent = read(&|e| {
-        e["entries"].as_array_mut().unwrap().remove(0);
-    });
-    assert!(!absent.starts_with(INVALID), "{absent}");
-}
 #[test]
 fn lifetime_rejects_missing_expired_foreign_duplicate_and_inconsistent_entries() {
     for variant in 0..7 {

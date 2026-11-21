@@ -1066,14 +1066,23 @@ impl Provider {
                     Err(lapsed())
                 }
             }
-            Err(read) => {
-                let failed = crate::provider::failure(read);
-                let mut uncertain = Error::uncertain(failed.message);
-                if failed.code == crate::provider::NETWORK_UNAVAILABLE {
-                    uncertain.code = failed.code;
-                }
-                Err(uncertain)
+            Err(read) => Err(at_send(read)),
+        }
+    }
+    /// The lifetime of the contract wallet of `c` for a preparation: its entries when the
+    /// wallet is live at the head that closes the read. A lapsed wallet is refused with
+    /// `CONTRACT_EXPIRED`, a wallet whose instance runs other code with
+    /// [`rpc::owner_observation::OTHER_EXECUTABLE`], and an exit of the read is answered by its
+    /// class ([`at_preparation`]).
+    fn prepared_lifetime(&self, c: &WalletConfig) -> Result<rpc::WalletLifetime> {
+        use rpc::owner_observation::{PreparedLifetime, prepared_lifetime};
+        match prepared_lifetime(self.rpc(), &c.network, &c.wallet, &c.module_digest) {
+            Ok(PreparedLifetime::Live(lifetime)) => Ok(lifetime),
+            Ok(PreparedLifetime::Lapsed) => Err(Error::config(rpc::CONTRACT_EXPIRED)),
+            Ok(PreparedLifetime::OtherExecutable) => {
+                Err(Error::config(rpc::owner_observation::OTHER_EXECUTABLE))
             }
+            Err(read) => Err(at_preparation(read)),
         }
     }
     /// Before the server signs for a policy wallet, require its live instance to run the
@@ -1188,6 +1197,46 @@ fn diagnostic_events(reply: &serde_json::Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+/// A call of the transport that gave no reply: an uncertain error. An endpoint that gave no
+/// answer keeps its code, which the transport's own error states.
+fn transport_error(text: String) -> Error {
+    let failed = crate::provider::failure(text);
+    let mut uncertain = Error::uncertain(failed.message);
+    if failed.code == crate::provider::NETWORK_UNAVAILABLE {
+        uncertain.code = failed.code;
+    }
+    uncertain
+}
+/// The rail's answer to an exit of the lifetime read at a preparation, by the exit's class
+/// alone (the table of [`rpc::owner_observation::Class`]).
+fn at_preparation(read: rpc::owner_observation::ReadExit) -> Error {
+    use rpc::owner_observation::Class;
+    match read.exit.class() {
+        Class::Configuration => Error::config(read.text),
+        Class::Transport => transport_error(read.text),
+        Class::InvalidReply => Error::uncertain(read.text),
+        // The caller prepares once more: the typed code says so.
+        Class::NotCurrent => {
+            let mut stale = Error::config(read.text);
+            stale.api_code =
+                Some(allowit_core::vendor::runtime::STALE_OWNER_OBSERVATION.to_owned());
+            stale
+        }
+        // The rail's refusal: the network does not hold the entry.
+        Class::NotHeld => Error::config(read.text),
+    }
+}
+/// The rail's answer to an exit of the lifetime read at a send, by the exit's class alone (the
+/// table of [`rpc::owner_observation::Class`]). Only the caller's own input is a configuration
+/// error; an entry that the network does not hold is an absence, and an absence is no lapse.
+fn at_send(read: rpc::owner_observation::ReadExit) -> Error {
+    use rpc::owner_observation::Class;
+    match read.exit.class() {
+        Class::Configuration => Error::config(read.text),
+        Class::Transport => transport_error(read.text),
+        Class::InvalidReply | Class::NotCurrent | Class::NotHeld => Error::uncertain(read.text),
+    }
 }
 /// The problem of an error that no simulation fault explains. The refusal of a send to a lapsed
 /// wallet is named by its typed code. An uncertain error is no refusal: its text names nothing,
@@ -1429,12 +1478,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         let code_present = code == rpc::CodeState::Live;
         // A lifetime reads live entries only: lapsed code has none until it is restored.
         let lifetime = if wallet_present && code_present {
-            let l = checked(rpc::wallet_lifetime(
-                self.rpc(),
-                &c.network,
-                &c.wallet,
-                &c.module_digest,
-            ))?;
+            let l = self.prepared_lifetime(&c)?;
             Some(Lifetime {
                 observed_height: u64::from(l.ledger),
                 instance_until: u64::from(l.instance_live_until),
@@ -2068,12 +2112,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                 )?;
                 // A transfer does not call the wallet: its lifetimes are read first, and a wallet
                 // whose instance or code lapsed takes no funds (`CONTRACT_EXPIRED`).
-                checked(rpc::wallet_lifetime(
-                    self.rpc(),
-                    &c.network,
-                    &c.wallet,
-                    &c.module_digest,
-                ))?;
+                self.prepared_lifetime(&c)?;
                 checked(d.fund(&c, units))?
             }
             OwnerAction::Extend => {
@@ -2085,12 +2124,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
                     }
                     .custody(),
                 )?;
-                let l = checked(rpc::wallet_lifetime(
-                    self.rpc(),
-                    &c.network,
-                    &c.wallet,
-                    &c.module_digest,
-                ))?;
+                let l = self.prepared_lifetime(&c)?;
                 checked(d.extend_wallet(&c, checked(l.extend_to())?))?
             }
         };
@@ -6541,6 +6575,70 @@ mod owner_steps {
         );
     }
 
+    /// Each class of an exit of the lifetime read has one answer at a preparation and one at a
+    /// send, whatever the exit and its text: the table of `rpc::owner_observation::Class`.
+    #[test]
+    fn each_class_of_an_exit_has_one_answer_at_a_preparation_and_one_at_a_send() {
+        use rpc::owner_observation::{Class, Exit, ReadExit};
+        let uncertain = Error::uncertain("").code;
+        let stale = allowit_core::vendor::runtime::STALE_OWNER_OBSERVATION;
+        let answer = |error: Error| (error.code, error.api_code, error.config);
+        // The class, an exit of it, and the answers (code, typed code, configuration error).
+        for (class, exit, prepared, sent) in [
+            (
+                Class::Configuration,
+                Exit::WalletAddress,
+                (3, None, true),
+                (3, None, true),
+            ),
+            (
+                Class::Transport,
+                Exit::EntriesCall,
+                (uncertain, None, false),
+                (uncertain, None, false),
+            ),
+            (
+                Class::InvalidReply,
+                Exit::KeyDiffers,
+                (uncertain, None, false),
+                (uncertain, None, false),
+            ),
+            (
+                Class::NotCurrent,
+                Exit::NotCurrent,
+                (3, Some(stale.to_owned()), true),
+                (uncertain, None, false),
+            ),
+            (
+                Class::NotHeld,
+                Exit::CodeNotHeld,
+                (3, None, true),
+                (uncertain, None, false),
+            ),
+        ] {
+            assert_eq!(exit.class(), class);
+            // The text decides nothing: also the text of a refusal or of a lapse.
+            for text in ["an exit", rpc::CONTRACT_EXPIRED, rpc::LAPSED_AT_SEND] {
+                let read = || ReadExit {
+                    exit,
+                    text: text.into(),
+                };
+                assert_eq!(answer(at_preparation(read())), prepared, "{class:?} {text}");
+                assert_eq!(answer(at_send(read())), sent, "{class:?} {text}");
+            }
+        }
+        // A transport that says of itself that the endpoint gave no answer keeps that code.
+        let silent = || ReadExit {
+            exit: Exit::EntriesCall,
+            text: rpc::NETWORK_UNAVAILABLE.into(),
+        };
+        for error in [at_preparation(silent()), at_send(silent())] {
+            assert_eq!(
+                answer(error),
+                (crate::provider::NETWORK_UNAVAILABLE, None, false)
+            );
+        }
+    }
     /// An invalid lifetime reply is an uncertain error at a preparation's read too, as at a
     /// send: the resources of the wallet are not answered from it, and it is no configuration
     /// fault and no lapse. The rows here are those that the single-entry reads before the
