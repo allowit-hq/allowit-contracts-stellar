@@ -438,14 +438,7 @@ pub fn restore(k: Kind, document: Box<RawValue>) -> Result<Packet> {
             decode_packet::<native::owner_intent::OwnerTransaction>(&packet)?;
         }
         Kind::OwnerSigned => {
-            // A restored signed step is the pair that `read_owner_signed` admitted: the signed
-            // bytes are the retained transaction with its owner's signature. Any other pair is
-            // refused here, so that no send or lookup takes one transaction for another.
-            let data: OwnerSignedData = decode_packet(&packet)?;
-            checked(native::owner_intent::validate_signed_owner_transaction(
-                &data.original,
-                owner_payload(&data)?,
-            ))?;
+            decode_packet::<OwnerSignedData>(&packet)?;
         }
         Kind::Receipt => {
             decode_packet::<rpc::VerifiedReceipt>(&packet)?;
@@ -5309,7 +5302,11 @@ mod owner_steps {
     }
     /// A funding of the policy wallet of `c`, signed by its owner, valid until `NOW + 300`.
     fn funding(c: &WalletConfig) -> OwnerSigned {
-        let step = crate::test_support::owner::fund_step(c, 10, NOW);
+        funding_of(c, 10)
+    }
+    /// A funding of `units` of the policy wallet of `c`.
+    fn funding_of(c: &WalletConfig, units: i128) -> OwnerSigned {
+        let step = crate::test_support::owner::fund_step(c, units, NOW);
         signed(
             native::owner_intent::OwnerTransaction {
                 network: NETWORK.into(),
@@ -5377,6 +5374,43 @@ mod owner_steps {
         provider(&steps)
             .validate_owner_signed(&step, late - 1)
             .unwrap();
+    }
+
+    /// A signed step is the pair that `read_owner_signed` admitted: the signed bytes are the
+    /// retained transaction with its owner's signature. A stored pair of one step's record and
+    /// another step's signed bytes is not restored, and no method sends it or looks it up.
+    #[test]
+    fn a_signed_step_whose_bytes_are_not_its_retained_transaction_is_refused() {
+        let c = policy_wallet();
+        let (retained, other) = (funding_of(&c, 10), funding_of(&c, 11));
+        let retained: OwnerSignedData = decode_packet(&retained.0).unwrap();
+        let other: OwnerSignedData = decode_packet(&other.0).unwrap();
+        assert_ne!(
+            retained.original.transaction_hash,
+            other.original.transaction_hash
+        );
+        let mixed = Packet::new(
+            NETWORK,
+            &OwnerSignedData {
+                original: retained.original.clone(),
+                signed_payload: other.signed_payload.clone(),
+            },
+            &PACKETS,
+        )
+        .unwrap();
+        assert!(restore(Kind::OwnerSigned, mixed.document().to_owned()).is_err());
+        let consistent = Packet::new(NETWORK, &retained, &PACKETS).unwrap();
+        restore(Kind::OwnerSigned, consistent.document().to_owned()).unwrap();
+        let steps = Arc::new(Steps::new());
+        let mixed = OwnerSigned(mixed);
+        let provider = provider(&steps);
+        assert!(provider.validate_owner_signed(&mixed, NOW).is_err());
+        assert!(provider.broadcast_owner(&mixed, NOW).is_err());
+        assert!(provider.owner_status(&mixed).is_err());
+        assert!(provider.observe_owner(&mixed).is_err());
+        assert!(provider.owner_step_lapsed(&mixed, 20).is_err());
+        assert!(mixed.info().is_err());
+        assert!(steps.calls.lock().unwrap().is_empty());
     }
 
     /// The check of a signed step reads nothing: it decides by the step's time bound alone, and a
@@ -5464,6 +5498,29 @@ mod owner_steps {
                 *steps.sent_bytes.lock().unwrap(),
                 [String::from_utf8(data.signed_payload).unwrap()]
             );
+        }
+        // After a send that the network did not take, the receipt that the network holds
+        // decides: the step's own receipt, applied or failed, means that it was sent before;
+        // the receipt of another transaction is no answer about this step.
+        let other = funding_of(&c, 11);
+        for send in ["TRY_AGAIN_LATER", "ERROR"] {
+            for (receipt, expected) in [
+                (receipt(&step, true), Status::Submitted),
+                (receipt(&step, false), Status::Submitted),
+                (receipt(&other, true), Status::SubmissionUnknown),
+            ] {
+                let steps = Arc::new(Steps {
+                    send: Some(send),
+                    holds: true,
+                    receipt,
+                    ..Steps::new()
+                });
+                assert_eq!(
+                    provider(&steps).broadcast_owner(&step, NOW).unwrap(),
+                    expected,
+                    "{send}"
+                );
+            }
         }
     }
 
