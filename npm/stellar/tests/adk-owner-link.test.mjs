@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {ADK_OWNER_FRAGMENT, adkAgentPrompt, adkParamLines, parseAdkOwnerLink} from '../dist/adk-owner-link.js';
 import {stellarAssetContractId} from '../dist/stellar-wallet.js';
-import {assets} from '../dist/plugin.js';
+import plugin, {assets} from '../dist/plugin.js';
 
 const proposal = {
   network: 'stellar:testnet', revision: 2, title: 'Pay for access', explanation: 'Use the approved limit.',
@@ -53,6 +53,15 @@ test('a link on each network of the rail opens, in the unit of its own asset, an
   // The Mainnet asset is no unit on Testnet: the amount stays in base units. An alias, or a network that the rail
   // does not list, is refused.
   assert.deepEqual(adkParamLines(mainnet.params, assets('stellar:testnet')).map(line => line.value), ['20000000', usdc]);
+  // The plugin's hook, which the SDK calls with the link's network, reads the assets of that network.
+  assert.deepEqual(plugin.review.paramLines(mainnet.params, 'stellar:pubnet').map(line => line.value), ['2 USDC', 'USDC']);
+  assert.deepEqual(plugin.review.paramLines(mainnet.params, 'stellar:testnet').map(line => line.value), ['20000000', usdc]);
+  // Only a list of one asset address names the unit, as Core reads the rule: several assets, a text entry or a
+  // bare value leave the amount in base units.
+  const xlm = stellarAssetContractId('XLM', null, 'stellar:pubnet');
+  for (const tokens of [{List: [{Addr: usdc}, {Addr: xlm}]}, {List: [{Str: usdc}]}, {Addr: usdc}]) {
+    assert.equal(adkParamLines({payment_limit: {Int: '20000000'}, tokens}, assets('stellar:pubnet'))[0].value, '20000000');
+  }
   for (const network of ['stellar:mainnet', 'stellar-testnet', 'other:mainnet', '']) {
     assert.throws(() => parseReviewLink(fragment({proposal: {...mainnet, network}, workPrompt: 'w'})), /agent policy link is invalid/);
   }

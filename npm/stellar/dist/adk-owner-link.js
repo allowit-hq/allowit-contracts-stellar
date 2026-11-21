@@ -111,15 +111,15 @@ function decimal(units, decimals) {
 }
 const integer = /^-?[0-9]+$/;
 /**
- * The unit of a proposal's amounts: the one listed asset that its `tokens` rule admits, else, for a proposal without
- * that rule, the network's native asset (the first listed). A rule that admits several or unlisted assets gives null.
+ * The unit of a proposal's amounts: the one listed asset that its `tokens` rule admits, a list of one `Addr` as Core
+ * reads it, else, for a proposal without that rule, the network's native asset (the first listed). Any other rule
+ * gives null.
  */
 function unitOf(params, listed) {
     const rule = params.tokens;
     if (rule === undefined)
         return listed[0] ?? null;
-    const tokens = Array.isArray(rule.List) ? rule.List : [rule];
-    const only = tokens.length === 1 ? tokens[0].Addr ?? tokens[0].Str : null;
+    const only = Array.isArray(rule.List) && rule.List.length === 1 ? rule.List[0].Addr : null;
     return listed.find(asset => asset.id === only) ?? null;
 }
 function leaf(semantic, unit, listed) {

@@ -129,14 +129,14 @@ function decimal(units: string, decimals: number): string {
 
 const integer = /^-?[0-9]+$/;
 /**
- * The unit of a proposal's amounts: the one listed asset that its `tokens` rule admits, else, for a proposal without
- * that rule, the network's native asset (the first listed). A rule that admits several or unlisted assets gives null.
+ * The unit of a proposal's amounts: the one listed asset that its `tokens` rule admits, a list of one `Addr` as Core
+ * reads it, else, for a proposal without that rule, the network's native asset (the first listed). Any other rule
+ * gives null.
  */
 function unitOf(params: AdkProposal['params'], listed: readonly ListedAsset[]): ListedAsset | null {
-  const rule = params.tokens as Record<string, unknown> | undefined;
+  const rule = params.tokens as {List?: {Addr?: unknown}[]} | undefined;
   if (rule === undefined) return listed[0] ?? null;
-  const tokens = Array.isArray(rule.List) ? rule.List as Record<string, unknown>[] : [rule];
-  const only = tokens.length === 1 ? tokens[0].Addr ?? tokens[0].Str : null;
+  const only = Array.isArray(rule.List) && rule.List.length === 1 ? rule.List[0].Addr : null;
   return listed.find(asset => asset.id === only) ?? null;
 }
 function leaf(semantic: ParameterSemanticType | undefined, unit: ListedAsset | null, listed: readonly ListedAsset[]): (item: string) => string {
