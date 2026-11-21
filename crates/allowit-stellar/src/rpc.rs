@@ -474,6 +474,10 @@ fn priced_terms(
 /// `CONTRACT_EXPIRED`).
 pub const CONTRACT_EXPIRED: &str =
     "The wallet's instance or code lapsed on the network: nothing restores it";
+/// The refusal of one attempt to send a signed owner step to a wallet whose instance or code
+/// lapsed (Core's `CONTRACT_EXPIRED`). The step is signed, and an earlier attempt of it stays as
+/// it was.
+pub const LAPSED_AT_SEND: &str = "The wallet's instance or code lapsed on the network: this attempt of the owner step is not sent";
 /// Refuse the simulation `value` of a step on the wallet `wallet`, whose code is `code`, when it
 /// would restore that wallet's instance or code, in place or in a separate restoration first
 /// (`CONTRACT_EXPIRED`). A creation names the code of the wallet that it creates and no wallet.

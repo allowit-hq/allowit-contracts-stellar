@@ -113,6 +113,13 @@ pub fn denial(message: &str, contract: Option<&ContractFault>, wallet: &str) -> 
             "The wallet lapsed on the network: nothing restores it, and nothing was signed or sent. Its owner restores it outside Allowit.",
         );
     }
+    if contract.is_none() && message == crate::rpc::LAPSED_AT_SEND {
+        return coded(
+            409,
+            allowit_core::vendor::runtime::CONTRACT_EXPIRED,
+            "The wallet lapsed on the network, and this attempt of the owner step was not sent. An earlier attempt of the step stays as it was. Its owner restores the wallet outside Allowit.",
+        );
+    }
     if contract.is_none() && message == crate::rpc::PARAMS_DIFFER {
         return coded(
             409,

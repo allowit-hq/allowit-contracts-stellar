@@ -1054,10 +1054,11 @@ impl Provider {
                 if l.instance_live_until >= l.ledger && l.code_live_until >= l.ledger {
                     Ok(())
                 } else {
-                    // The text that `problem` names `contract_expired`, as at a preparation.
+                    // A text that `problem` names `contract_expired` too. It is of this attempt:
+                    // the step is signed, and an earlier send of it stays as it was.
                     Err(Error::coded(
                         allowit_core::vendor::runtime::CONTRACT_EXPIRED,
-                        rpc::CONTRACT_EXPIRED,
+                        rpc::LAPSED_AT_SEND,
                     ))
                 }
             }
@@ -2221,20 +2222,29 @@ impl crate::host::vendors::RuntimeProvider for Provider {
     /// wallet: its owner restores it on the ledger outside Allowit, and the next read then
     /// finds it live. A keypair wallet has no lifetime, and a step without an installation, as
     /// a creation, is not read.
+    ///
+    /// The read takes time, and `now` is the caller's clock before it. So the time bound is
+    /// checked again after a read, at `now` plus the whole seconds that the read took, rounded
+    /// up: a step is never sent past its bound because its wallet was read first.
     fn validate_owner_signed(
         &self,
         p: &OwnerSigned,
         on: Option<&Installation>,
         now: u64,
     ) -> Result<()> {
+        let started = std::time::Instant::now();
         self.network(p.network())?;
         let data: OwnerSignedData = decode_packet(&p.0)?;
-        if now >= data.original.expires_at {
-            return Err(Error::coded(
-                OWNER_TRANSACTION_EXPIRED,
-                "The owner step is at or past its time bound: it is not sent again.",
-            ));
-        }
+        let bound = |at: u64| {
+            if at >= data.original.expires_at {
+                return Err(Error::coded(
+                    OWNER_TRANSACTION_EXPIRED,
+                    "The owner step is at or past its time bound: it is not sent again.",
+                ));
+            }
+            Ok(())
+        };
+        bound(now)?;
         let Some(installation) = on else {
             return Ok(());
         };
@@ -2245,7 +2255,12 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         {
             return Ok(());
         }
-        self.live_at_send(&c)
+        self.live_at_send(&c)?;
+        let spent = started.elapsed();
+        bound(
+            now.saturating_add(spent.as_secs())
+                .saturating_add(u64::from(spent.subsec_nanos() > 0)),
+        )
     }
     /// Send the signed owner step once, after [`Self::validate_owner_signed`]. A step that the
     /// network did not take now, by a rejection or by `TRY_AGAIN_LATER`, was sent before when
@@ -5380,6 +5395,8 @@ mod owner_steps {
         running_absent: bool,
         /// From the second read of its entries on, the instance runs yet other code.
         running_changes: bool,
+        /// How long a read of the wallet's lifetime entries takes.
+        entries_take: std::time::Duration,
     }
     impl Steps {
         fn new() -> Self {
@@ -5401,6 +5418,7 @@ mod owner_steps {
                 running: None,
                 running_absent: false,
                 running_changes: false,
+                entries_take: std::time::Duration::ZERO,
             }
         }
         fn sent(&self) -> bool {
@@ -5443,6 +5461,7 @@ mod owner_steps {
                     }
                 }
                 "getLedgerEntries" => {
+                    std::thread::sleep(self.entries_take);
                     if let Some(failure) = self.entries_fail {
                         return Err(failure.into());
                     }
@@ -5974,7 +5993,16 @@ mod owner_steps {
                 ] {
                     let refused = refused.unwrap_err();
                     assert_eq!(refused.api_code.as_deref(), Some(LAPSED), "{lifetime:?}");
-                    assert_eq!(provider(&steps).problem(&refused).code, LAPSED);
+                    // The adapter names the refusal too, as one of this attempt: the step is
+                    // signed, so its text does not say that nothing was signed.
+                    let problem = provider(&steps).problem(&refused);
+                    assert_eq!((problem.status, problem.code), (409, LAPSED));
+                    assert!(
+                        problem.message.contains("this attempt"),
+                        "{}",
+                        problem.message
+                    );
+                    assert!(!problem.message.contains("signed"), "{}", problem.message);
                 }
                 assert!(!steps.sent());
             }
@@ -6020,6 +6048,54 @@ mod owner_steps {
                 .api_code
                 .as_deref(),
             Some(OWNER_TRANSACTION_EXPIRED)
+        );
+        assert_eq!(entry_reads(&steps), 0);
+    }
+
+    /// The read of the wallet takes time, and the caller's clock is of the moment before it: the
+    /// time bound is checked again after the read, at that clock plus the time of the read
+    /// rounded up to a second. A step whose bound passes during the read is not sent, and the
+    /// last second before a bound sends nothing after a read. A step that is not read, as the
+    /// renewal, keeps its own clock.
+    #[test]
+    fn a_step_whose_bound_passes_during_the_read_of_its_wallet_is_not_sent() {
+        let c = deployed_wallet();
+        let installation = installed(&c);
+        let on = Some(&installation);
+        let step = funding(&c);
+        let late = step.info().unwrap().expires_at;
+        let expired = |steps: &Arc<Steps>, at: u64| {
+            let refused = provider(steps)
+                .broadcast_owner(&step, on, at)
+                .map(drop)
+                .unwrap_err();
+            assert_eq!(refused.api_code.as_deref(), Some(OWNER_TRANSACTION_EXPIRED));
+            assert_eq!(entry_reads(steps), 1);
+            assert!(!steps.sent());
+        };
+        // A read of a live wallet that takes more than a second counts as two, and the step is
+        // refused two seconds before its bound, where a quick read sends it (below).
+        let slow = Arc::new(Steps {
+            entries_take: std::time::Duration::from_millis(1_050),
+            ..Steps::new()
+        });
+        expired(&slow, late - 2);
+        // A quick read counts as a second: the last second before the bound sends nothing.
+        expired(&Arc::new(Steps::new()), late - 1);
+        let steps = Arc::new(Steps::new());
+        assert_eq!(
+            provider(&steps)
+                .broadcast_owner(&step, on, late - 2)
+                .unwrap(),
+            Status::Submitted
+        );
+        // The renewal is not read: it is sent in its last second.
+        let steps = Arc::new(Steps::new());
+        assert_eq!(
+            provider(&steps)
+                .broadcast_owner(&renewal(&c), on, late - 1)
+                .unwrap(),
+            Status::Submitted
         );
         assert_eq!(entry_reads(&steps), 0);
     }
