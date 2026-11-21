@@ -3916,24 +3916,36 @@ mod keypair_wallet_owner_tests {
             .unwrap();
         assert_eq!(close.info().unwrap().action, "close");
         assert!(!provider.wallet_closed(&installation).unwrap());
-        /// An endpoint of the network `0` that answers an account read with `1`.
-        struct Gone(&'static str, serde_json::Value);
+        /// An endpoint of the network `0` that answers a read of the account `2` with `1`, and
+        /// of no other account: after a close the owner's account is still there.
+        struct Gone(&'static str, serde_json::Value, String);
         impl rpc::Rpc for Gone {
             fn call(
                 &self,
                 method: &str,
-                _: serde_json::Value,
+                params: serde_json::Value,
             ) -> native::Result<serde_json::Value> {
                 match method {
                     "getNetwork" => {
                         Ok(serde_json::json!({"passphrase": native::passphrase(self.0)?}))
                     }
                     "getLatestLedger" => Ok(serde_json::json!({"sequence": 120})),
-                    "getLedgerEntries" => Ok(self.1.clone()),
-                    _ => Err(format!("Unexpected call {method}")),
+                    "getLedgerEntries" if params["keys"] == serde_json::json!([self.2]) => {
+                        Ok(self.1.clone())
+                    }
+                    _ => Err(format!("Unexpected call {method} {params}")),
                 }
             }
         }
+        let wallet = native::xdr(&stellar_xdr::LedgerKey::Account(
+            stellar_xdr::LedgerKeyAccount {
+                account_id: stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                    stellar_xdr::Uint256(native::account_key(&c.wallet).unwrap()),
+                )),
+            },
+        ))
+        .unwrap();
+        assert_ne!(c.wallet, c.owner);
         let network: &'static str = if c.network == "stellar:testnet" {
             "stellar:testnet"
         } else {
@@ -3946,18 +3958,25 @@ mod keypair_wallet_owner_tests {
             serde_json::json!({"latestLedger": 120}),
             serde_json::json!({"latestLedger": 120, "entries": null}),
         ] {
-            let gone = Provider::from_rpc(&c.network, Arc::new(Gone(network, found_none)));
+            let gone = Provider::from_rpc(
+                &c.network,
+                Arc::new(Gone(network, found_none, wallet.clone())),
+            );
             assert!(gone.wallet_closed(&installation).unwrap());
         }
         // A reply with neither a list nor a ledger is no answer.
         for malformed in [serde_json::json!({}), serde_json::json!({"entries": 1})] {
-            let unread = Provider::from_rpc(&c.network, Arc::new(Gone(network, malformed)));
+            let unread = Provider::from_rpc(
+                &c.network,
+                Arc::new(Gone(network, malformed, wallet.clone())),
+            );
             assert!(unread.wallet_closed(&installation).is_err());
         }
         // An account that is absent from another network says nothing about this wallet, and no
         // close is prepared from another network's state: the transport's network is refused
         // before any account is read.
-        let elsewhere = Provider::from_rpc(&c.network, Arc::new(Gone("stellar:pubnet", empty)));
+        let elsewhere =
+            Provider::from_rpc(&c.network, Arc::new(Gone("stellar:pubnet", empty, wallet)));
         for refused in [
             elsewhere.wallet_closed(&installation).map(drop),
             elsewhere
@@ -5187,6 +5206,8 @@ mod owner_steps {
         /// The transaction hashes that were looked up.
         looked_up: Mutex<Vec<String>>,
         calls: Mutex<Vec<String>>,
+        /// The `transaction` argument of each send.
+        sent_bytes: Mutex<Vec<String>>,
         receipt: serde_json::Value,
     }
     impl Steps {
@@ -5198,6 +5219,7 @@ mod owner_steps {
                 closed_at: NOW + 1_000,
                 looked_up: Mutex::new(Vec::new()),
                 calls: Mutex::new(Vec::new()),
+                sent_bytes: Mutex::new(Vec::new()),
                 receipt: serde_json::Value::Null,
             }
         }
@@ -5227,10 +5249,9 @@ mod owner_steps {
                 "getNetwork" => serde_json::json!({"passphrase": native::passphrase(NETWORK)?}),
                 "getLatestLedger" => serde_json::json!({"sequence": 120}),
                 "sendTransaction" => {
-                    let hash = native::hex(&rpc::signed_transaction_hash(
-                        NETWORK,
-                        params["transaction"].as_str().unwrap(),
-                    )?);
+                    let bytes = params["transaction"].as_str().unwrap();
+                    self.sent_bytes.lock().unwrap().push(bytes.into());
+                    let hash = native::hex(&rpc::signed_transaction_hash(NETWORK, bytes)?);
                     match self.send {
                         Some(status) => serde_json::json!({"hash": hash, "status": status}),
                         None => return Err("sendTransaction: the endpoint is unreachable".into()),
@@ -5297,15 +5318,30 @@ mod owner_steps {
     fn provider(steps: &Arc<Steps>) -> Provider {
         Provider::from_rpc(NETWORK, steps.clone())
     }
-    /// The receipt of the step `p`, as the endpoint holds it.
+    /// The receipt of the applied step `p`, as the endpoint holds it.
     fn confirmed(p: &OwnerSigned) -> serde_json::Value {
+        receipt(p, true)
+    }
+    /// The receipt of the step `p`, applied or failed, as the endpoint holds it.
+    fn receipt(p: &OwnerSigned, applied: bool) -> serde_json::Value {
         let data: OwnerSignedData = decode_packet(&p.0).unwrap();
+        let (status, outcome) = if applied {
+            (
+                "SUCCESS",
+                x::TransactionResultResult::TxSuccess(Default::default()),
+            )
+        } else {
+            (
+                "FAILED",
+                x::TransactionResultResult::TxFailed(Default::default()),
+            )
+        };
         let result = x::TransactionResult {
             fee_charged: 100,
-            result: x::TransactionResultResult::TxSuccess(Default::default()),
+            result: outcome,
             ext: x::TransactionResultExt::V0,
         };
-        serde_json::json!({"status": "SUCCESS", "txHash": native::hex(&data.original.transaction_hash),
+        serde_json::json!({"status": status, "txHash": native::hex(&data.original.transaction_hash),
             "ledger": 110, "envelopeXdr": String::from_utf8(data.signed_payload).unwrap(),
             "resultXdr": native::xdr(&result).unwrap()})
     }
@@ -5317,14 +5353,16 @@ mod owner_steps {
         let step = funding(&c);
         let steps = Arc::new(Steps::new());
         let late = step.info().unwrap().expires_at;
-        for result in [
-            provider(&steps).validate_owner_signed(&step, late),
-            provider(&steps).broadcast_owner(&step, late).map(drop),
-        ] {
-            assert_eq!(
-                result.unwrap_err().api_code.as_deref(),
-                Some(OWNER_TRANSACTION_EXPIRED)
-            );
+        for at in [late, late + 1] {
+            for result in [
+                provider(&steps).validate_owner_signed(&step, at),
+                provider(&steps).broadcast_owner(&step, at).map(drop),
+            ] {
+                assert_eq!(
+                    result.unwrap_err().api_code.as_deref(),
+                    Some(OWNER_TRANSACTION_EXPIRED)
+                );
+            }
         }
         assert!(!steps.sent());
         provider(&steps)
@@ -5407,30 +5445,51 @@ mod owner_steps {
                 .filter(|m| *m == "sendTransaction")
                 .count();
             assert_eq!(sends, 1);
+            // What is sent is the owner's signed bytes, not the step as it was prepared.
+            let data: OwnerSignedData = decode_packet(&step.0).unwrap();
+            assert_ne!(
+                data.signed_payload,
+                data.original.transaction_xdr.as_bytes()
+            );
+            assert_eq!(
+                *steps.sent_bytes.lock().unwrap(),
+                [String::from_utf8(data.signed_payload).unwrap()]
+            );
         }
     }
 
-    /// A lookup answers `Submitted` when the network holds the step's transaction, and
-    /// `SubmissionUnknown` otherwise; the receipt itself is `observe_owner`'s.
+    /// A lookup answers `Submitted` when the network holds the step's transaction, applied or
+    /// failed, and `SubmissionUnknown` when it holds none; the receipt itself is
+    /// `observe_owner`'s. A lookup that fails is an error, and no lookup sends.
     #[test]
     fn a_step_is_looked_up_with_no_final_status() {
         let c = policy_wallet();
         let step = funding(&c);
-        let held = Arc::new(Steps {
-            holds: true,
-            receipt: confirmed(&step),
-            ..Steps::new()
-        });
-        assert_eq!(
-            provider(&held).owner_status(&step).unwrap(),
-            Status::Submitted
-        );
-        assert!(provider(&held).observe_owner(&step).unwrap().is_some());
+        for applied in [true, false] {
+            let held = Arc::new(Steps {
+                holds: true,
+                receipt: receipt(&step, applied),
+                ..Steps::new()
+            });
+            assert_eq!(
+                provider(&held).owner_status(&step).unwrap(),
+                Status::Submitted,
+                "{applied}"
+            );
+            assert!(provider(&held).observe_owner(&step).unwrap().is_some());
+            assert!(!held.sent());
+        }
         let unknown = Arc::new(Steps::new());
         assert_eq!(
             provider(&unknown).owner_status(&step).unwrap(),
             Status::SubmissionUnknown
         );
+        let unread = Arc::new(Steps {
+            reads_fail: true,
+            ..Steps::new()
+        });
+        assert!(provider(&unread).owner_status(&step).is_err());
+        assert!(!unknown.sent() && !unread.sent());
     }
 
     /// A signed step's identity is its transaction hash, and its lapse is proven by that hash
