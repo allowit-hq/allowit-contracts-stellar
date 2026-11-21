@@ -315,6 +315,9 @@ pub fn lifetime_read(
     let before = head(rpc)?;
     let response = rpc.call("getLedgerEntries", json!({"keys":encoded}))?;
     let (observed, max, entries) = valid_lifetime_reply(&response)?;
+    // An entry of another key, an entry under another key and a second entry of a key make an
+    // invalid reply too. An entry that the network does not hold is no invalid reply.
+    let invalid = |reason: &str| format!("{INVALID_REPLY}: {reason}");
     let mut setting = false;
     let mut instance = None;
     let mut executable = None;
@@ -345,20 +348,24 @@ pub fn lifetime_read(
             {
                 (&code_key, 2)
             }
-            _ => return Err("Wallet lifetime entry differs from the exact selected keys".into()),
+            _ => {
+                return Err(invalid(
+                    "Wallet lifetime entry differs from the exact selected keys",
+                ));
+            }
         };
         if entry
             .key
             .is_some_and(|key| Some(key.as_str()) != xdr(expected).ok().as_deref())
         {
-            return Err("Wallet lifetime response ledger key differs".into());
+            return Err(invalid("Wallet lifetime response ledger key differs"));
         }
         match slot {
             1 if instance.replace((entry.live_until, entry.life)).is_some() => {
-                return Err("Duplicate wallet instance lifetime".into());
+                return Err(invalid("Duplicate wallet instance lifetime"));
             }
             2 if executable.replace((entry.live_until, entry.life)).is_some() => {
-                return Err("Duplicate wallet code lifetime".into());
+                return Err(invalid("Duplicate wallet code lifetime"));
             }
             _ => {}
         }

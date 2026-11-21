@@ -5408,6 +5408,8 @@ mod owner_steps {
         modified: Option<u32>,
         /// The reply gives the instance entry no change ledger.
         unchanged: bool,
+        /// The reply of the three lifetime entries gives the instance entry under another key.
+        other_key: bool,
         /// The read of the wallet's lifetime entries fails with this text.
         entries_fail: Option<&'static str>,
         /// The read of the wallet's lifetime entries gives no code entry.
@@ -5436,6 +5438,7 @@ mod owner_steps {
                 closing: 120,
                 modified: None,
                 unchanged: false,
+                other_key: false,
                 entries_fail: None,
                 entries_lack_code: false,
                 running: None,
@@ -5546,6 +5549,9 @@ mod owner_steps {
                                 let mut instance = entry(&instance, self.lifetime.0);
                                 if let Some(modified) = self.modified {
                                     instance["lastModifiedLedgerSeq"] = modified.into();
+                                }
+                                if self.other_key && params["keys"].as_array().unwrap().len() == 3 {
+                                    instance["key"] = "another key".into();
                                 }
                                 if self.unchanged {
                                     instance
@@ -6435,6 +6441,14 @@ mod owner_steps {
                 uncertain,
             ),
             (
+                "an entry comes under another key",
+                Steps {
+                    other_key: true,
+                    ..Steps::new()
+                },
+                uncertain,
+            ),
+            (
                 "an entry has no change ledger",
                 Steps {
                     unchanged: true,
@@ -6546,6 +6560,10 @@ mod owner_steps {
             },
             Steps {
                 lifetime: (520, 2_120),
+                ..Steps::new()
+            },
+            Steps {
+                other_key: true,
                 ..Steps::new()
             },
         ] {
