@@ -187,15 +187,18 @@ pub struct LifetimeEntries {
 pub enum LifetimeRead {
     /// The instance runs the code that was asked for: both entries, of one ledger.
     Entries(LifetimeEntries),
-    /// The instance runs this other code. The reply says nothing of that code's lifetime.
-    OtherExecutable([u8; 32]),
+    /// The instance runs the other code `running`. The reply says nothing of that code's
+    /// lifetime. `closing` is the head that closed the read: a later read of that code is of
+    /// that ledger or a later one.
+    OtherExecutable { running: [u8; 32], closing: u32 },
 }
 /// Read the instance of `wallet`, the entry of `code` and the network's archival limit in one
 /// reply, and bind each returned entry to the key that was asked for. The reply is current
 /// ([`current`]) before anything of it is used: a reply that is older than the head before it, or
 /// that trails the closing head by more than [`MAX_OBSERVATION_LAG`], is a stale observation. A
-/// missing entry, a malformed reply, an entry that the reply dates after its own ledger and a
-/// lifetime beyond the network's limit are errors of their own. Nothing here says that an entry
+/// missing entry, a malformed reply, an entry that the reply dates after its own ledger or after
+/// the entry's own last live ledger, and a lifetime beyond the network's limit are errors of
+/// their own. Nothing here says that an entry
 /// lapsed: the caller compares the last live ledgers with the ledger that it decides for.
 pub fn lifetime_read(
     rpc: &dyn Rpc,
@@ -225,11 +228,11 @@ pub fn lifetime_read(
     let mut other = None;
     for entry in entries {
         // An entry that changed after the reply's own ledger contradicts the reply.
-        if entry
-            .get("lastModifiedLedgerSeq")
-            .is_some_and(|modified| !modified.is_null())
-            && ledger(&entry["lastModifiedLedgerSeq"])? > observed
-        {
+        let modified = match entry.get("lastModifiedLedgerSeq") {
+            Some(modified) if !modified.is_null() => Some(ledger(modified)?),
+            _ => None,
+        };
+        if modified.is_some_and(|modified| modified > observed) {
             return Err("Wallet lifetime entry is newer than its reply".into());
         }
         let data: LedgerEntryData =
@@ -279,6 +282,14 @@ pub fn lifetime_read(
         {
             return Err("Wallet lifetime response ledger key differs".into());
         }
+        // An entry is live at the ledger that changes it: a last live ledger before its last
+        // change contradicts itself. An archived entry has no last live ledger.
+        if let (Some(modified), Some(until)) = (modified, ttl)
+            && until > 0
+            && modified > until
+        {
+            return Err("Wallet lifetime entry changed after its last live ledger".into());
+        }
         match slot {
             1 if instance.replace(ttl.unwrap()).is_some() => {
                 return Err("Duplicate wallet instance lifetime".into());
@@ -295,7 +306,7 @@ pub fn lifetime_read(
     if let Some(running) = other {
         // The code that was asked for is not the wallet's: its entry, present or not, says
         // nothing of the wallet.
-        return Ok(LifetimeRead::OtherExecutable(running));
+        return Ok(LifetimeRead::OtherExecutable { running, closing });
     }
     let code = executable.ok_or("Missing wallet code lifetime")?;
     if observed.checked_add(max - 1).is_none()
@@ -325,7 +336,7 @@ pub fn wallet_lifetime(
 ) -> Result<WalletLifetime> {
     let entries = match lifetime_read(rpc, selected_network, wallet, code)? {
         LifetimeRead::Entries(entries) => entries,
-        LifetimeRead::OtherExecutable(_) => return Err(OTHER_EXECUTABLE.into()),
+        LifetimeRead::OtherExecutable { .. } => return Err(OTHER_EXECUTABLE.into()),
     };
     if entries.instance_live_until < entries.closing || entries.code_live_until < entries.closing {
         return Err(super::CONTRACT_EXPIRED.into());

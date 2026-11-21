@@ -1041,12 +1041,18 @@ impl Provider {
     /// outside Allowit still takes its owner's steps, so it lives by that code and not by the
     /// installation's. The first reply then only names the code that the instance runs, and a
     /// second reply, of the instance with that code, decides as above. An instance that runs yet
-    /// other code in the second reply is no answer.
+    /// other code in the second reply is no answer, and neither is a second reply of an earlier
+    /// ledger than the head that closed the first read.
     fn live_at_send(&self, c: &WalletConfig) -> Result<()> {
         use rpc::owner_observation::{LifetimeRead, lifetime_read};
         let read = |code: &[u8; 32]| lifetime_read(self.rpc(), &c.network, &c.wallet, code);
         let entries = match read(&c.module_digest) {
-            Ok(LifetimeRead::OtherExecutable(running)) => read(&running),
+            Ok(LifetimeRead::OtherExecutable { running, closing }) => match read(&running) {
+                Ok(LifetimeRead::Entries(second)) if second.ledger < closing => Err(
+                    "The reply of the wallet's code is older than the read that named it".into(),
+                ),
+                second => second,
+            },
             first => first,
         };
         match entries {
@@ -1062,7 +1068,7 @@ impl Provider {
                     ))
                 }
             }
-            Ok(LifetimeRead::OtherExecutable(_)) => Err(Error::uncertain(
+            Ok(LifetimeRead::OtherExecutable { .. }) => Err(Error::uncertain(
                 "The wallet's code changed during the read of its lifetime",
             )),
             Err(read) => {
@@ -2225,7 +2231,9 @@ impl crate::host::vendors::RuntimeProvider for Provider {
     ///
     /// The read takes time, and `now` is the caller's clock before it. So the time bound is
     /// checked again after a read, at `now` plus the whole seconds that the read took, rounded
-    /// up: a step is never sent past its bound because its wallet was read first.
+    /// up: a step is never sent past its bound because its wallet was read first. That check
+    /// comes before the read's own answer: a step whose bound passed during the read is expired
+    /// for good, whatever the read said of its wallet.
     fn validate_owner_signed(
         &self,
         p: &OwnerSigned,
@@ -2255,12 +2263,13 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         {
             return Ok(());
         }
-        self.live_at_send(&c)?;
+        let live = self.live_at_send(&c);
         let spent = started.elapsed();
         bound(
             now.saturating_add(spent.as_secs())
                 .saturating_add(u64::from(spent.subsec_nanos() > 0)),
-        )
+        )?;
+        live
     }
     /// Send the signed owner step once, after [`Self::validate_owner_signed`]. A step that the
     /// network did not take now, by a rejection or by `TRY_AGAIN_LATER`, was sent before when
@@ -6082,6 +6091,17 @@ mod owner_steps {
         expired(&slow, late - 2);
         // A quick read counts as a second: the last second before the bound sends nothing.
         expired(&Arc::new(Steps::new()), late - 1);
+        // The bound comes before the read's own answer: a lapse that the read shows, and a read
+        // that fails, answer as an expired step once the bound passed during the read.
+        for (lifetime, fails) in [((0, 0), None), ((520, 1_119), Some("The endpoint failed"))] {
+            let slow = Arc::new(Steps {
+                entries_take: std::time::Duration::from_millis(1_050),
+                lifetime,
+                entries_fail: fails,
+                ..Steps::new()
+            });
+            expired(&slow, late - 2);
+        }
         let steps = Arc::new(Steps::new());
         assert_eq!(
             provider(&steps)
@@ -6174,13 +6194,17 @@ mod owner_steps {
                 );
                 assert!(!steps.sent());
             }
-            // A network without that code, and an instance that runs yet other code in the
-            // second reply, are no answer.
-            for (absent, changes) in [(true, false), (false, true)] {
+            // A network without that code, an instance that runs yet other code in the second
+            // reply, and a second reply of ledger 120 after the first read closed at head 125
+            // are no answer.
+            for (absent, changes, closing) in
+                [(true, false, 120), (false, true, 120), (false, false, 125)]
+            {
                 let steps = Arc::new(Steps {
                     running: Some(OTHER),
                     running_absent: absent,
                     running_changes: changes,
+                    closing,
                     ..Steps::new()
                 });
                 let error = provider(&steps)
@@ -6189,7 +6213,7 @@ mod owner_steps {
                 assert_eq!(
                     (error.code, error.api_code),
                     (Error::uncertain("").code, None),
-                    "{absent} {changes}"
+                    "{absent} {changes} {closing}"
                 );
                 assert_eq!(entry_reads(&steps), 2);
                 assert!(!steps.sent());
@@ -6265,6 +6289,15 @@ mod owner_steps {
                 "the reply dates an entry after its own ledger",
                 Steps {
                     modified: Some(121),
+                    ..Steps::new()
+                },
+                uncertain,
+            ),
+            (
+                "an entry changed after its last live ledger",
+                Steps {
+                    modified: Some(120),
+                    lifetime: (119, 1_119),
                     ..Steps::new()
                 },
                 uncertain,

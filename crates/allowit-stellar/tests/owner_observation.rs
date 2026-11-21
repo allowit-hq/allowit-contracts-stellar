@@ -299,6 +299,14 @@ fn a_lifetime_reply_says_a_lapse_only_when_it_is_current_and_valid() {
             120,
         ),
         (
+            "an entry that changed after its last live ledger",
+            &|e| {
+                e["entries"][2]["liveUntilLedgerSeq"] = json!(119);
+                e["entries"][2]["lastModifiedLedgerSeq"] = json!(120);
+            },
+            120,
+        ),
+        (
             "an entry dated after its reply",
             &|e| {
                 archive(e, 2);
