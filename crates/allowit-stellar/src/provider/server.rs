@@ -816,6 +816,8 @@ impl Provider {
         now: u64,
     ) -> Result<OwnerPacket> {
         use native::owner::WalletAction;
+        // Every step is built from the wallet's state on its own network.
+        checked(rpc::owner_observation::network(self.rpc(), &c.network))?;
         let asset = checked(native::asset_xdr(c))?;
         let units = |units: i128| {
             i64::try_from(units).map_err(|_| Error::usage("The amount exceeds the native range"))
@@ -1330,7 +1332,9 @@ impl crate::host::vendors::RuntimeProvider for Provider {
     fn resources(&self, i: &Installation) -> Result<Resources> {
         let c = self.config(i)?;
         if c.route == WalletRoute::Native {
-            // A keypair wallet has no code and no lifetime: it is present when its account is.
+            // A keypair wallet has no code and no lifetime: it is present when its account is,
+            // on its own network: an account that is absent from another network says nothing.
+            checked(rpc::owner_observation::network(self.rpc(), &c.network))?;
             return Ok(Resources {
                 code_present: true,
                 wallet_present: checked(rpc::account_present(self.rpc(), &c.wallet))?,
@@ -4022,6 +4026,35 @@ mod keypair_wallet_owner_tests {
             assert_eq!(
                 refused.unwrap_err().message,
                 "Runtime transport network differs"
+            );
+        }
+        // The same for the wallet's resources and for every owner step that is prepared from the
+        // wallet's state, the close among them.
+        for refused in [
+            elsewhere.resources(&installation).map(drop),
+            elsewhere
+                .prepare_owner(
+                    &installation,
+                    OwnerAction::Recover {
+                        units: None,
+                        recipient: None,
+                    },
+                    100_000,
+                    86_401,
+                )
+                .map(drop),
+            elsewhere
+                .prepare_owner(
+                    &installation,
+                    OwnerAction::Fund { units: 5 },
+                    100_000,
+                    86_401,
+                )
+                .map(drop),
+        ] {
+            assert_eq!(
+                refused.unwrap_err().message,
+                "Owner observation RPC network differs"
             );
         }
     }
