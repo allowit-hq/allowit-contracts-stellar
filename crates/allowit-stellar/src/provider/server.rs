@@ -6194,6 +6194,22 @@ mod owner_steps {
                 );
                 assert!(!steps.sent());
             }
+            // A first reply whose instance claims a lifetime beyond the network's limit (2,000
+            // ledgers from ledger 120) is no answer either, and no second read follows it.
+            let steps = Arc::new(Steps {
+                running: Some(OTHER),
+                lifetime: (2_120, 1_119),
+                ..Steps::new()
+            });
+            let error = provider(&steps)
+                .broadcast_owner(&step, on, NOW)
+                .unwrap_err();
+            assert_eq!(
+                (error.code, error.api_code),
+                (Error::uncertain("").code, None)
+            );
+            assert_eq!(entry_reads(&steps), 1);
+            assert!(!steps.sent());
             // A network without that code, an instance that runs yet other code in the second
             // reply, and a second reply of ledger 120 after the first read closed at head 125
             // are no answer.

@@ -303,16 +303,18 @@ pub fn lifetime_read(
     let max = max.ok_or("Missing archival lifetime setting")?;
     let instance = instance.ok_or("Missing wallet instance lifetime")?;
     let closing = current(rpc, before, observed)?;
+    let within_limit = |until: u32| until.saturating_sub(observed) < max;
+    // The instance's lifetime is checked before the reply names other code, too.
+    if observed.checked_add(max - 1).is_none() || !within_limit(instance) {
+        return Err("Wallet lifetime exceeds the network limit".into());
+    }
     if let Some(running) = other {
         // The code that was asked for is not the wallet's: its entry, present or not, says
         // nothing of the wallet.
         return Ok(LifetimeRead::OtherExecutable { running, closing });
     }
     let code = executable.ok_or("Missing wallet code lifetime")?;
-    if observed.checked_add(max - 1).is_none()
-        || instance.saturating_sub(observed) >= max
-        || code.saturating_sub(observed) >= max
-    {
+    if !within_limit(code) {
         return Err("Wallet lifetime exceeds the network limit".into());
     }
     Ok(LifetimeRead::Entries(LifetimeEntries {
