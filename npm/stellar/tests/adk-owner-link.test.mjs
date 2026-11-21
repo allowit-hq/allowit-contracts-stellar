@@ -53,7 +53,7 @@ test('a link on each network of the rail opens, in the unit of its own asset, an
   // The Mainnet asset is no unit on Testnet: the amount stays in base units. An alias, or a network that the rail
   // does not list, is refused.
   assert.deepEqual(adkParamLines(mainnet.params, assets('stellar:testnet')).map(line => line.value), ['20000000', usdc]);
-  for (const network of ['stellar:mainnet', 'stellar-testnet', 'solana:mainnet', '']) {
+  for (const network of ['stellar:mainnet', 'stellar-testnet', 'other:mainnet', '']) {
     assert.throws(() => parseReviewLink(fragment({proposal: {...mainnet, network}, workPrompt: 'w'})), /agent policy link is invalid/);
   }
 });
