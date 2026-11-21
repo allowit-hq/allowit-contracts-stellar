@@ -1032,14 +1032,16 @@ impl Provider {
     /// ledger after the head that closes the read, and that head is at most
     /// [`rpc::owner_observation::MAX_OBSERVATION_LAG`] ledgers after the read's own, so both
     /// entries must be live past the read's ledger by more than that: a wallet in its last
-    /// ledgers reads as lapsed. A lapse is the typed refusal `CONTRACT_EXPIRED`. Any other answer
+    /// ledgers reads as lapsed. The one reply of the entries decides both answers, by its own
+    /// ledger and the entries' last live ledgers; the heads around it only refuse a reply that
+    /// is not current. A lapse is the typed refusal `CONTRACT_EXPIRED`. Any other answer
     /// of the read, a failure, a stale observation or a reply that is not the wallet's two
     /// entries, proves nothing: it is an uncertain error, never a lapse and never a pass.
     fn live_at_send(&self, c: &WalletConfig) -> Result<()> {
         let lapsed = || {
             Error::coded(
                 allowit_core::vendor::runtime::CONTRACT_EXPIRED,
-                rpc::CONTRACT_EXPIRED,
+                "The wallet's instance or code lapsed on the network, or lapses before the step can apply: the step is not sent. Its owner restores the wallet outside Allowit.",
             )
         };
         match rpc::wallet_lifetime(self.rpc(), &c.network, &c.wallet, &c.module_digest) {
