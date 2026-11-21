@@ -181,18 +181,27 @@ pub struct LifetimeEntries {
     pub max_entry_ttl: u32,
     pub instance_live_until: u32,
     pub code_live_until: u32,
+    /// Whether the validating decode found the instance and the code live at `ledger`.
+    pub instance_live: bool,
+    pub code_live: bool,
 }
 /// What one current reply says of a wallet's lifetime entries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LifetimeRead {
     /// The instance runs the code that was asked for: both entries, of one ledger.
     Entries(LifetimeEntries),
-    /// The instance runs other code than the code that was asked for: its own entry alone, of
-    /// the reply's ledger. The reply says nothing of the lifetime of the code that it runs.
-    OtherExecutable {
-        ledger: u32,
-        instance_live_until: u32,
-    },
+    /// The instance runs other code than the code that was asked for: its own entry alone,
+    /// live or not at the reply's ledger by the validating decode. The reply says nothing of
+    /// the lifetime of the code that it runs.
+    OtherExecutable { instance_live: bool },
+}
+/// What the validating decode says of an entry with a lifetime, at the reply's ledger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Life {
+    /// Live at the reply's ledger.
+    Live,
+    /// Past its lifetime at the reply's ledger, or archived.
+    Archived,
 }
 /// One entry of a lifetime reply after its validating decode.
 struct ValidEntry {
@@ -202,14 +211,18 @@ struct ValidEntry {
     /// The entry's last live ledger; 0 for an archived entry and for an entry without a lifetime,
     /// as the network's setting.
     live_until: u32,
+    /// `None` for the network's setting, which has no lifetime.
+    life: Option<Life>,
 }
 /// The validating decode of a lifetime reply: its ledger, the network's archival limit that it
 /// holds, and its entries. Every entry of every lifetime reply passes it before any caller
 /// sees the entry, and nothing else reads an entry of such a reply. An entry is valid only with
 /// all of: its change ledger; a change ledger that is not after the reply's ledger; a change
 /// ledger that is not after the entry's last live ledger; a last live ledger within the
-/// network's limit, counted from the reply's ledger. A reply with an entry that fails is an
-/// invalid reply: an error, never a decision.
+/// network's limit, counted from the reply's ledger. An entry with a lifetime is then live at
+/// the reply's ledger, or archived: past its last live ledger there, or without one. A reply
+/// with an entry that fails is an invalid reply: an error, never a decision. The truth table of
+/// the test module `decode_table` states every row, and the decode says nothing else.
 fn valid_lifetime_reply(response: &Value) -> Result<(u32, u32, Vec<ValidEntry>)> {
     let observed = ledger(&response["latestLedger"])?;
     let listed = response["entries"]
@@ -228,12 +241,8 @@ fn valid_lifetime_reply(response: &Value) -> Result<(u32, u32, Vec<ValidEntry>)>
         if changed > observed {
             return Err("Wallet lifetime entry is newer than its reply".into());
         }
+        // Zero stands for no last live ledger, as a missing or null one does.
         let live_until = live_until(&entry["liveUntilLedgerSeq"])?;
-        // An entry is live at the ledger that changes it. An archived entry and an entry
-        // without a lifetime have no last live ledger.
-        if live_until > 0 && changed > live_until {
-            return Err("Wallet lifetime entry changed after its last live ledger".into());
-        }
         let data: LedgerEntryData =
             read(entry["xdr"].as_str().ok_or("Missing wallet lifetime XDR")?)?;
         if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(settings)) = &data
@@ -241,12 +250,32 @@ fn valid_lifetime_reply(response: &Value) -> Result<(u32, u32, Vec<ValidEntry>)>
         {
             return Err("Invalid or duplicate archival lifetime setting".into());
         }
+        // The rows of the decode's truth table (`decode_table`), in its order.
+        let life = match &data {
+            // The network's setting has no lifetime.
+            LedgerEntryData::ConfigSetting(_) if live_until > 0 => {
+                return Err("The archival setting has a last live ledger".into());
+            }
+            LedgerEntryData::ConfigSetting(_) => None,
+            // An entry is live at the ledger that changes it: without a last live ledger it
+            // cannot have changed at the reply's own ledger.
+            _ if live_until == 0 && changed == observed => {
+                return Err("Wallet lifetime entry changed at its reply's ledger and has no last live ledger".into());
+            }
+            _ if live_until == 0 => Some(Life::Archived),
+            _ if changed > live_until => {
+                return Err("Wallet lifetime entry changed after its last live ledger".into());
+            }
+            _ if live_until >= observed => Some(Life::Live),
+            _ => Some(Life::Archived),
+        };
         entries.push(ValidEntry {
             data,
             key: entry
                 .get("key")
                 .map(|key| key.as_str().unwrap_or("").into()),
             live_until,
+            life,
         });
     }
     let max = max.ok_or("Missing archival lifetime setting")?;
@@ -318,10 +347,10 @@ pub fn lifetime_read(
             return Err("Wallet lifetime response ledger key differs".into());
         }
         match slot {
-            1 if instance.replace(entry.live_until).is_some() => {
+            1 if instance.replace((entry.live_until, entry.life)).is_some() => {
                 return Err("Duplicate wallet instance lifetime".into());
             }
-            2 if executable.replace(entry.live_until).is_some() => {
+            2 if executable.replace((entry.live_until, entry.life)).is_some() => {
                 return Err("Duplicate wallet code lifetime".into());
             }
             _ => {}
@@ -330,23 +359,25 @@ pub fn lifetime_read(
     if !setting {
         return Err("Missing archival lifetime setting".into());
     }
-    let instance = instance.ok_or("Missing wallet instance lifetime")?;
+    let (instance, instance_life) = instance.ok_or("Missing wallet instance lifetime")?;
     let closing = current(rpc, before, observed)?;
+    let live = |life: Option<Life>| life == Some(Life::Live);
     if other {
         // The code that was asked for is not the wallet's: its entry, present or not, says
         // nothing of the wallet.
         return Ok(LifetimeRead::OtherExecutable {
-            ledger: observed,
-            instance_live_until: instance,
+            instance_live: live(instance_life),
         });
     }
-    let code = executable.ok_or("Missing wallet code lifetime")?;
+    let (code, code_life) = executable.ok_or("Missing wallet code lifetime")?;
     Ok(LifetimeRead::Entries(LifetimeEntries {
         ledger: observed,
         closing,
         max_entry_ttl: max,
         instance_live_until: instance,
         code_live_until: code,
+        instance_live: live(instance_life),
+        code_live: live(code_life),
     }))
 }
 /// Read and bind both selected lifetime entries and the exact current network archival limit
@@ -373,4 +404,375 @@ pub fn wallet_lifetime(
         instance_live_until: entries.instance_live_until,
         code_live_until: entries.code_live_until,
     })
+}
+
+#[cfg(test)]
+mod decode_table {
+    //! The truth table of the validating decode of a lifetime reply. The table is the test's
+    //! data: the decode is correct when every row passes, and a row that is not here does not
+    //! exist. The reply is of ledger 120, and the network's limit is 1,000 ledgers, so the last
+    //! valid last live ledger is 1,119.
+    use super::*;
+    const LEDGER: u32 = 120;
+    const LIMIT: u32 = 1_000;
+    /// A field of an entry as a reply can give it.
+    #[derive(Clone, Copy, Debug)]
+    enum Field {
+        Absent,
+        Null,
+        At(u32),
+        Text,
+    }
+    use Field::{Absent, At, Null, Text};
+    /// What the decode says of a row.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Says {
+        Live,
+        Archived,
+        /// The reply is invalid: an error, never a decision.
+        Invalid,
+        /// The network's setting is valid; it has no lifetime.
+        Setting,
+    }
+    /// An entry with a lifetime, the wallet's instance or its code: its change ledger, its last
+    /// live ledger, and what the decode says.
+    const WITH_LIFETIME: &[(&str, Field, Field, Says)] = &[
+        // No change ledger: invalid, whatever else the entry says.
+        (
+            "no change ledger, a live last ledger",
+            Absent,
+            At(520),
+            Says::Invalid,
+        ),
+        (
+            "no change ledger, no last live ledger",
+            Absent,
+            Absent,
+            Says::Invalid,
+        ),
+        ("a null change ledger", Null, At(520), Says::Invalid),
+        (
+            "a change ledger that is no number",
+            Text,
+            At(520),
+            Says::Invalid,
+        ),
+        ("change ledger zero", At(0), At(520), Says::Invalid),
+        // A change after the reply's own ledger contradicts the reply.
+        (
+            "changed after the reply, a live last ledger",
+            At(121),
+            At(520),
+            Says::Invalid,
+        ),
+        (
+            "changed after the reply, no last live ledger",
+            At(121),
+            Absent,
+            Says::Invalid,
+        ),
+        // An entry is live at the ledger that changes it: one that changed at the reply's
+        // ledger and has no last live ledger contradicts itself.
+        (
+            "changed at the reply's ledger, no last live ledger",
+            At(120),
+            Absent,
+            Says::Invalid,
+        ),
+        (
+            "changed at the reply's ledger, a null last live ledger",
+            At(120),
+            Null,
+            Says::Invalid,
+        ),
+        (
+            "changed at the reply's ledger, last live ledger zero",
+            At(120),
+            At(0),
+            Says::Invalid,
+        ),
+        // Changed before the reply and without a last live ledger: archived.
+        (
+            "changed before the reply, no last live ledger",
+            At(100),
+            Absent,
+            Says::Archived,
+        ),
+        (
+            "changed before the reply, a null last live ledger",
+            At(100),
+            Null,
+            Says::Archived,
+        ),
+        (
+            "changed before the reply, last live ledger zero",
+            At(100),
+            At(0),
+            Says::Archived,
+        ),
+        (
+            "a last live ledger that is no number",
+            At(100),
+            Text,
+            Says::Invalid,
+        ),
+        // A last live ledger before the change contradicts the change.
+        (
+            "last live ledger before the change",
+            At(100),
+            At(99),
+            Says::Invalid,
+        ),
+        (
+            "changed at the reply's ledger, last live ledger before it",
+            At(120),
+            At(119),
+            Says::Invalid,
+        ),
+        // A last live ledger from the change on and before the reply: past its lifetime.
+        (
+            "last live ledger at the change, before the reply",
+            At(100),
+            At(100),
+            Says::Archived,
+        ),
+        (
+            "last live ledger one before the reply",
+            At(100),
+            At(119),
+            Says::Archived,
+        ),
+        // A last live ledger from the reply's ledger on, within the limit: live.
+        (
+            "last live ledger at the reply's ledger",
+            At(100),
+            At(120),
+            Says::Live,
+        ),
+        (
+            "changed and last live at the reply's ledger",
+            At(120),
+            At(120),
+            Says::Live,
+        ),
+        ("a live last ledger", At(100), At(520), Says::Live),
+        (
+            "last live ledger at the network's limit",
+            At(100),
+            At(1_119),
+            Says::Live,
+        ),
+        (
+            "last live ledger beyond the network's limit",
+            At(100),
+            At(1_120),
+            Says::Invalid,
+        ),
+    ];
+    /// The network's setting, which has no lifetime: its change ledger, a last live ledger that
+    /// a reply gives it, and what the decode says.
+    const SETTING: &[(&str, Field, Field, Says)] = &[
+        (
+            "the setting with its change ledger",
+            At(100),
+            Absent,
+            Says::Setting,
+        ),
+        (
+            "the setting changed at the reply's ledger",
+            At(120),
+            Absent,
+            Says::Setting,
+        ),
+        (
+            "the setting with a null last live ledger",
+            At(100),
+            Null,
+            Says::Setting,
+        ),
+        (
+            "the setting without its change ledger",
+            Absent,
+            Absent,
+            Says::Invalid,
+        ),
+        (
+            "the setting with a null change ledger",
+            Null,
+            Absent,
+            Says::Invalid,
+        ),
+        (
+            "the setting changed after the reply",
+            At(121),
+            Absent,
+            Says::Invalid,
+        ),
+        (
+            "the setting with a last live ledger",
+            At(100),
+            At(520),
+            Says::Invalid,
+        ),
+        // Zero is no last live ledger, as for an entry with a lifetime.
+        (
+            "the setting with last live ledger zero",
+            At(100),
+            At(0),
+            Says::Setting,
+        ),
+    ];
+    fn field(entry: &mut Value, name: &str, field: Field) {
+        match field {
+            Absent => {}
+            Null => entry[name] = Value::Null,
+            At(ledger) => entry[name] = json!(ledger),
+            Text => entry[name] = json!("soon"),
+        }
+    }
+    fn entry(data: &LedgerEntryData, changed: Field, until: Field) -> Value {
+        let mut entry = json!({"xdr": xdr(data).unwrap()});
+        field(&mut entry, "lastModifiedLedgerSeq", changed);
+        field(&mut entry, "liveUntilLedgerSeq", until);
+        entry
+    }
+    fn setting(limit: u32) -> LedgerEntryData {
+        LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(StateArchivalSettings {
+            max_entry_ttl: limit,
+            ..Default::default()
+        }))
+    }
+    fn code() -> LedgerEntryData {
+        let code = b"the code of the table".to_vec();
+        LedgerEntryData::ContractCode(ContractCodeEntry {
+            ext: ContractCodeEntryExt::V0,
+            hash: Hash(hash(&code)),
+            code: code.try_into().unwrap(),
+        })
+    }
+    fn instance() -> LedgerEntryData {
+        LedgerEntryData::ContractData(ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: ScAddress::Contract(ContractId(Hash([9; 32]))),
+            key: ScVal::LedgerKeyContractInstance,
+            durability: ContractDataDurability::Persistent,
+            val: ScVal::ContractInstance(ScContractInstance {
+                executable: ContractExecutable::Wasm(Hash([7; 32])),
+                storage: None,
+            }),
+        })
+    }
+    /// A valid entry of each kind.
+    fn valid(data: &LedgerEntryData) -> Value {
+        match data {
+            LedgerEntryData::ConfigSetting(_) => entry(data, At(100), Absent),
+            _ => entry(data, At(100), At(520)),
+        }
+    }
+    /// What the decode says of the entry at `at` of `entries`, in a reply of ledger 120.
+    fn says(entries: Vec<Value>, at: usize) -> Says {
+        match valid_lifetime_reply(&json!({"latestLedger": LEDGER, "entries": entries})) {
+            Err(_) => Says::Invalid,
+            Ok((ledger, limit, entries)) => {
+                assert_eq!((ledger, limit), (LEDGER, LIMIT));
+                match entries[at].life {
+                    None => Says::Setting,
+                    Some(Life::Live) => Says::Live,
+                    Some(Life::Archived) => Says::Archived,
+                }
+            }
+        }
+    }
+    /// Every row of the table, for the instance and for the code, and every row of the setting.
+    /// The failing rows are named together.
+    #[test]
+    fn the_decode_says_what_the_table_says() {
+        let mut wrong = Vec::new();
+        for (kind, data) in [("instance", instance()), ("code", code())] {
+            for (row, changed, until, expected) in WITH_LIFETIME {
+                let entries = vec![
+                    valid(&setting(LIMIT)),
+                    entry(&data, *changed, *until),
+                    valid(&if kind == "instance" {
+                        code()
+                    } else {
+                        instance()
+                    }),
+                ];
+                let said = says(entries, 1);
+                if said != *expected {
+                    wrong.push(format!("{kind}: {row}: {said:?}, not {expected:?}"));
+                }
+            }
+        }
+        for (row, changed, until, expected) in SETTING {
+            let entries = vec![
+                entry(&setting(LIMIT), *changed, *until),
+                valid(&instance()),
+                valid(&code()),
+            ];
+            let said = says(entries, 0);
+            if said != *expected {
+                wrong.push(format!("setting: {row}: {said:?}, not {expected:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+    /// The rows of the reply itself: its ledger and the network's limit, present or absent. Each
+    /// row is invalid by one rule alone: its entries are otherwise valid, and those of the limit
+    /// rows are in their last live ledger, so that no entry is beyond the limit. The failing rows
+    /// are named together.
+    #[test]
+    fn a_reply_without_its_ledger_or_its_limit_is_invalid() {
+        let last = |data: &LedgerEntryData| entry(data, At(100), At(LEDGER));
+        let entries = || vec![valid(&setting(LIMIT)), valid(&instance()), valid(&code())];
+        let limited = |limit| vec![valid(&setting(limit)), last(&instance()), last(&code())];
+        let invalid = |reply: Value| valid_lifetime_reply(&reply).is_err();
+        assert!(!invalid(
+            json!({"latestLedger": LEDGER, "entries": entries()})
+        ));
+        assert!(!invalid(
+            json!({"latestLedger": LEDGER, "entries": limited(2)})
+        ));
+        let mut wrong = Vec::new();
+        for (row, reply) in [
+            (
+                "the reply without its ledger",
+                json!({"entries": entries()}),
+            ),
+            (
+                "a reply ledger that is no number",
+                json!({"latestLedger": "soon", "entries": entries()}),
+            ),
+            (
+                "reply ledger zero",
+                json!({"latestLedger": 0, "entries": entries()}),
+            ),
+            (
+                "the reply without the network's setting",
+                json!({"latestLedger": LEDGER, "entries": [valid(&instance()), valid(&code())]}),
+            ),
+            (
+                "two settings",
+                json!({"latestLedger": LEDGER, "entries": [valid(&setting(LIMIT)), valid(&setting(LIMIT)), valid(&code())]}),
+            ),
+            (
+                "a limit of one ledger",
+                json!({"latestLedger": LEDGER, "entries": limited(1)}),
+            ),
+            (
+                "a limit that no ledger number can hold",
+                json!({"latestLedger": LEDGER, "entries": limited(u32::MAX)}),
+            ),
+            (
+                "four entries",
+                json!({"latestLedger": LEDGER, "entries": [valid(&setting(LIMIT)), valid(&instance()), valid(&code()), valid(&code())]}),
+            ),
+        ] {
+            if !invalid(reply) {
+                wrong.push(format!("reply: {row}: valid, not Invalid"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
 }

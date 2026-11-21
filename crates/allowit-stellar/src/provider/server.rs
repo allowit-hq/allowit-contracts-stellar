@@ -1029,9 +1029,10 @@ impl Provider {
     }
     /// The liveness of the contract wallet of `c` at the send of an owner step, by one current
     /// reply of its instance and its code at one ledger ([`rpc::owner_observation::lifetime_read`]).
-    /// The wallet is live when both entries live at the reply's own ledger, and lapsed when one
-    /// of them is past its lifetime there or archived: that one reply decides either answer, and
-    /// a lapse is the typed refusal `CONTRACT_EXPIRED`. The check is of the read's ledger and
+    /// The wallet is live when the reply's validating decode finds both entries live at the
+    /// reply's own ledger, and lapsed when it finds one of them archived: that one reply decides
+    /// either answer, by the decode's truth table, and a lapse is the typed refusal
+    /// `CONTRACT_EXPIRED`. The check is of the read's ledger and
     /// promises nothing about the ledger that applies the step: a wallet that lapses after the
     /// read is not refused. Any other answer of the read, a failure, a stale observation or a
     /// reply that is not the wallet's entries, proves nothing: it is an uncertain error, never a
@@ -1052,17 +1053,14 @@ impl Provider {
         };
         match lifetime_read(self.rpc(), &c.network, &c.wallet, &c.module_digest) {
             Ok(LifetimeRead::Entries(l)) => {
-                if l.instance_live_until >= l.ledger && l.code_live_until >= l.ledger {
+                if l.instance_live && l.code_live {
                     Ok(())
                 } else {
                     Err(lapsed())
                 }
             }
-            Ok(LifetimeRead::OtherExecutable {
-                ledger,
-                instance_live_until,
-            }) => {
-                if instance_live_until >= ledger {
+            Ok(LifetimeRead::OtherExecutable { instance_live }) => {
+                if instance_live {
                     Ok(())
                 } else {
                     Err(lapsed())
@@ -6465,6 +6463,15 @@ mod owner_steps {
                 "the code claims a lifetime beyond the network's limit",
                 Steps {
                     lifetime: (520, 2_120),
+                    ..Steps::new()
+                },
+                uncertain,
+            ),
+            (
+                "an archived entry changed at the reply's own ledger",
+                Steps {
+                    modified: Some(120),
+                    lifetime: (0, 1_119),
                     ..Steps::new()
                 },
                 uncertain,

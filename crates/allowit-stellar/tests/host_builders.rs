@@ -119,7 +119,12 @@ impl Chain {
                 settings,
             ),
         ] {
-            entries.insert(xdr(&key).unwrap(),json!({"key":xdr(&key).unwrap(),"xdr":xdr(&data).unwrap(),"lastModifiedLedgerSeq":100,"liveUntilLedgerSeq":520}));
+            let mut entry = json!({"key":xdr(&key).unwrap(),"xdr":xdr(&data).unwrap(),"lastModifiedLedgerSeq":100,"liveUntilLedgerSeq":520});
+            // The network's setting has no lifetime.
+            if matches!(key, x::LedgerKey::ConfigSetting(_)) {
+                entry.as_object_mut().unwrap().remove("liveUntilLedgerSeq");
+            }
+            entries.insert(xdr(&key).unwrap(), entry);
         }
         Self {
             entries,

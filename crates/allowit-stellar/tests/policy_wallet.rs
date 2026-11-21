@@ -710,6 +710,8 @@ impl rpc::Rpc for ModelChain {
                             key: x::ScVal::LedgerKeyContractInstance,
                             ..
                         }) if m.lapsed_instances => 0,
+                        // The network's setting has no lifetime.
+                        x::LedgerKey::ConfigSetting(_) => 0,
                         _ => m.ledger + 10_000,
                     };
                     entries.extend(entry.into_iter().map(
