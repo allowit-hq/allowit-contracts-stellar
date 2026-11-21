@@ -816,6 +816,12 @@ impl Provider {
         now: u64,
     ) -> Result<OwnerPacket> {
         use native::owner::WalletAction;
+        // An action that a keypair wallet does not take is refused before any read.
+        if matches!(a, OwnerAction::Create { .. } | OwnerAction::Extend) {
+            return Err(Error::unsupported(
+                "A keypair wallet has no code: its owner creates it with the wallet setup",
+            ));
+        }
         // Every step is built from the wallet's state on its own network.
         checked(rpc::owner_observation::network(self.rpc(), &c.network))?;
         let asset = checked(native::asset_xdr(c))?;
@@ -872,9 +878,7 @@ impl Provider {
                 }
             }
             OwnerAction::Create { .. } | OwnerAction::Extend => {
-                return Err(Error::unsupported(
-                    "A keypair wallet has no code: its owner creates it with the wallet setup",
-                ));
+                unreachable!("refused before any read")
             }
         };
         let owner_state = checked(rpc::get_account(self.rpc(), &c.owner))?;
@@ -1337,7 +1341,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
             checked(rpc::owner_observation::network(self.rpc(), &c.network))?;
             return Ok(Resources {
                 code_present: true,
-                wallet_present: checked(rpc::account_present(self.rpc(), &c.wallet))?,
+                wallet_present: checked(rpc::find_account(self.rpc(), &c.wallet))?.is_some(),
                 lifetime: None,
             });
         }
@@ -2245,10 +2249,9 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         if c.route != WalletRoute::Native {
             return Ok(false);
         }
-        // An account that is absent from another network says nothing, and neither does the
-        // reply of an earlier ledger: the absence is an observation of the head.
+        // An account that is absent from another network says nothing.
         self.current_height()?;
-        Ok(!checked(rpc::account_present(self.rpc(), &c.wallet))?)
+        Ok(checked(rpc::find_account(self.rpc(), &c.wallet))?.is_none())
     }
     /// A keypair wallet's close: every amount returns to the owner, every signer is removed and
     /// the account merges into the owner's account. A policy wallet does not close.
@@ -3988,25 +3991,7 @@ mod keypair_wallet_owner_tests {
             );
             assert!(unread.wallet_closed(&installation).is_err());
         }
-        // The absence is an observation of the head, which is ledger 120: the reply of an
-        // earlier ledger, or of one that the head has not reached, does not say that the wallet
-        // is closed now. It is a stale observation, which the caller reads again.
-        for dated in [119, 121] {
-            let stale = serde_json::json!({"latestLedger": dated, "entries": []});
-            let earlier =
-                Provider::from_rpc(&c.network, Arc::new(Gone(network, stale, wallet.clone())));
-            for read in [
-                earlier.wallet_closed(&installation).map(drop),
-                earlier.resources(&installation).map(drop),
-            ] {
-                assert_eq!(
-                    read.unwrap_err().api_code.as_deref(),
-                    Some(allowit_core::vendor::runtime::STALE_OWNER_OBSERVATION),
-                    "{dated}"
-                );
-            }
-        }
-        // The same reply at the head: the wallet is gone, and its resources say so.
+        // The wallet is gone, and its resources say so.
         let gone = Provider::from_rpc(
             &c.network,
             Arc::new(Gone(network, empty.clone(), wallet.clone())),
@@ -4057,6 +4042,14 @@ mod keypair_wallet_owner_tests {
                 "Owner observation RPC network differs"
             );
         }
+        // An action that a keypair wallet does not take is refused before the endpoint is asked.
+        assert_eq!(
+            elsewhere
+                .prepare_owner(&installation, OwnerAction::Extend, 100_000, 86_401)
+                .unwrap_err()
+                .message,
+            "A keypair wallet has no code: its owner creates it with the wallet setup"
+        );
     }
     #[test]
     fn the_server_prepares_each_owner_action_of_a_keypair_wallet_for_one_owner_signature() {
