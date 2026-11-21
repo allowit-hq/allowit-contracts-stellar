@@ -1037,6 +1037,12 @@ impl Provider {
     /// is not current. A lapse is the typed refusal `CONTRACT_EXPIRED`. Any other answer
     /// of the read, a failure, a stale observation or a reply that is not the wallet's two
     /// entries, proves nothing: it is an uncertain error, never a lapse and never a pass.
+    ///
+    /// The code is the one that the instance runs. A wallet whose owner installed other code
+    /// outside Allowit still takes its owner's steps, so it lives by that code and not by the
+    /// installation's: the instance names it ([`rpc::instance_code`]), and one read of the
+    /// instance with that code then decides as above. The first two reads only say which code
+    /// to ask for; an instance that changed its code again in between is no answer.
     fn live_at_send(&self, c: &WalletConfig) -> Result<()> {
         let lapsed = || {
             Error::coded(
@@ -1044,7 +1050,19 @@ impl Provider {
                 "The wallet's instance or code lapsed on the network, or lapses before the step can apply: the step is not sent. Its owner restores the wallet outside Allowit.",
             )
         };
-        match rpc::wallet_lifetime(self.rpc(), &c.network, &c.wallet, &c.module_digest) {
+        let lifetime =
+            |code: &[u8; 32]| rpc::wallet_lifetime(self.rpc(), &c.network, &c.wallet, code);
+        let read = match lifetime(&c.module_digest) {
+            Err(other) if other == rpc::owner_observation::OTHER_EXECUTABLE => {
+                match rpc::instance_code(self.rpc(), &c.network, &c.wallet) {
+                    Ok(Some(running)) => lifetime(&running),
+                    Ok(None) => Err("The wallet is not on the network".into()),
+                    Err(read) => Err(read),
+                }
+            }
+            read => read,
+        };
+        match read {
             Ok(lifetime) => {
                 let applies_after = lifetime
                     .ledger
@@ -5361,6 +5379,12 @@ mod owner_steps {
         entries_fail: Option<&'static str>,
         /// The read of the wallet's lifetime entries gives no code entry.
         entries_lack_code: bool,
+        /// Other code that the wallet's instance runs, which its owner installed outside
+        /// Allowit. `lifetime` is then of the instance and of this code, and the installation's
+        /// own code is archived.
+        running: Option<&'static [u8]>,
+        /// The network holds no entry of the other code that the instance runs.
+        running_absent: bool,
     }
     impl Steps {
         fn new() -> Self {
@@ -5377,6 +5401,8 @@ mod owner_steps {
                 entries_ledger: 120,
                 entries_fail: None,
                 entries_lack_code: false,
+                running: None,
+                running_absent: false,
             }
         }
         fn sent(&self) -> bool {
@@ -5418,6 +5444,9 @@ mod owner_steps {
                         return Err(failure.into());
                     }
                     let c = deployed_wallet();
+                    let installed = crate::test_support::owner::wasm();
+                    let code = self.running.unwrap_or(&installed);
+                    let executable = native::hash(code);
                     let archival = x::LedgerEntryData::ConfigSetting(
                         x::ConfigSettingEntry::StateArchival(x::StateArchivalSettings {
                             max_entry_ttl: 2_000,
@@ -5432,15 +5461,17 @@ mod owner_steps {
                         key: x::ScVal::LedgerKeyContractInstance,
                         durability: x::ContractDataDurability::Persistent,
                         val: x::ScVal::ContractInstance(x::ScContractInstance {
-                            executable: x::ContractExecutable::Wasm(x::Hash(c.module_digest)),
+                            executable: x::ContractExecutable::Wasm(x::Hash(executable)),
                             storage: None,
                         }),
                     });
-                    let code = x::LedgerEntryData::ContractCode(x::ContractCodeEntry {
-                        ext: x::ContractCodeEntryExt::V0,
-                        hash: x::Hash(c.module_digest),
-                        code: crate::test_support::owner::wasm().try_into().unwrap(),
-                    });
+                    let code_entry = |code: &[u8]| {
+                        x::LedgerEntryData::ContractCode(x::ContractCodeEntry {
+                            ext: x::ContractCodeEntryExt::V0,
+                            hash: x::Hash(native::hash(code)),
+                            code: code.try_into().unwrap(),
+                        })
+                    };
                     // An archived entry comes without its last live ledger.
                     let entry = |data: &x::LedgerEntryData, until: u32| {
                         let mut entry = serde_json::json!({"xdr": native::xdr(data).unwrap()});
@@ -5449,12 +5480,30 @@ mod owner_steps {
                         }
                         entry
                     };
-                    let mut entries = vec![
-                        serde_json::json!({"xdr": native::xdr(&archival).unwrap()}),
-                        entry(&instance, self.lifetime.0),
-                    ];
-                    if !self.entries_lack_code {
-                        entries.push(entry(&code, self.lifetime.1));
+                    // The endpoint answers the keys that it is asked for.
+                    let mut entries = Vec::new();
+                    for key in params["keys"].as_array().unwrap() {
+                        match native::read(key.as_str().unwrap())? {
+                            x::LedgerKey::ConfigSetting(_) => entries
+                                .push(serde_json::json!({"xdr": native::xdr(&archival).unwrap()})),
+                            x::LedgerKey::ContractData(_) => {
+                                entries.push(entry(&instance, self.lifetime.0))
+                            }
+                            x::LedgerKey::ContractCode(asked) if asked.hash.0 == executable => {
+                                let absent = self.entries_lack_code
+                                    || self.running.is_some() && self.running_absent;
+                                if !absent {
+                                    entries.push(entry(&code_entry(code), self.lifetime.1));
+                                }
+                            }
+                            // The installation's code, which the wallet does not run: archived.
+                            x::LedgerKey::ContractCode(asked)
+                                if asked.hash.0 == native::hash(&installed) =>
+                            {
+                                entries.push(entry(&code_entry(&installed), 0))
+                            }
+                            _ => {}
+                        }
                     }
                     serde_json::json!({"latestLedger": self.entries_ledger, "entries": entries})
                 }
@@ -5981,6 +6030,62 @@ mod owner_steps {
         assert!(restored.sent());
     }
 
+    /// A wallet whose owner installed other code outside Allowit still takes its owner's steps:
+    /// it lives by the code that its instance runs, not by the installation's code, which is
+    /// archived here. A lapse of the instance or of the running code refuses the step, and a
+    /// network without that code is no answer.
+    #[test]
+    fn a_wallet_that_runs_other_code_lives_by_the_code_that_it_runs() {
+        const OTHER: &[u8] = b"code that the owner installed outside Allowit";
+        let c = deployed_wallet();
+        let installation = installed(&c);
+        let on = Some(&installation);
+        for step in [funding(&c), returning(&c)] {
+            let steps = Arc::new(Steps {
+                running: Some(OTHER),
+                ..Steps::new()
+            });
+            provider(&steps)
+                .validate_owner_signed(&step, on, NOW)
+                .unwrap();
+            // The installation's code, the instance alone, the instance with its own code.
+            assert_eq!(entry_reads(&steps), 3);
+            assert_eq!(
+                provider(&steps).broadcast_owner(&step, on, NOW).unwrap(),
+                Status::Submitted
+            );
+            for lifetime in [(125, 1_119), (520, 125), (0, 1_119), (520, 0)] {
+                let steps = Arc::new(Steps {
+                    running: Some(OTHER),
+                    lifetime,
+                    ..Steps::new()
+                });
+                assert_eq!(
+                    provider(&steps)
+                        .broadcast_owner(&step, on, NOW)
+                        .unwrap_err()
+                        .api_code
+                        .as_deref(),
+                    Some(LAPSED),
+                    "{lifetime:?}"
+                );
+                assert!(!steps.sent());
+            }
+            let steps = Arc::new(Steps {
+                running: Some(OTHER),
+                running_absent: true,
+                ..Steps::new()
+            });
+            let error = provider(&steps)
+                .broadcast_owner(&step, on, NOW)
+                .unwrap_err();
+            assert_eq!(
+                (error.code, error.api_code),
+                (Error::uncertain("").code, None)
+            );
+            assert!(!steps.sent());
+        }
+    }
     /// A read of the wallet's liveness that gives no answer proves nothing: it is an uncertain
     /// error, never a lapse and never a pass, and nothing is sent.
     #[test]

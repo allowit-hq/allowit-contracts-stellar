@@ -161,6 +161,9 @@ pub(crate) fn lifetime_keys(wallet: &str, code: &[u8; 32]) -> Result<[LedgerKey;
 /// A wallet whose instance or code lapsed is refused with `CONTRACT_EXPIRED`: nothing restores it.
 /// An archived entry that the RPC serves without a live-until ledger has lapsed; a missing entry
 /// or a malformed reply is an error of its own.
+/// The refusal of a lifetime read whose instance runs other code than the code that was asked
+/// for: the wallet's owner installed that code outside Allowit.
+pub const OTHER_EXECUTABLE: &str = "Wallet lifetime instance names another executable";
 /// A live-until ledger as an entry's lifetime reply gives it: 0 for an archived entry served
 /// without one.
 fn live_until(value: &Value) -> Result<u32> {
@@ -214,7 +217,7 @@ pub fn wallet_lifetime(
                     return Err("Invalid selected wallet instance".into());
                 };
                 if state.executable != ContractExecutable::Wasm(Hash(*code)) {
-                    return Err("Wallet lifetime instance names another executable".into());
+                    return Err(OTHER_EXECUTABLE.into());
                 }
                 (
                     &instance_key,
