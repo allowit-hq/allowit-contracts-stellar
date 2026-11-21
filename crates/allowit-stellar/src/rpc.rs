@@ -117,7 +117,13 @@ pub fn find_account(rpc: &dyn Rpc, address: &str) -> Result<Option<AccountState>
         )?))),
     });
     let value = rpc.call("getLedgerEntries", json!({"keys":[xdr(&key)?]}))?;
-    if value["entries"].as_array().is_some_and(Vec::is_empty) {
+    // A reply that finds no entry gives an empty list, or omits the list beside its ledger.
+    let absent = match value.get("entries") {
+        Some(Value::Array(entries)) => entries.is_empty(),
+        None | Some(Value::Null) => owner_observation::ledger(&value["latestLedger"]).is_ok(),
+        Some(_) => false,
+    };
+    if absent {
         return Ok(None);
     }
     account_from_response(&value, address).map(Some)
