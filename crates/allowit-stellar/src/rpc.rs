@@ -2507,6 +2507,163 @@ mod custom_state_tests {
     }
 }
 #[cfg(test)]
+mod owner_read_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// An endpoint whose head reads answer `heads` in order, the last one again after them, and
+    /// whose entry read answers `entries`.
+    struct Endpoint {
+        heads: Mutex<Vec<u32>>,
+        entries: Value,
+        calls: Mutex<Vec<String>>,
+    }
+    impl Rpc for Endpoint {
+        fn call(&self, method: &str, _: Value) -> Result<Value> {
+            self.calls.lock().unwrap().push(method.into());
+            match method {
+                "getLatestLedger" => {
+                    let mut heads = self.heads.lock().unwrap();
+                    let head = if heads.len() > 1 {
+                        heads.remove(0)
+                    } else {
+                        heads[0]
+                    };
+                    Ok(json!({ "sequence": head }))
+                }
+                "getLedgerEntries" => Ok(self.entries.clone()),
+                _ => Err(format!("Unexpected call {method}")),
+            }
+        }
+    }
+    fn endpoint(heads: &[u32], entries: Value) -> Endpoint {
+        Endpoint {
+            heads: Mutex::new(heads.to_vec()),
+            entries,
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+    fn address(seed: u8) -> String {
+        ed25519::PublicKey([seed; 32]).to_string()
+    }
+    fn account_id(seed: u8) -> AccountId {
+        AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))
+    }
+
+    /// An absent account is an observation of the head: its reply is dated, not older than the
+    /// head that was read before it and not ahead of the head that is read after it.
+    #[test]
+    fn an_absent_account_is_an_observation_of_the_head() {
+        let absent = |heads: &[u32], entries: Value| {
+            let rpc = endpoint(heads, entries);
+            let present = account_present(&rpc, &address(7));
+            (present, rpc.calls.into_inner().unwrap())
+        };
+        let bracket = ["getLatestLedger", "getLedgerEntries", "getLatestLedger"]
+            .map(String::from)
+            .to_vec();
+        // The three forms of a reply that finds no entry.
+        for entries in [
+            json!({"latestLedger": 120, "entries": []}),
+            json!({"latestLedger": 120}),
+            json!({"latestLedger": 120, "entries": null}),
+        ] {
+            assert_eq!(absent(&[120], entries), (Ok(false), bracket.clone()));
+        }
+        // The head moves on while the reply travels: still current.
+        assert_eq!(
+            absent(&[120, 123], json!({"latestLedger": 121, "entries": []})).0,
+            Ok(false)
+        );
+        // The reply of an earlier ledger than the head that was read before it, of a ledger
+        // that the head has not reached, and of a ledger that the head left far behind.
+        for (heads, dated) in [
+            (&[120, 120][..], 119),
+            (&[120, 120], 121),
+            (&[120, 127], 121),
+        ] {
+            assert_eq!(
+                absent(heads, json!({"latestLedger": dated, "entries": []})).0,
+                Err(owner_observation::STALE_OBSERVATION.to_owned()),
+                "{heads:?} {dated}"
+            );
+        }
+        // An absence without its ledger has no date, and a reply that is no list is no answer.
+        assert!(absent(&[120], json!({"entries": []})).0.is_err());
+        assert!(absent(&[120], json!({"entries": 1})).0.is_err());
+    }
+
+    fn usdc(issuer: u8) -> Asset {
+        Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USDC"),
+            issuer: account_id(issuer),
+        })
+    }
+    /// The trustline entry of the account `holder` for USDC of `issuer`: 9 units, 3 of them
+    /// held by an open offer.
+    fn line(holder: u8, issuer: u8) -> Value {
+        let Asset::CreditAlphanum4(asset) = usdc(issuer) else {
+            unreachable!()
+        };
+        let entry = LedgerEntryData::Trustline(TrustLineEntry {
+            account_id: account_id(holder),
+            asset: TrustLineAsset::CreditAlphanum4(asset),
+            balance: 9,
+            limit: i64::MAX,
+            flags: 1,
+            ext: TrustLineEntryExt::V1(TrustLineEntryV1 {
+                liabilities: Liabilities {
+                    buying: 0,
+                    selling: 3,
+                },
+                ext: TrustLineEntryV1Ext::V0,
+            }),
+        });
+        json!({ "xdr": xdr(&entry).unwrap() })
+    }
+
+    /// A trustline read gives the balance of the line that was asked for, and of no other; a
+    /// reply that finds no entry is no trustline.
+    #[test]
+    fn a_trustline_read_is_of_the_line_that_was_asked_for() {
+        let read = |entries: Value| {
+            let rpc = endpoint(&[120], entries);
+            (
+                trustline_balance(&rpc, &address(7), &usdc(5)),
+                trustline_spendable(&rpc, &address(7), &usdc(5)),
+            )
+        };
+        assert_eq!(
+            read(json!({"latestLedger": 120, "entries": [line(7, 5)]})),
+            (Ok(Some(9)), Ok(Some(6)))
+        );
+        // The three forms of a reply that finds no entry.
+        for none in [
+            json!({"latestLedger": 120, "entries": []}),
+            json!({"latestLedger": 120}),
+            json!({"latestLedger": 120, "entries": null}),
+        ] {
+            assert_eq!(read(none), (Ok(None), Ok(None)));
+        }
+        // The line of another account, the line of another issuer's asset, and two lines.
+        for other in [
+            json!([line(8, 5)]),
+            json!([line(7, 6)]),
+            json!([line(7, 5), line(7, 5)]),
+        ] {
+            let (balance, spendable) = read(json!({"latestLedger": 120, "entries": other}));
+            assert!(balance.is_err() && spendable.is_err(), "{other}");
+        }
+        // A reply with neither a list nor a ledger is no answer.
+        let (balance, spendable) = read(json!({}));
+        assert!(balance.is_err() && spendable.is_err());
+        // XLM has no trustline.
+        let rpc = endpoint(&[120], json!({}));
+        assert!(trustline_balance(&rpc, &address(7), &Asset::Native).is_err());
+        assert!(rpc.calls.lock().unwrap().is_empty());
+    }
+}
+#[cfg(test)]
 mod owner_lapse_tests {
     use super::*;
 

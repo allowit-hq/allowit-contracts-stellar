@@ -3702,6 +3702,8 @@ mod keypair_wallet_owner_tests {
         issued: i64,
         /// The issued units that an open offer of the account holds.
         issued_selling: i64,
+        /// The account holds no trustline of its issued asset.
+        no_trustline: bool,
     }
     /// A ledger that holds the owner's account and the wallet account `wallet`.
     struct Ledger(OwnerLedger, Mutex<native::AccountState>, Mutex<Holdings>);
@@ -3737,6 +3739,9 @@ mod keypair_wallet_owner_tests {
                 }
                 Some(x::LedgerKey::Trustline(key)) => {
                     let holdings = *self.2.lock().unwrap();
+                    if holdings.no_trustline {
+                        return Ok(serde_json::json!({"latestLedger": 120, "entries": []}));
+                    }
                     let line = x::LedgerEntryData::Trustline(x::TrustLineEntry {
                         account_id: key.account_id,
                         asset: key.asset,
@@ -3773,6 +3778,7 @@ mod keypair_wallet_owner_tests {
                 other_entries: 0,
                 issued: 7,
                 issued_selling: 0,
+                no_trustline: false,
             }),
         ));
         let configuration =
@@ -3917,6 +3923,10 @@ mod keypair_wallet_owner_tests {
             .prepare_close(&installation, 100_000, 86_401)
             .unwrap();
         assert_eq!(close.info().unwrap().action, "close");
+        // The close takes the caller's clock and fee limit: its cutoff is counted from the
+        // clock, and a limit below the minimum fee of its operations prepares nothing.
+        assert_eq!(close.info().unwrap().expires_at, 86_701);
+        assert!(provider.prepare_close(&installation, 100, 86_401).is_err());
         assert!(!provider.wallet_closed(&installation).unwrap());
         /// An endpoint of the network `0` that answers a read of the account `2` with `1`, and
         /// of no other account: after a close the owner's account is still there.
@@ -3974,6 +3984,30 @@ mod keypair_wallet_owner_tests {
             );
             assert!(unread.wallet_closed(&installation).is_err());
         }
+        // The absence is an observation of the head, which is ledger 120: the reply of an
+        // earlier ledger, or of one that the head has not reached, does not say that the wallet
+        // is closed now. It is a stale observation, which the caller reads again.
+        for dated in [119, 121] {
+            let stale = serde_json::json!({"latestLedger": dated, "entries": []});
+            let earlier =
+                Provider::from_rpc(&c.network, Arc::new(Gone(network, stale, wallet.clone())));
+            for read in [
+                earlier.wallet_closed(&installation).map(drop),
+                earlier.resources(&installation).map(drop),
+            ] {
+                assert_eq!(
+                    read.unwrap_err().api_code.as_deref(),
+                    Some(allowit_core::vendor::runtime::STALE_OWNER_OBSERVATION),
+                    "{dated}"
+                );
+            }
+        }
+        // The same reply at the head: the wallet is gone, and its resources say so.
+        let gone = Provider::from_rpc(
+            &c.network,
+            Arc::new(Gone(network, empty.clone(), wallet.clone())),
+        );
+        assert!(!gone.resources(&installation).unwrap().wallet_present);
         // An account that is absent from another network says nothing about this wallet, and no
         // close is prepared from another network's state: the transport's network is refused
         // before any account is read.
@@ -4056,6 +4090,19 @@ mod keypair_wallet_owner_tests {
             panic!()
         };
         assert_eq!(u64::from(envelope.tx.fee), minimum);
+        // A wallet whose trustline is already gone closes without a payment of the asset and
+        // without a removal of the trustline, which would fail the whole close.
+        if issued {
+            ledger.2.lock().unwrap().no_trustline = true;
+            let packet = prepare(close()).unwrap();
+            let operations = operations(&packet, &c);
+            assert_eq!(operations.len(), 4);
+            assert!(operations.iter().all(|operation| !matches!(
+                operation.body,
+                stellar_xdr::OperationBody::Payment(_) | stellar_xdr::OperationBody::ChangeTrust(_)
+            )));
+            ledger.2.lock().unwrap().no_trustline = false;
+        }
         // A wallet that is not paused takes no resume, and a keypair wallet has no code.
         assert!(prepare(OwnerAction::SetPause { paused: false }).is_err());
         for action in [

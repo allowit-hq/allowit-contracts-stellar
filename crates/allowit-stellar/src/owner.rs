@@ -1316,6 +1316,71 @@ mod tests {
         };
         assert_eq!(*destination, muxed(&v.owner).unwrap());
     }
+    /// The close of a wallet of an issued asset returns the asset and removes its trustline
+    /// before the merge. A wallet whose trustline is already gone does neither: a removal of a
+    /// trustline that does not exist would fail the whole close.
+    #[test]
+    fn a_close_returns_the_issued_asset_and_removes_only_a_trustline_that_exists() {
+        let agent = agent(2);
+        let v = setup(&agent);
+        let server = engine();
+        let roles = WalletRoles {
+            wallet: &v.wallet,
+            owner: &v.owner,
+            agent: &agent,
+            engine: &server,
+        };
+        let owner = owner_state();
+        let state = created(&v);
+        let usdc = crate::asset_from_identity("USDC", Some(&account_for_seed(&[5; 32]))).unwrap();
+        let close = |asset: &Asset, token_balance: Option<i64>| {
+            prepare_wallet_action(
+                &owner,
+                &state,
+                roles,
+                &WalletAction::Close { token_balance },
+                asset,
+                NETWORK,
+                100,
+                5,
+            )
+            .map(|packet| {
+                let TransactionEnvelope::Tx(envelope) = read(&packet.transaction_xdr).unwrap()
+                else {
+                    panic!()
+                };
+                envelope
+                    .tx
+                    .operations
+                    .iter()
+                    .map(|operation| match &operation.body {
+                        OperationBody::Payment(payment) => format!("payment {}", payment.amount),
+                        OperationBody::ChangeTrust(change) => format!("trust {}", change.limit),
+                        OperationBody::SetOptions(_) => "signer".to_owned(),
+                        OperationBody::AccountMerge(_) => "merge".to_owned(),
+                        _ => "other".to_owned(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        let signers = ["signer", "signer", "signer", "merge"];
+        // A balance returns, then the trustline goes.
+        assert_eq!(
+            close(&usdc, Some(7)).unwrap(),
+            [&["payment 7", "trust 0"][..], &signers[..]].concat()
+        );
+        // An empty trustline is removed with no payment.
+        assert_eq!(
+            close(&usdc, Some(0)).unwrap(),
+            [&["trust 0"][..], &signers[..]].concat()
+        );
+        // No trustline: nothing of the asset is touched.
+        assert_eq!(close(&usdc, None).unwrap(), signers);
+        assert_eq!(close(&Asset::Native, None).unwrap(), signers);
+        // A balance that is not one, and a trustline of XLM.
+        assert!(close(&usdc, Some(-1)).is_err());
+        assert!(close(&Asset::Native, Some(0)).is_err());
+    }
     #[test]
     fn an_owner_action_refuses_an_account_with_other_authority() {
         let agent = agent(2);
