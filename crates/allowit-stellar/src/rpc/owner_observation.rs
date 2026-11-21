@@ -194,14 +194,75 @@ pub enum LifetimeRead {
         instance_live_until: u32,
     },
 }
+/// One entry of a lifetime reply after its validating decode.
+struct ValidEntry {
+    data: LedgerEntryData,
+    /// The key that the reply gives for the entry, when it gives one.
+    key: Option<String>,
+    /// The entry's last live ledger; 0 for an archived entry and for an entry without a lifetime,
+    /// as the network's setting.
+    live_until: u32,
+}
+/// The validating decode of a lifetime reply: its ledger, the network's archival limit that it
+/// holds, and its entries. Every entry of every lifetime reply passes it before any caller
+/// sees the entry, and nothing else reads an entry of such a reply. An entry is valid only with
+/// all of: its change ledger; a change ledger that is not after the reply's ledger; a change
+/// ledger that is not after the entry's last live ledger; a last live ledger within the
+/// network's limit, counted from the reply's ledger. A reply with an entry that fails is an
+/// invalid reply: an error, never a decision.
+fn valid_lifetime_reply(response: &Value) -> Result<(u32, u32, Vec<ValidEntry>)> {
+    let observed = ledger(&response["latestLedger"])?;
+    let listed = response["entries"]
+        .as_array()
+        .ok_or("Missing wallet lifetime entries")?;
+    if listed.len() > 3 {
+        return Err("Expected the archival setting and both wallet lifetime entries".into());
+    }
+    let mut max = None;
+    let mut entries = Vec::new();
+    for entry in listed {
+        let changed = match entry.get("lastModifiedLedgerSeq") {
+            Some(changed) if !changed.is_null() => ledger(changed)?,
+            _ => return Err("Wallet lifetime entry has no change ledger".into()),
+        };
+        if changed > observed {
+            return Err("Wallet lifetime entry is newer than its reply".into());
+        }
+        let live_until = live_until(&entry["liveUntilLedgerSeq"])?;
+        // An entry is live at the ledger that changes it. An archived entry and an entry
+        // without a lifetime have no last live ledger.
+        if live_until > 0 && changed > live_until {
+            return Err("Wallet lifetime entry changed after its last live ledger".into());
+        }
+        let data: LedgerEntryData =
+            read(entry["xdr"].as_str().ok_or("Missing wallet lifetime XDR")?)?;
+        if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(settings)) = &data
+            && (max.replace(settings.max_entry_ttl).is_some() || settings.max_entry_ttl <= 1)
+        {
+            return Err("Invalid or duplicate archival lifetime setting".into());
+        }
+        entries.push(ValidEntry {
+            data,
+            key: entry
+                .get("key")
+                .map(|key| key.as_str().unwrap_or("").into()),
+            live_until,
+        });
+    }
+    let max = max.ok_or("Missing archival lifetime setting")?;
+    let beyond = |entry: &ValidEntry| entry.live_until.saturating_sub(observed) >= max;
+    if observed.checked_add(max - 1).is_none() || entries.iter().any(beyond) {
+        return Err("Wallet lifetime exceeds the network limit".into());
+    }
+    Ok((observed, max, entries))
+}
 /// Read the instance of `wallet`, the entry of `code` and the network's archival limit in one
-/// reply, and bind each returned entry to the key that was asked for. The reply is current
-/// ([`current`]) before anything of it is used: a reply that is older than the head before it, or
-/// that trails the closing head by more than [`MAX_OBSERVATION_LAG`], is a stale observation. A
-/// missing entry, a malformed reply, an entry that the reply dates after its own ledger or after
-/// the entry's own last live ledger, and a lifetime beyond the network's limit are errors of
-/// their own. Nothing here says that an entry
-/// lapsed: the caller compares the last live ledgers with the ledger that it decides for.
+/// reply, and bind each returned entry to the key that was asked for. Every entry passes the
+/// validating decode first ([`valid_lifetime_reply`]). The reply is current ([`current`]) before
+/// it decides anything: a reply that is older than the head before it, or that trails the
+/// closing head by more than [`MAX_OBSERVATION_LAG`], is a stale observation. A missing entry
+/// and an entry of another key are errors of their own. Nothing here says that an entry lapsed:
+/// the caller compares the last live ledgers with the ledger that it decides for.
 pub fn lifetime_read(
     rpc: &dyn Rpc,
     selected_network: &str,
@@ -217,34 +278,16 @@ pub fn lifetime_read(
     let encoded = keys.iter().map(xdr).collect::<Result<Vec<_>>>()?;
     let before = head(rpc)?;
     let response = rpc.call("getLedgerEntries", json!({"keys":encoded}))?;
-    let observed = ledger(&response["latestLedger"])?;
-    let entries = response["entries"]
-        .as_array()
-        .ok_or("Missing wallet lifetime entries")?;
-    if entries.len() > 3 {
-        return Err("Expected the archival setting and both wallet lifetime entries".into());
-    }
-    let mut max = None;
+    let (observed, max, entries) = valid_lifetime_reply(&response)?;
+    let mut setting = false;
     let mut instance = None;
     let mut executable = None;
-    let mut other = None;
+    let mut other = false;
     for entry in entries {
-        // An entry that changed after the reply's own ledger contradicts the reply.
-        let modified = match entry.get("lastModifiedLedgerSeq") {
-            Some(modified) if !modified.is_null() => Some(ledger(modified)?),
-            _ => None,
-        };
-        if modified.is_some_and(|modified| modified > observed) {
-            return Err("Wallet lifetime entry is newer than its reply".into());
-        }
-        let data: LedgerEntryData =
-            read(entry["xdr"].as_str().ok_or("Missing wallet lifetime XDR")?)?;
-        let (expected, slot, ttl) = match data {
-            LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(settings)) => {
-                if max.replace(settings.max_entry_ttl).is_some() || settings.max_entry_ttl <= 1 {
-                    return Err("Invalid or duplicate archival lifetime setting".into());
-                }
-                (&config_key, 0, None)
+        let (expected, slot) = match entry.data {
+            LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(_)) => {
+                setting = true;
+                (&config_key, 0)
             }
             LedgerEntryData::ContractData(data)
                 if data.contract == address(wallet)?
@@ -258,60 +301,38 @@ pub fn lifetime_read(
                 else {
                     return Err("Invalid selected wallet instance".into());
                 };
-                if running != *code {
-                    other = Some(());
-                }
-                (
-                    &instance_key,
-                    1,
-                    Some(live_until(&entry["liveUntilLedgerSeq"])?),
-                )
+                other = running != *code;
+                (&instance_key, 1)
             }
             LedgerEntryData::ContractCode(data)
                 if data.hash == Hash(*code) && hash(data.code.as_slice()) == *code =>
             {
-                (
-                    &code_key,
-                    2,
-                    Some(live_until(&entry["liveUntilLedgerSeq"])?),
-                )
+                (&code_key, 2)
             }
             _ => return Err("Wallet lifetime entry differs from the exact selected keys".into()),
         };
         if entry
-            .get("key")
-            .is_some_and(|key| key.as_str() != xdr(expected).ok().as_deref())
+            .key
+            .is_some_and(|key| Some(key.as_str()) != xdr(expected).ok().as_deref())
         {
             return Err("Wallet lifetime response ledger key differs".into());
         }
-        // An entry is live at the ledger that changes it: a last live ledger before its last
-        // change contradicts itself. An archived entry has no last live ledger.
-        if let (Some(modified), Some(until)) = (modified, ttl)
-            && until > 0
-            && modified > until
-        {
-            return Err("Wallet lifetime entry changed after its last live ledger".into());
-        }
         match slot {
-            1 if instance.replace(ttl.unwrap()).is_some() => {
+            1 if instance.replace(entry.live_until).is_some() => {
                 return Err("Duplicate wallet instance lifetime".into());
             }
-            2 if executable.replace(ttl.unwrap()).is_some() => {
+            2 if executable.replace(entry.live_until).is_some() => {
                 return Err("Duplicate wallet code lifetime".into());
             }
             _ => {}
         }
     }
-    let max = max.ok_or("Missing archival lifetime setting")?;
+    if !setting {
+        return Err("Missing archival lifetime setting".into());
+    }
     let instance = instance.ok_or("Missing wallet instance lifetime")?;
     let closing = current(rpc, before, observed)?;
-    let within_limit = |until: u32| until.saturating_sub(observed) < max;
-    // The instance's own lifetime is valid before the reply says anything, also that the
-    // instance runs other code.
-    if observed.checked_add(max - 1).is_none() || !within_limit(instance) {
-        return Err("Wallet lifetime exceeds the network limit".into());
-    }
-    if other.is_some() {
+    if other {
         // The code that was asked for is not the wallet's: its entry, present or not, says
         // nothing of the wallet.
         return Ok(LifetimeRead::OtherExecutable {
@@ -320,9 +341,6 @@ pub fn lifetime_read(
         });
     }
     let code = executable.ok_or("Missing wallet code lifetime")?;
-    if !within_limit(code) {
-        return Err("Wallet lifetime exceeds the network limit".into());
-    }
     Ok(LifetimeRead::Entries(LifetimeEntries {
         ledger: observed,
         closing,

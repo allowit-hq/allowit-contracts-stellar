@@ -291,7 +291,7 @@ impl OwnerLedger {
                         code: wasm().try_into().unwrap(),
                     });
                     return Ok(
-                        json!({"latestLedger":120,"entries":[{"xdr":enc(&archival)},{"xdr":enc(&instance),"liveUntilLedgerSeq":520},{"xdr":enc(&code),"liveUntilLedgerSeq":1119}]}),
+                        json!({"latestLedger":120,"entries":[{"xdr":enc(&archival),"lastModifiedLedgerSeq":100},{"xdr":enc(&instance),"lastModifiedLedgerSeq":100,"liveUntilLedgerSeq":520},{"xdr":enc(&code),"lastModifiedLedgerSeq":100,"liveUntilLedgerSeq":1119}]}),
                     );
                 }
                 if let x::LedgerKey::Account(a) = key {

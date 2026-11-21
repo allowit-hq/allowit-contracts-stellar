@@ -214,7 +214,7 @@ fn lifetime_entries() -> ([u8; 32], Value) {
     });
     (
         hash,
-        json!({"latestLedger":120,"entries":[{"xdr":enc(&executable),"liveUntilLedgerSeq":1119},{"xdr":enc(&archival)},{"xdr":enc(&instance),"liveUntilLedgerSeq":520}]}),
+        json!({"latestLedger":120,"entries":[{"xdr":enc(&executable),"lastModifiedLedgerSeq":100,"liveUntilLedgerSeq":1119},{"xdr":enc(&archival),"lastModifiedLedgerSeq":100},{"xdr":enc(&instance),"lastModifiedLedgerSeq":100,"liveUntilLedgerSeq":520}]}),
     )
 }
 struct Lifetime {
@@ -227,7 +227,39 @@ impl Rpc for Lifetime {
             "getNetwork" => Ok(json!({"passphrase":"Test SDF Network ; September 2015"})),
             "getLatestLedger" => Ok(json!({"sequence":self.head})),
             "getLedgerEntries" => {
-                assert_eq!(params["keys"].as_array().unwrap().len(), 3);
+                // The read asks for exactly the archival setting, the wallet's instance and one
+                // code entry, in that order, whatever order the reply has.
+                let asked: Vec<x::LedgerKey> = params["keys"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|key| {
+                        x::LedgerKey::from_xdr_base64(key.as_str().unwrap(), x::Limits::none())
+                            .unwrap()
+                    })
+                    .collect();
+                let [setting, instance, x::LedgerKey::ContractCode(code)] = asked.as_slice() else {
+                    panic!("{asked:?}")
+                };
+                assert_eq!(
+                    *setting,
+                    x::LedgerKey::ConfigSetting(x::LedgerKeyConfigSetting {
+                        config_setting_id: x::ConfigSettingId::StateArchival,
+                    })
+                );
+                assert_eq!(
+                    *instance,
+                    x::LedgerKey::ContractData(x::LedgerKeyContractData {
+                        contract: address(&wallet()),
+                        key: x::ScVal::LedgerKeyContractInstance,
+                        durability: x::ContractDataDurability::Persistent,
+                    })
+                );
+                let asked_for = [
+                    lifetime_entries().0,
+                    native::hash(b"code that the instance does not run"),
+                ];
+                assert!(asked_for.contains(&code.hash.0));
                 Ok(self.entries.clone())
             }
             _ => Err("unexpected lifetime RPC".into()),
@@ -299,6 +331,30 @@ fn a_lifetime_reply_says_a_lapse_only_when_it_is_current_and_valid() {
             120,
         ),
         (
+            "an entry without its change ledger",
+            &|e| {
+                let entry = e["entries"][2].as_object_mut().unwrap();
+                entry.remove("lastModifiedLedgerSeq");
+            },
+            120,
+        ),
+        (
+            "an entry without its change ledger and past its lifetime",
+            &|e| {
+                e["entries"][2]["liveUntilLedgerSeq"] = json!(119);
+                e["entries"][2]["lastModifiedLedgerSeq"] = Value::Null;
+            },
+            120,
+        ),
+        (
+            "the network's setting without its change ledger",
+            &|e| {
+                let entry = e["entries"][1].as_object_mut().unwrap();
+                entry.remove("lastModifiedLedgerSeq");
+            },
+            120,
+        ),
+        (
             "an entry that changed after its last live ledger",
             &|e| {
                 e["entries"][2]["liveUntilLedgerSeq"] = json!(119);
@@ -341,7 +397,7 @@ fn a_lifetime_reply_says_a_lapse_only_when_it_is_current_and_valid() {
                 hash: x::Hash(other),
                 code: code.try_into().unwrap(),
             });
-            list.push(json!({"xdr": enc(&entry), "liveUntilLedgerSeq": 1119}));
+            list.push(json!({"xdr": enc(&entry), "lastModifiedLedgerSeq": 100, "liveUntilLedgerSeq": 1119}));
         }
         let error = rpc::wallet_lifetime(
             &Lifetime { entries, head: 120 },

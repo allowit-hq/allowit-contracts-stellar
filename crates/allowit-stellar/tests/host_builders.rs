@@ -119,7 +119,7 @@ impl Chain {
                 settings,
             ),
         ] {
-            entries.insert(xdr(&key).unwrap(),json!({"key":xdr(&key).unwrap(),"xdr":xdr(&data).unwrap(),"liveUntilLedgerSeq":520}));
+            entries.insert(xdr(&key).unwrap(),json!({"key":xdr(&key).unwrap(),"xdr":xdr(&data).unwrap(),"lastModifiedLedgerSeq":100,"liveUntilLedgerSeq":520}));
         }
         Self {
             entries,
