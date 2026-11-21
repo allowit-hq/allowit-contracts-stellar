@@ -123,21 +123,28 @@ pub fn find_account(rpc: &dyn Rpc, address: &str) -> Result<Option<AccountState>
     }
     account_from_response(&value, address).map(Some)
 }
-/// Whether the ledger holds the account, as an observation of the head. An absence is dated by
-/// its reply and bracketed by the heads read before and after it
-/// ([`owner_observation::current`]): the reply of an earlier ledger does not say that an account
-/// is gone now, so it is a stale observation, which a caller reads again. A presence needs no
-/// date: it never reads as a closed wallet.
+/// Whether the ledger holds the account. A presence is the answer of one read: it never reads
+/// as a closed wallet. An absence is confirmed as an observation of the head: after a reply that
+/// finds no account, the head is read, then the account again, then the closing head, and the
+/// second reply is dated between them ([`owner_observation::current`]). The reply of an earlier
+/// ledger does not say that an account is gone now: it is a stale observation, which a caller
+/// reads again.
 pub fn account_present(rpc: &dyn Rpc, address: &str) -> Result<bool> {
-    let before = owner_observation::head(rpc)?;
     let key = LedgerKey::Account(LedgerKeyAccount {
         account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(account_key(
             address,
         )?))),
     });
-    let value = rpc.call("getLedgerEntries", json!({"keys":[xdr(&key)?]}))?;
+    let read = || rpc.call("getLedgerEntries", json!({"keys":[xdr(&key)?]}));
+    let present = |value: &Value| account_from_response(value, address).map(|_| true);
+    let value = read()?;
     if !no_entry(&value) {
-        return account_from_response(&value, address).map(|_| true);
+        return present(&value);
+    }
+    let before = owner_observation::head(rpc)?;
+    let value = read()?;
+    if !no_entry(&value) {
+        return present(&value);
     }
     let observed = owner_observation::ledger(&value["latestLedger"])?;
     owner_observation::current(rpc, before, observed)?;
@@ -2559,9 +2566,15 @@ mod owner_read_tests {
             let present = account_present(&rpc, &address(7));
             (present, rpc.calls.into_inner().unwrap())
         };
-        let bracket = ["getLatestLedger", "getLedgerEntries", "getLatestLedger"]
-            .map(String::from)
-            .to_vec();
+        // A reply that finds no account, then the head, the account again and the closing head.
+        let bracket = [
+            "getLedgerEntries",
+            "getLatestLedger",
+            "getLedgerEntries",
+            "getLatestLedger",
+        ]
+        .map(String::from)
+        .to_vec();
         // The three forms of a reply that finds no entry.
         for entries in [
             json!({"latestLedger": 120, "entries": []}),
