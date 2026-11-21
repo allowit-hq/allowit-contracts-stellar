@@ -438,7 +438,14 @@ pub fn restore(k: Kind, document: Box<RawValue>) -> Result<Packet> {
             decode_packet::<native::owner_intent::OwnerTransaction>(&packet)?;
         }
         Kind::OwnerSigned => {
-            decode_packet::<OwnerSignedData>(&packet)?;
+            // A restored signed step is the pair that `read_owner_signed` admitted: the signed
+            // bytes are the retained transaction with its owner's signature. Any other pair is
+            // refused here, so that no send or lookup takes one transaction for another.
+            let data: OwnerSignedData = decode_packet(&packet)?;
+            checked(native::owner_intent::validate_signed_owner_transaction(
+                &data.original,
+                owner_payload(&data)?,
+            ))?;
         }
         Kind::Receipt => {
             decode_packet::<rpc::VerifiedReceipt>(&packet)?;
@@ -837,10 +844,11 @@ impl Provider {
                 units: None,
                 recipient: None,
             } => WalletAction::Close {
+                // No trustline: XLM has none, and one that is already gone is not removed again.
                 token_balance: if asset == stellar_xdr::Asset::Native {
-                    0
+                    None
                 } else {
-                    checked(rpc::trustline_balance(self.rpc(), &c.wallet, &asset))?.unwrap_or(0)
+                    checked(rpc::trustline_balance(self.rpc(), &c.wallet, &asset))?
                 },
             },
             // Every spendable unit returns and the account stays. It keeps the reserve of the
@@ -1332,7 +1340,7 @@ impl crate::host::vendors::RuntimeProvider for Provider {
             // A keypair wallet has no code and no lifetime: it is present when its account is.
             return Ok(Resources {
                 code_present: true,
-                wallet_present: checked(rpc::find_account(self.rpc(), &c.wallet))?.is_some(),
+                wallet_present: checked(rpc::account_present(self.rpc(), &c.wallet))?,
                 lifetime: None,
             });
         }
@@ -2240,9 +2248,10 @@ impl crate::host::vendors::RuntimeProvider for Provider {
         if c.route != WalletRoute::Native {
             return Ok(false);
         }
-        // An account that is absent from another network says nothing.
+        // An account that is absent from another network says nothing, and neither does the
+        // reply of an earlier ledger: the absence is an observation of the head.
         self.current_height()?;
-        Ok(checked(rpc::find_account(self.rpc(), &c.wallet))?.is_none())
+        Ok(!checked(rpc::account_present(self.rpc(), &c.wallet))?)
     }
     /// A keypair wallet's close: every amount returns to the owner, every signer is removed and
     /// the account merges into the owner's account. A policy wallet does not close.
@@ -5513,11 +5522,14 @@ mod owner_steps {
         assert!(provider(&steps).owner_step_lapsed(&step, 20).unwrap());
         // A step prepared before the history that the endpoint keeps is not proven lapsed.
         assert!(!provider(&steps).owner_step_lapsed(&step, 5).unwrap());
-        // The proof is of the step's own hash and its own time bound: a ledger that closed at
-        // the bound proves nothing, one that closed a second later does.
+        // The proof is of the step's own hash, in two lookups, and of its own time bound: a
+        // ledger that closed at the bound proves nothing, and nothing else is then asked; one
+        // that closed a second later does.
         let own = native::hex(&data.original.transaction_hash);
-        assert_eq!(*steps.looked_up.lock().unwrap(), [own.clone(), own.clone()]);
-        for (closed_at, lapsed) in [(info.expires_at, false), (info.expires_at + 1, true)] {
+        assert_eq!(*steps.looked_up.lock().unwrap(), vec![own.clone(); 4]);
+        for (closed_at, lapsed, lookups) in
+            [(info.expires_at, false, 1), (info.expires_at + 1, true, 2)]
+        {
             let steps = Arc::new(Steps {
                 closed_at,
                 ..Steps::new()
@@ -5526,7 +5538,7 @@ mod owner_steps {
                 provider(&steps).owner_step_lapsed(&step, 20).unwrap(),
                 lapsed
             );
-            assert_eq!(*steps.looked_up.lock().unwrap(), std::slice::from_ref(&own));
+            assert_eq!(*steps.looked_up.lock().unwrap(), vec![own.clone(); lookups]);
         }
     }
 

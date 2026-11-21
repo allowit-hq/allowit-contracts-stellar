@@ -546,8 +546,10 @@ pub enum WalletAction {
         recipient: Option<String>,
     },
     /// Remove every signer and merge the account into the owner's account. `token_balance`
-    /// is the wallet's balance of its issued asset, which returns to the owner first.
-    Close { token_balance: i64 },
+    /// is the wallet's balance of its issued asset, which returns to the owner first, before
+    /// its trustline is removed; `None` when the wallet holds no trustline: XLM has none, and
+    /// one that is already gone is not removed again.
+    Close { token_balance: Option<i64> },
 }
 impl WalletAction {
     /// The action name of the owner step.
@@ -637,7 +639,10 @@ pub fn prepare_wallet_action(
         }
         WalletAction::Close { token_balance } => {
             let mut operations = Vec::new();
-            if *asset != Asset::Native {
+            if *asset == Asset::Native && token_balance.is_some() {
+                return Err("XLM has no trustline to close".into());
+            }
+            if let Some(token_balance) = token_balance {
                 if *token_balance < 0 {
                     return Err("Invalid issued asset balance".into());
                 }
@@ -1292,7 +1297,13 @@ mod tests {
         let [payment] = operations(&fund).try_into().unwrap();
         assert_eq!(payment.source_account, None);
 
-        let close = run(&state, WalletAction::Close { token_balance: 0 }).unwrap();
+        let close = run(
+            &state,
+            WalletAction::Close {
+                token_balance: None,
+            },
+        )
+        .unwrap();
         let closing = operations(&close);
         assert_eq!(closing.len(), 4);
         for operation in &closing {
