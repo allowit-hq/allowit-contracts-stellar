@@ -187,10 +187,12 @@ pub struct LifetimeEntries {
 pub enum LifetimeRead {
     /// The instance runs the code that was asked for: both entries, of one ledger.
     Entries(LifetimeEntries),
-    /// The instance runs the other code `running`. The reply says nothing of that code's
-    /// lifetime. `closing` is the head that closed the read: a later read of that code is of
-    /// that ledger or a later one.
-    OtherExecutable { running: [u8; 32], closing: u32 },
+    /// The instance runs other code than the code that was asked for: its own entry alone, of
+    /// the reply's ledger. The reply says nothing of the lifetime of the code that it runs.
+    OtherExecutable {
+        ledger: u32,
+        instance_live_until: u32,
+    },
 }
 /// Read the instance of `wallet`, the entry of `code` and the network's archival limit in one
 /// reply, and bind each returned entry to the key that was asked for. The reply is current
@@ -257,7 +259,7 @@ pub fn lifetime_read(
                     return Err("Invalid selected wallet instance".into());
                 };
                 if running != *code {
-                    other = Some(running);
+                    other = Some(());
                 }
                 (
                     &instance_key,
@@ -303,16 +305,22 @@ pub fn lifetime_read(
     let max = max.ok_or("Missing archival lifetime setting")?;
     let instance = instance.ok_or("Missing wallet instance lifetime")?;
     let closing = current(rpc, before, observed)?;
-    if let Some(running) = other {
+    let within_limit = |until: u32| until.saturating_sub(observed) < max;
+    // The instance's own lifetime is valid before the reply says anything, also that the
+    // instance runs other code.
+    if observed.checked_add(max - 1).is_none() || !within_limit(instance) {
+        return Err("Wallet lifetime exceeds the network limit".into());
+    }
+    if other.is_some() {
         // The code that was asked for is not the wallet's: its entry, present or not, says
         // nothing of the wallet.
-        return Ok(LifetimeRead::OtherExecutable { running, closing });
+        return Ok(LifetimeRead::OtherExecutable {
+            ledger: observed,
+            instance_live_until: instance,
+        });
     }
     let code = executable.ok_or("Missing wallet code lifetime")?;
-    if observed.checked_add(max - 1).is_none()
-        || instance.saturating_sub(observed) >= max
-        || code.saturating_sub(observed) >= max
-    {
+    if !within_limit(code) {
         return Err("Wallet lifetime exceeds the network limit".into());
     }
     Ok(LifetimeRead::Entries(LifetimeEntries {
