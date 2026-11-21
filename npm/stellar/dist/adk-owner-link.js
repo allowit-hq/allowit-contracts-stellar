@@ -1,6 +1,6 @@
 import { canonicalFunctions } from '@allowit/core';
 import { ADK_OWNER_FRAGMENT } from './stellar-fragments.js';
-import { stellarAssetContractId } from './stellar-wallet.js';
+import { NETWORKS } from './networks.js';
 export { ADK_OWNER_FRAGMENT } from './stellar-fragments.js';
 const MAX_ENCODED_LENGTH = 87_000;
 const hashPattern = /^[0-9a-f]{64}$/;
@@ -8,19 +8,21 @@ const hashPattern = /^[0-9a-f]{64}$/;
 const kindPattern = /^[a-z]{1,32}$/;
 /** The CLI uses this origin when `ALLOWIT_URL` is not set. */
 const CLI_DEFAULT_ORIGIN = 'https://app.allowit.ai';
-/** The ADK owner flow funds native XLM on Stellar Testnet. */
-const XLM = { symbol: 'XLM', decimals: 7, address: stellarAssetContractId('XLM', null, 'stellar:testnet') };
-export function adkAgentPrompt(workPrompt, origin, policyId, wallet, agent) {
+/** The prompt that the owner gives the agent after signing, for a policy on `network`. */
+export function adkAgentPrompt(workPrompt, origin, policyId, wallet, agent, network) {
+    const label = NETWORKS.find(n => n.id === network)?.label;
+    if (!label)
+        throw new Error('The agent policy link is invalid.');
     const cli = origin === CLI_DEFAULT_ORIGIN ? 'allowit' : `ALLOWIT_URL=${origin} allowit`;
     return [
         workPrompt,
         '',
         `Allowit origin: ${origin}`,
-        `Stellar Testnet policy: ${policyId}`,
+        `${label} policy: ${policyId}`,
         `Policy wallet: ${wallet}`,
         `Agent public key: ${agent}`,
-        `Verify the server public key independently using trusted operator configuration. If this origin is not already trusted, run \`${cli} --rail stellar:testnet rail trust ${origin} <independently verified server public key>\`.`,
-        `Import the attached public profile with \`${cli} --rail stellar:testnet --rpc-url <independent Stellar Testnet RPC URL> wallet import allowit-stellar-profile.json\`. Use your own matching agent key locally.`,
+        `Verify the server public key independently using trusted operator configuration. If this origin is not already trusted, run \`${cli} --rail ${network} rail trust ${origin} <independently verified server public key>\`.`,
+        `Import the attached public profile with \`${cli} --rail ${network} --rpc-url <independent ${label} RPC URL> wallet import allowit-stellar-profile.json\`. Use your own matching agent key locally.`,
     ].join('\n');
 }
 function object(value) {
@@ -54,7 +56,7 @@ export function parseReviewLink(fragment) {
 }
 /** The prompt that the owner gives the agent after signing. */
 export function reviewAgentPrompt(link, origin, policyId, wallet, agent) {
-    return adkAgentPrompt(link.workPrompt, origin, policyId, wallet, agent);
+    return adkAgentPrompt(link.workPrompt, origin, policyId, wallet, agent, link.proposal.network);
 }
 function parseLink(fragment, review) {
     const invalid = () => new Error('The agent policy link is invalid.');
@@ -89,7 +91,7 @@ function parseLink(fragment, review) {
     if (walletKind !== null && (typeof walletKind !== 'string' || !kindPattern.test(walletKind)))
         throw invalid();
     const { network, revision, title, explanation, code, sourceHash, paramsHash, params } = envelope.proposal;
-    if (Object.keys(envelope.proposal).length !== 8 || network !== 'stellar:testnet'
+    if (Object.keys(envelope.proposal).length !== 8 || !NETWORKS.some(n => n.id === network)
         || typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 1 || revision > 0xffffffff
         || typeof title !== 'string' || !title.trim() || title.length > 160
         || typeof explanation !== 'string' || explanation.length > 8_000
@@ -98,7 +100,7 @@ function parseLink(fragment, review) {
         || typeof paramsHash !== 'string' || !hashPattern.test(paramsHash)
         || !object(params) || Object.keys(params).length > 64 || !Object.values(params).every(value => policyValue(value)))
         throw invalid();
-    return { proposal: { network, revision, title, explanation, code, sourceHash, paramsHash, params }, workPrompt: envelope.workPrompt, agent, amount, walletKind };
+    return { proposal: { network: network, revision, title, explanation, code, sourceHash, paramsHash, params }, workPrompt: envelope.workPrompt, agent, amount, walletKind };
 }
 /** Base units as a decimal, without floating-point rounding. */
 function decimal(units, decimals) {
@@ -108,12 +110,24 @@ function decimal(units, decimals) {
     return `${negative ? '-' : ''}${digits.slice(0, -decimals)}${fraction ? `.${fraction}` : ''}`;
 }
 const integer = /^-?[0-9]+$/;
-function leaf(semantic) {
+/**
+ * The unit of a proposal's amounts: the one listed asset that its `tokens` rule admits, a list of one `Addr` as Core
+ * reads it, else, for a proposal without that rule, the network's native asset (the first listed). Any other rule
+ * gives null.
+ */
+function unitOf(params, listed) {
+    const rule = params.tokens;
+    if (rule === undefined)
+        return listed[0] ?? null;
+    const only = Array.isArray(rule.List) && rule.List.length === 1 ? rule.List[0].Addr : null;
+    return listed.find(asset => asset.id === only) ?? null;
+}
+function leaf(semantic, unit, listed) {
     switch (semantic) {
-        case 'amount': return units => integer.test(units) ? `${decimal(units, XLM.decimals)} ${XLM.symbol}` : units;
+        case 'amount': return units => integer.test(units) && unit ? `${decimal(units, unit.decimals)} ${unit.symbol}` : units;
         case 'timestamp': return seconds => integer.test(seconds) && Math.abs(Number(seconds)) <= 8.64e12
             ? new Date(Number(seconds) * 1000).toISOString().replace(/\.000Z$/, 'Z') : seconds;
-        case 'assets': return asset => asset === XLM.address ? XLM.symbol : asset;
+        case 'assets': return asset => listed.find(item => item.id === asset)?.symbol ?? asset;
         case 'operations': return operation => operation === '*' ? 'Any' : operation;
         default: return item => item;
     }
@@ -127,12 +141,15 @@ function text(value, format) {
     return format(String(item));
 }
 /**
- * Owner-readable lines for the params of a parsed proposal. Canonical keys use the Core registry label. Amounts use
- * the XLM decimals, an expiry is a UTC time, and the XLM asset contract shows as XLM. Other keys keep their name.
+ * Owner-readable lines for the params of a parsed proposal, with the assets that the rail lists for its network.
+ * Canonical keys use the Core registry label. Amounts use the unit of the proposal's asset and stay in base units
+ * when it is not known, an expiry is a UTC time, and a listed asset contract shows as its code. Other keys keep
+ * their name.
  */
-export function adkParamLines(params) {
+export function adkParamLines(params, listed) {
+    const unit = unitOf(params, listed);
     return Object.entries(params).map(([key, value]) => {
         const canonical = canonicalFunctions.find(item => item.name === key);
-        return { key, label: canonical?.label ?? key, value: text(value, leaf(canonical?.parameter.semanticType)) };
+        return { key, label: canonical?.label ?? key, value: text(value, leaf(canonical?.parameter.semanticType, unit, listed)) };
     });
 }

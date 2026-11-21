@@ -763,6 +763,69 @@ fn a_request_id_binds_its_asset_and_a_signed_setup_keeps_its_hints() {
     let message = refused(&request(Some(&usdc), 100_000), &signer);
     assert!(message.contains("bytes changed"), "{message}");
 }
+/// A setup request binds its amount from its first run on: a request that stopped before its
+/// signature and one that was signed both refuse a retry with another amount and sign nothing.
+/// So a host that shows the amount of the request shows the amount that the setup signs.
+#[test]
+fn a_retry_with_another_amount_signs_nothing_whether_or_not_the_setup_was_signed() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().canonicalize().unwrap().join("proof")).unwrap();
+    let c = selection().config;
+    let chain = Arc::new(Chain::new(c.clone()));
+    let runtime = Runtime::from_rpc(chain.clone());
+    let request = |funding: i64| SetupRequest {
+        network: c.network.clone(),
+        owner: c.owner.clone(),
+        agent: c.agent.clone(),
+        server: c.server.clone(),
+        request_id: "setup-amount-001".into(),
+        fee_per_operation: 100,
+        asset: None,
+        funding: Some(funding),
+    };
+    let now = wire::now();
+    // The owner's signer fails: the request is retained unsigned.
+    let failing = Key {
+        calls: AtomicUsize::new(0),
+        bad: true,
+        before: None,
+    };
+    workflow::configure_native(&runtime, &store, &request(200_000_000), &failing, &|| {
+        Ok(now)
+    })
+    .unwrap_err();
+    let unsigned: Value = store.load("setup-amount-001").unwrap().unwrap();
+    assert!(unsigned["signedXdr"].is_null());
+    let signer = key();
+    let refused =
+        workflow::configure_native(&runtime, &store, &request(300_000_000), &signer, &|| {
+            Ok(now)
+        })
+        .unwrap_err();
+    assert!(
+        refused.message.contains("another intent"),
+        "{}",
+        refused.message
+    );
+    assert_eq!(signer.calls.load(Ordering::SeqCst), 0);
+    // The same amount signs; then another amount is refused again.
+    workflow::configure_native(&runtime, &store, &request(200_000_000), &signer, &|| {
+        Ok(now)
+    })
+    .unwrap();
+    assert_eq!(signer.calls.load(Ordering::SeqCst), 1);
+    let refused =
+        workflow::configure_native(&runtime, &store, &request(300_000_000), &signer, &|| {
+            Ok(now)
+        })
+        .unwrap_err();
+    assert!(
+        refused.message.contains("another intent"),
+        "{}",
+        refused.message
+    );
+    assert_eq!(signer.calls.load(Ordering::SeqCst), 1);
+}
 /// The setup key of a wallet account is random and lives in one run. A request that settled
 /// reports its wallet again and signs nothing. A request that stopped before its signature
 /// holds no key and nothing signed: its next run prepares another account with a new key.

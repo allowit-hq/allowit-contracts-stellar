@@ -5,7 +5,7 @@
  */
 import { type ExplorerKind } from './explorer.js';
 import { defineElements } from './elements/index.js';
-import { adkParamLines, parseReviewLink, reviewAgentPrompt } from './adk-owner-link.js';
+import { parseReviewLink, reviewAgentPrompt, type AdkProposal } from './adk-owner-link.js';
 import type { AssetDisplay, WalletKindId } from '@allowit/core';
 export type ElementKind = 'address' | 'explorer-link' | 'amount' | 'wallet-sign-in' | 'owner-sign' | 'owner-answer' | 'receipt' | 'binding-review';
 export type Feature = 'transfer' | 'swap' | 'deposit' | 'redeem' | 'owner-setup' | 'deploy' | 'fund' | 'activate' | 'binding-review' | 'explorer-links';
@@ -73,7 +73,7 @@ declare const plugin: Readonly<{
         fragment: "#adk-proposal-v1=";
         parseLink: typeof parseReviewLink;
         agentPrompt: typeof reviewAgentPrompt;
-        paramLines: typeof adkParamLines;
+        paramLines: (params: AdkProposal["params"], network: string) => import("./adk-owner-link.js").AdkParamLine[];
     }>;
     /**
      * What the SDK's owner workflows read from Stellar and check with its keys: transaction records, the record of an
@@ -85,6 +85,8 @@ declare const plugin: Readonly<{
         skips: Readonly<Partial<Record<Feature, string>>>;
         fixtures: Readonly<{
             address: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+            /** Two more accounts, each distinct from `address`, for a test that needs several roles, such as a wallet setup. */
+            accounts: readonly string[];
             invalidAddress: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA6";
             txHash: string;
             asset: "USDC";

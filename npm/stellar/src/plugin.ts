@@ -7,7 +7,7 @@ import {stellarExplorerUrl, type ExplorerKind} from './explorer.js';
 import {StrKey} from '@stellar/stellar-sdk/base';
 import {stellarAssetContract} from './stellar-asset.js';
 import {defineElements, ELEMENTS} from './elements/index.js';
-import {ADK_OWNER_FRAGMENT, adkParamLines, parseReviewLink, reviewAgentPrompt} from './adk-owner-link.js';
+import {ADK_OWNER_FRAGMENT, adkParamLines, parseReviewLink, reviewAgentPrompt, type AdkProposal} from './adk-owner-link.js';
 import {ownerChain} from './owner-chain.js';
 import {NETWORKS, canonicalNetwork, networkPassphrase} from './networks.js';
 import type {AssetDisplay, WalletKindId} from '@allowit/core';
@@ -119,7 +119,8 @@ const plugin = Object.freeze({
   nativeAsset,
   assetDisplay,
   /** Review and sign links: the fragment, its parser, the agent prompt and the owner-readable params. */
-  review: Object.freeze({fragment: ADK_OWNER_FRAGMENT, parseLink: parseReviewLink, agentPrompt: reviewAgentPrompt, paramLines: adkParamLines}),
+  review: Object.freeze({fragment: ADK_OWNER_FRAGMENT, parseLink: parseReviewLink, agentPrompt: reviewAgentPrompt,
+    paramLines: (params: AdkProposal['params'], network: string) => adkParamLines(params, assets(network))}),
   /**
    * What the SDK's owner workflows read from Stellar and check with its keys: transaction records, the record of an
    * expired step, the Native wallet's setup and the owner's approval. The SDK holds the workflows and their journal.
@@ -130,6 +131,8 @@ const plugin = Object.freeze({
     skips: Object.freeze({swap: 'Stellar has no swap venue in the minimal path'} as Partial<Record<Feature, string>>),
     fixtures: Object.freeze({
       address: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+      /** Two more accounts, each distinct from `address`, for a test that needs several roles, such as a wallet setup. */
+      accounts: Object.freeze(['GD5EQNAUP5XGSDBWSPX7MEZWARSAHTMK4KQU6MNTYQDTLBLJEOKWLSJG', 'GAMX62ZD4FWIKMWGVPEDR6WNL2TYTPQMO2ZJEAZUAON7VCZ5G2GWDF7W']),
       invalidAddress: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA6',
       txHash: 'ab'.repeat(32),
       asset: 'USDC',

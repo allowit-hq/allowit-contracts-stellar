@@ -21,6 +21,12 @@ test('define is a no-op without custom elements, so servers and tests can import
   plugin.define();
 });
 
+test('the fixture accounts are valid and distinct', () => {
+  const {address, accounts} = plugin.test.fixtures;
+  assert.equal(new Set([address, ...accounts]).size, 3);
+  for (const account of accounts) assert.equal(plugin.validateAddress(plugin.test.network, account), true);
+});
+
 test('addresses need a valid StrKey checksum', () => {
   const {address, invalidAddress} = plugin.test.fixtures;
   assert.equal(plugin.validateAddress(plugin.test.network, address), true);

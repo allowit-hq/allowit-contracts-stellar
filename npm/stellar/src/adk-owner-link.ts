@@ -1,6 +1,6 @@
 import {canonicalFunctions, type ParameterSemanticType} from '@allowit/core';
 import {ADK_OWNER_FRAGMENT} from './stellar-fragments.js';
-import {stellarAssetContractId} from './stellar-wallet.js';
+import {NETWORKS} from './networks.js';
 export {ADK_OWNER_FRAGMENT} from './stellar-fragments.js';
 
 const MAX_ENCODED_LENGTH = 87_000;
@@ -9,11 +9,12 @@ const hashPattern = /^[0-9a-f]{64}$/;
 const kindPattern = /^[a-z]{1,32}$/;
 /** The CLI uses this origin when `ALLOWIT_URL` is not set. */
 const CLI_DEFAULT_ORIGIN = 'https://app.allowit.ai';
-/** The ADK owner flow funds native XLM on Stellar Testnet. */
-const XLM = {symbol: 'XLM', decimals: 7, address: stellarAssetContractId('XLM', null, 'stellar:testnet')};
+/** An asset that the rail lists for a network: its contract, its code and its decimals. */
+export type ListedAsset = {id: string; symbol: string; decimals: number};
 
 export type AdkProposal = {
-  network: 'stellar:testnet';
+  /** A canonical network id of the rail's registry ([`NETWORKS`]). */
+  network: string;
   revision: number;
   title: string;
   explanation: string;
@@ -25,17 +26,20 @@ export type AdkProposal = {
 
 export type AdkOwnerLink = {proposal: AdkProposal; workPrompt: string};
 
-export function adkAgentPrompt(workPrompt: string, origin: string, policyId: string, wallet: string, agent: string): string {
+/** The prompt that the owner gives the agent after signing, for a policy on `network`. */
+export function adkAgentPrompt(workPrompt: string, origin: string, policyId: string, wallet: string, agent: string, network: string): string {
+  const label = NETWORKS.find(n => n.id === network)?.label;
+  if (!label) throw new Error('The agent policy link is invalid.');
   const cli = origin === CLI_DEFAULT_ORIGIN ? 'allowit' : `ALLOWIT_URL=${origin} allowit`;
   return [
     workPrompt,
     '',
     `Allowit origin: ${origin}`,
-    `Stellar Testnet policy: ${policyId}`,
+    `${label} policy: ${policyId}`,
     `Policy wallet: ${wallet}`,
     `Agent public key: ${agent}`,
-    `Verify the server public key independently using trusted operator configuration. If this origin is not already trusted, run \`${cli} --rail stellar:testnet rail trust ${origin} <independently verified server public key>\`.`,
-    `Import the attached public profile with \`${cli} --rail stellar:testnet --rpc-url <independent Stellar Testnet RPC URL> wallet import allowit-stellar-profile.json\`. Use your own matching agent key locally.`,
+    `Verify the server public key independently using trusted operator configuration. If this origin is not already trusted, run \`${cli} --rail ${network} rail trust ${origin} <independently verified server public key>\`.`,
+    `Import the attached public profile with \`${cli} --rail ${network} --rpc-url <independent ${label} RPC URL> wallet import allowit-stellar-profile.json\`. Use your own matching agent key locally.`,
   ].join('\n');
 }
 
@@ -75,8 +79,8 @@ export function parseReviewLink(fragment: string): ReviewLink {
 }
 
 /** The prompt that the owner gives the agent after signing. */
-export function reviewAgentPrompt(link: Pick<ReviewLink, 'workPrompt'>, origin: string, policyId: string, wallet: string, agent: string): string {
-  return adkAgentPrompt(link.workPrompt, origin, policyId, wallet, agent);
+export function reviewAgentPrompt(link: Pick<ReviewLink, 'workPrompt' | 'proposal'>, origin: string, policyId: string, wallet: string, agent: string): string {
+  return adkAgentPrompt(link.workPrompt, origin, policyId, wallet, agent, link.proposal.network);
 }
 
 function parseLink(fragment: string, review: boolean): ReviewLink {
@@ -104,7 +108,7 @@ function parseLink(fragment: string, review: boolean): ReviewLink {
   const walletKind = envelope.walletKind ?? null;
   if (walletKind !== null && (typeof walletKind !== 'string' || !kindPattern.test(walletKind))) throw invalid();
   const {network, revision, title, explanation, code, sourceHash, paramsHash, params} = envelope.proposal;
-  if (Object.keys(envelope.proposal).length !== 8 || network !== 'stellar:testnet'
+  if (Object.keys(envelope.proposal).length !== 8 || !NETWORKS.some(n => n.id === network)
     || typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 1 || revision > 0xffffffff
     || typeof title !== 'string' || !title.trim() || title.length > 160
     || typeof explanation !== 'string' || explanation.length > 8_000
@@ -112,7 +116,7 @@ function parseLink(fragment: string, review: boolean): ReviewLink {
     || typeof sourceHash !== 'string' || !hashPattern.test(sourceHash)
     || typeof paramsHash !== 'string' || !hashPattern.test(paramsHash)
     || !object(params) || Object.keys(params).length > 64 || !Object.values(params).every(value => policyValue(value))) throw invalid();
-  return {proposal: {network, revision, title, explanation, code, sourceHash, paramsHash, params}, workPrompt: envelope.workPrompt, agent, amount, walletKind};
+  return {proposal: {network: network as string, revision, title, explanation, code, sourceHash, paramsHash, params}, workPrompt: envelope.workPrompt, agent, amount, walletKind};
 }
 
 /** Base units as a decimal, without floating-point rounding. */
@@ -124,12 +128,23 @@ function decimal(units: string, decimals: number): string {
 }
 
 const integer = /^-?[0-9]+$/;
-function leaf(semantic: ParameterSemanticType | undefined): (item: string) => string {
+/**
+ * The unit of a proposal's amounts: the one listed asset that its `tokens` rule admits, a list of one `Addr` as Core
+ * reads it, else, for a proposal without that rule, the network's native asset (the first listed). Any other rule
+ * gives null.
+ */
+function unitOf(params: AdkProposal['params'], listed: readonly ListedAsset[]): ListedAsset | null {
+  const rule = params.tokens as {List?: {Addr?: unknown}[]} | undefined;
+  if (rule === undefined) return listed[0] ?? null;
+  const only = Array.isArray(rule.List) && rule.List.length === 1 ? rule.List[0].Addr : null;
+  return listed.find(asset => asset.id === only) ?? null;
+}
+function leaf(semantic: ParameterSemanticType | undefined, unit: ListedAsset | null, listed: readonly ListedAsset[]): (item: string) => string {
   switch (semantic) {
-    case 'amount': return units => integer.test(units) ? `${decimal(units, XLM.decimals)} ${XLM.symbol}` : units;
+    case 'amount': return units => integer.test(units) && unit ? `${decimal(units, unit.decimals)} ${unit.symbol}` : units;
     case 'timestamp': return seconds => integer.test(seconds) && Math.abs(Number(seconds)) <= 8.64e12
       ? new Date(Number(seconds) * 1000).toISOString().replace(/\.000Z$/, 'Z') : seconds;
-    case 'assets': return asset => asset === XLM.address ? XLM.symbol : asset;
+    case 'assets': return asset => listed.find(item => item.id === asset)?.symbol ?? asset;
     case 'operations': return operation => operation === '*' ? 'Any' : operation;
     default: return item => item;
   }
@@ -145,12 +160,15 @@ function text(value: unknown, format: (item: string) => string): string {
 export type AdkParamLine = {key: string; label: string; value: string};
 
 /**
- * Owner-readable lines for the params of a parsed proposal. Canonical keys use the Core registry label. Amounts use
- * the XLM decimals, an expiry is a UTC time, and the XLM asset contract shows as XLM. Other keys keep their name.
+ * Owner-readable lines for the params of a parsed proposal, with the assets that the rail lists for its network.
+ * Canonical keys use the Core registry label. Amounts use the unit of the proposal's asset and stay in base units
+ * when it is not known, an expiry is a UTC time, and a listed asset contract shows as its code. Other keys keep
+ * their name.
  */
-export function adkParamLines(params: AdkProposal['params']): AdkParamLine[] {
+export function adkParamLines(params: AdkProposal['params'], listed: readonly ListedAsset[]): AdkParamLine[] {
+  const unit = unitOf(params, listed);
   return Object.entries(params).map(([key, value]) => {
     const canonical = canonicalFunctions.find(item => item.name === key);
-    return {key, label: canonical?.label ?? key, value: text(value, leaf(canonical?.parameter.semanticType))};
+    return {key, label: canonical?.label ?? key, value: text(value, leaf(canonical?.parameter.semanticType, unit, listed))};
   });
 }
