@@ -157,10 +157,6 @@ pub(crate) fn lifetime_keys(wallet: &str, code: &[u8; 32]) -> Result<[LedgerKey;
         LedgerKey::ContractCode(LedgerKeyContractCode { hash: Hash(*code) }),
     ])
 }
-/// Read and bind both selected lifetime entries and the exact current network archival limit.
-/// A wallet whose instance or code lapsed is refused with `CONTRACT_EXPIRED`: nothing restores it.
-/// An archived entry that the RPC serves without a live-until ledger has lapsed; a missing entry
-/// or a malformed reply is an error of its own.
 /// The refusal of a lifetime read whose instance runs other code than the code that was asked
 /// for: the wallet's owner installed that code outside Allowit.
 pub const OTHER_EXECUTABLE: &str = "Wallet lifetime instance names another executable";
@@ -173,12 +169,40 @@ fn live_until(value: &Value) -> Result<u32> {
         value => ledger(value),
     }
 }
-pub fn wallet_lifetime(
+/// The lifetime entries of a wallet as one current reply gives them, with no judgement of a
+/// lapse: the last live ledger of the instance and of the code that was asked for, 0 for an
+/// archived entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LifetimeEntries {
+    /// The ledger of the reply.
+    pub ledger: u32,
+    /// The head that closed the read: at or after `ledger`, by at most [`MAX_OBSERVATION_LAG`].
+    pub closing: u32,
+    pub max_entry_ttl: u32,
+    pub instance_live_until: u32,
+    pub code_live_until: u32,
+}
+/// What one current reply says of a wallet's lifetime entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LifetimeRead {
+    /// The instance runs the code that was asked for: both entries, of one ledger.
+    Entries(LifetimeEntries),
+    /// The instance runs this other code. The reply says nothing of that code's lifetime.
+    OtherExecutable([u8; 32]),
+}
+/// Read the instance of `wallet`, the entry of `code` and the network's archival limit in one
+/// reply, and bind each returned entry to the key that was asked for. The reply is current
+/// ([`current`]) before anything of it is used: a reply that is older than the head before it, or
+/// that trails the closing head by more than [`MAX_OBSERVATION_LAG`], is a stale observation. A
+/// missing entry, a malformed reply, an entry that the reply dates after its own ledger and a
+/// lifetime beyond the network's limit are errors of their own. Nothing here says that an entry
+/// lapsed: the caller compares the last live ledgers with the ledger that it decides for.
+pub fn lifetime_read(
     rpc: &dyn Rpc,
     selected_network: &str,
     wallet: &str,
     code: &[u8; 32],
-) -> Result<WalletLifetime> {
+) -> Result<LifetimeRead> {
     network(rpc, selected_network)?;
     let [instance_key, code_key] = lifetime_keys(wallet, code)?;
     let config_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
@@ -192,13 +216,22 @@ pub fn wallet_lifetime(
     let entries = response["entries"]
         .as_array()
         .ok_or("Missing wallet lifetime entries")?;
-    if entries.len() != 3 {
+    if entries.len() > 3 {
         return Err("Expected the archival setting and both wallet lifetime entries".into());
     }
     let mut max = None;
     let mut instance = None;
     let mut executable = None;
+    let mut other = None;
     for entry in entries {
+        // An entry that changed after the reply's own ledger contradicts the reply.
+        if entry
+            .get("lastModifiedLedgerSeq")
+            .is_some_and(|modified| !modified.is_null())
+            && ledger(&entry["lastModifiedLedgerSeq"])? > observed
+        {
+            return Err("Wallet lifetime entry is newer than its reply".into());
+        }
         let data: LedgerEntryData =
             read(entry["xdr"].as_str().ok_or("Missing wallet lifetime XDR")?)?;
         let (expected, slot, ttl) = match data {
@@ -213,11 +246,15 @@ pub fn wallet_lifetime(
                     && data.key == ScVal::LedgerKeyContractInstance
                     && data.durability == ContractDataDurability::Persistent =>
             {
-                let ScVal::ContractInstance(state) = data.val else {
+                let ScVal::ContractInstance(ScContractInstance {
+                    executable: ContractExecutable::Wasm(Hash(running)),
+                    ..
+                }) = data.val
+                else {
                     return Err("Invalid selected wallet instance".into());
                 };
-                if state.executable != ContractExecutable::Wasm(Hash(*code)) {
-                    return Err(OTHER_EXECUTABLE.into());
+                if running != *code {
+                    other = Some(running);
                 }
                 (
                     &instance_key,
@@ -254,24 +291,49 @@ pub fn wallet_lifetime(
     }
     let max = max.ok_or("Missing archival lifetime setting")?;
     let instance = instance.ok_or("Missing wallet instance lifetime")?;
-    let code = executable.ok_or("Missing wallet code lifetime")?;
-    if instance < observed || code < observed {
-        return Err(super::CONTRACT_EXPIRED.into());
+    let closing = current(rpc, before, observed)?;
+    if let Some(running) = other {
+        // The code that was asked for is not the wallet's: its entry, present or not, says
+        // nothing of the wallet.
+        return Ok(LifetimeRead::OtherExecutable(running));
     }
+    let code = executable.ok_or("Missing wallet code lifetime")?;
     if observed.checked_add(max - 1).is_none()
-        || instance - observed >= max
-        || code - observed >= max
+        || instance.saturating_sub(observed) >= max
+        || code.saturating_sub(observed) >= max
     {
         return Err("Wallet lifetime exceeds the network limit".into());
     }
-    let closing = current(rpc, before, observed)?;
-    if instance < closing || code < closing {
-        return Err(super::CONTRACT_EXPIRED.into());
-    }
-    Ok(WalletLifetime {
+    Ok(LifetimeRead::Entries(LifetimeEntries {
         ledger: observed,
+        closing,
         max_entry_ttl: max,
         instance_live_until: instance,
         code_live_until: code,
+    }))
+}
+/// Read and bind both selected lifetime entries and the exact current network archival limit
+/// ([`lifetime_read`]). A wallet whose instance or code is past its lifetime at the head that
+/// closes the read is refused with `CONTRACT_EXPIRED`: nothing restores it. An archived entry
+/// that the RPC serves without a live-until ledger has lapsed. A wallet whose instance runs other
+/// code is [`OTHER_EXECUTABLE`].
+pub fn wallet_lifetime(
+    rpc: &dyn Rpc,
+    selected_network: &str,
+    wallet: &str,
+    code: &[u8; 32],
+) -> Result<WalletLifetime> {
+    let entries = match lifetime_read(rpc, selected_network, wallet, code)? {
+        LifetimeRead::Entries(entries) => entries,
+        LifetimeRead::OtherExecutable(_) => return Err(OTHER_EXECUTABLE.into()),
+    };
+    if entries.instance_live_until < entries.closing || entries.code_live_until < entries.closing {
+        return Err(super::CONTRACT_EXPIRED.into());
+    }
+    Ok(WalletLifetime {
+        ledger: entries.ledger,
+        max_entry_ttl: entries.max_entry_ttl,
+        instance_live_until: entries.instance_live_until,
+        code_live_until: entries.code_live_until,
     })
 }
