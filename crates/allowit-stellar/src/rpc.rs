@@ -126,9 +126,9 @@ pub fn find_account(rpc: &dyn Rpc, address: &str) -> Result<Option<AccountState>
 /// Whether the ledger holds the account. A presence is the answer of one read: it never reads
 /// as a closed wallet. An absence is confirmed as an observation of the head: after a reply that
 /// finds no account, the head is read, then the account again, then the closing head, and the
-/// second reply is dated between them ([`owner_observation::current`]). The reply of an earlier
-/// ledger does not say that an account is gone now: it is a stale observation, which a caller
-/// reads again.
+/// second reply is of the closing head's own ledger, not older than the head before it
+/// ([`owner_observation::current`]). The reply of any other ledger does not say that an account
+/// is gone now: it is a stale observation, which a caller reads again.
 pub fn account_present(rpc: &dyn Rpc, address: &str) -> Result<bool> {
     let key = LedgerKey::Account(LedgerKeyAccount {
         account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(account_key(
@@ -147,7 +147,11 @@ pub fn account_present(rpc: &dyn Rpc, address: &str) -> Result<bool> {
         return present(&value);
     }
     let observed = owner_observation::ledger(&value["latestLedger"])?;
-    owner_observation::current(rpc, before, observed)?;
+    // The absence is of the closing head itself: a ledger that closed after the reply could
+    // hold the account again.
+    if owner_observation::current(rpc, before, observed)? != observed {
+        return Err(owner_observation::STALE_OBSERVATION.into());
+    }
     Ok(false)
 }
 /// Whether a `getLedgerEntries` reply finds no entry: an empty list, or no list beside a valid
@@ -949,24 +953,16 @@ pub fn status_by_hash(
 }
 /// Whether the owner transaction with hash `hash` lapsed: it never applied and can no longer
 /// apply. The server prepared it at ledger `since`, with the time bound `expires_at`. The proof
-/// is two `getTransaction` replies. The first is read for its ledgers only: a ledger that closed
-/// after the time bound, after which no ledger can hold the transaction. The second, asked once
-/// the first was answered, has no record of the hash in a searched history that holds `since`
-/// and reaches that ledger. One reply cannot prove it: an endpoint looks the hash up before it
-/// reads its ledger range, so the range of a reply can be newer than its lookup. `false` means
-/// not proven.
+/// is one `getTransaction` reply: no record of the hash, a searched history that holds `since`,
+/// and a ledger that closed after the time bound. `false` means not proven.
 pub fn owner_transaction_lapsed(
     rpc: &dyn Rpc,
     hash: &[u8; 32],
     expires_at: u64,
     since: u64,
 ) -> Result<bool> {
-    let first = rpc.call("getTransaction", json!({ "hash": hex(hash) }))?;
-    let Some(closed) = ledger_closed_after(&first, expires_at) else {
-        return Ok(false);
-    };
-    let second = rpc.call("getTransaction", json!({ "hash": hex(hash) }))?;
-    Ok(owner_never_applied(&second, &hex(hash), since, closed))
+    let reply = rpc.call("getTransaction", json!({ "hash": hex(hash) }))?;
+    Ok(owner_never_applied(&reply, &hex(hash), expires_at, since))
 }
 /// The network's minimum lifetime of a persistent entry, in ledgers: the lifetime of code that
 /// an upload creates, and the lifetime to which a renewal extends shared code.
@@ -991,31 +987,23 @@ pub fn minimum_persistent_lifetime(rpc: &dyn Rpc) -> Result<u32> {
     }
     Ok(settings.min_persistent_ttl)
 }
-/// A number of a `getTransaction` reply, which an endpoint gives as a number or as text.
-fn reply_number(reply: &Value, key: &str) -> Option<u64> {
-    reply[key]
-        .as_u64()
-        .or_else(|| reply[key].as_str()?.parse().ok())
-}
-/// The latest ledger of a `getTransaction` reply, when it closed after `expires_at`.
-fn ledger_closed_after(reply: &Value, expires_at: u64) -> Option<u64> {
-    let closed = reply_number(reply, "latestLedgerCloseTime")?;
-    let latest = reply_number(reply, "latestLedger")?;
-    (closed > expires_at && latest > 0).then_some(latest)
-}
-/// Whether a `getTransaction` reply has no record of the transaction with this hash in a searched
-/// history that holds the ledger `since` and reaches the ledger `closed`, which closed after the
-/// transaction's time bound: see [`owner_transaction_lapsed`].
-fn owner_never_applied(reply: &Value, hash: &str, since: u64, closed: u64) -> bool {
-    // The searched history is ledgers `oldest..=latest`: it must contain `since` and `closed`.
+/// Whether a `getTransaction` reply proves that the transaction with this hash never applied and
+/// can no longer apply: see [`owner_transaction_lapsed`].
+fn owner_never_applied(reply: &Value, hash: &str, expires_at: u64, since: u64) -> bool {
+    let number = |key: &str| {
+        reply[key]
+            .as_u64()
+            .or_else(|| reply[key].as_str()?.parse().ok())
+    };
+    // The searched history is ledgers `oldest..=latest`, and it must contain `since`.
     let covered = matches!(
-        (reply_number(reply, "oldestLedger"), reply_number(reply, "latestLedger")),
-        (Some(oldest), Some(latest))
-            if 0 < oldest && oldest <= since && since <= latest && closed <= latest
+        (number("oldestLedger"), number("latestLedger")),
+        (Some(oldest), Some(latest)) if 0 < oldest && oldest <= since && since <= latest
     );
     covered
         && reply["status"] == "NOT_FOUND"
         && (reply["txHash"].is_null() || reply["txHash"] == hash)
+        && number("latestLedgerCloseTime").is_some_and(|closed| closed > expires_at)
 }
 /// Whether the policy wallet operation `p` lapsed: it can no longer execute, and the network's
 /// history holds no execution of it. A ledger closed at or after its signed `expires_at`, and the
@@ -2583,16 +2571,18 @@ mod owner_read_tests {
         ] {
             assert_eq!(absent(&[120], entries), (Ok(false), bracket.clone()));
         }
-        // The head moves on while the reply travels: still current.
+        // A reply of the closing head, which moved since the head before it.
         assert_eq!(
-            absent(&[120, 123], json!({"latestLedger": 121, "entries": []})).0,
+            absent(&[120, 121], json!({"latestLedger": 121, "entries": []})).0,
             Ok(false)
         );
         // The reply of an earlier ledger than the head that was read before it, of a ledger
-        // that the head has not reached, and of a ledger that the head left far behind.
+        // that the head has not reached, of a ledger that the head left one ledger behind (the
+        // account could exist again in it), and of one that it left far behind.
         for (heads, dated) in [
             (&[120, 120][..], 119),
             (&[120, 120], 121),
+            (&[120, 121], 120),
             (&[120, 127], 121),
         ] {
             assert_eq!(
@@ -2685,45 +2675,20 @@ mod owner_lapse_tests {
         json!({"status":status,"oldestLedger":oldest,"latestLedger":latest,"latestLedgerCloseTime":closed.to_string()})
     }
 
-    /// A reply shows a ledger that closed after the time bound, or it shows nothing.
+    /// A sent owner step past its time bound with no ledger record lapsed, so the owner signs a
+    /// new step. The proof needs history from the prepared ledger `since` onward.
     #[test]
-    fn a_reply_names_the_ledger_that_closed_after_the_time_bound() {
-        assert_eq!(
-            ledger_closed_after(&reply("NOT_FOUND", 400, 900, 1_001), 1_000),
-            Some(900)
-        );
-        // No ledger closed after the time bound yet: the step can still apply.
-        assert_eq!(
-            ledger_closed_after(&reply("NOT_FOUND", 400, 900, 1_000), 1_000),
-            None
-        );
-        // A reply without its close time or its latest ledger shows nothing.
-        assert_eq!(
-            ledger_closed_after(&json!({"status":"NOT_FOUND","latestLedger":900}), 1_000),
-            None
-        );
-        assert_eq!(
-            ledger_closed_after(
-                &json!({"status":"NOT_FOUND","latestLedgerCloseTime":"1001"}),
-                1_000
-            ),
-            None
-        );
-    }
-
-    /// A sent owner step with no ledger record lapsed when the searched history holds its
-    /// prepared ledger `since` and reaches the ledger `closed`, which closed after its bound.
-    #[test]
-    fn a_lost_owner_send_lapses_only_when_history_covers_its_prepared_and_closing_ledgers() {
-        let (since, closed) = (500, 900);
-        let lapsed = |reply: &Value| owner_never_applied(reply, HASH, since, closed);
+    fn a_lost_owner_send_lapses_only_when_history_covers_its_prepared_ledger() {
+        let (expires_at, since) = (1_000, 500);
+        let lapsed = |reply: &Value| owner_never_applied(reply, HASH, expires_at, since);
         assert!(lapsed(&reply("NOT_FOUND", 400, 900, 1_001)));
-        assert!(lapsed(&reply("NOT_FOUND", 500, 950, 1_050)));
+        assert!(lapsed(&reply("NOT_FOUND", 500, 500, 1_001)));
         // The history starts after the prepared ledger: an earlier inclusion could be missing.
         assert!(!lapsed(&reply("NOT_FOUND", 501, 900, 1_001)));
-        // The endpoint has not reached the ledger that closed after the bound: a ledger up to
-        // it could hold the step.
-        assert!(!lapsed(&reply("NOT_FOUND", 400, 899, 1_001)));
+        // The endpoint has not reached the prepared ledger.
+        assert!(!lapsed(&reply("NOT_FOUND", 400, 499, 1_001)));
+        // No ledger closed after the time bound yet: the step can still apply.
+        assert!(!lapsed(&reply("NOT_FOUND", 400, 900, 1_000)));
         // A ledger record, a reply without history bounds and a reply for another hash prove
         // nothing.
         assert!(!lapsed(&reply("SUCCESS", 400, 900, 1_001)));
@@ -2739,59 +2704,34 @@ mod owner_lapse_tests {
         assert!(lapsed(&other));
     }
 
-    /// The endpoint's answers to the lookups of one hash, in order, and the calls that it got.
-    struct Replies(std::sync::Mutex<Vec<Value>>, std::sync::Mutex<Vec<Value>>);
-    impl Rpc for Replies {
-        fn call(&self, method: &str, params: Value) -> Result<Value> {
-            self.1
-                .lock()
-                .unwrap()
-                .push(json!({"method": method, "params": params}));
-            Ok(self.0.lock().unwrap().remove(0))
-        }
-    }
-    fn lapsed(replies: Vec<Value>, expires_at: u64) -> (Result<bool>, usize) {
-        let rpc = Replies(
-            std::sync::Mutex::new(replies),
-            std::sync::Mutex::new(Vec::new()),
-        );
-        let result = owner_transaction_lapsed(&rpc, &[0xab; 32], expires_at, 500);
-        let calls = rpc.1.lock().unwrap();
-        // Every lookup is of the exact hash.
-        for call in calls.iter() {
-            assert_eq!(
-                *call,
-                json!({"method":"getTransaction","params":{"hash": hex(&[0xab; 32])}})
-            );
-        }
-        (result, calls.len())
-    }
-
-    /// The proof is two replies: a ledger that closed after the bound, then a lookup that
-    /// reaches it and finds nothing. The range of one reply can be newer than its own lookup.
+    /// The proof reads the reply for the exact hash.
     #[test]
-    fn the_owner_lapse_is_proven_by_a_lookup_after_the_closing_ledger_is_known() {
-        let missing = || reply("NOT_FOUND", 400, 900, 1_001);
-        assert_eq!(lapsed(vec![missing(), missing()], 1_000), (Ok(true), 2));
-        // No ledger closed after the bound: nothing is proven, and nothing else is asked.
-        assert_eq!(lapsed(vec![missing()], 1_001), (Ok(false), 1));
-        // The first lookup ran before the endpoint read the ledger that holds the step, and its
-        // range is of the ledgers after it: the second lookup finds the step.
-        for held in ["SUCCESS", "FAILED"] {
-            assert_eq!(
-                lapsed(vec![missing(), reply(held, 400, 901, 1_006)], 1_000),
-                (Ok(false), 2)
-            );
+    fn the_owner_lapse_reads_the_transaction_of_its_hash() {
+        struct Reply(std::sync::Mutex<Vec<Value>>);
+        impl Rpc for Reply {
+            fn call(&self, method: &str, params: Value) -> Result<Value> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(json!({"method": method, "params": params}));
+                Ok(
+                    json!({"status":"NOT_FOUND","oldestLedger":400,"latestLedger":900,"latestLedgerCloseTime":"1001"}),
+                )
+            }
         }
-        // The second reply is of an endpoint that has not reached the closing ledger, or whose
-        // history no longer holds the prepared ledger.
+        let rpc = Reply(std::sync::Mutex::new(Vec::new()));
         assert_eq!(
-            lapsed(vec![missing(), reply("NOT_FOUND", 400, 899, 995)], 1_000),
-            (Ok(false), 2)
+            owner_transaction_lapsed(&rpc, &[0xab; 32], 1_000, 500),
+            Ok(true)
         );
         assert_eq!(
-            lapsed(vec![missing(), reply("NOT_FOUND", 501, 900, 1_001)], 1_000),
-            (Ok(false), 2)
+            owner_transaction_lapsed(&rpc, &[0xab; 32], 1_001, 500),
+            Ok(false)
+        );
+        let calls = rpc.0.lock().unwrap();
+        assert_eq!(
+            calls[0],
+            json!({"method":"getTransaction","params":{"hash": hex(&[0xab; 32])}})
         );
     }
 }

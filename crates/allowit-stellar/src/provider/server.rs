@@ -5626,14 +5626,11 @@ mod owner_steps {
         assert!(provider(&steps).owner_step_lapsed(&step, 20).unwrap());
         // A step prepared before the history that the endpoint keeps is not proven lapsed.
         assert!(!provider(&steps).owner_step_lapsed(&step, 5).unwrap());
-        // The proof is of the step's own hash, in two lookups, and of its own time bound: a
-        // ledger that closed at the bound proves nothing, and nothing else is then asked; one
-        // that closed a second later does.
+        // The proof is of the step's own hash and its own time bound: a ledger that closed at
+        // the bound proves nothing, one that closed a second later does.
         let own = native::hex(&data.original.transaction_hash);
-        assert_eq!(*steps.looked_up.lock().unwrap(), vec![own.clone(); 4]);
-        for (closed_at, lapsed, lookups) in
-            [(info.expires_at, false, 1), (info.expires_at + 1, true, 2)]
-        {
+        assert_eq!(*steps.looked_up.lock().unwrap(), [own.clone(), own.clone()]);
+        for (closed_at, lapsed) in [(info.expires_at, false), (info.expires_at + 1, true)] {
             let steps = Arc::new(Steps {
                 closed_at,
                 ..Steps::new()
@@ -5642,7 +5639,7 @@ mod owner_steps {
                 provider(&steps).owner_step_lapsed(&step, 20).unwrap(),
                 lapsed
             );
-            assert_eq!(*steps.looked_up.lock().unwrap(), vec![own.clone(); lookups]);
+            assert_eq!(*steps.looked_up.lock().unwrap(), std::slice::from_ref(&own));
         }
     }
 
