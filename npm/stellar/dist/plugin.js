@@ -129,6 +129,8 @@ const plugin = Object.freeze({
         skips: Object.freeze({ swap: 'Stellar has no swap venue in the minimal path' }),
         fixtures: Object.freeze({
             address: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+            /** Two more accounts, each distinct from `address`, for a test that needs several roles, such as a wallet setup. */
+            accounts: Object.freeze(['GD5EQNAUP5XGSDBWSPX7MEZWARSAHTMK4KQU6MNTYQDTLBLJEOKWLSJG', 'GAMX62ZD4FWIKMWGVPEDR6WNL2TYTPQMO2ZJEAZUAON7VCZ5G2GWDF7W']),
             invalidAddress: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA6',
             txHash: 'ab'.repeat(32),
             asset: 'USDC',

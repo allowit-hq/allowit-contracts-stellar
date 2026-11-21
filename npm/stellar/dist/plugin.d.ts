@@ -85,6 +85,8 @@ declare const plugin: Readonly<{
         skips: Readonly<Partial<Record<Feature, string>>>;
         fixtures: Readonly<{
             address: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+            /** Two more accounts, each distinct from `address`, for a test that needs several roles, such as a wallet setup. */
+            accounts: readonly string[];
             invalidAddress: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA6";
             txHash: string;
             asset: "USDC";
