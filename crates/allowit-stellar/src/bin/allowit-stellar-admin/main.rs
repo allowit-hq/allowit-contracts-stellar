@@ -534,7 +534,10 @@ fn agent_wallet(args: &Arguments, get: Get, now: u64) -> Result<String> {
             units: args.amount.ok_or("--amount is required")?,
             recipient: args.recipient.clone(),
         },
-        "close-agent-wallet" => WalletAction::Close { token_balance: 0 },
+        // The tool closes an XLM wallet, which holds no trustline.
+        "close-agent-wallet" => WalletAction::Close {
+            token_balance: None,
+        },
         _ => return Err("Unsupported agent wallet action".into()),
     };
     let network = match args.network.as_str() {

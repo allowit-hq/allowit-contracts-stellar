@@ -118,15 +118,19 @@ pub fn find_account(rpc: &dyn Rpc, address: &str) -> Result<Option<AccountState>
     });
     let value = rpc.call("getLedgerEntries", json!({"keys":[xdr(&key)?]}))?;
     // A reply that finds no entry gives an empty list, or omits the list beside its ledger.
-    let absent = match value.get("entries") {
-        Some(Value::Array(entries)) => entries.is_empty(),
-        None | Some(Value::Null) => owner_observation::ledger(&value["latestLedger"]).is_ok(),
-        Some(_) => false,
-    };
-    if absent {
+    if no_entry(&value) {
         return Ok(None);
     }
     account_from_response(&value, address).map(Some)
+}
+/// Whether a `getLedgerEntries` reply finds no entry: an empty list, or no list beside a valid
+/// ledger. Any other reply is read as it is.
+fn no_entry(value: &Value) -> bool {
+    match value.get("entries") {
+        Some(Value::Array(entries)) => entries.is_empty(),
+        None | Some(Value::Null) => owner_observation::ledger(&value["latestLedger"]).is_ok(),
+        Some(_) => false,
+    }
 }
 /// The XLM of an account as the ledger holds it, in stroops, with what the network locks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,64 +193,57 @@ pub fn native_balance(rpc: &dyn Rpc, address: &str) -> Result<NativeBalance> {
         reserved_entries: i64::from(account.num_sub_entries) + sponsoring - sponsored,
     })
 }
-/// The balance of an issued asset that an account holds, `None` without its trustline.
-pub fn trustline_balance(rpc: &dyn Rpc, address: &str, asset: &Asset) -> Result<Option<i64>> {
+/// The trustline of an issued asset that an account holds, `None` without it. A reply that
+/// finds no entry is no trustline ([`no_entry`]). The entry that the reply gives must be the one
+/// that was asked for, of this account and this asset: the balance of another line is never read.
+fn trustline(rpc: &dyn Rpc, address: &str, asset: &Asset) -> Result<Option<TrustLineEntry>> {
     let line = match asset {
         Asset::CreditAlphanum4(a) => TrustLineAsset::CreditAlphanum4(a.clone()),
         Asset::CreditAlphanum12(a) => TrustLineAsset::CreditAlphanum12(a.clone()),
         Asset::Native => return Err("XLM has no trustline".into()),
     };
+    let account = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(account_key(
+        address,
+    )?)));
     let key = LedgerKey::Trustline(LedgerKeyTrustLine {
-        account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(account_key(
-            address,
-        )?))),
-        asset: line,
+        account_id: account.clone(),
+        asset: line.clone(),
     });
     let value = rpc.call("getLedgerEntries", json!({"keys":[xdr(&key)?]}))?;
-    let entries = value["entries"]
-        .as_array()
-        .ok_or("Missing trustline entries")?;
-    let Some(entry) = entries.first() else {
+    if no_entry(&value) {
         return Ok(None);
+    }
+    let [entry] = value["entries"]
+        .as_array()
+        .map(Vec::as_slice)
+        .ok_or("Missing trustline entries")?
+    else {
+        return Err("Expected one trustline entry".into());
     };
-    let LedgerEntryData::Trustline(line) =
+    let LedgerEntryData::Trustline(found) =
         read(entry["xdr"].as_str().ok_or("Missing trustline XDR")?)?
     else {
         return Err("Wrong ledger entry type".into());
     };
-    Ok(Some(line.balance))
+    if found.account_id != account || found.asset != line {
+        return Err("Ledger trustline identity differs".into());
+    }
+    Ok(Some(found))
+}
+/// The balance of an issued asset that an account holds, `None` without its trustline.
+pub fn trustline_balance(rpc: &dyn Rpc, address: &str, asset: &Asset) -> Result<Option<i64>> {
+    Ok(trustline(rpc, address, asset)?.map(|line| line.balance))
 }
 /// The units of an issued asset that an account can send: its balance less what its open
 /// offers hold. `None` without its trustline.
 pub fn trustline_spendable(rpc: &dyn Rpc, address: &str, asset: &Asset) -> Result<Option<i64>> {
-    let line = match asset {
-        Asset::CreditAlphanum4(a) => TrustLineAsset::CreditAlphanum4(a.clone()),
-        Asset::CreditAlphanum12(a) => TrustLineAsset::CreditAlphanum12(a.clone()),
-        Asset::Native => return Err("XLM has no trustline".into()),
-    };
-    let key = LedgerKey::Trustline(LedgerKeyTrustLine {
-        account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(account_key(
-            address,
-        )?))),
-        asset: line,
-    });
-    let value = rpc.call("getLedgerEntries", json!({"keys":[xdr(&key)?]}))?;
-    let entries = value["entries"]
-        .as_array()
-        .ok_or("Missing trustline entries")?;
-    let Some(entry) = entries.first() else {
-        return Ok(None);
-    };
-    let LedgerEntryData::Trustline(line) =
-        read(entry["xdr"].as_str().ok_or("Missing trustline XDR")?)?
-    else {
-        return Err("Wrong ledger entry type".into());
-    };
-    let selling = match &line.ext {
-        TrustLineEntryExt::V0 => 0,
-        TrustLineEntryExt::V1(v1) => v1.liabilities.selling,
-    };
-    Ok(Some(line.balance.saturating_sub(selling).max(0)))
+    Ok(trustline(rpc, address, asset)?.map(|line| {
+        let selling = match &line.ext {
+            TrustLineEntryExt::V0 => 0,
+            TrustLineEntryExt::V1(v1) => v1.liabilities.selling,
+        };
+        line.balance.saturating_sub(selling).max(0)
+    }))
 }
 /// A native source account dated by the entry response and fresh bracketing heads.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2471,6 +2468,130 @@ mod custom_state_tests {
         // Another tier reads none.
         c.tier = Some(crate::PolicyTier::Common);
         assert!(custom_state(&rpc, &c, 100).unwrap().is_empty());
+    }
+}
+#[cfg(test)]
+mod owner_read_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// An endpoint whose head reads answer `heads` in order and whose entry reads answer
+    /// `entries` in order, the last one of each again after them.
+    struct Endpoint {
+        heads: Mutex<Vec<u32>>,
+        entries: Mutex<Vec<Value>>,
+        calls: Mutex<Vec<String>>,
+    }
+    impl Rpc for Endpoint {
+        fn call(&self, method: &str, _: Value) -> Result<Value> {
+            self.calls.lock().unwrap().push(method.into());
+            match method {
+                "getLatestLedger" => {
+                    let mut heads = self.heads.lock().unwrap();
+                    let head = if heads.len() > 1 {
+                        heads.remove(0)
+                    } else {
+                        heads[0]
+                    };
+                    Ok(json!({ "sequence": head }))
+                }
+                "getLedgerEntries" => {
+                    let mut entries = self.entries.lock().unwrap();
+                    Ok(if entries.len() > 1 {
+                        entries.remove(0)
+                    } else {
+                        entries[0].clone()
+                    })
+                }
+                _ => Err(format!("Unexpected call {method}")),
+            }
+        }
+    }
+    fn endpoint(heads: &[u32], entries: Value) -> Endpoint {
+        replies(heads, vec![entries])
+    }
+    fn replies(heads: &[u32], entries: Vec<Value>) -> Endpoint {
+        Endpoint {
+            heads: Mutex::new(heads.to_vec()),
+            entries: Mutex::new(entries),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+    fn address(seed: u8) -> String {
+        ed25519::PublicKey([seed; 32]).to_string()
+    }
+    fn account_id(seed: u8) -> AccountId {
+        AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))
+    }
+
+    fn usdc(issuer: u8) -> Asset {
+        Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USDC"),
+            issuer: account_id(issuer),
+        })
+    }
+    /// The trustline entry of the account `holder` for USDC of `issuer`: 9 units, 3 of them
+    /// held by an open offer.
+    fn line(holder: u8, issuer: u8) -> Value {
+        let Asset::CreditAlphanum4(asset) = usdc(issuer) else {
+            unreachable!()
+        };
+        let entry = LedgerEntryData::Trustline(TrustLineEntry {
+            account_id: account_id(holder),
+            asset: TrustLineAsset::CreditAlphanum4(asset),
+            balance: 9,
+            limit: i64::MAX,
+            flags: 1,
+            ext: TrustLineEntryExt::V1(TrustLineEntryV1 {
+                liabilities: Liabilities {
+                    buying: 0,
+                    selling: 3,
+                },
+                ext: TrustLineEntryV1Ext::V0,
+            }),
+        });
+        json!({ "xdr": xdr(&entry).unwrap() })
+    }
+
+    /// A trustline read gives the balance of the line that was asked for, and of no other; a
+    /// reply that finds no entry is no trustline.
+    #[test]
+    fn a_trustline_read_is_of_the_line_that_was_asked_for() {
+        let read = |entries: Value| {
+            let rpc = endpoint(&[120], entries);
+            (
+                trustline_balance(&rpc, &address(7), &usdc(5)),
+                trustline_spendable(&rpc, &address(7), &usdc(5)),
+            )
+        };
+        assert_eq!(
+            read(json!({"latestLedger": 120, "entries": [line(7, 5)]})),
+            (Ok(Some(9)), Ok(Some(6)))
+        );
+        // The three forms of a reply that finds no entry.
+        for none in [
+            json!({"latestLedger": 120, "entries": []}),
+            json!({"latestLedger": 120}),
+            json!({"latestLedger": 120, "entries": null}),
+        ] {
+            assert_eq!(read(none), (Ok(None), Ok(None)));
+        }
+        // The line of another account, the line of another issuer's asset, and two lines.
+        for other in [
+            json!([line(8, 5)]),
+            json!([line(7, 6)]),
+            json!([line(7, 5), line(7, 5)]),
+        ] {
+            let (balance, spendable) = read(json!({"latestLedger": 120, "entries": other}));
+            assert!(balance.is_err() && spendable.is_err(), "{other}");
+        }
+        // A reply with neither a list nor a ledger is no answer.
+        let (balance, spendable) = read(json!({}));
+        assert!(balance.is_err() && spendable.is_err());
+        // XLM has no trustline.
+        let rpc = endpoint(&[120], json!({}));
+        assert!(trustline_balance(&rpc, &address(7), &Asset::Native).is_err());
+        assert!(rpc.calls.lock().unwrap().is_empty());
     }
 }
 #[cfg(test)]

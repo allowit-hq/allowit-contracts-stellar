@@ -816,6 +816,14 @@ impl Provider {
         now: u64,
     ) -> Result<OwnerPacket> {
         use native::owner::WalletAction;
+        // An action that a keypair wallet does not take is refused before any read.
+        if matches!(a, OwnerAction::Create { .. } | OwnerAction::Extend) {
+            return Err(Error::unsupported(
+                "A keypair wallet has no code: its owner creates it with the wallet setup",
+            ));
+        }
+        // Every step is built from the wallet's state on its own network.
+        checked(rpc::owner_observation::network(self.rpc(), &c.network))?;
         let asset = checked(native::asset_xdr(c))?;
         let units = |units: i128| {
             i64::try_from(units).map_err(|_| Error::usage("The amount exceeds the native range"))
@@ -837,10 +845,11 @@ impl Provider {
                 units: None,
                 recipient: None,
             } => WalletAction::Close {
+                // No trustline: XLM has none, and one that is already gone is not removed again.
                 token_balance: if asset == stellar_xdr::Asset::Native {
-                    0
+                    None
                 } else {
-                    checked(rpc::trustline_balance(self.rpc(), &c.wallet, &asset))?.unwrap_or(0)
+                    checked(rpc::trustline_balance(self.rpc(), &c.wallet, &asset))?
                 },
             },
             // Every spendable unit returns and the account stays. It keeps the reserve of the
@@ -869,9 +878,7 @@ impl Provider {
                 }
             }
             OwnerAction::Create { .. } | OwnerAction::Extend => {
-                return Err(Error::unsupported(
-                    "A keypair wallet has no code: its owner creates it with the wallet setup",
-                ));
+                unreachable!("refused before any read")
             }
         };
         let owner_state = checked(rpc::get_account(self.rpc(), &c.owner))?;
@@ -1329,7 +1336,9 @@ impl crate::host::vendors::RuntimeProvider for Provider {
     fn resources(&self, i: &Installation) -> Result<Resources> {
         let c = self.config(i)?;
         if c.route == WalletRoute::Native {
-            // A keypair wallet has no code and no lifetime: it is present when its account is.
+            // A keypair wallet has no code and no lifetime: it is present when its account is,
+            // on its own network: an account that is absent from another network says nothing.
+            checked(rpc::owner_observation::network(self.rpc(), &c.network))?;
             return Ok(Resources {
                 code_present: true,
                 wallet_present: checked(rpc::find_account(self.rpc(), &c.wallet))?.is_some(),
@@ -3700,6 +3709,8 @@ mod keypair_wallet_owner_tests {
         issued: i64,
         /// The issued units that an open offer of the account holds.
         issued_selling: i64,
+        /// The account holds no trustline of its issued asset.
+        no_trustline: bool,
     }
     /// A ledger that holds the owner's account and the wallet account `wallet`.
     struct Ledger(OwnerLedger, Mutex<native::AccountState>, Mutex<Holdings>);
@@ -3735,6 +3746,9 @@ mod keypair_wallet_owner_tests {
                 }
                 Some(x::LedgerKey::Trustline(key)) => {
                     let holdings = *self.2.lock().unwrap();
+                    if holdings.no_trustline {
+                        return Ok(serde_json::json!({"latestLedger": 120, "entries": []}));
+                    }
                     let line = x::LedgerEntryData::Trustline(x::TrustLineEntry {
                         account_id: key.account_id,
                         asset: key.asset,
@@ -3771,6 +3785,7 @@ mod keypair_wallet_owner_tests {
                 other_entries: 0,
                 issued: 7,
                 issued_selling: 0,
+                no_trustline: false,
             }),
         ));
         let configuration =
@@ -3915,6 +3930,10 @@ mod keypair_wallet_owner_tests {
             .prepare_close(&installation, 100_000, 86_401)
             .unwrap();
         assert_eq!(close.info().unwrap().action, "close");
+        // The close takes the caller's clock and fee limit: its cutoff is counted from the
+        // clock, and a limit below the minimum fee of its operations prepares nothing.
+        assert_eq!(close.info().unwrap().expires_at, 86_701);
+        assert!(provider.prepare_close(&installation, 100, 86_401).is_err());
         assert!(!provider.wallet_closed(&installation).unwrap());
         /// An endpoint of the network `0` that answers a read of the account `2` with `1`, and
         /// of no other account: after a close the owner's account is still there.
@@ -3972,6 +3991,12 @@ mod keypair_wallet_owner_tests {
             );
             assert!(unread.wallet_closed(&installation).is_err());
         }
+        // The wallet is gone, and its resources say so.
+        let gone = Provider::from_rpc(
+            &c.network,
+            Arc::new(Gone(network, empty.clone(), wallet.clone())),
+        );
+        assert!(!gone.resources(&installation).unwrap().wallet_present);
         // An account that is absent from another network says nothing about this wallet, and no
         // close is prepared from another network's state: the transport's network is refused
         // before any account is read.
@@ -3988,6 +4013,43 @@ mod keypair_wallet_owner_tests {
                 "Runtime transport network differs"
             );
         }
+        // The same for the wallet's resources and for every owner step that is prepared from the
+        // wallet's state, the close among them.
+        for refused in [
+            elsewhere.resources(&installation).map(drop),
+            elsewhere
+                .prepare_owner(
+                    &installation,
+                    OwnerAction::Recover {
+                        units: None,
+                        recipient: None,
+                    },
+                    100_000,
+                    86_401,
+                )
+                .map(drop),
+            elsewhere
+                .prepare_owner(
+                    &installation,
+                    OwnerAction::Fund { units: 5 },
+                    100_000,
+                    86_401,
+                )
+                .map(drop),
+        ] {
+            assert_eq!(
+                refused.unwrap_err().message,
+                "Owner observation RPC network differs"
+            );
+        }
+        // An action that a keypair wallet does not take is refused before the endpoint is asked.
+        assert_eq!(
+            elsewhere
+                .prepare_owner(&installation, OwnerAction::Extend, 100_000, 86_401)
+                .unwrap_err()
+                .message,
+            "A keypair wallet has no code: its owner creates it with the wallet setup"
+        );
     }
     #[test]
     fn the_server_prepares_each_owner_action_of_a_keypair_wallet_for_one_owner_signature() {
@@ -4054,6 +4116,19 @@ mod keypair_wallet_owner_tests {
             panic!()
         };
         assert_eq!(u64::from(envelope.tx.fee), minimum);
+        // A wallet whose trustline is already gone closes without a payment of the asset and
+        // without a removal of the trustline, which would fail the whole close.
+        if issued {
+            ledger.2.lock().unwrap().no_trustline = true;
+            let packet = prepare(close()).unwrap();
+            let operations = operations(&packet, &c);
+            assert_eq!(operations.len(), 4);
+            assert!(operations.iter().all(|operation| !matches!(
+                operation.body,
+                stellar_xdr::OperationBody::Payment(_) | stellar_xdr::OperationBody::ChangeTrust(_)
+            )));
+            ledger.2.lock().unwrap().no_trustline = false;
+        }
         // A wallet that is not paused takes no resume, and a keypair wallet has no code.
         assert!(prepare(OwnerAction::SetPause { paused: false }).is_err());
         for action in [
@@ -5300,7 +5375,11 @@ mod owner_steps {
     }
     /// A funding of the policy wallet of `c`, signed by its owner, valid until `NOW + 300`.
     fn funding(c: &WalletConfig) -> OwnerSigned {
-        let step = crate::test_support::owner::fund_step(c, 10, NOW);
+        funding_of(c, 10)
+    }
+    /// A funding of `units` of the policy wallet of `c`.
+    fn funding_of(c: &WalletConfig, units: i128) -> OwnerSigned {
+        let step = crate::test_support::owner::fund_step(c, units, NOW);
         signed(
             native::owner_intent::OwnerTransaction {
                 network: NETWORK.into(),
@@ -5368,6 +5447,43 @@ mod owner_steps {
         provider(&steps)
             .validate_owner_signed(&step, late - 1)
             .unwrap();
+    }
+
+    /// A signed step is the pair that `read_owner_signed` admitted: the signed bytes are the
+    /// retained transaction with its owner's signature. A stored pair of one step's record and
+    /// another step's signed bytes is not restored, and no method sends it or looks it up.
+    #[test]
+    fn a_signed_step_whose_bytes_are_not_its_retained_transaction_is_refused() {
+        let c = policy_wallet();
+        let (retained, other) = (funding_of(&c, 10), funding_of(&c, 11));
+        let retained: OwnerSignedData = decode_packet(&retained.0).unwrap();
+        let other: OwnerSignedData = decode_packet(&other.0).unwrap();
+        assert_ne!(
+            retained.original.transaction_hash,
+            other.original.transaction_hash
+        );
+        let mixed = Packet::new(
+            NETWORK,
+            &OwnerSignedData {
+                original: retained.original.clone(),
+                signed_payload: other.signed_payload.clone(),
+            },
+            &PACKETS,
+        )
+        .unwrap();
+        assert!(restore(Kind::OwnerSigned, mixed.document().to_owned()).is_err());
+        let consistent = Packet::new(NETWORK, &retained, &PACKETS).unwrap();
+        restore(Kind::OwnerSigned, consistent.document().to_owned()).unwrap();
+        let steps = Arc::new(Steps::new());
+        let mixed = OwnerSigned(mixed);
+        let provider = provider(&steps);
+        assert!(provider.validate_owner_signed(&mixed, NOW).is_err());
+        assert!(provider.broadcast_owner(&mixed, NOW).is_err());
+        assert!(provider.owner_status(&mixed).is_err());
+        assert!(provider.observe_owner(&mixed).is_err());
+        assert!(provider.owner_step_lapsed(&mixed, 20).is_err());
+        assert!(mixed.info().is_err());
+        assert!(steps.calls.lock().unwrap().is_empty());
     }
 
     /// The check of a signed step reads nothing: it decides by the step's time bound alone, and a
@@ -5455,6 +5571,29 @@ mod owner_steps {
                 *steps.sent_bytes.lock().unwrap(),
                 [String::from_utf8(data.signed_payload).unwrap()]
             );
+        }
+        // After a send that the network did not take, the receipt that the network holds
+        // decides: the step's own receipt, applied or failed, means that it was sent before;
+        // the receipt of another transaction is no answer about this step.
+        let other = funding_of(&c, 11);
+        for send in ["TRY_AGAIN_LATER", "ERROR"] {
+            for (receipt, expected) in [
+                (receipt(&step, true), Status::Submitted),
+                (receipt(&step, false), Status::Submitted),
+                (receipt(&other, true), Status::SubmissionUnknown),
+            ] {
+                let steps = Arc::new(Steps {
+                    send: Some(send),
+                    holds: true,
+                    receipt,
+                    ..Steps::new()
+                });
+                assert_eq!(
+                    provider(&steps).broadcast_owner(&step, NOW).unwrap(),
+                    expected,
+                    "{send}"
+                );
+            }
         }
     }
 
