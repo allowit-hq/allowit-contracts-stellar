@@ -591,7 +591,7 @@ type ConfigCase = (&'static str, fn(&Env, &mut AllowitPolicyConfig));
 #[test]
 fn request_bindings_and_gas_are_checked() {
     let f = Fixture::new(SIMPLE);
-    let cases: [RequestCase; 8] = [
+    let cases: [RequestCase; 11] = [
         (
             "stale version",
             |_, e| e.1 = 1,
@@ -645,6 +645,33 @@ fn request_bindings_and_gas_are_checked() {
             "gas repaid on an unpriced request",
             |_, e| {
                 e.4 = AllowitExpense::Unpriced;
+            },
+            AllowitWalletError::InvalidInvocation,
+        ),
+        (
+            "a negative conversion",
+            |_, e| {
+                if let AllowitExpense::Priced(_, conversion, _, _) = &mut e.4 {
+                    *conversion = -1;
+                }
+            },
+            AllowitWalletError::InvalidInvocation,
+        ),
+        (
+            "no observation ledger",
+            |_, e| {
+                if let AllowitExpense::Priced(_, _, _, observed) = &mut e.4 {
+                    *observed = 0;
+                }
+            },
+            AllowitWalletError::InvalidInvocation,
+        ),
+        (
+            "an observation after the current ledger",
+            |f, e| {
+                if let AllowitExpense::Priced(_, _, _, observed) = &mut e.4 {
+                    *observed = f.env.ledger().sequence() + 1;
+                }
             },
             AllowitWalletError::InvalidInvocation,
         ),

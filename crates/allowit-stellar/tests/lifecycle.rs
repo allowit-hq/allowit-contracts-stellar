@@ -567,7 +567,7 @@ fn stale_or_changed_payload_cannot_be_signed() {
     assert!(validate_signed(&signed, 86401).is_err());
 }
 #[test]
-fn a_changed_trusted_server_or_an_approval_across_the_utc_day_is_refused() {
+fn a_packet_is_built_only_for_the_trusted_wallet_and_within_its_utc_day() {
     // The trusted server key must be the configured one on the routes that have a server.
     for route in [WalletRoute::Native, WalletRoute::PolicyWallet] {
         let (c, r, s) = fixture(route.clone(), false);
@@ -576,6 +576,26 @@ fn a_changed_trusted_server_or_an_approval_across_the_utc_day_is_refused() {
         changed.server = account_for_seed(&[11; 32]);
         assert!(prepare(&c, &r, &changed, 86401, 86700).is_err());
     }
+    // The trusted agent key of a Native wallet must be the configured one.
+    let (c, r, s) = fixture(WalletRoute::Native, false);
+    let mut changed = s.clone();
+    changed.agent = account_for_seed(&[11; 32]);
+    assert!(prepare(&c, &r, &changed, 86401, 86700).is_err());
+    // The params that a policy wallet stores are the installed ones.
+    let (c, r, s) = fixture(WalletRoute::PolicyWallet, false);
+    let mut changed = s.clone();
+    let mut params = installed_params(&c);
+    params.0.insert("payment_limit".into(), PolicyValue::Int(1));
+    changed.policy_state.as_mut().unwrap().params = params;
+    assert!(prepare(&c, &r, &changed, 86401, 86700).is_err());
+    // The trusted account of a Native wallet is the configured wallet, with the agent signing.
+    let (c, r, s) = fixture(WalletRoute::Native, false);
+    let mut other = s.clone();
+    other.source.address = account_for_seed(&[12; 32]);
+    assert!(prepare(&c, &r, &other, 86401, 86700).is_err());
+    let mut paused = s.clone();
+    paused.source.signers.retain(|signer| signer.key != c.agent);
+    assert!(prepare(&c, &r, &paused, 86401, 86700).is_err());
     // A Native approval ends within its UTC day: 100 seconds before midnight it may run for 100
     // seconds, not for 200.
     let (c, r, s) = fixture(WalletRoute::Native, false);
@@ -607,6 +627,26 @@ fn an_envelope_signature_that_does_not_verify_is_refused_even_with_the_right_hin
         .to_xdr_base64(Limits::none())
         .unwrap();
     assert!(validate_signed(&signed, 86401).is_err());
+}
+#[test]
+fn a_native_daily_limit_counts_the_spending_of_the_same_utc_day() {
+    let (mut c, r, mut s) = fixture(WalletRoute::Native, true);
+    c.policy_source = DAILY.into();
+    c.params = policy::params_from_json(
+        &json!({"destinations": [account_for_seed(&[6; 32])], "daily_spending_limit": 30_000_000}),
+        Some(PolicyTier::Simple),
+    )
+    .unwrap();
+    c.source_hash = hash(&c.policy_source);
+    s.source_hash = c.source_hash;
+    // Five seconds into UTC day 2, where the server counted day 2's spending.
+    let now = 2 * 86_400 + 5;
+    s.spent_day = 2;
+    s.spent_daily = 5_000_000;
+    assert!(prepare(&c, &r, &s, now, now + 200).is_ok());
+    // 15,000,000 + 20,000,000 exceeds the daily limit of 30,000,000.
+    s.spent_daily = 15_000_000;
+    assert!(prepare(&c, &r, &s, now, now + 200).is_err());
 }
 #[test]
 fn classic_limits_keep_exact_local_math_while_odc_requires_native_preflight() {
@@ -2825,6 +2865,7 @@ fn preflight_rpc(c: &WalletConfig, r: &ExecutionRequest, s: &TrustedState) -> Pr
         failure: "",
     }
 }
+const DAILY: &str = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::destinations(ctx, &ctx.params[allowit::DESTINATIONS])?;\n    allowit::daily_spending_limit(ctx, &ctx.params[allowit::DAILY_SPENDING_LIMIT])?;\n    Ok(())\n}\n";
 const LIMITED: &str = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::destinations(ctx, &ctx.params[allowit::DESTINATIONS])?;\n    allowit::payment_limit(ctx, &ctx.params[allowit::PAYMENT_LIMIT])?;\n    Ok(())\n}\n";
 const SUFFIXED: &str = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::destinations(ctx, &ctx.params[allowit::DESTINATIONS])?;\n    let limit: i128 = allowit::param(ctx, \"payment_limit\");\n    if ctx.request.amount > limit {\n        return Err(AllowitError::PaymentLimitExceeded);\n    }\n    Ok(())\n}\n";
 

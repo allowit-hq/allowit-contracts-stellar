@@ -231,8 +231,16 @@ fn deployer() -> String {
 }
 /// The owner's one creation through the deployer, with one funding transfer.
 fn create(tier: PolicyTier) -> (OwnerTransaction, ExpectedOwnerIntent) {
+    create_with(tier, |_| {})
+}
+/// A creation of a wallet whose configuration `edit` changed before the packet was built.
+fn create_with(
+    tier: PolicyTier,
+    edit: impl FnOnce(&mut WalletConfig),
+) -> (OwnerTransaction, ExpectedOwnerIntent) {
     let salt = [8; 32];
-    let c = config(tier, &salt);
+    let mut c = config(tier, &salt);
+    edit(&mut c);
     // `AllowitPolicyConfig`: the agent and server keys raw, the owner's source hash and the
     // gas cap; the fixture's own encoder is the contract's field order.
     let raw_key = |account: &str| bytes(&allowit_stellar::account_key(account).unwrap());
@@ -1749,4 +1757,11 @@ fn the_owner_signs_a_native_wallet_step_only_for_its_own_account_and_lifetime() 
         loose.limits.valid_until = NOW + 1_000;
         assert!(validate_owner_transaction(&packet, &loose, NOW - 1).is_err());
     }
+}
+
+#[test]
+fn the_owner_never_signs_the_creation_of_a_wallet_that_another_owner_controls() {
+    // The packet and the intent agree on a configuration whose owner is not the signer.
+    let (packet, expected) = create_with(PolicyTier::Simple, |c| c.owner = account(9));
+    assert_refused(&packet, &expected, "another owner");
 }
