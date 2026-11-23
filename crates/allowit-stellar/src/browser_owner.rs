@@ -364,6 +364,20 @@ mod tests {
             .map_err(crate::err)?,
         )
     }
+    /// The bridge's answer for `input`: 1 when the packet verifies, 0 otherwise.
+    fn bridge(input: &serde_json::Value) -> u32 {
+        let bytes = serde_json::to_vec(input).unwrap();
+        let target = owner_input();
+        // SAFETY: the input buffer holds INPUT_BYTES, more than this test input.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), target, bytes.len()) };
+        owner_verify(bytes.len())
+    }
+    #[test]
+    fn the_browser_bridge_answers_1_only_for_a_packet_that_verifies() {
+        let input = |limit: i64| serde_json::json!({"step": step(limit, 2), "expected": selection(20_000_000, "2"), "now": NOW});
+        assert_eq!(bridge(&input(20_000_000)), 1);
+        assert_eq!(bridge(&input(90_000_000)), 0);
+    }
     #[test]
     fn the_browser_verifier_binds_a_params_update_to_the_reviewed_values_and_revision() {
         check(step(20_000_000, 2), selection(20_000_000, "2")).unwrap();
