@@ -1468,6 +1468,45 @@ impl MockPair {
         token::Client::new(&env, &token).transfer(&env.current_contract_address(), &to, &amount);
     }
 }
+/// Hostile test router: reports `amount_in * rate / 100` but pays `short` units less, and does
+/// not check the minimum output itself.
+#[contract]
+pub struct ShortRouter;
+#[contractimpl]
+impl ShortRouter {
+    pub fn __constructor(env: Env, pair: Address, rate: i128, short: i128) {
+        env.storage().instance().set(&0u32, &(pair, rate, short));
+    }
+    pub fn router_pair_for(env: Env, _a: Address, _b: Address) -> Address {
+        let (pair, _, _): (Address, i128, i128) = env.storage().instance().get(&0u32).unwrap();
+        pair
+    }
+    pub fn swap_exact_tokens_for_tokens(
+        env: Env,
+        amount_in: i128,
+        _amount_out_min: i128,
+        path: Vec<Address>,
+        to: Address,
+        _deadline: u64,
+    ) -> Vec<i128> {
+        let (pair, rate, short): (Address, i128, i128) =
+            env.storage().instance().get(&0u32).unwrap();
+        to.require_auth();
+        let out = amount_in * rate / 100;
+        token::Client::new(&env, &path.get_unchecked(0)).transfer(&to, &pair, &amount_in);
+        MockPairClient::new(&env, &pair).pay(
+            &path.get_unchecked(path.len() - 1),
+            &to,
+            &(out - short),
+        );
+        let mut amounts = Vec::new(&env);
+        amounts.push_back(amount_in);
+        for _ in 1..path.len() {
+            amounts.push_back(out);
+        }
+        amounts
+    }
+}
 /// Test router of the Soroswap shape: pays `amount_in * rate / 100`.
 #[contract]
 pub struct MockRouter;
@@ -1644,6 +1683,27 @@ fn swap_deposit_and_redeem_run_through_execute_with_effect_checks() {
                 f.run(&e),
                 Err(Ok(AllowitWalletError::InvalidInvocation)),
                 "swap case {n}"
+            );
+        }
+        // A router that pays less than its minimum output, or less than it reports, is refused.
+        for (n, (short, minimum)) in [(0i128, 48i128), (1, 47)].into_iter().enumerate() {
+            f.env.mock_all_auths();
+            let hostile = f.env.register(ShortRouter, (pair.clone(), 95i128, short));
+            f.env.set_auths(&[]);
+            let mut e = f.transfer(1, 0);
+            e.0 = BytesN::from_array(&f.env, &[13 + n as u8; 32]);
+            e.3 = AllowitStellarOperation::Swap(
+                hostile,
+                50,
+                minimum,
+                Vec::from_array(&f.env, [f.asset.clone(), other.clone()]),
+                e.2,
+            );
+            priced(&f, &mut e, 3);
+            assert_eq!(
+                f.run(&e),
+                Err(Ok(AllowitWalletError::InvalidEffects)),
+                "router case {n}"
             );
         }
         // A swap names a positive minimum output.
@@ -1947,14 +2007,6 @@ fn construction_checks_the_owner_configuration() {
         })
     }));
     assert!(result.is_err());
-}
-
-/// The length of the wallet's stored configuration.
-fn config_len(f: &Fixture) -> usize {
-    f.env.as_contract(&f.wallet, || {
-        let raw: Bytes = f.env.storage().instance().get(&CONFIG).unwrap();
-        raw.len() as usize
-    })
 }
 
 #[test]
