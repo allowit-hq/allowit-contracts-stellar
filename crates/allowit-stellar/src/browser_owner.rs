@@ -371,6 +371,10 @@ mod tests {
         let mut code = selection(20_000_000, "2");
         code["wasmHash"] = crate::hex(&[9; 32]).into();
         assert!(check(step(20_000_000, 2), code).is_err());
+        // A source hash other than the hash of the reviewed code differs.
+        let mut source = selection(20_000_000, "2");
+        source["sourceHash"] = crate::hex(&[7; 32]).into();
+        assert!(check(step(20_000_000, 2), source).is_err());
         // Another value, another revision or another wallet differs.
         assert!(check(step(90_000_000, 2), selection(20_000_000, "2")).is_err());
         assert!(check(step(20_000_000, 3), selection(20_000_000, "2")).is_err());
