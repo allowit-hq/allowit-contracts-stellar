@@ -39,6 +39,8 @@ pub(super) const DAILY_STATE: &[u8] =
     include_bytes!("../../../target/test-fixtures/custom_daily.wasm");
 pub(super) const VAULT: &[u8] =
     include_bytes!("../../../target/wasm32v1-none/release/allowit_sep56_test_vault.wasm");
+/// Not a Wasm: for this name `Fixture::with` registers the native wallet of [`ReadsDayUnpriced`].
+const READS_DAY_UNPRICED: &[u8] = b"native wallet of ReadsDayUnpriced";
 
 /// A `List` of `Addr` values.
 fn addresses(env: &Env, items: &[&Address]) -> AllowitValue {
@@ -215,7 +217,11 @@ impl Fixture {
             params,
         };
         edit(&env, &mut config);
-        let wallet = env.register(wasm, (config,));
+        let wallet = if wasm == READS_DAY_UNPRICED {
+            env.register(reads_day_unpriced::Wallet, (config,))
+        } else {
+            env.register(wasm, (config,))
+        };
         if issued {
             StellarAssetClient::new(&env, &asset).mint(&wallet, &1_000);
         } else {
@@ -797,6 +803,9 @@ fn daily_figures_live_in_a_window_that_ends_with_its_own_ledger() {
     assert_eq!(f.run(&f.transfer(100, 0)), Ok(()));
 }
 
+/// Each daily figure reads back on its own. A swap spends its conversion loss and moves its whole
+/// input, so its spent and volume figures differ; the daily spending limit of 110 is below the
+/// daily volume limit of 160, so each limit can be the one that refuses.
 #[test]
 fn a_wallet_that_keeps_only_both_daily_figures_reads_them_back() {
     let f = Fixture::with(COMMON, false, |env, c| {
@@ -807,16 +816,91 @@ fn a_wallet_that_keeps_only_both_daily_figures_reads_them_back() {
                 AllowitRule::daily_volume_limit,
             ],
         );
+        c.params.set(
+            Symbol::new(env, DAILY_SPENDING_LIMIT),
+            AllowitValue::Int(110),
+        );
     });
     assert_eq!(f.client().state().kept, u32::from(DAILIES));
+    f.env.mock_all_auths();
+    let other = f
+        .env
+        .register_stellar_asset_contract_v2(Address::generate(&f.env))
+        .address();
+    let pair = f.env.register(MockPair, ());
+    StellarAssetClient::new(&f.env, &other).mint(&pair, &1_000);
+    let router = f.env.register(MockRouter, (pair, 95i128));
+    f.env.set_auths(&[]);
+    let swap = |id: u8, amount_in: i128, loss: i128| {
+        let mut e = f.transfer(1, 0);
+        e.0 = BytesN::from_array(&f.env, &[id; 32]);
+        e.3 = AllowitStellarOperation::Swap(
+            router.clone(),
+            amount_in,
+            amount_in * 95 / 100,
+            Vec::from_array(&f.env, [f.asset.clone(), other.clone()]),
+            e.2,
+        );
+        priced(&f, &mut e, loss);
+        e
+    };
+    // Spent 3 and volume 50, then spent 103 and volume 150.
+    assert_eq!(f.run(&swap(1, 50, 3)), Ok(()));
     assert_eq!(f.run(&f.transfer(100, 0)), Ok(()));
     f.advance(10);
-    // 100 + 61 > 160, the daily volume limit.
+    let figures = f.figures();
+    assert_eq!((figures.day_spent, figures.day_total), (103, 150));
+    // 103 + 8 > 110, the daily spending limit; the volume of 158 is within its limit.
     assert_eq!(
-        f.run(&f.transfer(61, 0)),
+        f.run(&f.transfer(8, 0)),
+        denied(COMMON, AllowitError::DailySpendingLimitExceeded)
+    );
+    // 150 + 11 > 160, the daily volume limit; a swap without loss spends nothing.
+    assert_eq!(
+        f.run(&swap(2, 11, 0)),
         denied(COMMON, AllowitError::DailyVolumeLimitExceeded)
     );
-    assert_eq!(f.run(&f.transfer(60, 0)), Ok(()));
+    assert_eq!(f.run(&f.transfer(7, 0)), Ok(()));
+    let figures = f.figures();
+    assert_eq!((figures.day_spent, figures.day_total), (110, 157));
+}
+
+/// A Custom source that reads only the daily unpriced flag. Its build keeps the daily entry for
+/// the flag (`state_keys::packed(["day_unpriced"])` is `DAY_SPENT`), so an unpriced payment, which
+/// spends nothing, changes the flag alone. The source admits an unpriced payment and refuses any
+/// payment after one on the same day.
+struct ReadsDayUnpriced;
+impl AllowitPolicy for ReadsDayUnpriced {
+    const KIND: &'static str = "reads_day_unpriced";
+    const FIGURES: Option<u8> = Some(DAY_SPENT);
+    fn check(ctx: &AllowitContext, _: &Vec<AllowitRule>) -> Result<(), AllowitWalletError> {
+        if AllowitStandardState::read(&ctx.state)?.day_unpriced {
+            return Err(AllowitWalletError::PolicyDenied);
+        }
+        Ok(())
+    }
+}
+mod reads_day_unpriced {
+    crate::policy_wallet!(Wallet, super::ReadsDayUnpriced);
+}
+
+#[test]
+fn an_unpriced_payment_that_changes_only_the_daily_flag_is_kept() {
+    let f = Fixture::with(READS_DAY_UNPRICED, false, |_, _| {});
+    assert_eq!(f.client().state().kept, u32::from(DAY_SPENT));
+    let mut e = f.transfer(10, 0);
+    e.4 = AllowitExpense::Unpriced;
+    assert_eq!(f.run(&e), Ok(()));
+    let figures = f.figures();
+    assert!(figures.day_unpriced);
+    assert_eq!(figures.day_spent, 0);
+    // The policy reads the flag back on the same day and refuses the next payment.
+    f.advance(10);
+    assert_eq!(
+        f.run(&f.transfer(10, 0)),
+        Err(Ok(AllowitWalletError::PolicyDenied))
+    );
+    assert_eq!(f.balance(&f.asset, &f.recipient), 10);
 }
 
 /// The window of `d` follows Core's rule at its edges (`allowit::daily_window_end`, the end being

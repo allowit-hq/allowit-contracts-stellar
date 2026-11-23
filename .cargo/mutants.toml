@@ -22,7 +22,8 @@ exclude_globs = [
 ]
 
 # The contract tests of one package run the Wasm of another (the deployer tests run the Simple and
-# Standard Wasm, the parent tests run the wallet engine Wasm), so every mutant runs every test.
+# Standard Wasm, the parent tests run the wallet engine Wasm), so every mutant runs the tests of
+# every package, except the three tests of core_vectors_tests that the arguments below skip.
 test_workspace = true
 
 # The release vectors (crates/policy-wallet/src/core_vectors_tests.rs) replay recorded `create`

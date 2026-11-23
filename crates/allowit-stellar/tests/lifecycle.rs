@@ -576,7 +576,8 @@ fn a_packet_is_built_only_for_the_trusted_wallet_and_within_its_utc_day() {
         changed.server = account_for_seed(&[11; 32]);
         assert!(prepare(&c, &r, &changed, 86401, 86700).is_err());
     }
-    // A Native transfer moves a positive amount out of the wallet itself.
+    // A Native transfer moves a positive amount out of the wallet itself. Each case changes the
+    // instruction alone, or with the effect that it implies, so only the transfer check refuses.
     let (c, r, s) = fixture(WalletRoute::Native, false);
     for edit in [0, 1] {
         let mut changed = r.clone();
@@ -590,14 +591,17 @@ fn a_packet_is_built_only_for_the_trusted_wallet_and_within_its_utc_day() {
             panic!()
         };
         if edit == 0 {
+            // The approved effect still names the wallet as its source.
             *source = wf(&account_for_seed(&[12; 32]));
-            changed.effect_bounds[0].source = wf(&account_for_seed(&[12; 32]));
         } else {
             *stroops = 0;
             changed.effect_bounds[0].max_debit = 0u64.into();
             changed.effect_bounds[0].min_credit = 0u64.into();
         }
-        assert!(prepare(&c, &changed, &s, 86401, 86700).is_err());
+        assert_eq!(
+            prepare(&c, &changed, &s, 86401, 86700).unwrap_err(),
+            "Invalid transfer source, amount or recipient"
+        );
     }
     // The approved effect names the asset that moves, its beneficiary and its amount.
     for edit in 0..4 {
@@ -636,7 +640,7 @@ fn a_packet_is_built_only_for_the_trusted_wallet_and_within_its_utc_day() {
     let (mut c, r, s) = fixture(WalletRoute::Native, false);
     c.policy_source.push('\n');
     assert!(prepare(&c, &r, &s, 86401, 86700).is_err());
-    // A Native packet carries no execution args.
+    // A Native packet carries no execution args: the Native check refuses them first.
     let (c, r, s) = fixture(WalletRoute::Native, false);
     let mut args = PolicyParams::default();
     args.0.insert("invoice".into(), PolicyValue::Int(1));
@@ -644,7 +648,10 @@ fn a_packet_is_built_only_for_the_trusted_wallet_and_within_its_utc_day() {
         args,
         ..Default::default()
     };
-    assert!(prepare_with(&c, &r, &terms, &s, 86401, 86700).is_err());
+    assert_eq!(
+        prepare_with(&c, &r, &terms, &s, 86401, 86700).unwrap_err(),
+        "Classic custody carries no execution args or expense bounds"
+    );
     // The trusted agent key of a Native wallet must be the configured one.
     let (c, r, s) = fixture(WalletRoute::Native, false);
     let mut changed = s.clone();
@@ -665,13 +672,21 @@ fn a_packet_is_built_only_for_the_trusted_wallet_and_within_its_utc_day() {
     changed.policy_state.as_mut().unwrap().rules = vec!["payment_limit".into()];
     assert!(prepare(&c, &r, &changed, 86401, 86700).is_err());
     // The trusted account of a Native wallet is the configured wallet, with the agent signing.
+    // Each refusal is the wallet check's own: a paused account also lacks the payment quorum,
+    // which a later check would refuse.
     let (c, r, s) = fixture(WalletRoute::Native, false);
     let mut other = s.clone();
     other.source.address = account_for_seed(&[12; 32]);
-    assert!(prepare(&c, &r, &other, 86401, 86700).is_err());
+    assert_eq!(
+        prepare(&c, &r, &other, 86401, 86700).unwrap_err(),
+        "Native wallet identity differs"
+    );
     let mut paused = s.clone();
     paused.source.signers.retain(|signer| signer.key != c.agent);
-    assert!(prepare(&c, &r, &paused, 86401, 86700).is_err());
+    assert_eq!(
+        prepare(&c, &r, &paused, 86401, 86700).unwrap_err(),
+        "Customer is not a current account signer"
+    );
     // A Native approval ends within its UTC day: 100 seconds before midnight it may run for 100
     // seconds, not for 200.
     let (c, r, s) = fixture(WalletRoute::Native, false);

@@ -1442,6 +1442,55 @@ mod tests {
         assert_eq!(cursor_ledger("end"), None);
     }
 
+    #[test]
+    fn observation_reports_the_confirmed_settlement_and_skips_a_failed_one() {
+        let p = keypair_wallet();
+        let signed = assemble(&p, &[signed_by(AGENT, &p), signed_by(SERVER, &p)], NOW).unwrap();
+        let last = u64::from(expiry_ledger(part(&p).unwrap()).unwrap());
+        // The facilitator's transaction: its own source, the same invocation and entry.
+        let TransactionEnvelope::Tx(mut envelope) = read(&signed.transaction_xdr).unwrap() else {
+            panic!("a transaction")
+        };
+        envelope.tx.source_account = MuxedAccount::Ed25519(Uint256([6; 32]));
+        envelope.tx.seq_num = SequenceNumber(77);
+        let hash = transaction_hash(&p.config.network, &envelope.tx).unwrap();
+        // The token reported one transfer through the expiry ledger, in that transaction; the
+        // ledger returns the transaction with `status`.
+        let read = |status: &str| {
+            let result = TransactionResult {
+                fee_charged: 12_345,
+                result: if status == "SUCCESS" {
+                    TransactionResultResult::TxSuccess(VecM::default())
+                } else {
+                    TransactionResultResult::TxFailed(VecM::default())
+                },
+                ext: TransactionResultExt::V0,
+            };
+            Events {
+                passphrase: passphrase(&p.config.network).unwrap().to_owned(),
+                latest: last + 5,
+                pages: vec![vec![json!({"ledger": last, "txHash": hex(&hash)})]],
+                scanned: last + 5,
+                transaction: json!({
+                    "status": status,
+                    "ledger": last,
+                    "envelopeXdr": xdr(&TransactionEnvelope::Tx(envelope.clone())).unwrap(),
+                    "resultXdr": xdr(&result).unwrap(),
+                }),
+            }
+        };
+        // A confirmed transaction that carries the entry settled it: the payer paid.
+        let Observed::Settled(settled) = observe(&read("SUCCESS"), &p).unwrap() else {
+            panic!("the confirmed settlement is not reported")
+        };
+        assert_eq!(settled.receipt.transaction_hash, hash);
+        assert_eq!(settled.receipt.settles, Some(p.transaction_hash));
+        assert_eq!(settled.signed.role_signatures, signed.role_signatures);
+        assert!(!lapsed(&read("SUCCESS"), &p).unwrap());
+        // A failed transaction moved nothing: through the expiry ledger, the entry lapsed.
+        assert!(lapsed(&read("FAILED"), &p).unwrap());
+    }
+
     /// A ledger endpoint that must never be called.
     struct Unreachable;
     impl rpc::Rpc for Unreachable {
