@@ -2223,6 +2223,24 @@ fn owner_params_update_step_matches_the_owner_reconstruction_and_keeps_usage() {
             ..c.clone()
         };
         assert!(params_update::installed(&*chain, &other_server, &update).is_err());
+        // So is an owner or an agent key that the ledger no longer holds, each on its own.
+        for other_role in [
+            WalletConfig {
+                owner: account_for_seed(&[45; 32]),
+                ..c.clone()
+            },
+            WalletConfig {
+                agent: account_for_seed(&[46; 32]),
+                ..c.clone()
+            },
+        ] {
+            assert!(
+                params_update::installed(&*chain, &other_role, &update)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("roles")
+            );
+        }
         let differs = params_update::verify(&*chain, "policy", &other_gas_cap).unwrap();
         assert!(!differs.matches);
         let gas_cap_row = serde_json::to_value(&differs.comparisons)
