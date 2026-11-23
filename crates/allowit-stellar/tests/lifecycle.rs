@@ -599,6 +599,27 @@ fn a_packet_is_built_only_for_the_trusted_wallet_and_within_its_utc_day() {
         }
         assert!(prepare(&c, &changed, &s, 86401, 86700).is_err());
     }
+    // The approved effect names the asset that moves and its beneficiary.
+    for edit in 0..3 {
+        let (c, mut r, s) = fixture(WalletRoute::Native, true);
+        let network = network_id(&c.network).unwrap();
+        match edit {
+            0 => {
+                r.effect_bounds[0].asset = WorkflowAsset::Native {
+                    chain: Chain::Stellar,
+                    network,
+                }
+            }
+            1 => {
+                r.effect_bounds[0].asset = WorkflowAsset::Token(AssetId {
+                    network,
+                    token: wf(&Contract([9; 32]).to_string()),
+                })
+            }
+            _ => r.effect_bounds[0].beneficiary = wf(&account_for_seed(&[13; 32])),
+        }
+        assert!(prepare(&c, &r, &s, 86401, 86700).is_err());
+    }
     // A token transfer calls the wallet's own asset contract.
     let (c, mut r, s) = fixture(WalletRoute::Native, true);
     assert!(prepare(&c, &r, &s, 86401, 86700).is_ok());
