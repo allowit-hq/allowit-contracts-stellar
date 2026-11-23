@@ -1115,6 +1115,31 @@ fn custom_params_of_every_kind_round_trip_through_the_packed_instance() {
     }
 }
 
+#[test]
+fn custom_params_at_their_size_bounds_round_trip() {
+    // A text of MAX_TEXT bytes and a list of MAX_ITEMS items store and read back.
+    let values = |env: &Env| {
+        let mut items = Vec::new(env);
+        for n in 0..i128::from(allowit::MAX_ITEMS) {
+            items.push_back(AllowitValue::Int(n));
+        }
+        let text = "t".repeat(allowit::MAX_TEXT as usize);
+        (
+            AllowitValue::Str(soroban_sdk::String::from_str(env, &text)),
+            AllowitValue::List(items),
+        )
+    };
+    let f = Fixture::with(CUSTOM, false, |env, c| {
+        let (text, list) = values(env);
+        c.params.set(Symbol::new(env, "text"), text);
+        c.params.set(Symbol::new(env, "list"), list);
+    });
+    let stored = f.client().state().params;
+    let (text, list) = values(&f.env);
+    assert_eq!(stored.get(Symbol::new(&f.env, "text")), Some(text));
+    assert_eq!(stored.get(Symbol::new(&f.env, "list")), Some(list));
+}
+
 // --- Policies -------------------------------------------------------------------------------------
 
 #[test]
