@@ -617,7 +617,7 @@ fn a_packet_is_built_only_for_the_trusted_wallet_and_within_its_utc_day() {
                 })
             }
             2 => r.effect_bounds[0].beneficiary = wf(&account_for_seed(&[13; 32])),
-            _ => r.effect_bounds[0].max_debit = 20_000_001u64.into(),
+            _ => r.effect_bounds[0].min_credit = 20_000_001u64.into(),
         }
         assert!(prepare(&c, &r, &s, 86401, 86700).is_err());
     }

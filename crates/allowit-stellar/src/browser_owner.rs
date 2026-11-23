@@ -385,6 +385,10 @@ mod tests {
         let mut code = selection(20_000_000, "2");
         code["wasmHash"] = crate::hex(&[9; 32]).into();
         assert!(check(step(20_000_000, 2), code).is_err());
+        // An asset other than native XLM differs.
+        let mut asset = selection(20_000_000, "2");
+        asset["asset"] = crate::test_support::contract_address([3; 32]).into();
+        assert!(check(step(20_000_000, 2), asset).is_err());
         // A source hash other than the hash of the reviewed code differs.
         let mut source = selection(20_000_000, "2");
         source["sourceHash"] = crate::hex(&[7; 32]).into();
