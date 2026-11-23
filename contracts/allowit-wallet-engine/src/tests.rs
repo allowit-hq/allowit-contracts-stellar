@@ -170,6 +170,12 @@ fn compiled_engine_returns_bundled_pass_values_and_rule_errors() {
         client.try_daily_volume_limit(ctx.params.map(), &ctx.state, &ctx.request),
         Err(Ok(AllowitError::DailyVolumeLimitExceeded))
     );
+    // One call made under a limit of one: the engine vetoes the next call.
+    set(&mut ctx, allowit::CALL_LIMIT, Some(AllowitValue::Int(1)));
+    assert_eq!(
+        client.try_call_limit(ctx.params.map(), &ctx.state, &ctx.request),
+        Err(Ok(AllowitError::CallLimitExceeded))
+    );
     set(&mut ctx, allowit::LIFETIME_SPENDING_LIMIT, None);
     assert_eq!(
         client.try_lifetime_spending_limit(ctx.params.map(), &ctx.state, &ctx.request),
