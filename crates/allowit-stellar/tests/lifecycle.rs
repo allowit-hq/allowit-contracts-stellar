@@ -567,6 +567,48 @@ fn stale_or_changed_payload_cannot_be_signed() {
     assert!(validate_signed(&signed, 86401).is_err());
 }
 #[test]
+fn a_changed_trusted_server_or_an_approval_across_the_utc_day_is_refused() {
+    // The trusted server key must be the configured one on the routes that have a server.
+    for route in [WalletRoute::Native, WalletRoute::PolicyWallet] {
+        let (c, r, s) = fixture(route.clone(), false);
+        assert!(prepare(&c, &r, &s, 86401, 86700).is_ok());
+        let mut changed = s.clone();
+        changed.server = account_for_seed(&[11; 32]);
+        assert!(prepare(&c, &r, &changed, 86401, 86700).is_err());
+    }
+    // A Native approval ends within its UTC day: 100 seconds before midnight it may run for 100
+    // seconds, not for 200.
+    let (c, r, s) = fixture(WalletRoute::Native, false);
+    let midnight = 2 * 86_400;
+    assert!(prepare(&c, &r, &s, midnight - 100, midnight).is_ok());
+    assert!(
+        prepare(&c, &r, &s, midnight - 100, midnight + 100)
+            .unwrap_err()
+            .contains("cross its UTC budget day")
+    );
+}
+#[test]
+fn an_envelope_signature_that_does_not_verify_is_refused_even_with_the_right_hint() {
+    let (c, r, s) = fixture(WalletRoute::Native, false);
+    let p = prepare(&c, &r, &s, 86401, 86700).unwrap();
+    let mut signed = sign_native(&p);
+    validate_signed(&signed, 86401).unwrap();
+    let TransactionEnvelope::Tx(mut env) =
+        TransactionEnvelope::from_xdr_base64(&signed.transaction_xdr, Limits::none()).unwrap()
+    else {
+        panic!()
+    };
+    let mut signatures = env.signatures.to_vec();
+    let mut bytes = signatures[0].signature.0.to_vec();
+    bytes[0] ^= 1;
+    signatures[0].signature = stellar_xdr::Signature(bytes.try_into().unwrap());
+    env.signatures = signatures.try_into().unwrap();
+    signed.transaction_xdr = TransactionEnvelope::Tx(env)
+        .to_xdr_base64(Limits::none())
+        .unwrap();
+    assert!(validate_signed(&signed, 86401).is_err());
+}
+#[test]
 fn classic_limits_keep_exact_local_math_while_odc_requires_native_preflight() {
     for route in [WalletRoute::Native, WalletRoute::PolicyWallet] {
         let (mut c, mut r, mut s) = fixture(route.clone(), true);
@@ -624,7 +666,10 @@ fn odc_uses_execute_and_exact_module_schema_payload() {
         .to_xdr_base64(Limits::none())
         .unwrap();
     let p = attach_simulation(&p, &data).unwrap();
+    // The server's authorization is required, and present once the server signed.
+    assert!(validate_server_authorization(&p).is_err());
     let p = server_ready(&p);
+    validate_server_authorization(&p).unwrap();
     let sig = sign(&p, &[2; 32], 86401).unwrap();
     let signed = authorize(&p, &[sig], 86401).unwrap();
     validate_signed(&signed, 86401).unwrap();
@@ -2109,6 +2154,13 @@ fn owner_handoff_completes_with_the_new_owner_signature(
     // The latest ledger in the mock is 120.
     let signed = sign_owner_entry(&c.network, recorded, &[51; 32], 130);
     let signed_xdr = signed.to_xdr_base64(Limits::none()).unwrap();
+    // The rail signs the recorded entry as the test does, and only the seed's own unsigned entry.
+    assert_eq!(
+        sign_account_entry(&c.network, recorded, &[51; 32], 130).unwrap(),
+        signed
+    );
+    assert!(sign_account_entry(&c.network, recorded, &[52; 32], 130).is_err());
+    assert!(sign_account_entry(&c.network, &signed, &[51; 32], 130).is_err());
     let rejects = |entry: SorobanAuthorizationEntry| {
         owner_admin
             .complete_owner_handoff(prepared, &entry.to_xdr_base64(Limits::none()).unwrap())

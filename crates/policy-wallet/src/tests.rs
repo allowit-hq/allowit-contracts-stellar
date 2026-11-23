@@ -770,6 +770,28 @@ fn daily_figures_live_in_a_window_that_ends_with_its_own_ledger() {
     assert_eq!(f.run(&f.transfer(100, 0)), Ok(()));
 }
 
+#[test]
+fn a_wallet_that_keeps_only_both_daily_figures_reads_them_back() {
+    let f = Fixture::with(COMMON, false, |env, c| {
+        c.rules = Vec::from_array(
+            env,
+            [
+                AllowitRule::daily_spending_limit,
+                AllowitRule::daily_volume_limit,
+            ],
+        );
+    });
+    assert_eq!(f.client().state().kept, u32::from(DAILIES));
+    assert_eq!(f.run(&f.transfer(100, 0)), Ok(()));
+    f.advance(10);
+    // 100 + 61 > 160, the daily volume limit.
+    assert_eq!(
+        f.run(&f.transfer(61, 0)),
+        denied(COMMON, AllowitError::DailyVolumeLimitExceeded)
+    );
+    assert_eq!(f.run(&f.transfer(60, 0)), Ok(()));
+}
+
 /// The window of `d` follows Core's rule at its edges (`allowit::daily_window_end`, the end being
 /// the window's last ledger): a write at the last ledger keeps the end; one ledger later the
 /// figures read as zero, and the next write opens a window from that ledger.
@@ -1757,6 +1779,35 @@ fn construction_checks_the_owner_configuration() {
         }));
         assert!(result.is_err(), "{name}");
     }
+    // An owner account whose key is the agent's or the server's key is refused; an owner account
+    // of its own key is not.
+    let owner_account = |env: &Env, key: &BytesN<32>| {
+        Address::try_from_val(
+            env,
+            &xdr::ScVal::Address(xdr::ScAddress::Account(xdr::AccountId(
+                xdr::PublicKey::PublicKeyTypeEd25519(xdr::Uint256(key.to_array())),
+            ))),
+        )
+        .unwrap()
+    };
+    for (name, role) in [("agent", 0), ("server", 1)] {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Fixture::with(SIMPLE, false, |env, c| {
+                let key = if role == 0 { &c.agent } else { &c.server };
+                c.owner = owner_account(env, key);
+            })
+        }));
+        assert!(result.is_err(), "owner account of the {name} key");
+    }
+    let own = SigningKey::from_bytes(&[11; 32]).verifying_key().to_bytes();
+    // The owner account is read back as the account that it is.
+    let f = Fixture::with(SIMPLE, false, |env, c| {
+        c.owner = owner_account(env, &BytesN::from_array(env, &own))
+    });
+    assert_eq!(
+        f.client().state().owner,
+        owner_account(&f.env, &BytesN::from_array(&f.env, &own))
+    );
     // A Custom wallet binds the hash of its own source.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         Fixture::with(CUSTOM, false, |env, c| {
@@ -1764,6 +1815,28 @@ fn construction_checks_the_owner_configuration() {
         })
     }));
     assert!(result.is_err());
+}
+
+/// The length of the wallet's stored configuration.
+fn config_len(f: &Fixture) -> usize {
+    f.env.as_contract(&f.wallet, || {
+        let raw: Bytes = f.env.storage().instance().get(&CONFIG).unwrap();
+        raw.len() as usize
+    })
+}
+
+#[test]
+fn a_configuration_of_another_layout_is_not_read() {
+    let f = Fixture::new(COMMON);
+    f.env.as_contract(&f.wallet, || {
+        let mut raw: Bytes = f.env.storage().instance().get(&CONFIG).unwrap();
+        raw.set(0, CONTRACT_VERSION as u8 - 1);
+        f.env.storage().instance().set(&CONFIG, &raw);
+    });
+    assert_eq!(
+        f.client().try_state(),
+        Err(Ok(AllowitWalletError::InvalidState))
+    );
 }
 
 // --- Packing ----------------------------------------------------------------------------------

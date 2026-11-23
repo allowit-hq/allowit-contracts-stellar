@@ -2571,6 +2571,28 @@ fn recorded_vectors_decode_to_the_exact_workflow_packets() {
     assert_eq!(executions, 12);
 }
 #[test]
+fn a_priced_operation_ends_within_its_utc_expense_day() {
+    let wasm = wasm_for(PolicyTier::Simple);
+    let chain = ModelChain::new(BTreeMap::from([(hash(&wasm), PolicyTier::Simple)]));
+    let c = create(&chain, PolicyTier::Simple, &wasm, [0x32; 32]);
+    let state = sending_state(&chain, &c);
+    let r = request::transfer(&c, &state, [1; 32], &account_for_seed(&RECIPIENT), 1).unwrap();
+    // 100 seconds before the end of the UTC day of NOW.
+    let now = (NOW / 86_400 + 1) * 86_400 - 100;
+    let t = ExecutionTerms {
+        expense: Some(ExpenseBounds::xlm(1, 0, MAX_FEE, chain.ledger() - 1, now).unwrap()),
+        ..terms(1, chain.ledger())
+    };
+    let prepare =
+        |expires| rpc::prepare_with(&chain, &c, &r, &t, Some(chain.accounting()), now, expires);
+    assert!(prepare(now + 100).is_ok());
+    assert!(
+        prepare(now + 200)
+            .unwrap_err()
+            .contains("cross its UTC expense day")
+    );
+}
+#[test]
 fn the_sending_account_is_the_gas_payee_and_the_gas_follows_the_priced_expense() {
     let wasm = wasm_for(PolicyTier::Simple);
     let chain = ModelChain::new(BTreeMap::from([(hash(&wasm), PolicyTier::Simple)]));
