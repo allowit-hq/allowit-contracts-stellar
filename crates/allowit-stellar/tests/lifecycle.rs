@@ -599,8 +599,8 @@ fn a_packet_is_built_only_for_the_trusted_wallet_and_within_its_utc_day() {
         }
         assert!(prepare(&c, &changed, &s, 86401, 86700).is_err());
     }
-    // The approved effect names the asset that moves and its beneficiary.
-    for edit in 0..3 {
+    // The approved effect names the asset that moves, its beneficiary and its amount.
+    for edit in 0..4 {
         let (c, mut r, s) = fixture(WalletRoute::Native, true);
         let network = network_id(&c.network).unwrap();
         match edit {
@@ -616,7 +616,8 @@ fn a_packet_is_built_only_for_the_trusted_wallet_and_within_its_utc_day() {
                     token: wf(&Contract([9; 32]).to_string()),
                 })
             }
-            _ => r.effect_bounds[0].beneficiary = wf(&account_for_seed(&[13; 32])),
+            2 => r.effect_bounds[0].beneficiary = wf(&account_for_seed(&[13; 32])),
+            _ => r.effect_bounds[0].max_debit = 20_000_001u64.into(),
         }
         assert!(prepare(&c, &r, &s, 86401, 86700).is_err());
     }
