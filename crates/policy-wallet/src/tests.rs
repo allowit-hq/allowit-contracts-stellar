@@ -591,7 +591,7 @@ type ConfigCase = (&'static str, fn(&Env, &mut AllowitPolicyConfig));
 #[test]
 fn request_bindings_and_gas_are_checked() {
     let f = Fixture::new(SIMPLE);
-    let cases: [RequestCase; 8] = [
+    let cases: [RequestCase; 10] = [
         (
             "stale version",
             |_, e| e.1 = 1,
@@ -648,6 +648,24 @@ fn request_bindings_and_gas_are_checked() {
             },
             AllowitWalletError::InvalidInvocation,
         ),
+        (
+            "no observation ledger",
+            |_, e| {
+                if let AllowitExpense::Priced(_, _, _, observed) = &mut e.4 {
+                    *observed = 0;
+                }
+            },
+            AllowitWalletError::InvalidInvocation,
+        ),
+        (
+            "an observation after the current ledger",
+            |f, e| {
+                if let AllowitExpense::Priced(_, _, _, observed) = &mut e.4 {
+                    *observed = f.env.ledger().sequence() + 1;
+                }
+            },
+            AllowitWalletError::InvalidInvocation,
+        ),
     ];
     for (name, edit, error) in cases {
         let mut e = f.transfer(10, 5);
@@ -664,6 +682,15 @@ fn request_bindings_and_gas_are_checked() {
     e.4 = AllowitExpense::Unpriced;
     assert_eq!(f.run(&e), Ok(()));
     assert_eq!(f.balance(&f.asset, &f.recipient), 10);
+}
+
+#[test]
+fn a_wallet_of_another_asset_refuses_negative_attested_gas_units() {
+    let f = Fixture::with(SIMPLE, true, |_, _| {});
+    // 5 stroops of gas attested as -2 units would count 2 units less than the transfer.
+    let mut e = f.transfer(10, 5);
+    e.4 = AllowitExpense::Priced(-2, 0, 8, f.env.ledger().sequence());
+    assert_eq!(f.run(&e), Err(Ok(AllowitWalletError::InvalidInvocation)));
 }
 
 #[test]
@@ -768,6 +795,28 @@ fn daily_figures_live_in_a_window_that_ends_with_its_own_ledger() {
     f.advance(200_000);
     assert_eq!(f.figures(), AllowitFigures::default());
     assert_eq!(f.run(&f.transfer(100, 0)), Ok(()));
+}
+
+#[test]
+fn a_wallet_that_keeps_only_both_daily_figures_reads_them_back() {
+    let f = Fixture::with(COMMON, false, |env, c| {
+        c.rules = Vec::from_array(
+            env,
+            [
+                AllowitRule::daily_spending_limit,
+                AllowitRule::daily_volume_limit,
+            ],
+        );
+    });
+    assert_eq!(f.client().state().kept, u32::from(DAILIES));
+    assert_eq!(f.run(&f.transfer(100, 0)), Ok(()));
+    f.advance(10);
+    // 100 + 61 > 160, the daily volume limit.
+    assert_eq!(
+        f.run(&f.transfer(61, 0)),
+        denied(COMMON, AllowitError::DailyVolumeLimitExceeded)
+    );
+    assert_eq!(f.run(&f.transfer(60, 0)), Ok(()));
 }
 
 /// The window of `d` follows Core's rule at its edges (`allowit::daily_window_end`, the end being
@@ -1073,6 +1122,36 @@ fn custom_params_of_every_kind_round_trip_through_the_packed_instance() {
     for (key, value) in values(&f.env) {
         assert_eq!(stored.get(Symbol::new(&f.env, key)), Some(value), "{key}");
     }
+}
+
+#[test]
+fn custom_params_at_their_size_bounds_round_trip() {
+    // A text of MAX_TEXT bytes, a list of MAX_ITEMS items and an integer of the decoder's top
+    // group store and read back.
+    let values = |env: &Env| {
+        let mut items = Vec::new(env);
+        for n in 0..i128::from(allowit::MAX_ITEMS) {
+            items.push_back(AllowitValue::Int(n));
+        }
+        let text = "t".repeat(allowit::MAX_TEXT as usize);
+        (
+            AllowitValue::Str(soroban_sdk::String::from_str(env, &text)),
+            AllowitValue::List(items),
+        )
+    };
+    // 2^125 packs into a last LEB128 group of 1 at shift 126, the decoder's top group.
+    let large = AllowitValue::Int(1 << 125);
+    let f = Fixture::with(CUSTOM, false, |env, c| {
+        let (text, list) = values(env);
+        c.params.set(Symbol::new(env, "text"), text);
+        c.params.set(Symbol::new(env, "list"), list);
+        c.params.set(Symbol::new(env, "large"), large.clone());
+    });
+    let stored = f.client().state().params;
+    let (text, list) = values(&f.env);
+    assert_eq!(stored.get(Symbol::new(&f.env, "text")), Some(text));
+    assert_eq!(stored.get(Symbol::new(&f.env, "list")), Some(list));
+    assert_eq!(stored.get(Symbol::new(&f.env, "large")), Some(large));
 }
 
 // --- Policies -------------------------------------------------------------------------------------
@@ -1428,6 +1507,45 @@ impl MockPair {
         token::Client::new(&env, &token).transfer(&env.current_contract_address(), &to, &amount);
     }
 }
+/// Hostile test router: reports `amount_in * rate / 100` but pays `short` units less, and does
+/// not check the minimum output itself.
+#[contract]
+pub struct ShortRouter;
+#[contractimpl]
+impl ShortRouter {
+    pub fn __constructor(env: Env, pair: Address, rate: i128, short: i128) {
+        env.storage().instance().set(&0u32, &(pair, rate, short));
+    }
+    pub fn router_pair_for(env: Env, _a: Address, _b: Address) -> Address {
+        let (pair, _, _): (Address, i128, i128) = env.storage().instance().get(&0u32).unwrap();
+        pair
+    }
+    pub fn swap_exact_tokens_for_tokens(
+        env: Env,
+        amount_in: i128,
+        _amount_out_min: i128,
+        path: Vec<Address>,
+        to: Address,
+        _deadline: u64,
+    ) -> Vec<i128> {
+        let (pair, rate, short): (Address, i128, i128) =
+            env.storage().instance().get(&0u32).unwrap();
+        to.require_auth();
+        let out = amount_in * rate / 100;
+        token::Client::new(&env, &path.get_unchecked(0)).transfer(&to, &pair, &amount_in);
+        MockPairClient::new(&env, &pair).pay(
+            &path.get_unchecked(path.len() - 1),
+            &to,
+            &(out - short),
+        );
+        let mut amounts = Vec::new(&env);
+        amounts.push_back(amount_in);
+        for _ in 1..path.len() {
+            amounts.push_back(out);
+        }
+        amounts
+    }
+}
 /// Test router of the Soroswap shape: pays `amount_in * rate / 100`.
 #[contract]
 pub struct MockRouter;
@@ -1532,6 +1650,131 @@ fn swap_deposit_and_redeem_run_through_execute_with_effect_checks() {
         e.0 = BytesN::from_array(&f.env, &[4; 32]);
         e.3 = AllowitStellarOperation::Deposit(wrong, 10, 10);
         priced(&f, &mut e, 0);
+        assert_eq!(f.run(&e), Err(Ok(AllowitWalletError::UnsupportedAsset)));
+        // A swap that attests a negative loss, which would count less than its gas: a swap has no
+        // later loss check that a deposit has.
+        let mut e = f.transfer(1, 5);
+        e.0 = BytesN::from_array(&f.env, &[5; 32]);
+        e.3 = AllowitStellarOperation::Swap(
+            router.clone(),
+            50,
+            47,
+            Vec::from_array(&f.env, [f.asset.clone(), other.clone()]),
+            e.2,
+        );
+        e.4 = AllowitExpense::Priced(5, -1, 4, f.env.ledger().sequence());
+        assert_eq!(f.run(&e), Err(Ok(AllowitWalletError::InvalidInvocation)));
+        // A deposit names a positive minimum of shares.
+        let mut e = f.transfer(1, 0);
+        e.0 = BytesN::from_array(&f.env, &[6; 32]);
+        e.3 = AllowitStellarOperation::Deposit(vault.clone(), 10, 0);
+        priced(&f, &mut e, 0);
+        assert_eq!(f.run(&e), Err(Ok(AllowitWalletError::InvalidAmount)));
+        if wasm == COMMON {
+            // A forward swap counts its asset input, 150, against the payment limit of 100.
+            let mut e = f.transfer(1, 0);
+            e.0 = BytesN::from_array(&f.env, &[7; 32]);
+            e.3 = AllowitStellarOperation::Swap(
+                router.clone(),
+                150,
+                10,
+                Vec::from_array(&f.env, [f.asset.clone(), other.clone()]),
+                e.2,
+            );
+            priced(&f, &mut e, 3);
+            assert_eq!(
+                f.run(&e),
+                denied(COMMON, AllowitError::PaymentLimitExceeded)
+            );
+        }
+        // A swap through the asset as its router, over a path longer than four tokens, or with
+        // a deadline after the request's expiry is refused.
+        let third = f
+            .env
+            .register_stellar_asset_contract_v2(Address::generate(&f.env))
+            .address();
+        for (n, (via, path, late)) in [
+            (
+                f.asset.clone(),
+                std::vec![f.asset.clone(), other.clone()],
+                0,
+            ),
+            (
+                router.clone(),
+                std::vec![
+                    f.asset.clone(),
+                    third.clone(),
+                    other.clone(),
+                    third.clone(),
+                    other.clone(),
+                ],
+                0,
+            ),
+            (router.clone(), std::vec![f.asset.clone(), other.clone()], 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut e = f.transfer(1, 0);
+            e.0 = BytesN::from_array(&f.env, &[8 + n as u8; 32]);
+            e.3 = AllowitStellarOperation::Swap(
+                via,
+                50,
+                47,
+                Vec::from_slice(&f.env, &path),
+                e.2 + late,
+            );
+            priced(&f, &mut e, 3);
+            assert_eq!(
+                f.run(&e),
+                Err(Ok(AllowitWalletError::InvalidInvocation)),
+                "swap case {n}"
+            );
+        }
+        // A router that pays less than its minimum output, or less than it reports, is refused.
+        for (n, (short, minimum)) in [(0i128, 48i128), (1, 47)].into_iter().enumerate() {
+            f.env.mock_all_auths();
+            let hostile = f.env.register(ShortRouter, (pair.clone(), 95i128, short));
+            f.env.set_auths(&[]);
+            let mut e = f.transfer(1, 0);
+            e.0 = BytesN::from_array(&f.env, &[13 + n as u8; 32]);
+            e.3 = AllowitStellarOperation::Swap(
+                hostile,
+                50,
+                minimum,
+                Vec::from_array(&f.env, [f.asset.clone(), other.clone()]),
+                e.2,
+            );
+            priced(&f, &mut e, 3);
+            assert_eq!(
+                f.run(&e),
+                Err(Ok(AllowitWalletError::InvalidEffects)),
+                "router case {n}"
+            );
+        }
+        // A swap names a positive minimum output.
+        let mut e = f.transfer(1, 0);
+        e.0 = BytesN::from_array(&f.env, &[11; 32]);
+        e.3 = AllowitStellarOperation::Swap(
+            router.clone(),
+            50,
+            0,
+            Vec::from_array(&f.env, [f.asset.clone(), other.clone()]),
+            e.2,
+        );
+        priced(&f, &mut e, 3);
+        assert_eq!(f.run(&e), Err(Ok(AllowitWalletError::InvalidAmount)));
+        // A swap's other endpoint is a Stellar Asset Contract, not a token of its own code.
+        let mut e = f.transfer(1, 0);
+        e.0 = BytesN::from_array(&f.env, &[12; 32]);
+        e.3 = AllowitStellarOperation::Swap(
+            router.clone(),
+            50,
+            47,
+            Vec::from_array(&f.env, [f.asset.clone(), vault.clone()]),
+            e.2,
+        );
+        priced(&f, &mut e, 3);
         assert_eq!(f.run(&e), Err(Ok(AllowitWalletError::UnsupportedAsset)));
     }
 }
@@ -1688,6 +1931,23 @@ fn the_owner_recovers_any_token_and_passes_calls_through() {
         Ok(())
     );
     assert_eq!(f.balance(&f.native, &to), 5);
+    // The owner's passthrough: the wallet calls the token as itself.
+    let call: Vec<Val> = (f.wallet.clone(), to.clone(), 5i128).into_val(&f.env);
+    let auth: Vec<InvokerContractAuthEntry> = Vec::new(&f.env);
+    assert_eq!(
+        f.owner_call(
+            "invoke",
+            (
+                f.native.clone(),
+                Symbol::new(&f.env, "transfer"),
+                call,
+                auth
+            )
+                .into_val(&f.env)
+        ),
+        Ok(())
+    );
+    assert_eq!(f.balance(&f.native, &to), 10);
 }
 
 #[test]
@@ -1757,6 +2017,35 @@ fn construction_checks_the_owner_configuration() {
         }));
         assert!(result.is_err(), "{name}");
     }
+    // An owner account whose key is the agent's or the server's key is refused; an owner account
+    // of its own key is not.
+    let owner_account = |env: &Env, key: &BytesN<32>| {
+        Address::try_from_val(
+            env,
+            &xdr::ScVal::Address(xdr::ScAddress::Account(xdr::AccountId(
+                xdr::PublicKey::PublicKeyTypeEd25519(xdr::Uint256(key.to_array())),
+            ))),
+        )
+        .unwrap()
+    };
+    for (name, role) in [("agent", 0), ("server", 1)] {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Fixture::with(SIMPLE, false, |env, c| {
+                let key = if role == 0 { &c.agent } else { &c.server };
+                c.owner = owner_account(env, key);
+            })
+        }));
+        assert!(result.is_err(), "owner account of the {name} key");
+    }
+    let own = SigningKey::from_bytes(&[11; 32]).verifying_key().to_bytes();
+    // The owner account is read back as the account that it is.
+    let f = Fixture::with(SIMPLE, false, |env, c| {
+        c.owner = owner_account(env, &BytesN::from_array(env, &own))
+    });
+    assert_eq!(
+        f.client().state().owner,
+        owner_account(&f.env, &BytesN::from_array(&f.env, &own))
+    );
     // A Custom wallet binds the hash of its own source.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         Fixture::with(CUSTOM, false, |env, c| {
@@ -1764,6 +2053,106 @@ fn construction_checks_the_owner_configuration() {
         })
     }));
     assert!(result.is_err());
+}
+
+#[test]
+fn a_configuration_of_another_layout_is_not_read() {
+    let f = Fixture::new(COMMON);
+    f.env.as_contract(&f.wallet, || {
+        let mut raw: Bytes = f.env.storage().instance().get(&CONFIG).unwrap();
+        raw.set(0, CONTRACT_VERSION as u8 - 1);
+        f.env.storage().instance().set(&CONFIG, &raw);
+    });
+    assert_eq!(
+        f.client().try_state(),
+        Err(Ok(AllowitWalletError::InvalidState))
+    );
+}
+
+#[test]
+fn a_deposit_whose_vault_breaks_its_effects_is_refused() {
+    let f = Fixture::new(SIMPLE);
+    // The test vault's behavior 2 credits one share fewer than it reports, 11 values the shares
+    // two units below the assets, and behavior 0 mints 40 shares where 41 are the minimum.
+    for (n, (behavior, minimum)) in [(2u32, 1i128), (11, 1), (0, 41)].into_iter().enumerate() {
+        let vault = f.env.register(VAULT, (f.asset.clone(), behavior));
+        let mut e = f.transfer(1, 0);
+        e.0 = BytesN::from_array(&f.env, &[20 + n as u8; 32]);
+        e.3 = AllowitStellarOperation::Deposit(vault, 40, minimum);
+        priced(&f, &mut e, 0);
+        assert_eq!(
+            f.run(&e),
+            Err(Ok(AllowitWalletError::InvalidEffects)),
+            "case {n}"
+        );
+    }
+}
+
+#[test]
+fn a_redeem_whose_vault_breaks_its_effects_is_refused() {
+    let f = Fixture::new(SIMPLE);
+    // The test vault's behavior 21 pays one unit less than it reports, 23 burns one share more,
+    // 25 keeps a fee that its preview does not show, and behavior 0 pays 30 where 31 is the
+    // minimum. Each vault first takes a deposit of 40.
+    for (n, (behavior, minimum)) in [(21u32, 1i128), (23, 1), (25, 1), (0, 31)]
+        .into_iter()
+        .enumerate()
+    {
+        let vault = f.env.register(VAULT, (f.asset.clone(), behavior));
+        let mut e = f.transfer(1, 0);
+        e.0 = BytesN::from_array(&f.env, &[30 + 2 * n as u8; 32]);
+        e.3 = AllowitStellarOperation::Deposit(vault.clone(), 40, 40);
+        priced(&f, &mut e, 0);
+        assert_eq!(f.run(&e), Ok(()), "deposit {n}");
+        let mut e = f.transfer(1, 0);
+        e.0 = BytesN::from_array(&f.env, &[31 + 2 * n as u8; 32]);
+        e.3 = AllowitStellarOperation::Redeem(vault, 30, minimum);
+        priced(&f, &mut e, 0);
+        assert_eq!(
+            f.run(&e),
+            Err(Ok(AllowitWalletError::InvalidEffects)),
+            "case {n}"
+        );
+    }
+}
+
+#[test]
+fn a_transfer_to_the_classic_issuer_of_the_asset_is_refused() {
+    let key = SigningKey::from_bytes(&[21; 32]).verifying_key().to_bytes();
+    let issuer = xdr::AccountId(xdr::PublicKey::PublicKeyTypeEd25519(xdr::Uint256(key)));
+    // An AlphaNum4 code and an AlphaNum12 code.
+    for asset in [
+        xdr::Asset::CreditAlphanum4(xdr::AlphaNum4 {
+            asset_code: xdr::AssetCode4(*b"USDC"),
+            issuer: issuer.clone(),
+        }),
+        xdr::Asset::CreditAlphanum12(xdr::AlphaNum12 {
+            asset_code: xdr::AssetCode12(*b"ABCDEFG\0\0\0\0\0"),
+            issuer: issuer.clone(),
+        }),
+    ] {
+        let created = core::cell::RefCell::new(None);
+        let f = Fixture::with(SIMPLE, false, |env, c| {
+            let sac = env
+                .host()
+                .invoke_function(xdr::HostFunction::CreateContract(xdr::CreateContractArgs {
+                    contract_id_preimage: xdr::ContractIdPreimage::Asset(asset),
+                    executable: xdr::ContractExecutable::StellarAsset,
+                }))
+                .unwrap();
+            c.asset = Address::try_from_val(env, &sac).unwrap();
+            *created.borrow_mut() = Some(c.asset.clone());
+        });
+        let token = created.into_inner().unwrap();
+        let to = Address::try_from_val(
+            &f.env,
+            &xdr::ScVal::Address(xdr::ScAddress::Account(issuer.clone())),
+        )
+        .unwrap();
+        let mut e = f.transfer(10, 0);
+        e.3 = AllowitStellarOperation::Transfer(token, to, 10);
+        assert_eq!(f.run(&e), Err(Ok(AllowitWalletError::InvalidRecipient)));
+    }
 }
 
 // --- Packing ----------------------------------------------------------------------------------

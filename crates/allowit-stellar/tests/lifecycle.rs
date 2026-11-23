@@ -567,6 +567,144 @@ fn stale_or_changed_payload_cannot_be_signed() {
     assert!(validate_signed(&signed, 86401).is_err());
 }
 #[test]
+fn a_packet_is_built_only_for_the_trusted_wallet_and_within_its_utc_day() {
+    // The trusted server key must be the configured one on the routes that have a server.
+    for route in [WalletRoute::Native, WalletRoute::PolicyWallet] {
+        let (c, r, s) = fixture(route.clone(), false);
+        assert!(prepare(&c, &r, &s, 86401, 86700).is_ok());
+        let mut changed = s.clone();
+        changed.server = account_for_seed(&[11; 32]);
+        assert!(prepare(&c, &r, &changed, 86401, 86700).is_err());
+    }
+    // A Native transfer moves a positive amount out of the wallet itself.
+    let (c, r, s) = fixture(WalletRoute::Native, false);
+    for edit in [0, 1] {
+        let mut changed = r.clone();
+        let ExecutionInput::Instructions(v) = &mut changed.input else {
+            panic!()
+        };
+        let NativeInstruction::StellarNativeTransfer {
+            source, stroops, ..
+        } = &mut v[0]
+        else {
+            panic!()
+        };
+        if edit == 0 {
+            *source = wf(&account_for_seed(&[12; 32]));
+            changed.effect_bounds[0].source = wf(&account_for_seed(&[12; 32]));
+        } else {
+            *stroops = 0;
+            changed.effect_bounds[0].max_debit = 0u64.into();
+            changed.effect_bounds[0].min_credit = 0u64.into();
+        }
+        assert!(prepare(&c, &changed, &s, 86401, 86700).is_err());
+    }
+    // The approved effect names the asset that moves, its beneficiary and its amount.
+    for edit in 0..4 {
+        let (c, mut r, s) = fixture(WalletRoute::Native, true);
+        let network = network_id(&c.network).unwrap();
+        match edit {
+            0 => {
+                r.effect_bounds[0].asset = WorkflowAsset::Native {
+                    chain: Chain::Stellar,
+                    network,
+                }
+            }
+            1 => {
+                r.effect_bounds[0].asset = WorkflowAsset::Token(AssetId {
+                    network,
+                    token: wf(&Contract([9; 32]).to_string()),
+                })
+            }
+            2 => r.effect_bounds[0].beneficiary = wf(&account_for_seed(&[13; 32])),
+            _ => r.effect_bounds[0].min_credit = 20_000_001u64.into(),
+        }
+        assert!(prepare(&c, &r, &s, 86401, 86700).is_err());
+    }
+    // A token transfer calls the wallet's own asset contract.
+    let (c, mut r, s) = fixture(WalletRoute::Native, true);
+    assert!(prepare(&c, &r, &s, 86401, 86700).is_ok());
+    let ExecutionInput::Instructions(v) = &mut r.input else {
+        panic!()
+    };
+    let NativeInstruction::StellarCall { contract, .. } = &mut v[0] else {
+        panic!()
+    };
+    *contract = wf(&Contract([9; 32]).to_string());
+    assert!(prepare(&c, &r, &s, 86401, 86700).is_err());
+    // The installed source text is the one that the source hash names.
+    let (mut c, r, s) = fixture(WalletRoute::Native, false);
+    c.policy_source.push('\n');
+    assert!(prepare(&c, &r, &s, 86401, 86700).is_err());
+    // A Native packet carries no execution args.
+    let (c, r, s) = fixture(WalletRoute::Native, false);
+    let mut args = PolicyParams::default();
+    args.0.insert("invoice".into(), PolicyValue::Int(1));
+    let terms = ExecutionTerms {
+        args,
+        ..Default::default()
+    };
+    assert!(prepare_with(&c, &r, &terms, &s, 86401, 86700).is_err());
+    // The trusted agent key of a Native wallet must be the configured one.
+    let (c, r, s) = fixture(WalletRoute::Native, false);
+    let mut changed = s.clone();
+    changed.agent = account_for_seed(&[11; 32]);
+    assert!(prepare(&c, &r, &changed, 86401, 86700).is_err());
+    // The params that a policy wallet stores are the installed ones.
+    let (c, r, s) = fixture(WalletRoute::PolicyWallet, false);
+    let mut changed = s.clone();
+    let mut params = installed_params(&c);
+    params.0.insert("payment_limit".into(), PolicyValue::Int(1));
+    changed.policy_state.as_mut().unwrap().params = params;
+    assert!(prepare(&c, &r, &changed, 86401, 86700).is_err());
+    // So are the source hash and the rules that the wallet's own state names.
+    let mut changed = s.clone();
+    changed.policy_state.as_mut().unwrap().source_hash = [3; 32];
+    assert!(prepare(&c, &r, &changed, 86401, 86700).is_err());
+    let mut changed = s.clone();
+    changed.policy_state.as_mut().unwrap().rules = vec!["payment_limit".into()];
+    assert!(prepare(&c, &r, &changed, 86401, 86700).is_err());
+    // The trusted account of a Native wallet is the configured wallet, with the agent signing.
+    let (c, r, s) = fixture(WalletRoute::Native, false);
+    let mut other = s.clone();
+    other.source.address = account_for_seed(&[12; 32]);
+    assert!(prepare(&c, &r, &other, 86401, 86700).is_err());
+    let mut paused = s.clone();
+    paused.source.signers.retain(|signer| signer.key != c.agent);
+    assert!(prepare(&c, &r, &paused, 86401, 86700).is_err());
+    // A Native approval ends within its UTC day: 100 seconds before midnight it may run for 100
+    // seconds, not for 200.
+    let (c, r, s) = fixture(WalletRoute::Native, false);
+    let midnight = 2 * 86_400;
+    assert!(prepare(&c, &r, &s, midnight - 100, midnight).is_ok());
+    assert!(
+        prepare(&c, &r, &s, midnight - 100, midnight + 100)
+            .unwrap_err()
+            .contains("cross its UTC budget day")
+    );
+}
+#[test]
+fn an_envelope_signature_that_does_not_verify_is_refused_even_with_the_right_hint() {
+    let (c, r, s) = fixture(WalletRoute::Native, false);
+    let p = prepare(&c, &r, &s, 86401, 86700).unwrap();
+    let mut signed = sign_native(&p);
+    validate_signed(&signed, 86401).unwrap();
+    let TransactionEnvelope::Tx(mut env) =
+        TransactionEnvelope::from_xdr_base64(&signed.transaction_xdr, Limits::none()).unwrap()
+    else {
+        panic!()
+    };
+    let mut signatures = env.signatures.to_vec();
+    let mut bytes = signatures[0].signature.0.to_vec();
+    bytes[0] ^= 1;
+    signatures[0].signature = stellar_xdr::Signature(bytes.try_into().unwrap());
+    env.signatures = signatures.try_into().unwrap();
+    signed.transaction_xdr = TransactionEnvelope::Tx(env)
+        .to_xdr_base64(Limits::none())
+        .unwrap();
+    assert!(validate_signed(&signed, 86401).is_err());
+}
+#[test]
 fn classic_limits_keep_exact_local_math_while_odc_requires_native_preflight() {
     for route in [WalletRoute::Native, WalletRoute::PolicyWallet] {
         let (mut c, mut r, mut s) = fixture(route.clone(), true);
@@ -595,6 +733,7 @@ fn classic_limits_keep_exact_local_math_while_odc_requires_native_preflight() {
         }
         s.source_hash = c.source_hash;
         let prepared = prepare(&c, &r, &s, 86401, 86700).unwrap();
+        verify_policy(&c, &r, &s, 86401).unwrap();
         if c.route == WalletRoute::PolicyWallet {
             // Host evaluation admits it, but signing still needs native preflight.
             assert!(
@@ -613,6 +752,7 @@ fn classic_limits_keep_exact_local_math_while_odc_requires_native_preflight() {
         r.effect_bounds[0].max_debit = 20_000_001u64.into();
         r.effect_bounds[0].min_credit = 20_000_001u64.into();
         assert!(prepare(&c, &r, &s, 86401, 86700).is_err());
+        assert!(verify_policy(&c, &r, &s, 86401).is_err());
     }
 }
 #[test]
@@ -624,7 +764,10 @@ fn odc_uses_execute_and_exact_module_schema_payload() {
         .to_xdr_base64(Limits::none())
         .unwrap();
     let p = attach_simulation(&p, &data).unwrap();
+    // The server's authorization is required, and present once the server signed.
+    assert!(validate_server_authorization(&p).is_err());
     let p = server_ready(&p);
+    validate_server_authorization(&p).unwrap();
     let sig = sign(&p, &[2; 32], 86401).unwrap();
     let signed = authorize(&p, &[sig], 86401).unwrap();
     validate_signed(&signed, 86401).unwrap();
@@ -2109,6 +2252,13 @@ fn owner_handoff_completes_with_the_new_owner_signature(
     // The latest ledger in the mock is 120.
     let signed = sign_owner_entry(&c.network, recorded, &[51; 32], 130);
     let signed_xdr = signed.to_xdr_base64(Limits::none()).unwrap();
+    // The rail signs the recorded entry as the test does, and only the seed's own unsigned entry.
+    assert_eq!(
+        sign_account_entry(&c.network, recorded, &[51; 32], 130).unwrap(),
+        signed
+    );
+    assert!(sign_account_entry(&c.network, recorded, &[52; 32], 130).is_err());
+    assert!(sign_account_entry(&c.network, &signed, &[51; 32], 130).is_err());
     let rejects = |entry: SorobanAuthorizationEntry| {
         owner_admin
             .complete_owner_handoff(prepared, &entry.to_xdr_base64(Limits::none()).unwrap())

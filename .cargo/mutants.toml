@@ -8,6 +8,8 @@
 # never runs. The contract tests run the built Wasm; the wrapper rebuilds the Wasm of each mutant in
 # its build copy with scripts/build-contracts.sh, which needs the pinned Stellar CLI.
 # A mutant that the tests do not catch is listed in mutants.out/missed.txt.
+# The client crate (crates/allowit-stellar, a workspace of its own) has its own scope and command
+# in crates/allowit-stellar/.cargo/mutants.toml.
 
 # Not product code: the SEP-56 vault of the tests and the two Custom policy fixtures that
 # scripts/build-contracts.sh builds with the `test-catching` and `test-daily` features. Build
@@ -22,3 +24,10 @@ exclude_globs = [
 # The contract tests of one package run the Wasm of another (the deployer tests run the Simple and
 # Standard Wasm, the parent tests run the wallet engine Wasm), so every mutant runs every test.
 test_workspace = true
+
+# The release vectors (crates/policy-wallet/src/core_vectors_tests.rs) replay recorded `create`
+# transactions that name the released Wasm hash. Any change to the bytes of a contract Wasm fails
+# them before the mutated code runs, so they would count every mutant of the wallet Wasm as caught.
+# They do not judge a mutant; normal CI still runs them. These arguments go to the test binaries:
+# do not add a second `--` on the command line.
+additional_cargo_test_args = ["--", "--skip", "core_vectors_tests::"]

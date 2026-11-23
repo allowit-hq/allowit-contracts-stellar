@@ -2216,6 +2216,13 @@ fn owner_params_update_step_matches_the_owner_reconstruction_and_keeps_usage() {
                 .to_string()
                 .contains("gas cap")
         );
+        // A server key that the ledger no longer holds is refused the same way: the update would
+        // write the old key back.
+        let other_server = WalletConfig {
+            server: account_for_seed(&[44; 32]),
+            ..c.clone()
+        };
+        assert!(params_update::installed(&*chain, &other_server, &update).is_err());
         let differs = params_update::verify(&*chain, "policy", &other_gas_cap).unwrap();
         assert!(!differs.matches);
         let gas_cap_row = serde_json::to_value(&differs.comparisons)
@@ -2569,6 +2576,45 @@ fn recorded_vectors_decode_to_the_exact_workflow_packets() {
         }
     }
     assert_eq!(executions, 12);
+}
+#[test]
+fn a_priced_operation_ends_within_its_utc_expense_day() {
+    let wasm = wasm_for(PolicyTier::Simple);
+    let chain = ModelChain::new(BTreeMap::from([(hash(&wasm), PolicyTier::Simple)]));
+    let c = create(&chain, PolicyTier::Simple, &wasm, [0x32; 32]);
+    let state = sending_state(&chain, &c);
+    let r = request::transfer(&c, &state, [1; 32], &account_for_seed(&RECIPIENT), 1).unwrap();
+    // 100 seconds before the end of the UTC day of NOW.
+    let now = (NOW / 86_400 + 1) * 86_400 - 100;
+    let t = ExecutionTerms {
+        expense: Some(ExpenseBounds::xlm(1, 0, MAX_FEE, chain.ledger() - 1, now).unwrap()),
+        ..terms(1, chain.ledger())
+    };
+    let prepare =
+        |expires| rpc::prepare_with(&chain, &c, &r, &t, Some(chain.accounting()), now, expires);
+    assert!(prepare(now + 100).is_ok());
+    assert!(
+        prepare(now + 200)
+            .unwrap_err()
+            .contains("cross its UTC expense day")
+    );
+    // An expense priced on the day before is refused.
+    let yesterday = ExecutionTerms {
+        expense: Some(ExpenseBounds::xlm(1, 0, MAX_FEE, chain.ledger() - 1, now - 86_400).unwrap()),
+        ..terms(1, chain.ledger())
+    };
+    assert!(
+        rpc::prepare_with(
+            &chain,
+            &c,
+            &r,
+            &yesterday,
+            Some(chain.accounting()),
+            now,
+            now + 100
+        )
+        .is_err()
+    );
 }
 #[test]
 fn the_sending_account_is_the_gas_payee_and_the_gas_follows_the_priced_expense() {

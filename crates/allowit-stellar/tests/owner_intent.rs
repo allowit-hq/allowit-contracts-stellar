@@ -231,8 +231,16 @@ fn deployer() -> String {
 }
 /// The owner's one creation through the deployer, with one funding transfer.
 fn create(tier: PolicyTier) -> (OwnerTransaction, ExpectedOwnerIntent) {
+    create_with(tier, |_| {})
+}
+/// A creation of a wallet whose configuration `edit` changed before the packet was built.
+fn create_with(
+    tier: PolicyTier,
+    edit: impl FnOnce(&mut WalletConfig),
+) -> (OwnerTransaction, ExpectedOwnerIntent) {
     let salt = [8; 32];
-    let c = config(tier, &salt);
+    let mut c = config(tier, &salt);
+    edit(&mut c);
     // `AllowitPolicyConfig`: the agent and server keys raw, the owner's source hash and the
     // gas cap; the fixture's own encoder is the contract's field order.
     let raw_key = |account: &str| bytes(&allowit_stellar::account_key(account).unwrap());
@@ -1653,4 +1661,114 @@ fn lifetime_target_and_footprint_mutations_fail_before_signing() {
         });
         assert_refused(&packet, &expected, &format!("lifetime mutation {variant}"));
     }
+}
+
+/// One owner step on a Native wallet, prepared by the rail from the owner's and the wallet's
+/// accounts, with the owner's own intent for it.
+fn wallet_step(action: owner::WalletAction) -> (OwnerTransaction, ExpectedOwnerIntent) {
+    let (owner_account, wallet, agent, server) = (owner(), account(8), account(2), account(3));
+    let owner_state = AccountState {
+        address: owner_account.clone(),
+        sequence: 41,
+        master_weight: 1,
+        low_threshold: 0,
+        medium_threshold: 0,
+        high_threshold: 0,
+        signers: vec![],
+    };
+    let signer = |key: &str, weight| AccountSigner {
+        key: key.into(),
+        weight,
+    };
+    let wallet_state = AccountState {
+        address: wallet.clone(),
+        sequence: 7,
+        master_weight: 0,
+        low_threshold: 2,
+        medium_threshold: 2,
+        high_threshold: 3,
+        signers: vec![
+            signer(&agent, 1),
+            signer(&server, 1),
+            signer(&owner_account, 3),
+        ],
+    };
+    let roles = owner::WalletRoles {
+        wallet: &wallet,
+        owner: &owner_account,
+        agent: &agent,
+        engine: &server,
+    };
+    let packet = owner::prepare_wallet_action(
+        &owner_state,
+        &wallet_state,
+        roles,
+        &action,
+        &x::Asset::Native,
+        "stellar:testnet",
+        100,
+        NOW,
+    )
+    .unwrap();
+    let expected = ExpectedOwnerIntent {
+        limits: limits(),
+        action: OwnerAction::Wallet {
+            owner_state,
+            wallet_state,
+            agent,
+            engine: server,
+            action,
+            asset_symbol: "XLM".into(),
+            asset_issuer: None,
+        },
+    };
+    (packet, expected)
+}
+
+#[test]
+fn the_owner_signs_a_native_wallet_step_only_for_its_own_account_and_lifetime() {
+    use owner::WalletAction::*;
+    for action in [
+        Fund { units: 5 },
+        Pause,
+        Withdraw {
+            units: 5,
+            recipient: None,
+        },
+        Close {
+            token_balance: None,
+        },
+    ] {
+        let name = action.name();
+        let (packet, expected) = wallet_step(action);
+        validate_owner_transaction(&packet, &expected, NOW).unwrap();
+        // The owner's account state is of another account than the signing owner.
+        let mut other = expected.clone();
+        if let OwnerAction::Wallet { owner_state, .. } = &mut other.action {
+            owner_state.address = account(9);
+        }
+        assert_refused(&packet, &other, name);
+        // The caller's own limit ends one second before the packet, within five minutes.
+        let mut tight = expected.clone();
+        tight.limits.valid_until = NOW + 299;
+        assert_refused(&packet, &tight, name);
+        // Five minutes from one second earlier end before the packet, within the caller's limit.
+        let mut loose = expected.clone();
+        loose.limits.valid_until = NOW + 1_000;
+        assert!(validate_owner_transaction(&packet, &loose, NOW - 1).is_err());
+    }
+    // A close has several operations at 100 stroops each: above an owner's fee limit of 100.
+    let (packet, expected) = wallet_step(Close {
+        token_balance: None,
+    });
+    let mut cheap = expected.clone();
+    cheap.limits.max_fee_stroops = 100;
+    assert_refused(&packet, &cheap, "fee above the owner's limit");
+}
+
+#[test]
+fn the_owner_never_signs_the_creation_of_a_wallet_that_another_owner_controls() {
+    // The packet and the intent agree on a configuration whose owner is not the signer.
+    let (packet, expected) = create_with(PolicyTier::Simple, |c| c.owner = account(9));
+    assert_refused(&packet, &expected, "another owner");
 }

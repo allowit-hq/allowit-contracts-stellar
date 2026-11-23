@@ -1,0 +1,59 @@
+# Mutation testing (cargo-mutants) of the client crate: the code that builds, authorizes or signs
+# the transactions that move funds or change a wallet's policy (the agent's and the owner's signing
+# paths, amounts, destinations, fees and limits). Parsing helpers, messages and tooling are left
+# out. It runs once for each release, beside the run of the contract workspace
+# (../../.cargo/mutants.toml).
+#
+# The crate's tests read files outside the crate (the contract sources and ../../target/*.wasm),
+# so cargo-mutants cannot copy the crate alone. Run it in place, in a clone kept for the run, after
+# scripts/build-contracts.sh has built the Wasm in that clone:
+#
+#   cd crates/allowit-stellar
+#   cargo-mutants mutants --in-place
+#
+# In place, one mutant runs at a time; to run in parallel, give each clone one `--shard k/n`.
+# cargo-mutants 27.1.0 applies examine_re and exclude_re to no "delete field" mutant, so the few
+# of those in these files run too.
+#
+# The two skipped tests read source files as text (error codes, exits): a mutant that removes a
+# literal would fail them with no change of behaviour.
+examine_globs = [
+  'src/admin/host.rs',
+  'src/authorization.rs',
+  'src/browser_owner.rs',
+  'src/contract.rs',
+  'src/lib.rs',
+  'src/owner.rs',
+  'src/owner_intent.rs',
+  'src/provider/params_update.rs',
+  'src/provider/request.rs',
+  'src/request.rs',
+  'src/seller_settled.rs',
+  'src/signing.rs',
+]
+examine_re = [
+  '^src/admin/host\.rs:\d+:\d+: ',
+  '^src/authorization\.rs:\d+:\d+: ',
+  '^src/browser_owner\.rs:\d+:\d+: ',
+  '^src/contract\.rs:\d+:\d+: ',
+  '^src/lib\.rs:\d+:\d+: (replace (build|transaction_bounds|prepare|prepare_with|prepare_with_bounds|attach_resources|attach_simulation|authorize|authorize_wallet|sign|sign_with|signing_digest|transaction_signers|account_transaction_signers|validate_signing_policy|validate_prepared|validate_retained_prepared|validate_signed|validate_wallet_signed|validate_retained_signed|validate_role_signatures|AccountState::validate_authority_signatures|AccountState::validate_signer_quorum|AccountState::signer_weight|AccountState::validate_roles|AccountState::validate_wallet|AccountState::validate_structure|TrustedState::policy_role_weight|packet_bounds|current_authorization_bounds|preflight_binding|record_native_preflight|prepare_for_native_preflight|needs_native_preflight|retained_revision_packet|transaction_hash|verify_operation|verify_policy|admit_classic|verify_classic_portable|verify_wallet_portable|validate_expense|ExpenseBounds::xlm|ExpenseBounds::with_fee_bound_only|ExpenseBounds::repaid_after_carry|ExpenseBounds::with_gas_carry|ExpenseBounds::with_repayment|ExpenseBounds::with_fee_bound|ExecutionTerms::is_empty|ExecutionTerms::repaid_stroops|fee_bound|mul_div_ceil|scale_units|max_fee_ceiling|gas_repayment|gas_payee|named_sender|policy_wallet_request|legacy_wallet_request|legacy_transfer_args|transfer_from_request|operation_from_request|retained_operation_from_request|decode_operation|StellarOperation::debit|StellarOperation::debit_token|amount|operation_usage|validate_config|validate_retained_configuration|validate_config_for|<impl\ PartialEq\ for\ PreparedOperation>::eq) -> |.* in (build|transaction_bounds|prepare|prepare_with|prepare_with_bounds|attach_resources|attach_simulation|authorize|authorize_wallet|sign|sign_with|signing_digest|transaction_signers|account_transaction_signers|validate_signing_policy|validate_prepared|validate_retained_prepared|validate_signed|validate_wallet_signed|validate_retained_signed|validate_role_signatures|AccountState::validate_authority_signatures|AccountState::validate_signer_quorum|AccountState::signer_weight|AccountState::validate_roles|AccountState::validate_wallet|AccountState::validate_structure|TrustedState::policy_role_weight|packet_bounds|current_authorization_bounds|preflight_binding|record_native_preflight|prepare_for_native_preflight|needs_native_preflight|retained_revision_packet|transaction_hash|verify_operation|verify_policy|admit_classic|verify_classic_portable|verify_wallet_portable|validate_expense|ExpenseBounds::xlm|ExpenseBounds::with_fee_bound_only|ExpenseBounds::repaid_after_carry|ExpenseBounds::with_gas_carry|ExpenseBounds::with_repayment|ExpenseBounds::with_fee_bound|ExecutionTerms::is_empty|ExecutionTerms::repaid_stroops|fee_bound|mul_div_ceil|scale_units|max_fee_ceiling|gas_repayment|gas_payee|named_sender|policy_wallet_request|legacy_wallet_request|legacy_transfer_args|transfer_from_request|operation_from_request|retained_operation_from_request|decode_operation|StellarOperation::debit|StellarOperation::debit_token|amount|operation_usage|validate_config|validate_retained_configuration|validate_config_for|<impl\ PartialEq\ for\ PreparedOperation>::eq)$)',
+  '^src/owner\.rs:\d+:\d+: ',
+  '^src/owner_intent\.rs:\d+:\d+: ',
+  '^src/provider/params_update\.rs:\d+:\d+: ',
+  '^src/provider/request\.rs:\d+:\d+: ',
+  '^src/request\.rs:\d+:\d+: ',
+  '^src/seller_settled\.rs:\d+:\d+: ',
+  '^src/signing\.rs:\d+:\d+: ',
+]
+exclude_re = [
+  '^src/owner\.rs:\d+:\d+: (replace (service_origin|service_json|fund_testnet_account|WalletAction::name|Trustline::names_the_native_code) -> |.* in (service_origin|service_json|fund_testnet_account|WalletAction::name|Trustline::names_the_native_code)$)',
+  '^src/seller_settled\.rs:\d+:\d+: (replace (tests::.*) -> |.* in (tests::.*)$)',
+  '^src/signing\.rs:\d+:\d+: (replace (sign_in_message_times|source_approval_message|source_approval_payload|signed_message_digest) -> |.* in (sign_in_message_times|source_approval_message|source_approval_payload|signed_message_digest)$)',
+]
+additional_cargo_test_args = [
+  '--',
+  '--skip',
+  'every_typed_code_of_the_rail_has_a_catalogue_entry',
+  '--skip',
+  'every_exit_is_built_once',
+]
