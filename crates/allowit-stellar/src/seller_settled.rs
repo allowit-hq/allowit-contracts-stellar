@@ -1443,7 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn observation_reports_the_confirmed_settlement_and_skips_a_failed_one() {
+    fn observation_reports_the_settlement_and_lapses_an_entry_that_no_transaction_carried() {
         let p = keypair_wallet();
         let signed = assemble(&p, &[signed_by(AGENT, &p), signed_by(SERVER, &p)], NOW).unwrap();
         // The expiry ledger as the entry states it, read here without `expiry_ledger`.
@@ -1459,44 +1459,86 @@ mod tests {
         };
         envelope.tx.source_account = MuxedAccount::Ed25519(Uint256([6; 32]));
         envelope.tx.seq_num = SequenceNumber(77);
-        let hash = transaction_hash(&p.config.network, &envelope.tx).unwrap();
-        // The token reported one transfer through the expiry ledger, in that transaction; the
-        // ledger returns the transaction with `status`.
-        let read = |status: &str| {
+        // The token reported one transfer through the expiry ledger, in the successful
+        // transaction `envelope`, and the ledger returns that transaction.
+        let ledger = |envelope: &TransactionV1Envelope| {
             let result = TransactionResult {
                 fee_charged: 12_345,
-                result: if status == "SUCCESS" {
-                    TransactionResultResult::TxSuccess(VecM::default())
-                } else {
-                    TransactionResultResult::TxFailed(VecM::default())
-                },
+                result: TransactionResultResult::TxSuccess(VecM::default()),
                 ext: TransactionResultExt::V0,
             };
+            let hash = transaction_hash(&p.config.network, &envelope.tx).unwrap();
             Events {
                 passphrase: passphrase(&p.config.network).unwrap().to_owned(),
                 latest: last + 5,
                 pages: vec![vec![json!({"ledger": last, "txHash": hex(&hash)})]],
                 scanned: last + 5,
                 transaction: json!({
-                    "status": status,
+                    "status": "SUCCESS",
                     "ledger": last,
                     "envelopeXdr": xdr(&TransactionEnvelope::Tx(envelope.clone())).unwrap(),
                     "resultXdr": xdr(&result).unwrap(),
                 }),
             }
         };
-        // A confirmed transaction that carries the entry settled it: the payer paid.
-        let Observed::Settled(settled) = observe(&read("SUCCESS"), &p).unwrap() else {
+        // A confirmed transaction that carries the entry settled it: the payer paid, and the
+        // settlement comes with its receipt.
+        let hash = transaction_hash(&p.config.network, &envelope.tx).unwrap();
+        let Observed::Settled(settled) = observe(&ledger(&envelope), &p).unwrap() else {
             panic!("the confirmed settlement is not reported")
         };
         assert_eq!(settled.receipt.transaction_hash, hash);
         assert_eq!(settled.receipt.settles, Some(p.transaction_hash));
         assert_eq!(settled.signed.role_signatures, signed.role_signatures);
-        assert!(!lapsed(&read("SUCCESS"), &p).unwrap());
-        let settled = settlement(&read("SUCCESS"), &p).unwrap().unwrap();
+        assert!(!lapsed(&ledger(&envelope), &p).unwrap());
+        let settled = settlement(&ledger(&envelope), &p).unwrap().unwrap();
         assert_eq!(settled.receipt.transaction_hash, hash);
-        // A failed transaction moved nothing: through the expiry ledger, the entry lapsed.
-        assert!(lapsed(&read("FAILED"), &p).unwrap());
+        // The same transfer settled by another entry of the wallet (another nonce) is not this
+        // entry's settlement: the read reaches past the expiry ledger, so this entry lapsed.
+        let mut other = envelope.clone();
+        let mut operations = other.tx.operations.to_vec();
+        let OperationBody::InvokeHostFunction(op) = &mut operations[0].body else {
+            panic!("an invocation")
+        };
+        let mut auth = op.auth.to_vec();
+        if let SorobanCredentials::Address(credentials) = &mut auth[0].credentials {
+            credentials.nonce += 1;
+        }
+        op.auth = auth.try_into().unwrap();
+        other.tx.operations = operations.try_into().unwrap();
+        assert!(matches!(
+            observe(&ledger(&other), &p).unwrap(),
+            Observed::Lapsed
+        ));
+    }
+
+    /// The nonce of the entry of `p`.
+    fn nonce_of(p: &PreparedOperation) -> i64 {
+        let entry: SorobanAuthorizationEntry = read(&part(p).unwrap().authorization_xdr).unwrap();
+        let SorobanCredentials::Address(credentials) = entry.credentials else {
+            panic!("an address authorization")
+        };
+        credentials.nonce
+    }
+
+    #[test]
+    fn each_operation_has_its_own_nonce_and_a_retained_entry_keeps_it() {
+        // A retained packet rebuilds its entry, so the derivation of the nonce never changes:
+        // this is the nonce of the fixture's operation.
+        assert_eq!(nonce_of(&keypair_wallet()), 1_125_705_196_250_729_941);
+        // Each operation id has its own nonce, which the ledger takes once.
+        let ordinary = test_support::native_signed().prepared;
+        let mut seen = std::collections::BTreeSet::new();
+        for id in 1..=4u8 {
+            let mut request = ordinary.request.clone();
+            request.operation.nonce = [id; 32];
+            let prepared =
+                crate::prepare(&ordinary.config, &request, &ordinary.state, NOW, EXPIRES).unwrap();
+            let r = authorization_request(&prepared);
+            let nonce = nonce_of(&attach(prepared, &r, NOW).unwrap());
+            assert!(nonce >= 0);
+            assert!(seen.insert(nonce), "operation {id} repeats a nonce");
+        }
     }
 
     #[test]
@@ -1510,21 +1552,42 @@ mod tests {
     }
 
     /// A ledger at `latest` that shows the wallet account as `account` and answers the
-    /// simulation of the payload with `simulated`.
+    /// simulation of the payload with `simulated`. It keeps the parameters of each simulation.
     struct Simulating {
         latest: u64,
         account: AccountState,
         simulated: serde_json::Value,
+        simulations: std::sync::Mutex<Vec<serde_json::Value>>,
     }
     impl rpc::Rpc for Simulating {
-        fn call(&self, method: &str, _: serde_json::Value) -> Result<serde_json::Value> {
+        fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
             Ok(match method {
                 "getLatestLedger" => json!({"sequence": self.latest}),
                 "getLedgerEntries" => test_support::owner::account_entry(&self.account),
-                "simulateTransaction" => self.simulated.clone(),
+                "simulateTransaction" => {
+                    self.simulations.lock().unwrap().push(params);
+                    self.simulated.clone()
+                }
                 other => panic!("unexpected ledger call: {other}"),
             })
         }
+    }
+    /// A successful simulation: the resources of the invocation and its fee.
+    fn simulation_passes() -> serde_json::Value {
+        let resources = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: VecM::default(),
+                    read_write: VecM::default(),
+                },
+                instructions: 1,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 100,
+        };
+        json!({"latestLedger": 1, "transactionData": xdr(&resources).unwrap(), "minResourceFee": "100"})
     }
 
     #[test]
@@ -1548,14 +1611,22 @@ mod tests {
         let r = authorization_request(&ordinary);
         let p = attach(ordinary, &r, NOW).unwrap();
         let signatures = [signed_by(AGENT, &p), signed_by(SERVER, &p)];
-        let passes = json!({"latestLedger": 1});
+        let passes = simulation_passes();
         let ledger = |simulated| Simulating {
             latest: u64::from(p.state.ledger),
             account: p.state.source.clone(),
             simulated,
+            simulations: Default::default(),
         };
         let release = |ledger: &Simulating| super::authorize(ledger, &p, &signatures, NOW);
-        release(&ledger(passes.clone())).unwrap();
+        // The ledger simulates exactly the released payload, with the account's signature check
+        // enforced.
+        let passing = ledger(passes.clone());
+        let released = release(&passing).unwrap();
+        assert_eq!(
+            *passing.simulations.lock().unwrap(),
+            [json!({"transaction": released.transaction_xdr, "authMode": "enforce"})]
+        );
         assert_eq!(
             release(&ledger(
                 json!({"error": "the account's signature check failed"})
