@@ -1446,7 +1446,13 @@ mod tests {
     fn observation_reports_the_confirmed_settlement_and_skips_a_failed_one() {
         let p = keypair_wallet();
         let signed = assemble(&p, &[signed_by(AGENT, &p), signed_by(SERVER, &p)], NOW).unwrap();
-        let last = u64::from(expiry_ledger(part(&p).unwrap()).unwrap());
+        // The expiry ledger as the entry states it, read here without `expiry_ledger`.
+        let entry: SorobanAuthorizationEntry = read(&part(&p).unwrap().authorization_xdr).unwrap();
+        let SorobanCredentials::Address(credentials) = &entry.credentials else {
+            panic!("an address authorization")
+        };
+        let last = u64::from(credentials.signature_expiration_ledger);
+        assert!(last > u64::from(p.state.ledger));
         // The facilitator's transaction: its own source, the same invocation and entry.
         let TransactionEnvelope::Tx(mut envelope) = read(&signed.transaction_xdr).unwrap() else {
             panic!("a transaction")
