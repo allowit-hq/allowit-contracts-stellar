@@ -1972,6 +1972,25 @@ fn a_configuration_of_another_layout_is_not_read() {
 }
 
 #[test]
+fn a_deposit_whose_vault_breaks_its_effects_is_refused() {
+    let f = Fixture::new(SIMPLE);
+    // The test vault's behavior 2 credits one share fewer than it reports, 11 values the shares
+    // two units below the assets, and behavior 0 mints 40 shares where 41 are the minimum.
+    for (n, (behavior, minimum)) in [(2u32, 1i128), (11, 1), (0, 41)].into_iter().enumerate() {
+        let vault = f.env.register(VAULT, (f.asset.clone(), behavior));
+        let mut e = f.transfer(1, 0);
+        e.0 = BytesN::from_array(&f.env, &[20 + n as u8; 32]);
+        e.3 = AllowitStellarOperation::Deposit(vault, 40, minimum);
+        priced(&f, &mut e, 0);
+        assert_eq!(
+            f.run(&e),
+            Err(Ok(AllowitWalletError::InvalidEffects)),
+            "case {n}"
+        );
+    }
+}
+
+#[test]
 fn a_transfer_to_the_classic_issuer_of_the_asset_is_refused() {
     let key = SigningKey::from_bytes(&[21; 32]).verifying_key().to_bytes();
     let issuer = xdr::AccountId(xdr::PublicKey::PublicKeyTypeEd25519(xdr::Uint256(key)));

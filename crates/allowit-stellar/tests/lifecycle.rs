@@ -599,6 +599,10 @@ fn a_packet_is_built_only_for_the_trusted_wallet_and_within_its_utc_day() {
         }
         assert!(prepare(&c, &changed, &s, 86401, 86700).is_err());
     }
+    // The installed source text is the one that the source hash names.
+    let (mut c, r, s) = fixture(WalletRoute::Native, false);
+    c.policy_source.push('\n');
+    assert!(prepare(&c, &r, &s, 86401, 86700).is_err());
     // A Native packet carries no execution args.
     let (c, r, s) = fixture(WalletRoute::Native, false);
     let mut args = PolicyParams::default();
@@ -689,6 +693,7 @@ fn classic_limits_keep_exact_local_math_while_odc_requires_native_preflight() {
         }
         s.source_hash = c.source_hash;
         let prepared = prepare(&c, &r, &s, 86401, 86700).unwrap();
+        verify_policy(&c, &r, &s, 86401).unwrap();
         if c.route == WalletRoute::PolicyWallet {
             // Host evaluation admits it, but signing still needs native preflight.
             assert!(
@@ -707,6 +712,7 @@ fn classic_limits_keep_exact_local_math_while_odc_requires_native_preflight() {
         r.effect_bounds[0].max_debit = 20_000_001u64.into();
         r.effect_bounds[0].min_credit = 20_000_001u64.into();
         assert!(prepare(&c, &r, &s, 86401, 86700).is_err());
+        assert!(verify_policy(&c, &r, &s, 86401).is_err());
     }
 }
 #[test]

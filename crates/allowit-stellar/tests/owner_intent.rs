@@ -1757,6 +1757,13 @@ fn the_owner_signs_a_native_wallet_step_only_for_its_own_account_and_lifetime() 
         loose.limits.valid_until = NOW + 1_000;
         assert!(validate_owner_transaction(&packet, &loose, NOW - 1).is_err());
     }
+    // A close has several operations at 100 stroops each: above an owner's fee limit of 100.
+    let (packet, expected) = wallet_step(Close {
+        token_balance: None,
+    });
+    let mut cheap = expected.clone();
+    cheap.limits.max_fee_stroops = 100;
+    assert_refused(&packet, &cheap, "fee above the owner's limit");
 }
 
 #[test]
