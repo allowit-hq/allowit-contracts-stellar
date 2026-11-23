@@ -1,0 +1,24 @@
+# Mutation testing (cargo-mutants) of the contracts and of the crates whose code decides on funds
+# and signatures: policy checks, limits, authorization, the return and stop paths and gas
+# repayment. It runs once for each release, from the repository root:
+#
+#   CARGO="$PWD/scripts/mutants-cargo.sh" cargo-mutants mutants --jobs 2
+#
+# Call `cargo-mutants mutants`, not `cargo mutants`: Cargo sets CARGO to itself, so the wrapper
+# never runs. The contract tests run the built Wasm; the wrapper rebuilds the Wasm of each mutant in
+# its build copy with scripts/build-contracts.sh, which needs the pinned Stellar CLI.
+# A mutant that the tests do not catch is listed in mutants.out/missed.txt.
+
+# Not product code: the SEP-56 vault of the tests and the two Custom policy fixtures that
+# scripts/build-contracts.sh builds with the `test-catching` and `test-daily` features. Build
+# scripts, `#[cfg(test)]` modules and the Core rule source that crates/policy generates into
+# OUT_DIR get no mutants.
+exclude_globs = [
+  "crates/test-vault/**",
+  "contracts/allowit-custom-policy/src/catching_policy.rs",
+  "contracts/allowit-custom-policy/src/daily_policy.rs",
+]
+
+# The contract tests of one package run the Wasm of another (the deployer tests run the Simple and
+# Standard Wasm, the parent tests run the wallet engine Wasm), so every mutant runs every test.
+test_workspace = true
