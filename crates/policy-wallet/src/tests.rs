@@ -685,6 +685,15 @@ fn request_bindings_and_gas_are_checked() {
 }
 
 #[test]
+fn a_wallet_of_another_asset_refuses_negative_attested_gas_units() {
+    let f = Fixture::with(SIMPLE, true, |_, _| {});
+    // 5 stroops of gas attested as -2 units would count 2 units less than the transfer.
+    let mut e = f.transfer(10, 5);
+    e.4 = AllowitExpense::Priced(-2, 0, 8, f.env.ledger().sequence());
+    assert_eq!(f.run(&e), Err(Ok(AllowitWalletError::InvalidInvocation)));
+}
+
+#[test]
 fn a_wallet_of_another_asset_repays_gas_in_xlm_and_counts_its_attested_units() {
     let f = Fixture::with(COMMON, true, |_, _| {});
     let e = f.transfer(10, 4);
@@ -1117,7 +1126,8 @@ fn custom_params_of_every_kind_round_trip_through_the_packed_instance() {
 
 #[test]
 fn custom_params_at_their_size_bounds_round_trip() {
-    // A text of MAX_TEXT bytes and a list of MAX_ITEMS items store and read back.
+    // A text of MAX_TEXT bytes, a list of MAX_ITEMS items and an integer of the decoder's top
+    // group store and read back.
     let values = |env: &Env| {
         let mut items = Vec::new(env);
         for n in 0..i128::from(allowit::MAX_ITEMS) {
@@ -1129,15 +1139,19 @@ fn custom_params_at_their_size_bounds_round_trip() {
             AllowitValue::List(items),
         )
     };
+    // 2^125 packs into a last LEB128 group of 1 at shift 126, the decoder's top group.
+    let large = AllowitValue::Int(1 << 125);
     let f = Fixture::with(CUSTOM, false, |env, c| {
         let (text, list) = values(env);
         c.params.set(Symbol::new(env, "text"), text);
         c.params.set(Symbol::new(env, "list"), list);
+        c.params.set(Symbol::new(env, "large"), large.clone());
     });
     let stored = f.client().state().params;
     let (text, list) = values(&f.env);
     assert_eq!(stored.get(Symbol::new(&f.env, "text")), Some(text));
     assert_eq!(stored.get(Symbol::new(&f.env, "list")), Some(list));
+    assert_eq!(stored.get(Symbol::new(&f.env, "large")), Some(large));
 }
 
 // --- Policies -------------------------------------------------------------------------------------
@@ -1637,10 +1651,17 @@ fn swap_deposit_and_redeem_run_through_execute_with_effect_checks() {
         e.3 = AllowitStellarOperation::Deposit(wrong, 10, 10);
         priced(&f, &mut e, 0);
         assert_eq!(f.run(&e), Err(Ok(AllowitWalletError::UnsupportedAsset)));
-        // A deposit that attests a negative loss, which would count less than its gas.
+        // A swap that attests a negative loss, which would count less than its gas: a swap has no
+        // later loss check that a deposit has.
         let mut e = f.transfer(1, 5);
         e.0 = BytesN::from_array(&f.env, &[5; 32]);
-        e.3 = AllowitStellarOperation::Deposit(vault.clone(), 10, 10);
+        e.3 = AllowitStellarOperation::Swap(
+            router.clone(),
+            50,
+            47,
+            Vec::from_array(&f.env, [f.asset.clone(), other.clone()]),
+            e.2,
+        );
         e.4 = AllowitExpense::Priced(5, -1, 4, f.env.ledger().sequence());
         assert_eq!(f.run(&e), Err(Ok(AllowitWalletError::InvalidInvocation)));
         // A deposit names a positive minimum of shares.

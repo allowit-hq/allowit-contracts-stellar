@@ -368,7 +368,13 @@ mod tests {
     fn bridge(input: &serde_json::Value) -> u32 {
         let bytes = serde_json::to_vec(input).unwrap();
         let target = owner_input();
-        // SAFETY: the input buffer holds INPUT_BYTES, more than this test input.
+        assert!(!target.is_null(), "the bridge gave no input buffer");
+        assert!(
+            INPUT.with(|input| input.borrow().len()) >= bytes.len(),
+            "the input buffer is smaller than the test input"
+        );
+        // SAFETY: the pointer is the start of the thread's input buffer, checked above to hold
+        // at least `bytes.len()` bytes.
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), target, bytes.len()) };
         owner_verify(bytes.len())
     }
@@ -377,6 +383,63 @@ mod tests {
         let input = |limit: i64| serde_json::json!({"step": step(limit, 2), "expected": selection(20_000_000, "2"), "now": NOW});
         assert_eq!(bridge(&input(20_000_000)), 1);
         assert_eq!(bridge(&input(90_000_000)), 0);
+    }
+    #[test]
+    fn an_owner_update_never_installs_other_code() {
+        let expected: Selection = serde_json::from_value(selection(20_000_000, "2")).unwrap();
+        let config = WalletConfig {
+            network: NETWORK.into(),
+            policy_instance: [4; 32],
+            wallet: expected.wallet.clone().unwrap(),
+            owner: expected.owner.clone(),
+            agent: expected.agent.clone(),
+            server: expected.server.clone(),
+            route: WalletRoute::PolicyWallet,
+            tier: Some(PolicyTier::Common),
+            language: PolicyLanguage::Portable,
+            rules: crate::policy::tier_rules(PolicyTier::Common, CODE).unwrap(),
+            params: expected.params.clone(),
+            source_digest: [0; 32],
+            asset: expected.asset.clone(),
+            asset_symbol: "XLM".into(),
+            asset_issuer: None,
+            policy_source: CODE.into(),
+            source_hash: crate::hash(CODE.as_bytes()),
+            module_digest: crate::unhex(COMMON_WASM_HASH).unwrap(),
+            max_fee_stroops: 1_000_000,
+        };
+        let (mut deployment, _) =
+            crate::admin::PolicyDeployment::for_source(&config, CODE, config.params.clone())
+                .unwrap();
+        deployment.wasm_hash = Some([9; 32]);
+        let step = update_step(&config, &deployment, 2, NOW);
+        let packet = OwnerTransaction {
+            network: step["network"].as_str().unwrap().into(),
+            action: step["action"].as_str().unwrap().into(),
+            transaction_xdr: step["payload"].as_str().unwrap().into(),
+            transaction_hash: crate::unhex(step["transactionHash"].as_str().unwrap()).unwrap(),
+            expires_at: step["expiresAt"].as_u64().unwrap(),
+        };
+        // The packet and the intent agree on the update, which also installs other code.
+        let intent = ExpectedOwnerIntent {
+            limits: OwnerLimits {
+                network: NETWORK.into(),
+                owner: expected.owner.clone(),
+                next_sequence: 42,
+                max_fee_stroops: 10_000,
+                valid_until: NOW + 300,
+            },
+            action: OwnerAction::UpdatePolicy {
+                wallet: config.wallet.clone(),
+                deployment: Box::new(deployment),
+                version: 2,
+            },
+        };
+        assert!(
+            crate::owner_intent::validate_owner_transaction(&packet, &intent, NOW)
+                .err()
+                .is_some_and(|error| error.contains("installed code"))
+        );
     }
     #[test]
     fn the_browser_verifier_binds_a_params_update_to_the_reviewed_values_and_revision() {

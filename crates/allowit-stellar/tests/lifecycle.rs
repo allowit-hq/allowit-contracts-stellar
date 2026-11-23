@@ -657,6 +657,13 @@ fn a_packet_is_built_only_for_the_trusted_wallet_and_within_its_utc_day() {
     params.0.insert("payment_limit".into(), PolicyValue::Int(1));
     changed.policy_state.as_mut().unwrap().params = params;
     assert!(prepare(&c, &r, &changed, 86401, 86700).is_err());
+    // So are the source hash and the rules that the wallet's own state names.
+    let mut changed = s.clone();
+    changed.policy_state.as_mut().unwrap().source_hash = [3; 32];
+    assert!(prepare(&c, &r, &changed, 86401, 86700).is_err());
+    let mut changed = s.clone();
+    changed.policy_state.as_mut().unwrap().rules = vec!["payment_limit".into()];
+    assert!(prepare(&c, &r, &changed, 86401, 86700).is_err());
     // The trusted account of a Native wallet is the configured wallet, with the agent signing.
     let (c, r, s) = fixture(WalletRoute::Native, false);
     let mut other = s.clone();
