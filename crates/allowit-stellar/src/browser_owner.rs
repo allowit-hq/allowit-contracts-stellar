@@ -367,6 +367,10 @@ mod tests {
     #[test]
     fn the_browser_verifier_binds_a_params_update_to_the_reviewed_values_and_revision() {
         check(step(20_000_000, 2), selection(20_000_000, "2")).unwrap();
+        // Code other than the reviewed Common Wasm differs.
+        let mut code = selection(20_000_000, "2");
+        code["wasmHash"] = crate::hex(&[9; 32]).into();
+        assert!(check(step(20_000_000, 2), code).is_err());
         // Another value, another revision or another wallet differs.
         assert!(check(step(90_000_000, 2), selection(20_000_000, "2")).is_err());
         assert!(check(step(20_000_000, 3), selection(20_000_000, "2")).is_err());
@@ -417,6 +421,15 @@ mod tests {
         let mut reviewed = selection(20_000_000, "2");
         assert!(check(funding.clone(), reviewed.clone()).is_err());
         reviewed.as_object_mut().unwrap().remove("update");
+        check(funding, reviewed.clone()).unwrap();
+        // A fractional amount: 1.5 XLM is 15,000,000 stroops.
+        let funding = crate::test_support::owner::fund_step(&config, 15_000_000, NOW);
+        let funding = serde_json::json!({
+            "network": funding["network"], "action": funding["action"],
+            "transactionXdr": funding["payload"], "transactionHash": funding["transactionHash"],
+            "expiresAt": funding["expiresAt"],
+        });
+        reviewed["amount"] = "1.5".into();
         check(funding, reviewed).unwrap();
     }
 }

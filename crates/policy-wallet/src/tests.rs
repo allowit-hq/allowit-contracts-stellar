@@ -1579,6 +1579,73 @@ fn swap_deposit_and_redeem_run_through_execute_with_effect_checks() {
         e.3 = AllowitStellarOperation::Deposit(vault.clone(), 10, 10);
         e.4 = AllowitExpense::Priced(5, -1, 4, f.env.ledger().sequence());
         assert_eq!(f.run(&e), Err(Ok(AllowitWalletError::InvalidInvocation)));
+        // A deposit names a positive minimum of shares.
+        let mut e = f.transfer(1, 0);
+        e.0 = BytesN::from_array(&f.env, &[6; 32]);
+        e.3 = AllowitStellarOperation::Deposit(vault.clone(), 10, 0);
+        priced(&f, &mut e, 0);
+        assert_eq!(f.run(&e), Err(Ok(AllowitWalletError::InvalidAmount)));
+        if wasm == COMMON {
+            // A forward swap counts its asset input, 150, against the payment limit of 100.
+            let mut e = f.transfer(1, 0);
+            e.0 = BytesN::from_array(&f.env, &[7; 32]);
+            e.3 = AllowitStellarOperation::Swap(
+                router.clone(),
+                150,
+                10,
+                Vec::from_array(&f.env, [f.asset.clone(), other.clone()]),
+                e.2,
+            );
+            priced(&f, &mut e, 3);
+            assert_eq!(
+                f.run(&e),
+                denied(COMMON, AllowitError::PaymentLimitExceeded)
+            );
+        }
+        // A swap through the asset as its router, over a path longer than four tokens, or with
+        // a deadline after the request's expiry is refused.
+        let third = f
+            .env
+            .register_stellar_asset_contract_v2(Address::generate(&f.env))
+            .address();
+        for (n, (via, path, late)) in [
+            (
+                f.asset.clone(),
+                std::vec![f.asset.clone(), other.clone()],
+                0,
+            ),
+            (
+                router.clone(),
+                std::vec![
+                    f.asset.clone(),
+                    third.clone(),
+                    other.clone(),
+                    third.clone(),
+                    other.clone(),
+                ],
+                0,
+            ),
+            (router.clone(), std::vec![f.asset.clone(), other.clone()], 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut e = f.transfer(1, 0);
+            e.0 = BytesN::from_array(&f.env, &[8 + n as u8; 32]);
+            e.3 = AllowitStellarOperation::Swap(
+                via,
+                50,
+                47,
+                Vec::from_slice(&f.env, &path),
+                e.2 + late,
+            );
+            priced(&f, &mut e, 3);
+            assert_eq!(
+                f.run(&e),
+                Err(Ok(AllowitWalletError::InvalidInvocation)),
+                "swap case {n}"
+            );
+        }
     }
 }
 
