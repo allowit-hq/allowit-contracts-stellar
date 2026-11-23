@@ -1487,6 +1487,8 @@ mod tests {
         assert_eq!(settled.receipt.settles, Some(p.transaction_hash));
         assert_eq!(settled.signed.role_signatures, signed.role_signatures);
         assert!(!lapsed(&read("SUCCESS"), &p).unwrap());
+        let settled = settlement(&read("SUCCESS"), &p).unwrap().unwrap();
+        assert_eq!(settled.receipt.transaction_hash, hash);
         // A failed transaction moved nothing: through the expiry ledger, the entry lapsed.
         assert!(lapsed(&read("FAILED"), &p).unwrap());
     }
@@ -1501,17 +1503,18 @@ mod tests {
         }
     }
 
-    /// A ledger that shows the wallet account as the preparation read it and answers the
+    /// A ledger at `latest` that shows the wallet account as `account` and answers the
     /// simulation of the payload with `simulated`.
     struct Simulating {
-        p: PreparedOperation,
+        latest: u64,
+        account: AccountState,
         simulated: serde_json::Value,
     }
     impl rpc::Rpc for Simulating {
         fn call(&self, method: &str, _: serde_json::Value) -> Result<serde_json::Value> {
             Ok(match method {
-                "getLatestLedger" => json!({"sequence": self.p.state.ledger}),
-                "getLedgerEntries" => test_support::owner::account_entry(&self.p.state.source),
+                "getLatestLedger" => json!({"sequence": self.latest}),
+                "getLedgerEntries" => test_support::owner::account_entry(&self.account),
                 "simulateTransaction" => self.simulated.clone(),
                 other => panic!("unexpected ledger call: {other}"),
             })
@@ -1539,20 +1542,35 @@ mod tests {
         let r = authorization_request(&ordinary);
         let p = attach(ordinary, &r, NOW).unwrap();
         let signatures = [signed_by(AGENT, &p), signed_by(SERVER, &p)];
+        let passes = json!({"latestLedger": 1});
         let ledger = |simulated| Simulating {
-            p: p.clone(),
+            latest: u64::from(p.state.ledger),
+            account: p.state.source.clone(),
             simulated,
         };
-        super::authorize(&ledger(json!({"latestLedger": 1})), &p, &signatures, NOW).unwrap();
+        let release = |ledger: &Simulating| super::authorize(ledger, &p, &signatures, NOW);
+        release(&ledger(passes.clone())).unwrap();
         assert_eq!(
-            super::authorize(
-                &ledger(json!({"error": "the account's signature check failed"})),
-                &p,
-                &signatures,
-                NOW
-            )
+            release(&ledger(
+                json!({"error": "the account's signature check failed"})
+            ))
             .unwrap_err(),
             "The ledger refuses this payment authorization"
+        );
+        // The ledger passes the simulation, but the preparation named a ledger that the network
+        // has not closed, so the entry would stay valid longer than its operation.
+        let mut behind = ledger(passes.clone());
+        behind.latest -= u64::from(LEDGER_AHEAD) + 1;
+        assert_eq!(
+            release(&behind).unwrap_err(),
+            "The payment authorization counts its expiry from a ledger that the network has not closed"
+        );
+        // The wallet account changed since the preparation.
+        let mut changed = ledger(passes);
+        changed.account.sequence += 1;
+        assert_eq!(
+            release(&changed).unwrap_err(),
+            "The wallet changed since this payment authorization was prepared"
         );
     }
 
