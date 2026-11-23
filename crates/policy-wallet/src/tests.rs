@@ -1646,6 +1646,30 @@ fn swap_deposit_and_redeem_run_through_execute_with_effect_checks() {
                 "swap case {n}"
             );
         }
+        // A swap names a positive minimum output.
+        let mut e = f.transfer(1, 0);
+        e.0 = BytesN::from_array(&f.env, &[11; 32]);
+        e.3 = AllowitStellarOperation::Swap(
+            router.clone(),
+            50,
+            0,
+            Vec::from_array(&f.env, [f.asset.clone(), other.clone()]),
+            e.2,
+        );
+        priced(&f, &mut e, 3);
+        assert_eq!(f.run(&e), Err(Ok(AllowitWalletError::InvalidAmount)));
+        // A swap's other endpoint is a Stellar Asset Contract, not a token of its own code.
+        let mut e = f.transfer(1, 0);
+        e.0 = BytesN::from_array(&f.env, &[12; 32]);
+        e.3 = AllowitStellarOperation::Swap(
+            router.clone(),
+            50,
+            47,
+            Vec::from_array(&f.env, [f.asset.clone(), vault.clone()]),
+            e.2,
+        );
+        priced(&f, &mut e, 3);
+        assert_eq!(f.run(&e), Err(Ok(AllowitWalletError::UnsupportedAsset)));
     }
 }
 
@@ -1945,6 +1969,45 @@ fn a_configuration_of_another_layout_is_not_read() {
         f.client().try_state(),
         Err(Ok(AllowitWalletError::InvalidState))
     );
+}
+
+#[test]
+fn a_transfer_to_the_classic_issuer_of_the_asset_is_refused() {
+    let key = SigningKey::from_bytes(&[21; 32]).verifying_key().to_bytes();
+    let issuer = xdr::AccountId(xdr::PublicKey::PublicKeyTypeEd25519(xdr::Uint256(key)));
+    // An AlphaNum4 code and an AlphaNum12 code.
+    for asset in [
+        xdr::Asset::CreditAlphanum4(xdr::AlphaNum4 {
+            asset_code: xdr::AssetCode4(*b"USDC"),
+            issuer: issuer.clone(),
+        }),
+        xdr::Asset::CreditAlphanum12(xdr::AlphaNum12 {
+            asset_code: xdr::AssetCode12(*b"ABCDEFG\0\0\0\0\0"),
+            issuer: issuer.clone(),
+        }),
+    ] {
+        let created = core::cell::RefCell::new(None);
+        let f = Fixture::with(SIMPLE, false, |env, c| {
+            let sac = env
+                .host()
+                .invoke_function(xdr::HostFunction::CreateContract(xdr::CreateContractArgs {
+                    contract_id_preimage: xdr::ContractIdPreimage::Asset(asset),
+                    executable: xdr::ContractExecutable::StellarAsset,
+                }))
+                .unwrap();
+            c.asset = Address::try_from_val(env, &sac).unwrap();
+            *created.borrow_mut() = Some(c.asset.clone());
+        });
+        let token = created.into_inner().unwrap();
+        let to = Address::try_from_val(
+            &f.env,
+            &xdr::ScVal::Address(xdr::ScAddress::Account(issuer.clone())),
+        )
+        .unwrap();
+        let mut e = f.transfer(10, 0);
+        e.3 = AllowitStellarOperation::Transfer(token, to, 10);
+        assert_eq!(f.run(&e), Err(Ok(AllowitWalletError::InvalidRecipient)));
+    }
 }
 
 // --- Packing ----------------------------------------------------------------------------------
