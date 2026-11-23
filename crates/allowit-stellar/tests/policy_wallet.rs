@@ -2223,6 +2223,23 @@ fn owner_params_update_step_matches_the_owner_reconstruction_and_keeps_usage() {
             ..c.clone()
         };
         assert!(params_update::installed(&*chain, &other_server, &update).is_err());
+        // So is code other than the installed code, under the installation's own binding.
+        let mut other_code = c.clone();
+        other_code.module_digest = [7; 32];
+        other_code.source_digest = allowit_stellar::policy::installed_source_digest(
+            tier,
+            &other_code.module_digest,
+            &c.asset,
+            &c.rules,
+            &c.policy_source,
+        )
+        .unwrap();
+        assert!(
+            params_update::installed(&*chain, &other_code, &update)
+                .unwrap_err()
+                .to_string()
+                .contains("differ from this installation")
+        );
         // So is an owner or an agent key that the ledger no longer holds, each on its own.
         for other_role in [
             WalletConfig {
@@ -2238,7 +2255,7 @@ fn owner_params_update_step_matches_the_owner_reconstruction_and_keeps_usage() {
                 params_update::installed(&*chain, &other_role, &update)
                     .unwrap_err()
                     .to_string()
-                    .contains("roles")
+                    .contains("differ from this installation")
             );
         }
         let differs = params_update::verify(&*chain, "policy", &other_gas_cap).unwrap();
