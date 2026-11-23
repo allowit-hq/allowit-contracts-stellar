@@ -1491,6 +1491,71 @@ mod tests {
         assert!(lapsed(&read("FAILED"), &p).unwrap());
     }
 
+    #[test]
+    fn a_payment_authorization_is_admitted_only_from_its_creation_until_its_expiry() {
+        let p = keypair_wallet();
+        admit(&p, p.created_at).unwrap();
+        admit(&p, p.expires_at - 1).unwrap();
+        for now in [p.created_at - 1, p.expires_at] {
+            assert_eq!(admit(&p, now).unwrap_err(), "Prepared operation is stale");
+        }
+    }
+
+    /// A ledger that shows the wallet account as the preparation read it and answers the
+    /// simulation of the payload with `simulated`.
+    struct Simulating {
+        p: PreparedOperation,
+        simulated: serde_json::Value,
+    }
+    impl rpc::Rpc for Simulating {
+        fn call(&self, method: &str, _: serde_json::Value) -> Result<serde_json::Value> {
+            Ok(match method {
+                "getLatestLedger" => json!({"sequence": self.p.state.ledger}),
+                "getLedgerEntries" => test_support::owner::account_entry(&self.p.state.source),
+                "simulateTransaction" => self.simulated.clone(),
+                other => panic!("unexpected ledger call: {other}"),
+            })
+        }
+    }
+
+    #[test]
+    fn an_authorization_that_the_ledger_refuses_is_not_released() {
+        // A keypair wallet whose account has exactly its roles, with an owner of its own, as the
+        // ledger shows it.
+        let ordinary = test_support::native_signed().prepared;
+        let mut config = ordinary.config.clone();
+        config.owner = account_for_seed(&[10; 32]);
+        let c = &config;
+        let mut state = ordinary.state.clone();
+        state.owner = c.owner.clone();
+        state.source = test_support::wallet_account(
+            &c.wallet,
+            &c.owner,
+            &c.agent,
+            &c.server,
+            state.source.sequence,
+        );
+        let ordinary = crate::prepare(c, &ordinary.request, &state, NOW, EXPIRES).unwrap();
+        let r = authorization_request(&ordinary);
+        let p = attach(ordinary, &r, NOW).unwrap();
+        let signatures = [signed_by(AGENT, &p), signed_by(SERVER, &p)];
+        let ledger = |simulated| Simulating {
+            p: p.clone(),
+            simulated,
+        };
+        super::authorize(&ledger(json!({"latestLedger": 1})), &p, &signatures, NOW).unwrap();
+        assert_eq!(
+            super::authorize(
+                &ledger(json!({"error": "the account's signature check failed"})),
+                &p,
+                &signatures,
+                NOW
+            )
+            .unwrap_err(),
+            "The ledger refuses this payment authorization"
+        );
+    }
+
     /// A ledger endpoint that must never be called.
     struct Unreachable;
     impl rpc::Rpc for Unreachable {
