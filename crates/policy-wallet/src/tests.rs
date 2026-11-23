@@ -591,7 +591,7 @@ type ConfigCase = (&'static str, fn(&Env, &mut AllowitPolicyConfig));
 #[test]
 fn request_bindings_and_gas_are_checked() {
     let f = Fixture::new(SIMPLE);
-    let cases: [RequestCase; 11] = [
+    let cases: [RequestCase; 10] = [
         (
             "stale version",
             |_, e| e.1 = 1,
@@ -645,15 +645,6 @@ fn request_bindings_and_gas_are_checked() {
             "gas repaid on an unpriced request",
             |_, e| {
                 e.4 = AllowitExpense::Unpriced;
-            },
-            AllowitWalletError::InvalidInvocation,
-        ),
-        (
-            "a negative conversion",
-            |_, e| {
-                if let AllowitExpense::Priced(_, conversion, _, _) = &mut e.4 {
-                    *conversion = -1;
-                }
             },
             AllowitWalletError::InvalidInvocation,
         ),
@@ -1582,6 +1573,12 @@ fn swap_deposit_and_redeem_run_through_execute_with_effect_checks() {
         e.3 = AllowitStellarOperation::Deposit(wrong, 10, 10);
         priced(&f, &mut e, 0);
         assert_eq!(f.run(&e), Err(Ok(AllowitWalletError::UnsupportedAsset)));
+        // A deposit that attests a negative loss, which would count less than its gas.
+        let mut e = f.transfer(1, 5);
+        e.0 = BytesN::from_array(&f.env, &[5; 32]);
+        e.3 = AllowitStellarOperation::Deposit(vault.clone(), 10, 10);
+        e.4 = AllowitExpense::Priced(5, -1, 4, f.env.ledger().sequence());
+        assert_eq!(f.run(&e), Err(Ok(AllowitWalletError::InvalidInvocation)));
     }
 }
 
@@ -1737,6 +1734,23 @@ fn the_owner_recovers_any_token_and_passes_calls_through() {
         Ok(())
     );
     assert_eq!(f.balance(&f.native, &to), 5);
+    // The owner's passthrough: the wallet calls the token as itself.
+    let call: Vec<Val> = (f.wallet.clone(), to.clone(), 5i128).into_val(&f.env);
+    let auth: Vec<InvokerContractAuthEntry> = Vec::new(&f.env);
+    assert_eq!(
+        f.owner_call(
+            "invoke",
+            (
+                f.native.clone(),
+                Symbol::new(&f.env, "transfer"),
+                call,
+                auth
+            )
+                .into_val(&f.env)
+        ),
+        Ok(())
+    );
+    assert_eq!(f.balance(&f.native, &to), 10);
 }
 
 #[test]

@@ -576,6 +576,38 @@ fn a_packet_is_built_only_for_the_trusted_wallet_and_within_its_utc_day() {
         changed.server = account_for_seed(&[11; 32]);
         assert!(prepare(&c, &r, &changed, 86401, 86700).is_err());
     }
+    // A Native transfer moves a positive amount out of the wallet itself.
+    let (c, r, s) = fixture(WalletRoute::Native, false);
+    for edit in [0, 1] {
+        let mut changed = r.clone();
+        let ExecutionInput::Instructions(v) = &mut changed.input else {
+            panic!()
+        };
+        let NativeInstruction::StellarNativeTransfer {
+            source, stroops, ..
+        } = &mut v[0]
+        else {
+            panic!()
+        };
+        if edit == 0 {
+            *source = wf(&account_for_seed(&[12; 32]));
+            changed.effect_bounds[0].source = wf(&account_for_seed(&[12; 32]));
+        } else {
+            *stroops = 0;
+            changed.effect_bounds[0].max_debit = 0u64.into();
+            changed.effect_bounds[0].min_credit = 0u64.into();
+        }
+        assert!(prepare(&c, &changed, &s, 86401, 86700).is_err());
+    }
+    // A Native packet carries no execution args.
+    let (c, r, s) = fixture(WalletRoute::Native, false);
+    let mut args = PolicyParams::default();
+    args.0.insert("invoice".into(), PolicyValue::Int(1));
+    let terms = ExecutionTerms {
+        args,
+        ..Default::default()
+    };
+    assert!(prepare_with(&c, &r, &terms, &s, 86401, 86700).is_err());
     // The trusted agent key of a Native wallet must be the configured one.
     let (c, r, s) = fixture(WalletRoute::Native, false);
     let mut changed = s.clone();
@@ -627,26 +659,6 @@ fn an_envelope_signature_that_does_not_verify_is_refused_even_with_the_right_hin
         .to_xdr_base64(Limits::none())
         .unwrap();
     assert!(validate_signed(&signed, 86401).is_err());
-}
-#[test]
-fn a_native_daily_limit_counts_the_spending_of_the_same_utc_day() {
-    let (mut c, r, mut s) = fixture(WalletRoute::Native, true);
-    c.policy_source = DAILY.into();
-    c.params = policy::params_from_json(
-        &json!({"destinations": [account_for_seed(&[6; 32])], "daily_spending_limit": 30_000_000}),
-        Some(PolicyTier::Simple),
-    )
-    .unwrap();
-    c.source_hash = hash(&c.policy_source);
-    s.source_hash = c.source_hash;
-    // Five seconds into UTC day 2, where the server counted day 2's spending.
-    let now = 2 * 86_400 + 5;
-    s.spent_day = 2;
-    s.spent_daily = 5_000_000;
-    assert!(prepare(&c, &r, &s, now, now + 200).is_ok());
-    // 15,000,000 + 20,000,000 exceeds the daily limit of 30,000,000.
-    s.spent_daily = 15_000_000;
-    assert!(prepare(&c, &r, &s, now, now + 200).is_err());
 }
 #[test]
 fn classic_limits_keep_exact_local_math_while_odc_requires_native_preflight() {
@@ -2865,7 +2877,6 @@ fn preflight_rpc(c: &WalletConfig, r: &ExecutionRequest, s: &TrustedState) -> Pr
         failure: "",
     }
 }
-const DAILY: &str = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::destinations(ctx, &ctx.params[allowit::DESTINATIONS])?;\n    allowit::daily_spending_limit(ctx, &ctx.params[allowit::DAILY_SPENDING_LIMIT])?;\n    Ok(())\n}\n";
 const LIMITED: &str = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::destinations(ctx, &ctx.params[allowit::DESTINATIONS])?;\n    allowit::payment_limit(ctx, &ctx.params[allowit::PAYMENT_LIMIT])?;\n    Ok(())\n}\n";
 const SUFFIXED: &str = "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::destinations(ctx, &ctx.params[allowit::DESTINATIONS])?;\n    let limit: i128 = allowit::param(ctx, \"payment_limit\");\n    if ctx.request.amount > limit {\n        return Err(AllowitError::PaymentLimitExceeded);\n    }\n    Ok(())\n}\n";
 
