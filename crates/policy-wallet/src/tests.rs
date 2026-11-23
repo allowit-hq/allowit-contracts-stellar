@@ -1311,6 +1311,47 @@ fn a_state_value_over_its_bound_or_an_undeclared_key_is_refused() {
     });
 }
 
+/// A policy that declares `MAX_POLICY_STATE` persistent entries: the most that a build admits.
+struct MostState;
+impl AllowitPolicy for MostState {
+    const KIND: &'static str = "most_state";
+    const STATE: &'static [AllowitStateKey] = &{
+        let names = ["s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7"];
+        let mut keys = [AllowitStateKey {
+            name: "",
+            key: 0,
+            daily: false,
+        }; MAX_POLICY_STATE];
+        let mut i = 0;
+        while i < MAX_POLICY_STATE {
+            keys[i].name = names[i];
+            keys[i].key = 100 + i as u32;
+            i += 1;
+        }
+        keys
+    };
+    fn check(_: &AllowitContext, _: &Vec<AllowitRule>) -> Result<(), AllowitWalletError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_policy_with_the_most_state_entries_reads_and_writes_them() {
+    let f = Fixture::new(SIMPLE);
+    let env = &f.env;
+    f.env.as_contract(&f.wallet, || {
+        let before = read_policy_state::<MostState>(env).unwrap();
+        let mut state = Map::new(env);
+        state.set(Symbol::new(env, "s7"), AllowitValue::Int(7));
+        assert_eq!(
+            write_policy_state::<MostState>(env, &state, &before),
+            Ok(())
+        );
+        let slots = read_policy_state::<MostState>(env).unwrap();
+        assert_eq!(slots[7].value, Some(AllowitValue::Int(7)));
+    });
+}
+
 /// The wallet keeps a daily entry by Core's rule (`allowit::daily_window_end`): the window's end
 /// is its last ledger, inclusive. A write at that ledger keeps the window; the entry reads as
 /// absent one ledger later, and the next write opens a new window there.
