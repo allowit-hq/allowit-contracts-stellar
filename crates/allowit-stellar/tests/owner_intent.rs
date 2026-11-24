@@ -1742,12 +1742,20 @@ fn the_owner_signs_a_native_wallet_step_only_for_its_own_account_and_lifetime() 
         let name = action.name();
         let (packet, expected) = wallet_step(action);
         validate_owner_transaction(&packet, &expected, NOW).unwrap();
-        // The owner's account state is of another account than the signing owner.
+        // The owner's account state is of another account than the signing owner. The
+        // verifier's own check refuses it, before it rebuilds the action, which would also
+        // differ.
         let mut other = expected.clone();
         if let OwnerAction::Wallet { owner_state, .. } = &mut other.action {
             owner_state.address = account(9);
         }
         assert_refused(&packet, &other, name);
+        assert_eq!(
+            validate_owner_transaction(&packet, &other, NOW)
+                .err()
+                .as_deref(),
+            Some("Wallet action source differs from caller intent")
+        );
         // The caller's own limit ends one second before the packet, within five minutes.
         let mut tight = expected.clone();
         tight.limits.valid_until = NOW + 299;
