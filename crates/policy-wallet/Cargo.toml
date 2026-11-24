@@ -19,3 +19,4 @@ allowit = { workspace = true }
 soroban-sdk = { workspace = true, features = ["testutils"] }
 ed25519-dalek = "=2.2.0"
 allowit-sep56-test-vault = { path = "../test-vault" }
+allowit-sep56-priced-test-vault = { path = "../priced-test-vault" }

@@ -71,6 +71,13 @@ impl OwnerDocuments {
             &serde_json_canonicalizer::to_vec(&b["portable"]["params"]).unwrap()
         ));
     }
+    /// The documents of a Native draft for a new wallet account: the runtime advertises the
+    /// Native profile, and generation answers [`native_new_wallet`] of the fixture policy.
+    pub fn use_native_new_wallet(&mut self) {
+        self.discovery["wallets"][0]["profile"] = json!("allowit-native-v1");
+        self.discovery["wallets"][0]["kind"] = json!("owner-wallet");
+        native_new_wallet(&mut self.policy);
+    }
     pub fn install_native_existing(&mut self, owner: &str, tampered: bool) {
         let mut config = self.install_existing(owner);
         config.route = crate::WalletRoute::Native;
@@ -126,4 +133,71 @@ pub fn generated_policy_reply(policy: &Value, prompt: &Value) -> Value {
     let mut policy = policy.clone();
     policy["originalIntent"] = prompt.clone();
     json!({"selectedId":policy["id"],"policies":[policy]})
+}
+
+/// Turn a generated policy into the server's Native draft for a new wallet account: XLM, the
+/// Native route and module identity, and no account, deployment or tier until the owner's setup
+/// creates the account and its registration binds the draft. It keeps the network template's fee
+/// bound, as the server's draft does.
+pub fn native_new_wallet(policy: &mut Value) {
+    let xlm = crate::sac_address(
+        "stellar:testnet",
+        &crate::asset_from_identity("XLM", None).unwrap(),
+    )
+    .unwrap();
+    policy["mint"] = json!(xlm);
+    policy["token"] = json!("XLM");
+    let b = policy["runtime"]["instanceBinding"]
+        .as_object_mut()
+        .unwrap();
+    b.insert("asset".into(), json!(xlm));
+    b.insert("assetSymbol".into(), json!("XLM"));
+    b.insert("assetIssuer".into(), Value::Null);
+    let d = b["portable"].as_object_mut().unwrap();
+    d.insert(
+        "asset".into(),
+        json!({"address":xlm,"symbol":"XLM","decimals":7}),
+    );
+    d["params"]["tokens"] = json!({"List":[{"Addr":xlm}]});
+    let params_hash =
+        allowit_core::digest(&serde_json_canonicalizer::to_vec(&d["params"]).unwrap());
+    d.insert("paramsHash".into(), json!(params_hash));
+    native_new_wallet_keeping_asset(policy);
+}
+/// [`native_new_wallet`] in the policy's own asset: the Native route and module identity, and no
+/// account, deployment or tier.
+pub fn native_new_wallet_keeping_asset(policy: &mut Value) {
+    policy["runtime"]["wallet"] = json!({"kind":"owner-wallet","profile":"allowit-native-v1"});
+    let b = policy["runtime"]["instanceBinding"]
+        .as_object_mut()
+        .unwrap();
+    b.remove("tier");
+    for (key, value) in [
+        ("route", json!("native")),
+        ("wallet", json!("")),
+        ("deploymentId", json!("")),
+        ("template", json!(true)),
+    ] {
+        b.insert(key.into(), value);
+    }
+    let d = &b["portable"];
+    let identity = json!({"language":d["language"],"tier":d["tier"],"rules":d["rules"],"sourceHash":d["sourceHash"],"paramsHash":d["paramsHash"]});
+    b.insert(
+        "moduleDigest".into(),
+        json!(allowit_core::digest(
+            &serde_json_canonicalizer::to_vec(&identity).unwrap()
+        )),
+    );
+}
+/// The Native draft `policy` as its registration for the wallet account `wallet` binds it: it
+/// names the account and its installation, and it is no longer a draft for a new wallet.
+pub fn native_bound(policy: &Value, wallet: &str) -> Value {
+    let mut bound = policy.clone();
+    let b = bound["runtime"]["instanceBinding"].as_object_mut().unwrap();
+    b.remove("template");
+    b.insert("wallet".into(), json!(wallet));
+    b.insert("deploymentId".into(), json!("07".repeat(32)));
+    // The account's own fee bound, as the setup states it.
+    b.insert("maxFeeUnits".into(), json!(100_000));
+    bound
 }

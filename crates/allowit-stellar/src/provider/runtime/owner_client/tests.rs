@@ -1739,3 +1739,455 @@ fn a_returned_owner_wallet_policy_that_writes_state_is_refused() {
     let refused = returned(&writes).unwrap_err();
     assert_eq!(refused.message, "Returned native policy identity differs");
 }
+
+/// A Native draft for a new wallet names no account: the request names the new installation, so
+/// the server drafts for an account that the deployment creates, and no contract template is
+/// read. A reply that names an account for a new wallet is refused.
+#[test]
+#[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
+fn a_native_draft_for_a_new_wallet_names_the_new_installation_and_no_account() {
+    use super::{GenerateRequest, Target};
+    let now = wire::now();
+    let generate = |plan: wire::Plan| {
+        let prompt = plan.policy["originalIntent"].as_str().unwrap().to_owned();
+        let server = wire::Server::new(plan);
+        let mut client = OwnerClient::with_authority(
+            &authority(&server.url),
+            "http://localhost:5173",
+            &account(11),
+        )
+        .unwrap();
+        client.authenticate(&key(), now).unwrap();
+        let request = GenerateRequest {
+            prompt,
+            network: "stellar:testnet".into(),
+            profile: "allowit-native-v1".into(),
+            target: Target::NewWallet,
+            wallet_kind: None,
+        };
+        let result = client.generate(&request, now);
+        let sent = server.state.lock().unwrap().generated.clone();
+        (result, sent, server.calls("/api/native/templates"))
+    };
+    let mut plan = wire::Plan::new(&account(11));
+    plan.native_new_wallet(&account(13));
+    let (policy, sent, templates) = generate(plan);
+    let policy = policy.map_err(|e| e.message).unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["installationId"], "new");
+    assert_eq!(sent[0]["runtime"]["wallet"]["kind"], "owner-wallet");
+    assert_eq!(templates, 0);
+    let b = &policy.runtime.instance_binding;
+    assert_eq!(
+        (b.template, b.route.as_str(), b.wallet.as_str()),
+        (Some(true), "native", "")
+    );
+    // A Native draft for a new wallet cannot be activated: it has no account yet.
+    let error =
+        workflow::native_policy(policy, &account(11), &account(12), &account(13)).unwrap_err();
+    assert_eq!(error.code, 2);
+    assert!(
+        error
+            .message
+            .starts_with("This Native draft has no wallet account yet.")
+    );
+    // A reply that names an account, or a deployment, is no draft for a new wallet.
+    for (key, value) in [("wallet", account(15)), ("deploymentId", "07".repeat(32))] {
+        let mut plan = wire::Plan::new(&account(11));
+        plan.native_new_wallet(&account(13));
+        plan.policy["runtime"]["instanceBinding"][key] = json!(value);
+        let (result, _, _) = generate(plan);
+        assert_eq!(result.unwrap_err().code, 5, "{key}");
+    }
+    // A Native draft for a new wallet holds its template's asset, an issued asset too: the
+    // deployment's setup adds its trustline.
+    let mut plan = wire::Plan::new(&account(11));
+    plan.native_new_wallet(&account(13));
+    plan.policy = wire::fixture()["policy"].clone();
+    crate::test_support::server::native_new_wallet_keeping_asset(&mut plan.policy);
+    assert_eq!(plan.policy["token"], "USDC");
+    let (result, _, _) = generate(plan);
+    let policy = result.map_err(|e| e.message).unwrap();
+    let b = &policy.runtime.instance_binding;
+    assert_eq!(
+        (
+            b.template,
+            b.asset_symbol.as_str(),
+            b.asset_issuer.is_some()
+        ),
+        (Some(true), "USDC", true)
+    );
+}
+
+/// What a Native deployment test runs on: a ledger, its runtime, a journal and the request.
+struct NativeRun {
+    chain: Arc<Chain>,
+    runtime: Runtime,
+    store: Store,
+    _dir: tempfile::TempDir,
+    now: u64,
+}
+impl NativeRun {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().canonicalize().unwrap().join("proof")).unwrap();
+        let chain = Arc::new(Chain::new(native_selection().config));
+        Self {
+            runtime: Runtime::from_rpc(chain.clone()),
+            chain,
+            store,
+            _dir: dir,
+            now: wire::now(),
+        }
+    }
+    /// One deployment of `draft` against `server`, with a client of the pinned authority.
+    fn deploy(
+        &self,
+        server: &wire::Server,
+        draft: &super::GeneratedPolicy,
+        request: &SetupRequest,
+        signer: &Key,
+    ) -> crate::host::error::Result<workflow::Outcome> {
+        let mut client = OwnerClient::with_authority(
+            &authority(&server.url),
+            "http://localhost:5173",
+            &account(11),
+        )
+        .unwrap();
+        client.authenticate(&key(), self.now).unwrap();
+        let now = self.now;
+        client.deploy_native(
+            &self.runtime,
+            OwnerCapabilities {
+                store: &self.store,
+                rpc: self.chain.as_ref(),
+                signer,
+                clock: &|| Ok(now),
+            },
+            draft,
+            request,
+        )
+    }
+    fn sends(&self) -> usize {
+        self.chain
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.as_str() == "sendTransaction")
+            .count()
+    }
+}
+/// The server of a Native draft for a new wallet, with `server` as the key that it names.
+fn native_plan(server: &str) -> wire::Plan {
+    let mut plan = wire::Plan::new(&account(11));
+    plan.native_new_wallet(server);
+    plan
+}
+fn native_draft(plan: &wire::Plan) -> super::GeneratedPolicy {
+    serde_json::from_value(plan.policy.clone()).unwrap()
+}
+fn native_request(id: &str) -> SetupRequest {
+    SetupRequest {
+        network: "stellar:testnet".into(),
+        owner: account(11),
+        agent: account(12),
+        server: account(13),
+        request_id: id.into(),
+        fee_per_operation: 100,
+        asset: None,
+        funding: Some(200_000_000),
+    }
+}
+fn registrations(server: &wire::Server) -> usize {
+    server.state.lock().unwrap().registrations.len()
+}
+
+/// The deployment of a Native draft, as the app does it: the server names the roles, one owner
+/// transaction creates and funds the agent's wallet account, and the registration binds the
+/// draft to that account. The outcome selects the bound draft for activation. The same request
+/// on the same server reads the bound draft back and signs nothing.
+#[test]
+#[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
+fn a_native_draft_deploys_with_one_setup_that_binds_it_to_the_new_account() {
+    let run = NativeRun::new();
+    let plan = native_plan(&account(13));
+    let draft = native_draft(&plan);
+    let server = wire::Server::new(plan);
+    let request = native_request("deploy-native-001");
+    let signer = key();
+    let outcome = run
+        .deploy(&server, &draft, &request, &signer)
+        .map_err(|e| e.message)
+        .unwrap();
+    assert_eq!(signer.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(run.sends(), 1);
+    let created = run.chain.created.lock().unwrap().clone().unwrap().address;
+    let registered = server.state.lock().unwrap().registrations.clone();
+    assert_eq!(registered.len(), 1);
+    assert_eq!(registered[0]["policyId"], draft.id.as_str());
+    assert_eq!(registered[0]["configuration"]["wallet"], created.as_str());
+    assert_eq!(outcome.state, "installed");
+    assert_eq!(outcome.request_id, "deploy-native-001");
+    let c = &outcome.selection.config;
+    assert_eq!(c.wallet, created);
+    assert_eq!(c.route, crate::WalletRoute::Native);
+    assert_eq!(
+        (c.owner.as_str(), c.agent.as_str(), c.server.as_str()),
+        (
+            account(11).as_str(),
+            account(12).as_str(),
+            account(13).as_str()
+        )
+    );
+    let bound = &outcome.selection.policy;
+    assert_eq!(
+        (bound.id.as_str(), bound.code.as_str()),
+        (draft.id.as_str(), draft.code.as_str())
+    );
+    assert_eq!(bound.runtime.instance_binding.template, None);
+    assert_eq!(bound.runtime.instance_binding.wallet, created);
+    assert_eq!(outcome.receipts.len(), 1);
+    assert_eq!(outcome.receipts[0].action, "native_setup");
+    assert_eq!(
+        outcome.transactions,
+        [outcome.receipts[0].transaction_hash.clone()]
+    );
+    // The outcome is the selection that activation reads.
+    let read: workflow::Outcome =
+        serde_json::from_slice(&serde_json::to_vec(&outcome).unwrap()).unwrap();
+    read.selection.validate().unwrap();
+    // The same request on the same server: the server answers that the draft is installed, the
+    // journal gives the setup's receipt back, and nothing is signed, sent or registered.
+    let again = run
+        .deploy(&server, &draft, &request, &signer)
+        .map_err(|e| e.message)
+        .unwrap();
+    assert_eq!(signer.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(run.sends(), 1);
+    assert_eq!(registrations(&server), 1);
+    assert_eq!(again.selection.config.wallet, created);
+    assert_eq!(again.transactions, outcome.transactions);
+    // The same request ID never carries its setup into another draft.
+    let mut other = draft.clone();
+    other.id = "another-native-draft".into();
+    let refused = run.deploy(&server, &other, &request, &signer).unwrap_err();
+    assert_eq!(refused.code, 3);
+    assert_eq!(
+        refused.message,
+        "This request ID already deployed another draft; use a new request ID"
+    );
+    assert_eq!(registrations(&server), 1);
+    // A draft that names its account already is activated, not deployed.
+    let bound = native_draft(&{
+        let mut plan = native_plan(&account(13));
+        plan.policy = crate::test_support::server::native_bound(&plan.policy, &created);
+        plan
+    });
+    assert_eq!(
+        run.deploy(
+            &server,
+            &bound,
+            &native_request("deploy-native-002"),
+            &signer
+        )
+        .unwrap_err()
+        .code,
+        2
+    );
+    assert_eq!(signer.calls.load(Ordering::SeqCst), 1);
+}
+
+/// Nothing is signed for a server other than the pinned authority, for roles that the server
+/// names otherwise, for a draft that changed on the server after the owner's review, or under a
+/// request ID whose setup another workflow started.
+#[test]
+#[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
+fn a_native_deployment_signs_nothing_for_another_server_a_changed_draft_or_a_foreign_setup() {
+    let run = NativeRun::new();
+    let signer = key();
+    // A server key other than the client's pinned authority, before any request.
+    let plan = native_plan(&account(14));
+    let draft = native_draft(&plan);
+    let server = wire::Server::new(plan);
+    let mut request = native_request("deploy-native-101");
+    request.server = account(14);
+    let refused = run.deploy(&server, &draft, &request, &signer).unwrap_err();
+    assert_eq!(refused.code, 3, "{}", refused.message);
+    assert_eq!(
+        refused.message,
+        "Native deployment server differs from independently configured authority"
+    );
+    assert_eq!(server.calls("/api/native/deploy/prepare"), 0);
+    // The pinned authority, but the server names another server key for the account.
+    let refused = run
+        .deploy(
+            &server,
+            &draft,
+            &native_request("deploy-native-102"),
+            &signer,
+        )
+        .unwrap_err();
+    assert_eq!(refused.code, 3, "{}", refused.message);
+    assert!(refused.message.starts_with("The server named other roles"));
+    // A draft that changed on the server after the review: no preparation.
+    let mut plan = native_plan(&account(13));
+    plan.change_draft = Some(|policy| policy["revision"] = json!(2));
+    let draft = native_draft(&plan);
+    let server = wire::Server::new(plan);
+    let refused = run
+        .deploy(
+            &server,
+            &draft,
+            &native_request("deploy-native-103"),
+            &signer,
+        )
+        .unwrap_err();
+    assert_eq!(refused.code, 5);
+    assert!(
+        refused
+            .message
+            .starts_with("The draft on the server differs")
+    );
+    assert_eq!(server.calls("/api/native/deploy/prepare"), 0);
+    // A setup in another asset than the draft's: the draft holds XLM, the setup a trustline.
+    // An issued draft with a setup in XLM is refused the same way.
+    let server = wire::Server::new(native_plan(&account(13)));
+    let mut request = native_request("deploy-native-104");
+    request.asset = Some(crate::owner::Trustline {
+        code: "USDC".into(),
+        issuer: account(15),
+    });
+    let mut issued = native_plan(&account(13));
+    issued.policy = wire::fixture()["policy"].clone();
+    crate::test_support::server::native_new_wallet_keeping_asset(&mut issued.policy);
+    for (draft, request) in [
+        (native_draft(&native_plan(&account(13))), request),
+        (native_draft(&issued), native_request("deploy-native-105")),
+    ] {
+        let refused = run.deploy(&server, &draft, &request, &signer).unwrap_err();
+        assert_eq!(refused.code, 2, "{}", refused.message);
+        assert_eq!(
+            refused.message,
+            "The setup's asset differs from the draft's asset; nothing was signed"
+        );
+    }
+    assert_eq!(server.calls("/api/native/deploy/prepare"), 0);
+    // A request ID whose setup a plain wallet setup made: the deployment does not adopt it.
+    let setup = native_request("setup-shared-0001");
+    workflow::configure_native(&run.runtime, &run.store, &setup, &key(), &|| Ok(run.now)).unwrap();
+    let sent = run.sends();
+    let server = wire::Server::new(native_plan(&account(13)));
+    let refused = run
+        .deploy(
+            &server,
+            &native_draft(&native_plan(&account(13))),
+            &setup,
+            &signer,
+        )
+        .unwrap_err();
+    assert_eq!(
+        refused.message,
+        "This request ID belongs to another wallet setup; use a new request ID"
+    );
+    assert_eq!(registrations(&server), 0);
+    assert_eq!(run.sends(), sent);
+    assert_eq!(signer.calls.load(Ordering::SeqCst), 0);
+}
+
+/// A lost registration reply is uncertain, and the same request then reads the binding back. A
+/// journal setup that never signed is not completed once the server holds the draft bound. The
+/// bound draft must name the account and the fee bound of this deployment.
+#[test]
+#[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
+fn a_native_deployment_resumes_without_a_second_setup_and_checks_what_the_server_bound() {
+    let signer = key();
+    // The registration's reply is lost after the server recorded it.
+    let run = NativeRun::new();
+    let mut plan = native_plan(&account(13));
+    plan.lose_registration = true;
+    let draft = native_draft(&plan);
+    let server = wire::Server::new(plan);
+    let request = native_request("deploy-native-201");
+    let lost = run.deploy(&server, &draft, &request, &signer).unwrap_err();
+    assert_eq!(lost.code, 5, "{}", lost.message);
+    assert!(
+        lost.message.contains("registration of it is unknown"),
+        "{}",
+        lost.message
+    );
+    assert_eq!((signer.calls.load(Ordering::SeqCst), run.sends()), (1, 1));
+    let resumed = run
+        .deploy(&server, &draft, &request, &signer)
+        .map_err(|e| e.message)
+        .unwrap();
+    assert_eq!((signer.calls.load(Ordering::SeqCst), run.sends()), (1, 1));
+    assert_eq!(registrations(&server), 1);
+    assert_eq!(resumed.receipts.len(), 1);
+    // A setup that stopped before its signature, while the app bound the draft to an account:
+    // the deployment signs and sends nothing.
+    let run = NativeRun::new();
+    let plan = native_plan(&account(13));
+    let draft = native_draft(&plan);
+    let server = wire::Server::new(plan);
+    let request = native_request("deploy-native-202");
+    let failing = Key {
+        calls: AtomicUsize::new(0),
+        bad: true,
+        before: None,
+    };
+    assert!(run.deploy(&server, &draft, &request, &failing).is_err());
+    let unsigned: Value = run.store.load(&request.request_id).unwrap().unwrap();
+    assert!(unsigned["signedXdr"].is_null());
+    server.state.lock().unwrap().registrations.push(json!({
+        "policyId": draft.id,
+        "configuration": {"wallet": account(16), "agent": account(12), "network": "stellar:testnet"},
+    }));
+    let sent = run.sends();
+    let calls = key();
+    let _ = run.deploy(&server, &draft, &request, &calls);
+    assert_eq!(calls.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(run.sends(), sent);
+    // The preparation names another account than the one that the draft is bound to.
+    let run = NativeRun::new();
+    let mut plan = native_plan(&account(13));
+    plan.prepare_wallet = Some(account(16));
+    let draft = native_draft(&plan);
+    let server = wire::Server::new(plan);
+    let request = native_request("deploy-native-203");
+    run.deploy(&server, &draft, &request, &key())
+        .map_err(|e| e.message)
+        .unwrap();
+    let refused = run.deploy(&server, &draft, &request, &key()).unwrap_err();
+    assert_eq!(refused.code, 5);
+    assert!(
+        refused
+            .message
+            .starts_with("The server bound the draft to another"),
+        "{}",
+        refused.message
+    );
+    // The bound draft names another fee bound than the registered account.
+    let run = NativeRun::new();
+    let mut plan = native_plan(&account(13));
+    plan.change_bound =
+        Some(|policy| policy["runtime"]["instanceBinding"]["maxFeeUnits"] = json!(1_000_000));
+    let draft = native_draft(&plan);
+    let server = wire::Server::new(plan);
+    let refused = run
+        .deploy(
+            &server,
+            &draft,
+            &native_request("deploy-native-204"),
+            &key(),
+        )
+        .unwrap_err();
+    assert_eq!(refused.code, 5);
+    assert!(
+        refused
+            .message
+            .starts_with("The server bound the draft to another"),
+        "{}",
+        refused.message
+    );
+}

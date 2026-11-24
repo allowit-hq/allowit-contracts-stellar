@@ -170,7 +170,7 @@ fn signer_operation(wallet: &str, key: [u8; 32], weight: u32) -> Result<Operatio
     })
 }
 fn operation_count(v: &NativeSetup) -> u32 {
-    4 + u32::from(v.trustline.is_some()) + u32::from(v.funding.is_some())
+    SETUP_OPERATIONS + u32::from(v.trustline.is_some()) + u32::from(v.funding.is_some())
 }
 /// The funding of a setup in its trustline's asset, in base units.
 fn asset_funding(v: &NativeSetup) -> Result<Option<i64>> {
@@ -781,6 +781,11 @@ fn service_json(url: &str) -> Result<serde_json::Value> {
     }
     serde_json::from_slice(&response.body).map_err(|_| "Invalid Stellar service response".into())
 }
+
+/// The operations of a Native setup transaction without a trustline: the account's creation, the
+/// owner's and the agent's signers, and the server's signer with the thresholds. A trustline
+/// adds one, and the funding of an issued asset one more.
+pub const SETUP_OPERATIONS: u32 = 4;
 
 #[cfg(test)]
 mod tests {

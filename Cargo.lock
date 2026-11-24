@@ -75,10 +75,18 @@ dependencies = [
 name = "allowit-policy-wallet"
 version = "0.4.0"
 dependencies = [
+ "allowit-sep56-priced-test-vault",
  "allowit-sep56-test-vault",
  "allowit-stellar-policy",
  "allowit-wallet-protocol",
  "ed25519-dalek",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "allowit-sep56-priced-test-vault"
+version = "0.4.0"
+dependencies = [
  "soroban-sdk",
 ]
 

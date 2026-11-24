@@ -16,6 +16,10 @@
 //! and no liquidity pool, so a best path pays this price or more. Prices are units of `to` for
 //! each unit of `from`, scaled by [`SCALE`]. Every classic asset has seven decimals, so the
 //! ratio of base units is the ratio of display units.
+//!
+//! When `from` is a SEP-56 vault, selling its shares is a redeem, and the vault itself names the
+//! price: [`observe_vault`] reads the vault's own `preview_redeem` with read-only simulations on
+//! Stellar RPC. The price is then what one share pays in the vault's asset.
 use super::{token_contract, tokens_for};
 use crate as native;
 use serde_json::{Value, json};
@@ -120,21 +124,54 @@ pub struct Observation {
     /// Volume-weighted average price of the recent trades. Zero without one.
     pub trade_average: i128,
     pub trades: u32,
-    /// Close time of the newest ledger that Horizon ingested.
+    /// Close time of the newest ledger that Horizon ingested, or that RPC read for a vault.
     pub observed_at: u64,
     pub source: String,
+    /// The facts of a vault observation; `None` for an order book.
+    pub vault: Option<VaultFacts>,
+}
+
+/// What a vault observation adds: the vault's asset, its share decimals, the share units that
+/// the price is for, and the position of a holder when the host asks for one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VaultFacts {
+    /// The contract id of the vault's asset.
+    pub asset: String,
+    /// The asset's code when this rail lists it, such as `XLM`.
+    pub asset_code: Option<String>,
+    pub share_decimals: u32,
+    /// The share units that `price` and `paid` are for.
+    pub shares: i128,
+    /// What redeeming `shares` pays now, in asset base units.
+    pub paid: i128,
+    /// The holder's share units and what redeeming them pays now.
+    pub held: Option<(i128, i128)>,
 }
 
 impl Observation {
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut out = json!({
             "price": self.price.to_string(),
             "depth": self.depth.to_string(),
             "tradeAverage": self.trade_average.to_string(),
             "trades": self.trades,
             "observedAt": self.observed_at,
             "source": self.source,
-        })
+        });
+        if let Some(v) = &self.vault {
+            out["vault"] = json!({
+                "asset": v.asset,
+                "assetCode": v.asset_code,
+                "shareDecimals": v.share_decimals,
+                "shares": v.shares.to_string(),
+                "paid": v.paid.to_string(),
+            });
+            if let Some((held, value)) = v.held {
+                out["vault"]["held"] = held.to_string().into();
+                out["vault"]["heldValue"] = value.to_string().into();
+            }
+        }
+        out
     }
 }
 
@@ -317,6 +354,153 @@ pub fn observe(
         trades: count,
         observed_at,
         source: format!("{} ledger {ledger}", horizon.host()),
+        vault: None,
+    })
+}
+
+/// The public Stellar RPC of a network. Mainnet has no public endpoint of the network's own;
+/// a host names one in its facts.
+fn public_rpc(network: &str) -> Result<&'static str, String> {
+    match network {
+        "stellar:testnet" => Ok("https://soroban-testnet.stellar.org"),
+        _ => Err(format!(
+            "no public Stellar RPC is known for {network}; the host names one as `rpc`"
+        )),
+    }
+}
+
+/// Whether `asset` names a contract that is not the asset contract of a classic asset that this
+/// rail knows: a vault, for this function.
+pub fn is_vault(network: &str, asset: &str) -> bool {
+    stellar_strkey::Contract::from_string(asset).is_ok() && classic(network, asset).is_err()
+}
+
+/// One value that a read-only simulation of `function` on `vault` returns.
+fn vault_read(
+    rpc: &dyn crate::rpc::Rpc,
+    network: &str,
+    vault: &str,
+    function: &str,
+    args: Vec<stellar_xdr::ScVal>,
+) -> Result<(stellar_xdr::ScVal, u32), String> {
+    crate::rpc::contract_read(rpc, network, vault, function, args)
+        .map_err(|e| format!("The vault {vault} gave no {function}: {e}"))
+}
+
+/// Observe what redeeming `shares` share units of the SEP-56 vault `vault` pays now, with the
+/// vault's own `preview_redeem`; without `shares`, one whole share. `to`, when given, must be the
+/// vault's asset. With `holder`, the observation adds the holder's shares and what they pay.
+/// The vault fills any amount at its one price, so the depth is the whole amount when the price
+/// is inside the band. A vault has no trades. The price is what one share pays in display
+/// units, scaled by [`SCALE`].
+pub fn observe_vault(
+    rpc: &dyn crate::rpc::Rpc,
+    network: &str,
+    vault: &str,
+    to: Option<&str>,
+    shares: Option<i128>,
+    band: Band,
+    holder: Option<&str>,
+) -> Result<Observation, String> {
+    use stellar_xdr::ScVal;
+    let (asset, _) = vault_read(rpc, network, vault, "query_asset", vec![])?;
+    let ScVal::Address(asset) = asset else {
+        return Err(format!("The vault {vault} names no asset"));
+    };
+    let asset = native::address_text(&asset)?;
+    let listed = |code: &str| {
+        let classic = classic(network, code).ok()?;
+        let identity = match &classic.issuer {
+            None => native::Asset::Native,
+            Some(issuer) => native::asset_from_identity(&classic.code, Some(issuer)).ok()?,
+        };
+        Some((classic.code, native::sac_address(network, &identity).ok()?))
+    };
+    if let Some(to) = to {
+        let (_, expected) =
+            listed(to).ok_or_else(|| format!("{to} names no asset of this rail"))?;
+        if expected != asset {
+            return Err(format!("The vault {vault} holds {asset}, not {to}"));
+        }
+    }
+    let asset_code = listed(&asset).map(|(code, _)| code);
+    let (decimals, _) = vault_read(rpc, network, vault, "decimals", vec![])?;
+    let share_decimals = match decimals {
+        ScVal::U32(d) if d <= 18 => d,
+        _ => return Err(format!("The vault {vault} names no share decimals")),
+    };
+    let one = 10i128.pow(share_decimals);
+    let shares = shares.unwrap_or(one);
+    if shares <= 0 {
+        return Err("A price observation needs a positive amount".into());
+    }
+    let value = |units: i128| -> Result<(i128, u32), String> {
+        let (paid, ledger) = vault_read(
+            rpc,
+            network,
+            vault,
+            "preview_redeem",
+            vec![native::i128_value(units)],
+        )?;
+        let paid = native::rpc::wide(&paid)?;
+        if paid < 0 {
+            return Err(format!("The vault {vault} values its shares below zero"));
+        }
+        Ok((paid, ledger))
+    };
+    let (paid, ledger) = value(shares)?;
+    // What one share pays, in display units: the asset has seven decimals, as every Stellar asset
+    // contract does, and a share has the vault's decimals.
+    let price = scaled(paid, one, shares)?;
+    let inside = match band {
+        Some((expected, slip)) => {
+            let slip = i128::from(slip.min(10_000));
+            let at = |points: i128| expected.checked_mul(points);
+            matches!(
+                (price.checked_mul(10_000), at(10_000 - slip), at(10_000 + slip)),
+                (Some(p), Some(floor), Some(ceiling)) if p >= floor && p <= ceiling
+            )
+        }
+        None => true,
+    };
+    let held = match holder {
+        Some(holder) => {
+            let (balance, _) = vault_read(
+                rpc,
+                network,
+                vault,
+                "balance",
+                vec![ScVal::Address(native::address(holder)?)],
+            )?;
+            let held = native::rpc::wide(&balance)?;
+            let worth = if held > 0 { value(held)?.0 } else { 0 };
+            Some((held, worth))
+        }
+        None => None,
+    };
+    let head = rpc
+        .call("getLatestLedger", json!({}))
+        .map_err(|e| format!("Stellar RPC gave no ledger time: {e}"))?;
+    let observed_at = head["closeTime"]
+        .as_str()
+        .and_then(|t| t.parse().ok())
+        .or_else(|| head["closeTime"].as_u64())
+        .ok_or("Stellar RPC gave no ledger time")?;
+    Ok(Observation {
+        price,
+        depth: if inside { shares } else { 0 },
+        trade_average: 0,
+        trades: 0,
+        observed_at,
+        source: format!("{vault} preview_redeem at ledger {ledger}"),
+        vault: Some(VaultFacts {
+            asset,
+            asset_code,
+            share_decimals,
+            shares,
+            paid,
+            held,
+        }),
     })
 }
 
@@ -363,6 +547,8 @@ impl Horizon for Public {
 /// The evidence function. `args` are `{"network", "from", "to", "amount"}` and, when the host
 /// states its band, `"price"` and `"slip"`. Amounts and prices are decimal text. `facts` are
 /// the host's own: its `network` is the network that the policy runs for, and it decides.
+/// When `from` is a SEP-56 vault, `to` and `amount` (share units) are optional, `"holder"` asks
+/// for that holder's position, and the host may name its Stellar RPC as `facts.rpc`.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn price(args: &Value, facts: &Value) -> Result<Value, String> {
     let text = |name: &str| {
@@ -377,9 +563,6 @@ pub fn price(args: &Value, facts: &Value) -> Result<Value, String> {
         (Some(network), _) | (None, Some(network)) => network,
         (None, None) => return Err("A price observation needs `network`".into()),
     };
-    let amount: i128 = text("amount")?
-        .parse()
-        .map_err(|_| "A price observation needs a decimal `amount`")?;
     let band = match (args["price"].as_str(), args["slip"].as_u64()) {
         (Some(price), Some(slip)) => Some((
             price
@@ -394,12 +577,42 @@ pub fn price(args: &Value, facts: &Value) -> Result<Value, String> {
         )),
         _ => None,
     };
+    let amount = |required: bool| -> Result<Option<i128>, String> {
+        match args["amount"].as_str() {
+            Some(text) => text
+                .parse()
+                .map(Some)
+                .map_err(|_| "A price observation needs a decimal `amount`".into()),
+            None if required => Err("A price observation needs `amount`".into()),
+            None => Ok(None),
+        }
+    };
+    let from = text("from")?;
+    if is_vault(network, from) {
+        // A vault: `to` and `amount` are optional, `holder` asks for a position, and the host
+        // may name its own Stellar RPC.
+        let endpoint = match facts["rpc"].as_str() {
+            Some(endpoint) => endpoint,
+            None => public_rpc(network)?,
+        };
+        let rpc = crate::rpc::HttpRpc::new(endpoint)?;
+        let observed = observe_vault(
+            &rpc,
+            network,
+            from,
+            args["to"].as_str(),
+            amount(false)?,
+            band,
+            args["holder"].as_str(),
+        )?;
+        return Ok(observed.to_json());
+    }
     let observed = observe(
         &Public(horizon(network)?),
         network,
-        text("from")?,
+        from,
         text("to")?,
-        amount,
+        amount(true)?.unwrap_or_default(),
         band,
     )?;
     Ok(observed.to_json())
@@ -733,5 +946,171 @@ mod tests {
             .is_err()
         );
         assert!(horizon("stellar:futurenet").is_err());
+    }
+
+    /// A Stellar RPC that answers read-only simulations of a priced SEP-56 vault: each function
+    /// by name, with the shares worth `price` asset units for each whole share.
+    struct VaultRpc {
+        asset: String,
+        price: i128,
+        held: i128,
+        auth: bool,
+        restore: bool,
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+    impl VaultRpc {
+        fn new(price: i128) -> Self {
+            Self {
+                asset: native::sac_address(NETWORK, &native::Asset::Native).unwrap(),
+                price,
+                held: 0,
+                auth: false,
+                restore: false,
+                asked: Default::default(),
+            }
+        }
+    }
+    impl crate::rpc::Rpc for VaultRpc {
+        fn call(&self, method: &str, params: Value) -> native::Result<Value> {
+            use stellar_xdr::{HostFunction, OperationBody, ScVal, TransactionEnvelope};
+            match method {
+                "getNetwork" => Ok(json!({"passphrase": native::passphrase(NETWORK)?})),
+                "getLatestLedger" => Ok(json!({"sequence": 101, "closeTime": "1795003303"})),
+                "simulateTransaction" => {
+                    let TransactionEnvelope::Tx(envelope) =
+                        native::read(params["transaction"].as_str().unwrap())?
+                    else {
+                        panic!("a version 1 envelope");
+                    };
+                    assert_eq!(
+                        envelope.tx.source_account,
+                        native::muxed(crate::rpc::NULL_ACCOUNT).unwrap()
+                    );
+                    let OperationBody::InvokeHostFunction(op) = &envelope.tx.operations[0].body
+                    else {
+                        panic!("one contract call");
+                    };
+                    let HostFunction::InvokeContract(call) = &op.host_function else {
+                        panic!("one contract call");
+                    };
+                    let function = String::from_utf8(call.function_name.0.to_vec()).unwrap();
+                    self.asked.lock().unwrap().push(function.clone());
+                    let units = |v: &ScVal| native::rpc::wide(v).unwrap();
+                    let value = match function.as_str() {
+                        "query_asset" => ScVal::Address(native::address(&self.asset)?),
+                        "decimals" => ScVal::U32(7),
+                        "preview_redeem" => {
+                            native::i128_value(units(&call.args[0]) * self.price / SCALE)
+                        }
+                        "balance" => native::i128_value(self.held),
+                        other => panic!("unexpected read {other}"),
+                    };
+                    let auth: Vec<String> = if self.auth {
+                        vec!["AAAA".into()]
+                    } else {
+                        vec![]
+                    };
+                    let mut reply = json!({
+                        "latestLedger": 100,
+                        "results": [{"auth": auth, "xdr": native::xdr(&value)?}],
+                    });
+                    if self.restore {
+                        reply["restorePreamble"] = json!({"transactionData": "AAAA"});
+                    }
+                    Ok(reply)
+                }
+                other => panic!("unexpected RPC method {other}"),
+            }
+        }
+    }
+    fn vault_id() -> String {
+        stellar_strkey::Contract([7; 32]).to_string()
+    }
+
+    #[test]
+    fn a_vault_names_what_one_share_pays_now() {
+        let rpc = VaultRpc::new(9_400_000);
+        let seen =
+            observe_vault(&rpc, NETWORK, &vault_id(), Some("native"), None, None, None).unwrap();
+        assert_eq!((seen.price, seen.depth, seen.trades), (9_400_000, SCALE, 0));
+        assert_eq!(seen.observed_at, 1_795_003_303);
+        let v = seen.vault.clone().unwrap();
+        assert_eq!(
+            (v.share_decimals, v.shares, v.paid, v.held),
+            (7, SCALE, 9_400_000, None)
+        );
+        assert_eq!(
+            (v.asset, v.asset_code.as_deref()),
+            (rpc.asset.clone(), Some("XLM"))
+        );
+        let out = seen.to_json();
+        assert_eq!(out["price"], "9400000");
+        assert_eq!(out["vault"]["assetCode"], "XLM");
+        assert!(out["vault"].get("held").is_none());
+        assert!(is_vault(NETWORK, &vault_id()));
+        assert!(!is_vault(NETWORK, &rpc.asset));
+        assert!(!is_vault(NETWORK, "native"));
+    }
+
+    #[test]
+    fn a_vault_values_a_holders_position_and_a_given_amount() {
+        let mut rpc = VaultRpc::new(9_600_000);
+        rpc.held = 1_000_000_000;
+        let holder = stellar_strkey::ed25519::PublicKey([3; 32]).to_string();
+        let seen = observe_vault(
+            &rpc,
+            NETWORK,
+            &vault_id(),
+            None,
+            Some(5 * SCALE),
+            None,
+            Some(&holder),
+        )
+        .unwrap();
+        let v = seen.vault.unwrap();
+        assert_eq!(
+            (seen.price, v.shares, v.paid),
+            (9_600_000, 5 * SCALE, 48_000_000)
+        );
+        assert_eq!(v.held, Some((1_000_000_000, 960_000_000)));
+        assert_eq!(
+            rpc.asked.lock().unwrap().as_slice(),
+            [
+                "query_asset",
+                "decimals",
+                "preview_redeem",
+                "balance",
+                "preview_redeem"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_vault_price_inside_the_band_has_depth_and_one_outside_has_none() {
+        let rpc = VaultRpc::new(9_400_000);
+        let observe = |band| observe_vault(&rpc, NETWORK, &vault_id(), None, None, band, None);
+        // Expected 1.0 within 5%: 0.94 is outside; within 6%, inside.
+        assert_eq!(observe(Some((SCALE, 500))).unwrap().depth, 0);
+        assert_eq!(observe(Some((SCALE, 600))).unwrap().depth, SCALE);
+    }
+
+    #[test]
+    fn a_vault_read_that_differs_or_asks_for_more_is_refused() {
+        // A vault of another asset than `to`.
+        let rpc = VaultRpc::new(SCALE);
+        let usdc = observe_vault(&rpc, NETWORK, &vault_id(), Some(USDC), None, None, None);
+        assert!(usdc.unwrap_err().contains("not USDC:"));
+        // A read that asks for an authorization, or one that needs a restoration.
+        let mut rpc = VaultRpc::new(SCALE);
+        rpc.auth = true;
+        assert!(observe_vault(&rpc, NETWORK, &vault_id(), None, None, None, None).is_err());
+        let mut rpc = VaultRpc::new(SCALE);
+        rpc.restore = true;
+        assert!(observe_vault(&rpc, NETWORK, &vault_id(), None, None, None, None).is_err());
+        // No shares to value.
+        let rpc = VaultRpc::new(SCALE);
+        assert!(observe_vault(&rpc, NETWORK, &vault_id(), None, Some(0), None, None).is_err());
+        // Mainnet has no public RPC: the host names one.
+        assert!(public_rpc("stellar:pubnet").is_err());
     }
 }
