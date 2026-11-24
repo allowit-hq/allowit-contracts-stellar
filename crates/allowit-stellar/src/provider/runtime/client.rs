@@ -113,10 +113,6 @@ fn validate_portable_profile(bundle: &Bundle) -> Result<()> {
             "The portable Stellar profile is missing its source binding",
         ));
     };
-    let shape = crate::provider::source_shape(
-        bundle.config.route == WalletRoute::Native,
-        &bundle.config.policy_source,
-    )?;
     let params_hash = crate::host::authoring::canonical_digest(&portable.params)?;
     if bundle.language.as_deref() != Some("allowit-portable-v1")
         || portable.language != "allowit-portable-v1"
@@ -127,8 +123,13 @@ fn validate_portable_profile(bundle: &Bundle) -> Result<()> {
         || portable.asset.symbol != bundle.config.asset_symbol
         || portable.asset.decimals != 7
         || !portable.unresolved.is_empty()
-        || portable.build.prefix != shape.prefix
-        || portable.build.writes_state != shape.writes_state
+        || !crate::provider::report_matches(
+            bundle.config.route == WalletRoute::Native,
+            bundle.config.tier == Some(crate::PolicyTier::Custom),
+            &bundle.config.policy_source,
+            &portable.build.prefix,
+            portable.build.writes_state,
+        )?
     {
         return Err(Error::config(
             "The portable Stellar descriptor differs from its installed configuration",
@@ -934,21 +935,18 @@ impl Client {
         }
         Ok(())
     }
-    /// Whether the engine released the retained policy wallet operation and this client's own
-    /// RPC proves that it lapsed without executing. Without independent RPC, a retained
-    /// preparation or the proof, the operation stays `submissionUnknown`.
+    /// Whether the engine released the retained payment authorization and this client's own RPC
+    /// proves that it lapsed unsettled. A policy wallet operation that the engine released
+    /// without a receipt stays `submissionUnknown` here: this client decides no outcome from a
+    /// lapse of it. Without independent RPC, a retained preparation or the proof, the operation
+    /// stays `submissionUnknown`.
     fn proven_release(&self, r: &Response, record: Option<&Record>) -> bool {
         r.released
+            && r.prepared.payment_authorization.is_some()
             && record.and_then(|v| v.prepared.as_ref()) == Some(&r.prepared)
             && !self.rpc_url.is_empty()
             && sdk::rpc::HttpRpc::new(&self.rpc_url)
-                .and_then(|rpc| {
-                    if r.prepared.payment_authorization.is_some() {
-                        sdk::seller_settled::lapsed(&rpc, &r.prepared)
-                    } else {
-                        sdk::rpc::operation_lapsed(&rpc, &r.prepared)
-                    }
-                })
+                .and_then(|rpc| sdk::seller_settled::lapsed(&rpc, &r.prepared))
                 .unwrap_or(false)
     }
 }
@@ -987,9 +985,11 @@ pub fn status(c: &Client, journal: &Store, id: &str, wait: Duration) -> Result<E
 ///
 /// `wait` bounds only the engine status reads after the submit answer. Prepare and submit each
 /// wait up to [`ENGINE_TIMEOUT`] for the engine: a submit that stops early leaves its outcome
-/// unknown, so no caller bound ends it. A status answer that reports a released policy wallet
-/// operation also starts the lapse proof on the caller's RPC, which keeps its own timeouts and
-/// runs to its end, because a half-read proof decides nothing.
+/// unknown, so no caller bound ends it. A status answer that reports a released payment
+/// authorization also starts the lapse proof on the caller's RPC, which keeps its own timeouts
+/// and runs to its end, because a half-read proof decides nothing. A policy wallet operation
+/// that the engine released without a receipt stays `submissionUnknown`: the client decides no
+/// outcome from its lapse.
 pub fn exec(
     c: &Client,
     journal: &Store,
@@ -3184,8 +3184,8 @@ mod native_revalidation_tests {
     ) -> impl Fn(&str, &serde_json::Value) -> serde_json::Value + Send + 'static {
         lapse_rpc_spent(transaction, entries_ledger, false)
     }
-    /// The lapse reads: the transaction, then the wallet's nonce entry, present when `spent`,
-    /// and the network's minimum temporary lifetime of 720 ledgers.
+    /// The lapse reads: the transaction, with the history from ledger 100 unless it names its
+    /// own, then the wallet's events, which hold an execution of the operation when `spent`.
     fn lapse_rpc_spent(
         transaction: serde_json::Value,
         entries_ledger: u64,
@@ -3197,7 +3197,27 @@ mod native_revalidation_tests {
         };
         let calls = fixture()["calls"].as_array().unwrap().clone();
         move |method, params| match method {
-            "getTransaction" => transaction.clone(),
+            "getTransaction" => {
+                let mut reply = transaction.clone();
+                if reply.get("oldestLedger").is_none() {
+                    reply["oldestLedger"] = json!(100);
+                }
+                reply
+            }
+            "getEvents" => {
+                let events = if spent {
+                    json!([{"txHash": sdk::hex(&[0xee; 32]), "ledger": 130}])
+                } else {
+                    json!([])
+                };
+                // One page scans every ledger up to the head.
+                let cursor = format!(
+                    "{:019}-{:010}",
+                    (entries_ledger << 32) | 0xffff_ffff,
+                    u32::MAX
+                );
+                json!({"events": events, "latestLedger": entries_ledger, "cursor": cursor})
+            }
             "getLatestLedger" => json!({"sequence":130}),
             "getLedgerEntries" if params["keys"].as_array().unwrap().len() == 2 => {
                 let mut entries = vec![];
@@ -3244,7 +3264,7 @@ mod native_revalidation_tests {
     }
     #[test]
     #[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
-    fn released_operation_fails_only_with_an_independent_lapse_proof() {
+    fn a_released_policy_wallet_operation_stays_unknown_in_the_client() {
         // Common R4.1 on testnet: the engine released the expired operation as `failed`
         // without a receipt, and the CLI reported `submissionUnknown`.
         let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
@@ -3284,7 +3304,8 @@ mod native_revalidation_tests {
             paid_service: None,
             rpc_url: None,
         };
-        assert!(client.proven_release(&r, Some(&record)));
+        // The client decides no outcome of a released policy wallet operation from a lapse.
+        assert!(!client.proven_release(&r, Some(&record)));
         record.prepared = None;
         assert!(!client.proven_release(&r, Some(&record)));
         assert!(!client.proven_release(&r, None));
@@ -3297,8 +3318,8 @@ mod native_revalidation_tests {
         unreleased.rpc_url.clear();
         assert!(!unreleased.proven_release(&submitted, Some(&record)));
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        let methods = server.join().unwrap();
-        assert_eq!(methods[0], "getTransaction");
+        // The client read no lapse.
+        assert!(server.join().unwrap().is_empty());
 
         for (transaction, entries_ledger, packet, lapsed) in [
             (not_found.clone(), 185, &p, true),
@@ -3308,16 +3329,15 @@ mod native_revalidation_tests {
                 &p,
                 true,
             ),
-            // At the expiration ledger of the wallet's authorization it can still run.
+            // A ledger closed at or after the expiry, and no execution in the history.
             (
                 json!({"status":"NOT_FOUND","latestLedger":184,"latestLedgerCloseTime":"86700"}),
                 184,
                 &p,
-                false,
+                true,
             ),
-            // Past the lifetime that a spent nonce is sure to have, its absence proves nothing.
             (not_found.clone(), 184 - 64 + 720 - 1, &p, true),
-            (not_found.clone(), 184 - 64 + 720, &p, false),
+            (not_found.clone(), 184 - 64 + 720, &p, true),
             // The closing ledger precedes the expiry: the wallet can still execute it.
             (
                 json!({"status":"NOT_FOUND","latestLedger":130,"latestLedgerCloseTime":"86699"}),
@@ -3344,8 +3364,7 @@ mod native_revalidation_tests {
             server.join().unwrap();
             assert_eq!(result, Ok(lapsed), "{transaction} at {entries_ledger}");
         }
-        // A sealed transaction has another hash than the prepared one, so a prepared hash that
-        // the network does not know proves nothing: the spent nonce shows that the operation ran.
+        // An execution in the wallet's events, in any envelope: no lapse.
         let (rpc, stop, server) = rpc_server(lapse_rpc_spent(not_found.clone(), 185, true));
         let result = sdk::rpc::operation_lapsed(&sdk::rpc::HttpRpc::new(&rpc).unwrap(), &p);
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -3354,7 +3373,7 @@ mod native_revalidation_tests {
     }
     #[test]
     #[cfg_attr(not(feature = "e2e"), ignore = "end-to-end: run with --features e2e")]
-    fn proven_failure_stays_failed_after_the_nonce_moves_or_rpc_fails() {
+    fn a_retained_proof_stays_failed_after_the_nonce_moves_or_rpc_fails() {
         // Codex P2 on PR #45: poll journaled only `failed`, so a later status query that could
         // not repeat the lapse proof overwrote the terminal failure with `submissionUnknown`.
         let p: PreparedOperation = serde_json::from_value(fixture()["prepared"].clone()).unwrap();
@@ -3386,17 +3405,16 @@ mod native_revalidation_tests {
         client.settle(&mut r, Some(&record)).unwrap();
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         server.join().unwrap();
-        assert_eq!(r.operation.status, OperationStatus::Failed);
-        journal
-            .save(
-                "released",
-                &journaled(&client, "released-001", Some(record), &r),
-            )
-            .unwrap();
+        // The client proves no lapse of a policy wallet operation itself.
+        assert_eq!(r.operation.status, OperationStatus::SubmissionUnknown);
+        // A journal that an earlier client wrote with its own proof keeps it final.
+        let mut proven = journaled(&client, "released-001", Some(record), &r);
+        proven.lapsed = true;
+        journal.save("released", &proven).unwrap();
 
-        // A node that answers before the authorization's expiration ledger proves no lapse.
+        // A node whose last ledger closed before the expiry proves no lapse.
         let early =
-            json!({"status":"NOT_FOUND","latestLedger":150,"latestLedgerCloseTime":"86700"});
+            json!({"status":"NOT_FOUND","latestLedger":150,"latestLedgerCloseTime":"86699"});
         let (moved, stop, server) = rpc_server(lapse_rpc(early, 130));
         assert_eq!(
             sdk::rpc::operation_lapsed(&sdk::rpc::HttpRpc::new(&moved).unwrap(), &p),
@@ -3472,6 +3490,7 @@ mod native_revalidation_tests {
             envelope_xdr: signed.transaction_xdr.clone(),
             result_xdr: result.to_xdr_base64(Limits::none()).unwrap(),
             settles: None,
+            closed_at: None,
         };
         sdk::rpc::validate_settled_policy_packet(&signed, &receipt).unwrap();
         let body = serde_json::to_vec(&json!({"prepared":signed.prepared,"signedOperation":signed,"operation":{"id":"wire-status-001","status":OperationStatus::SubmissionUnknown,"transactionHash":sdk::hex(&receipt.transaction_hash)},"receipt":receipt})).unwrap();

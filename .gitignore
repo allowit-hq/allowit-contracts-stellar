@@ -16,3 +16,6 @@ __pycache__/
 
 package-lock.json
 npm-shrinkwrap.json
+
+# Output of the mutation run (.cargo/mutants.toml).
+/mutants.out*/

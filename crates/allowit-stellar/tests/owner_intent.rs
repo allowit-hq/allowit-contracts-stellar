@@ -231,8 +231,16 @@ fn deployer() -> String {
 }
 /// The owner's one creation through the deployer, with one funding transfer.
 fn create(tier: PolicyTier) -> (OwnerTransaction, ExpectedOwnerIntent) {
+    create_with(tier, |_| {})
+}
+/// A creation of a wallet whose configuration `edit` changed before the packet was built.
+fn create_with(
+    tier: PolicyTier,
+    edit: impl FnOnce(&mut WalletConfig),
+) -> (OwnerTransaction, ExpectedOwnerIntent) {
     let salt = [8; 32];
-    let c = config(tier, &salt);
+    let mut c = config(tier, &salt);
+    edit(&mut c);
     // `AllowitPolicyConfig`: the agent and server keys raw, the owner's source hash and the
     // gas cap; the fixture's own encoder is the contract's field order.
     let raw_key = |account: &str| bytes(&allowit_stellar::account_key(account).unwrap());
@@ -377,6 +385,7 @@ fn native() -> (OwnerTransaction, ExpectedOwnerIntent) {
             fee_per_operation: 100,
             starting_balance: None,
             trustline: None,
+            funding: None,
         },
         NOW,
     )
@@ -396,6 +405,7 @@ fn native() -> (OwnerTransaction, ExpectedOwnerIntent) {
                 wallet: account(15),
                 starting_balance: None,
                 trustline: None,
+                funding: None,
                 agent: account(12),
                 engine: account(13),
                 request_id: "intent-fixture-001".into(),
@@ -848,7 +858,7 @@ fn native_setup_rebuilds_exact_roles_thresholds_and_request_identity() {
     assert_refused(&packet, &changed, "native fee overflow");
 }
 /// A retained setup packet of an earlier release configured the owner's own account with three
-/// operations. It stays readable as history, and no intent signs it.
+/// operations. It stays readable as history, and the Rust owner-intent signer refuses it.
 #[test]
 fn a_retained_setup_of_an_earlier_release_stays_readable_and_is_never_signed() {
     let (current, expected) = native();
@@ -886,6 +896,296 @@ fn a_retained_setup_of_an_earlier_release_stays_readable_and_is_never_signed() {
     allowit_stellar::owner_intent::validate_retained_owner_transaction(&current).unwrap();
     assert_refused(&legacy, &expected, "the setup of an earlier release");
 }
+/// A setup of an issued asset: the trustline of the new account, then the owner's one payment
+/// of that asset, then the signers. The caller's intent names the asset and the amount, so a
+/// setup with another amount or asset, or without the payment, is never signed. Retained bytes
+/// are a setup only in that order: any other place, source or count of the trustline or the
+/// payment is refused as history too.
+#[test]
+fn a_setup_of_an_issued_asset_is_signed_only_for_its_exact_asset_and_amount() {
+    let state = AccountState {
+        address: owner(),
+        sequence: 41,
+        master_weight: 1,
+        low_threshold: 0,
+        medium_threshold: 0,
+        high_threshold: 0,
+        signers: vec![],
+    };
+    let trustline = owner::Trustline {
+        code: "USDC".into(),
+        issuer: account(21),
+    };
+    let prepared = owner::prepare_native_setup(
+        &state,
+        &owner::SetupTerms {
+            wallet: &account(15),
+            agent: &account(12),
+            engine: &account(13),
+            request_id: "intent-fixture-001",
+            network: "stellar:testnet",
+            fee_per_operation: 100,
+            starting_balance: None,
+            trustline: Some(&trustline),
+            funding: Some(100_000),
+        },
+        NOW,
+    )
+    .unwrap();
+    let packet = OwnerTransaction {
+        network: prepared.network.clone(),
+        action: "native_setup".into(),
+        transaction_xdr: prepared.transaction_xdr.clone(),
+        transaction_hash: unhex(&prepared.transaction_hash).unwrap(),
+        expires_at: prepared.expires_at,
+    };
+    let intent = |trustline: Option<owner::Trustline>, funding: Option<i64>| ExpectedOwnerIntent {
+        limits: limits(),
+        action: OwnerAction::NativeSetup {
+            state: state.clone(),
+            wallet: account(15),
+            starting_balance: None,
+            trustline,
+            funding,
+            agent: account(12),
+            engine: account(13),
+            request_id: "intent-fixture-001".into(),
+            fee_per_operation: 100,
+            created_at: NOW,
+        },
+    };
+    validate_owner_transaction(
+        &packet,
+        &intent(Some(trustline.clone()), Some(100_000)),
+        NOW,
+    )
+    .unwrap();
+    validate_retained_owner_transaction(&packet).unwrap();
+    let other = owner::Trustline {
+        code: "EURC".into(),
+        issuer: account(21),
+    };
+    for (name, expected) in [
+        (
+            "another amount",
+            intent(Some(trustline.clone()), Some(100_001)),
+        ),
+        ("no funding", intent(Some(trustline.clone()), None)),
+        ("another asset", intent(Some(other), Some(100_000))),
+        ("no asset", intent(None, None)),
+    ] {
+        assert_refused(&packet, &expected, name);
+    }
+    // The order of the retained operations: creation, trustline, payment, three signers.
+    let reordered = |f: &dyn Fn(&mut Vec<x::Operation>)| {
+        let mut changed = packet.clone();
+        modify_tx(&mut changed, |tx| {
+            let mut operations = tx.operations.to_vec();
+            f(&mut operations);
+            tx.operations = operations.try_into().unwrap();
+        });
+        changed
+    };
+    for (name, changed) in [
+        (
+            "the payment before the trustline",
+            reordered(&|ops| ops.swap(1, 2)),
+        ),
+        (
+            "the payment after a signer",
+            reordered(&|ops| ops.swap(2, 3)),
+        ),
+        (
+            "the trustline after the signers",
+            reordered(&|ops| {
+                let trust = ops.remove(1);
+                ops.push(trust);
+            }),
+        ),
+        (
+            "two payments",
+            reordered(&|ops| ops.insert(2, ops[2].clone())),
+        ),
+        (
+            "two trustlines",
+            reordered(&|ops| ops.insert(1, ops[1].clone())),
+        ),
+        (
+            "a payment without a trustline",
+            reordered(&|ops| {
+                ops.remove(1);
+            }),
+        ),
+        (
+            "a payment from the new account",
+            reordered(&|ops| {
+                ops[2].source_account = ops[1].source_account.clone();
+            }),
+        ),
+        (
+            "a trustline of the owner's account",
+            reordered(&|ops| ops[1].source_account = None),
+        ),
+        (
+            "a signer missing",
+            reordered(&|ops| {
+                ops.pop();
+            }),
+        ),
+        (
+            "a payment of XLM",
+            reordered(&|ops| {
+                let x::OperationBody::Payment(payment) = &mut ops[2].body else {
+                    panic!()
+                };
+                payment.asset = x::Asset::Native;
+            }),
+        ),
+        (
+            "a payment of another issued asset",
+            reordered(&|ops| {
+                let x::OperationBody::Payment(payment) = &mut ops[2].body else {
+                    panic!()
+                };
+                payment.asset = asset_from_identity("EURC", Some(&account(21))).unwrap();
+            }),
+        ),
+        (
+            "a payment to the agent",
+            reordered(&|ops| {
+                let x::OperationBody::Payment(payment) = &mut ops[2].body else {
+                    panic!()
+                };
+                payment.destination = muxed(&account(12));
+            }),
+        ),
+        (
+            "a payment of nothing",
+            reordered(&|ops| {
+                let x::OperationBody::Payment(payment) = &mut ops[2].body else {
+                    panic!()
+                };
+                payment.amount = 0;
+            }),
+        ),
+        (
+            "a starting balance below the reserve of the account and its trustline",
+            reordered(&|ops| {
+                let x::OperationBody::CreateAccount(create) = &mut ops[0].body else {
+                    panic!()
+                };
+                create.starting_balance = owner::wallet_reserve(true) + 99;
+            }),
+        ),
+        (
+            "an issued asset with the code XLM",
+            reordered(&|ops| {
+                let xlm = asset_from_identity("XLM", Some(&account(21))).unwrap();
+                let x::Asset::CreditAlphanum4(code) = &xlm else {
+                    panic!()
+                };
+                let x::OperationBody::ChangeTrust(trust) = &mut ops[1].body else {
+                    panic!()
+                };
+                trust.line = x::ChangeTrustAsset::CreditAlphanum4(code.clone());
+                let x::OperationBody::Payment(payment) = &mut ops[2].body else {
+                    panic!()
+                };
+                payment.asset = xlm;
+            }),
+        ),
+        ("a fee that no setup bids", {
+            let mut changed = packet.clone();
+            modify_tx(&mut changed, |tx| tx.fee = 601);
+            changed
+        }),
+        ("no memo", {
+            let mut changed = packet.clone();
+            modify_tx(&mut changed, |tx| tx.memo = x::Memo::None);
+            changed
+        }),
+        (
+            "a starting balance above the most that a setup sends",
+            reordered(&|ops| {
+                let x::OperationBody::CreateAccount(create) = &mut ops[0].body else {
+                    panic!()
+                };
+                create.starting_balance = owner::MAX_STARTING_BALANCE + 1;
+            }),
+        ),
+        (
+            "an agent that pays alone",
+            reordered(&|ops| {
+                let x::OperationBody::SetOptions(options) = &mut ops[4].body else {
+                    panic!()
+                };
+                options.signer.as_mut().unwrap().weight = 2;
+            }),
+        ),
+        (
+            "a home domain in a signer operation",
+            reordered(&|ops| {
+                let x::OperationBody::SetOptions(options) = &mut ops[5].body else {
+                    panic!()
+                };
+                options.home_domain = Some(x::String32("example.com".try_into().unwrap()));
+            }),
+        ),
+        (
+            "a trustline with a lower limit",
+            reordered(&|ops| {
+                let x::OperationBody::ChangeTrust(trust) = &mut ops[1].body else {
+                    panic!()
+                };
+                trust.limit = 0;
+            }),
+        ),
+        (
+            "a trustline of another account",
+            reordered(&|ops| ops[1].source_account = Some(muxed(&account(12)))),
+        ),
+        (
+            "a signer of another account",
+            reordered(&|ops| ops[3].source_account = Some(muxed(&account(12)))),
+        ),
+    ] {
+        assert!(
+            validate_retained_owner_transaction(&changed).is_err(),
+            "{name}"
+        );
+    }
+    // No contract call stands for the setup of a wallet account, whatever its function is
+    // named. Every other action keeps the reading of a call that is named as the action.
+    for action in ["native_setup", "close"] {
+        let mut call = packet.clone();
+        call.action = action.into();
+        modify_tx(&mut call, |tx| {
+            tx.operations = vec![x::Operation {
+                source_account: None,
+                body: x::OperationBody::InvokeHostFunction(x::InvokeHostFunctionOp {
+                    host_function: x::HostFunction::InvokeContract(x::InvokeContractArgs {
+                        contract_address: x::ScAddress::Contract(x::ContractId(x::Hash([7; 32]))),
+                        function_name: symbol(action),
+                        args: vec![].try_into().unwrap(),
+                    }),
+                    auth: vec![].try_into().unwrap(),
+                }),
+            }]
+            .try_into()
+            .unwrap();
+        });
+        assert_eq!(
+            validate_retained_owner_transaction(&call).is_err(),
+            action == "native_setup",
+            "a contract call named {action}"
+        );
+    }
+    // A setup with the trustline alone stays a setup.
+    let unfunded = reordered(&|ops| {
+        ops.remove(2);
+    });
+    validate_retained_owner_transaction(&unfunded).unwrap();
+}
 /// The new account's own key signs its creation once, after the owner. A key of another
 /// account never co-signs.
 #[test]
@@ -909,6 +1209,7 @@ fn native_setup_takes_the_owner_signature_and_the_wallet_key_signature() {
         fee_per_operation: 100,
         starting_balance: None,
         trustline: None,
+        funding: None,
     };
     let prepared = owner::prepare_native_setup(&state, &terms, NOW).unwrap();
     let expected = ExpectedOwnerIntent {
@@ -922,6 +1223,7 @@ fn native_setup_takes_the_owner_signature_and_the_wallet_key_signature() {
             fee_per_operation: 100,
             starting_balance: None,
             trustline: None,
+            funding: None,
             created_at: NOW,
         },
     };
@@ -1063,6 +1365,7 @@ fn deployment_and_setup_adapters_validate_all_public_metadata() {
             fee_per_operation: *fee_per_operation,
             starting_balance: None,
             trustline: None,
+            funding: None,
         },
         *created_at,
     )
@@ -1358,4 +1661,122 @@ fn lifetime_target_and_footprint_mutations_fail_before_signing() {
         });
         assert_refused(&packet, &expected, &format!("lifetime mutation {variant}"));
     }
+}
+
+/// One owner step on a Native wallet, prepared by the rail from the owner's and the wallet's
+/// accounts, with the owner's own intent for it.
+fn wallet_step(action: owner::WalletAction) -> (OwnerTransaction, ExpectedOwnerIntent) {
+    let (owner_account, wallet, agent, server) = (owner(), account(8), account(2), account(3));
+    let owner_state = AccountState {
+        address: owner_account.clone(),
+        sequence: 41,
+        master_weight: 1,
+        low_threshold: 0,
+        medium_threshold: 0,
+        high_threshold: 0,
+        signers: vec![],
+    };
+    let signer = |key: &str, weight| AccountSigner {
+        key: key.into(),
+        weight,
+    };
+    let wallet_state = AccountState {
+        address: wallet.clone(),
+        sequence: 7,
+        master_weight: 0,
+        low_threshold: 2,
+        medium_threshold: 2,
+        high_threshold: 3,
+        signers: vec![
+            signer(&agent, 1),
+            signer(&server, 1),
+            signer(&owner_account, 3),
+        ],
+    };
+    let roles = owner::WalletRoles {
+        wallet: &wallet,
+        owner: &owner_account,
+        agent: &agent,
+        engine: &server,
+    };
+    let packet = owner::prepare_wallet_action(
+        &owner_state,
+        &wallet_state,
+        roles,
+        &action,
+        &x::Asset::Native,
+        "stellar:testnet",
+        100,
+        NOW,
+    )
+    .unwrap();
+    let expected = ExpectedOwnerIntent {
+        limits: limits(),
+        action: OwnerAction::Wallet {
+            owner_state,
+            wallet_state,
+            agent,
+            engine: server,
+            action,
+            asset_symbol: "XLM".into(),
+            asset_issuer: None,
+        },
+    };
+    (packet, expected)
+}
+
+#[test]
+fn the_owner_signs_a_native_wallet_step_only_for_its_own_account_and_lifetime() {
+    use owner::WalletAction::*;
+    for action in [
+        Fund { units: 5 },
+        Pause,
+        Withdraw {
+            units: 5,
+            recipient: None,
+        },
+        Close {
+            token_balance: None,
+        },
+    ] {
+        let name = action.name();
+        let (packet, expected) = wallet_step(action);
+        validate_owner_transaction(&packet, &expected, NOW).unwrap();
+        // The owner's account state is of another account than the signing owner. The
+        // verifier's own check refuses it, before it rebuilds the action, which would also
+        // differ.
+        let mut other = expected.clone();
+        if let OwnerAction::Wallet { owner_state, .. } = &mut other.action {
+            owner_state.address = account(9);
+        }
+        assert_refused(&packet, &other, name);
+        assert_eq!(
+            validate_owner_transaction(&packet, &other, NOW)
+                .err()
+                .as_deref(),
+            Some("Wallet action source differs from caller intent")
+        );
+        // The caller's own limit ends one second before the packet, within five minutes.
+        let mut tight = expected.clone();
+        tight.limits.valid_until = NOW + 299;
+        assert_refused(&packet, &tight, name);
+        // Five minutes from one second earlier end before the packet, within the caller's limit.
+        let mut loose = expected.clone();
+        loose.limits.valid_until = NOW + 1_000;
+        assert!(validate_owner_transaction(&packet, &loose, NOW - 1).is_err());
+    }
+    // A close has several operations at 100 stroops each: above an owner's fee limit of 100.
+    let (packet, expected) = wallet_step(Close {
+        token_balance: None,
+    });
+    let mut cheap = expected.clone();
+    cheap.limits.max_fee_stroops = 100;
+    assert_refused(&packet, &cheap, "fee above the owner's limit");
+}
+
+#[test]
+fn the_owner_never_signs_the_creation_of_a_wallet_that_another_owner_controls() {
+    // The packet and the intent agree on a configuration whose owner is not the signer.
+    let (packet, expected) = create_with(PolicyTier::Simple, |c| c.owner = account(9));
+    assert_refused(&packet, &expected, "another owner");
 }

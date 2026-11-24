@@ -119,7 +119,12 @@ impl Chain {
                 settings,
             ),
         ] {
-            entries.insert(xdr(&key).unwrap(),json!({"key":xdr(&key).unwrap(),"xdr":xdr(&data).unwrap(),"liveUntilLedgerSeq":520}));
+            let mut entry = json!({"key":xdr(&key).unwrap(),"xdr":xdr(&data).unwrap(),"lastModifiedLedgerSeq":100,"liveUntilLedgerSeq":520});
+            // The network's setting has no lifetime.
+            if matches!(key, x::LedgerKey::ConfigSetting(_)) {
+                entry.as_object_mut().unwrap().remove("liveUntilLedgerSeq");
+            }
+            entries.insert(xdr(&key).unwrap(), entry);
         }
         Self {
             entries,
@@ -383,6 +388,40 @@ fn observation_and_original_settlement_do_not_invent_missing_entries_or_receipts
     let key = xdr(&keys(&c)[1]).unwrap();
     chain.entries.get_mut(&key).unwrap()["xdr"] = json!("broken");
     assert!(rpc::code_uploaded(&chain, NETWORK, &c.module_digest).is_err());
+}
+/// Code is live, lapsed (on the ledger past its lifetime, or served from the archive without a
+/// live-until ledger) or absent; a broken entry stays an error.
+#[test]
+fn code_state_tells_lapsed_code_from_absent_code() {
+    let c = config();
+    let mut chain = Chain::new(&c);
+    let code = xdr(&keys(&c)[1]).unwrap();
+    let state = |chain: &Chain| rpc::code_state(chain, NETWORK, &c.module_digest);
+    assert_eq!(state(&chain).unwrap(), rpc::CodeState::Live);
+    for lapsed in [json!(119), json!(0), Value::Null] {
+        chain.entries.get_mut(&code).unwrap()["liveUntilLedgerSeq"] = lapsed.clone();
+        assert_eq!(state(&chain).unwrap(), rpc::CodeState::Lapsed, "{lapsed}");
+        // The live-entry read keeps refusing lapsed code.
+        assert!(rpc::code_uploaded(&chain, NETWORK, &c.module_digest).is_err());
+    }
+    chain.entries.get_mut(&code).unwrap()["liveUntilLedgerSeq"] = json!("soon");
+    assert!(state(&chain).is_err());
+    chain.entries.get_mut(&code).unwrap()["liveUntilLedgerSeq"] = json!(120);
+    assert_eq!(state(&chain).unwrap(), rpc::CodeState::Live);
+    let moving = Advancing {
+        chain: &chain,
+        heads: 0.into(),
+    };
+    // Code whose last live ledger the closing head passed has lapsed.
+    assert_eq!(
+        rpc::code_state(&moving, NETWORK, &c.module_digest).unwrap(),
+        rpc::CodeState::Lapsed
+    );
+    chain.entries.get_mut(&code).unwrap()["xdr"] = json!("broken");
+    assert!(state(&chain).is_err());
+    chain.entries.remove(&code);
+    assert_eq!(state(&chain).unwrap(), rpc::CodeState::Absent);
+    assert!(rpc::code_state(&chain, NETWORK, &[0; 32]).is_err());
 }
 #[test]
 fn installation_preserves_policy_instance_salt_and_constructor_binding() {
@@ -1185,6 +1224,35 @@ fn a_reported_fee_bump_hash_reads_the_receipt_of_its_inner_transaction() {
     rpc::validate_receipt(&receipt, NETWORK, &packet.transaction_hash).unwrap();
     // Another reported hash does not read this wrapper.
     assert!(rpc::receipt_by_reported_hash(&chain, NETWORK, &[13; 32]).is_err());
+}
+
+/// A receipt keeps the close time of its ledger, which the RPC states as `createdAt`: the time
+/// at which the operation settled. A reply without it gives a receipt without it, and a time that
+/// is no count of seconds is refused.
+#[test]
+fn a_receipt_keeps_the_close_time_of_its_ledger() {
+    let c = config();
+    let mut chain = Chain::new(&c);
+    let packet = deployer(&chain).fund(&c, 500).unwrap();
+    let signed = sign_owner_transaction(NETWORK, &packet.transaction_xdr, &[11; 32]).unwrap();
+    let x::TransactionEnvelope::Tx(inner) = read(&signed).unwrap() else {
+        panic!()
+    };
+    chain.receipt = fee_bump_reply(&inner, true);
+    let outer = unhex(chain.receipt["txHash"].as_str().unwrap()).unwrap();
+    let read = |chain: &Chain| rpc::receipt_by_reported_hash(chain, NETWORK, &outer);
+    assert_eq!(read(&chain).unwrap().unwrap().closed_at, None);
+    for (created, closed) in [
+        (json!("1795028239"), 1_795_028_239),
+        (json!(1_795_028_240u64), 1_795_028_240),
+    ] {
+        chain.receipt["createdAt"] = created;
+        assert_eq!(read(&chain).unwrap().unwrap().closed_at, Some(closed));
+    }
+    for invalid in [json!(""), json!("-1"), json!("1.5"), json!(-1), json!(true)] {
+        chain.receipt["createdAt"] = invalid.clone();
+        assert!(read(&chain).is_err(), "{invalid}");
+    }
 }
 
 #[test]

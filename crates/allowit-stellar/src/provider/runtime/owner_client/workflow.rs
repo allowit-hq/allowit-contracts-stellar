@@ -402,7 +402,7 @@ pub fn amount_units(amount: &str) -> Result<i128> {
         .filter(|v| *v > 0);
     units.ok_or_else(|| Error::usage("Asset amount exceeds the supported positive range"))
 }
-fn network(rpc: &dyn rpc::Rpc, selected: &str) -> Result<()> {
+pub(crate) fn network(rpc: &dyn rpc::Rpc, selected: &str) -> Result<()> {
     if checked(rpc.call("getNetwork", json!({})))?["passphrase"]
         != checked(native::passphrase(selected))?
     {
@@ -1330,6 +1330,20 @@ impl OwnerClient {
                 "Supply unresolved owner params before deployment",
             ));
         }
+        // The account holds the draft's asset, which the server checks when it binds the draft:
+        // the setup adds the trustline of the draft's issued asset, and none for XLM.
+        if request
+            .asset
+            .as_ref()
+            .map(|t| (t.code.as_str(), t.issuer.as_str()))
+            != b.asset_issuer
+                .as_deref()
+                .map(|issuer| (b.asset_symbol.as_str(), issuer))
+        {
+            return Err(Error::usage(
+                "The setup's asset differs from the draft's asset; nothing was signed",
+            ));
+        }
         // The request ID binds this draft. A setup under it that no deployment of this draft
         // started belongs to another workflow.
         let marker = native_deployment_key(&request.request_id);
@@ -1857,17 +1871,63 @@ struct NativeSetupRecord {
     submitted: bool,
     receipt: Option<rpc::VerifiedReceipt>,
 }
+/// The asset of the signed setup that the store retains under `request_id`, when it retains
+/// one: the issued asset, or `None` for XLM. A signed setup keeps its asset, so its resume
+/// builds the same request whatever the server's template names now; the resume then checks
+/// the retained signed bytes against that request. A request that stopped before its
+/// signature retains nothing that the owner signed: its next run takes the asset from the
+/// server's template again, as a new request does. A request ID binds its intent, the asset
+/// included: when the template names another asset by then, the run is refused as another
+/// intent, and the setup for that asset takes a new request ID.
+pub fn retained_setup_asset(
+    store: &Store,
+    request_id: &str,
+) -> Result<Option<Option<native::owner::Trustline>>> {
+    if !crate::host::request::request_id_valid(request_id) {
+        return Err(Error::usage("Invalid Stellar setup request ID"));
+    }
+    match store.load::<NativeSetupRecord>(request_id)? {
+        Some(record) if record.is_signed()? => Ok(Some(record.setup.trustline)),
+        _ => Ok(None),
+    }
+}
+impl NativeSetupRecord {
+    /// Whether the record holds the setup that the owner signed. A record without its signed
+    /// transaction is a request that stopped before its signature, and its next run prepares
+    /// another account. A record that lost its signed transaction and still holds the owner's
+    /// signature, the mark of a submission or a receipt is damaged: its setup may be on the
+    /// ledger, so no run replaces it with another account.
+    fn is_signed(&self) -> Result<bool> {
+        if self.signed_xdr.is_none()
+            && (self.signature.is_some() || self.submitted || self.receipt.is_some())
+        {
+            return Err(Error::uncertain(
+                "The retained Native setup lost its signed transaction; do not replace it",
+            ));
+        }
+        Ok(self.signed_xdr.is_some())
+    }
+}
 /// The server's first record of a wallet: the account, its roles and a policy that admits
-/// transfers of XLM. The owner's generated policy replaces it at activation.
+/// transfers of the wallet's asset, which is `asset` or XLM. The owner's generated policy
+/// replaces it at activation.
 pub fn bootstrap_configuration(
     network: &str,
     wallet: &str,
     owner: &str,
     agent: &str,
     server: &str,
+    asset: Option<&native::owner::Trustline>,
 ) -> Result<native::WalletConfig> {
     const SOURCE: &str = "use allowit::prelude::*;\n/// Bootstrap: transfers in the installed asset.\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    allowit::operations(ctx, &ctx.params[allowit::OPERATIONS])?;\n    allowit::tokens(ctx, &ctx.params[allowit::TOKENS])?;\n    Ok(())\n}\n";
-    let asset = checked(native::sac_address(network, &stellar_xdr::Asset::Native))?;
+    let (symbol, issuer) = match asset {
+        Some(asset) => (asset.code.as_str(), Some(asset.issuer.as_str())),
+        None => ("XLM", None),
+    };
+    let asset = checked(native::sac_address(
+        network,
+        &checked(native::asset_from_identity(symbol, issuer))?,
+    ))?;
     let instance = native::hash(format!(
         "allowit-stellar-native-wallet-v1:{network}:{wallet}"
     ));
@@ -1875,7 +1935,7 @@ pub fn bootstrap_configuration(
         "network": network, "policyInstance": instance, "wallet": wallet, "owner": owner,
         "agent": agent, "server": server, "route": "native", "language": "portable",
         "params": {"operations": {"List": [{"Str": "transfer"}]}, "tokens": {"List": [{"Addr": asset}]}},
-        "asset": asset, "assetSymbol": "XLM", "assetIssuer": null, "policySource": SOURCE,
+        "asset": asset, "assetSymbol": symbol, "assetIssuer": issuer, "policySource": SOURCE,
         "sourceHash": native::hash(SOURCE), "moduleDigest": vec![0u8; 32],
         "maxFeeStroops": 100_000,
     }))
@@ -1895,31 +1955,41 @@ fn configured(
         &request.owner,
         &request.agent,
         &request.server,
+        request.asset.as_ref(),
     )?;
     Ok(
         json!({"state":"configured","requestId":request.request_id,"network":request.network,"wallet":wallet,"owner":request.owner,"agent":request.agent,"server":request.server,
         "installation":native::hex(&configuration.policy_instance),"configuration":configuration,
         "signers":{"owner":native::owner::OWNER_WEIGHT,"agent":native::owner::AUTOMATED_WEIGHT,"server":native::owner::AUTOMATED_WEIGHT,"walletKey":0},
         "thresholds":{"low":native::owner::PAYMENT_THRESHOLD,"medium":native::owner::PAYMENT_THRESHOLD,"high":native::owner::OWNER_THRESHOLD},
-        "reserveStroops":native::owner::wallet_reserve(false).to_string(),
+        "reserveStroops":native::owner::wallet_reserve(request.asset.is_some()).to_string(),
         "transactionHash":transaction.map(|t|t.0),"ledger":transaction.map(|t|t.1)}),
     )
 }
 /// Prepare the setup of the wallet account `wallet` from the owner's current account.
-/// What one setup request binds. A funded setup also binds its amount; an unfunded one keeps the
-/// identity of earlier releases, so their retained requests resume.
+/// What one setup request binds. A funded setup also binds its amount, and a setup of an issued
+/// asset binds that asset; a setup with neither keeps the identity of earlier releases, so
+/// their retained requests resume.
 fn setup_identity(request: &crate::provider::runtime::owner::SetupRequest) -> Value {
     let mut identity = json!({"network":request.network,"owner":request.owner,"agent":request.agent,"server":request.server,"requestId":request.request_id,"fee":request.fee_per_operation});
     if let Some(funding) = request.funding {
         identity["funding"] = json!(funding.to_string());
     }
+    if let Some(asset) = &request.asset {
+        identity["asset"] = json!(asset);
+    }
     identity
 }
-/// The starting balance of a setup: the reserve and the float, and the owner's funding on top.
-/// The owner's account sends all of it in the setup transaction.
+/// The XLM starting balance of a setup. A wallet that holds XLM starts with the reserve, the
+/// float and the owner's funding on top. A wallet of an issued asset starts with the reserve of
+/// its account and trustline and the float: its funding is a payment of the asset. The owner's
+/// account sends all of it in the setup transaction.
 fn setup_starting_balance(
     request: &crate::provider::runtime::owner::SetupRequest,
 ) -> Result<Option<i64>> {
+    if request.asset.is_some() {
+        return Ok(None);
+    }
     request
         .funding
         .map(|funding| {
@@ -1928,6 +1998,10 @@ fn setup_starting_balance(
                 .ok_or_else(|| Error::usage("The setup funding amount is out of range"))
         })
         .transpose()
+}
+/// The funding of a setup in the wallet's issued asset, in base units.
+fn setup_asset_funding(request: &crate::provider::runtime::owner::SetupRequest) -> Option<i64> {
+    request.asset.as_ref().and(request.funding)
 }
 fn prepare_setup(
     runtime: &crate::provider::runtime::Runtime,
@@ -1947,7 +2021,8 @@ fn prepare_setup(
             network: &request.network,
             fee_per_operation: request.fee_per_operation,
             starting_balance: setup_starting_balance(request)?,
-            trustline: None,
+            trustline: request.asset.as_ref(),
+            funding: setup_asset_funding(request),
         },
         now,
     ))?;
@@ -1988,16 +2063,22 @@ fn verify_setup_signatures(record: &NativeSetupRecord, signature: &[u8; 64]) -> 
     {
         return Err(changed());
     }
-    checked(native::signing::verify_digest(
-        &record.setup.owner,
-        &hash,
-        by_owner.signature.as_slice(),
-    ))?;
-    checked(native::signing::verify_digest(
-        &record.setup.wallet,
-        &hash,
-        by_wallet.signature.as_slice(),
-    ))
+    // The network matches a signature to its key by the hint: each signature stands under
+    // the hint of its own key.
+    for (account, decorated) in [
+        (&record.setup.owner, by_owner),
+        (&record.setup.wallet, by_wallet),
+    ] {
+        if decorated.hint.0 != checked(native::account_key(account))?[28..] {
+            return Err(changed());
+        }
+        checked(native::signing::verify_digest(
+            account,
+            &hash,
+            decorated.signature.as_slice(),
+        ))?;
+    }
+    Ok(())
 }
 /// Create one agent's wallet account with one owner-signed transaction, through SDK Runtime.
 /// The new account's one-time key is random and lives in this call: it co-signs the creation
@@ -2038,8 +2119,9 @@ pub fn configure_native(
             prepare_setup(runtime, request, &identity, &wallet, clock()?)?
         }
     };
+    let unsigned = !record.is_signed()?;
     store.save(&request.request_id, &record)?;
-    if record.signed_xdr.is_none() {
+    if unsigned {
         let key = match made.take() {
             Some(key) => key,
             None => {
@@ -2089,10 +2171,11 @@ pub fn configure_native(
         .ok_or_else(|| Error::config("Missing retained Native setup signature"))?
         .try_into()
         .map_err(|_| Error::config("Invalid retained Native signature"))?;
-    // The retained unsigned packet is still the exact setup of the caller's intent, and the
-    // retained signed bytes are that packet with the owner's and the wallet key's signatures.
-    checked(owner_intent::validate_owner_transaction(
-        &packet,
+    // The whole retained setup is still the exact setup of the caller's intent: its fields and
+    // its digest as well as its transaction, as before its signature. The retained signed bytes
+    // are that transaction with the owner's and the wallet key's signatures.
+    checked(owner_intent::validate_native_setup(
+        &record.setup,
         &expected,
         record.created_at,
     ))?;
@@ -2183,7 +2266,8 @@ fn expected_setup(
             request_id: request.request_id.clone(),
             fee_per_operation: request.fee_per_operation,
             starting_balance: setup_starting_balance(request)?,
-            trustline: None,
+            trustline: request.asset.clone(),
+            funding: setup_asset_funding(request),
             created_at: record.created_at,
         },
     })
@@ -2400,6 +2484,7 @@ mod submit_refusal_tests {
             envelope_xdr: String::new(),
             result_xdr: String::new(),
             settles: None,
+            closed_at: None,
         });
         let receipt = OwnerReceipt::of(&step).unwrap();
         // The link is this client's own, never the one that the server sent with the step.

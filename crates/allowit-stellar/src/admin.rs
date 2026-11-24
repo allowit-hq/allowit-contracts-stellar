@@ -381,6 +381,11 @@ impl OwnerAdmin<'_> {
         version: DeploymentVersion,
         authorizers: Vec<String>,
     ) -> Result<PreparedOwnerOperation> {
+        // No owner step reaches a wallet whose instance, or the code that it runs, lapsed: the
+        // answer is `CONTRACT_EXPIRED` whatever a simulation of the step would say.
+        if self.lapsed()? {
+            return Err(rpc::CONTRACT_EXPIRED.into());
+        }
         let expires = self.now.checked_add(300).ok_or("Expiry overflow")?;
         let mut tx = self.transaction(
             &snapshot.owner,
@@ -467,7 +472,10 @@ impl OwnerAdmin<'_> {
         })
     }
     /// Set the fee and resource data from a simulation, within the configured fee ceiling.
+    /// Take the simulated resources and fee of an owner step. Nothing restores a wallet whose
+    /// instance or code lapsed: such a simulation is refused (`rpc::refuse_expired`).
     fn apply_resources(&self, tx: &mut Transaction, response: &serde_json::Value) -> Result<()> {
+        rpc::refuse_expired(response, Some(&self.config.wallet), None)?;
         let fee = response["minResourceFee"]
             .as_str()
             .ok_or("Missing resource fee")?
@@ -820,7 +828,7 @@ impl RecoverFunds for OwnerAdmin<'_> {
         }
         let amount = self.balance_of(&s, token)?;
         if amount <= 0 {
-            return Err(NO_RECOVERABLE_BALANCE.into());
+            return Err(self.nothing_to_recover());
         }
         let owner = s.owner.address.clone();
         let version = s.deployment_version;
@@ -868,10 +876,31 @@ impl OwnerAdmin<'_> {
         } else {
             self.balance_of(&s, &xlm)?
         };
-        let token = next_recovery(&asset, &xlm, asset_balance, xlm_balance)
-            .ok_or(NO_RECOVERABLE_BALANCE)?
-            .to_owned();
+        let Some(token) = next_recovery(&asset, &xlm, asset_balance, xlm_balance) else {
+            return Err(self.nothing_to_recover());
+        };
+        let token = token.to_owned();
         self.recover_funds(&token)
+    }
+    /// The refusal of a recovery that found nothing to return: `CONTRACT_EXPIRED` for a wallet
+    /// whose instance, or the code that it runs, lapsed, since no owner step reaches it; the
+    /// balance reads touch neither. A read that fails is its error.
+    fn nothing_to_recover(&self) -> String {
+        match self.lapsed() {
+            Ok(true) => rpc::CONTRACT_EXPIRED.into(),
+            Ok(false) => NO_RECOVERABLE_BALANCE.into(),
+            Err(error) => error.to_string(),
+        }
+    }
+    /// Whether the wallet's instance, or the code that it runs, lapsed on the network. A wallet
+    /// with no instance has not lapsed.
+    fn lapsed(&self) -> Result<bool> {
+        let Some(running) =
+            rpc::instance_code(self.rpc, &self.config.network, &self.config.wallet)?
+        else {
+            return Ok(false);
+        };
+        Ok(rpc::code_state(self.rpc, &self.config.network, &running)? == rpc::CodeState::Lapsed)
     }
     /// The balance of `token` that the wallet holds, read through the owner's simulation.
     fn balance_of(&self, s: &Snapshot, token: &str) -> Result<i128> {
@@ -1284,7 +1313,7 @@ pub fn check_assembled(
 pub struct PreparedDeployment {
     pub network: String,
     pub source: String,
-    /// `upload_wasm` or `create_wallet`.
+    /// `upload_wasm`, `renew_code` or `create_wallet`.
     pub function: String,
     pub wasm_hash: [u8; 32],
     /// The derived wallet address of a creation.
@@ -1369,7 +1398,11 @@ impl Deployer<'_> {
         if response.get("error").is_some_and(|v| !v.is_null()) {
             return Err("Deployment simulation rejected the transaction".into());
         }
-        // Archived code or deployer entries restore in the same transaction.
+        // Archived deployer entries restore in the same transaction; archived wallet code does not:
+        // nothing restores it.
+        if let Some(code) = expected_wasm {
+            rpc::refuse_expired(&response, None, Some(&code))?;
+        }
         rpc::restoring_in_place(&response)?;
         let results = response["results"]
             .as_array()
@@ -1449,6 +1482,10 @@ impl Deployer<'_> {
     ) -> Result<PreparedDeployment> {
         let expires_at = match &tx.cond {
             Preconditions::Time(bounds) => bounds.max_time.0,
+            Preconditions::V2(PreconditionsV2 {
+                time_bounds: Some(bounds),
+                ..
+            }) => bounds.max_time.0,
             _ => unreachable!(),
         };
         Ok(PreparedDeployment {
@@ -1466,11 +1503,20 @@ impl Deployer<'_> {
         })
     }
     /// Prepare `UploadContractWasm` of policy wallet code that declares custody layout 4.
-    pub fn upload_wasm(&self, source: &str, wasm: &[u8]) -> Result<PreparedDeployment> {
+    /// `None` when the simulation finds the code live on the network: an upload of it would only
+    /// read its entry, so there is nothing to upload, and no fee ceiling applies. A simulation
+    /// that writes the entry does not prove that the code is absent: the host also rewrites
+    /// live code whose stored cost inputs differ, so a caller that pays reads the code again.
+    pub fn upload_wasm(&self, source: &str, wasm: &[u8]) -> Result<Option<PreparedDeployment>> {
         let wasm_hash = check_wallet_code(wasm)?;
         let account = self.account(source)?;
         let host = HostFunction::UploadContractWasm(wasm.to_vec().try_into().map_err(err)?);
-        let (tx, value) = self.assemble(&account, host, None)?;
+        // The ceiling applies to an upload that is needed: it is checked after the footprint.
+        let unbounded = Deployer {
+            max_fee_stroops: u32::MAX,
+            ..*self
+        };
+        let (tx, value) = unbounded.assemble(&account, host, None)?;
         if value != value_bytes(&wasm_hash)? {
             return Err("Upload simulation returned another Wasm hash".into());
         }
@@ -1480,7 +1526,133 @@ impl Deployer<'_> {
         if !op.auth.is_empty() {
             return Err("Wasm upload needs no contract authorization".into());
         }
+        // An upload whose simulation restores an archived entry in place would restore code
+        // that lapsed: nothing restores lapsed code.
+        if let TransactionExt::V1(data) = &tx.ext
+            && matches!(&data.ext, SorobanTransactionDataExt::V1(ext) if !ext.archived_soroban_entries.is_empty())
+        {
+            return Err(
+                "The upload restores an archived entry: nothing restores lapsed code".into(),
+            );
+        }
+        // An upload writes the code entry alone. Code that is live, for example because another
+        // transaction uploaded it after it was read, is only read: nothing to upload or pay.
+        let TransactionExt::V1(data) = &tx.ext else {
+            return Err("Missing upload resources".into());
+        };
+        let key = [LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: Hash(wasm_hash),
+        })];
+        let footprint = &data.resources.footprint;
+        match (
+            footprint.read_only.as_slice(),
+            footprint.read_write.as_slice(),
+        ) {
+            ([], written) if written == key => {}
+            (read, []) if read == key => return Ok(None),
+            _ => return Err("Upload resources name another entry than its code".into()),
+        }
+        if tx.fee > self.max_fee_stroops {
+            return Err("Simulated fee exceeds the explicitly selected ceiling".into());
+        }
         self.prepared(&account, "upload_wasm", wasm_hash, None, tx)
+            .map(Some)
+    }
+    /// Prepare `ExtendFootprintTtl` of the live code entry `wasm_hash` from `source`, so that the
+    /// code lives `extend_to` ledgers after the ledger that includes it. It names that entry alone,
+    /// read-only, and gives no authority; the simulation sets its fee, within the ceiling. Code
+    /// that lapsed is refused: nothing restores it.
+    pub fn renew_code(
+        &self,
+        source: &str,
+        wasm_hash: [u8; 32],
+        extend_to: u32,
+    ) -> Result<PreparedDeployment> {
+        if extend_to == 0 {
+            return Err("A renewal extends the code's lifetime".into());
+        }
+        let account = self.account(source)?;
+        let key = LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: Hash(wasm_hash),
+        });
+        let mut tx = Transaction {
+            source_account: muxed(&account.address)?,
+            fee: 100,
+            seq_num: SequenceNumber(account.sequence.checked_add(1).ok_or("Sequence overflow")?),
+            cond: Preconditions::Time(TimeBounds {
+                min_time: TimePoint(0),
+                max_time: TimePoint(self.now.checked_add(300).ok_or("Expiry overflow")?),
+            }),
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::ExtendFootprintTtl(ExtendFootprintTtlOp {
+                    ext: ExtensionPoint::V0,
+                    extend_to,
+                }),
+            }]
+            .try_into()
+            .map_err(err)?,
+            ext: TransactionExt::V1(SorobanTransactionData {
+                ext: SorobanTransactionDataExt::V0,
+                resources: SorobanResources {
+                    footprint: LedgerFootprint {
+                        read_only: vec![key.clone()].try_into().map_err(err)?,
+                        read_write: VecM::default(),
+                    },
+                    instructions: 0,
+                    disk_read_bytes: 0,
+                    write_bytes: 0,
+                },
+                resource_fee: 0,
+            }),
+        };
+        let raw = xdr(&TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: tx.clone(),
+            signatures: VecM::default(),
+        }))?;
+        let response = self.simulate(&account, &raw, false)?;
+        if response.get("error").is_some_and(|v| !v.is_null()) {
+            return Err("The network refused the simulation of the code renewal".into());
+        }
+        if response
+            .get("restorePreamble")
+            .is_some_and(|value| !value.is_null())
+        {
+            return Err("The wallet code lapsed: nothing restores it".into());
+        }
+        let data: SorobanTransactionData = read(
+            response["transactionData"]
+                .as_str()
+                .ok_or("Missing renewal resources")?,
+        )?;
+        if matches!(&data.ext, SorobanTransactionDataExt::V1(ext) if !ext.archived_soroban_entries.is_empty())
+        {
+            return Err("The wallet code lapsed: nothing restores it".into());
+        }
+        if data.resources.footprint.read_only.as_slice() != [key]
+            || !data.resources.footprint.read_write.is_empty()
+        {
+            return Err("Renewal resources name another entry".into());
+        }
+        let fee = response["minResourceFee"]
+            .as_str()
+            .ok_or("Missing renewal fee")?
+            .parse::<u32>()
+            .map_err(err)?
+            .checked_add(100)
+            .ok_or("Renewal fee overflow")?;
+        if fee > self.max_fee_stroops {
+            return Err("Simulated fee exceeds the explicitly selected ceiling".into());
+        }
+        if data.resource_fee < 0
+            || u64::try_from(data.resource_fee).map_err(err)? + 100 != u64::from(fee)
+        {
+            return Err("Renewal resource fee differs from simulation".into());
+        }
+        tx.fee = fee;
+        tx.ext = TransactionExt::V1(data);
+        self.prepared(&account, "renew_code", wasm_hash, None, tx)
     }
     /// Prepare the owner's one transaction that creates the policy wallet of `wasm` (uploaded by
     /// the server) through `deployer` and funds it with each `(asset, amount)` of `funding`. The
@@ -1584,6 +1756,96 @@ pub fn with_source_signature(
     .try_into()
     .map_err(err)?;
     xdr(&TransactionEnvelope::Tx(envelope))
+}
+/// Check that the code transaction `tx` is bounded by time alone, with a nonzero time bound that
+/// ends at `expires_at`: Stellar reads a zero upper bound as no bound at all.
+fn code_time_bound(tx: &Transaction, expires_at: u64) -> Result<()> {
+    match &tx.cond {
+        Preconditions::Time(time) if time.max_time.0 != 0 && time.max_time.0 == expires_at => {
+            Ok(())
+        }
+        _ => Err("The code transaction's time bound differs from its expiry".into()),
+    }
+}
+/// Check a wallet code transaction that its source signed: `signed_xdr` is the unsigned prepared
+/// transaction `p` with one signature of its source over its hash, under the source key's hint;
+/// the transaction is bounded by a time bound that is `p.expires_at` (`code_time_bound`); and it
+/// uploads the code `p.wasm_hash` (`upload_wasm`), with the code entry alone in its read-write
+/// footprint, or renews that code's entry (`renew_code`), with the code entry alone in its
+/// read-only footprint. It restores no archived entry in place.
+pub fn check_signed_code(p: &PreparedDeployment, signed_xdr: &str) -> Result<()> {
+    let TransactionEnvelope::Tx(unsigned) = read(&p.transaction_xdr)? else {
+        return Err("Expected a v1 code transaction".into());
+    };
+    let TransactionEnvelope::Tx(signed) = read(signed_xdr)? else {
+        return Err("Expected a signed v1 code transaction".into());
+    };
+    // The preparation is unsigned: its bytes, and so its packet, are the server's alone.
+    if !unsigned.signatures.is_empty() {
+        return Err("The prepared code transaction carries a signature".into());
+    }
+    if signed.tx != unsigned.tx {
+        return Err("The signed code transaction differs from its preparation".into());
+    }
+    if transaction_hash(&p.network, &signed.tx)? != p.transaction_hash {
+        return Err("The code transaction's hash differs from its preparation".into());
+    }
+    if signed.tx.source_account != muxed(&p.source)? {
+        return Err("The code transaction has another source".into());
+    }
+    code_time_bound(&signed.tx, p.expires_at)?;
+    let [signature] = signed.signatures.as_slice() else {
+        return Err("A code transaction carries one signature, its source's".into());
+    };
+    let MuxedAccount::Ed25519(Uint256(key)) = &signed.tx.source_account else {
+        return Err("The code transaction's source is a plain account".into());
+    };
+    if signature.hint.0.as_slice() != &key[28..] {
+        return Err("The code transaction's signature hint is not its source's".into());
+    }
+    let bytes: [u8; 64] = signature.signature.0.as_slice().try_into().map_err(err)?;
+    signing::verify_digest(&p.source, &p.transaction_hash, &bytes)?;
+    let [operation] = signed.tx.operations.as_slice() else {
+        return Err("A code transaction has one operation".into());
+    };
+    let key = LedgerKey::ContractCode(LedgerKeyContractCode {
+        hash: Hash(p.wasm_hash),
+    });
+    // Both name the code entry alone and restore nothing in place: nothing restores lapsed code.
+    let key = [key];
+    let footprint = match &signed.tx.ext {
+        TransactionExt::V1(data) => {
+            let (read_only, read_write) = (
+                data.resources.footprint.read_only.as_slice(),
+                data.resources.footprint.read_write.as_slice(),
+            );
+            let named = match p.function.as_str() {
+                "upload_wasm" => read_only.is_empty() && read_write == key,
+                "renew_code" => read_only == key && read_write.is_empty(),
+                _ => false,
+            };
+            named
+                && match &data.ext {
+                    SorobanTransactionDataExt::V0 => true,
+                    SorobanTransactionDataExt::V1(ext) => ext.archived_soroban_entries.is_empty(),
+                }
+        }
+        TransactionExt::V0 => false,
+    };
+    let alone = footprint
+        && match (p.function.as_str(), &operation.body) {
+            ("upload_wasm", OperationBody::InvokeHostFunction(op)) => {
+                op.auth.is_empty()
+                    && matches!(&op.host_function,
+                    HostFunction::UploadContractWasm(code) if hash(code.as_slice()) == p.wasm_hash)
+            }
+            ("renew_code", OperationBody::ExtendFootprintTtl(op)) => op.extend_to > 0,
+            _ => false,
+        };
+    if !alone || operation.source_account.is_some() || p.wallet.is_some() {
+        return Err("The code transaction neither uploads nor renews its code alone".into());
+    }
+    Ok(())
 }
 /// Low-level source-account signing. This checks unsigned v1 envelope ownership only; it does
 /// not validate the business intent, fees or expiry. Use [`crate::owner_intent`] to validate an

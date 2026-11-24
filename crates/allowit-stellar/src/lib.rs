@@ -99,6 +99,10 @@ pub fn passphrase(network: &str) -> Result<&'static str> {
         _ => Err("Unsupported Stellar network".into()),
     }
 }
+/// Whether `network` is the id of a network of the rail, and not an alias of one.
+pub fn is_network_id(network: &str) -> bool {
+    matches!(network, "stellar:pubnet" | "stellar:testnet")
+}
 pub fn network_id(network: &str) -> Result<[u8; 32]> {
     Ok(hash(passphrase(network)?))
 }
@@ -342,6 +346,41 @@ pub fn fee_bound(resource_fee: i64) -> Result<u32> {
         .and_then(|fee| fee.checked_add(resource.div_ceil(FEE_BOUND_MARGIN_DIVISOR)))
         .ok_or_else(|| "Resource fee overflow".into())
 }
+/// The refusal of [`mul_div_ceil`] and [`scale_units`]: a negative operand, a zero divisor, or
+/// a result that its type cannot hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutOfRange;
+impl std::fmt::Display for OutOfRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The amount is out of range")
+    }
+}
+/// `ceil(x * y / d)` for `d > 0`, with no intermediate value wider than the result: with
+/// `y = yq * d + yr` and `x = xq * d + xr`, it is `x * yq + xq * yr` plus `ceil(xr * yr / d)`.
+/// A 32-bit divisor keeps `xr * yr` below `2^64`; every step is checked.
+pub fn mul_div_ceil(x: u128, y: u128, d: u32) -> std::result::Result<u128, OutOfRange> {
+    if d == 0 {
+        return Err(OutOfRange);
+    }
+    let d = u128::from(d);
+    let (yq, yr) = (y / d, y % d);
+    let (xq, xr) = (x / d, x % d);
+    let tail = xr
+        .checked_mul(yr)
+        .and_then(|p| p.checked_add(d - 1))
+        .map(|p| p / d)
+        .ok_or(OutOfRange)?;
+    x.checked_mul(yq)
+        .and_then(|v| v.checked_add(xq.checked_mul(yr)?))
+        .and_then(|v| v.checked_add(tail))
+        .ok_or(OutOfRange)
+}
+/// [`mul_div_ceil`] of nonnegative `i128` units: `ceil(units * by / d)`.
+pub fn scale_units(units: i128, by: i128, d: u32) -> std::result::Result<i128, OutOfRange> {
+    let units = u128::try_from(units).map_err(|_| OutOfRange)?;
+    let by = u128::try_from(by).map_err(|_| OutOfRange)?;
+    i128::try_from(mul_div_ceil(units, by, d)?).map_err(|_| OutOfRange)
+}
 /// Request-bound conservative economic ceilings in the wallet asset, attested by the server
 /// signer with its authorization: `AllowitExpenseBounds`. Amounts use the wallet asset's seven
 /// decimals. For XLM, gas equals the fee bound in stroops.
@@ -380,9 +419,6 @@ impl ExpenseBounds {
             day: now / allowit_core::DAY,
         })
     }
-    /// These bounds with the fee bound lowered to `fee_stroops`. Gas falls pro rata and rounds
-    /// up, so it never counts less than the gas rate of these bounds prices `fee_stroops`; for
-    /// XLM it is `fee_stroops` itself. Spent units fall by the same gas.
     /// The bound of a transaction fee for terms whose gas repayment the server set itself, such
     /// as the gas that it repays after a carry: only the fee bound moves, and the gas that the
     /// wallet repays and counts stays.
@@ -414,14 +450,9 @@ impl ExpenseBounds {
         if self.gas_units < 0 {
             return Err("A gas carry lowers nonnegative gas".into());
         }
-        let bound = i128::from(self.max_fee_stroops);
         let repaid = self.repaid_after_carry(carry);
-        let gas_units = self
-            .gas_units
-            .checked_mul(repaid)
-            .and_then(|units| units.checked_add(bound - 1))
-            .map(|units| units / bound)
-            .ok_or("Expense overflow")?;
+        let gas_units = scale_units(self.gas_units, repaid, self.max_fee_stroops)
+            .map_err(|_| "Expense overflow")?;
         Ok(Self {
             gas_units,
             spent_units: self
@@ -432,17 +463,48 @@ impl ExpenseBounds {
             ..self.clone()
         })
     }
+    /// These bounds, the ceiling of the server's quote, at the transaction fee bound `fee_stroops`,
+    /// when the wallet repays that bound less `carry`, at least zero. The repayment converts once,
+    /// at the rate of these bounds, and rounds up, so an XLM wallet counts exactly what it repays
+    /// and another asset counts its units at the quoted rate; spent units change by the same gas.
+    /// Without a carry this is [`Self::with_fee_bound`]. A repayment above the gas cap `gas_cap` is
+    /// refused: the wallet repays at most its gas cap.
+    pub fn with_repayment(&self, fee_stroops: u32, carry: u128, gas_cap: i128) -> Result<Self> {
+        if fee_stroops == 0 || fee_stroops > self.max_fee_stroops || self.gas_units < 0 {
+            return Err("A fee bound lowers a positive fee ceiling".into());
+        }
+        let bound = i128::from(fee_stroops);
+        let base = bound - i128::try_from(carry).unwrap_or(i128::MAX).min(bound);
+        if base > gas_cap {
+            return Err("The repayment exceeds the wallet's gas cap".into());
+        }
+        let repaid = base;
+        let gas_units = scale_units(self.gas_units, repaid, self.max_fee_stroops)
+            .map_err(|_| "Expense overflow")?;
+        Ok(Self {
+            gas_units,
+            spent_units: self
+                .spent_units
+                .checked_sub(self.gas_units)
+                .and_then(|principal| principal.checked_add(gas_units))
+                .ok_or("Expense overflow")?,
+            max_fee_stroops: fee_stroops,
+            ..self.clone()
+        })
+    }
+    /// These bounds with the fee bound lowered to `fee_stroops`. Gas falls pro rata and rounds
+    /// up, so it never counts less than the gas rate of these bounds prices `fee_stroops`; for
+    /// XLM it is `fee_stroops` itself. Spent units fall by the same gas.
     pub fn with_fee_bound(&self, fee_stroops: u32) -> Result<Self> {
         if fee_stroops == 0 || fee_stroops > self.max_fee_stroops || self.gas_units < 0 {
             return Err("A fee bound lowers a positive fee ceiling".into());
         }
-        let ceiling = i128::from(self.max_fee_stroops);
-        let gas_units = self
-            .gas_units
-            .checked_mul(i128::from(fee_stroops))
-            .and_then(|units| units.checked_add(ceiling - 1))
-            .map(|units| units / ceiling)
-            .ok_or("Expense overflow")?;
+        let gas_units = scale_units(
+            self.gas_units,
+            i128::from(fee_stroops),
+            self.max_fee_stroops,
+        )
+        .map_err(|_| "Expense overflow")?;
         Ok(Self {
             gas_units,
             spent_units: self
@@ -490,8 +552,8 @@ impl ExecutionTerms {
             && self.gas_carry == 0
     }
     /// The stroops that a policy wallet repays under these terms: the explicit repayment, else
-    /// the fee bound of the expense less the gas carry, at least zero; nothing when unpriced.
-    /// An explicit repayment takes no carry.
+    /// the fee bound of the expense less the gas carry, at least zero; nothing when unpriced. An
+    /// explicit repayment takes no carry.
     pub fn repaid_stroops(&self) -> Result<i128> {
         match &self.gas {
             Some(_) if self.gas_carry != 0 => {
@@ -694,12 +756,14 @@ impl AccountState {
         Ok(())
     }
 }
-/// The state entries of a Custom policy source: the same scan as the contract's build.
+/// The wallet's storage of the figures and state keys that Core names for a Custom policy: the
+/// same functions as the contract's build.
 #[path = "../../../contracts/allowit-custom-policy/state_keys.rs"]
 pub mod state_keys;
-/// The declared state entries of a Custom policy source, as its build declares them.
-pub fn custom_state_entries(source: &str) -> Result<Vec<state_keys::StateEntry>> {
-    state_keys::declared(source, |name| hash(name)).map(|(entries, _)| entries)
+/// The state entries that the contract of a Custom wallet stores for the owner's `source`: the
+/// keys that Core's derivation gives the chain ([`policy::CustomParts::stored`]).
+pub fn custom_wallet_state_entries(source: &str) -> Result<Vec<state_keys::StateEntry>> {
+    Ok(policy::custom_parts(source)?.stored)
 }
 /// Chain-observed policy inputs of a layout 4 policy wallet.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -758,57 +822,58 @@ impl TrustedState {
             .policy_state
             .as_ref()
             .ok_or("Trusted layout 5 params and figures are required")?;
-        let kept = kept_figures(c);
+        let kept = wallet_figures(c);
         let wallet = &snapshot.figures;
         let open = wallet.day_ends != 0;
         let today = now / allowit_core::DAY;
         let server_today = self.spent_day == today;
-        let pick =
-            |figure: u8, own: i128, server: i128| if kept & figure != 0 { own } else { server };
+        let keeps = |key: &str| kept.contains(&key);
+        let pick = |key: &str, own: i128, server: i128| if keeps(key) { own } else { server };
         let mut state = std::collections::BTreeMap::new();
         state.insert(
             "calls".to_owned(),
             PolicyValue::Int(pick(
-                packed::CALLS,
+                "calls",
                 i128::from(wallet.calls),
                 i128::from(self.calls),
             )),
         );
         state.insert(
             "spent".to_owned(),
-            PolicyValue::Int(pick(packed::SPENT, wallet.spent, self.spent_total)),
+            PolicyValue::Int(pick("spent", wallet.spent, self.spent_total)),
         );
         state.insert(
             "unpriced".to_owned(),
-            PolicyValue::Bool(if kept & packed::SPENT != 0 {
+            PolicyValue::Bool(if keeps("unpriced") {
                 wallet.unpriced
             } else {
                 self.unpriced_total
             }),
         );
+        // The day of the daily figures below: each is of the wallet's current window or of the
+        // server's current UTC day, and an ended one reads as zero. Core's daily rules read it to
+        // roll those figures over. No policy reads it: Core's derivation refuses a use of it.
         state.insert("day".to_owned(), PolicyValue::Int(i128::from(today)));
         let server_daily = if server_today { self.spent_daily } else { 0 };
         let server_volume = if server_today { self.volume_daily } else { 0 };
+        // A daily figure of an ended window reads as zero, as the contract's state map holds it
+        // (Core's `AllowitStandardState::write`).
         let own_daily = |value: i128| if open { value } else { 0 };
         state.insert(
             "day_spent".to_owned(),
-            PolicyValue::Int(pick(
-                packed::DAY_SPENT,
-                own_daily(wallet.day_spent),
-                server_daily,
-            )),
+            PolicyValue::Int(pick("day_spent", own_daily(wallet.day_spent), server_daily)),
         );
         state.insert(
             "day_total".to_owned(),
             PolicyValue::Int(pick(
-                packed::DAY_TOTAL,
+                "day_total",
                 own_daily(wallet.day_total),
                 server_volume,
             )),
         );
         state.insert(
             "day_unpriced".to_owned(),
-            PolicyValue::Bool(if kept & (packed::DAY_SPENT | packed::DAY_TOTAL) != 0 {
+            PolicyValue::Bool(if keeps("day_unpriced") {
                 open && wallet.day_unpriced
             } else {
                 server_today && self.unpriced_daily
@@ -1020,14 +1085,66 @@ pub fn max_fee_ceiling(route: &WalletRoute) -> u32 {
     }
 }
 
-/// The figures that a policy wallet keeps for its checks: a Simple or Common wallet those of its
-/// rules with params; a Custom wallet every figure that its compiled source reads, which are the
-/// only ones that the source can read on the server too.
+/// The wallet entries of the figures that a policy wallet keeps for its checks: a Simple or
+/// Common wallet those of its rules with params. A Custom wallet whose contract compiles its whole
+/// source keeps every figure that the source reads, which are the only ones that the source can
+/// read on the server too. A Custom wallet whose source has a server part keeps the figures that
+/// Core names for its on-chain part, as its build does, and the server's accounting gives every
+/// other figure to the part that only the server runs.
 pub fn kept_figures(c: &WalletConfig) -> u8 {
-    if c.tier == Some(PolicyTier::Custom) {
-        return packed::ALL;
+    match server_part_figures(c) {
+        Some(figures) => state_keys::packed(figures.iter().copied()).unwrap_or(packed::ALL),
+        None if c.tier == Some(PolicyTier::Custom) => packed::ALL,
+        None => packed::standard_kept(&c.rules, &installed_params(c)),
     }
-    packed::standard_kept(&c.rules, &installed_params(c))
+}
+/// The keys of the figures that a Custom wallet whose source has a server part keeps: those that
+/// Core names for its on-chain part. A source that no longer derives keeps every figure: its
+/// operations are refused elsewhere.
+fn server_part_figures(c: &WalletConfig) -> Option<Vec<&'static str>> {
+    (c.tier == Some(PolicyTier::Custom))
+        .then(|| policy::custom_parts(&c.policy_source).ok())
+        .flatten()
+        .filter(|parts| parts.server_part)
+        .map(|parts| parts.figures)
+}
+/// Every standard figure that a policy wallet can give to an evaluation.
+const FIGURE_KEYS: [&str; 6] = [
+    "calls",
+    "spent",
+    "unpriced",
+    "day_spent",
+    "day_total",
+    "day_unpriced",
+];
+/// Whether a policy wallet gives every standard figure to an evaluation, so that the server's
+/// accounting gives none ([`wallet_figures`]).
+pub fn wallet_gives_every_figure(c: &WalletConfig) -> bool {
+    let given = wallet_figures(c);
+    FIGURE_KEYS.iter().all(|key| given.contains(key))
+}
+/// The keys of the figures that a policy wallet gives to an evaluation from its own entries; the
+/// server's accounting gives the others. A Custom wallet whose source has a server part gives
+/// exactly the figures that Core names for its on-chain part. Any other wallet gives the figures
+/// of its kept entries: `spent` and `unpriced` with `SPENT`, `calls` with `CALLS`, `day_spent`
+/// and `day_total` with their own entries, and `day_unpriced` with either daily entry.
+fn wallet_figures(c: &WalletConfig) -> Vec<&'static str> {
+    if let Some(figures) = server_part_figures(c) {
+        return figures;
+    }
+    let kept = kept_figures(c);
+    [
+        ("spent", packed::SPENT),
+        ("unpriced", packed::SPENT),
+        ("calls", packed::CALLS),
+        ("day_spent", packed::DAY_SPENT),
+        ("day_total", packed::DAY_TOTAL),
+        ("day_unpriced", packed::DAY_SPENT | packed::DAY_TOTAL),
+    ]
+    .into_iter()
+    .filter(|(_, entries)| kept & entries != 0)
+    .map(|(key, _)| key)
+    .collect()
 }
 /// The params that a policy wallet stores: a Simple or Common wallet keeps only the params of its
 /// on-chain rules, and the server keeps the rest of the owner's params; a Custom wallet keeps all.
@@ -1136,7 +1253,7 @@ fn validate_portable_install(c: &WalletConfig) -> Result<()> {
     if c.language != PolicyLanguage::Portable {
         return Err("Policy wallets of layout 4 run portable policy source".into());
     }
-    let shape = policy::source_shape(&c.policy_source)?;
+    let shape = policy::wallet_shape(tier, &c.policy_source)?;
     let expected = if tier == PolicyTier::Common {
         shape.prefix.clone()
     } else {
@@ -1145,12 +1262,10 @@ fn validate_portable_install(c: &WalletConfig) -> Result<()> {
     if c.rules != expected {
         return Err("Installed rules differ from the standard prefix of the policy source".into());
     }
-    // Only a Custom wallet stores its policy's own state: the entries that its build declares.
+    // Only a Custom wallet stores its policy's own state: the entries that the build of its
+    // on-chain part declares, which `wallet_shape` checked.
     if shape.writes_state && tier != PolicyTier::Custom {
         return Err(policy::WRITES_STATE.into());
-    }
-    if tier == PolicyTier::Custom {
-        custom_state_entries(&c.policy_source)?;
     }
     let digest = policy::installed_source_digest(
         tier,
@@ -1188,7 +1303,8 @@ pub fn operation_usage(p: &PreparedOperation) -> Result<Option<OperationUsage>> 
     if p.config.route != WalletRoute::PolicyWallet || p.payment_authorization.is_some() {
         return Ok(None);
     }
-    let operation = operation_from_request(&p.config, &p.request)?;
+    // The figures of the operation that executed, under the rules that admitted it.
+    let operation = retained_operation_from_request(&p.config, &p.request)?;
     let facts = policy::RuleRequest::new(
         &operation,
         &p.config.asset,
@@ -1441,8 +1557,9 @@ pub fn verify_policy(
 /// binding, owner params, execution args and expense bounds, run the Common prefix as the
 /// contract does and evaluate the full policy on the host when the source is canonical-only or
 /// `evaluator` compiles it. `Evaluation::Prefix` means only the onchain part ran: a Custom wallet
-/// runs the rest in native preflight, and the server evaluates the rest of a Simple or Common
-/// policy with `authorize_server_with`.
+/// runs the on-chain part of its source in native preflight, and the server evaluates the whole
+/// source of a Simple or Common policy, and of a Custom policy with a server part, with
+/// `authorize_server_with`.
 pub fn verify_operation(
     c: &WalletConfig,
     r: &ExecutionRequest,
@@ -1632,10 +1749,15 @@ fn verify_wallet_portable(
     {
         return Err("Installed policy wallet binding differs from the installation".into());
     }
-    if let Some(expense) = &terms.expense {
-        validate_expense(c, expense, terms.repaid_stroops()?, operation, state, now)?;
+    // As the wallet checks (`ExcessGas`): it repays at most its gas cap, the installed fee
+    // ceiling, whatever the terms add to the fee bound.
+    let repaid = terms.repaid_stroops()?;
+    if repaid > i128::from(c.max_fee_stroops) {
+        return Err("The gas repayment exceeds the wallet's gas cap".into());
     }
-    let shape = policy::source_shape(&c.policy_source)?;
+    if let Some(expense) = &terms.expense {
+        validate_expense(c, expense, repaid, operation, state, now)?;
+    }
     let request = policy::RuleRequest::new(
         operation,
         &c.asset,
@@ -1644,13 +1766,14 @@ fn verify_wallet_portable(
         terms.expense.clone(),
         terms.args.clone(),
     );
-    let declared: Vec<String> = if tier == PolicyTier::Custom {
-        custom_state_entries(&c.policy_source)?
-            .into_iter()
-            .map(|entry| entry.name)
-            .collect()
+    // The keys that the policy may write: those that the contract stores, and those that the
+    // server keeps for the part of a Custom wallet's source that only it runs.
+    let (shape, stored, server) = if tier == PolicyTier::Custom {
+        let parts = policy::custom_parts(&c.policy_source)?;
+        let stored: Vec<String> = parts.stored.into_iter().map(|entry| entry.name).collect();
+        (parts.shape, stored, parts.server_keys)
     } else {
-        vec![]
+        (policy::source_shape(&c.policy_source)?, vec![], vec![])
     };
     policy::evaluate(
         tier,
@@ -1660,7 +1783,10 @@ fn verify_wallet_portable(
         &state.policy_wallet_state(c, now)?,
         &request,
         evaluator,
-        Some(&declared),
+        Some(policy::WalletKeys {
+            stored: &stored,
+            server: &server,
+        }),
     )
 }
 fn muxed(value: &str) -> Result<MuxedAccount> {
@@ -1730,6 +1856,22 @@ fn legacy_wallet_request(
 /// server's sending account, which `terms` or the request's fee payer names; when both name one,
 /// they agree. An unpriced request repays nothing.
 pub(crate) fn gas_repayment(r: &ExecutionRequest, terms: &ExecutionTerms) -> Result<GasRepayment> {
+    if let Some(gas) = &terms.gas {
+        terms.repaid_stroops()?;
+        named_sender(r, terms)?;
+        return Ok(gas.clone());
+    }
+    let payee = named_sender(r, terms)?
+        .ok_or("A policy wallet operation needs the server's sending account as its gas payee")?;
+    Ok(GasRepayment {
+        stroops: terms.repaid_stroops()?,
+        payee,
+    })
+}
+/// The one sending account that a request and its terms name: the payer of the request's fee
+/// bound, the terms' sending account and the payee of an explicit repayment, when they name one.
+/// It does not depend on how much the wallet repays.
+fn named_sender(r: &ExecutionRequest, terms: &ExecutionTerms) -> Result<Option<String>> {
     let payer = match &r.fee_bounds {
         Some(fees) => Some(workflow_address(
             &fees.first().ok_or("Native fee bound required")?.payer,
@@ -1750,21 +1892,14 @@ pub(crate) fn gas_repayment(r: &ExecutionRequest, terms: &ExecutionTerms) -> Res
         }
         sender = Some(account);
     }
-    let stroops = terms.repaid_stroops()?;
-    if let Some(gas) = &terms.gas {
-        return Ok(gas.clone());
-    }
-    Ok(GasRepayment {
-        stroops,
-        payee: sender.ok_or(
-            "A policy wallet operation needs the server's sending account as its gas payee",
-        )?,
-    })
+    Ok(sender)
 }
 /// The sending account that a policy wallet operation names: the payee of its gas repayment and
 /// the fee payer of its request.
 pub fn gas_payee(r: &ExecutionRequest, terms: &ExecutionTerms) -> Result<String> {
-    Ok(gas_repayment(r, terms)?.payee)
+    named_sender(r, terms)?.ok_or_else(|| {
+        "A policy wallet operation needs the server's sending account as its gas payee".into()
+    })
 }
 /// The layout 5 `AllowitExecutionRequest` of one operation: its id, the wallet's deployment
 /// version, the expiry, the typed native operation, the expense, the gas repayment and the
@@ -2482,6 +2617,13 @@ fn validate_wallet_signed(s: &SignedOperation) -> Result<()> {
     let mut normalized = env.tx.clone();
     normalized.fee = unsigned.tx.fee;
     normalized.ext = unsigned.tx.ext.clone();
+    // The sender can send the same authorization again in a later transaction of its own: the
+    // wallet's authorization, not the sender's sequence, is the operation.
+    if env.tx.source_account == unsigned.tx.source_account
+        && env.tx.seq_num.0 >= unsigned.tx.seq_num.0
+    {
+        normalized.seq_num = unsigned.tx.seq_num.clone();
+    }
     let mut operations = normalized.operations.to_vec();
     let mut original = unsigned.tx.operations.to_vec();
     if let (
@@ -2714,4 +2856,54 @@ fn attach_resources(
         transaction_signers(&out, &automated_roles(&out.config))?;
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod repayment_width {
+    use super::*;
+    /// The gas of a wide ceiling scales down to the repayment without an intermediate overflow,
+    /// as the price of the same rate does: 10^37 units for 10,000,000 stroops are 10^32 for 100.
+    /// The helper is exact where the result fits, and refuses with its typed error where it
+    /// does not, or where an operand is outside its domain.
+    #[test]
+    fn mul_div_ceil_is_exact_or_out_of_range() {
+        assert_eq!(mul_div_ceil(1, 15, 10), Ok(2));
+        assert_eq!(
+            mul_div_ceil(10_u128.pow(30), 100, 10_000_000),
+            Ok(10_u128.pow(25))
+        );
+        let d = u32::MAX;
+        let wide = u128::from(d) - 1;
+        assert_eq!(mul_div_ceil(wide, wide, d), Ok(wide));
+        // An operand wider than `i128` whose result fits.
+        assert_eq!(mul_div_ceil(1 << 127, 5_000_000, 10_000_000), Ok(1 << 126));
+        assert_eq!(mul_div_ceil(u128::MAX, 2, 1), Err(OutOfRange));
+        assert_eq!(mul_div_ceil(1, 2, 0), Err(OutOfRange));
+        assert_eq!(scale_units(-1, 2, 3), Err(OutOfRange));
+        assert_eq!(scale_units(i128::MAX, 2, 1), Err(OutOfRange));
+        assert_eq!(scale_units(7, 3, 2), Ok(11));
+    }
+    #[test]
+    fn a_wide_ceiling_scales_to_its_repayment() {
+        let bounds = ExpenseBounds {
+            gas_units: 10_i128.pow(37),
+            conversion_units: 0,
+            spent_units: 10_i128.pow(37) + 1,
+            max_fee_stroops: 10_000_000,
+            observed_ledger: 9,
+            day: 1,
+        };
+        assert_eq!(
+            bounds.with_repayment(100, 0, i128::MAX).unwrap().gas_units,
+            10_i128.pow(32)
+        );
+        assert_eq!(
+            bounds.with_fee_bound(100).unwrap().gas_units,
+            10_i128.pow(32)
+        );
+        assert_eq!(
+            bounds.with_gas_carry(10_000_000 - 100).unwrap().gas_units,
+            10_i128.pow(32)
+        );
+    }
 }

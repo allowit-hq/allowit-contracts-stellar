@@ -99,12 +99,38 @@ pub fn rule_denial(code: u32) -> Problem {
 /// vault, or whose origin is unknown, is a plain wallet rejection with the raw code. A stale owner
 /// observation is `stale_owner_observation`, which a caller can retry once. Anything else stays
 /// a plain conflict.
+/// The problem of an error that names no refusal: a plain conflict with the error's own text.
+pub fn unnamed(message: impl Into<String>) -> Problem {
+    fail(message)
+}
+/// The problem of the typed refusal of one attempt to send an owner step to a lapsed wallet.
+pub fn lapsed_at_send() -> Problem {
+    coded(
+        409,
+        allowit_core::vendor::runtime::CONTRACT_EXPIRED,
+        "The wallet lapsed on the network, and this attempt of the owner step was not sent. An earlier attempt of the step stays as it was. Its owner restores the wallet outside Allowit.",
+    )
+}
 pub fn denial(message: &str, contract: Option<&ContractFault>, wallet: &str) -> Problem {
     if contract.is_none() && message == crate::rpc::owner_observation::STALE_OBSERVATION {
         return coded(409, "stale_owner_observation", message);
     }
     if contract.is_none() && [NOTHING_TO_RETURN, NOTHING_TO_RECOVER].contains(&message) {
         return coded(409, "nothing_to_return", message);
+    }
+    if contract.is_none() && message == crate::rpc::CONTRACT_EXPIRED {
+        return coded(
+            409,
+            allowit_core::vendor::runtime::CONTRACT_EXPIRED,
+            "The wallet lapsed on the network: nothing restores it, and nothing was signed or sent. Its owner restores it outside Allowit.",
+        );
+    }
+    if contract.is_none() && message == crate::rpc::PARAMS_DIFFER {
+        return coded(
+            409,
+            "params_differ_from_wallet",
+            "The wallet's params on the ledger are not the ones that its installation stores.",
+        );
     }
     if contract.is_none() && message == crate::rpc::EXECUTABLE_DIFFERS {
         return coded(
@@ -179,6 +205,12 @@ mod tests {
         let local = denial("Policy prefix denied: PaymentLimitExceeded", None, "");
         assert_eq!(local.code, "policy_denied");
         assert!(local.details.unwrap()["contractError"].is_null());
+    }
+    #[test]
+    fn a_wallet_whose_params_differ_from_its_installation_has_its_own_code() {
+        let problem = denial(crate::rpc::PARAMS_DIFFER, None, "wallet");
+        assert_eq!(problem.code, "params_differ_from_wallet");
+        assert_eq!(problem.status, 409);
     }
     #[test]
     fn a_wallet_with_other_code_than_its_configuration_has_its_own_code() {

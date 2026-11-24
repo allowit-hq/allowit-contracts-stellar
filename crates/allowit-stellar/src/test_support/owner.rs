@@ -226,6 +226,9 @@ pub struct OwnerLedger {
     /// The params, configuration revision and recorded usage that the wallet holds after an
     /// owner update. `None` is the installation's params at revision 1 with no usage.
     pub installed: Mutex<Option<(native::PolicyParams, u64, native::PolicyParams)>>,
+    /// What `getLatestLedger` states as the close time of its ledger (`closeTime`). `None`: the
+    /// reply states no time.
+    pub close_time: Mutex<Option<Value>>,
 }
 impl OwnerLedger {
     pub fn new(c: native::WalletConfig) -> Self {
@@ -237,6 +240,7 @@ impl OwnerLedger {
             lose_direct: false,
             events: Mutex::new(vec![]),
             installed: Mutex::new(None),
+            close_time: Mutex::new(None),
         }
     }
 }
@@ -251,7 +255,13 @@ impl OwnerLedger {
         let c = &self.config;
         match method {
             "getNetwork" => Ok(json!({"passphrase":native::passphrase(&c.network)?})),
-            "getLatestLedger" => Ok(json!({"sequence":120})),
+            "getLatestLedger" => {
+                let mut reply = json!({"sequence":120});
+                if let Some(time) = self.close_time.lock().unwrap().clone() {
+                    reply["closeTime"] = time;
+                }
+                Ok(reply)
+            }
             "getLedgerEntries" => {
                 let key = x::LedgerKey::from_xdr_base64(
                     params["keys"][0].as_str().unwrap(),
@@ -281,7 +291,7 @@ impl OwnerLedger {
                         code: wasm().try_into().unwrap(),
                     });
                     return Ok(
-                        json!({"latestLedger":120,"entries":[{"xdr":enc(&archival)},{"xdr":enc(&instance),"liveUntilLedgerSeq":520},{"xdr":enc(&code),"liveUntilLedgerSeq":1119}]}),
+                        json!({"latestLedger":120,"entries":[{"xdr":enc(&archival),"lastModifiedLedgerSeq":100},{"xdr":enc(&instance),"lastModifiedLedgerSeq":100,"liveUntilLedgerSeq":520},{"xdr":enc(&code),"lastModifiedLedgerSeq":100,"liveUntilLedgerSeq":1119}]}),
                     );
                 }
                 if let x::LedgerKey::Account(a) = key {

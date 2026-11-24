@@ -452,39 +452,86 @@ impl ServerHooks for Hooks {
         )
         .map_err(|_| Error::usage("The wallet sign-in signature is invalid"))
     }
-    /// The XLM fee in installed-asset units, rounded up. Native XLM is one to one; another
-    /// asset needs its `gasRates` entry, keyed by contract id or symbol.
+    /// The XLM fee in units of the installed asset `config["asset"]`, rounded up, at the rate
+    /// that [`ServerHooks::price_fee`] finds for that asset: one lookup ([`asset_rate`]) serves
+    /// both hooks, so a listed token without a rate under its contract id takes the rate of its
+    /// ticker. The two hooks differ in their range: this one keeps the arithmetic that the
+    /// server's admission reads and refuses a fee whose product with the rate does not fit its
+    /// signed 128 bits, which `price_fee` can still price.
     fn charged_fee(&self, network: &str, config: &Value, receipt: &ReceiptInfo) -> Result<i128> {
-        let network = self::network(network)?.id;
-        let fee = i128::try_from(receipt.fee.native_units)
-            .map_err(|_| Error::config("The receipt fee is out of range"))?;
         let asset = config
             .get("asset")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::config("The fee needs the installed asset"))?;
-        let tokens = provider::tokens_for(network);
-        let token = tokens
-            .iter()
-            .find(|t| crate::provider::token_contract(network, t).as_deref() == Some(asset));
-        if token.is_some_and(|t| t.native) {
+        let fee = i128::try_from(receipt.fee.native_units)
+            .map_err(|_| Error::config("The receipt fee is out of range"))?;
+        let Some(rate) = asset_rate(network, config, asset)? else {
             return Ok(fee);
-        }
-        let rates = config.get("gasRates").and_then(Value::as_object);
-        let rate = rates
-            .and_then(|r| r.get(asset).or_else(|| token.and_then(|t| r.get(t.code))))
-            .and_then(Value::as_str)
-            .and_then(rate)
-            .ok_or_else(|| {
-                Error::config(format!(
-                    "Configure gasRates to price the XLM fee in {asset}"
-                ))
-            })?;
-        // `rate` has 7 decimals, as XLM does, so units = ceil(fee * rate / 10^7).
+        };
+        // The arithmetic of this hook stays the one that the server's admission reads today:
+        // units = ceil(fee * rate / 10^7), refused when fee * rate does not fit.
         fee.checked_mul(rate)
             .and_then(|v| v.checked_add(9_999_999))
             .map(|v| v / 10_000_000)
             .ok_or_else(|| Error::config("The fee is out of range"))
     }
+    /// The XLM fee of `native_units` in the wallet's asset `asset` (its contract id), rounded
+    /// up, at the rate of [`asset_rate`], as `charged_fee` finds it. It refuses only a price
+    /// that its result cannot hold.
+    fn price_fee(
+        &self,
+        network: &str,
+        config: &Value,
+        asset: &str,
+        native_units: u128,
+    ) -> Result<i128> {
+        let out_of_range =
+            || Error::coded(AMOUNT_OUT_OF_RANGE, "The price of the fee is out of range");
+        let price = match asset_rate(network, config, asset)? {
+            None => native_units,
+            // `rate` has 7 decimals, as XLM does, so units = ceil(fee * rate / 10^7), unsigned
+            // until the price, with no intermediate value wider than it, as the repayment of a
+            // preparation computes it.
+            Some(rate) => crate::mul_div_ceil(
+                native_units,
+                u128::try_from(rate).map_err(|_| out_of_range())?,
+                10_000_000,
+            )
+            .map_err(|_| out_of_range())?,
+        };
+        i128::try_from(price).map_err(|_| out_of_range())
+    }
+}
+
+/// The code of a fee or a price that its type cannot hold.
+pub const AMOUNT_OUT_OF_RANGE: &str = "amount_out_of_range";
+/// The rate of the wallet's asset `asset` (its contract id) in `config`, scaled by 10^7, for
+/// both fee hooks: the rate under the asset's contract id, else, for a token of the network's
+/// list, the rate under its ticker. `None` for XLM, the network's own asset, one to one.
+fn asset_rate(network: &str, config: &Value, asset: &str) -> Result<Option<i128>> {
+    let network = self::network(network)?.id;
+    let xlm = crate::sac_address(network, &stellar_xdr::Asset::Native).map_err(Error::config)?;
+    if asset == xlm {
+        return Ok(None);
+    }
+    let rates = config.get("gasRates");
+    let ticker = || {
+        let listed = provider::tokens_for(network)
+            .iter()
+            .find(|t| provider::token_contract(network, t).as_deref() == Some(asset))?;
+        rates?.get(listed.code)
+    };
+    rates
+        .and_then(|rates| rates.get(asset))
+        .or_else(ticker)
+        .and_then(Value::as_str)
+        .and_then(rate)
+        .map(Some)
+        .ok_or_else(|| {
+            Error::config(format!(
+                "Configure gasRates to price the XLM fee in {asset}"
+            ))
+        })
 }
 
 /// A positive decimal string with at most 7 fraction digits, scaled by 10^7.
@@ -890,7 +937,8 @@ mod tests {
         let tokens = provider::tokens_for("stellar:testnet");
         let xlm = provider::token_contract("stellar:testnet", &tokens[0]).unwrap();
         let usdc = provider::token_contract("stellar:testnet", &tokens[1]).unwrap();
-        let config = |asset: &str| serde_json::json!({"asset":asset,"gasRates":{"USDC":"0.15"}});
+        let config =
+            |asset: &str| serde_json::json!({"asset":asset,"gasRates":{usdc.as_str():"0.15"}});
         assert_eq!(
             hooks
                 .charged_fee("stellar:testnet", &config(&xlm), &receipt(1_234))
@@ -920,6 +968,139 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    /// A fee is priced at the rate of the wallet's asset: the rate under its contract id, else the
+    /// ticker rate of a listed token, one lookup for both hooks. XLM is one to one.
+    #[test]
+    fn a_fee_is_priced_by_the_rate_of_the_wallets_asset() {
+        let hooks = PLUGIN.server();
+        let network = "stellar:testnet";
+        let issued = |code: &str| {
+            let issuer = crate::account_for_seed(&[40; 32]);
+            crate::sac_address(
+                network,
+                &crate::asset_from_identity(code, Some(&issuer)).unwrap(),
+            )
+            .unwrap()
+        };
+        let foo = issued("FOO");
+        let usdc = provider::token_contract(network, &provider::tokens_for(network)[1]).unwrap();
+        let xlm = crate::sac_address(network, &stellar_xdr::Asset::Native).unwrap();
+        let rates = |key: &str| serde_json::json!({"gasRates": {key: "0.15"}});
+        assert_eq!(
+            hooks.price_fee(network, &rates(&foo), &foo, 1_000).unwrap(),
+            150
+        );
+        assert_eq!(
+            hooks
+                .price_fee(network, &rates(&usdc), &usdc, 1_000)
+                .unwrap(),
+            150
+        );
+        assert_eq!(
+            hooks
+                .price_fee(network, &serde_json::json!({}), &xlm, 1_000)
+                .unwrap(),
+            1_000
+        );
+        // A price that fits is given, whatever the width of fee times rate: 100 stroops at
+        // 10^30 units per XLM are 10^32 units.
+        let wide =
+            serde_json::json!({"gasRates": {foo.as_str(): "1000000000000000000000000000000"}});
+        assert_eq!(
+            hooks.price_fee(network, &wide, &foo, 100).unwrap(),
+            10_i128.pow(32)
+        );
+        // The existing receipt hook keeps the rate of a listed token's ticker.
+        let ticker = serde_json::json!({"asset": usdc.as_str(), "gasRates": {"USDC": "0.15"}});
+        let receipt = crate::host::runtime::ReceiptInfo {
+            transaction_hash: [0; 32],
+            status: crate::host::runtime::Status::Confirmed,
+            observed_height: 1,
+            fee: allowit_core::vendor::runtime::Fee {
+                native_units: 1_000,
+                charged_units: 0,
+                repaid_native_units: 0,
+            },
+            debits: Vec::new(),
+            settlement_hash: None,
+        };
+        assert_eq!(hooks.charged_fee(network, &ticker, &receipt).unwrap(), 150);
+        // A rate under the contract id comes before the ticker's.
+        let both = serde_json::json!({"asset": usdc.as_str(),
+            "gasRates": {"USDC": "0.15", usdc.as_str(): "0.20"}});
+        assert_eq!(hooks.charged_fee(network, &both, &receipt).unwrap(), 200);
+        // The price is exact for every native fee whose price fits: 2^127 stroops at 0.5.
+        let half = serde_json::json!({"gasRates": {usdc.as_str(): "0.5"}});
+        assert_eq!(
+            hooks.price_fee(network, &half, &usdc, 1 << 127).unwrap(),
+            1 << 126
+        );
+        assert_eq!(
+            hooks
+                .price_fee(network, &half, &usdc, u128::MAX)
+                .unwrap_err()
+                .api_code
+                .as_deref(),
+            Some(AMOUNT_OUT_OF_RANGE)
+        );
+        // At an extreme rate the receipt hook keeps the server's refusal of today, and the
+        // wallet's price is the exact one: 5,000,000 stroops at 10^30 are 5 * 10^36 units.
+        let extreme = serde_json::json!({"asset": usdc.as_str(),
+            "gasRates": {usdc.as_str(): "1000000000000000000000000000000"}});
+        let wide = ReceiptInfo {
+            fee: allowit_core::vendor::runtime::Fee {
+                native_units: 5_000_000,
+                ..receipt.fee
+            },
+            ..receipt.clone()
+        };
+        assert!(hooks.charged_fee(network, &extreme, &wide).is_err());
+        // A product that fits but whose rounding does not is refused too, as the server's
+        // admission reads it.
+        let rounding = serde_json::json!({"asset": usdc.as_str(),
+            "gasRates": {usdc.as_str(): "3402823669209384634633746.0743176"}});
+        assert!(hooks.charged_fee(network, &rounding, &wide).is_err());
+        assert_eq!(
+            hooks
+                .price_fee(network, &extreme, &usdc, 5_000_000)
+                .unwrap(),
+            5 * 10_i128.pow(36)
+        );
+        // One lookup for both hooks: a listed token's ticker rate prices it in each, a contract
+        // id rate comes first, and the ticker of a token outside the list names no asset.
+        let receipt_of = |native_units| ReceiptInfo {
+            fee: allowit_core::vendor::runtime::Fee {
+                native_units,
+                ..receipt.fee
+            },
+            ..receipt.clone()
+        };
+        for (config, asset, expected) in [
+            (rates("USDC"), &usdc, Some(150)),
+            (
+                serde_json::json!({"gasRates": {"USDC": "0.15", usdc.as_str(): "0.20"}}),
+                &usdc,
+                Some(200),
+            ),
+            (rates("FOO"), &foo, None),
+        ] {
+            let mut with_asset = config.clone();
+            with_asset["asset"] = serde_json::json!(asset);
+            assert_eq!(
+                hooks.price_fee(network, &config, asset, 1_000).ok(),
+                expected,
+                "{config}"
+            );
+            assert_eq!(
+                hooks
+                    .charged_fee(network, &with_asset, &receipt_of(1_000))
+                    .ok(),
+                expected,
+                "{config}"
+            );
+        }
     }
 
     #[test]

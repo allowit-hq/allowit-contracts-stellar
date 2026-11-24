@@ -393,7 +393,8 @@ impl Server {
                         );
                     }
                     "/api/micro/runtime" => reply(&mut stream, 200, plan.discovery.clone(), ""),
-                    "/api/native/templates" => {
+                    // Every caller names the network of its templates request.
+                    "/api/native/templates?network=stellar:testnet" => {
                         assert_eq!(body, json!({}));
                         reply(&mut stream, 200, plan.templates.clone(), "")
                     }

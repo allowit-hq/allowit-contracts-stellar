@@ -141,6 +141,9 @@ def contract_build_sources(root):
     for member in members:
         files += sorted((root / member).rglob("*.rs"))
         files += sorted((root / member).rglob("Cargo.toml"))
+        # A Custom contract's build inputs beside its policy: the figures and state keys of Core's derivation.
+        files += sorted((root / member).rglob("*.figures"))
+        files += sorted((root / member).rglob("*.state"))
     return files + [root / "scripts" / name for name in BUILD_SCRIPTS]
 
 

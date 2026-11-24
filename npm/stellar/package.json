@@ -2,6 +2,7 @@
   "name": "@allowit/stellar",
   "version": "0.4.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "files": [
     "dist"
@@ -17,7 +18,7 @@
     }
   },
   "dependencies": {
-    "@allowit/core": "github:allowit-hq/allowit-core#9dfd9f1e7fef0e99d984cdd1a2fe781f5b53bc73",
+    "@allowit/core": "github:allowit-hq/allowit-core#463c244aec5111c36d0cb09db6de312c6bd737f4",
     "@noble/curves": "1.9.7",
     "@noble/hashes": "1.8.0",
     "@stellar/freighter-api": "6.0.1",

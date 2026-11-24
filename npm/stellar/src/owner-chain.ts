@@ -7,8 +7,8 @@
 import type {OwnerChain} from '@allowit/core';
 import {Keypair} from '@stellar/stellar-sdk/base';
 import {expiredRecord, horizonGet} from './chain-record.js';
-import {OWNER_WEIGHT, approvalStep, nativeApprovalHolds, nativeWalletConfiguration, policyApproval, prepareNativeSetup, sendNativeSetup,
-  signedNativeSetupOf, type PolicyApproval, type ReviewedPolicy} from './native-wallet.js';
+import {OWNER_WEIGHT, approvalStep, checkNativeAsset, nativeApprovalHolds, nativeWalletConfiguration, policyApproval, prepareNativeSetup,
+  sendNativeSetup, signedNativeSetupOf, type PolicyApproval, type ReviewedPolicy} from './native-wallet.js';
 
 const object = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
 
@@ -52,6 +52,7 @@ export const ownerChain: OwnerChain = Object.freeze({
   keypairSetup: Object.freeze({
     prepare: prepareNativeSetup,
     read: signedNativeSetupOf,
+    checkAsset: checkNativeAsset,
     send: (network: string, signedPayload: string, hash: string): Promise<number | null> => sendNativeSetup(network, signedPayload, hash),
     configuration: nativeWalletConfiguration,
   }),

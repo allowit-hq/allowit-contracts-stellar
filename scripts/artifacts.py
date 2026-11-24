@@ -21,6 +21,9 @@ members = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["members
 for member in members:
     source_files += sorted((ROOT / member).rglob("*.rs"))
     source_files += sorted((ROOT / member).rglob("Cargo.toml"))
+    # A Custom contract's build inputs beside its policy: the figures and state keys of Core's derivation.
+    source_files += sorted((ROOT / member).rglob("*.figures"))
+    source_files += sorted((ROOT / member).rglob("*.state"))
 source_files += [ROOT / "scripts" / name for name in ("build-contracts.sh", "check-policy-bindings.py", "policy_source.py", "core_sources.py")]
 manifest = {
     "schema": 2,

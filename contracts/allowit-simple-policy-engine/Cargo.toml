@@ -3,7 +3,7 @@ name = "allowit-simple-policy-engine"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
-license = "UNLICENSED"
+license = "MIT"
 publish = false
 
 [lib]

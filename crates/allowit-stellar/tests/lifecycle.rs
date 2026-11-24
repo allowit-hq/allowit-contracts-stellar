@@ -567,6 +567,159 @@ fn stale_or_changed_payload_cannot_be_signed() {
     assert!(validate_signed(&signed, 86401).is_err());
 }
 #[test]
+fn a_packet_is_built_only_for_the_trusted_wallet_and_within_its_utc_day() {
+    // The trusted server key must be the configured one on the routes that have a server.
+    for route in [WalletRoute::Native, WalletRoute::PolicyWallet] {
+        let (c, r, s) = fixture(route.clone(), false);
+        assert!(prepare(&c, &r, &s, 86401, 86700).is_ok());
+        let mut changed = s.clone();
+        changed.server = account_for_seed(&[11; 32]);
+        assert!(prepare(&c, &r, &changed, 86401, 86700).is_err());
+    }
+    // A Native transfer moves a positive amount out of the wallet itself. Each case changes the
+    // instruction alone, or with the effect that it implies, so only the transfer check refuses.
+    let (c, r, s) = fixture(WalletRoute::Native, false);
+    for edit in [0, 1] {
+        let mut changed = r.clone();
+        let ExecutionInput::Instructions(v) = &mut changed.input else {
+            panic!()
+        };
+        let NativeInstruction::StellarNativeTransfer {
+            source, stroops, ..
+        } = &mut v[0]
+        else {
+            panic!()
+        };
+        if edit == 0 {
+            // The approved effect still names the wallet as its source.
+            *source = wf(&account_for_seed(&[12; 32]));
+        } else {
+            *stroops = 0;
+            changed.effect_bounds[0].max_debit = 0u64.into();
+            changed.effect_bounds[0].min_credit = 0u64.into();
+        }
+        assert_eq!(
+            prepare(&c, &changed, &s, 86401, 86700).unwrap_err(),
+            "Invalid transfer source, amount or recipient"
+        );
+    }
+    // The approved effect names the asset that moves, its beneficiary and its amount.
+    for edit in 0..4 {
+        let (c, mut r, s) = fixture(WalletRoute::Native, true);
+        let network = network_id(&c.network).unwrap();
+        match edit {
+            0 => {
+                r.effect_bounds[0].asset = WorkflowAsset::Native {
+                    chain: Chain::Stellar,
+                    network,
+                }
+            }
+            1 => {
+                r.effect_bounds[0].asset = WorkflowAsset::Token(AssetId {
+                    network,
+                    token: wf(&Contract([9; 32]).to_string()),
+                })
+            }
+            2 => r.effect_bounds[0].beneficiary = wf(&account_for_seed(&[13; 32])),
+            _ => r.effect_bounds[0].min_credit = 20_000_001u64.into(),
+        }
+        assert!(prepare(&c, &r, &s, 86401, 86700).is_err());
+    }
+    // A token transfer calls the wallet's own asset contract.
+    let (c, mut r, s) = fixture(WalletRoute::Native, true);
+    assert!(prepare(&c, &r, &s, 86401, 86700).is_ok());
+    let ExecutionInput::Instructions(v) = &mut r.input else {
+        panic!()
+    };
+    let NativeInstruction::StellarCall { contract, .. } = &mut v[0] else {
+        panic!()
+    };
+    *contract = wf(&Contract([9; 32]).to_string());
+    assert!(prepare(&c, &r, &s, 86401, 86700).is_err());
+    // The installed source text is the one that the source hash names.
+    let (mut c, r, s) = fixture(WalletRoute::Native, false);
+    c.policy_source.push('\n');
+    assert!(prepare(&c, &r, &s, 86401, 86700).is_err());
+    // A Native packet carries no execution args: the Native check refuses them first.
+    let (c, r, s) = fixture(WalletRoute::Native, false);
+    let mut args = PolicyParams::default();
+    args.0.insert("invoice".into(), PolicyValue::Int(1));
+    let terms = ExecutionTerms {
+        args,
+        ..Default::default()
+    };
+    assert_eq!(
+        prepare_with(&c, &r, &terms, &s, 86401, 86700).unwrap_err(),
+        "Classic custody carries no execution args or expense bounds"
+    );
+    // The trusted agent key of a Native wallet must be the configured one.
+    let (c, r, s) = fixture(WalletRoute::Native, false);
+    let mut changed = s.clone();
+    changed.agent = account_for_seed(&[11; 32]);
+    assert!(prepare(&c, &r, &changed, 86401, 86700).is_err());
+    // The params that a policy wallet stores are the installed ones.
+    let (c, r, s) = fixture(WalletRoute::PolicyWallet, false);
+    let mut changed = s.clone();
+    let mut params = installed_params(&c);
+    params.0.insert("payment_limit".into(), PolicyValue::Int(1));
+    changed.policy_state.as_mut().unwrap().params = params;
+    assert!(prepare(&c, &r, &changed, 86401, 86700).is_err());
+    // So are the source hash and the rules that the wallet's own state names.
+    let mut changed = s.clone();
+    changed.policy_state.as_mut().unwrap().source_hash = [3; 32];
+    assert!(prepare(&c, &r, &changed, 86401, 86700).is_err());
+    let mut changed = s.clone();
+    changed.policy_state.as_mut().unwrap().rules = vec!["payment_limit".into()];
+    assert!(prepare(&c, &r, &changed, 86401, 86700).is_err());
+    // The trusted account of a Native wallet is the configured wallet, with the agent signing.
+    // Each refusal is the wallet check's own: a paused account also lacks the payment quorum,
+    // which a later check would refuse.
+    let (c, r, s) = fixture(WalletRoute::Native, false);
+    let mut other = s.clone();
+    other.source.address = account_for_seed(&[12; 32]);
+    assert_eq!(
+        prepare(&c, &r, &other, 86401, 86700).unwrap_err(),
+        "Native wallet identity differs"
+    );
+    let mut paused = s.clone();
+    paused.source.signers.retain(|signer| signer.key != c.agent);
+    assert_eq!(
+        prepare(&c, &r, &paused, 86401, 86700).unwrap_err(),
+        "Customer is not a current account signer"
+    );
+    // A Native approval ends within its UTC day: 100 seconds before midnight it may run for 100
+    // seconds, not for 200.
+    let (c, r, s) = fixture(WalletRoute::Native, false);
+    let midnight = 2 * 86_400;
+    assert!(prepare(&c, &r, &s, midnight - 100, midnight).is_ok());
+    assert!(
+        prepare(&c, &r, &s, midnight - 100, midnight + 100)
+            .unwrap_err()
+            .contains("cross its UTC budget day")
+    );
+}
+#[test]
+fn an_envelope_signature_that_does_not_verify_is_refused_even_with_the_right_hint() {
+    let (c, r, s) = fixture(WalletRoute::Native, false);
+    let p = prepare(&c, &r, &s, 86401, 86700).unwrap();
+    let mut signed = sign_native(&p);
+    validate_signed(&signed, 86401).unwrap();
+    let TransactionEnvelope::Tx(mut env) =
+        TransactionEnvelope::from_xdr_base64(&signed.transaction_xdr, Limits::none()).unwrap()
+    else {
+        panic!()
+    };
+    let mut signatures = env.signatures.to_vec();
+    let mut bytes = signatures[0].signature.0.to_vec();
+    bytes[0] ^= 1;
+    signatures[0].signature = stellar_xdr::Signature(bytes.try_into().unwrap());
+    env.signatures = signatures.try_into().unwrap();
+    signed.transaction_xdr = TransactionEnvelope::Tx(env)
+        .to_xdr_base64(Limits::none())
+        .unwrap();
+    assert!(validate_signed(&signed, 86401).is_err());
+}
+#[test]
 fn classic_limits_keep_exact_local_math_while_odc_requires_native_preflight() {
     for route in [WalletRoute::Native, WalletRoute::PolicyWallet] {
         let (mut c, mut r, mut s) = fixture(route.clone(), true);
@@ -595,6 +748,7 @@ fn classic_limits_keep_exact_local_math_while_odc_requires_native_preflight() {
         }
         s.source_hash = c.source_hash;
         let prepared = prepare(&c, &r, &s, 86401, 86700).unwrap();
+        verify_policy(&c, &r, &s, 86401).unwrap();
         if c.route == WalletRoute::PolicyWallet {
             // Host evaluation admits it, but signing still needs native preflight.
             assert!(
@@ -613,6 +767,7 @@ fn classic_limits_keep_exact_local_math_while_odc_requires_native_preflight() {
         r.effect_bounds[0].max_debit = 20_000_001u64.into();
         r.effect_bounds[0].min_credit = 20_000_001u64.into();
         assert!(prepare(&c, &r, &s, 86401, 86700).is_err());
+        assert!(verify_policy(&c, &r, &s, 86401).is_err());
     }
 }
 #[test]
@@ -624,7 +779,10 @@ fn odc_uses_execute_and_exact_module_schema_payload() {
         .to_xdr_base64(Limits::none())
         .unwrap();
     let p = attach_simulation(&p, &data).unwrap();
+    // The server's authorization is required, and present once the server signed.
+    assert!(validate_server_authorization(&p).is_err());
     let p = server_ready(&p);
+    validate_server_authorization(&p).unwrap();
     let sig = sign(&p, &[2; 32], 86401).unwrap();
     let signed = authorize(&p, &[sig], 86401).unwrap();
     validate_signed(&signed, 86401).unwrap();
@@ -1621,6 +1779,11 @@ impl rpc::Rpc for AdminRpc {
             {
                 return self.base.call(method, params);
             }
+            if matches!(key, LedgerKey::ContractCode(_)) {
+                // The wallet's code is not on the model network: an owner step's liveness read
+                // finds a live instance and no lapsed code.
+                return Ok(json!({"latestLedger":120,"entries":[]}));
+            }
             if matches!(key, LedgerKey::Account(_)) {
                 // Trusted delegated discovery reads the agent; owner administration reads the
                 // current owner and a new owner of a handoff.
@@ -1685,6 +1848,9 @@ impl rpc::Rpc for AdminRpc {
             storage[0].val = ScVal::Bytes(bytes.try_into().unwrap());
             instance.storage = Some(storage.try_into().unwrap());
             response["entries"][0]["xdr"] = json!(entry.to_xdr_base64(Limits::none()).unwrap());
+            // The instance is live: the ledger of the reply, and the instance's live-until ledger.
+            response["latestLedger"] = json!(120);
+            response["entries"][0]["liveUntilLedgerSeq"] = json!(100_000);
             return Ok(response);
         }
         if method == "simulateTransaction" {
@@ -2101,6 +2267,13 @@ fn owner_handoff_completes_with_the_new_owner_signature(
     // The latest ledger in the mock is 120.
     let signed = sign_owner_entry(&c.network, recorded, &[51; 32], 130);
     let signed_xdr = signed.to_xdr_base64(Limits::none()).unwrap();
+    // The rail signs the recorded entry as the test does, and only the seed's own unsigned entry.
+    assert_eq!(
+        sign_account_entry(&c.network, recorded, &[51; 32], 130).unwrap(),
+        signed
+    );
+    assert!(sign_account_entry(&c.network, recorded, &[52; 32], 130).is_err());
+    assert!(sign_account_entry(&c.network, &signed, &[51; 32], 130).is_err());
     let rejects = |entry: SorobanAuthorizationEntry| {
         owner_admin
             .complete_owner_handoff(prepared, &entry.to_xdr_base64(Limits::none()).unwrap())
@@ -2461,6 +2634,65 @@ fn native_preflight_binds_new_signing_and_json_cannot_restore_it() {
         assert!(sign(&changed, &[2; 32], 86401).is_err(), "{change}");
     }
 }
+/// A Custom wallet whose source has a server part. Its contract compiles only the on-chain part,
+/// so the server signs after it evaluated the whole source: without its evaluator it does not
+/// sign, a denial of the evaluator is its denial, and a pass signs. The wallet keeps the figures
+/// that its on-chain part reads, so an execution needs the server's accounting of the others.
+#[test]
+fn a_custom_wallet_with_a_server_part_signs_only_after_the_servers_evaluation() {
+    let mut rpc = preflight_fixture();
+    let one = PORTABLE.replace(
+        "    Ok(())\n}",
+        "    let score = allowit::decision(ctx, &allowit::AllowitDecision { id: \"research\", query: \"Is this payment for research?\", deny_below: 3000, allow_above: 8000 })?;\n    allowit::set_state(ctx, \"last_score\", score)?;\n    Ok(())\n}",
+    );
+    assert_ne!(one, PORTABLE);
+    let parts = policy::custom_parts(&one).unwrap();
+    assert!(parts.server_part && parts.onchain == PORTABLE);
+    assert_eq!(parts.server_keys, ["last_score"]);
+    rpc.base.config.source_hash = hash(&one);
+    rpc.base.config.source_digest = rpc.base.config.source_hash;
+    rpc.base.config.policy_source = one;
+    let c = rpc.base.config.clone();
+    assert_eq!(kept_figures(&c), 0);
+    assert!(
+        rpc::prepare(&rpc, &c, &rpc.request, None, 86401, 86700)
+            .unwrap_err()
+            .contains("needs the server's accounting")
+    );
+    let accounting = rpc::NativeAccounting {
+        nonce: 0,
+        deployment_version: 0,
+        spent_daily: 0,
+        spent_total: 0,
+        spent_day: 1,
+        volume_daily: 0,
+        unpriced_total: false,
+        unpriced_daily: false,
+        calls: 0,
+    };
+    let p = rpc::prepare(&rpc, &c, &rpc.request, Some(accounting), 86401, 86700).unwrap();
+    assert_eq!(
+        authorize_server(&p, &[3; 32], 86401, None).unwrap_err(),
+        policy::NEEDS_SERVER_EVALUATION
+    );
+    let deny: policy::PortableEvaluator = &|_| Err(allowit_core::AllowitError::Unsupported);
+    assert!(
+        authorize_server_with(&p, &[3; 32], 86401, deny)
+            .unwrap_err()
+            .contains("denied")
+    );
+    // The server part writes its own key: the server keeps it, and the wallet's build does
+    // not declare it.
+    let pass: policy::PortableEvaluator =
+        &|ctx| allowit_core::set_state(ctx, "last_score", 9_000u32);
+    authorize_server_with(&p, &[3; 32], 86401, pass).unwrap();
+    let stray: policy::PortableEvaluator = &|ctx| allowit_core::set_state(ctx, "other", 1u32);
+    assert!(
+        authorize_server_with(&p, &[3; 32], 86401, stray)
+            .unwrap_err()
+            .contains("does not declare")
+    );
+}
 #[test]
 fn local_revalidation_preserves_existing_unsigned_identity_and_checks_current_authority() {
     let rpc = preflight_fixture();
@@ -2794,6 +3026,95 @@ fn a_simple_wallet_reads_the_daily_volume_and_unpriced_flags_from_the_servers_ac
     ] {
         assert_eq!(yesterday[key], value, "{key}");
     }
+}
+
+/// A Custom wallet whose on-chain part keeps the daily spending figure, while only the server
+/// reads the daily volume. The wallet gives the figures that Core names for its on-chain part,
+/// the daily spending and the daily unpriced flag, and the server's accounting gives the daily
+/// volume. A daily volume rule that only the server runs is refused: it reads the daily unpriced
+/// flag, which the wallet keeps in a window of its own (Core 0.18).
+#[test]
+fn a_split_custom_wallet_gives_the_figures_that_core_names_from_the_wallet() {
+    let (mut c, r, s) = fixture(WalletRoute::PolicyWallet, true);
+    let split = |server: &str| {
+        format!(
+            "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {{\n    allowit::daily_spending_limit(ctx, &ctx.params[allowit::DAILY_SPENDING_LIMIT])?;\n    let score = allowit::decision(ctx, &allowit::AllowitDecision {{ id: \"a\", query: \"Is this research?\", deny_below: 1, allow_above: 2 }})?;\n    if score < 9000 {{\n{server}    }}\n    Ok(())\n}}\n"
+        )
+    };
+    let refused = policy::tier_rules(
+        PolicyTier::Custom,
+        &split("        allowit::daily_volume_limit(ctx, &ctx.params[allowit::DAILY_VOLUME_LIMIT])?;\n"),
+    )
+    .unwrap_err();
+    assert!(
+        refused.contains("depends on the daily figure \"day_unpriced\""),
+        "{refused}"
+    );
+    install(
+        &mut c,
+        PolicyTier::Custom,
+        &split(
+            "        let total: i128 = allowit::get_state(ctx, \"day_total\")?.unwrap_or(0);\n        assert!(total < 1_000);\n",
+        ),
+        json!({"daily_spending_limit": 100}),
+    );
+    assert_eq!(kept_figures(&c), 4);
+    let rpc = preflight_rpc(&c, &r, &s);
+    let now = 86_401;
+    let figures = |unpriced_daily: bool| {
+        rpc::trusted_state(
+            &rpc,
+            &c,
+            Some(rpc::NativeAccounting {
+                spent_daily: 3,
+                spent_day: now / 86_400,
+                volume_daily: 9,
+                unpriced_daily,
+                ..server_accounting()
+            }),
+        )
+        .unwrap()
+        .policy_wallet_state(&c, now)
+        .unwrap()
+        .0
+    };
+    let marked = figures(true);
+    // The wallet's daily window is not open: its own figures read as zero and false, also when
+    // the server's accounting marks its own day. The volume is the server's.
+    assert_eq!(marked["day_spent"], PolicyValue::Int(0));
+    assert_eq!(marked["day_total"], PolicyValue::Int(9));
+    assert_eq!(marked["day_unpriced"], PolicyValue::Bool(false));
+    assert_eq!(figures(false), marked);
+}
+
+/// A Custom wallet whose on-chain part reads four figures directly, while only the server reads
+/// the lifetime unpriced flag. Every wallet entry is kept, yet Core leaves the flag to the
+/// server: the server's accounting gives it, so an execution needs that accounting.
+#[test]
+fn a_split_custom_wallet_takes_from_the_server_a_figure_that_core_leaves_to_it() {
+    let (mut c, r, s) = fixture(WalletRoute::PolicyWallet, true);
+    install(
+        &mut c,
+        PolicyTier::Custom,
+        "use allowit::prelude::*;\npub fn execute(ctx: &AllowitContext) -> allowit::Result {\n    let calls: u64 = allowit::get_state(ctx, \"calls\")?.unwrap_or(0);\n    let spent: i128 = allowit::get_state(ctx, \"spent\")?.unwrap_or(0);\n    let day_spent: i128 = allowit::get_state(ctx, \"day_spent\")?.unwrap_or(0);\n    let day_total: i128 = allowit::get_state(ctx, \"day_total\")?.unwrap_or(0);\n    assert!(calls < 1_000 && spent < 1_000_000 && day_spent < 1_000 && day_total < 1_000);\n    let score = allowit::decision(ctx, &allowit::AllowitDecision { id: \"a\", query: \"Is this research?\", deny_below: 1, allow_above: 2 })?;\n    if score < 9000 {\n        let unpriced: bool = allowit::get_state(ctx, \"unpriced\")?.unwrap_or(false);\n        assert!(!unpriced);\n    }\n    Ok(())\n}\n",
+        json!({}),
+    );
+    assert_eq!(kept_figures(&c), allowit_stellar::packed::ALL);
+    assert!(!allowit_stellar::wallet_gives_every_figure(&c));
+    let rpc = preflight_rpc(&c, &r, &s);
+    let state = rpc::trusted_state(
+        &rpc,
+        &c,
+        Some(rpc::NativeAccounting {
+            unpriced_total: true,
+            ..server_accounting()
+        }),
+    )
+    .unwrap()
+    .policy_wallet_state(&c, 86_401)
+    .unwrap()
+    .0;
+    assert_eq!(state["unpriced"], PolicyValue::Bool(true));
 }
 
 #[test]

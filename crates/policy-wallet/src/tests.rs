@@ -39,6 +39,8 @@ pub(super) const DAILY_STATE: &[u8] =
     include_bytes!("../../../target/test-fixtures/custom_daily.wasm");
 pub(super) const VAULT: &[u8] =
     include_bytes!("../../../target/wasm32v1-none/release/allowit_sep56_test_vault.wasm");
+/// Not a Wasm: for this name `Fixture::with` registers the native wallet of [`ReadsDayUnpriced`].
+const READS_DAY_UNPRICED: &[u8] = b"native wallet of ReadsDayUnpriced";
 
 /// A `List` of `Addr` values.
 fn addresses(env: &Env, items: &[&Address]) -> AllowitValue {
@@ -215,7 +217,11 @@ impl Fixture {
             params,
         };
         edit(&env, &mut config);
-        let wallet = env.register(wasm, (config,));
+        let wallet = if wasm == READS_DAY_UNPRICED {
+            env.register(reads_day_unpriced::Wallet, (config,))
+        } else {
+            env.register(wasm, (config,))
+        };
         if issued {
             StellarAssetClient::new(&env, &asset).mint(&wallet, &1_000);
         } else {
@@ -591,7 +597,7 @@ type ConfigCase = (&'static str, fn(&Env, &mut AllowitPolicyConfig));
 #[test]
 fn request_bindings_and_gas_are_checked() {
     let f = Fixture::new(SIMPLE);
-    let cases: [RequestCase; 8] = [
+    let cases: [RequestCase; 10] = [
         (
             "stale version",
             |_, e| e.1 = 1,
@@ -648,6 +654,24 @@ fn request_bindings_and_gas_are_checked() {
             },
             AllowitWalletError::InvalidInvocation,
         ),
+        (
+            "no observation ledger",
+            |_, e| {
+                if let AllowitExpense::Priced(_, _, _, observed) = &mut e.4 {
+                    *observed = 0;
+                }
+            },
+            AllowitWalletError::InvalidInvocation,
+        ),
+        (
+            "an observation after the current ledger",
+            |f, e| {
+                if let AllowitExpense::Priced(_, _, _, observed) = &mut e.4 {
+                    *observed = f.env.ledger().sequence() + 1;
+                }
+            },
+            AllowitWalletError::InvalidInvocation,
+        ),
     ];
     for (name, edit, error) in cases {
         let mut e = f.transfer(10, 5);
@@ -664,6 +688,15 @@ fn request_bindings_and_gas_are_checked() {
     e.4 = AllowitExpense::Unpriced;
     assert_eq!(f.run(&e), Ok(()));
     assert_eq!(f.balance(&f.asset, &f.recipient), 10);
+}
+
+#[test]
+fn a_wallet_of_another_asset_refuses_negative_attested_gas_units() {
+    let f = Fixture::with(SIMPLE, true, |_, _| {});
+    // 5 stroops of gas attested as -2 units would count 2 units less than the transfer.
+    let mut e = f.transfer(10, 5);
+    e.4 = AllowitExpense::Priced(-2, 0, 8, f.env.ledger().sequence());
+    assert_eq!(f.run(&e), Err(Ok(AllowitWalletError::InvalidInvocation)));
 }
 
 #[test]
@@ -768,6 +801,241 @@ fn daily_figures_live_in_a_window_that_ends_with_its_own_ledger() {
     f.advance(200_000);
     assert_eq!(f.figures(), AllowitFigures::default());
     assert_eq!(f.run(&f.transfer(100, 0)), Ok(()));
+}
+
+/// Each daily figure reads back on its own. A swap spends its conversion loss and moves its whole
+/// input, so its spent and volume figures differ; the daily spending limit of 110 is below the
+/// daily volume limit of 160, so each limit can be the one that refuses.
+#[test]
+fn a_wallet_that_keeps_only_both_daily_figures_reads_them_back() {
+    let f = Fixture::with(COMMON, false, |env, c| {
+        c.rules = Vec::from_array(
+            env,
+            [
+                AllowitRule::daily_spending_limit,
+                AllowitRule::daily_volume_limit,
+            ],
+        );
+        c.params.set(
+            Symbol::new(env, DAILY_SPENDING_LIMIT),
+            AllowitValue::Int(110),
+        );
+    });
+    assert_eq!(f.client().state().kept, u32::from(DAILIES));
+    f.env.mock_all_auths();
+    let other = f
+        .env
+        .register_stellar_asset_contract_v2(Address::generate(&f.env))
+        .address();
+    let pair = f.env.register(MockPair, ());
+    StellarAssetClient::new(&f.env, &other).mint(&pair, &1_000);
+    let router = f.env.register(MockRouter, (pair, 95i128));
+    f.env.set_auths(&[]);
+    let swap = |id: u8, amount_in: i128, loss: i128| {
+        let mut e = f.transfer(1, 0);
+        e.0 = BytesN::from_array(&f.env, &[id; 32]);
+        e.3 = AllowitStellarOperation::Swap(
+            router.clone(),
+            amount_in,
+            amount_in * 95 / 100,
+            Vec::from_array(&f.env, [f.asset.clone(), other.clone()]),
+            e.2,
+        );
+        priced(&f, &mut e, loss);
+        e
+    };
+    // Spent 3 and volume 50, then spent 103 and volume 150.
+    assert_eq!(f.run(&swap(1, 50, 3)), Ok(()));
+    assert_eq!(f.run(&f.transfer(100, 0)), Ok(()));
+    f.advance(10);
+    let figures = f.figures();
+    assert_eq!((figures.day_spent, figures.day_total), (103, 150));
+    // 103 + 8 > 110, the daily spending limit; the volume of 158 is within its limit.
+    assert_eq!(
+        f.run(&f.transfer(8, 0)),
+        denied(COMMON, AllowitError::DailySpendingLimitExceeded)
+    );
+    // 150 + 11 > 160, the daily volume limit; a swap without loss spends nothing.
+    assert_eq!(
+        f.run(&swap(2, 11, 0)),
+        denied(COMMON, AllowitError::DailyVolumeLimitExceeded)
+    );
+    assert_eq!(f.run(&f.transfer(7, 0)), Ok(()));
+    let figures = f.figures();
+    assert_eq!((figures.day_spent, figures.day_total), (110, 157));
+}
+
+/// A Custom source that reads only the daily unpriced flag. Its build keeps the daily entry for
+/// the flag (`state_keys::packed(["day_unpriced"])` is `DAY_SPENT`), so an unpriced payment, which
+/// spends nothing, changes the flag alone. The source admits an unpriced payment and refuses any
+/// payment after one on the same day.
+struct ReadsDayUnpriced;
+impl AllowitPolicy for ReadsDayUnpriced {
+    const KIND: &'static str = "reads_day_unpriced";
+    const FIGURES: Option<u8> = Some(DAY_SPENT);
+    fn check(ctx: &AllowitContext, _: &Vec<AllowitRule>) -> Result<(), AllowitWalletError> {
+        if AllowitStandardState::read(&ctx.state)?.day_unpriced {
+            return Err(AllowitWalletError::PolicyDenied);
+        }
+        Ok(())
+    }
+}
+mod reads_day_unpriced {
+    crate::policy_wallet!(Wallet, super::ReadsDayUnpriced);
+}
+
+#[test]
+fn an_unpriced_payment_that_changes_only_the_daily_flag_is_kept() {
+    let f = Fixture::with(READS_DAY_UNPRICED, false, |_, _| {});
+    assert_eq!(f.client().state().kept, u32::from(DAY_SPENT));
+    let mut e = f.transfer(10, 0);
+    e.4 = AllowitExpense::Unpriced;
+    assert_eq!(f.run(&e), Ok(()));
+    let figures = f.figures();
+    assert!(figures.day_unpriced);
+    assert_eq!(figures.day_spent, 0);
+    // The policy reads the flag back on the same day and refuses the next payment.
+    f.advance(10);
+    assert_eq!(
+        f.run(&f.transfer(10, 0)),
+        Err(Ok(AllowitWalletError::PolicyDenied))
+    );
+    assert_eq!(f.balance(&f.asset, &f.recipient), 10);
+}
+
+/// The window of `d` follows Core's rule at its edges (`allowit::daily_window_end`, the end being
+/// the window's last ledger): a write at the last ledger keeps the end; one ledger later the
+/// figures read as zero, and the next write opens a window from that ledger.
+#[test]
+fn daily_figures_keep_cores_window_at_its_edges() {
+    let f = Fixture::with(COMMON, false, |env, c| {
+        c.rules = Vec::from_array(env, [AllowitRule::daily_spending_limit]);
+    });
+    assert_eq!(f.run(&f.transfer(10, 0)), Ok(()));
+    let start = f.env.ledger().sequence();
+    let end = start + DAY_LEDGERS - 1;
+    assert_eq!(f.figures().day_ends, end);
+    f.advance(DAY_LEDGERS - 1);
+    assert_eq!(f.env.ledger().sequence(), end);
+    assert_eq!(f.run(&f.transfer(10, 0)), Ok(()));
+    assert_eq!((f.figures().day_spent, f.figures().day_ends), (20, end));
+    f.advance(1);
+    assert_eq!(f.figures().day_ends, 0, "the window has ended");
+    assert_eq!(f.run(&f.transfer(10, 0)), Ok(()));
+    assert_eq!(
+        (f.figures().day_spent, f.figures().day_ends),
+        (10, end + DAY_LEDGERS)
+    );
+    // The same ends from Core's rule for a changed value.
+    let (before, after) = (AllowitValue::Bool(false), AllowitValue::Bool(true));
+    for (open, at, want) in [(Some(end), end, end), (None, end + 1, end + DAY_LEDGERS)] {
+        assert_eq!(
+            allowit::daily_window_end(
+                open.map(|end| (&before, u64::from(end))),
+                &after,
+                u64::from(at),
+                u64::from(DAY_LEDGERS)
+            ),
+            Ok(u64::from(want))
+        );
+    }
+}
+
+/// Each call keeps the wallet live. Once the instance has at most `TOTAL_LEDGERS - RENEWAL_LEDGERS`
+/// ledgers left, a call renews it to `TOTAL_LEDGERS - 1`; a call above that threshold renews
+/// nothing. A Custom wallet's code is its own, and a call renews it the same way;
+/// the code that a fixed tier shares with every wallet of its kind is Allowit's to keep live, and
+/// no call of a wallet renews it.
+#[test]
+fn a_call_below_the_threshold_renews_the_instance_and_a_custom_wallets_own_code() {
+    for (wasm, owns_code) in [(SIMPLE, false), (COMMON, false), (CUSTOM, true)] {
+        let f = Fixture::new(wasm);
+        let instance = || f.env.deployer().get_contract_instance_ttl(&f.wallet);
+        let code = || f.env.deployer().get_contract_code_ttl(&f.wallet);
+        let advance = |ledgers: u32| f.env.ledger().with_mut(|l| l.sequence_number += ledgers);
+        assert_eq!(instance(), TOTAL_LEDGERS - 1);
+        if owns_code {
+            assert_eq!(code(), TOTAL_LEDGERS - 1);
+        }
+        // Each owner call names the next deployment version.
+        let mut version = 0u32;
+        let mut pause = |paused: bool| {
+            version += 1;
+            f.owner_call("set_pause", (paused, version).into_val(&f.env))
+        };
+        // Above the threshold a call renews nothing.
+        advance(RENEWAL_LEDGERS - 2);
+        let (live_instance, live_code) = (instance(), code());
+        assert_eq!(pause(true), Ok(()));
+        assert_eq!((instance(), code()), (live_instance, live_code));
+        // At it, the instance lives `TOTAL_LEDGERS - 1` again, and a Custom wallet's code too.
+        advance(1);
+        let shared_code = code();
+        assert_eq!(pause(false), Ok(()));
+        assert_eq!(instance(), TOTAL_LEDGERS - 1);
+        if owns_code {
+            assert_eq!(code(), TOTAL_LEDGERS - 1);
+        } else {
+            assert_eq!(code(), shared_code);
+        }
+    }
+    // The agent's operation keeps the wallet live as well.
+    let f = Fixture::new(COMMON);
+    f.env
+        .ledger()
+        .with_mut(|l| l.sequence_number += RENEWAL_LEDGERS + 1);
+    assert_eq!(f.run(&f.transfer(10, 0)), Ok(()));
+    assert_eq!(
+        f.env.deployer().get_contract_instance_ttl(&f.wallet),
+        TOTAL_LEDGERS - 1
+    );
+}
+
+/// Every committed call of a wallet keeps it live, also a read of its state: at the threshold it
+/// renews the instance, and a Custom wallet's own code too; above it, nothing.
+#[test]
+fn a_committed_state_read_renews_the_wallet_under_the_threshold() {
+    for (wasm, owns_code) in [(SIMPLE, false), (COMMON, false), (CUSTOM, true)] {
+        let f = Fixture::new(wasm);
+        let instance = || f.env.deployer().get_contract_instance_ttl(&f.wallet);
+        let code = || f.env.deployer().get_contract_code_ttl(&f.wallet);
+        let advance = |ledgers: u32| f.env.ledger().with_mut(|l| l.sequence_number += ledgers);
+        advance(RENEWAL_LEDGERS - 2);
+        let (live_instance, live_code) = (instance(), code());
+        f.client().state();
+        assert_eq!((instance(), code()), (live_instance, live_code));
+        advance(1);
+        let shared_code = code();
+        f.client().state();
+        assert_eq!(instance(), TOTAL_LEDGERS - 1);
+        if owns_code {
+            assert_eq!(code(), TOTAL_LEDGERS - 1);
+        } else {
+            assert_eq!(code(), shared_code);
+        }
+    }
+}
+
+/// An upgrade keeps the code that it installs live, whatever the tier that it leaves or enters:
+/// the owner's upgrade renews the new code, whose own upload gave it the network's minimum
+/// lifetime only.
+#[test]
+fn an_upgrade_renews_the_code_that_it_installs() {
+    for (from, to) in [
+        (CUSTOM, CATCHING),
+        (SIMPLE, CATCHING),
+        (CUSTOM, DAILY_STATE),
+    ] {
+        let f = Fixture::new(from);
+        let next = f.env.deployer().upload_contract_wasm(to);
+        let mut u = f.update();
+        u.wasm_hash = Some(next.clone());
+        assert_eq!(f.owner_call("deploy_policy", (u,).into_val(&f.env)), Ok(()));
+        assert_eq!(
+            f.env.deployer().get_contract_code_ttl(&f.wallet),
+            TOTAL_LEDGERS - 1
+        );
+    }
 }
 
 #[test]
@@ -938,6 +1206,36 @@ fn custom_params_of_every_kind_round_trip_through_the_packed_instance() {
     for (key, value) in values(&f.env) {
         assert_eq!(stored.get(Symbol::new(&f.env, key)), Some(value), "{key}");
     }
+}
+
+#[test]
+fn custom_params_at_their_size_bounds_round_trip() {
+    // A text of MAX_TEXT bytes, a list of MAX_ITEMS items and an integer of the decoder's top
+    // group store and read back.
+    let values = |env: &Env| {
+        let mut items = Vec::new(env);
+        for n in 0..i128::from(allowit::MAX_ITEMS) {
+            items.push_back(AllowitValue::Int(n));
+        }
+        let text = "t".repeat(allowit::MAX_TEXT as usize);
+        (
+            AllowitValue::Str(soroban_sdk::String::from_str(env, &text)),
+            AllowitValue::List(items),
+        )
+    };
+    // 2^125 packs into a last LEB128 group of 1 at shift 126, the decoder's top group.
+    let large = AllowitValue::Int(1 << 125);
+    let f = Fixture::with(CUSTOM, false, |env, c| {
+        let (text, list) = values(env);
+        c.params.set(Symbol::new(env, "text"), text);
+        c.params.set(Symbol::new(env, "list"), list);
+        c.params.set(Symbol::new(env, "large"), large.clone());
+    });
+    let stored = f.client().state().params;
+    let (text, list) = values(&f.env);
+    assert_eq!(stored.get(Symbol::new(&f.env, "text")), Some(text));
+    assert_eq!(stored.get(Symbol::new(&f.env, "list")), Some(list));
+    assert_eq!(stored.get(Symbol::new(&f.env, "large")), Some(large));
 }
 
 // --- Policies -------------------------------------------------------------------------------------
@@ -1176,6 +1474,94 @@ fn a_state_value_over_its_bound_or_an_undeclared_key_is_refused() {
     });
 }
 
+/// A policy that declares `MAX_POLICY_STATE` persistent entries: the most that a build admits.
+struct MostState;
+impl AllowitPolicy for MostState {
+    const KIND: &'static str = "most_state";
+    const STATE: &'static [AllowitStateKey] = &{
+        let names = ["s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7"];
+        let mut keys = [AllowitStateKey {
+            name: "",
+            key: 0,
+            daily: false,
+        }; MAX_POLICY_STATE];
+        let mut i = 0;
+        while i < MAX_POLICY_STATE {
+            keys[i].name = names[i];
+            keys[i].key = 100 + i as u32;
+            i += 1;
+        }
+        keys
+    };
+    fn check(_: &AllowitContext, _: &Vec<AllowitRule>) -> Result<(), AllowitWalletError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_policy_with_the_most_state_entries_reads_and_writes_them() {
+    let f = Fixture::new(SIMPLE);
+    let env = &f.env;
+    f.env.as_contract(&f.wallet, || {
+        let before = read_policy_state::<MostState>(env).unwrap();
+        let mut state = Map::new(env);
+        state.set(Symbol::new(env, "s7"), AllowitValue::Int(7));
+        assert_eq!(
+            write_policy_state::<MostState>(env, &state, &before),
+            Ok(())
+        );
+        let slots = read_policy_state::<MostState>(env).unwrap();
+        assert_eq!(slots[7].value, Some(AllowitValue::Int(7)));
+    });
+}
+
+/// The wallet keeps a daily entry by Core's rule (`allowit::daily_window_end`): the window's end
+/// is its last ledger, inclusive. A write at that ledger keeps the window; the entry reads as
+/// absent one ledger later, and the next write opens a new window there.
+#[test]
+fn a_daily_entry_keeps_its_window_through_its_last_ledger_by_cores_rule() {
+    let f = Fixture::new(SIMPLE);
+    let env = &f.env;
+    let write = |value: i128| {
+        env.as_contract(&f.wallet, || {
+            let before = read_policy_state::<Declared>(env).unwrap();
+            let mut state = Map::new(env);
+            state.set(Symbol::new(env, "day_note"), AllowitValue::Int(value));
+            write_policy_state::<Declared>(env, &state, &before)
+        })
+    };
+    let read = || {
+        env.as_contract(&f.wallet, || {
+            read_policy_state::<Declared>(env).unwrap()[1].clone()
+        })
+    };
+    let start = env.ledger().sequence();
+    assert_eq!(write(1), Ok(()));
+    let end = start + DAY_LEDGERS - 1;
+    assert_eq!(read().day_ends, Some(end));
+    assert_eq!(
+        u64::from(end),
+        allowit::daily_window_end(
+            None,
+            &AllowitValue::Int(1),
+            u64::from(start),
+            u64::from(DAY_LEDGERS)
+        )
+        .unwrap()
+    );
+    // At the window's last ledger the value still reads, and a write keeps the end.
+    f.advance(end - start);
+    assert_eq!(read().value, Some(AllowitValue::Int(1)));
+    assert_eq!(write(2), Ok(()));
+    assert_eq!(read().day_ends, Some(end));
+    // One ledger later the window has ended: the value reads as absent, and a write opens a new
+    // window from that ledger.
+    f.advance(1);
+    assert_eq!(read().value, None);
+    assert_eq!(write(3), Ok(()));
+    assert_eq!(read().day_ends, Some(end + DAY_LEDGERS));
+}
+
 #[test]
 fn one_event_names_the_operation_and_its_output() {
     let f = Fixture::new(SIMPLE);
@@ -1203,6 +1589,45 @@ pub struct MockPair;
 impl MockPair {
     pub fn pay(env: Env, token: Address, to: Address, amount: i128) {
         token::Client::new(&env, &token).transfer(&env.current_contract_address(), &to, &amount);
+    }
+}
+/// Hostile test router: reports `amount_in * rate / 100` but pays `short` units less, and does
+/// not check the minimum output itself.
+#[contract]
+pub struct ShortRouter;
+#[contractimpl]
+impl ShortRouter {
+    pub fn __constructor(env: Env, pair: Address, rate: i128, short: i128) {
+        env.storage().instance().set(&0u32, &(pair, rate, short));
+    }
+    pub fn router_pair_for(env: Env, _a: Address, _b: Address) -> Address {
+        let (pair, _, _): (Address, i128, i128) = env.storage().instance().get(&0u32).unwrap();
+        pair
+    }
+    pub fn swap_exact_tokens_for_tokens(
+        env: Env,
+        amount_in: i128,
+        _amount_out_min: i128,
+        path: Vec<Address>,
+        to: Address,
+        _deadline: u64,
+    ) -> Vec<i128> {
+        let (pair, rate, short): (Address, i128, i128) =
+            env.storage().instance().get(&0u32).unwrap();
+        to.require_auth();
+        let out = amount_in * rate / 100;
+        token::Client::new(&env, &path.get_unchecked(0)).transfer(&to, &pair, &amount_in);
+        MockPairClient::new(&env, &pair).pay(
+            &path.get_unchecked(path.len() - 1),
+            &to,
+            &(out - short),
+        );
+        let mut amounts = Vec::new(&env);
+        amounts.push_back(amount_in);
+        for _ in 1..path.len() {
+            amounts.push_back(out);
+        }
+        amounts
     }
 }
 /// Test router of the Soroswap shape: pays `amount_in * rate / 100`.
@@ -1310,7 +1735,167 @@ fn swap_deposit_and_redeem_run_through_execute_with_effect_checks() {
         e.3 = AllowitStellarOperation::Deposit(wrong, 10, 10);
         priced(&f, &mut e, 0);
         assert_eq!(f.run(&e), Err(Ok(AllowitWalletError::UnsupportedAsset)));
+        // A swap that attests a negative loss, which would count less than its gas: a swap has no
+        // later loss check that a deposit has.
+        let mut e = f.transfer(1, 5);
+        e.0 = BytesN::from_array(&f.env, &[5; 32]);
+        e.3 = AllowitStellarOperation::Swap(
+            router.clone(),
+            50,
+            47,
+            Vec::from_array(&f.env, [f.asset.clone(), other.clone()]),
+            e.2,
+        );
+        e.4 = AllowitExpense::Priced(5, -1, 4, f.env.ledger().sequence());
+        assert_eq!(f.run(&e), Err(Ok(AllowitWalletError::InvalidInvocation)));
+        // A deposit names a positive minimum of shares.
+        let mut e = f.transfer(1, 0);
+        e.0 = BytesN::from_array(&f.env, &[6; 32]);
+        e.3 = AllowitStellarOperation::Deposit(vault.clone(), 10, 0);
+        priced(&f, &mut e, 0);
+        assert_eq!(f.run(&e), Err(Ok(AllowitWalletError::InvalidAmount)));
+        if wasm == COMMON {
+            // A forward swap counts its asset input, 150, against the payment limit of 100.
+            let mut e = f.transfer(1, 0);
+            e.0 = BytesN::from_array(&f.env, &[7; 32]);
+            e.3 = AllowitStellarOperation::Swap(
+                router.clone(),
+                150,
+                10,
+                Vec::from_array(&f.env, [f.asset.clone(), other.clone()]),
+                e.2,
+            );
+            priced(&f, &mut e, 3);
+            assert_eq!(
+                f.run(&e),
+                denied(COMMON, AllowitError::PaymentLimitExceeded)
+            );
+        }
+        // A swap through the asset as its router, over a path longer than four tokens, or with
+        // a deadline after the request's expiry is refused.
+        let third = f
+            .env
+            .register_stellar_asset_contract_v2(Address::generate(&f.env))
+            .address();
+        for (n, (via, path, late)) in [
+            (
+                f.asset.clone(),
+                std::vec![f.asset.clone(), other.clone()],
+                0,
+            ),
+            (
+                router.clone(),
+                std::vec![
+                    f.asset.clone(),
+                    third.clone(),
+                    other.clone(),
+                    third.clone(),
+                    other.clone(),
+                ],
+                0,
+            ),
+            (router.clone(), std::vec![f.asset.clone(), other.clone()], 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut e = f.transfer(1, 0);
+            e.0 = BytesN::from_array(&f.env, &[8 + n as u8; 32]);
+            e.3 = AllowitStellarOperation::Swap(
+                via,
+                50,
+                47,
+                Vec::from_slice(&f.env, &path),
+                e.2 + late,
+            );
+            priced(&f, &mut e, 3);
+            assert_eq!(
+                f.run(&e),
+                Err(Ok(AllowitWalletError::InvalidInvocation)),
+                "swap case {n}"
+            );
+        }
+        // A router that pays less than its minimum output, or less than it reports, is refused.
+        for (n, (short, minimum)) in [(0i128, 48i128), (1, 47)].into_iter().enumerate() {
+            f.env.mock_all_auths();
+            let hostile = f.env.register(ShortRouter, (pair.clone(), 95i128, short));
+            f.env.set_auths(&[]);
+            let mut e = f.transfer(1, 0);
+            e.0 = BytesN::from_array(&f.env, &[13 + n as u8; 32]);
+            e.3 = AllowitStellarOperation::Swap(
+                hostile,
+                50,
+                minimum,
+                Vec::from_array(&f.env, [f.asset.clone(), other.clone()]),
+                e.2,
+            );
+            priced(&f, &mut e, 3);
+            assert_eq!(
+                f.run(&e),
+                Err(Ok(AllowitWalletError::InvalidEffects)),
+                "router case {n}"
+            );
+        }
+        // A swap names a positive minimum output.
+        let mut e = f.transfer(1, 0);
+        e.0 = BytesN::from_array(&f.env, &[11; 32]);
+        e.3 = AllowitStellarOperation::Swap(
+            router.clone(),
+            50,
+            0,
+            Vec::from_array(&f.env, [f.asset.clone(), other.clone()]),
+            e.2,
+        );
+        priced(&f, &mut e, 3);
+        assert_eq!(f.run(&e), Err(Ok(AllowitWalletError::InvalidAmount)));
+        // A swap's other endpoint is a Stellar Asset Contract, not a token of its own code.
+        let mut e = f.transfer(1, 0);
+        e.0 = BytesN::from_array(&f.env, &[12; 32]);
+        e.3 = AllowitStellarOperation::Swap(
+            router.clone(),
+            50,
+            47,
+            Vec::from_array(&f.env, [f.asset.clone(), vault.clone()]),
+            e.2,
+        );
+        priced(&f, &mut e, 3);
+        assert_eq!(f.run(&e), Err(Ok(AllowitWalletError::UnsupportedAsset)));
     }
+}
+
+/// A wallet that keeps only the daily spending figures writes `d` only when one of them changes.
+/// A deposit spends nothing: it leaves the window closed, so the next spend opens it at its own
+/// ledger, and that spend's day ends a whole window later.
+#[test]
+fn a_deposit_leaves_the_daily_spending_window_closed() {
+    let f = Fixture::with(COMMON, false, |env, c| {
+        c.rules = Vec::from_array(env, [AllowitRule::daily_spending_limit]);
+    });
+    assert_eq!(f.client().state().kept, u32::from(DAY_SPENT));
+    f.env.mock_all_auths();
+    let vault = f.env.register(VAULT, (f.asset.clone(), 0u32));
+    f.env.set_auths(&[]);
+    let mut e = f.transfer(1, 0);
+    e.3 = AllowitStellarOperation::Deposit(vault, 40, 40);
+    priced(&f, &mut e, 0);
+    assert_eq!(f.run(&e), Ok(()));
+    assert_eq!(
+        f.figures().day_ends,
+        0,
+        "a deposit opens no spending window"
+    );
+    assert!(
+        !f.env
+            .as_contract(&f.wallet, || f.env.storage().temporary().has(&DAILY)),
+        "nor writes d"
+    );
+    f.advance(10);
+    assert_eq!(f.run(&f.transfer(10, 0)), Ok(()));
+    let now = f.env.ledger().sequence();
+    assert_eq!(
+        (f.figures().day_spent, f.figures().day_ends),
+        (10, now + DAY_LEDGERS - 1)
+    );
 }
 
 #[test]
@@ -1430,6 +2015,23 @@ fn the_owner_recovers_any_token_and_passes_calls_through() {
         Ok(())
     );
     assert_eq!(f.balance(&f.native, &to), 5);
+    // The owner's passthrough: the wallet calls the token as itself.
+    let call: Vec<Val> = (f.wallet.clone(), to.clone(), 5i128).into_val(&f.env);
+    let auth: Vec<InvokerContractAuthEntry> = Vec::new(&f.env);
+    assert_eq!(
+        f.owner_call(
+            "invoke",
+            (
+                f.native.clone(),
+                Symbol::new(&f.env, "transfer"),
+                call,
+                auth
+            )
+                .into_val(&f.env)
+        ),
+        Ok(())
+    );
+    assert_eq!(f.balance(&f.native, &to), 10);
 }
 
 #[test]
@@ -1499,6 +2101,35 @@ fn construction_checks_the_owner_configuration() {
         }));
         assert!(result.is_err(), "{name}");
     }
+    // An owner account whose key is the agent's or the server's key is refused; an owner account
+    // of its own key is not.
+    let owner_account = |env: &Env, key: &BytesN<32>| {
+        Address::try_from_val(
+            env,
+            &xdr::ScVal::Address(xdr::ScAddress::Account(xdr::AccountId(
+                xdr::PublicKey::PublicKeyTypeEd25519(xdr::Uint256(key.to_array())),
+            ))),
+        )
+        .unwrap()
+    };
+    for (name, role) in [("agent", 0), ("server", 1)] {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Fixture::with(SIMPLE, false, |env, c| {
+                let key = if role == 0 { &c.agent } else { &c.server };
+                c.owner = owner_account(env, key);
+            })
+        }));
+        assert!(result.is_err(), "owner account of the {name} key");
+    }
+    let own = SigningKey::from_bytes(&[11; 32]).verifying_key().to_bytes();
+    // The owner account is read back as the account that it is.
+    let f = Fixture::with(SIMPLE, false, |env, c| {
+        c.owner = owner_account(env, &BytesN::from_array(env, &own))
+    });
+    assert_eq!(
+        f.client().state().owner,
+        owner_account(&f.env, &BytesN::from_array(&f.env, &own))
+    );
     // A Custom wallet binds the hash of its own source.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         Fixture::with(CUSTOM, false, |env, c| {
@@ -1506,6 +2137,106 @@ fn construction_checks_the_owner_configuration() {
         })
     }));
     assert!(result.is_err());
+}
+
+#[test]
+fn a_configuration_of_another_layout_is_not_read() {
+    let f = Fixture::new(COMMON);
+    f.env.as_contract(&f.wallet, || {
+        let mut raw: Bytes = f.env.storage().instance().get(&CONFIG).unwrap();
+        raw.set(0, CONTRACT_VERSION as u8 - 1);
+        f.env.storage().instance().set(&CONFIG, &raw);
+    });
+    assert_eq!(
+        f.client().try_state(),
+        Err(Ok(AllowitWalletError::InvalidState))
+    );
+}
+
+#[test]
+fn a_deposit_whose_vault_breaks_its_effects_is_refused() {
+    let f = Fixture::new(SIMPLE);
+    // The test vault's behavior 2 credits one share fewer than it reports, 11 values the shares
+    // two units below the assets, and behavior 0 mints 40 shares where 41 are the minimum.
+    for (n, (behavior, minimum)) in [(2u32, 1i128), (11, 1), (0, 41)].into_iter().enumerate() {
+        let vault = f.env.register(VAULT, (f.asset.clone(), behavior));
+        let mut e = f.transfer(1, 0);
+        e.0 = BytesN::from_array(&f.env, &[20 + n as u8; 32]);
+        e.3 = AllowitStellarOperation::Deposit(vault, 40, minimum);
+        priced(&f, &mut e, 0);
+        assert_eq!(
+            f.run(&e),
+            Err(Ok(AllowitWalletError::InvalidEffects)),
+            "case {n}"
+        );
+    }
+}
+
+#[test]
+fn a_redeem_whose_vault_breaks_its_effects_is_refused() {
+    let f = Fixture::new(SIMPLE);
+    // The test vault's behavior 21 pays one unit less than it reports, 23 burns one share more,
+    // 25 keeps a fee that its preview does not show, and behavior 0 pays 30 where 31 is the
+    // minimum. Each vault first takes a deposit of 40.
+    for (n, (behavior, minimum)) in [(21u32, 1i128), (23, 1), (25, 1), (0, 31)]
+        .into_iter()
+        .enumerate()
+    {
+        let vault = f.env.register(VAULT, (f.asset.clone(), behavior));
+        let mut e = f.transfer(1, 0);
+        e.0 = BytesN::from_array(&f.env, &[30 + 2 * n as u8; 32]);
+        e.3 = AllowitStellarOperation::Deposit(vault.clone(), 40, 40);
+        priced(&f, &mut e, 0);
+        assert_eq!(f.run(&e), Ok(()), "deposit {n}");
+        let mut e = f.transfer(1, 0);
+        e.0 = BytesN::from_array(&f.env, &[31 + 2 * n as u8; 32]);
+        e.3 = AllowitStellarOperation::Redeem(vault, 30, minimum);
+        priced(&f, &mut e, 0);
+        assert_eq!(
+            f.run(&e),
+            Err(Ok(AllowitWalletError::InvalidEffects)),
+            "case {n}"
+        );
+    }
+}
+
+#[test]
+fn a_transfer_to_the_classic_issuer_of_the_asset_is_refused() {
+    let key = SigningKey::from_bytes(&[21; 32]).verifying_key().to_bytes();
+    let issuer = xdr::AccountId(xdr::PublicKey::PublicKeyTypeEd25519(xdr::Uint256(key)));
+    // An AlphaNum4 code and an AlphaNum12 code.
+    for asset in [
+        xdr::Asset::CreditAlphanum4(xdr::AlphaNum4 {
+            asset_code: xdr::AssetCode4(*b"USDC"),
+            issuer: issuer.clone(),
+        }),
+        xdr::Asset::CreditAlphanum12(xdr::AlphaNum12 {
+            asset_code: xdr::AssetCode12(*b"ABCDEFG\0\0\0\0\0"),
+            issuer: issuer.clone(),
+        }),
+    ] {
+        let created = core::cell::RefCell::new(None);
+        let f = Fixture::with(SIMPLE, false, |env, c| {
+            let sac = env
+                .host()
+                .invoke_function(xdr::HostFunction::CreateContract(xdr::CreateContractArgs {
+                    contract_id_preimage: xdr::ContractIdPreimage::Asset(asset),
+                    executable: xdr::ContractExecutable::StellarAsset,
+                }))
+                .unwrap();
+            c.asset = Address::try_from_val(env, &sac).unwrap();
+            *created.borrow_mut() = Some(c.asset.clone());
+        });
+        let token = created.into_inner().unwrap();
+        let to = Address::try_from_val(
+            &f.env,
+            &xdr::ScVal::Address(xdr::ScAddress::Account(issuer.clone())),
+        )
+        .unwrap();
+        let mut e = f.transfer(10, 0);
+        e.3 = AllowitStellarOperation::Transfer(token, to, 10);
+        assert_eq!(f.run(&e), Err(Ok(AllowitWalletError::InvalidRecipient)));
+    }
 }
 
 // --- Packing ----------------------------------------------------------------------------------

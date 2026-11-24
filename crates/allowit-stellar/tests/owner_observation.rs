@@ -214,7 +214,7 @@ fn lifetime_entries() -> ([u8; 32], Value) {
     });
     (
         hash,
-        json!({"latestLedger":120,"entries":[{"xdr":enc(&executable),"liveUntilLedgerSeq":1119},{"xdr":enc(&archival)},{"xdr":enc(&instance),"liveUntilLedgerSeq":520}]}),
+        json!({"latestLedger":120,"entries":[{"xdr":enc(&executable),"lastModifiedLedgerSeq":100,"liveUntilLedgerSeq":1119},{"xdr":enc(&archival),"lastModifiedLedgerSeq":100},{"xdr":enc(&instance),"lastModifiedLedgerSeq":100,"liveUntilLedgerSeq":520}]}),
     )
 }
 struct Lifetime {
@@ -227,7 +227,39 @@ impl Rpc for Lifetime {
             "getNetwork" => Ok(json!({"passphrase":"Test SDF Network ; September 2015"})),
             "getLatestLedger" => Ok(json!({"sequence":self.head})),
             "getLedgerEntries" => {
-                assert_eq!(params["keys"].as_array().unwrap().len(), 3);
+                // The read asks for exactly the archival setting, the wallet's instance and one
+                // code entry, in that order, whatever order the reply has.
+                let asked: Vec<x::LedgerKey> = params["keys"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|key| {
+                        x::LedgerKey::from_xdr_base64(key.as_str().unwrap(), x::Limits::none())
+                            .unwrap()
+                    })
+                    .collect();
+                let [setting, instance, x::LedgerKey::ContractCode(code)] = asked.as_slice() else {
+                    panic!("{asked:?}")
+                };
+                assert_eq!(
+                    *setting,
+                    x::LedgerKey::ConfigSetting(x::LedgerKeyConfigSetting {
+                        config_setting_id: x::ConfigSettingId::StateArchival,
+                    })
+                );
+                assert_eq!(
+                    *instance,
+                    x::LedgerKey::ContractData(x::LedgerKeyContractData {
+                        contract: address(&wallet()),
+                        key: x::ScVal::LedgerKeyContractInstance,
+                        durability: x::ContractDataDurability::Persistent,
+                    })
+                );
+                let asked_for = [
+                    lifetime_entries().0,
+                    native::hash(b"code that the instance does not run"),
+                ];
+                assert!(asked_for.contains(&code.hash.0));
                 Ok(self.entries.clone())
             }
             _ => Err("unexpected lifetime RPC".into()),
@@ -250,6 +282,132 @@ fn lifetime_reads_exact_shuffled_entries_and_relative_maximum_without_absolute_l
         ..result
     };
     assert!(!at_max.needs_renewal().unwrap());
+}
+/// A lifetime reply says that a wallet lapsed only when it is current and its lifetimes are
+/// valid: a reply of an earlier ledger than the head, a lifetime beyond the network's limit and
+/// an entry that the reply dates after its own ledger are errors of their own, also when the
+/// reply shows an entry past its lifetime or archived. A wallet whose instance runs other code
+/// than the code that was asked for is named as such, with or without an entry of that code.
+#[test]
+fn a_lifetime_reply_says_a_lapse_only_when_it_is_current_and_valid() {
+    let read = |change: &dyn Fn(&mut Value), head: u32| {
+        let (hash, mut entries) = lifetime_entries();
+        change(&mut entries);
+        rpc::wallet_lifetime(
+            &Lifetime { entries, head },
+            "stellar:testnet",
+            &wallet(),
+            &hash,
+        )
+        .map(|l| l.ledger)
+    };
+    let archive = |entries: &mut Value, at: usize| {
+        let entry = entries["entries"][at].as_object_mut().unwrap();
+        entry.remove("liveUntilLedgerSeq");
+    };
+    // Entry 0 is the code, entry 2 the instance; the reply is of ledger 120.
+    assert_eq!(read(&|_| {}, 120), Ok(120));
+    for lapsed in [
+        &(|e: &mut Value| e["entries"][2]["liveUntilLedgerSeq"] = json!(119))
+            as &dyn Fn(&mut Value),
+        &|e| e["entries"][0]["liveUntilLedgerSeq"] = json!(119),
+        &|e| archive(e, 2),
+        &|e| archive(e, 0),
+    ] {
+        assert_eq!(read(lapsed, 120).unwrap_err(), rpc::CONTRACT_EXPIRED);
+    }
+    for (case, change, head) in [
+        (
+            "a reply of an earlier ledger than the head",
+            &(|e: &mut Value| archive(e, 2)) as &dyn Fn(&mut Value),
+            121,
+        ),
+        (
+            "a code lifetime beyond the network's limit",
+            &|e| {
+                archive(e, 2);
+                e["entries"][0]["liveUntilLedgerSeq"] = json!(1120);
+            },
+            120,
+        ),
+        (
+            "an entry without its change ledger",
+            &|e| {
+                let entry = e["entries"][2].as_object_mut().unwrap();
+                entry.remove("lastModifiedLedgerSeq");
+            },
+            120,
+        ),
+        (
+            "an entry without its change ledger and past its lifetime",
+            &|e| {
+                e["entries"][2]["liveUntilLedgerSeq"] = json!(119);
+                e["entries"][2]["lastModifiedLedgerSeq"] = Value::Null;
+            },
+            120,
+        ),
+        (
+            "the network's setting without its change ledger",
+            &|e| {
+                let entry = e["entries"][1].as_object_mut().unwrap();
+                entry.remove("lastModifiedLedgerSeq");
+            },
+            120,
+        ),
+        (
+            "an entry that changed after its last live ledger",
+            &|e| {
+                e["entries"][2]["liveUntilLedgerSeq"] = json!(119);
+                e["entries"][2]["lastModifiedLedgerSeq"] = json!(120);
+            },
+            120,
+        ),
+        (
+            "an entry dated after its reply",
+            &|e| {
+                archive(e, 2);
+                e["entries"][2]["lastModifiedLedgerSeq"] = json!(121);
+            },
+            120,
+        ),
+    ] {
+        let error = read(change, head).unwrap_err();
+        assert_ne!(error, rpc::CONTRACT_EXPIRED, "{case}");
+    }
+    // An entry that changed at the reply's own ledger is of that reply.
+    assert_eq!(
+        read(
+            &|e| e["entries"][2]["lastModifiedLedgerSeq"] = json!(120),
+            120
+        ),
+        Ok(120)
+    );
+    // The instance runs the fixture's code; another code is asked for.
+    let (_, entries) = lifetime_entries();
+    let other = native::hash(b"code that the instance does not run");
+    for with_entry in [false, true] {
+        let mut entries = entries.clone();
+        // The endpoint has no entry of the code that was asked for, or it has one.
+        let list = entries["entries"].as_array_mut().unwrap();
+        list.remove(0);
+        if with_entry {
+            let code = b"code that the instance does not run".to_vec();
+            let entry = x::LedgerEntryData::ContractCode(x::ContractCodeEntry {
+                ext: x::ContractCodeEntryExt::V0,
+                hash: x::Hash(other),
+                code: code.try_into().unwrap(),
+            });
+            list.push(json!({"xdr": enc(&entry), "lastModifiedLedgerSeq": 100, "liveUntilLedgerSeq": 1119}));
+        }
+        let error = rpc::wallet_lifetime(
+            &Lifetime { entries, head: 120 },
+            "stellar:testnet",
+            &wallet(),
+            &other,
+        )
+        .unwrap_err();
+        assert_eq!(error, "Wallet lifetime instance names another executable");
+    }
 }
 #[test]
 fn lifetime_rejects_missing_expired_foreign_duplicate_and_inconsistent_entries() {

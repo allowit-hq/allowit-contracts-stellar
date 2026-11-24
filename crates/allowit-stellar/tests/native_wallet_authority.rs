@@ -263,6 +263,7 @@ fn a_native_wallet_on_testnet_obeys_its_signers_weights_and_thresholds() {
         fee_per_operation: 100,
         starting_balance: Some(starting),
         trustline: None,
+        funding: None,
     };
     let setup = owner::prepare_native_setup(&owner_state, &terms, now).unwrap();
     let expected = ExpectedOwnerIntent {
@@ -282,6 +283,7 @@ fn a_native_wallet_on_testnet_obeys_its_signers_weights_and_thresholds() {
             fee_per_operation: 100,
             starting_balance: Some(starting),
             trustline: None,
+            funding: None,
             created_at: now,
         },
     };
@@ -475,7 +477,9 @@ fn a_native_wallet_on_testnet_obeys_its_signers_weights_and_thresholds() {
         &rpc,
         &roles,
         &owner,
-        WalletAction::Close { token_balance: 0 },
+        WalletAction::Close {
+            token_balance: None,
+        },
     );
     assert_eq!(
         settle(&rpc, "close by the owner alone", &step),

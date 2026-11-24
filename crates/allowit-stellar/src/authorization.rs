@@ -247,11 +247,12 @@ pub(crate) fn attach(p: &PreparedOperation, signature: ScVal) -> Result<Prepared
 /// Sign the service's half of the wallet's authorization after its policy gates, before the agent
 /// signs. This changes the transaction hash. Persist and deliver the returned packet to the agent.
 ///
-/// The service evaluates the installed policy on the host first. A Custom wallet runs its whole
-/// policy onchain, so native preflight completes it. A Simple or Common wallet runs at most its
-/// prefix onchain: a policy that is not canonical-only needs `authorize_server_with` and the
-/// compiled evaluator of its source. Layout 4 wallets keep standard accounting onchain, so
-/// `accounting` must be `None`.
+/// The service evaluates the installed policy on the host first. A Custom wallet whose source has
+/// no server part runs its whole policy onchain, so native preflight completes it. A Custom
+/// wallet whose source has a server part runs only its on-chain part onchain, and a Simple or
+/// Common wallet at most its prefix: such a Custom source, and a Simple or Common policy that is
+/// not canonical-only, need `authorize_server_with` and the compiled evaluator of the source.
+/// Layout 4 wallets keep standard accounting onchain, so `accounting` must be `None`.
 pub fn authorize_server(
     p: &PreparedOperation,
     seed: &[u8; 32],
@@ -308,6 +309,14 @@ pub fn authorize_server_using(
     )?;
     if tier.standard() && evaluation == policy::Evaluation::Prefix {
         return Err("The service must evaluate the full Simple or Common policy; supply its compiled evaluator".into());
+    }
+    // The contract of a Custom wallet runs only the on-chain part of its source. The server
+    // evaluates the whole source before it signs, so a source with a server part needs the
+    // server's evaluator.
+    if evaluation == policy::Evaluation::Prefix
+        && policy::custom_parts(&p.config.policy_source)?.server_part
+    {
+        return Err(policy::NEEDS_SERVER_EVALUATION.into());
     }
     if cosignatures(p)? != (None, None) {
         return Err("Service authorization is already signed".into());

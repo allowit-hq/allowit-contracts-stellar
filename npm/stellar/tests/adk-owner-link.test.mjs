@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {ADK_OWNER_FRAGMENT, adkAgentPrompt, adkParamLines, parseAdkOwnerLink} from '../dist/adk-owner-link.js';
 import {stellarAssetContractId} from '../dist/stellar-wallet.js';
+import plugin, {assets} from '../dist/plugin.js';
 
 const proposal = {
   network: 'stellar:testnet', revision: 2, title: 'Pay for access', explanation: 'Use the approved limit.',
@@ -23,13 +24,47 @@ test('the review shows labelled params and the prompt names the RPC and a non-de
   assert.deepEqual(adkParamLines({
     payment_limit: {Int: '50000000'}, tokens: {List: [{Addr: xlm}]}, operations: {List: [{Str: '*'}]},
     expires_at: {Int: '1800000000'}, call_limit: {Int: '3'},
-  }).map(line => `${line.label}: ${line.value}`), [
+  }, assets('stellar:testnet')).map(line => `${line.label}: ${line.value}`), [
     'Per operation: 5 XLM', 'Assets: XLM', 'Operations: Any', 'Expires at: 2027-01-15T08:00:00Z', 'Operation count: 3',
   ]);
-  const staging = adkAgentPrompt('Run the approved task.', 'https://staging.allowit.ai', 'policy-id', 'policy-wallet', 'agent-key');
+  const staging = adkAgentPrompt('Run the approved task.', 'https://staging.allowit.ai', 'policy-id', 'policy-wallet', 'agent-key', 'stellar:testnet');
   assert.match(staging, /Stellar Testnet policy: policy-id\nPolicy wallet: policy-wallet\nAgent public key: agent-key/);
   assert.match(staging, /`ALLOWIT_URL=https:\/\/staging\.allowit\.ai allowit --rail stellar:testnet --rpc-url <independent Stellar Testnet RPC URL> wallet import allowit-stellar-profile\.json`/);
-  assert.doesNotMatch(adkAgentPrompt('Run.', 'https://app.allowit.ai', 'p', 'w', 'a'), /ALLOWIT_URL/);
+  assert.doesNotMatch(adkAgentPrompt('Run.', 'https://app.allowit.ai', 'p', 'w', 'a', 'stellar:testnet'), /ALLOWIT_URL/);
+});
+
+test('a link on each network of the rail opens, in the unit of its own asset, and names its network', async () => {
+  const {parseReviewLink, reviewAgentPrompt} = await import('../dist/adk-owner-link.js');
+  const usdc = stellarAssetContractId('USDC', 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN', 'stellar:pubnet');
+  const mainnet = {...proposal, network: 'stellar:pubnet',
+    params: {payment_limit: {Int: '20000000'}, tokens: {List: [{Addr: usdc}]}}};
+  const link = parseReviewLink(fragment({proposal: mainnet, workPrompt: 'Buy one report.', agent: 'GAGENT', amount: '20', walletKind: 'native'}));
+  assert.deepEqual(link, {proposal: mainnet, workPrompt: 'Buy one report.', agent: 'GAGENT', amount: '20', walletKind: 'native'});
+  assert.deepEqual(adkParamLines(mainnet.params, assets('stellar:pubnet')).map(line => line.value), ['2 USDC', 'USDC']);
+  const prompt = reviewAgentPrompt(link, 'https://app.allowit.ai', 'policy-1', 'GWALLET', 'GAGENT');
+  assert.match(prompt, /Stellar Mainnet policy: policy-1/);
+  assert.match(prompt, /`allowit --rail stellar:pubnet --rpc-url <independent Stellar Mainnet RPC URL> wallet import/);
+  assert.doesNotMatch(prompt, /testnet|Testnet/);
+  // The Testnet link keeps its own network and unit.
+  const testnet = parseReviewLink(fragment({proposal, workPrompt: 'w'}));
+  assert.equal(testnet.proposal.network, 'stellar:testnet');
+  assert.deepEqual(adkParamLines(proposal.params, assets('stellar:testnet')).map(line => line.value), ['0.0000001 XLM']);
+  assert.match(reviewAgentPrompt(testnet, 'https://app.allowit.ai', 'p', 'w', 'a'), /Stellar Testnet policy: p/);
+  // The Mainnet asset is no unit on Testnet: the amount stays in base units. An alias, or a network that the rail
+  // does not list, is refused.
+  assert.deepEqual(adkParamLines(mainnet.params, assets('stellar:testnet')).map(line => line.value), ['20000000', usdc]);
+  // The plugin's hook, which the SDK calls with the link's network, reads the assets of that network.
+  assert.deepEqual(plugin.review.paramLines(mainnet.params, 'stellar:pubnet').map(line => line.value), ['2 USDC', 'USDC']);
+  assert.deepEqual(plugin.review.paramLines(mainnet.params, 'stellar:testnet').map(line => line.value), ['20000000', usdc]);
+  // Only a list of one asset address names the unit, as Core reads the rule: several assets, a text entry or a
+  // bare value leave the amount in base units.
+  const xlm = stellarAssetContractId('XLM', null, 'stellar:pubnet');
+  for (const tokens of [{List: [{Addr: usdc}, {Addr: xlm}]}, {List: [{Str: usdc}]}, {Addr: usdc}]) {
+    assert.equal(adkParamLines({payment_limit: {Int: '20000000'}, tokens}, assets('stellar:pubnet'))[0].value, '20000000');
+  }
+  for (const network of ['stellar:mainnet', 'stellar-testnet', 'other:mainnet', '']) {
+    assert.throws(() => parseReviewLink(fragment({proposal: {...mainnet, network}, workPrompt: 'w'})), /agent policy link is invalid/);
+  }
 });
 
 test('a review link carries the chat-collected agent key and amount and refuses any other key', async () => {

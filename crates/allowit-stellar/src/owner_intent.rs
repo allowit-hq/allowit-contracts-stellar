@@ -60,8 +60,9 @@ pub fn validate_retained_owner_transaction(original: &OwnerTransaction) -> Resul
                 let function = call.function_name.0.as_slice();
                 // A server retains each step under its own name for the owner action. Those
                 // names describe these contract calls; a pause and a resume differ only in
-                // the first argument.
-                function == original.action.as_bytes()
+                // the first argument. The setup of a wallet account is a classic transaction
+                // only: no contract call stands for it, whatever its function is named.
+                original.action != "native_setup" && function == original.action.as_bytes()
                     || match (original.action.as_str(), function) {
                         // A creation runs through the network's deployer.
                         ("create_wallet", b"deploy")
@@ -83,12 +84,34 @@ pub fn validate_retained_owner_transaction(original: &OwnerTransaction) -> Resul
                 ..
             },
         ] => original.action == "extend",
-        operations => classic_action_matches(&original.action, operations),
+        // The setup of a wallet account is exactly what the setup builder makes from the values
+        // of the bytes themselves. Every other classic action is described by its operations.
+        operations => {
+            classic_action_matches(&original.action, operations)
+                || (original.action == "native_setup"
+                    && owner::is_setup_transaction(tx, &original.network))
+        }
     };
     if !action_matches {
         return Err("Retained owner action differs from its transaction".into());
     }
     Ok(())
+}
+
+/// Whether the retained owner transaction renews a wallet's lifetime: its one operation extends
+/// the lifetime of ledger entries. The transaction itself says so, not its action name. Such a
+/// step moves nothing.
+pub fn renews_lifetime(original: &OwnerTransaction) -> Result<bool> {
+    let TransactionEnvelope::Tx(envelope) = read(&original.transaction_xdr)? else {
+        return Err("Expected a v1 owner transaction".into());
+    };
+    Ok(matches!(
+        envelope.tx.operations.as_slice(),
+        [Operation {
+            body: OperationBody::ExtendFootprintTtl(_),
+            ..
+        }]
+    ))
 }
 
 /// Whether a classic owner transaction has the operations of its named action: the creation
@@ -105,18 +128,6 @@ fn classic_action_matches(action: &str, operations: &[Operation]) -> bool {
             }) =>
         {
             true
-        }
-        ("native_setup", [create, rest @ ..]) => {
-            matches!(create.body, OperationBody::CreateAccount(_))
-                && create.source_account.is_none()
-                && (3..=4).contains(&rest.len())
-                && rest.iter().all(|op| {
-                    wallet_sourced(op)
-                        && matches!(
-                            op.body,
-                            OperationBody::SetOptions(_) | OperationBody::ChangeTrust(_)
-                        )
-                })
         }
         ("fund", [op]) => !wallet_sourced(op) && matches!(op.body, OperationBody::Payment(_)),
         ("withdraw", [op]) => wallet_sourced(op) && matches!(op.body, OperationBody::Payment(_)),
@@ -237,6 +248,8 @@ pub enum OwnerAction {
         fee_per_operation: u32,
         starting_balance: Option<i64>,
         trustline: Option<owner::Trustline>,
+        /// Base units of the trustline's asset that the owner's account sends to the wallet.
+        funding: Option<i64>,
         created_at: u64,
     },
     /// One owner action on a wallet account (fund, pause, resume, withdraw or close),
@@ -736,6 +749,7 @@ fn exact_native_setup(action: &OwnerAction, network: &str, now: u64) -> Result<o
         fee_per_operation,
         starting_balance,
         trustline,
+        funding,
         created_at,
     } = action
     else {
@@ -755,6 +769,7 @@ fn exact_native_setup(action: &OwnerAction, network: &str, now: u64) -> Result<o
             fee_per_operation: *fee_per_operation,
             starting_balance: *starting_balance,
             trustline: trustline.as_ref(),
+            funding: *funding,
         },
         *created_at,
     )
