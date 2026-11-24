@@ -1899,6 +1899,67 @@ fn a_deposit_leaves_the_daily_spending_window_closed() {
 }
 
 #[test]
+fn a_wallet_deposits_into_and_redeems_from_the_priced_test_vault() {
+    use allowit_sep56_priced_test_vault::{
+        AllowitSep56PricedTestVault, AllowitSep56PricedTestVaultClient, SHARE,
+    };
+    for wasm in [SIMPLE, COMMON] {
+        let f = Fixture::with(wasm, false, |env, c| {
+            if !c.rules.is_empty() {
+                c.rules = Vec::from_array(env, [AllowitRule::payment_limit]);
+            }
+        });
+        f.env.mock_all_auths();
+        let admin = Address::generate(&f.env);
+        let vault = f.env.register(
+            AllowitSep56PricedTestVault,
+            (
+                f.asset.clone(),
+                admin,
+                soroban_sdk::String::from_str(&f.env, "Vault A"),
+                SHARE,
+            ),
+        );
+        let v = AllowitSep56PricedTestVaultClient::new(&f.env, &vault);
+        f.env.set_auths(&[]);
+        // At one asset a share, 40 assets buy 40 shares with no conversion loss.
+        let mut e = f.transfer(1, 0);
+        e.0 = BytesN::from_array(&f.env, &[2; 32]);
+        e.3 = AllowitStellarOperation::Deposit(vault.clone(), 40, 40);
+        priced(&f, &mut e, 0);
+        assert_eq!(f.run(&e), Ok(()));
+        assert_eq!(
+            (v.balance(&f.wallet), f.balance(&f.asset, &f.wallet)),
+            (40, 960)
+        );
+        // The admin lowers the price by 6%: the 40 shares redeem for 37 assets, as previewed.
+        f.env.mock_all_auths();
+        v.set_share_price(&9_400_000);
+        f.env.set_auths(&[]);
+        assert_eq!(v.preview_redeem(&40), 37);
+        let mut e = f.transfer(1, 0);
+        e.0 = BytesN::from_array(&f.env, &[3; 32]);
+        e.3 = AllowitStellarOperation::Redeem(vault.clone(), 40, 37);
+        priced(&f, &mut e, 0);
+        assert_eq!(f.run(&e), Ok(()));
+        assert_eq!(
+            (v.balance(&f.wallet), f.balance(&f.asset, &f.wallet)),
+            (0, 997)
+        );
+        // At 0.94 a deposit of 40 mints 42 shares worth 39: one unit of rounding loss, which
+        // the wallet admits only within the request's conversion bound.
+        let mut e = f.transfer(1, 0);
+        e.0 = BytesN::from_array(&f.env, &[4; 32]);
+        e.3 = AllowitStellarOperation::Deposit(vault.clone(), 40, 42);
+        priced(&f, &mut e, 0);
+        assert_eq!(f.run(&e), Err(Ok(AllowitWalletError::InvalidEffects)));
+        priced(&f, &mut e, 1);
+        assert_eq!(f.run(&e), Ok(()));
+        assert_eq!(v.balance(&f.wallet), 42);
+    }
+}
+
+#[test]
 fn a_custom_wallet_deposits_within_its_policy() {
     let f = Fixture::with(CUSTOM, false, |env, c| {
         c.params
