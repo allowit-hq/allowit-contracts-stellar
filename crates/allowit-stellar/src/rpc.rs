@@ -56,7 +56,8 @@ impl HttpRpc {
     pub fn new(url: &str) -> Result<Self> {
         Self::with_timeout(url, Duration::from_secs(30))
     }
-    fn with_timeout(url: &str, timeout: Duration) -> Result<Self> {
+    /// An adapter whose calls each wait at most `timeout`.
+    pub fn with_timeout(url: &str, timeout: Duration) -> Result<Self> {
         let client = |max_bytes| {
             RpcClient::new(url, timeout, max_bytes)
                 .map(RpcClient::accept_success_statuses)
