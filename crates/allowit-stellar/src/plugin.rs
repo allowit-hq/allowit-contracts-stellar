@@ -192,11 +192,15 @@ impl RailPlugin for Plugin {
     ) -> Option<&'static dyn allowit_core::vendor::wallet::MessageSignature> {
         Some(&provider::message_signature::MESSAGE_SIGNING)
     }
-    /// The price observation of a server policy: [`provider::price`].
+    /// The price observation of a server policy, [`provider::price`], and the balance that an
+    /// address holds of an asset, [`provider::balance`].
     fn policy_functions(
         &self,
     ) -> &'static [(&'static str, allowit_core::vendor::plugin::PolicyFunction)] {
-        &[(provider::price::FUNCTION, provider::price::price)]
+        &[
+            (provider::price::FUNCTION, provider::price::price),
+            (provider::balance::FUNCTION, provider::balance::balance),
+        ]
     }
     fn draft_params(
         &self,

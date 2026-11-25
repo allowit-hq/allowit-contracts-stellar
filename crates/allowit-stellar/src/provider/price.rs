@@ -360,7 +360,7 @@ pub fn observe(
 
 /// The public Stellar RPC of a network. Mainnet has no public endpoint of the network's own;
 /// a host names one in its facts.
-fn public_rpc(network: &str) -> Result<&'static str, String> {
+pub(crate) fn public_rpc(network: &str) -> Result<&'static str, String> {
     match network {
         "stellar:testnet" => Ok("https://soroban-testnet.stellar.org"),
         _ => Err(format!(
